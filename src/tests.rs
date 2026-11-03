@@ -271,3 +271,83 @@ fn interrupt_apply_worker(root: &Path, saved: &Path) -> Result<()> {
     })?;
     panic!("fixture did not replace the compositor");
 }
+
+#[test]
+fn exact_install_and_remove_offline() -> Result<()> {
+    const LIB: &str = "usr/lib/libexample.so";
+    const APP: &str = "usr/bin/example";
+    const EXTRA: &str = "usr/bin/extra";
+    const EDITED: &str = "etc/extra.conf";
+    let f = Fixture::new()?;
+    f.package(
+        "library/example",
+        "1.0.0-0",
+        f.file(LIB, "library", "0644", "")?,
+    )?;
+    f.package(
+        "app/example",
+        "1.0.0-0",
+        dependency("require", "library/example", "1.0.0-0") + &f.file(APP, "app", "0755", "")?,
+    )?;
+    f.package(
+        "app/extra",
+        "1.0.0-0",
+        f.file(EXTRA, "extra", "0755", "")?
+            + &f.file(EDITED, "vendor", "0644", "preserve=#true")?,
+    )?;
+    f.create()?;
+    let initial = plan(
+        &f.root,
+        Request::Install {
+            packages: vec![
+                "app/example".into(),
+                "library/example".into(),
+                "app/extra".into(),
+            ],
+        },
+    )?;
+    apply(&f.root, &initial)?;
+    fs::write(f.root.join(EDITED), "local config")?;
+    let exact = plan(
+        &f.root,
+        Request::ExactInstall {
+            packages: vec!["app/example".into()],
+        },
+    )?;
+    assert!(exact.summary().contains("Remove app/extra 1.0.0-0"));
+    assert!(
+        exact
+            .summary()
+            .contains("Preserve local config etc/extra.conf")
+    );
+    apply(&f.root, &exact)?;
+    assert_eq!(fs::read_to_string(f.root.join(EDITED))?, "local config");
+    assert!(!f.root.join(EXTRA).exists());
+    assert!(f.root.join(LIB).is_file());
+    let image = crate::image::Image::open(&f.root, false)?;
+    let installed = image.state()?.installed;
+    assert!(installed["app/example"].explicit);
+    assert!(!installed["library/example"].explicit);
+    drop(image);
+
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    let error = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec!["library/example".into()],
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("is missing required package library/example"));
+    let remove = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec!["app/example".into(), "library/example".into()],
+        },
+    )?;
+    assert!(remove.catalog.is_none());
+    apply(&f.root, &remove)?;
+    assert!(!f.root.join(LIB).exists() && !f.root.join(APP).exists());
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}

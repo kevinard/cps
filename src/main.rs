@@ -50,7 +50,7 @@ enum Command {
         #[arg(long, value_name = "NAME=BOOL")]
         facet: Vec<String>,
     },
-    /// Preview and save an install or update plan
+    /// Preview and save a package transaction
     Plan {
         #[arg(long)]
         root: PathBuf,
@@ -84,6 +84,16 @@ enum PlanCommand {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+    /// Reconcile an image to the named packages and their dependencies
+    ExactInstall {
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+    /// Remove installed packages without contacting the repository
+    Remove {
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
     /// Update the installed package set
     Update,
 }
@@ -102,7 +112,7 @@ enum BootCommand {
         /// Environment ID. Defaults to the previous known-good environment.
         id: Option<String>,
     },
-    /// Clone the base image and apply a saved update in a new directory
+    /// Clone the base image and apply a saved plan in a new directory
     Stage {
         #[arg(long)]
         source: PathBuf,
@@ -214,6 +224,8 @@ fn run(command: Command) -> Result<ExitCode> {
         } => {
             let request = match request {
                 PlanCommand::Install { packages } => Request::Install { packages },
+                PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
+                PlanCommand::Remove { packages } => Request::Remove { packages },
                 PlanCommand::Update => Request::Update,
             };
             let plan = plan(&root, request)?;

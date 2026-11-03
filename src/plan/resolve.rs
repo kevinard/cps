@@ -13,6 +13,7 @@ pub fn resolve(
     packages: &[Published],
     requested: &BTreeSet<String>,
     update: bool,
+    exact: bool,
 ) -> Result<BTreeMap<String, Installed>> {
     let mut candidates = BTreeMap::<_, Vec<_>>::new();
     for package in packages
@@ -53,6 +54,7 @@ pub fn resolve(
     let wanted = state
         .installed
         .keys()
+        .filter(|_| !exact)
         .chain(requested)
         .map(String::as_str)
         .collect();
@@ -62,7 +64,7 @@ pub fn resolve(
         .into_iter()
         .map(|(name, pkg)| {
             let explicit = requested.contains(name)
-                || state.installed.get(name).is_some_and(|old| old.explicit);
+                || (!exact && state.installed.get(name).is_some_and(|old| old.explicit));
             (
                 name.to_owned(),
                 Installed {

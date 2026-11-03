@@ -72,7 +72,7 @@ pub(crate) fn apply_with(
             &image.root,
             state,
             plan.request.clone(),
-            Some(&plan.catalog),
+            plan.catalog.as_deref(),
         )?;
         ensure!(
             &checked == plan,

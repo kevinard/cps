@@ -22,6 +22,8 @@ pub(crate) use resolve::check as check_dependencies;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Install { packages: Vec<String> },
+    ExactInstall { packages: Vec<String> },
+    Remove { packages: Vec<String> },
     Update,
 }
 
@@ -38,7 +40,7 @@ pub(crate) struct Write {
 struct PackageChange {
     name: String,
     from: Option<String>,
-    to: String,
+    to: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,7 +57,7 @@ pub struct Plan {
     format: u32,
     pub(crate) image: String,
     pub(crate) base_revision: u64,
-    pub(crate) catalog: String,
+    pub(crate) catalog: Option<String>,
     pub(crate) request: Request,
     selected: BTreeMap<String, String>,
     package_changes: Vec<PackageChange>,
@@ -76,9 +78,11 @@ impl Plan {
             self.image, self.base_revision
         )];
         for change in &self.package_changes {
-            lines.push(match &change.from {
-                Some(old) => format!("Update {} {old} -> {}", change.name, change.to),
-                None => format!("Install {} {}", change.name, change.to),
+            lines.push(match (&change.from, &change.to) {
+                (Some(old), Some(new)) => format!("Update {} {old} -> {new}", change.name),
+                (None, Some(new)) => format!("Install {} {new}", change.name),
+                (Some(old), None) => format!("Remove {} {old}", change.name),
+                (None, None) => continue,
             });
         }
         for transfer in &self.transfers {
@@ -198,28 +202,42 @@ pub(crate) fn build(
     request: Request,
     catalog: Option<&str>,
 ) -> Result<(Plan, State)> {
-    let packages = snapshot(
-        &state.publisher.repo,
-        &state.publisher.name,
-        &state.publisher.key,
-        catalog,
-    )?;
-    let requested = match &request {
-        Request::Install { packages } => {
-            ensure!(!packages.is_empty(), "install requires a package name");
-            for name in packages {
-                validate_name(name)?;
+    let (catalog, installed) = match &request {
+        Request::Remove { packages } => {
+            let names = requested_names(packages)?;
+            let mut installed = state.installed.clone();
+            for name in names {
+                ensure!(
+                    installed.remove(&name).is_some(),
+                    "package is not installed: {name}"
+                );
             }
-            packages.iter().cloned().collect()
+            resolve::check(&installed).context("removal would break installed dependencies")?;
+            (None, installed)
         }
-        Request::Update => BTreeSet::new(),
+        _ => {
+            let requested = match &request {
+                Request::Install { packages } | Request::ExactInstall { packages } => {
+                    requested_names(packages)?
+                }
+                _ => BTreeSet::new(),
+            };
+            let packages = snapshot(
+                &state.publisher.repo,
+                &state.publisher.name,
+                &state.publisher.key,
+                catalog,
+            )?;
+            let installed = resolve::resolve(
+                &state,
+                &packages.packages,
+                &requested,
+                matches!(request, Request::Update),
+                matches!(request, Request::ExactInstall { .. }),
+            )?;
+            (Some(packages.sha256), installed)
+        }
     };
-    let installed = resolve::resolve(
-        &state,
-        &packages.packages,
-        &requested,
-        matches!(request, Request::Update),
-    )?;
     let paths = effective_paths(&state.settings, &installed)?;
     let revision = state
         .settings
@@ -230,14 +248,14 @@ pub(crate) fn build(
     let kernel = kernel::selected(&installed, &paths)?;
     ensure!(
         previous_kernel.is_none() || kernel.is_some(),
-        "update would remove the image's selected kernel"
+        "transaction would remove the image's selected kernel"
     );
     let kernel_install = kernel.filter(|selected| Some(selected) != previous_kernel.as_ref());
     let mut plan = Plan {
         format: FORMAT,
         image: state.settings.id.clone(),
         base_revision: state.settings.revision,
-        catalog: packages.sha256,
+        catalog,
         request,
         selected: installed
             .iter()
@@ -251,17 +269,24 @@ pub(crate) fn build(
         kernel_install,
         payload_bytes: 0,
     };
-    for (name, package) in &installed {
-        let before = state
+    for name in state
+        .installed
+        .keys()
+        .chain(installed.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let from = state
             .installed
             .get(name)
             .map(|old| old.published.manifest.version.to_string());
-        let after = package.published.manifest.version.to_string();
-        if before.as_ref() != Some(&after) {
+        let to = installed
+            .get(name)
+            .map(|new| new.published.manifest.version.to_string());
+        if from != to {
             plan.package_changes.push(PackageChange {
                 name: name.clone(),
-                from: before,
-                to: after,
+                from,
+                to,
             });
         }
     }
@@ -394,6 +419,14 @@ pub(crate) fn build(
     state.installed = installed;
     state.paths = paths;
     Ok((plan, state))
+}
+
+fn requested_names(packages: &[String]) -> Result<BTreeSet<String>> {
+    ensure!(!packages.is_empty(), "request requires a package name");
+    for name in packages {
+        validate_name(name)?;
+    }
+    Ok(packages.iter().cloned().collect())
 }
 
 fn stage_config(

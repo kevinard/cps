@@ -13,7 +13,7 @@ use rustix::fs::{RenameFlags, renameat_with, syncfs};
 use crate::{
     apply::apply,
     image::{BootParent, Image},
-    plan::{Plan, Request},
+    plan::Plan,
     verify::verify_image,
 };
 
@@ -23,10 +23,6 @@ pub use systemd_boot::{
 };
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
-    ensure!(
-        matches!(plan.request, Request::Update),
-        "boot staging requires an update plan"
-    );
     let source = fs::canonicalize(source).context("opening the base image directory")?;
     ensure!(
         source != Path::new("/"),
@@ -54,7 +50,7 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
     let settings = base.state()?.settings;
     ensure!(
         settings.id == plan.image && settings.revision == plan.base_revision,
-        "update plan does not match the base image and revision"
+        "plan does not match the base image and revision"
     );
     let previous = BootParent {
         id: settings.id,
@@ -75,7 +71,7 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
     );
     drop(base);
 
-    apply(staged.path(), plan).context("applying the upgrade in the staged root")?;
+    apply(staged.path(), plan).context("applying the plan in the staged root")?;
     let image = Image::open(staged.path(), true)?;
     check_image_integrity(&image)?;
     let state = image.state()?;
