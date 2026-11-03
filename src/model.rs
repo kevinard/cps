@@ -1,0 +1,368 @@
+use std::{collections::BTreeSet, fmt, io::Read, str::FromStr};
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub const FORMAT: u32 = 1;
+
+pub fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub fn digest_reader(mut reader: impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut reader, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+pub fn validate_digest(hash: &str) -> Result<()> {
+    ensure!(
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid SHA-256 digest {hash:?}"
+    );
+    Ok(())
+}
+
+pub fn validate_path(path: &str) -> Result<()> {
+    ensure!(
+        !path.contains('\0') && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
+        "invalid root-relative path {path:?}"
+    );
+    Ok(())
+}
+
+fn name_component(part: &str) -> bool {
+    part.starts_with(|ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    ensure!(
+        name.split('/').all(name_component),
+        "invalid package name {name:?}"
+    );
+    Ok(())
+}
+
+pub fn validate_publisher(publisher: &str) -> Result<()> {
+    ensure!(name_component(publisher), "invalid publisher {publisher:?}");
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Version([u32; 4]);
+
+impl FromStr for Version {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (upstream, revision) = value
+            .split_once('-')
+            .context("expected major.minor.patch-revision")?;
+        let parts: Vec<_> = upstream.split('.').chain([revision]).collect();
+        ensure!(parts.len() == 4, "expected major.minor.patch-revision");
+        let mut numbers = [0; 4];
+        for (part, number) in parts.into_iter().zip(&mut numbers) {
+            *number = part.parse().context("invalid numeric version component")?;
+            ensure!(part == number.to_string(), "noncanonical version {value:?}");
+        }
+        Ok(Self(numbers))
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [major, minor, patch, revision] = self.0;
+        write!(f, "{major}.{minor}.{patch}-{revision}")
+    }
+}
+
+impl Serialize for Version {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Version {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyKind {
+    Require,
+    Incorporate,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dependency {
+    pub kind: DependencyKind,
+    pub package: String,
+    pub version: Option<String>,
+}
+
+impl Dependency {
+    pub fn matches(&self, version: Version) -> Result<bool> {
+        let Some(constraint) = &self.version else {
+            return Ok(true);
+        };
+        let mut matches = true;
+        for clause in constraint.split(',').map(str::trim) {
+            let (operator, bound) = [">=", "<=", "=", ">", "<"]
+                .into_iter()
+                .find_map(|op| clause.strip_prefix(op).map(|value| (op, value)))
+                .with_context(|| format!("invalid constraint {constraint:?}"))?;
+            let bound = bound.parse::<Version>()?;
+            matches &= match operator {
+                ">=" => version >= bound,
+                "<=" => version <= bound,
+                ">" => version > bound,
+                "<" => version < bound,
+                _ => version == bound,
+            };
+        }
+        Ok(matches)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Action {
+    File {
+        path: String,
+        mode: String,
+        uid: u32,
+        gid: u32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preserve: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        facet: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arch: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+    },
+    Dir {
+        path: String,
+        mode: String,
+        uid: u32,
+        gid: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        facet: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arch: Option<String>,
+    },
+    Symlink {
+        path: String,
+        target: String,
+        uid: u32,
+        gid: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        facet: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arch: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Node {
+    File {
+        sha256: String,
+        size: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    Dir {
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    Symlink {
+        target: String,
+        uid: u32,
+        gid: u32,
+    },
+    Special,
+}
+
+impl Node {
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Self::Dir { .. })
+    }
+}
+
+fn parse_mode(mode: &str) -> Result<u32> {
+    ensure!(
+        mode.len() == 4
+            && mode.starts_with('0')
+            && mode.bytes().all(|b| (b'0'..=b'7').contains(&b)),
+        "expected a mode such as \"0755\""
+    );
+    Ok(u32::from_str_radix(mode, 8)?)
+}
+
+impl Action {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::File { path, .. } | Self::Dir { path, .. } | Self::Symlink { path, .. } => path,
+        }
+    }
+
+    pub fn selectors(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::File { facet, arch, .. }
+            | Self::Dir { facet, arch, .. }
+            | Self::Symlink { facet, arch, .. } => (facet.as_deref(), arch.as_deref()),
+        }
+    }
+
+    pub fn preserve(&self) -> bool {
+        matches!(self, Self::File { preserve: true, .. })
+    }
+
+    pub fn node(&self) -> Result<Node> {
+        Ok(match self {
+            Self::File {
+                sha256,
+                size,
+                mode,
+                uid,
+                gid,
+                ..
+            } => Node::File {
+                sha256: sha256.clone().context("missing file digest")?,
+                size: size.context("missing file size")?,
+                mode: parse_mode(mode)?,
+                uid: *uid,
+                gid: *gid,
+            },
+            Self::Dir { mode, uid, gid, .. } => Node::Dir {
+                mode: parse_mode(mode)?,
+                uid: *uid,
+                gid: *gid,
+            },
+            Self::Symlink {
+                target, uid, gid, ..
+            } => Node::Symlink {
+                target: target.clone(),
+                uid: *uid,
+                gid: *gid,
+            },
+        })
+    }
+
+    fn validate(&self, published: bool) -> Result<()> {
+        let path = self.path();
+        validate_path(path)?;
+        ensure!(
+            path.split('/').next() != Some(".cps"),
+            "reserved image path {path}"
+        );
+        let (facet, arch) = self.selectors();
+        for selector in [facet, arch].into_iter().flatten() {
+            ensure!(
+                name_component(selector),
+                "invalid action selector {selector:?}"
+            );
+        }
+        let (uid, gid) = match self {
+            Self::File {
+                mode,
+                uid,
+                gid,
+                sha256,
+                size,
+                ..
+            } => {
+                parse_mode(mode)?;
+                if published {
+                    validate_digest(sha256.as_deref().context("missing file digest")?)?;
+                    ensure!(size.is_some(), "missing file size");
+                } else {
+                    ensure!(
+                        sha256.is_none() && size.is_none(),
+                        "publish derives file digest and size"
+                    );
+                }
+                (*uid, *gid)
+            }
+            Self::Dir { mode, uid, gid, .. } => {
+                parse_mode(mode)?;
+                (*uid, *gid)
+            }
+            Self::Symlink {
+                target, uid, gid, ..
+            } => {
+                ensure!(
+                    !target.is_empty() && !target.contains('\0'),
+                    "invalid symlink target"
+                );
+                (*uid, *gid)
+            }
+        };
+        ensure!(uid != u32::MAX && gid != u32::MAX, "invalid owner");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    pub format: u32,
+    pub publisher: String,
+    pub name: String,
+    pub version: Version,
+    #[serde(default)]
+    pub dependency: Vec<Dependency>,
+    #[serde(default)]
+    pub action: Vec<Action>,
+}
+
+impl Manifest {
+    pub fn id(&self) -> String {
+        format!("cps://{}/{}@{}", self.publisher, self.name, self.version)
+    }
+
+    pub fn validate(&self, published: bool) -> Result<()> {
+        ensure!(
+            self.format == FORMAT,
+            "unsupported manifest format {}",
+            self.format
+        );
+        validate_publisher(&self.publisher)?;
+        validate_name(&self.name)?;
+        for dependency in &self.dependency {
+            validate_name(&dependency.package)?;
+            ensure!(
+                dependency.kind != DependencyKind::Incorporate || dependency.version.is_some(),
+                "incorporate requires a version constraint"
+            );
+            dependency.matches(self.version)?;
+        }
+        let mut actions = BTreeSet::new();
+        for action in &self.action {
+            action
+                .validate(published)
+                .with_context(|| format!("action {}", action.path()))?;
+            if !actions.insert((action.path(), action.selectors())) {
+                bail!("duplicate action for {}", action.path());
+            }
+        }
+        Ok(())
+    }
+}
