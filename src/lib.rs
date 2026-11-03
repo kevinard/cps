@@ -1,5 +1,6 @@
 mod apply;
 mod boot;
+mod build;
 mod image;
 mod kdl_format;
 mod model;
@@ -13,6 +14,7 @@ pub use boot::{
     Activation, BootEnvironment, activate_boot_environment, list_boot_environments,
     rollback_boot_environment, stage_boot_environment,
 };
+pub use build::build;
 pub use image::create_image;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{Plan, Request, plan};

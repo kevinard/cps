@@ -13,6 +13,8 @@ use crate::{
     systemd::Action as SystemdAction,
 };
 
+pub(crate) mod build;
+
 struct Fields<'a> {
     args: Vec<&'a KdlValue>,
     properties: BTreeMap<&'a str, &'a KdlValue>,

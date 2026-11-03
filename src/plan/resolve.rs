@@ -2,14 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::{
-    image::{Installed, State},
-    model::DependencyKind,
-    repo::Published,
-};
+use crate::{image::Installed, model::DependencyKind, repo::Published};
 
 pub fn resolve(
-    state: &State,
+    installed: &BTreeMap<String, Installed>,
     packages: &[Published],
     requested: &BTreeSet<String>,
     update: bool,
@@ -18,10 +14,10 @@ pub fn resolve(
     let mut candidates = BTreeMap::<_, Vec<_>>::new();
     for package in packages
         .iter()
-        .chain(state.installed.values().map(|pkg| &pkg.published))
+        .chain(installed.values().map(|pkg| &pkg.published))
     {
         let manifest = &package.manifest;
-        let previous = state.installed.get(&manifest.name);
+        let previous = installed.get(&manifest.name);
         if let Some(previous) = previous {
             let old = &previous.published.manifest;
             if old.publisher != manifest.publisher || old.version > manifest.version {
@@ -40,7 +36,7 @@ pub fn resolve(
     }
     for (name, versions) in &mut candidates {
         let prefer_current = !update && !requested.contains(*name);
-        let current = state.installed.get(*name).map(|pkg| &pkg.published.sha256);
+        let current = installed.get(*name).map(|pkg| &pkg.published.sha256);
         versions.sort_by_key(|pkg| {
             (
                 prefer_current && current == Some(&pkg.sha256),
@@ -51,8 +47,7 @@ pub fn resolve(
         versions.dedup_by(|a, b| a.sha256 == b.sha256);
     }
 
-    let wanted = state
-        .installed
+    let wanted = installed
         .keys()
         .filter(|_| !exact)
         .chain(requested)
@@ -64,7 +59,7 @@ pub fn resolve(
         .into_iter()
         .map(|(name, pkg)| {
             let explicit = requested.contains(name)
-                || (!exact && state.installed.get(name).is_some_and(|old| old.explicit));
+                || (!exact && installed.get(name).is_some_and(|old| old.explicit));
             (
                 name.to_owned(),
                 Installed {

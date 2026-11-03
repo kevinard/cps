@@ -1,0 +1,343 @@
+mod sandbox;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Seek},
+    os::unix::fs::{PermissionsExt, symlink},
+    path::Path,
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use rustix::{
+    fs::{AtFlags, CWD, RenameFlags, Timespec, Timestamps, renameat_with, utimensat},
+    process::geteuid,
+};
+use tempfile::TempDir;
+
+use crate::{
+    image::root::Root,
+    kdl_format::{
+        build::{BuildRecipe, Source, parse},
+        parse_manifest,
+    },
+    model::{Action, Node, digest, digest_reader},
+    plan::{resolve_packages, select_paths},
+    repo::{MANIFEST_LIMIT, read_key, read_limited, snapshot, stage_blob},
+};
+
+const RECIPE_LIMIT: u64 = 1024 * 1024;
+const MOUNTS: &[&str] = &[
+    "build", "dev", "out", "proc", "recipe", "run", "sources", "tmp",
+];
+
+/// Build one package using sources and a package toolchain pinned by the recipe.
+pub fn build(
+    recipe_path: &Path,
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    sources: &Path,
+    output: &Path,
+    check_reproducible: bool,
+) -> Result<String> {
+    ensure!(
+        !geteuid().is_root(),
+        "package builds require an unprivileged user"
+    );
+    ensure!(
+        matches!(std::env::consts::ARCH, "x86_64" | "aarch64"),
+        "the build sandbox supports x86_64 and aarch64"
+    );
+    let recipe_bytes = read_limited(File::open(recipe_path)?, RECIPE_LIMIT)?;
+    let recipe = parse(std::str::from_utf8(&recipe_bytes)?)
+        .with_context(|| format!("parsing build recipe {}", recipe_path.display()))?;
+    ensure!(
+        recipe.arch == std::env::consts::ARCH,
+        "toolchain architecture {} does not match this build worker",
+        recipe.arch
+    );
+    let manifest_bytes = read_limited(
+        Root::open(parent(recipe_path))?.file(&recipe.manifest)?,
+        MANIFEST_LIMIT,
+    )?;
+    ensure!(
+        digest(&manifest_bytes) == recipe.manifest_digest,
+        "manifest digest mismatch for {}",
+        recipe.manifest
+    );
+    let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
+    manifest.validate(false)?;
+    let paths: BTreeSet<_> = manifest
+        .action
+        .iter()
+        .filter_map(|action| match action {
+            Action::File { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let destination = fs::canonicalize(parent(output))?;
+    let name = output.file_name().context("missing build output name")?;
+    match destination.join(name).symlink_metadata() {
+        Ok(_) => bail!("build output already exists"),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let work = TempDir::new_in(&destination)?;
+    let inputs = work.path().join("sources");
+    fs::create_dir(&inputs)?;
+    stage_sources(sources, &inputs, &recipe)?;
+    let script = work.path().join("build.sh");
+    fs::write(&script, &recipe.script)?;
+    set_mode(&script, 0o444)?;
+    normalize(&script, recipe.epoch)?;
+    let toolchain = work.path().join("toolchain");
+    fs::create_dir(&toolchain)?;
+    prepare_toolchain(&toolchain, repo, publisher, trust_key, &recipe)?;
+
+    let stage = TempDir::new_in(&destination)?;
+    let proto = stage.path().join("proto");
+    fs::create_dir(&proto)?;
+    let artifacts = run(
+        &toolchain,
+        &inputs,
+        &script,
+        work.path(),
+        &recipe,
+        &paths,
+        Some(&proto),
+    )?;
+    if check_reproducible {
+        let repeated = run(
+            &toolchain,
+            &inputs,
+            &script,
+            work.path(),
+            &recipe,
+            &paths,
+            None,
+        )?;
+        for (path, hash) in &artifacts {
+            ensure!(
+                repeated.get(path) == Some(hash),
+                "build is not reproducible for {path}"
+            );
+        }
+    }
+    for (name, bytes) in [
+        ("manifest.kdl", &manifest_bytes),
+        ("build.kdl", &recipe_bytes),
+    ] {
+        let path = stage.path().join(name);
+        fs::write(&path, bytes)?;
+        set_mode(&path, 0o644)?;
+        normalize(&path, recipe.epoch)?;
+    }
+    normalize(stage.path(), recipe.epoch)?;
+    // Flush the complete bundle before moving it into place on the same filesystem.
+    Root::open(stage.path())?.sync()?;
+    let parent = File::open(destination)?;
+    renameat_with(
+        &parent,
+        stage.path().file_name().context("missing staging name")?,
+        &parent,
+        name,
+        RenameFlags::NOREPLACE,
+    )?;
+    parent.sync_all()?;
+    Ok(manifest.id())
+}
+
+fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn normalize(path: &Path, epoch: u32) -> Result<()> {
+    let time = Timespec {
+        tv_sec: i64::from(epoch),
+        tv_nsec: 0,
+    };
+    utimensat(
+        CWD,
+        path,
+        &Timestamps {
+            last_access: time,
+            last_modification: time,
+        },
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    Ok(())
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    Ok(fs::set_permissions(path, fs::Permissions::from_mode(mode))?)
+}
+
+fn stage_sources(root: &Path, input: &Path, recipe: &BuildRecipe) -> Result<()> {
+    let root = Root::open(root)?;
+    let mut directories = BTreeSet::from([input.to_owned()]);
+    for (path, Source { sha256, size }) in &recipe.sources {
+        let mut source = root
+            .file(path)
+            .with_context(|| format!("opening build source {path}"))?;
+        ensure!(
+            source.metadata()?.len() == *size,
+            "source length mismatch for {path}"
+        );
+        let staged = input.join(path);
+        fs::create_dir_all(parent(&staged))?;
+        directories.extend(
+            staged
+                .ancestors()
+                .skip(1)
+                .take_while(|dir| dir.starts_with(input))
+                .map(Path::to_owned),
+        );
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        let copied = io::copy(&mut source.by_ref().take(size.saturating_add(1)), &mut file)?;
+        file.rewind()?;
+        ensure!(
+            copied == *size && digest_reader(&mut file)? == *sha256,
+            "source digest or length mismatch for {path}"
+        );
+        set_mode(&staged, 0o444)?;
+        normalize(&staged, recipe.epoch)?;
+    }
+    for directory in directories.iter().rev() {
+        set_mode(directory, 0o755)?;
+        normalize(directory, recipe.epoch)?;
+    }
+    Ok(())
+}
+
+fn prepare_toolchain(
+    path: &Path,
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    recipe: &BuildRecipe,
+) -> Result<()> {
+    let release = snapshot(
+        repo,
+        publisher,
+        &read_key(trust_key)?,
+        Some(&recipe.catalog),
+    )
+    .context("loading pinned toolchain catalog")?;
+    let installed = resolve_packages(
+        &BTreeMap::new(),
+        &release.packages,
+        &recipe.packages,
+        false,
+        true,
+    )
+    .context("resolving build toolchain")?;
+    let implicit = Node::Dir {
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+    };
+    let paths = select_paths(&recipe.arch, &BTreeMap::new(), implicit, &installed)?;
+    for (name, managed) in &paths {
+        let (top, _) = name.split_once('/').unwrap_or((name, ""));
+        if MOUNTS.contains(&top) {
+            ensure!(
+                name == top && managed.node.is_dir(),
+                "toolchain path {name} conflicts with a sandbox mount"
+            );
+            continue;
+        }
+        let file = path.join(name);
+        match &managed.node {
+            Node::Dir { .. } => {
+                fs::create_dir(&file)?;
+                set_mode(&file, 0o755)?;
+            }
+            Node::Symlink { target, .. } => symlink(target, &file)?,
+            Node::File { mode, .. } => {
+                let mut destination = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&file)?;
+                stage_blob(repo, &managed.node, &mut destination)
+                    .with_context(|| format!("materializing toolchain file {name}"))?;
+                let mode = if mode & 0o111 == 0 { 0o444 } else { 0o555 };
+                destination.set_permissions(fs::Permissions::from_mode(mode))?;
+            }
+            Node::Special => bail!("unexpected special file in toolchain"),
+        }
+    }
+    for mount in MOUNTS {
+        fs::create_dir(path.join(mount))?;
+        set_mode(&path.join(mount), 0o755)?;
+        normalize(&path.join(mount), recipe.epoch)?;
+    }
+    // The mount destination must exist before the root is mounted read-only.
+    File::create(path.join("recipe/build.sh"))?;
+    normalize(&path.join("recipe"), recipe.epoch)?;
+    for name in paths.keys().rev() {
+        normalize(&path.join(name), recipe.epoch)?;
+    }
+    set_mode(path, 0o755)?;
+    normalize(path, recipe.epoch)?;
+    Ok(())
+}
+
+fn run(
+    toolchain: &Path,
+    sources: &Path,
+    script: &Path,
+    work: &Path,
+    recipe: &BuildRecipe,
+    paths: &BTreeSet<&str>,
+    proto: Option<&Path>,
+) -> Result<BTreeMap<String, String>> {
+    let output = TempDir::new_in(work)?;
+    sandbox::run(toolchain, sources, script, output.path(), recipe.epoch)?;
+    let root = Root::open(output.path())?;
+    let mut artifacts = BTreeMap::new();
+    let mut directories: BTreeSet<_> = proto.into_iter().map(Path::to_owned).collect();
+    for path in paths {
+        let mut source = root
+            .file(path)
+            .with_context(|| format!("opening declared build output {path}"))?;
+        let hash = if let Some(proto) = proto {
+            let destination = proto.join(path);
+            fs::create_dir_all(parent(&destination))?;
+            directories.extend(
+                destination
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|dir| dir.starts_with(proto))
+                    .map(Path::to_owned),
+            );
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            io::copy(&mut source, &mut file)?;
+            file.rewind()?;
+            let hash = digest_reader(&mut file)?;
+            set_mode(&destination, 0o644)?;
+            normalize(&destination, recipe.epoch)?;
+            hash
+        } else {
+            digest_reader(&mut source)?
+        };
+        artifacts.insert((*path).to_owned(), hash);
+    }
+    for directory in directories.iter().rev() {
+        set_mode(directory, 0o755)?;
+        normalize(directory, recipe.epoch)?;
+    }
+    Ok(artifacts)
+}

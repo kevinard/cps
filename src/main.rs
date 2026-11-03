@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::{
-    Activation, ImageConfig, Plan, Request, activate_boot_environment, apply, create_image,
+    Activation, ImageConfig, Plan, Request, activate_boot_environment, apply, build, create_image,
     list_boot_environments, plan, publish, read_image_config, release, rollback_boot_environment,
     stage_boot_environment, verify,
 };
@@ -23,6 +23,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Build a package with verified inputs in an offline sandbox
+    Build {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+        #[arg(long)]
+        sources: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        check_reproducible: bool,
+        recipe: PathBuf,
+    },
     /// Publish one manifest and its payloads to a local repository
     Publish {
         #[arg(long)]
@@ -212,6 +228,26 @@ fn save(path: &Path, plan: &Plan) -> Result<()> {
 
 fn run(command: Command) -> Result<ExitCode> {
     match command {
+        Command::Build {
+            repo,
+            publisher,
+            trust_key,
+            sources,
+            output,
+            check_reproducible,
+            recipe,
+        } => {
+            let id = build(
+                &recipe,
+                &repo,
+                &publisher,
+                &trust_key,
+                &sources,
+                &output,
+                check_reproducible,
+            )?;
+            println!("Built {id} at {}", output.display());
+        }
         Command::Publish {
             repo,
             proto,

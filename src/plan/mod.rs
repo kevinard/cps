@@ -16,7 +16,7 @@ use crate::{
     systemd::{self, Action as SystemdAction},
 };
 
-pub(crate) use resolve::check as check_dependencies;
+pub(crate) use resolve::{check as check_dependencies, resolve as resolve_packages};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -128,14 +128,28 @@ pub(crate) fn effective_paths(
     settings: &Settings,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
+    select_paths(
+        &settings.arch,
+        &settings.facets,
+        settings.directory(),
+        installed,
+    )
+}
+
+pub(crate) fn select_paths(
+    arch: &str,
+    facets: &BTreeMap<String, bool>,
+    implicit_directory: Node,
+    installed: &BTreeMap<String, Installed>,
+) -> Result<BTreeMap<String, Managed>> {
     let mut paths: BTreeMap<String, Managed> = BTreeMap::new();
     let mut sizes = BTreeMap::new();
     for (name, package) in installed {
         let mut selected = BTreeSet::new();
         for action in &package.published.manifest.action {
-            let (facet, arch) = action.selectors();
-            if facet.is_some_and(|key| !settings.facets.get(key).copied().unwrap_or(true))
-                || arch.is_some_and(|arch| arch != settings.arch)
+            let (facet, action_arch) = action.selectors();
+            if facet.is_some_and(|key| !facets.get(key).copied().unwrap_or(true))
+                || action_arch.is_some_and(|action_arch| action_arch != arch)
             {
                 continue;
             }
@@ -183,7 +197,7 @@ pub(crate) fn effective_paths(
         .collect();
     for parent in parents {
         let entry = paths.entry(parent.clone()).or_insert_with(|| Managed {
-            node: settings.directory(),
+            node: implicit_directory.clone(),
             owners: BTreeSet::new(),
             preserve: false,
             implicit: true,
@@ -229,7 +243,7 @@ pub(crate) fn build(
                 catalog,
             )?;
             let installed = resolve::resolve(
-                &state,
+                &state.installed,
                 &packages.packages,
                 &requested,
                 matches!(request, Request::Update),

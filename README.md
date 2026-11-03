@@ -6,7 +6,7 @@ Repository reads cap catalogs at 64 MiB and manifests at 32 MiB. CPS streams pay
 
 ## Build and try it
 
-Build with `cargo build`. The prototype needs Linux with `openat2`, `/proc`, and the SQLite development library. The example uses OpenSSL to generate a local Ed25519 signing key. Run it as your regular user, with package UID and GID matching that user.
+Build with `cargo build --locked`. CPS needs Linux with `openat2` and `/proc`, plus the SQLite and libseccomp development libraries. The example uses OpenSSL to generate a local Ed25519 signing key. Run it as your regular user, with package UID and GID matching that user.
 
 ```sh
 cps="$PWD/target/debug/cps"
@@ -43,6 +43,39 @@ CONFIG
 To upgrade, publish the revised recipe under a new version and run `cps plan --root image --output upgrade.json update`, then apply the saved plan. Each plan pins a signed catalog and an image revision. Keep the saved plan until apply finishes. If interrupted, rerun `apply` with the same plan. Once writes begin, recovery uses the payloads staged inside the image and can finish offline.
 
 Use `plan exact-install NAME ...` to reconcile an image to the named packages and their required dependencies. The plan previews packages that would be removed. Use `plan remove NAME ...` to remove selected packages from committed image state while offline. Removal fails if a package that remains still requires one of those packages. Both operations preserve locally edited files declared with `preserve=#true`. A saved install, exact-install, remove, or update plan can also be applied to a clone with `boot-env stage`.
+
+## Building packages from source
+
+Run `cps build` as an unprivileged user on an x86-64 or AArch64 Linux worker. It needs Linux 5.11 or newer, unprivileged user namespaces, seccomp, and a current Bubblewrap at `/usr/bin/bwrap`. Supply a local CPS repository or synchronized cache containing a signed toolchain catalog. The recipe pins that catalog, the package manifest, and each source file.
+
+```kdl
+schema-version 1
+build architecture="x86_64" epoch=1700000000 {
+    toolchain "<catalog SHA-256>" {
+        package "devel/base"
+    }
+    manifest "hello.kdl" sha256="<manifest SHA-256>"
+    source "hello.c" sha256="<source SHA-256>" size=123
+    script """
+    mkdir -p "$DESTDIR/usr/bin"
+    cc -ffile-prefix-map=/build=. "$CPS_SOURCES/hello.c" -o "$DESTDIR/usr/bin/hello"
+    """
+}
+```
+
+Use the digest of the selected repository catalog, such as the digest recorded in its `current` file at recipe preparation. Replace the manifest and source hashes with their SHA-256 digests and set `size` to the source byte count. The manifest path is relative to the recipe. Source paths are relative to `--sources`. The example toolchain package must provide the shell, compiler, and utilities through its dependencies.
+
+```sh
+cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
+    --sources sources --output hello-build --check-reproducible hello.build.kdl
+cps publish --repo repo --proto hello-build/proto --signing-key private.der hello-build/manifest.kdl
+```
+
+CPS resolves build dependencies against the pinned catalog and verifies their payloads. The toolchain and source mounts are read-only. The recipe gets a fixed user, hostname, locale, timezone, umask, paths, and `SOURCE_DATE_EPOCH` with fresh writable scratch space. Bubblewrap isolates namespaces and seccomp limits sockets to local Unix sockets. Package signing is a separate step with its own inputs. [Bubblewrap sandboxing](https://github.com/containers/bubblewrap/blob/main/README.md) · [SOURCE_DATE_EPOCH](https://reproducible-builds.org/docs/source-date-epoch/)
+
+The bundle contains the recipe, package manifest, and the declared regular file outputs. The manifest supplies the packaged modes, owners, directory entries, and symlinks. `--check-reproducible` repeats the build in a fresh sandbox and requires identical file hashes before making the bundle available. Both runs use the same worker kernel and CPU. Worker-level CPU, memory, and disk quotas are external to CPS.
+
+Run [`tests/build.sh`](tests/build.sh) on a worker with Bubblewrap, Bash, a C compiler with static libc, binutils, and OpenSSL. It exercises isolation, reproducibility, and installation of the resulting package.
 
 ## Signed releases and mirrors
 

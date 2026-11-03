@@ -19,7 +19,7 @@ use crate::{
 };
 
 const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
-const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
+pub(crate) const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const TMPFILES_LIMIT: u64 = 1024 * 1024;
 
 pub mod release;
@@ -122,7 +122,7 @@ fn parse_current(pointer: &str) -> Result<String> {
     Ok(hash.to_owned())
 }
 
-fn read_limited(file: File, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_limited(file: File, limit: u64) -> Result<Vec<u8>> {
     ensure!(
         file.metadata()?.len() <= limit,
         "repository file exceeds {limit} bytes"
