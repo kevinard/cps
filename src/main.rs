@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::{
     Activation, ImageConfig, Plan, Request, activate_boot_environment, apply, create_image,
-    list_boot_environments, plan, publish, read_image_config, rollback_boot_environment,
+    list_boot_environments, plan, publish, read_image_config, release, rollback_boot_environment,
     stage_boot_environment, verify,
 };
 
@@ -32,6 +32,11 @@ enum Command {
         #[arg(long)]
         signing_key: PathBuf,
         manifest: PathBuf,
+    },
+    /// Export or synchronize a signed repository release
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
     },
     /// Initialize an empty directory as an image
     ImageCreate {
@@ -74,6 +79,36 @@ enum Command {
     BootEnv {
         #[command(subcommand)]
         command: BootCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Export the current catalog and its objects for TUF signing
+    Export {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify and cache a release from a TUF mirror
+    Sync {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        metadata: String,
+        #[arg(long)]
+        targets: String,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
     },
 }
 
@@ -188,6 +223,32 @@ fn run(command: Command) -> Result<ExitCode> {
                 publish(&repo, &proto, &manifest, &signing_key)?
             );
         }
+        Command::Repo { command } => match command {
+            RepoCommand::Export {
+                repo,
+                publisher,
+                trust_key,
+                output,
+            } => {
+                println!(
+                    "Exported {}",
+                    release::export(&repo, &publisher, &trust_key, &output)?
+                );
+            }
+            RepoCommand::Sync {
+                repo,
+                root,
+                metadata,
+                targets,
+                publisher,
+                trust_key,
+            } => {
+                println!(
+                    "Synchronized {}",
+                    release::sync(&repo, &root, &metadata, &targets, &publisher, &trust_key)?
+                );
+            }
+        },
         Command::ImageCreate {
             root,
             config,

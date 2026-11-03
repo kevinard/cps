@@ -16,7 +16,7 @@ pub use boot::{
 pub use image::create_image;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{Plan, Request, plan};
-pub use repo::publish;
+pub use repo::{publish, release};
 pub use verify::{Finding, verify};
 
 #[cfg(test)]

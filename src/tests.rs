@@ -351,3 +351,5 @@ fn exact_install_and_remove_offline() -> Result<()> {
     assert!(verify(&f.root)?.is_empty());
     Ok(())
 }
+
+mod release;

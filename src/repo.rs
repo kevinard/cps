@@ -1,13 +1,13 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -21,6 +21,8 @@ use crate::{
 const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
 const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const TMPFILES_LIMIT: u64 = 1024 * 1024;
+
+pub mod release;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -95,7 +97,8 @@ pub struct Snapshot {
 }
 
 pub fn read_key(path: &Path) -> Result<Vec<u8>> {
-    let bytes = fs::read(path).with_context(|| format!("reading trust key {}", path.display()))?;
+    let bytes = (|| read_limited(File::open(path)?, 44))()
+        .with_context(|| format!("reading trust key {}", path.display()))?;
     // SubjectPublicKeyInfo for Ed25519, as emitted by openssl pkey -pubout -outform DER.
     const PREFIX: &[u8] = b"\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00";
     let key = bytes
@@ -110,6 +113,10 @@ fn read_current(repo: &Path) -> Result<String> {
         read_limited(Root::open(repo)?.file("current")?, 65)
             .context("reading repository current catalog")?,
     )?;
+    parse_current(&pointer)
+}
+
+fn parse_current(pointer: &str) -> Result<String> {
     let hash = pointer.trim_end();
     validate_digest(hash)?;
     Ok(hash.to_owned())
@@ -218,6 +225,39 @@ fn store(repo: &Path, kind: &str, bytes: &[u8]) -> Result<String> {
     Ok(hash)
 }
 
+fn lock_repo(repo: &Path) -> Result<File> {
+    fs::create_dir_all(repo)?;
+    Root::open(repo)?;
+    let lock = File::from(open(
+        repo.join("publish.lock"),
+        OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    ensure!(lock.metadata()?.is_file(), "invalid repository lock");
+    flock(&lock, FlockOperation::LockExclusive)?;
+    Ok(lock)
+}
+
+fn path_present(path: &Path) -> Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn prepare_objects(repo: &Path) -> Result<()> {
+    let root = Root::open(repo)?;
+    for dir in ["catalogs", "manifests", "blobs"] {
+        if !path_present(&repo.join(dir))? {
+            fs::create_dir(repo.join(dir))?;
+        }
+        root.dir(dir)?;
+    }
+    File::open(repo)?.sync_all()?;
+    Ok(())
+}
+
 pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<String> {
     let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&fs::read(key)?)
         .map_err(|e| anyhow::anyhow!("invalid Ed25519 PKCS#8 signing key: {e}"))?;
@@ -225,16 +265,12 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
         .with_context(|| format!("parsing {}", recipe.display()))?;
     manifest.validate(false)?;
     let proto = Root::open(proto)?;
-    fs::create_dir_all(repo)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(repo.join("publish.lock"))?;
-    flock(&lock, FlockOperation::LockExclusive)?;
-    for dir in ["catalogs", "manifests", "blobs"] {
-        fs::create_dir_all(repo.join(dir))?;
-    }
+    let _lock = lock_repo(repo)?;
+    ensure!(
+        !path_present(&repo.join(".tuf"))?,
+        "cannot publish to a TUF-managed repository cache"
+    );
+    prepare_objects(repo)?;
     let mut catalog = if repo.join("current").try_exists()? {
         read_catalog(
             repo,
