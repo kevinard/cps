@@ -17,7 +17,10 @@ use crate::{
     verify::verify_image,
 };
 
-pub use systemd_boot::{Activation, activate_boot_environment};
+pub use systemd_boot::{
+    Activation, BootEnvironment, activate_boot_environment, list_boot_environments,
+    rollback_boot_environment,
+};
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
     ensure!(

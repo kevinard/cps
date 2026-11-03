@@ -105,6 +105,17 @@ package "system/kernel" publisher="canopa" version="7.2.11-1" {
 
 Installing or changing the selected kernel runs the host's `kernel-install add` with systemd's Type #1 BLS plugin and a private boot tree inside the image. CPS verifies the resulting kernel and initrd against the signed manifest. A staged upgrade prepares its files before publishing the new root. Later, `boot-env activate` takes the prepared files from that root and publishes them alongside its boot entry. Omit `--kernel` and `--initrd` for manifest-managed kernels. Images with manually supplied boot files can still use the options above. [systemd kernel-install](https://www.freedesktop.org/software/systemd/man/260/kernel-install.html)
 
+### Listing and rolling back
+
+```sh
+cps boot-env list --esp esp
+cps boot-env rollback --esp esp
+# Or select a specific known-good ID from the list.
+cps boot-env rollback --esp esp "$environment_id"
+```
+
+The list marks the default configured on the ESP and shows each registered root's partition UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. Rollback selects the default environment's recorded parent unless an ID is supplied. Entries from earlier CPS versions use the previous known-good revision. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
+
 ### VM boot tests
 
 The [VM test](tests/systemd-boot-vm.sh) builds a GPT disk with two separate ext4 roots and a FAT ESP, then boots it through OVMF and systemd-boot under QEMU. The `fallback` scenario checks that staging leaves the ESP alone and that the previous root boots after two failed attempts. The `bless` scenario runs systemd as PID 1, installs the health gate through the CPS package, and checks that systemd removes the counter and boots the blessed root again. The `health-fail` scenario corrupts a managed file and checks that the health gate blocks blessing through both attempts. The `kernel-upgrade` scenario checks the kernel and initrd on the ESP and reports `uname -r` from both roots.
@@ -124,3 +135,5 @@ The script defaults to Arch Linux paths for the kernel, BusyBox, and systemd-boo
 The blessing fixture also needs the local systemd userspace, util-linux, binutils `strip`, kmod, and kernel support for EFI variables and FAT. It copies the installed VFAT and ISO-8859-1 modules for the running kernel. Set `CPS_VM_KERNEL_RELEASE` for another installed kernel, or `CPS_VM_FAT_BUILTIN=1` if VFAT and its character sets are built in.
 
 For `kernel-upgrade`, provide the original kernel as `CPS_VM_KERNEL` with `CPS_VM_KERNEL_RELEASE`, and the upgrade as `CPS_VM_TRIAL_KERNEL` with `CPS_VM_TRIAL_KERNEL_RELEASE`. Both releases must be distinct, and both kernels need the built-in storage and console support listed above. This scenario also uses `cpio` and the host's `kernel-install` and `90-loaderentry.install` plugin.
+
+The `rollback` scenario combines the two-kernel test with systemd blessing. After the upgraded kernel boots as the blessed default, it runs `boot-env list` and `boot-env rollback` against the ESP and boots the same VM disk again. Both kernels need VFAT support. To load modules from extracted kernel packages, set `CPS_VM_KERNEL_MODULES_ROOT` and `CPS_VM_TRIAL_MODULES_ROOT` to the roots containing their indexed `lib/modules` trees.

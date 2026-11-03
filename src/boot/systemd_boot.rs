@@ -1,3 +1,5 @@
+mod policy;
+
 use std::{
     fs::{self, File},
     io::{self, Read},
@@ -14,8 +16,89 @@ use crate::{
     model::digest_reader,
 };
 
-const LOADER_CONFIG: &[u8] =
-    b"default cps-*.conf\ntimeout 0\neditor no\nauto-entries no\nauto-firmware no\n";
+use self::policy::{BootEntry, LoaderPolicy, inventory};
+
+#[derive(Debug)]
+pub struct BootEnvironment {
+    pub id: String,
+    pub title: String,
+    pub root_partuuid: String,
+    pub tries_left: Option<u32>,
+    pub is_default: bool,
+}
+
+pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let _lock = lock_esp(&esp, FlockOperation::LockShared)?;
+    let (policy, entries) = inventory(&esp)?;
+    let selected = policy
+        .as_ref()
+        .and_then(|policy| policy.selected(&entries))
+        .map(|entry| entry.id.clone());
+    Ok(entries
+        .into_iter()
+        .map(|entry| BootEnvironment {
+            is_default: selected.as_deref() == Some(&entry.id),
+            id: entry.id,
+            title: entry.title,
+            root_partuuid: entry.partuuid,
+            tries_left: entry.tries,
+        })
+        .collect())
+}
+
+pub fn rollback_boot_environment(esp: &Path, id: Option<&str>) -> Result<String> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
+    let (policy, entries) = inventory(&esp)?;
+    let policy = policy.context("no CPS boot environments registered")?;
+    let target = if let Some(id) = id {
+        find_known_good(&entries, id)?
+    } else {
+        let current = policy
+            .selected(&entries)
+            .context("no configured default CPS boot environment")?;
+        if let Some(parent) = &current.parent {
+            find_known_good(&entries, parent)?
+        } else {
+            // Entries made before CPS recorded their parent were activated
+            // from the newest known-good image at the time.
+            entries
+                .iter()
+                .find(|entry| entry.tries.is_none() && entry.revision < current.revision)
+                .context("no previous known-good boot environment")?
+        }
+    };
+    verify_fallback_artifacts(&esp, &target.id, &target.description)?;
+    LoaderPolicy::pinned(&target.id).write(&esp.join("loader/loader.conf"))?;
+    Ok(target.id.clone())
+}
+
+fn find_known_good<'a>(entries: &'a [BootEntry], id: &str) -> Result<&'a BootEntry> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .with_context(|| format!("unknown boot environment {id}"))?;
+    ensure!(
+        entry.tries.is_none(),
+        "boot environment {id} is not known-good"
+    );
+    Ok(entry)
+}
+
+fn lock_esp(esp: &Path, operation: FlockOperation) -> Result<File> {
+    ensure!(
+        esp != Path::new("/"),
+        "specify a dedicated EFI system partition"
+    );
+    let file = File::open(esp)?;
+    ensure!(
+        file.metadata()?.is_dir(),
+        "expected an EFI system partition directory"
+    );
+    flock(&file, operation)?;
+    Ok(file)
+}
 
 pub struct Activation {
     pub root_partuuid: String,
@@ -61,7 +144,7 @@ pub fn activate_boot_environment(
             );
             let parent_id =
                 canonical_partuuid(&parent.id).context("invalid base image identity")?;
-            Some((entry_id(&parent_id, parent.revision), parent.revision))
+            Some(entry_id(&parent_id, parent.revision))
         }
         (true, Some(_)) => bail!("a staged environment must be activated as a counted trial"),
         (false, None) => {
@@ -89,34 +172,22 @@ pub fn activate_boot_environment(
             .context("opening the environment initramfs")?;
         (kernel, initrd)
     };
-    let esp_dir = File::open(&esp)?;
-    ensure!(
-        esp_dir.metadata()?.is_dir(),
-        "expected an EFI system partition directory"
-    );
-    flock(&esp_dir, FlockOperation::LockExclusive)?;
-
+    let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let loader = ensure_dir(&esp, "loader")?;
     let entries = ensure_dir(&loader, "entries")?;
-    let existing = boot_entries(&entries)?;
+    let (policy, existing) = inventory(&esp)?;
     let existing_entry = existing.iter().find(|entry| entry.id == id);
     let config_path = loader.join("loader.conf");
-    if let Some(config) = read_regular(&config_path)? {
-        ensure!(
-            config == LOADER_CONFIG,
-            "EFI partition loader.conf differs from the CPS boot policy"
-        );
-    } else {
-        ensure!(
-            fallback.is_none() && existing.is_empty(),
-            "missing CPS loader.conf"
-        );
-    }
 
     let description = Entry {
         id: &id,
         revision: settings.revision,
         partuuid: &partuuid,
+        parent: if existing_entry.is_some_and(|entry| entry.parent.is_none()) {
+            None // Keep activation retries compatible with previously registered entries.
+        } else {
+            fallback.as_deref()
+        },
         options: &activation.options,
         initrd: initrd.is_some(),
         kernel_release: managed
@@ -130,51 +201,43 @@ pub fn activate_boot_environment(
             "boot attempts are exhausted; stage a new environment"
         );
         ensure!(
-            read_regular(&entry.path)?.as_deref() == Some(description.as_bytes()),
+            entry.description == description,
             "this environment already has a different boot entry"
         );
-    } else if let Some((fallback, base_revision)) = &fallback {
+    }
+    let select_trial = fallback.is_some()
+        && existing_entry.is_none_or(|entry| entry.tries.is_some())
+        && !policy
+            .as_ref()
+            .and_then(|policy| policy.selected(&existing))
+            .is_some_and(|entry| entry.id == id);
+    if let Some(fallback) = fallback.as_deref().filter(|_| select_trial) {
+        let base = find_known_good(&existing, fallback)
+            .context("the base must have a known-good boot entry")?;
         ensure!(
-            existing
-                .iter()
-                .any(|entry| &entry.id == fallback && entry.tries.is_none()),
-            "the base environment must have a known-good boot entry: {fallback}"
+            policy
+                .as_ref()
+                .and_then(|policy| policy.selected(&existing))
+                .is_some_and(|entry| entry.id == fallback),
+            "select the known-good base environment {fallback} before activating its upgrade"
         );
-        for entry in &existing {
-            ensure!(
-                entry.tries.is_none_or(|tries| tries == 0),
-                "another boot trial is still pending: {}",
-                entry.id
-            );
-            if entry.tries.is_none() && &entry.id != fallback {
-                ensure!(
-                    entry.revision < *base_revision,
-                    "the base is not the newest known-good environment"
-                );
-            }
-            let bytes = read_regular(&entry.path)?.context("boot entry disappeared")?;
-            let config = std::str::from_utf8(&bytes)?;
-            if &entry.id == fallback {
-                verify_fallback_artifacts(&esp, fallback, config)?;
-            }
-            let root = config
-                .lines()
-                .find_map(|line| line.strip_prefix("options "))
-                .and_then(|options| {
-                    options
-                        .split_ascii_whitespace()
-                        .find_map(|arg| arg.strip_prefix("root=PARTUUID="))
-                })
-                .context("CPS boot entry is missing its root PARTUUID")?;
-            ensure!(
-                !root.eq_ignore_ascii_case(&partuuid),
-                "each environment requires a distinct root PARTUUID"
-            );
-        }
-    } else {
+        verify_fallback_artifacts(&esp, fallback, &base.description)?;
+        ensure!(
+            !existing
+                .iter()
+                .any(|entry| entry.id != id && entry.partuuid == partuuid),
+            "each environment requires a distinct root PARTUUID"
+        );
+    } else if existing_entry.is_none() {
         ensure!(
             existing.is_empty(),
             "--known-good is only used to bootstrap the first environment"
+        );
+        ensure!(
+            policy
+                .as_ref()
+                .is_none_or(|policy| *policy == LoaderPolicy::Automatic),
+            "EFI partition is already configured for another boot environment"
         );
     }
 
@@ -189,16 +252,22 @@ pub fn activate_boot_environment(
         File::open(&entries)?.sync_all()?;
     } else {
         if fallback.is_none() {
-            install(&config_path, io::Cursor::new(LOADER_CONFIG))?;
+            LoaderPolicy::Automatic.write(&config_path)?;
         }
         let file = match fallback {
             None => format!("{id}.conf"),
             Some(_) => format!("{id}+{}.conf", activation.tries),
         };
-        // Publishing the entry is the activation boundary. All paths named
-        // by the entry are already durable, as is the known-good fallback.
         install(&entries.join(file), io::Cursor::new(description.as_bytes()))?;
     }
+    if let Some(fallback) = fallback
+        .as_deref()
+        .filter(|_| select_trial && policy != Some(LoaderPolicy::Automatic))
+    {
+        // The counted entry and its files are durable before selection.
+        LoaderPolicy::trial(fallback, &id).write(&config_path)?;
+    }
+
     Ok(id)
 }
 
@@ -207,6 +276,7 @@ struct Entry<'a> {
     revision: u64,
     partuuid: &'a str,
     options: &'a str,
+    parent: Option<&'a str>,
     initrd: bool,
     kernel_release: Option<&'a str>,
 }
@@ -218,6 +288,7 @@ impl Entry<'_> {
             revision,
             partuuid,
             options,
+            parent,
             initrd,
             kernel_release,
         } = self;
@@ -228,6 +299,9 @@ impl Entry<'_> {
         let mut entry = format!(
             "title {title}\nsort-key cps\nversion {revision}\nlinux /EFI/cps/{id}/vmlinuz.efi\n"
         );
+        if let Some(parent) = parent {
+            entry.push_str(&format!("# cps-parent {parent}\n"));
+        }
         if *initrd {
             entry.push_str(&format!("initrd /EFI/cps/{id}/initramfs.img\n"));
         }
@@ -236,60 +310,6 @@ impl Entry<'_> {
         ));
         entry
     }
-}
-
-struct BootEntry {
-    path: PathBuf,
-    id: String,
-    revision: u64,
-    tries: Option<u32>,
-}
-
-fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let file = entry.file_name();
-        let Some(name) = file.to_str().and_then(|s| s.strip_suffix(".conf")) else {
-            continue;
-        };
-        ensure!(
-            name.starts_with("cps-"),
-            "the EFI partition has a non-CPS boot entry: {name}"
-        );
-        ensure!(entry.file_type()?.is_file(), "invalid CPS entry {name}");
-        let (id, tries) = match name.split_once('+') {
-            None => (name, None),
-            Some((id, count)) => {
-                let left = if let Some((left, done)) = count.split_once('-') {
-                    done.parse::<u32>().context("invalid boot attempts done")?;
-                    left
-                } else {
-                    count
-                };
-                (
-                    id,
-                    Some(left.parse::<u32>().context("invalid boot attempts left")?),
-                )
-            }
-        };
-        let (image, revision) = id
-            .strip_prefix("cps-")
-            .and_then(|id| id.rsplit_once('-'))
-            .context("invalid CPS entry ID")?;
-        canonical_partuuid(image).context("invalid image UUID in CPS entry")?;
-        ensure!(
-            !entries.iter().any(|entry: &BootEntry| entry.id == id),
-            "duplicate CPS entry {id}"
-        );
-        entries.push(BootEntry {
-            path: entry.path(),
-            id: id.to_owned(),
-            revision: revision.parse()?,
-            tries,
-        });
-    }
-    Ok(entries)
 }
 
 fn verify_fallback_artifacts(esp: &Path, id: &str, entry: &str) -> Result<()> {

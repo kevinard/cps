@@ -4,8 +4,8 @@ set -euo pipefail
 
 mode=${1:-fallback}
 case $mode in
-    fallback|bless|health-fail|kernel-upgrade) ;;
-    *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade]" >&2; exit 2 ;;
+    fallback|bless|health-fail|kernel-upgrade|rollback) ;;
+    *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade|rollback]" >&2; exit 2 ;;
 esac
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
@@ -27,8 +27,8 @@ for file in "$cps" "$efi" "$kernel" "$busybox" "$code" "$vars"; do
 done
 
 systemd_guest=false
-if [[ $mode == bless || $mode == health-fail ]]; then systemd_guest=true; fi
-if [[ $mode == kernel-upgrade ]]; then
+if [[ $mode == bless || $mode == health-fail || $mode == rollback ]]; then systemd_guest=true; fi
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
     trial_kernel=${CPS_VM_TRIAL_KERNEL:?Set CPS_VM_TRIAL_KERNEL to the second kernel}
     trial_release=${CPS_VM_TRIAL_KERNEL_RELEASE:?Set CPS_VM_TRIAL_KERNEL_RELEASE to its uname -r value}
@@ -52,7 +52,7 @@ if $systemd_guest; then
     options='rw console=ttyS0 loglevel=3 init=/init systemd.log_target=console'
     root_mib=128
 fi
-if [[ $mode == kernel-upgrade ]]; then root_mib=128; fi
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then root_mib=128; fi
 mkdir -p esp/EFI/BOOT proto/etc
 cp "$efi" esp/EFI/BOOT/BOOTX64.EFI
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
@@ -90,7 +90,7 @@ MANIFEST
 
 publish_state 1.0.0-0 previous
 packages=(test/boot-state)
-if [[ $mode == kernel-upgrade ]]; then
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     publish_kernel 1.0.0-0 "$base_release" "$kernel"
     packages+=(system/kernel)
 fi
@@ -114,7 +114,7 @@ CONFIG
 "$cps" apply --root base install.json
 
 mkdir -p base/{boot,bin,dev}
-if [[ $mode == kernel-upgrade ]]; then
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     touch base/etc/cps-vm-assert-kernel
 else
     cp "$kernel" base/boot/vmlinuz
@@ -123,6 +123,9 @@ cp -L "$busybox" base/bin/busybox
 copy_runtime_deps base "$busybox"
 if $systemd_guest; then
     setup_systemd_guest base
+    if [[ $mode == rollback ]]; then
+        prepare_fat_modules base "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
+    fi
 else
     cat > base/init <<'GUEST'
 #!/bin/busybox sh
@@ -145,9 +148,13 @@ base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_uuid" --options "$options")
 base_id=${base_id#Activated }
 test -f "esp/loader/entries/$base_id.conf"
+if [[ $mode == rollback ]]; then
+    # A new upgrade should still be testable from an explicitly selected base.
+    "$cps" boot-env rollback --esp esp "$base_id"
+fi
 
 publish_state 2.0.0-0 trial
-if [[ $mode == kernel-upgrade ]]; then
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     publish_kernel 2.0.0-0 "$trial_release" "$trial_kernel"
 fi
 "$cps" plan --root base --output update.json update | tee update.log
@@ -161,7 +168,7 @@ test "$(cat staged/etc/cps-vm-state)" = trial
 "$cps" verify --root base
 "$cps" verify --root staged
 
-if [[ $mode == kernel-upgrade ]]; then
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     grep -Fq "Prepare Linux $trial_release with kernel-install" update.log
     cmp "$kernel" "base/usr/lib/modules/$base_release/vmlinuz"
     test ! -e "staged/usr/lib/modules/$base_release/vmlinuz"
@@ -208,11 +215,21 @@ test -f "esp/loader/entries/$trial_id+2.conf"
 test ! -e "esp/loader/entries/$trial_id+9.conf"
 cmp "esp-before/loader/entries/$base_id.conf" "esp/loader/entries/$base_id.conf"
 
-if [[ $mode == kernel-upgrade ]]; then
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     cmp "$kernel" "esp/EFI/cps/$base_id/vmlinuz.efi"
     cmp "$trial_kernel" "esp/EFI/cps/$trial_id/vmlinuz.efi"
     cmp "base/usr/lib/modules/$base_release/initrd" "esp/EFI/cps/$base_id/initramfs.img"
     cmp "staged/usr/lib/modules/$trial_release/initrd" "esp/EFI/cps/$trial_id/initramfs.img"
+fi
+
+if [[ $mode == rollback ]]; then
+    cp esp/loader/loader.conf config-before-rejected-rollback
+    if "$cps" boot-env rollback --esp esp "$trial_id" 2> rejected.log; then
+        echo 'Rollback accepted an unblessed trial' >&2
+        exit 1
+    fi
+    grep -q 'is not known-good' rejected.log
+    cmp config-before-rejected-rollback esp/loader/loader.conf
 fi
 
 if [[ $mode == health-fail ]]; then
@@ -247,18 +264,22 @@ cp "$vars" vars.fd
 
 args=()
 if [[ -n $qemu_data ]]; then args+=(-L "$qemu_data"); fi
-if ! timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${args[@]}" \
-    -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
-    -serial file:serial.log \
-    -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
-    -drive if=pflash,format=raw,unit=1,file=vars.fd \
-    -drive if=virtio,format=raw,file=disk.raw; then
-    test ! -f serial.log || tail -80 serial.log >&2
-    exit 1
-fi
+run_vm() {
+    local log=$1
+    if ! timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${args[@]}" \
+        -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
+        -serial "file:$log" \
+        -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
+        -drive if=pflash,format=raw,unit=1,file=vars.fd \
+        -drive if=virtio,format=raw,file=disk.raw; then
+        test ! -f "$log" || tail -80 "$log" >&2
+        return 1
+    fi
+}
+run_vm serial.log
 
 case $mode in
-    bless) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
+    bless|rollback) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
     health-fail) expected=$'CPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: previous' ;;
     fallback|kernel-upgrade) expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous' ;;
 esac
@@ -268,10 +289,12 @@ if [[ $boots != "$expected" ]]; then
     tail -80 serial.log >&2
     exit 1
 fi
-if [[ $mode == kernel-upgrade ]]; then
+if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     kernels=$(tr -d '\r' < serial.log | grep '^CPS_VM_KERNEL: ' || :)
-    expected_kernels=$(printf 'CPS_VM_KERNEL: trial %s\nCPS_VM_KERNEL: trial %s\nCPS_VM_KERNEL: previous %s\n' \
-        "$trial_release" "$trial_release" "$base_release")
+    expected_kernels=$(printf 'CPS_VM_KERNEL: trial %s\nCPS_VM_KERNEL: trial %s' "$trial_release" "$trial_release")
+    if [[ $mode == kernel-upgrade ]]; then
+        expected_kernels+=$'\n'"CPS_VM_KERNEL: previous $base_release"
+    fi
     if [[ $kernels != "$expected_kernels" ]]; then
         printf 'Unexpected root and kernel pairs:\n%s\n' "$kernels" >&2
         exit 1
@@ -280,7 +303,7 @@ if [[ $mode == kernel-upgrade ]]; then
 fi
 mcopy -i disk.raw@@1048576 "::/loader/entries/$base_id.conf" previous.conf
 cmp "esp/loader/entries/$base_id.conf" previous.conf
-if [[ $mode == bless ]]; then
+if [[ $mode == bless || $mode == rollback ]]; then
     mcopy -i disk.raw@@1048576 "::/loader/entries/$trial_id.conf" blessed.conf
     cmp "esp/loader/entries/$trial_id+2.conf" blessed.conf
     listing=$(mdir -b -i disk.raw@@1048576 ::/loader/entries)
@@ -289,6 +312,34 @@ if [[ $mode == bless ]]; then
         exit 1
     fi
     printf '%s\nVerified systemd-boot blessed %s.conf\n' "$boots" "$trial_id"
+    if [[ $mode == rollback ]]; then
+        # Bring the VM's blessed entry back into the offline ESP directory.
+        rm "esp/loader/entries/$trial_id+2.conf"
+        cp blessed.conf "esp/loader/entries/$trial_id.conf"
+        "$cps" boot-env list --esp esp | tee before-rollback.log
+        assert_default() {
+            awk -F '\t' -v id="$1" -v part="$2" -v release="$3" \
+                '$1 == "*" && $2 == "known-good" && $3 == id && $4 == part && index($5, release) {found=1} END {exit !found}' "$4"
+        }
+        assert_default "$trial_id" "$trial_uuid" "$trial_release" before-rollback.log
+        result=$("$cps" boot-env rollback --esp esp)
+        test "$result" = "Selected $base_id for the next boot"
+        "$cps" boot-env list --esp esp | tee after-rollback.log
+        assert_default "$base_id" "$base_uuid" "$base_release" after-rollback.log
+        grep -Fq "$trial_id" after-rollback.log
+        cmp blessed.conf "esp/loader/entries/$trial_id.conf"
+        cmp previous.conf "esp/loader/entries/$base_id.conf"
+        mcopy -o -i disk.raw@@1048576 esp/loader/loader.conf ::/loader/loader.conf
+        run_vm rollback.log
+        rollback_boots=$(tr -d '\r' < rollback.log | grep '^CPS_VM_BOOT: ' || :)
+        rollback_kernels=$(tr -d '\r' < rollback.log | grep '^CPS_VM_KERNEL: ' || :)
+        if [[ $rollback_boots != 'CPS_VM_BOOT: previous' || $rollback_kernels != "CPS_VM_KERNEL: previous $base_release" ]]; then
+            printf 'Unexpected rollback boot:\n%s\n%s\n' "$rollback_boots" "$rollback_kernels" >&2
+            tail -80 rollback.log >&2
+            exit 1
+        fi
+        printf '%s\n%s\n' "$rollback_boots" "$rollback_kernels"
+    fi
     exit 0
 fi
 

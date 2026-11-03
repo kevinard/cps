@@ -9,8 +9,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::{
-    Activation, ImageConfig, Plan, Request, activate_boot_environment, apply, create_image, plan,
-    publish, read_image_config, stage_boot_environment, verify,
+    Activation, ImageConfig, Plan, Request, activate_boot_environment, apply, create_image,
+    list_boot_environments, plan, publish, read_image_config, rollback_boot_environment,
+    stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -69,7 +70,7 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
     },
-    /// Stage and activate systemd-boot environments
+    /// Manage systemd-boot environments
     BootEnv {
         #[command(subcommand)]
         command: BootCommand,
@@ -89,6 +90,18 @@ enum PlanCommand {
 
 #[derive(Subcommand)]
 enum BootCommand {
+    /// List registered boot environments and the configured default
+    List {
+        #[arg(long)]
+        esp: PathBuf,
+    },
+    /// Select a known-good environment for the next boot
+    Rollback {
+        #[arg(long)]
+        esp: PathBuf,
+        /// Environment ID. Defaults to the previous known-good environment.
+        id: Option<String>,
+    },
     /// Clone the base image and apply a saved update in a new directory
     Stage {
         #[arg(long)]
@@ -226,6 +239,30 @@ fn run(command: Command) -> Result<ExitCode> {
             println!("Image verified");
         }
         Command::BootEnv { command } => match command {
+            BootCommand::List { esp } => {
+                let environments = list_boot_environments(&esp)?;
+                if environments.is_empty() {
+                    println!("No boot environments registered");
+                } else {
+                    println!("DEFAULT\tSTATUS\tID\tROOT PARTUUID\tTITLE");
+                    for environment in environments {
+                        let marker = if environment.is_default { "*" } else { "-" };
+                        let status = match environment.tries_left {
+                            None => "known-good".to_owned(),
+                            Some(0) => "exhausted".to_owned(),
+                            Some(tries) => format!("trial ({tries} left)"),
+                        };
+                        println!(
+                            "{marker}\t{status}\t{}\t{}\t{}",
+                            environment.id, environment.root_partuuid, environment.title
+                        );
+                    }
+                }
+            }
+            BootCommand::Rollback { esp, id } => {
+                let id = rollback_boot_environment(&esp, id.as_deref())?;
+                println!("Selected {id} for the next boot");
+            }
             BootCommand::Stage { source, root, plan } => {
                 let id = stage_boot_environment(&source, &root, &load_plan(&plan)?)?;
                 println!("Staged {id} at {}", root.display());

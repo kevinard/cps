@@ -12,10 +12,35 @@ copy_runtime_deps() {
     done < <(awk '/=> \// { print $3 } /^[[:space:]]*\// { print $1 }' <<< "$links")
 }
 
+prepare_fat_modules() {
+    local root=$1 release=$2 source=$3
+    local dir="$root/vm-modules/$release"
+    mkdir -p "$dir"
+    : > "$dir/load"
+    if [[ ${CPS_VM_FAT_BUILTIN:-0} == 1 ]]; then return; fi
+    local dependencies command module name
+    dependencies=$(
+        modprobe --show-depends --dirname "$source" --set-version "$release" vfat
+        modprobe --show-depends --dirname "$source" --set-version "$release" nls_iso8859-1
+    )
+    while read -r command module _; do
+        [[ $command == insmod ]] || continue
+        name=${module##*/}
+        name=${name%%.ko*}.ko
+        case $module in
+            *.zst) zstdcat "$module" > "$dir/$name" ;;
+            *.xz) xzcat "$module" > "$dir/$name" ;;
+            *.gz) zcat "$module" > "$dir/$name" ;;
+            *) cp "$module" "$dir/$name" ;;
+        esac
+        printf '/vm-modules/%s/%s\n' "$release" "$name" >> "$dir/load"
+    done <<< "$dependencies"
+}
+
 setup_systemd_guest() {
     local root=$1
     local systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
-    local binary unit module command
+    local binary unit command
     mkdir -p "$root"/{proc,sys,run,tmp,var/tmp,efi,etc/systemd/system,usr/lib/systemd/system-generators,usr/local/libexec,vm-modules}
     local programs=(systemd systemd-bless-boot system-generators/systemd-bless-boot-generator)
     if [[ -x "$systemd/systemd-executor" ]]; then programs+=(systemd-executor); fi
@@ -43,24 +68,7 @@ setup_systemd_guest() {
     printf '[Manager]\nDefaultStandardOutput=tty\nDefaultStandardError=inherit\n' > \
         "$root/etc/systemd/system.conf.d/vm-console.conf"
 
-    : > "$root/vm-modules/load"
-    if [[ ${CPS_VM_FAT_BUILTIN:-0} != 1 ]]; then
-        local release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
-        local dependencies
-        dependencies=$(modprobe --show-depends --set-version "$release" vfat nls_iso8859-1)
-        while read -r command module _; do
-            [[ $command == insmod ]] || continue
-            local name=${module##*/}
-            name=${name%%.ko*}.ko
-            case $module in
-                *.zst) zstdcat "$module" > "$root/vm-modules/$name" ;;
-                *.xz) xzcat "$module" > "$root/vm-modules/$name" ;;
-                *.gz) zcat "$module" > "$root/vm-modules/$name" ;;
-                *) cp "$module" "$root/vm-modules/$name" ;;
-            esac
-            printf '/vm-modules/%s\n' "$name" >> "$root/vm-modules/load"
-        done <<< "$dependencies"
-    fi
+    prepare_fat_modules "$root" "${CPS_VM_KERNEL_RELEASE:-$(uname -r)}" "${CPS_VM_KERNEL_MODULES_ROOT:-/}"
 
     cat > "$root/init" <<'GUEST'
 #!/bin/busybox sh
@@ -72,7 +80,8 @@ mount=/usr/bin/mount
 "$mount" -t cgroup2 cgroup2 /sys/fs/cgroup
 "$mount" -t efivarfs efivarfs /sys/firmware/efi/efivars
 "$mount" -t tmpfs tmpfs /run
-while read -r module; do /usr/bin/insmod "$module"; done < /vm-modules/load
+release=$(/bin/busybox uname -r)
+while read -r module; do /usr/bin/insmod "$module"; done < "/vm-modules/$release/load"
 "$mount" -t vfat /dev/vda1 /efi
 for entry in /efi/loader/entries/cps-*+*.conf; do
     if [ -f "$entry" ]; then : > /run/cps-vm-counted; fi
@@ -103,6 +112,9 @@ UNIT
 set -e
 bb=/bin/busybox
 state=$("$bb" cat /etc/cps-vm-state)
+if [ -f /etc/cps-vm-assert-kernel ]; then
+    printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$("$bb" uname -r)"
+fi
 if [ "$state" = previous ]; then
     printf 'CPS_VM_BOOT: previous\n'
 elif [ -f /run/cps-vm-counted ]; then
