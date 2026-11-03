@@ -1,0 +1,13 @@
+[Unit]
+Description=Verify the Canopa image before blessing the boot
+Requires=local-fs.target multi-user.target
+After=local-fs.target multi-user.target
+Before=boot-complete.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cps verify --root /
+
+[Install]
+RequiredBy=boot-complete.target

@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::{
-    Activation, Plan, Request, activate_boot_environment, apply, create_image, plan, publish,
-    stage_boot_environment, verify,
+    Activation, ImageConfig, Plan, Request, activate_boot_environment, apply, create_image, plan,
+    publish, read_image_config, stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -36,14 +36,16 @@ enum Command {
     ImageCreate {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_key", "arch", "facet"])]
+        config: Option<PathBuf>,
+        #[arg(long, required_unless_present = "config")]
+        repo: Option<PathBuf>,
+        #[arg(long, required_unless_present = "config")]
+        publisher: Option<String>,
+        #[arg(long, required_unless_present = "config")]
+        trust_key: Option<PathBuf>,
         #[arg(long)]
-        repo: PathBuf,
-        #[arg(long)]
-        publisher: String,
-        #[arg(long)]
-        trust_key: PathBuf,
-        #[arg(long, default_value = std::env::consts::ARCH)]
-        arch: String,
+        arch: Option<String>,
         #[arg(long, value_name = "NAME=BOOL")]
         facet: Vec<String>,
     },
@@ -165,19 +167,30 @@ fn run(command: Command) -> Result<ExitCode> {
         }
         Command::ImageCreate {
             root,
+            config,
             repo,
             publisher,
             trust_key,
             arch,
             facet,
         } => {
+            let config = match config {
+                Some(path) => read_image_config(&path)?,
+                None => ImageConfig {
+                    repository: repo.context("missing repository")?,
+                    publisher: publisher.context("missing publisher")?,
+                    trust_key: trust_key.context("missing trust key")?,
+                    arch: arch.unwrap_or_else(|| std::env::consts::ARCH.to_owned()),
+                    facets: parse_facets(facet)?,
+                },
+            };
             let id = create_image(
                 &root,
-                &repo,
-                &publisher,
-                &trust_key,
-                &arch,
-                parse_facets(facet)?,
+                &config.repository,
+                &config.publisher,
+                &config.trust_key,
+                &config.arch,
+                config.facets,
             )?;
             println!("Created image {id} at {}", root.display());
         }

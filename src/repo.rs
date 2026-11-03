@@ -13,6 +13,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     image::root::Root,
+    kdl_format::{manifest_text, parse_manifest},
     model::{Action, FORMAT, Manifest, Node, digest, validate_digest},
 };
 
@@ -36,6 +37,51 @@ struct SignedCatalog {
 pub struct Published {
     pub sha256: String,
     pub manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document: Option<String>,
+}
+
+impl Published {
+    pub fn verify(&self) -> Result<()> {
+        self.manifest.validate(true)?;
+        let bytes = if let Some(document) = &self.document {
+            ensure!(
+                parse_manifest(document)? == self.manifest,
+                "stored manifest does not match its KDL document"
+            );
+            document.as_bytes().to_vec()
+        } else {
+            // Existing images and catalogs contain canonical JSON manifests.
+            serde_json::to_vec(&self.manifest)?
+        };
+        ensure!(
+            digest(&bytes) == self.sha256,
+            "installed manifest digest mismatch for {}",
+            self.manifest.id()
+        );
+        Ok(())
+    }
+}
+
+fn load_manifest(repo: &Path, sha256: String) -> Result<Published> {
+    let bytes = read_object(repo, "manifests", &sha256)?;
+    let (manifest, document) = if bytes.starts_with(b"{") {
+        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        ensure!(
+            serde_json::to_vec(&manifest)? == bytes,
+            "noncanonical legacy manifest {sha256}"
+        );
+        (manifest, None)
+    } else {
+        let document = String::from_utf8(bytes)?;
+        (parse_manifest(&document)?, Some(document))
+    };
+    manifest.validate(true)?;
+    Ok(Published {
+        sha256,
+        manifest,
+        document,
+    })
 }
 
 pub struct Snapshot {
@@ -105,18 +151,12 @@ pub fn snapshot(
     let catalog = read_catalog(repo, &hash, publisher, key)?;
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {
-        let bytes = read_object(repo, "manifests", &sha256)?;
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        let package = load_manifest(repo, sha256)?;
         ensure!(
-            serde_json::to_vec(&manifest)? == bytes,
-            "noncanonical manifest {id}"
-        );
-        manifest.validate(true)?;
-        ensure!(
-            manifest.id() == id && manifest.publisher == publisher,
+            package.manifest.id() == id && package.manifest.publisher == publisher,
             "manifest identity mismatch for {id}"
         );
-        packages.push(Published { sha256, manifest });
+        packages.push(package);
     }
     Ok(Snapshot {
         sha256: hash,
@@ -155,7 +195,7 @@ fn store(repo: &Path, kind: &str, bytes: &[u8]) -> Result<String> {
 pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<String> {
     let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&fs::read(key)?)
         .map_err(|e| anyhow::anyhow!("invalid Ed25519 PKCS#8 signing key: {e}"))?;
-    let mut manifest: Manifest = toml::from_str(&fs::read_to_string(recipe)?)
+    let mut manifest = parse_manifest(&fs::read_to_string(recipe)?)
         .with_context(|| format!("parsing {}", recipe.display()))?;
     manifest.validate(false)?;
     let proto = Root::open(proto)?;
@@ -197,14 +237,15 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
     }
     manifest.validate(true)?;
     let id = manifest.id();
-    let sha256 = store(repo, "manifests", &serde_json::to_vec(&manifest)?)?;
     if let Some(existing) = catalog.entries.get(&id) {
+        let previous = load_manifest(repo, existing.clone())?;
         ensure!(
-            *existing == sha256,
+            previous.manifest == manifest,
             "{id} was already published with different content"
         );
         return Ok(id);
     }
+    let sha256 = store(repo, "manifests", manifest_text(&manifest).as_bytes())?;
     catalog.entries.insert(id.clone(), sha256);
     let signature = hex::encode(key.sign(&serde_json::to_vec(&catalog)?).as_ref());
     let signed = SignedCatalog { catalog, signature };
@@ -228,4 +269,23 @@ pub fn read_blob(repo: &Path, node: &Node) -> Result<Vec<u8>> {
 
 pub fn canonical_repo(repo: &Path) -> Result<PathBuf> {
     fs::canonicalize(repo).with_context(|| format!("opening repository {}", repo.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_json_manifest_keeps_its_digest() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir(repo.path().join("manifests"))?;
+        let bytes = br#"{"format":1,"publisher":"canopa","name":"test/legacy","version":"1.0.0-0","dependency":[],"action":[]}"#;
+        let hash = store(repo.path(), "manifests", bytes)?;
+        let manifest = load_manifest(repo.path(), hash.clone())?;
+        assert_eq!(manifest.sha256, hash);
+        assert!(manifest.document.is_none());
+        // The old installed record has no KDL document and verifies offline.
+        let manifest: Published = serde_json::from_slice(&serde_json::to_vec(&manifest)?)?;
+        manifest.verify()
+    }
 }

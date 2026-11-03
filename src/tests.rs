@@ -55,7 +55,7 @@ impl Fixture {
         Ok(Self {
             repo: path.join("repo"),
             root: path.join("image"),
-            recipe: path.join("manifest.toml"),
+            recipe: path.join("manifest.kdl"),
             proto,
             private,
             public,
@@ -63,12 +63,9 @@ impl Fixture {
         })
     }
 
-    fn package(&self, name: &str, version: &str, mut manifest: String) -> Result<()> {
-        manifest.insert_str(
-            0,
-            &format!(
-                "format = 1\npublisher = \"canopa\"\nname = {name:?}\nversion = {version:?}\n"
-            ),
+    fn package(&self, name: &str, version: &str, actions: String) -> Result<()> {
+        let manifest = format!(
+            "schema-version 1\npackage {name:?} publisher=\"canopa\" version={version:?} {{\n{actions}}}\n"
         );
         fs::write(&self.recipe, manifest)?;
         publish(&self.repo, &self.proto, &self.recipe, &self.private)?;
@@ -82,7 +79,7 @@ impl Fixture {
         let uid = geteuid().as_raw();
         let gid = getegid().as_raw();
         Ok(format!(
-            "\n[[action]]\nkind = \"file\"\npath = {path:?}\nmode = {mode:?}\nuid = {uid}\ngid = {gid}\n{extra}\n"
+            "    file {path:?} mode={mode:?} uid={uid} gid={gid} {extra}\n"
         ))
     }
 
@@ -100,7 +97,7 @@ impl Fixture {
 }
 
 fn dependency(kind: &str, name: &str, version: &str) -> String {
-    format!("\n[[dependency]]\nkind = {kind:?}\npackage = {name:?}\nversion = \"={version}\"\n")
+    format!("    {kind} {name:?} version=\"={version}\"\n")
 }
 
 #[test]
@@ -120,8 +117,8 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
     )?;
     let mut compositor = dependency("require", "library/libdisplay", "1.0.0-0");
     compositor += &f.file(COMPOSITOR, "compositor 1", "0755", "")?;
-    compositor += &f.file(CONFIG, "vendor config 1", "0644", "preserve = true")?;
-    compositor += &f.file(MANPAGE, "manpage 1", "0644", "facet = \"doc.man\"")?;
+    compositor += &f.file(CONFIG, "vendor config 1", "0644", "preserve=#true")?;
+    compositor += &f.file(MANPAGE, "manpage 1", "0644", "facet=\"doc.man\"")?;
     f.package("desktop/compositor", "1.0.0-0", compositor)?;
     let mut plugin = dependency("require", "desktop/compositor", "1.0.0-0");
     plugin += &f.file(PLUGIN, "plugin 1", "0644", "")?;
@@ -165,12 +162,12 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
     f.package(
         "desktop/settings",
         "2.0.0-0",
-        f.file(CONFIG, "vendor config 2", "0644", "preserve = true")?,
+        f.file(CONFIG, "vendor config 2", "0644", "preserve=#true")?,
     )?;
     let mut compositor = dependency("require", "library/libdisplay", "2.0.0-0");
     compositor += &dependency("require", "desktop/settings", "2.0.0-0");
     compositor += &f.file(COMPOSITOR, "compositor 2", "0755", "")?;
-    compositor += &f.file(MANPAGE, "manpage 2", "0644", "facet = \"doc.man\"")?;
+    compositor += &f.file(MANPAGE, "manpage 2", "0644", "facet=\"doc.man\"")?;
     f.package("desktop/compositor", "2.0.0-0", compositor)?;
     let mut plugin = dependency("require", "desktop/compositor", "2.0.0-0");
     plugin += &f.file(PLUGIN, "plugin 2", "0644", "")?;

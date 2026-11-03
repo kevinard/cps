@@ -2,7 +2,14 @@
 # Run with a writable temporary directory and local, non-Secure-Boot OVMF firmware.
 set -euo pipefail
 
+mode=${1:-fallback}
+case $mode in
+    fallback|bless|health-fail) ;;
+    *) echo "Usage: $0 [fallback|bless|health-fail]" >&2; exit 2 ;;
+esac
+
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
+source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
@@ -26,6 +33,11 @@ cd -- "$work"
 base_uuid=7adff456-af50-498f-b39a-dcf87cb4a7c1
 trial_uuid=b52060cf-81ab-4b8a-ad84-3aa69000ed49
 options='ro console=ttyS0 loglevel=3 init=/init'
+root_mib=64
+if [[ $mode != fallback ]]; then
+    options='rw console=ttyS0 loglevel=3 init=/init systemd.log_target=console'
+    root_mib=128
+fi
 mkdir -p esp/EFI/BOOT proto/etc
 cp "$efi" esp/EFI/BOOT/BOOTX64.EFI
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
@@ -34,40 +46,44 @@ openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 publish_state() {
     local version=$1 state=$2
     printf '%s\n' "$state" > proto/etc/cps-vm-state
-    cat > manifest.toml <<MANIFEST
-format = 1
-publisher = "canopa"
-name = "test/boot-state"
-version = "$version"
-
-[[action]]
-kind = "file"
-path = "etc/cps-vm-state"
-mode = "0644"
-uid = $(id -u)
-gid = $(id -g)
+    cat > manifest.kdl <<MANIFEST
+schema-version 1
+package "test/boot-state" publisher="canopa" version="$version" {
+    file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
+}
 MANIFEST
-    "$cps" publish --repo repo --proto proto --signing-key private.der manifest.toml
+    "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
 }
 
 publish_state 1.0.0-0 previous
-"$cps" image-create --root base --repo repo --publisher canopa --trust-key public.der
-"$cps" plan --root base --output install.json install test/boot-state
+packages=(test/boot-state)
+if [[ $mode != fallback ]]; then
+    mkdir -p proto/usr/{bin,lib/systemd/system}
+    strip --strip-debug -o proto/usr/bin/cps "$cps"
+    cp "$project/packaging/systemd/cps-boot-health.service" proto/usr/lib/systemd/system/
+    sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/cps.kdl" > cps.kdl
+    "$cps" publish --repo repo --proto proto --signing-key private.der cps.kdl
+    packages+=(system/cps)
+fi
+cat > image.kdl <<'CONFIG'
+schema-version 1
+publisher "canopa" {
+    repository "repo"
+    trust-key "public.der"
+}
+CONFIG
+"$cps" image-create --root base --config image.kdl
+"$cps" plan --root base --output install.json install "${packages[@]}"
 "$cps" apply --root base install.json
 
 mkdir -p base/{boot,bin,dev}
 cp "$kernel" base/boot/vmlinuz
 cp -L "$busybox" base/bin/busybox
-# Support either static BusyBox or a dynamically linked host build.
-links=$(ldd "$busybox" 2>&1 || :)
-if [[ $links == *'not found'* ]]; then
-    printf '%s\n' "$links" >&2
-    exit 1
-fi
-while read -r library; do
-    cp -L --parents "$library" base/
-done < <(awk '/=> \// { print $3 } /^[[:space:]]*\// { print $1 }' <<< "$links")
-cat > base/init <<'GUEST'
+copy_runtime_deps base "$busybox"
+if [[ $mode != fallback ]]; then
+    setup_systemd_guest base
+else
+    cat > base/init <<'GUEST'
 #!/bin/busybox sh
 set -e
 state=$(/bin/busybox cat /etc/cps-vm-state)
@@ -78,7 +94,8 @@ elif [ "$state" = previous ]; then
     /bin/busybox poweroff -f
 fi
 GUEST
-chmod 0755 base/init
+    chmod 0755 base/init
+fi
 
 base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_uuid" --options "$options")
@@ -122,27 +139,34 @@ test -f "esp/loader/entries/$trial_id+2.conf"
 test ! -e "esp/loader/entries/$trial_id+9.conf"
 cmp "esp-before/loader/entries/$base_id.conf" "esp/loader/entries/$base_id.conf"
 
+if [[ $mode == health-fail ]]; then
+    # The guest still identifies this as the trial, but the manifest hash fails.
+    printf 'trial\n\n' > staged/etc/cps-vm-state
+fi
+
 # Pack the two separate roots and the EFI directory into a GPT disk.
 # All construction uses regular files and works without loop devices.
 truncate -s 96M esp.fat
 mkfs.fat -F 32 esp.fat >/dev/null
 mcopy -s -i esp.fat esp/EFI esp/loader ::/
 for tree in base staged; do
-    truncate -s 64M "$tree.ext4"
+    truncate -s "${root_mib}M" "$tree.ext4"
     mkfs.ext4 -q -F -d "$tree" "$tree.ext4"
 done
-truncate -s 226M disk.raw
+base_mib=97
+trial_mib=$((base_mib + root_mib))
+truncate -s "$((trial_mib + root_mib + 1))M" disk.raw
 sfdisk --quiet disk.raw <<PARTITIONS
 label: gpt
 unit: sectors
 
 start=2048, size=196608, type=uefi
-start=198656, size=131072, type=linux, uuid=$base_uuid
-start=329728, size=131072, type=linux, uuid=$trial_uuid
+start=$((base_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$base_uuid
+start=$((trial_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$trial_uuid
 PARTITIONS
 dd if=esp.fat of=disk.raw bs=1M seek=1 conv=notrunc,sparse status=none
-dd if=base.ext4 of=disk.raw bs=1M seek=97 conv=notrunc,sparse status=none
-dd if=staged.ext4 of=disk.raw bs=1M seek=161 conv=notrunc,sparse status=none
+dd if=base.ext4 of=disk.raw bs=1M seek="$base_mib" conv=notrunc,sparse status=none
+dd if=staged.ext4 of=disk.raw bs=1M seek="$trial_mib" conv=notrunc,sparse status=none
 cp "$vars" vars.fd
 
 args=()
@@ -157,16 +181,37 @@ if ! timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${args[@]}" \
     exit 1
 fi
 
-expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous'
+case $mode in
+    bless) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
+    health-fail) expected=$'CPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: previous' ;;
+    fallback) expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous' ;;
+esac
 boots=$(tr -d '\r' < serial.log | grep '^CPS_VM_BOOT: ' || :)
 if [[ $boots != "$expected" ]]; then
     printf 'Unexpected boot order:\n%s\n' "$boots" >&2
     tail -80 serial.log >&2
     exit 1
 fi
-mcopy -i disk.raw@@1048576 "::/loader/entries/$trial_id+0-2.conf" exhausted.conf
 mcopy -i disk.raw@@1048576 "::/loader/entries/$base_id.conf" previous.conf
 cmp "esp/loader/entries/$base_id.conf" previous.conf
+if [[ $mode == bless ]]; then
+    mcopy -i disk.raw@@1048576 "::/loader/entries/$trial_id.conf" blessed.conf
+    cmp "esp/loader/entries/$trial_id+2.conf" blessed.conf
+    listing=$(mdir -b -i disk.raw@@1048576 ::/loader/entries)
+    if grep -Fq "$trial_id+" <<< "$listing"; then
+        echo "A counted trial entry remains after blessing" >&2
+        exit 1
+    fi
+    printf '%s\nVerified systemd-boot blessed %s.conf\n' "$boots" "$trial_id"
+    exit 0
+fi
+
+mcopy -i disk.raw@@1048576 "::/loader/entries/$trial_id+0-2.conf" exhausted.conf
+if [[ $mode == health-fail ]]; then
+    grep -q 'etc/cps-vm-state: content, type, or metadata differs' serial.log
+    printf '%s\nVerified the health gate blocked blessing and systemd-boot fell back\n' "$boots"
+    exit 0
+fi
 # Reproduce the exhausted ESP state on the host-facing directory and verify
 # that another invocation of activate cannot replenish the boot counter.
 mv "esp/loader/entries/$trial_id+2.conf" "esp/loader/entries/$trial_id+0-2.conf"

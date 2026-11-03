@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 
 use crate::{
     image::Image,
-    model::{Node, digest, validate_path},
+    model::{Node, validate_path},
     plan::{check_dependencies, effective_paths},
 };
 
@@ -24,14 +24,10 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for (name, package) in &state.installed {
         let manifest = &package.published.manifest;
-        manifest.validate(true)?;
+        package.published.verify()?;
         ensure!(
             &manifest.name == name && manifest.publisher == state.publisher.name,
             "invalid installed package identity for {name}"
-        );
-        ensure!(
-            digest(&serde_json::to_vec(manifest)?) == package.published.sha256,
-            "installed manifest digest mismatch for {name}"
         );
     }
     if let Err(error) = check_dependencies(&state.installed) {
