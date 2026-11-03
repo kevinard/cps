@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    boot::kernel::{self, Artifacts},
     image::{Image, Installed, Managed, Settings, State, root::Root},
     model::{FORMAT, Node, digest, validate_name},
     repo::snapshot,
@@ -63,6 +64,8 @@ pub struct Plan {
     pub(crate) writes: Vec<Write>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) systemd: Vec<SystemdAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kernel_install: Option<Artifacts>,
     payload_bytes: u64,
 }
 
@@ -92,6 +95,12 @@ impl Plan {
                 "Offline systemd {} {}",
                 effect.kind(),
                 effect.name()
+            ));
+        }
+        if let Some(artifacts) = &self.kernel_install {
+            lines.push(format!(
+                "Prepare Linux {} with kernel-install",
+                artifacts.kernel.release
             ));
         }
         lines.push(format!("{} payload bytes required", self.payload_bytes));
@@ -217,6 +226,13 @@ pub(crate) fn build(
         .revision
         .checked_add(1)
         .context("image revision exhausted")?;
+    let previous_kernel = kernel::selected(&state.installed, &state.paths)?;
+    let kernel = kernel::selected(&installed, &paths)?;
+    ensure!(
+        previous_kernel.is_none() || kernel.is_some(),
+        "update would remove the image's selected kernel"
+    );
+    let kernel_install = kernel.filter(|selected| Some(selected) != previous_kernel.as_ref());
     let mut plan = Plan {
         format: FORMAT,
         image: state.settings.id.clone(),
@@ -232,6 +248,7 @@ pub(crate) fn build(
         preserved: Vec::new(),
         writes: Vec::new(),
         systemd: systemd::plan_actions(&state, &installed, &paths),
+        kernel_install,
         payload_bytes: 0,
     };
     for (name, package) in &installed {

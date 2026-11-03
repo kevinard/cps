@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
+    boot::kernel::Artifacts,
     image::{Image, State, root::Root},
     model::{Node, digest_reader},
     plan::{Plan, Write, build, payloads},
@@ -24,6 +25,8 @@ struct Pending {
     next: State,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     systemd: Vec<SystemdAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel_install: Option<Artifacts>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     files_ready: bool,
 }
@@ -50,7 +53,10 @@ pub(crate) fn apply_with(
             pending.id == id,
             "a different plan is pending; rerun apply with that plan"
         );
-        let offline = offline_target(&image.root, &pending.systemd)?;
+        let offline = offline_target(
+            &image.root,
+            !pending.systemd.is_empty() || pending.kernel_install.is_some(),
+        )?;
         (pending, offline)
     } else {
         if let Some(revision) = image.applied(&id)? {
@@ -72,13 +78,17 @@ pub(crate) fn apply_with(
             &checked == plan,
             "saved plan differs from the verified plan; generate a new plan"
         );
-        let offline = offline_target(&image.root, &checked.systemd)?;
+        let offline = offline_target(
+            &image.root,
+            !checked.systemd.is_empty() || checked.kernel_install.is_some(),
+        )?;
         prepare(&stage, &checked.writes, &next.publisher.repo)?;
         let pending = Pending {
             id,
             writes: checked.writes,
             next,
             systemd: checked.systemd,
+            kernel_install: checked.kernel_install,
             files_ready: false,
         };
         image.record_pending(&pending)?;
@@ -93,11 +103,16 @@ pub(crate) fn apply_with(
         }
     }
     if let Some(path) = offline {
-        systemd::run(&image.root, &path, &pending.systemd, &pending.next)?;
+        if !pending.systemd.is_empty() {
+            systemd::run(&image.root, &path, &pending.systemd, &pending.next)?;
+        }
+        if let Some(kernel) = &pending.kernel_install {
+            kernel.prepare(&image.root, &path, &pending.next.settings.id)?;
+        }
         for finding in verify_state(&image.root, &pending.next)? {
             ensure!(
                 !finding.is_error,
-                "offline systemd effects left an inconsistent image: {}",
+                "offline actions left an inconsistent image: {}",
                 finding.message
             );
         }
@@ -107,10 +122,8 @@ pub(crate) fn apply_with(
     Ok(revision)
 }
 
-fn offline_target(root: &Root, actions: &[SystemdAction]) -> Result<Option<std::path::PathBuf>> {
-    (!actions.is_empty())
-        .then(|| systemd::offline_path(root))
-        .transpose()
+fn offline_target(root: &Root, needed: bool) -> Result<Option<std::path::PathBuf>> {
+    needed.then(|| systemd::offline_path(root)).transpose()
 }
 
 fn write_files(

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{FlockOperation, flock};
 use tempfile::NamedTempFile;
 
-use super::{check_image_integrity, entry_id};
+use super::{check_image_integrity, entry_id, kernel};
 use crate::{
     image::{Image, root::Root},
     model::digest_reader,
@@ -48,7 +48,8 @@ pub fn activate_boot_environment(
     );
     let image = Image::open(&root, false)?;
     check_image_integrity(&image)?;
-    let settings = image.state()?.settings;
+    let state = image.state()?;
+    let settings = &state.settings;
     let image_id = canonical_partuuid(&settings.id).context("invalid image identity")?;
     let id = entry_id(&image_id, settings.revision);
     let fallback = match (activation.known_good, &settings.boot_parent) {
@@ -68,16 +69,26 @@ pub fn activate_boot_environment(
         }
     };
 
-    let kernel = image
-        .root
-        .file(&activation.kernel)
-        .context("opening the environment kernel")?;
-    let initrd = activation
-        .initrd
-        .as_deref()
-        .map(|path| image.root.file(path))
-        .transpose()
-        .context("opening the environment initramfs")?;
+    let managed = kernel::selected(&state.installed, &state.paths)?;
+    let (kernel, initrd) = if let Some(artifacts) = &managed {
+        ensure!(
+            activation.kernel == "boot/vmlinuz" && activation.initrd.is_none(),
+            "the image uses kernel-install artifacts; omit --kernel and --initrd"
+        );
+        artifacts.open_prepared(&image.root)?
+    } else {
+        let kernel = image
+            .root
+            .file(&activation.kernel)
+            .context("opening the environment kernel")?;
+        let initrd = activation
+            .initrd
+            .as_deref()
+            .map(|path| image.root.file(path))
+            .transpose()
+            .context("opening the environment initramfs")?;
+        (kernel, initrd)
+    };
     let esp_dir = File::open(&esp)?;
     ensure!(
         esp_dir.metadata()?.is_dir(),
@@ -108,6 +119,9 @@ pub fn activate_boot_environment(
         partuuid: &partuuid,
         options: &activation.options,
         initrd: initrd.is_some(),
+        kernel_release: managed
+            .as_ref()
+            .map(|artifacts| artifacts.kernel.release.as_str()),
     }
     .render();
     if let Some(entry) = existing_entry {
@@ -194,6 +208,7 @@ struct Entry<'a> {
     partuuid: &'a str,
     options: &'a str,
     initrd: bool,
+    kernel_release: Option<&'a str>,
 }
 
 impl Entry<'_> {
@@ -204,9 +219,14 @@ impl Entry<'_> {
             partuuid,
             options,
             initrd,
+            kernel_release,
         } = self;
+        let title = match kernel_release {
+            Some(release) => format!("Canopa ({id}, Linux {release})"),
+            None => format!("Canopa ({id})"),
+        };
         let mut entry = format!(
-            "title Canopa ({id})\nsort-key cps\nversion {revision}\nlinux /EFI/cps/{id}/vmlinuz.efi\n"
+            "title {title}\nsort-key cps\nversion {revision}\nlinux /EFI/cps/{id}/vmlinuz.efi\n"
         );
         if *initrd {
             entry.push_str(&format!("initrd /EFI/cps/{id}/initramfs.img\n"));

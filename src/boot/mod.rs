@@ -1,3 +1,4 @@
+pub(crate) mod kernel;
 mod systemd_boot;
 
 use std::{
@@ -74,6 +75,10 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
     apply(staged.path(), plan).context("applying the upgrade in the staged root")?;
     let image = Image::open(staged.path(), true)?;
     check_image_integrity(&image)?;
+    let state = image.state()?;
+    if let Some(kernel) = kernel::selected(&state.installed, &state.paths)? {
+        kernel.open_prepared(&image.root)?;
+    }
     let settings = image.fork_for_boot(previous)?;
     drop(image);
 

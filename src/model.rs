@@ -333,6 +333,8 @@ pub struct Manifest {
     pub action: Vec<Action>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub systemd: Vec<crate::systemd::Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<crate::boot::kernel::Kernel>,
 }
 
 impl Manifest {
@@ -374,25 +376,35 @@ impl Manifest {
                 effect.kind(),
                 effect.name()
             );
-            let path = effect.path();
-            let mut inputs = self
-                .action
-                .iter()
-                .filter(|action| action.path() == path)
-                .peekable();
-            ensure!(
-                inputs.peek().is_some()
-                    && inputs.all(|action| matches!(
-                        action,
-                        Action::File {
-                            preserve: false,
-                            ..
-                        }
-                    )),
-                "{} requires an immutable file action for {path} in the same package",
-                effect.kind()
-            );
+            self.require_immutable_file(&effect.path(), effect.kind())?;
         }
+        if let Some(kernel) = &self.kernel {
+            kernel.validate()?;
+            self.require_immutable_file(&kernel.image(), "kernel-install")?;
+            if let Some(path) = kernel.initrd() {
+                self.require_immutable_file(&path, "kernel-install")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_immutable_file(&self, path: &str, operation: &str) -> Result<()> {
+        let mut inputs = self
+            .action
+            .iter()
+            .filter(|action| action.path() == path)
+            .peekable();
+        ensure!(
+            inputs.peek().is_some()
+                && inputs.all(|action| matches!(
+                    action,
+                    Action::File {
+                        preserve: false,
+                        ..
+                    }
+                )),
+            "{operation} requires an immutable file action for {path} in the same package"
+        );
         Ok(())
     }
 }

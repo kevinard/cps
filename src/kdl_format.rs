@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
 use crate::{
+    boot::kernel::Kernel,
     model::{Action, Dependency, DependencyKind, FORMAT, Manifest},
     systemd::Action as SystemdAction,
 };
@@ -140,6 +141,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         dependency: Vec::new(),
         action: Vec::new(),
         systemd: Vec::new(),
+        kernel: None,
     };
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
@@ -168,6 +170,20 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
                     _ => SystemdAction::Preset(value),
                 };
                 manifest.systemd.push(action);
+            }
+            "kernel-install" => {
+                ensure!(manifest.kernel.is_none(), "duplicate kernel-install node");
+                let fields = Fields::read(node, 1, &["initrd"], false)?;
+                let initrd = fields
+                    .properties
+                    .get("initrd")
+                    .map(|value| value.as_bool().context("initrd must be #true or #false"))
+                    .transpose()?
+                    .unwrap_or(false);
+                manifest.kernel = Some(Kernel {
+                    release: fields.string_arg(0)?,
+                    initrd,
+                });
             }
             _ => bail!("unknown package node {name}"),
         }
@@ -301,6 +317,14 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     for effect in &manifest.systemd {
         let mut node = KdlNode::new(effect.kind());
         node.push(effect.name());
+        children.push(node);
+    }
+    if let Some(kernel) = &manifest.kernel {
+        let mut node = KdlNode::new("kernel-install");
+        node.push(kernel.release.as_str());
+        if kernel.initrd {
+            node.insert("initrd", true);
+        }
         children.push(node);
     }
     doc.nodes_mut().push(package);

@@ -4,8 +4,8 @@ set -euo pipefail
 
 mode=${1:-fallback}
 case $mode in
-    fallback|bless|health-fail) ;;
-    *) echo "Usage: $0 [fallback|bless|health-fail]" >&2; exit 2 ;;
+    fallback|bless|health-fail|kernel-upgrade) ;;
+    *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade]" >&2; exit 2 ;;
 esac
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
@@ -26,6 +26,20 @@ for file in "$cps" "$efi" "$kernel" "$busybox" "$code" "$vars"; do
     test -r "$file" || { echo "Missing input: $file" >&2; exit 1; }
 done
 
+systemd_guest=false
+if [[ $mode == bless || $mode == health-fail ]]; then systemd_guest=true; fi
+if [[ $mode == kernel-upgrade ]]; then
+    base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
+    trial_kernel=${CPS_VM_TRIAL_KERNEL:?Set CPS_VM_TRIAL_KERNEL to the second kernel}
+    trial_release=${CPS_VM_TRIAL_KERNEL_RELEASE:?Set CPS_VM_TRIAL_KERNEL_RELEASE to its uname -r value}
+    kernel=$(realpath -- "$kernel")
+    trial_kernel=$(realpath -- "$trial_kernel")
+    test "$base_release" != "$trial_release"
+    ! cmp -s "$kernel" "$trial_kernel"
+    command -v cpio >/dev/null
+    command -v kernel-install >/dev/null
+fi
+
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
@@ -34,10 +48,11 @@ base_uuid=7adff456-af50-498f-b39a-dcf87cb4a7c1
 trial_uuid=b52060cf-81ab-4b8a-ad84-3aa69000ed49
 options='ro console=ttyS0 loglevel=3 init=/init'
 root_mib=64
-if [[ $mode != fallback ]]; then
+if $systemd_guest; then
     options='rw console=ttyS0 loglevel=3 init=/init systemd.log_target=console'
     root_mib=128
 fi
+if [[ $mode == kernel-upgrade ]]; then root_mib=128; fi
 mkdir -p esp/EFI/BOOT proto/etc
 cp "$efi" esp/EFI/BOOT/BOOTX64.EFI
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
@@ -55,9 +70,31 @@ MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
 }
 
+publish_kernel() {
+    local version=$1 release=$2 binary=$3
+    local modules="usr/lib/modules/$release"
+    mkdir -p "proto/$modules" initrd-tree
+    cp "$binary" "proto/$modules/vmlinuz"
+    printf '%s\n' "$release" > initrd-tree/cps-initrd-release
+    (cd initrd-tree && printf 'cps-initrd-release\n' | cpio --quiet -o -H newc) > "proto/$modules/initrd"
+    cat > kernel.kdl <<MANIFEST
+schema-version 1
+package "system/kernel" publisher="canopa" version="$version" {
+    file "$modules/vmlinuz" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "$modules/initrd" mode="0644" uid=$(id -u) gid=$(id -g)
+    kernel-install "$release" initrd=#true
+}
+MANIFEST
+    "$cps" publish --repo repo --proto proto --signing-key private.der kernel.kdl
+}
+
 publish_state 1.0.0-0 previous
 packages=(test/boot-state)
-if [[ $mode != fallback ]]; then
+if [[ $mode == kernel-upgrade ]]; then
+    publish_kernel 1.0.0-0 "$base_release" "$kernel"
+    packages+=(system/kernel)
+fi
+if $systemd_guest; then
     mkdir -p proto/usr/{bin,lib/systemd/system}
     strip --strip-debug -o proto/usr/bin/cps "$cps"
     cp "$project/packaging/systemd/cps-boot-health.service" proto/usr/lib/systemd/system/
@@ -77,10 +114,14 @@ CONFIG
 "$cps" apply --root base install.json
 
 mkdir -p base/{boot,bin,dev}
-cp "$kernel" base/boot/vmlinuz
+if [[ $mode == kernel-upgrade ]]; then
+    touch base/etc/cps-vm-assert-kernel
+else
+    cp "$kernel" base/boot/vmlinuz
+fi
 cp -L "$busybox" base/bin/busybox
 copy_runtime_deps base "$busybox"
-if [[ $mode != fallback ]]; then
+if $systemd_guest; then
     setup_systemd_guest base
 else
     cat > base/init <<'GUEST'
@@ -88,6 +129,9 @@ else
 set -e
 state=$(/bin/busybox cat /etc/cps-vm-state)
 printf 'CPS_VM_BOOT: %s\n' "$state"
+if [ -f /etc/cps-vm-assert-kernel ]; then
+    printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$(/bin/busybox uname -r)"
+fi
 if [ "$state" = trial ]; then
     /bin/busybox reboot -f
 elif [ "$state" = previous ]; then
@@ -103,7 +147,10 @@ base_id=${base_id#Activated }
 test -f "esp/loader/entries/$base_id.conf"
 
 publish_state 2.0.0-0 trial
-"$cps" plan --root base --output update.json update
+if [[ $mode == kernel-upgrade ]]; then
+    publish_kernel 2.0.0-0 "$trial_release" "$trial_kernel"
+fi
+"$cps" plan --root base --output update.json update | tee update.log
 cp -a esp esp-before
 trial=$("$cps" boot-env stage --source base --root staged update.json)
 trial_id=${trial#Staged }
@@ -113,6 +160,28 @@ test "$(cat base/etc/cps-vm-state)" = previous
 test "$(cat staged/etc/cps-vm-state)" = trial
 "$cps" verify --root base
 "$cps" verify --root staged
+
+if [[ $mode == kernel-upgrade ]]; then
+    grep -Fq "Prepare Linux $trial_release with kernel-install" update.log
+    cmp "$kernel" "base/usr/lib/modules/$base_release/vmlinuz"
+    test ! -e "staged/usr/lib/modules/$base_release/vmlinuz"
+    cmp "$trial_kernel" "staged/usr/lib/modules/$trial_release/vmlinuz"
+    prepared=
+    for file in staged/.cps/kernel-*/linux; do
+        if cmp -s "$file" "$trial_kernel"; then prepared=$file; break; fi
+    done
+    test -n "$prepared"
+    cmp "staged/usr/lib/modules/$trial_release/initrd" "${prepared%/*}/initrd"
+    printf 'corrupt prepared kernel' > "$prepared"
+    if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
+        --options "$options" 2> rejected.log; then
+        echo "Activation accepted a corrupted prepared kernel" >&2
+        exit 1
+    fi
+    grep -q 'kernel artifact digest mismatch' rejected.log
+    cp "$trial_kernel" "$prepared"
+    diff -r esp-before esp
+fi
 
 mv "esp/EFI/cps/$base_id/vmlinuz.efi" saved-kernel
 if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
@@ -138,6 +207,13 @@ diff -r esp-before esp
 test -f "esp/loader/entries/$trial_id+2.conf"
 test ! -e "esp/loader/entries/$trial_id+9.conf"
 cmp "esp-before/loader/entries/$base_id.conf" "esp/loader/entries/$base_id.conf"
+
+if [[ $mode == kernel-upgrade ]]; then
+    cmp "$kernel" "esp/EFI/cps/$base_id/vmlinuz.efi"
+    cmp "$trial_kernel" "esp/EFI/cps/$trial_id/vmlinuz.efi"
+    cmp "base/usr/lib/modules/$base_release/initrd" "esp/EFI/cps/$base_id/initramfs.img"
+    cmp "staged/usr/lib/modules/$trial_release/initrd" "esp/EFI/cps/$trial_id/initramfs.img"
+fi
 
 if [[ $mode == health-fail ]]; then
     # The guest still identifies this as the trial, but the manifest hash fails.
@@ -184,13 +260,23 @@ fi
 case $mode in
     bless) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
     health-fail) expected=$'CPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: previous' ;;
-    fallback) expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous' ;;
+    fallback|kernel-upgrade) expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous' ;;
 esac
 boots=$(tr -d '\r' < serial.log | grep '^CPS_VM_BOOT: ' || :)
 if [[ $boots != "$expected" ]]; then
     printf 'Unexpected boot order:\n%s\n' "$boots" >&2
     tail -80 serial.log >&2
     exit 1
+fi
+if [[ $mode == kernel-upgrade ]]; then
+    kernels=$(tr -d '\r' < serial.log | grep '^CPS_VM_KERNEL: ' || :)
+    expected_kernels=$(printf 'CPS_VM_KERNEL: trial %s\nCPS_VM_KERNEL: trial %s\nCPS_VM_KERNEL: previous %s\n' \
+        "$trial_release" "$trial_release" "$base_release")
+    if [[ $kernels != "$expected_kernels" ]]; then
+        printf 'Unexpected root and kernel pairs:\n%s\n' "$kernels" >&2
+        exit 1
+    fi
+    printf '%s\n' "$kernels"
 fi
 mcopy -i disk.raw@@1048576 "::/loader/entries/$base_id.conf" previous.conf
 cmp "esp/loader/entries/$base_id.conf" previous.conf
