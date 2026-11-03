@@ -47,3 +47,37 @@ To upgrade, publish the revised recipe under a new version and run `cps plan --r
 - The image must be inactive and reside on one filesystem. The prototype rejects directory metadata changes and transitions between a directory and a file or symlink. Directories left behind when their ownership ends are retained.
 
 Run `cargo test` for the desktop upgrade and interruption test.
+
+## Boot environments
+
+Boot environments use separate Linux roots and a dedicated systemd-boot EFI System Partition (ESP). Start with an inactive, single-filesystem base root containing the kernel. GNU `cp` clones the image and uses a reflink where supported. The destination must be a new directory.
+
+```sh
+cps boot-env activate --known-good --root base --esp esp \
+    --root-partuuid "$base_partuuid" --initrd boot/initramfs.img
+cps plan --root base --output upgrade.json update
+cps boot-env stage --source base --root staged upgrade.json
+# Deploy the staged directory to its own GPT root partition before activation.
+cps boot-env activate --root staged --esp esp \
+    --root-partuuid "$staged_partuuid" --initrd boot/initramfs.img
+```
+
+`stage` verifies the new root and gives it a fresh image identity. Activation copies boot files from the selected root and publishes its Boot Loader Specification entry last. Supply the **partition UUID** of each deployed root and the root-relative boot file paths. The kernel path defaults to `boot/vmlinuz`. Omit `--initrd` for a kernel that can mount the root on its own. Use `--options` for additional kernel arguments. Provisioning the partitions and installing systemd-boot on the dedicated ESP are external to these commands.
+
+`--known-good` bootstraps the first entry. Later activations require the previous environment's known-good entry and boot files. A trial gets two attempts by default. On an installed systemd image, `systemd-bless-boot.service` can mark the entry good after boot health checks. If the attempts run out, systemd-boot selects the previous environment. The managed ESP uses its own loader configuration and assumes no EFI default override. [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
+
+### VM fallback test
+
+The [VM test](tests/systemd-boot-vm.sh) builds a GPT disk with two separate ext4 roots and a FAT ESP, then boots it through OVMF and systemd-boot under QEMU. It checks that staging leaves the ESP alone, that a trial root boots twice, and that the previous root boots after exhaustion.
+
+Build with `cargo build`. The test needs `qemu-system-x86_64`, `mkfs.fat`, mtools, `mkfs.ext4`, `sfdisk`, OpenSSL, systemd-boot, and matching non-Secure-Boot x86-64 OVMF code and variables files. Supply an EFI-stub Linux kernel with built-in virtio block, GPT, ext4, and serial console support, plus a compatible BusyBox with `sh`, `cat`, `reboot`, and `poweroff`.
+
+```sh
+CPS_VM_OVMF_CODE=/path/to/OVMF_CODE.fd \
+CPS_VM_OVMF_VARS=/path/to/OVMF_VARS.fd \
+CPS_VM_KERNEL=/path/to/vmlinuz \
+CPS_VM_BUSYBOX=/path/to/busybox \
+tests/systemd-boot-vm.sh
+```
+
+The script defaults to Arch Linux paths for the kernel, BusyBox, and systemd-boot. Set `CPS_VM_SYSTEMD_BOOT` if the EFI binary is elsewhere. It uses regular files and software emulation.

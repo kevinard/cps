@@ -30,6 +30,14 @@ pub struct Settings {
     pub facets: BTreeMap<String, bool>,
     pub uid: u32,
     pub gid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_parent: Option<BootParent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BootParent {
+    pub id: String,
+    pub revision: u64,
 }
 
 impl Settings {
@@ -83,6 +91,24 @@ fn configure(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn new_identity() -> Result<String> {
+    let mut random = [0; 16];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| anyhow::anyhow!("generating image identity"))?;
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    let raw = hex::encode(random);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &raw[..8],
+        &raw[8..12],
+        &raw[12..16],
+        &raw[16..20],
+        &raw[20..]
+    ))
+}
+
 pub fn create_image(
     path: &Path,
     repo: &Path,
@@ -101,21 +127,7 @@ pub fn create_image(
         repo: canonical_repo(repo)?,
         key: read_key(trust_key)?,
     };
-    let mut random = [0; 16];
-    SystemRandom::new()
-        .fill(&mut random)
-        .map_err(|_| anyhow::anyhow!("generating image identity"))?;
-    random[6] = (random[6] & 0x0f) | 0x40;
-    random[8] = (random[8] & 0x3f) | 0x80;
-    let raw = hex::encode(random);
-    let id = format!(
-        "{}-{}-{}-{}-{}",
-        &raw[..8],
-        &raw[8..12],
-        &raw[12..16],
-        &raw[16..20],
-        &raw[20..]
-    );
+    let id = new_identity()?;
     let settings = Settings {
         format: FORMAT,
         id: id.clone(),
@@ -124,6 +136,7 @@ pub fn create_image(
         facets,
         uid: geteuid().as_raw(),
         gid: getegid().as_raw(),
+        boot_parent: None,
     };
     fs::create_dir_all(path)?;
     Root::open(path)?;
@@ -221,6 +234,22 @@ impl Image {
             installed: decode_rows(&self.db, "SELECT name, data FROM installed")?,
             paths: decode_rows(&self.db, "SELECT path, data FROM paths")?,
         })
+    }
+
+    pub fn fork_for_boot(&self, parent: BootParent) -> Result<Settings> {
+        self.require_clean()?;
+        let mut settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
+        ensure!(
+            settings.id == parent.id && parent.revision.checked_add(1) == Some(settings.revision),
+            "staged image does not descend from the requested base"
+        );
+        settings.id = new_identity()?;
+        settings.boot_parent = Some(parent);
+        self.db.execute(
+            "UPDATE image SET data=?1 WHERE id=1",
+            [serde_json::to_string(&settings)?],
+        )?;
+        Ok(settings)
     }
 
     pub fn stage(&self) -> Result<File> {

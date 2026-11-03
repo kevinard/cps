@@ -15,7 +15,10 @@ pub struct Finding {
 }
 
 pub fn verify(path: &Path) -> Result<Vec<Finding>> {
-    let image = Image::open(path, false)?;
+    verify_image(&Image::open(path, false)?)
+}
+
+pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     image.require_clean()?;
     let state = image.state()?;
     let mut findings = Vec::new();

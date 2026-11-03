@@ -1,0 +1,105 @@
+mod systemd_boot;
+
+use std::{
+    fs::{self, File},
+    path::Path,
+    process::Command,
+};
+
+use anyhow::{Context, Result, ensure};
+use rustix::fs::{RenameFlags, renameat_with, syncfs};
+
+use crate::{
+    apply::apply,
+    image::{BootParent, Image},
+    plan::{Plan, Request},
+    verify::verify_image,
+};
+
+pub use systemd_boot::{Activation, activate_boot_environment};
+
+pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
+    ensure!(
+        matches!(plan.request, Request::Update),
+        "boot staging requires an update plan"
+    );
+    let source = fs::canonicalize(source).context("opening the base image directory")?;
+    ensure!(
+        source != Path::new("/"),
+        "staging requires an inactive base image"
+    );
+    let name = destination
+        .file_name()
+        .context("expected a new environment directory name")?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = fs::canonicalize(parent).context("opening the destination parent")?;
+    ensure!(
+        !parent.starts_with(&source),
+        "the new environment must be outside the base image"
+    );
+    ensure!(
+        !parent.join(name).try_exists()?,
+        "the destination already exists"
+    );
+
+    let base = Image::open(&source, false)?;
+    base.require_clean()?;
+    let settings = base.state()?.settings;
+    ensure!(
+        settings.id == plan.image && settings.revision == plan.base_revision,
+        "update plan does not match the base image and revision"
+    );
+    let previous = BootParent {
+        id: settings.id,
+        revision: settings.revision,
+    };
+    let staged = tempfile::Builder::new()
+        .prefix(".cps-be-")
+        .tempdir_in(&parent)?;
+    let status = Command::new("cp")
+        .args(["-a", "--reflink=auto", "--one-file-system", "--"])
+        .arg(source.join("."))
+        .arg(staged.path())
+        .status()
+        .context("copying the base image with GNU cp")?;
+    ensure!(
+        status.success(),
+        "copying the base image failed with {status}"
+    );
+    drop(base);
+
+    apply(staged.path(), plan).context("applying the upgrade in the staged root")?;
+    let image = Image::open(staged.path(), true)?;
+    check_image_integrity(&image)?;
+    let settings = image.fork_for_boot(previous)?;
+    drop(image);
+
+    let parent = File::open(parent)?;
+    let stage_name = staged
+        .path()
+        .file_name()
+        .context("missing staging directory name")?;
+    syncfs(&File::open(staged.path())?)?;
+    renameat_with(&parent, stage_name, &parent, name, RenameFlags::NOREPLACE)
+        .context("publishing the staged root")?;
+    parent.sync_all()?;
+    Ok(entry_id(&settings.id, settings.revision))
+}
+
+fn entry_id(image: &str, revision: u64) -> String {
+    format!("cps-{image}-{revision}")
+}
+
+fn check_image_integrity(image: &Image) -> Result<()> {
+    for finding in verify_image(image)? {
+        ensure!(
+            !finding.is_error,
+            "image verification failed: {}",
+            finding.message
+        );
+    }
+    Ok(())
+}

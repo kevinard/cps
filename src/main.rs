@@ -8,7 +8,10 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use cps::{Plan, Request, apply, create_image, plan, publish, verify};
+use cps::{
+    Activation, Plan, Request, activate_boot_environment, apply, create_image, plan, publish,
+    stage_boot_environment, verify,
+};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -64,6 +67,11 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
     },
+    /// Stage and activate systemd-boot environments
+    BootEnv {
+        #[command(subcommand)]
+        command: BootCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -75,6 +83,43 @@ enum PlanCommand {
     },
     /// Update the installed package set
     Update,
+}
+
+#[derive(Subcommand)]
+enum BootCommand {
+    /// Clone the base image and apply a saved update in a new directory
+    Stage {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        plan: PathBuf,
+    },
+    /// Publish a systemd-boot entry for a verified environment
+    Activate {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        esp: PathBuf,
+        #[arg(long)]
+        root_partuuid: String,
+        #[arg(long, default_value = "boot/vmlinuz")]
+        kernel: String,
+        #[arg(long)]
+        initrd: Option<String>,
+        #[arg(long, default_value = "")]
+        options: String,
+        #[arg(long, default_value_t = 2)]
+        tries: u32,
+        /// Bootstrap the first entry using an already known-good base image
+        #[arg(long)]
+        known_good: bool,
+    },
+}
+
+fn load_plan(path: &Path) -> Result<Plan> {
+    serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("reading plan {}", path.display()))
 }
 
 fn parse_facets(entries: Vec<String>) -> Result<BTreeMap<String, bool>> {
@@ -150,8 +195,7 @@ fn run(command: Command) -> Result<ExitCode> {
             println!("{}", plan.summary());
         }
         Command::Apply { root, plan } => {
-            let saved: Plan = serde_json::from_slice(&fs::read(&plan)?)
-                .with_context(|| format!("reading plan {}", plan.display()))?;
+            let saved = load_plan(&plan)?;
             println!("Image revision {}", apply(&root, &saved)?);
         }
         Command::Verify { root } => {
@@ -168,6 +212,33 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             println!("Image verified");
         }
+        Command::BootEnv { command } => match command {
+            BootCommand::Stage { source, root, plan } => {
+                let id = stage_boot_environment(&source, &root, &load_plan(&plan)?)?;
+                println!("Staged {id} at {}", root.display());
+            }
+            BootCommand::Activate {
+                root,
+                esp,
+                root_partuuid,
+                kernel,
+                initrd,
+                options,
+                tries,
+                known_good,
+            } => {
+                let activation = Activation {
+                    root_partuuid,
+                    kernel,
+                    initrd,
+                    options,
+                    tries,
+                    known_good,
+                };
+                let id = activate_boot_environment(&root, &esp, &activation)?;
+                println!("Activated {id}");
+            }
+        },
     }
     Ok(ExitCode::SUCCESS)
 }
