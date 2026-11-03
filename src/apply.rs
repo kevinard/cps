@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Seek, Write as _},
+    io::Seek,
     path::Path,
 };
 
@@ -13,7 +13,7 @@ use crate::{
     image::{Image, State, root::Root},
     model::{Node, digest_reader},
     plan::{Plan, Write, build, payloads},
-    repo::read_blob,
+    repo::stage_blob,
     systemd::{self, Action as SystemdAction},
     verify::verify_state,
 };
@@ -177,7 +177,7 @@ fn prepare(stage: &File, writes: &[Write], repo: &Path) -> Result<()> {
     }
     for (hash, node) in payloads(writes) {
         let mut file = NamedTempFile::new_in(&dir)?;
-        file.write_all(&read_blob(repo, node)?)?;
+        stage_blob(repo, node, file.as_file_mut())?;
         file.as_file().sync_all()?;
         file.persist_noclobber(dir.join(hash))?;
     }

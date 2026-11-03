@@ -2,6 +2,8 @@
 
 This Rust prototype manages disposable Linux directory images from a signed local repository. It stores immutable package manifests and SHA-256 file payloads, plans changes across the image, and verifies installed files offline.
 
+Repository reads cap catalogs at 64 MiB and manifests at 32 MiB. CPS streams payloads to the staging directory with the signed length as a bound and checks the digest before recording a transaction.
+
 ## Build and try it
 
 Build with `cargo build`. The prototype needs Linux with `openat2`, `/proc`, and the SQLite development library. The example uses OpenSSL to generate a local Ed25519 signing key. Run it as your regular user, with package UID and GID matching that user.
