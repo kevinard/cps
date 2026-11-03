@@ -50,6 +50,28 @@ To upgrade, publish the revised recipe under a new version and run `cps plan --r
 
 Run `cargo test` for the desktop upgrade and interruption test.
 
+## Offline systemd actions
+
+A manifest can request an operation for a vendor file it delivers. The operation is selected with that file's architecture and facet settings.
+
+```kdl
+schema-version 1
+package "service/example" publisher="canopa" version="1.0.0-0" {
+    file "usr/lib/sysusers.d/example.conf" mode="0644" uid=0 gid=0
+    sysusers "example.conf"
+    file "usr/lib/tmpfiles.d/example.conf" mode="0644" uid=0 gid=0
+    tmpfiles "example.conf"
+    file "usr/lib/systemd/system/example.service" mode="0644" uid=0 gid=0
+    preset "example.service"
+}
+```
+
+CPS shows the actions in the plan and invokes the host's systemd tools with the inactive image as their alternate root. It installs the package files first, then provisions accounts, creates state, and applies presets. New or changed sysusers and tmpfiles declarations are processed by name, with target-local replacements and masks taking precedence. For example, a tmpfiles rule of `d /var/lib/example 0750 example example -` can use the account created earlier in the same transaction. Offline tmpfiles supports `d`, `f`, and `L` creation rules. Boot-only rules and paths under `/dev`, `/proc`, `/run`, and `/sys` are deferred to boot. [systemd-tmpfiles](https://www.freedesktop.org/software/systemd/man/latest/systemd-tmpfiles.html)
+
+Presets apply the image's own enablement policy to newly installed units. CPS preserves existing enablement and unit overrides, including masks. The preset step only writes enablement links in the image. [systemd presets](https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html)
+
+Run `cargo build` followed by [`tests/systemd-actions.sh`](tests/systemd-actions.sh) to exercise the real helpers against a staged root. The test also checks recovery from a failed tmpfiles step after sysusers has run.
+
 ## Boot environments
 
 Boot environments use separate Linux roots and a dedicated systemd-boot EFI System Partition (ESP). Start with an inactive, single-filesystem base root containing the kernel. GNU `cp` clones the image and uses a reflink where supported. The destination must be a new directory.

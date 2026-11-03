@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use crate::{
-    image::Image,
+    image::{Image, State, root::Root},
     model::{Node, validate_path},
     plan::{check_dependencies, effective_paths},
 };
@@ -20,7 +20,10 @@ pub fn verify(path: &Path) -> Result<Vec<Finding>> {
 
 pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     image.require_clean()?;
-    let state = image.state()?;
+    verify_state(&image.root, &image.state()?)
+}
+
+pub(crate) fn verify_state(root: &Root, state: &State) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for (name, package) in &state.installed {
         let manifest = &package.published.manifest;
@@ -45,7 +48,7 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     }
     for (path, managed) in expected {
         validate_path(&path)?;
-        let observed = match image.root.inspect(&path) {
+        let observed = match root.inspect(&path) {
             Ok(node) => node,
             Err(error) => {
                 findings.push(Finding {

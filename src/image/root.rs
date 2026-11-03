@@ -1,7 +1,7 @@
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{Read, Write},
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
 };
 
@@ -32,6 +32,26 @@ impl Root {
 
     pub fn fd_path(file: &File) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+
+    pub fn offline_path(&self) -> Result<PathBuf> {
+        let image = self.0.metadata()?;
+        let host = fs::metadata("/")?;
+        ensure!(
+            (image.dev(), image.ino()) != (host.dev(), host.ino()),
+            "systemd actions require an inactive image root"
+        );
+        let path = fs::read_link(Self::fd_path(&self.0))?;
+        let current = fs::metadata(&path)?;
+        ensure!(
+            path.is_absolute() && (current.dev(), current.ino()) == (image.dev(), image.ino()),
+            "image root moved or was replaced"
+        );
+        Ok(path)
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        Ok(rustix::fs::syncfs(&self.0)?)
     }
 
     fn open_relative(&self, path: &str, flags: OFlags) -> rustix::io::Result<File> {

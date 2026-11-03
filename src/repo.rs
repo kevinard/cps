@@ -15,6 +15,7 @@ use crate::{
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest},
     model::{Action, FORMAT, Manifest, Node, digest, validate_digest},
+    systemd::{self, Action as SystemdAction},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -223,6 +224,12 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
             entries: BTreeMap::new(),
         }
     };
+    let tmpfiles: std::collections::BTreeSet<_> = manifest
+        .systemd
+        .iter()
+        .filter(|effect| matches!(effect, SystemdAction::Tmpfiles(_)))
+        .map(SystemdAction::path)
+        .collect();
     for action in &mut manifest.action {
         if let Action::File {
             path, sha256, size, ..
@@ -231,6 +238,9 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
             let bytes = proto
                 .read_file(path)
                 .with_context(|| format!("reading build output {path}"))?;
+            if tmpfiles.contains(path) {
+                systemd::validate_tmpfiles(&bytes).with_context(|| format!("validating {path}"))?;
+            }
             *sha256 = Some(store(repo, "blobs", &bytes)?);
             *size = Some(bytes.len() as u64);
         }

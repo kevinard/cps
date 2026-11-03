@@ -5,6 +5,7 @@ mod kdl_format;
 mod model;
 mod plan;
 mod repo;
+mod systemd;
 mod verify;
 
 pub use apply::apply;

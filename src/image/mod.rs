@@ -287,6 +287,15 @@ impl Image {
         Ok(())
     }
 
+    pub fn update_pending(&self, data: &impl Serialize) -> Result<()> {
+        let changed = self.db.execute(
+            "UPDATE pending SET data=?1 WHERE id=1",
+            [serde_json::to_string(data)?],
+        )?;
+        ensure!(changed == 1, "no pending transaction to update");
+        Ok(())
+    }
+
     pub fn applied(&self, plan: &str) -> Result<Option<u64>> {
         Ok(self
             .db

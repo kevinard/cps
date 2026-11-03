@@ -331,6 +331,8 @@ pub struct Manifest {
     pub dependency: Vec<Dependency>,
     #[serde(default)]
     pub action: Vec<Action>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub systemd: Vec<crate::systemd::Action>,
 }
 
 impl Manifest {
@@ -362,6 +364,34 @@ impl Manifest {
             if !actions.insert((action.path(), action.selectors())) {
                 bail!("duplicate action for {}", action.path());
             }
+        }
+        let mut systemd = BTreeSet::new();
+        for effect in &self.systemd {
+            effect.validate()?;
+            ensure!(
+                systemd.insert(effect),
+                "duplicate {} action for {}",
+                effect.kind(),
+                effect.name()
+            );
+            let path = effect.path();
+            let mut inputs = self
+                .action
+                .iter()
+                .filter(|action| action.path() == path)
+                .peekable();
+            ensure!(
+                inputs.peek().is_some()
+                    && inputs.all(|action| matches!(
+                        action,
+                        Action::File {
+                            preserve: false,
+                            ..
+                        }
+                    )),
+                "{} requires an immutable file action for {path} in the same package",
+                effect.kind()
+            );
         }
         Ok(())
     }

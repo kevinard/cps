@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
-use crate::model::{Action, Dependency, DependencyKind, FORMAT, Manifest};
+use crate::{
+    model::{Action, Dependency, DependencyKind, FORMAT, Manifest},
+    systemd::Action as SystemdAction,
+};
 
 struct Fields<'a> {
     args: Vec<&'a KdlValue>,
@@ -136,6 +139,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         version: fields.required_string("version")?.parse()?,
         dependency: Vec::new(),
         action: Vec::new(),
+        systemd: Vec::new(),
     };
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
@@ -156,6 +160,15 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             "file" | "dir" | "symlink" => manifest
                 .action
                 .push(parse_action(node).with_context(|| format!("{name} action"))?),
+            "sysusers" | "tmpfiles" | "preset" => {
+                let value = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                let action = match name {
+                    "sysusers" => SystemdAction::Sysusers(value),
+                    "tmpfiles" => SystemdAction::Tmpfiles(value),
+                    _ => SystemdAction::Preset(value),
+                };
+                manifest.systemd.push(action);
+            }
             _ => bail!("unknown package node {name}"),
         }
     }
@@ -283,6 +296,11 @@ pub fn manifest_text(manifest: &Manifest) -> String {
         if let Some(arch) = arch {
             node.insert("arch", arch);
         }
+        children.push(node);
+    }
+    for effect in &manifest.systemd {
+        let mut node = KdlNode::new(effect.kind());
+        node.push(effect.name());
         children.push(node);
     }
     doc.nodes_mut().push(package);

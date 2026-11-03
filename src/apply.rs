@@ -13,6 +13,8 @@ use crate::{
     model::{Node, digest_reader},
     plan::{Plan, Write, build, payloads},
     repo::read_blob,
+    systemd::{self, Action as SystemdAction},
+    verify::verify_state,
 };
 
 #[derive(Deserialize, Serialize)]
@@ -20,6 +22,10 @@ struct Pending {
     id: String,
     writes: Vec<Write>,
     next: State,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    systemd: Vec<SystemdAction>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    files_ready: bool,
 }
 
 pub fn apply(path: &Path, plan: &Plan) -> Result<u64> {
@@ -39,12 +45,13 @@ pub(crate) fn apply_with(
         "plan targets a different image"
     );
     let stage = image.stage()?;
-    let pending = if let Some(pending) = image.pending::<Pending>()? {
+    let (mut pending, offline) = if let Some(pending) = image.pending::<Pending>()? {
         ensure!(
             pending.id == id,
             "a different plan is pending; rerun apply with that plan"
         );
-        pending
+        let offline = offline_target(&image.root, &pending.systemd)?;
+        (pending, offline)
     } else {
         if let Some(revision) = image.applied(&id)? {
             return Ok(revision);
@@ -65,24 +72,61 @@ pub(crate) fn apply_with(
             &checked == plan,
             "saved plan differs from the verified plan; generate a new plan"
         );
+        let offline = offline_target(&image.root, &checked.systemd)?;
         prepare(&stage, &checked.writes, &next.publisher.repo)?;
         let pending = Pending {
             id,
             writes: checked.writes,
             next,
+            systemd: checked.systemd,
+            files_ready: false,
         };
         image.record_pending(&pending)?;
-        pending
+        (pending, offline)
     };
 
-    for node in payloads(&pending.writes).into_values() {
-        checked_payload(&image.root, node)?;
+    if !pending.files_ready {
+        write_files(&image.root, &stage, &pending.writes, &mut after_write)?;
+        if offline.is_some() {
+            pending.files_ready = true;
+            image.update_pending(&pending)?;
+        }
     }
-    for write in &pending.writes {
-        let observed = image.root.inspect(&write.path)?;
+    if let Some(path) = offline {
+        systemd::run(&image.root, &path, &pending.systemd, &pending.next)?;
+        for finding in verify_state(&image.root, &pending.next)? {
+            ensure!(
+                !finding.is_error,
+                "offline systemd effects left an inconsistent image: {}",
+                finding.message
+            );
+        }
+    }
+    let revision = pending.next.settings.revision;
+    image.commit(&pending.id, &pending.next)?;
+    Ok(revision)
+}
+
+fn offline_target(root: &Root, actions: &[SystemdAction]) -> Result<Option<std::path::PathBuf>> {
+    (!actions.is_empty())
+        .then(|| systemd::offline_path(root))
+        .transpose()
+}
+
+fn write_files(
+    root: &Root,
+    stage: &File,
+    writes: &[Write],
+    after_write: &mut impl FnMut(&Write),
+) -> Result<()> {
+    for node in payloads(writes).into_values() {
+        checked_payload(root, node)?;
+    }
+    for write in writes {
+        let observed = root.inspect(&write.path)?;
         if observed == write.after {
             if write.before != write.after {
-                image.root.sync_parent(&write.path)?;
+                root.sync_parent(&write.path)?;
                 stage.sync_all()?;
             }
             continue;
@@ -95,19 +139,17 @@ pub(crate) fn apply_with(
         match &write.after {
             Some(node) => {
                 let payload = if matches!(node, Node::File { .. }) {
-                    Some(checked_payload(&image.root, node)?)
+                    Some(checked_payload(root, node)?)
                 } else {
                     None
                 };
-                image.root.replace(&write.path, node, payload, &stage)?;
+                root.replace(&write.path, node, payload, stage)?;
             }
-            None => image.root.remove_file(&write.path)?,
+            None => root.remove_file(&write.path)?,
         }
         after_write(write);
     }
-    let revision = pending.next.settings.revision;
-    image.commit(&pending.id, &pending.next)?;
-    Ok(revision)
+    Ok(())
 }
 
 fn prepare(stage: &File, writes: &[Write], repo: &Path) -> Result<()> {

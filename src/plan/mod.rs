@@ -12,6 +12,7 @@ use crate::{
     image::{Image, Installed, Managed, Settings, State, root::Root},
     model::{FORMAT, Node, digest, validate_name},
     repo::snapshot,
+    systemd::{self, Action as SystemdAction},
 };
 
 pub(crate) use resolve::check as check_dependencies;
@@ -60,6 +61,8 @@ pub struct Plan {
     transfers: Vec<Transfer>,
     preserved: Vec<String>,
     pub(crate) writes: Vec<Write>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) systemd: Vec<SystemdAction>,
     payload_bytes: u64,
 }
 
@@ -83,6 +86,13 @@ impl Plan {
         }
         for path in &self.preserved {
             lines.push(format!("Preserve local config {path}"));
+        }
+        for effect in &self.systemd {
+            lines.push(format!(
+                "Offline systemd {} {}",
+                effect.kind(),
+                effect.name()
+            ));
         }
         lines.push(format!("{} payload bytes required", self.payload_bytes));
         lines.join("\n")
@@ -221,6 +231,7 @@ pub(crate) fn build(
         transfers: Vec::new(),
         preserved: Vec::new(),
         writes: Vec::new(),
+        systemd: systemd::plan_actions(&state, &installed, &paths),
         payload_bytes: 0,
     };
     for (name, package) in &installed {
