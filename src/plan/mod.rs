@@ -245,7 +245,7 @@ impl Plan {
 }
 
 pub fn plan(path: &Path, request: Request) -> Result<Plan> {
-    let image = Image::open(path, false)?;
+    let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
     Ok(build(

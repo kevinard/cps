@@ -10,6 +10,7 @@ case $mode in
 esac
 recycle=${CPS_VM_RECYCLE_SLOT:-0}
 device_activation=${CPS_VM_DEVICE_ACTIVATION:-0}
+installed_stage=${CPS_VM_INSTALLED_STAGE:-0}
 if [[ $recycle == 1 && $mode != rollback ]]; then
     echo 'CPS_VM_RECYCLE_SLOT requires the rollback scenario' >&2
     exit 2
@@ -23,6 +24,10 @@ cps_version=${CPS_VM_CPS_VERSION:-0.1.0-2}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
+    exit 2
+fi
+if [[ $installed_stage == 1 && ( $device_activation != 1 || $recycle != 1 || ${CPS_VM_RELEASE_PROFILE:-0} != 1 ) ]]; then
+    echo 'CPS_VM_INSTALLED_STAGE requires device activation, slot reuse, and a signed release profile' >&2
     exit 2
 fi
 kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
@@ -374,6 +379,7 @@ if $systemd_guest; then
         fi
         touch runtime/etc/cps-vm-assert-extra-publisher
     fi
+    if [[ $installed_stage == 1 ]]; then touch runtime/etc/cps-vm-assert-installed-stage; fi
 else
     mkdir runtime/dev
     cat > runtime/init <<'GUEST'
@@ -876,42 +882,48 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$configs" = $'CPS_VM_CONFIG: trial administrator-setting\nCPS_VM_CONFIG: trial administrator-setting'
             publish_state 3.0.0-0 recycled
             if $profiled; then refresh_vm_profile; fi
-            "$cps" plan --root staged --output recycle.json update | tee recycle-plan.log
-            grep -Fq 'test/boot-state 2.0.0-0 -> 3.0.0-0' recycle-plan.log
-            result=$("$cps" boot-env stage --source staged --root recycled recycle.json)
-            recycled_id=${result#Staged }
-            recycled_id=${recycled_id%% at *}
-            test "$(cat recycled/etc/cps-vm.conf)" = administrator-setting
-            test "$(cat recycled/etc/cps-vm-policy.conf)" = administrator-policy
-            test "$(stat -c %a staged/etc/cps-vm-policy.conf)" = 644
-            test "$(stat -c %a recycled/etc/cps-vm-policy.conf)" = 600
-            "$cps" config list --root recycled | tee config-review.log
-            grep -Fq '"etc/cps-vm.conf"' config-review.log
-            "$cps" plan --root recycled --output config-review.json \
-                resolve-config etc/cps-vm.conf --take vendor
-            "$cps" apply --root recycled config-review.json
-            "$cps" plan --root recycled --output policy-review.json \
-                resolve-config etc/cps-vm-policy.conf --take local
-            "$cps" apply --root recycled policy-review.json
-            test "$("$cps" config list --root recycled)" = 'No pending configuration updates'
-            "$cps" boot-env export --receipt --root recycled --output recycled.ext4 \
-                --size-mib "$root_mib" > recycled.kdl
-            if [[ $device_activation == 1 ]]; then
-                activate_device_guest replace disk.raw replaced.raw recycled
-                activate_device_guest resume disk.raw recycled.raw recycled
-                cmp -i "$((base_mib * 1024 * 1024))" replaced.raw recycled.raw
-                for output in replaced.raw recycled.raw; do
-                    cmp -i "$((base_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" \
-                        "$output" recycled.ext4
-                    "$cps" boot-env list --disk "$output" --esp-partuuid "$esp_uuid" > "$output.list"
-                done
-                cmp replaced.raw.list recycled.raw.list
+            if [[ $installed_stage == 1 ]]; then
+                activate_device_guest installed disk.raw recycled.raw
+                recycled_id=$(sed -n 's/^CPS_VM_INSTALLED_STAGE: //p' device-installed-activation.log)
+                test -n "$recycled_id"
             else
-                result=$("$cps" boot-env activate --root recycled --root-image recycled.ext4 \
-                    --root-partuuid "$base_uuid" --replace "$base_id" \
-                    --disk disk.raw --receipt recycled.kdl --esp-partuuid "$esp_uuid" \
-                    --output-disk recycled.raw --options "$options")
-                test "$result" = "Activated $recycled_id"
+                "$cps" plan --root staged --output recycle.json update | tee recycle-plan.log
+                grep -Fq 'test/boot-state 2.0.0-0 -> 3.0.0-0' recycle-plan.log
+                result=$("$cps" boot-env stage --source staged --root recycled recycle.json)
+                recycled_id=${result#Staged }
+                recycled_id=${recycled_id%% at *}
+                test "$(cat recycled/etc/cps-vm.conf)" = administrator-setting
+                test "$(cat recycled/etc/cps-vm-policy.conf)" = administrator-policy
+                test "$(stat -c %a staged/etc/cps-vm-policy.conf)" = 644
+                test "$(stat -c %a recycled/etc/cps-vm-policy.conf)" = 600
+                "$cps" config list --root recycled | tee config-review.log
+                grep -Fq '"etc/cps-vm.conf"' config-review.log
+                "$cps" plan --root recycled --output config-review.json \
+                    resolve-config etc/cps-vm.conf --take vendor
+                "$cps" apply --root recycled config-review.json
+                "$cps" plan --root recycled --output policy-review.json \
+                    resolve-config etc/cps-vm-policy.conf --take local
+                "$cps" apply --root recycled policy-review.json
+                test "$("$cps" config list --root recycled)" = 'No pending configuration updates'
+                "$cps" boot-env export --receipt --root recycled --output recycled.ext4 \
+                    --size-mib "$root_mib" > recycled.kdl
+                if [[ $device_activation == 1 ]]; then
+                    activate_device_guest replace disk.raw replaced.raw recycled
+                    activate_device_guest resume disk.raw recycled.raw recycled
+                    cmp -i "$((base_mib * 1024 * 1024))" replaced.raw recycled.raw
+                    for output in replaced.raw recycled.raw; do
+                        cmp -i "$((base_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" \
+                            "$output" recycled.ext4
+                        "$cps" boot-env list --disk "$output" --esp-partuuid "$esp_uuid" > "$output.list"
+                    done
+                    cmp replaced.raw.list recycled.raw.list
+                else
+                    result=$("$cps" boot-env activate --root recycled --root-image recycled.ext4 \
+                        --root-partuuid "$base_uuid" --replace "$base_id" \
+                        --disk disk.raw --receipt recycled.kdl --esp-partuuid "$esp_uuid" \
+                        --output-disk recycled.raw --options "$options")
+                    test "$result" = "Activated $recycled_id"
+                fi
             fi
             cmp -n 1048576 disk.raw recycled.raw
             cmp -i "$((trial_mib * 1024 * 1024))" disk.raw recycled.raw

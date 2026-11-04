@@ -983,15 +983,34 @@ partition mapping when both flags are omitted.
 
 ### Activating a trial on an installed disk
 
-With a known-good base already registered, stage and export the trial as
-above. Use a dedicated, unregistered Linux filesystem partition on the same
-GPT disk as the mounted ESP. The disk must use 512-byte logical sectors,
-and the ext4 export must match the partition size.
+You can plan and stage directly from the installed root during a rescue boot.
+After a clean shutdown, mount that ext4 partition read-only and make the
+image's configured repositories or synced caches available at their recorded
+paths. Use writable scratch space outside the mounted root for the plan,
+staged tree, and export. CPS holds a shared image lock while copying and
+rejects nested mounts, including bind mounts.
 
 ```sh
-cps boot-env activate-device --root staged --esp /efi \
+mount -t ext4 -o ro,noload "/dev/disk/by-partuuid/$base_partuuid" /mnt/canopa
+cps plan --root /mnt/canopa --output /scratch/upgrade.json update
+cps boot-env stage --source /mnt/canopa --root /scratch/staged /scratch/upgrade.json
+cps boot-env export --root /scratch/staged --output /scratch/staged.ext4 \
+    --size-mib 2048 --receipt > /scratch/staged.kdl
+```
+
+Use `ro,noload` on a clean ext4 filesystem to avoid journal writes to the
+source partition. [Linux ext4 mount options](https://docs.kernel.org/admin-guide/ext4.html)
+
+With a known-good base already registered, use a dedicated, unregistered
+Linux filesystem partition on the same GPT disk as the mounted ESP for the
+trial. The disk must use 512-byte logical sectors, and the ext4 export must
+match the partition size.
+
+```sh
+cps boot-env activate-device --root /scratch/staged --esp /efi \
     --device "/dev/disk/by-partuuid/$trial_partuuid" \
-    --root-partuuid "$trial_partuuid" --receipt staged.kdl --root-image staged.ext4
+    --root-partuuid "$trial_partuuid" \
+    --receipt /scratch/staged.kdl --root-image /scratch/staged.ext4
 ```
 
 CPS checks the GPT and compares the kernel's device extents to the requested
@@ -1188,6 +1207,11 @@ result through the normal blessing and rollback checks.
 Combine it with `CPS_VM_RECYCLE_SLOT=1` to also exercise direct replacement,
 recovery from a partial write after retirement, and boot and rollback of
 the recovered upgrade.
+With those options and `CPS_VM_RELEASE_PROFILE=1`, set
+`CPS_VM_INSTALLED_STAGE=1` to plan and stage the second upgrade inside the
+rescue VM from the first upgrade's read-only root partition. This variant
+checks that state written during the first boot reaches the staged tree and
+that the fallback partition stays byte-for-byte intact during deployment.
 
 #### Testing a source-built Linux kernel
 

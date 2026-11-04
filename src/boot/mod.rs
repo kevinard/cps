@@ -8,16 +8,20 @@ mod systemd_boot;
 use std::{
     ffi::OsStr,
     fs::{self, File},
+    os::unix::fs::MetadataExt,
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
 };
 
-use anyhow::{Context, Result, ensure};
-use rustix::fs::{RenameFlags, renameat_with, syncfs};
+use anyhow::{Context, Result, bail, ensure};
+use rustix::{
+    fs::{AtFlags, FileType, RenameFlags, renameat_with, statat, syncfs},
+    io::Errno,
+};
 
 use crate::{
     apply::apply,
-    image::{BootParent, Image},
+    image::{BootParent, Image, root::Root},
     plan::{Plan, Request},
     verify::verify_image,
 };
@@ -56,12 +60,15 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
         !parent.starts_with(&source),
         "the new environment must be outside the base image"
     );
-    ensure!(
-        !parent.join(name).try_exists()?,
-        "the destination already exists"
-    );
+    let parent = Root::open(&parent)?;
+    match statat(parent.as_file(), name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => bail!("the destination already exists"),
+        Err(Errno::NOENT) => {}
+        Err(error) => return Err(error).context("checking the staging destination"),
+    }
 
-    let base = Image::open(&source, false)?;
+    let base = Image::open_query(&source)?;
+    base.root.offline_path()?;
     base.require_clean()?;
     let settings = base.settings()?;
     ensure!(
@@ -73,13 +80,34 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
         id: settings.id,
         revision: settings.revision,
     };
+    let destination = parent.as_file().metadata()?;
+    let destination = (destination.dev(), destination.ino());
+    let origin = base.root.as_file().metadata()?;
+    ensure!(
+        destination != (origin.dev(), origin.ino()),
+        "the new environment must be outside the base image"
+    );
+    base.root.walk(None, |path, _, info| {
+        ensure!(
+            destination != (info.st_dev, info.st_ino),
+            "the new environment must be outside the base image"
+        );
+        ensure!(
+            matches!(
+                FileType::from_raw_mode(info.st_mode),
+                FileType::Directory | FileType::RegularFile | FileType::Symlink
+            ),
+            "cannot stage special file {path:?}"
+        );
+        Ok(true)
+    })?;
     let staged = tempfile::Builder::new()
         .prefix(".cps-be-")
-        .tempdir_in(&parent)?;
-    let status = Command::new("cp")
+        .tempdir_in(Root::fd_path(parent.as_file()))?;
+    let status = artifact_helper("cp", staged.path())
+        .stdin(Stdio::from(base.root.as_file().try_clone()?))
         .args(["-a", "--reflink=auto", "--one-file-system", "--"])
-        .arg(source.join("."))
-        .arg(staged.path())
+        .args(["/proc/self/fd/0/.", "."])
         .status()
         .context("copying the base image with GNU cp")?;
     ensure!(
@@ -98,15 +126,20 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
     let settings = image.fork_for_boot(previous)?;
     drop(image);
 
-    let parent = File::open(parent)?;
     let stage_name = staged
         .path()
         .file_name()
         .context("missing staging directory name")?;
     syncfs(&File::open(staged.path())?)?;
-    renameat_with(&parent, stage_name, &parent, name, RenameFlags::NOREPLACE)
-        .context("publishing the staged root")?;
-    parent.sync_all()?;
+    renameat_with(
+        parent.as_file(),
+        stage_name,
+        parent.as_file(),
+        name,
+        RenameFlags::NOREPLACE,
+    )
+    .context("publishing the staged root")?;
+    parent.as_file().sync_all()?;
     Ok(entry_id(&settings.id, settings.revision))
 }
 

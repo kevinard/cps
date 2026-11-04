@@ -19,27 +19,41 @@ copy_runtime_deps() {
     done < <(awk '/=> \// { print $3 } /^[[:space:]]*\// { print $1 }' <<< "$links")
 }
 
-# Boot a rescue root with the exported trial on a read-only input disk.
+# Boot a rescue root with the inputs on a read-only disk.
 # The writable disk is the one later booted through systemd-boot.
 activate_device_guest() {
-    local mode=$1 source=$2 output=$3 stage=$4
+    local mode=$1 source=$2 output=$3 stage=${4:-}
     local inputs="device-$mode-inputs"
-    local program binary data_args=()
+    local program binary name repository key data_args=() scratch_args=()
+    local programs=(mount sfdisk blkid e2fsck)
     mkdir -p "$inputs"/{bin,usr/bin,dev,proc,sys,tmp,esp,fallback}
     cp -L -- "$busybox" "$inputs/bin/busybox"
     copy_runtime_deps "$inputs" "$busybox"
     ln -s busybox "$inputs/bin/sh"
     strip --strip-debug -o "$inputs/usr/bin/cps" "$cps"
     copy_runtime_deps "$inputs" "$cps"
-    for program in mount sfdisk blkid e2fsck; do
+    if [[ $mode == installed ]]; then programs+=(cp mke2fs); fi
+    for program in "${programs[@]}"; do
         binary=$(command -v "$program")
         cp -L -- "$binary" "$inputs/usr/bin/$program"
         copy_runtime_deps "$inputs" "$binary"
     done
-    cp -a -- "$stage" "$inputs/staged"
-    cp --sparse=always -- "$stage.ext4" "$inputs/staged.ext4"
-    cp -- "$stage.kdl" "$inputs/staged.kdl"
-    cp -- base.kdl "$inputs/"
+    if [[ $mode == installed ]]; then
+        # The image database records absolute repository locations.
+        mkdir -p "$inputs$PWD" "$inputs/scratch"
+        cp -a -- profile-repo profile-public.der "$inputs$PWD/"
+        while read -r name repository key; do
+            cp -a -- "$repository" "$key" "$inputs$PWD/"
+        done < <(profile_companions)
+        truncate -s "$((root_mib * 2 + 128))M" scratch.raw
+        mke2fs -q -F -t ext4 scratch.raw
+        scratch_args=(-drive if=virtio,format=raw,file=scratch.raw)
+    else
+        cp -a -- "$stage" "$inputs/staged"
+        cp --sparse=always -- "$stage.ext4" "$inputs/staged.ext4"
+        cp -- "$stage.kdl" "$inputs/staged.kdl"
+        cp -- base.kdl "$inputs/"
+    fi
     {
         printf '#!/bin/sh\nset -eu\nbase_uuid=%q\ntrial_uuid=%q\noptions=%q\n' \
             "$base_uuid" "$trial_uuid" "$options"
@@ -86,6 +100,44 @@ reject 'environment is already registered' --esp /esp --device /dev/vda3 \
     --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4
 activate --esp /esp --device /dev/vda3 \
     --root-partuuid "$trial_uuid" --receipt /staged.kdl
+GUEST
+        elif [[ $mode == installed ]]; then
+            printf 'base_id=%q\nroot_mib=%q\n' "$base_id" "$root_mib"
+            cat <<'GUEST'
+bb=/bin/busybox
+mount -t ext4 -o ro,noload /dev/vda3 /fallback
+mount -t ext4 /dev/vdc /scratch
+test "$("$bb" cat /fallback/etc/cps-vm-booted-source)" = booted
+cps plan --root /fallback --output /scratch/upgrade.json update > /tmp/plan
+"$bb" grep -F 'test/boot-state 2.0.0-0 -> 3.0.0-0' /tmp/plan
+mount --bind /fallback/etc /fallback/run
+if cps boot-env stage --source /fallback --root /scratch/recycled /scratch/upgrade.json > /tmp/rejected 2>&1; then
+    echo 'CPS_VM_DEVICE: staged a root with a nested bind mount'
+    exit 1
+fi
+"$bb" grep -F 'opening tree entry "run"' /tmp/rejected
+test ! -e /scratch/recycled
+"$bb" umount /fallback/run
+result=$(cps boot-env stage --source /fallback --root /scratch/recycled /scratch/upgrade.json)
+id=${result#Staged }
+id=${id%% at *}
+test "$("$bb" cat /scratch/recycled/etc/cps-vm-booted-source)" = booted
+test "$("$bb" cat /scratch/recycled/etc/cps-vm.conf)" = administrator-setting
+test "$("$bb" cat /scratch/recycled/etc/cps-vm-policy.conf)" = administrator-policy
+test "$("$bb" stat -c %a /fallback/etc/cps-vm-policy.conf)" = 644
+test "$("$bb" stat -c %a /scratch/recycled/etc/cps-vm-policy.conf)" = 600
+cps plan --root /scratch/recycled --output /scratch/config.json resolve-config etc/cps-vm.conf --take vendor
+cps apply --root /scratch/recycled /scratch/config.json
+cps plan --root /scratch/recycled --output /scratch/policy.json resolve-config etc/cps-vm-policy.conf --take local
+cps apply --root /scratch/recycled /scratch/policy.json
+test "$(cps config list --root /scratch/recycled)" = 'No pending configuration updates'
+cps boot-env export --receipt --root /scratch/recycled --output /scratch/recycled.ext4 \
+    --size-mib "$root_mib" > /scratch/recycled.kdl
+cps boot-env activate-device --root /scratch/recycled --esp /esp --device /dev/vda2 \
+    --root-partuuid "$base_uuid" --receipt /scratch/recycled.kdl --root-image /scratch/recycled.ext4 \
+    --replace "$base_id" --options "$options"
+"$bb" umount /scratch
+echo "CPS_VM_INSTALLED_STAGE: $id"
 GUEST
         else
             printf 'mode=%q\nbase_id=%q\ntrial_id=%q\n' "$mode" "$base_id" "$trial_id"
@@ -134,7 +186,7 @@ GUEST
         -serial "file:device-$mode.log" -kernel "$trial_kernel" \
         -append 'root=/dev/vdb rootfstype=ext4 rootwait ro console=ttyS0 loglevel=3 init=/init' \
         -drive "if=virtio,format=raw,file=$output" \
-        -drive "if=virtio,format=raw,readonly=on,file=$inputs.raw" || {
+        -drive "if=virtio,format=raw,readonly=on,file=$inputs.raw" "${scratch_args[@]}" || {
         tail -80 "device-$mode.log" >&2
         return 1
     }
@@ -336,6 +388,9 @@ set -e
 bb=/bin/busybox
 [ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
 state=$("$bb" cat /etc/cps-vm-boot-state)
+if [ -f /etc/cps-vm-assert-installed-stage ] && [ "$state" = trial ]; then
+    printf 'booted\n' > /etc/cps-vm-booted-source
+fi
 if [ -f /etc/cps-vm.conf ]; then
     printf 'CPS_VM_CONFIG: %s %s\n' "$state" "$("$bb" cat /etc/cps-vm.conf)"
 fi
