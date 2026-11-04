@@ -107,6 +107,8 @@ pub(crate) struct Toolchain {
 pub(crate) struct VerifiedBuild {
     pub envelope: Vec<u8>,
     pub artifacts: BTreeMap<String, FileDigest>,
+    pub builder_sha256: String,
+    pub recipe_sha256: String,
 }
 
 pub(crate) fn sign(
@@ -301,6 +303,8 @@ pub(crate) fn verify_bundle(
         VerifiedBuild {
             envelope: envelope(&payload, &signature, builder_key)?,
             artifacts,
+            builder_sha256: digest(builder_key),
+            recipe_sha256: reviewed_recipe.to_owned(),
         },
     ))
 }

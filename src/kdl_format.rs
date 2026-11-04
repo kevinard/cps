@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub(crate) mod build;
+pub(crate) mod publish_policy;
 
 struct Fields<'a> {
     args: Vec<&'a KdlValue>,

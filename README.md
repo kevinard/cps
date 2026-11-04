@@ -81,6 +81,20 @@ The optional worker key signs an in-toto statement in a DSSE envelope after both
 
 Run [`tests/build.sh`](tests/build.sh) on a worker with Bubblewrap, Bash, a C compiler with static libc, binutils, Python 3, and OpenSSL. It exercises isolation, reproducibility, signed provenance, and package installation.
 
+### Publishing policy
+
+To require attested builds for a release repository, install `publish-policy.kdl` in the repository directory before its first publication. Builder key paths resolve relative to that directory. Approve the reviewed recipe separately for each package version.
+
+```kdl
+schema-version 1
+publisher "canopa" {
+    builder-key "builder-public.der"
+    approve "demo/hello" version="1.0.0-0" sha256="<reviewed recipe SHA-256>"
+}
+```
+
+Protected repositories accept packages through `publish-bundle` only. CPS checks the verified worker key and recipe digest against the policy, independently of the command-line arguments. The publisher signs the protection flag into the catalog, and later publication fails if the policy file is missing. Keep bootstrap packages in a separate toolchain repository. Export carries package attestations and leaves the publisher's local policy and key files on the publishing machine.
+
 ## Signed releases and mirrors
 
 `publish` assembles the local CPS repository using a publisher signing key. Export a snapshot to a new directory before signing it with [The Update Framework](https://theupdateframework.github.io/specification/latest/).

@@ -146,6 +146,7 @@ build_package() {
 build_package --builder-signing-key builder.der --check-reproducible --output first build.kdl
 (umask 077; build_package --builder-signing-key builder.der --check-reproducible --output second build.kdl)
 diff -r first second
+build_package --builder-signing-key other.der --check-reproducible --output unapproved build.kdl
 test ! -e first/proto/unlisted
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
 test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
@@ -176,8 +177,19 @@ grep -F 'source digest or length mismatch for input' bad.log
 test ! -e bad
 
 reviewed=$(sha build.kdl)
+mkdir release
+cp builder-public.der release/
+write_policy() {
+    cat > release/publish-policy.kdl <<POLICY
+schema-version 1
+publisher "canopa" {
+    builder-key "builder-public.der"
+    approve "demo/hello" version="1.0.0-0" sha256="$1"
+}
+POLICY
+}
 publish_bundle() {
-    "$cps" publish-bundle --repo repo --signing-key signing.der "$@"
+    "$cps" publish-bundle --repo release --signing-key signing.der "$@"
 }
 expect_failure() {
     local expected=$1
@@ -188,22 +200,36 @@ expect_failure() {
     fi
     grep -F "$expected" rejected.log
 }
-before=$(cat repo/current)
+write_policy "$reviewed"
+expect_failure 'publish policy requires an attested build bundle' "$cps" publish \
+    --repo release --proto first/proto --signing-key signing.der first/manifest.kdl
 expect_failure 'invalid builder attestation signature' publish_bundle \
     --builder-key other-public.der --recipe-sha256 "$reviewed" first
+expect_failure 'build signer is not authorized by publish policy' publish_bundle \
+    --builder-key other-public.der --recipe-sha256 "$reviewed" unapproved
 expect_failure 'build recipe differs from the reviewed digest' publish_bundle \
     --builder-key builder-public.der --recipe-sha256 "$(sha unstable.kdl)" first
+write_policy "$(sha unstable.kdl)"
+expect_failure 'build recipe is not approved' publish_bundle \
+    --builder-key builder-public.der --recipe-sha256 "$reviewed" first
+write_policy "$reviewed"
 cp -a first modified
 printf 'x' | dd of=modified/proto/hello bs=1 conv=notrunc status=none
 expect_failure 'attested payload digest mismatch' publish_bundle \
     --builder-key builder-public.der --recipe-sha256 "$reviewed" modified
-test "$(cat repo/current)" = "$before"
+test ! -e release/current
 
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" first
-first_catalog=$(cat repo/current)
+first_catalog=$(cat release/current)
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" second
-test "$(cat repo/current)" = "$first_catalog"
-"$cps" repo attestation --repo repo --publisher canopa --trust-key public.der \
+mv release/publish-policy.kdl policy.saved
+expect_failure 'protected repository is missing publish-policy.kdl' "$cps" publish \
+    --repo release --proto first/proto --signing-key signing.der first/manifest.kdl
+expect_failure 'protected repository is missing publish-policy.kdl' publish_bundle \
+    --builder-key builder-public.der --recipe-sha256 "$reviewed" first
+mv policy.saved release/publish-policy.kdl
+test "$(cat release/current)" = "$first_catalog"
+"$cps" repo attestation --repo release --publisher canopa --trust-key public.der \
     cps://canopa/demo/hello@1.0.0-0 > envelope.json
 python3 - <<'PYTHON'
 import base64
@@ -223,7 +249,11 @@ Path('pae').write_bytes(b'DSSEv1 %d %s %d %s' % (len(kind), kind, len(payload), 
 Path('signature').write_bytes(base64.b64decode(envelope['signatures'][0]['sig'], validate=True))
 PYTHON
 openssl pkeyutl -verify -pubin -keyform DER -inkey builder-public.der -rawin -in pae -sigfile signature
-"$cps" image-create --root image --repo repo --publisher canopa --trust-key public.der
+"$cps" repo export --repo release --publisher canopa --trust-key public.der --output targets
+test -f "targets/attestations-$(sha first/attestation.json)"
+test ! -e targets/publish-policy.kdl
+test ! -e targets/builder-public.der
+"$cps" image-create --root image --repo release --publisher canopa --trust-key public.der
 "$cps" plan --root image --output install.json install demo/hello
 "$cps" apply --root image install.json
 "$cps" verify --root image

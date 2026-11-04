@@ -14,7 +14,7 @@ use tempfile::NamedTempFile;
 use crate::{
     attestation::{ATTESTATION_LIMIT, VerifiedBuild, verify_bundle},
     image::root::Root,
-    kdl_format::{manifest_text, parse_manifest},
+    kdl_format::{manifest_text, parse_manifest, publish_policy},
     model::{Action, FORMAT, FileDigest, Manifest, Node, digest, digest_reader, validate_digest},
     systemd::{self, Action as SystemdAction},
 };
@@ -22,6 +22,8 @@ use crate::{
 const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const TMPFILES_LIMIT: u64 = 1024 * 1024;
+const PUBLISH_POLICY_LIMIT: u64 = 1024 * 1024;
+const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
 pub mod release;
 
@@ -33,6 +35,8 @@ struct Catalog {
     entries: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     attestations: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    attestations_required: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -187,6 +191,10 @@ fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<
             "duplicate package attestation {digest}"
         );
     }
+    ensure!(
+        !catalog.attestations_required || catalog.attestations.len() == catalog.entries.len(),
+        "protected catalog contains a package without build evidence"
+    );
     Ok(catalog)
 }
 
@@ -336,8 +344,7 @@ fn publish_manifest(
         !path_present(&repo.join(".tuf"))?,
         "cannot publish to a TUF-managed repository cache"
     );
-    prepare_objects(repo)?;
-    let mut catalog = if repo.join("current").try_exists()? {
+    let mut catalog = if path_present(&repo.join("current"))? {
         read_catalog(
             repo,
             &read_current(repo)?,
@@ -350,8 +357,12 @@ fn publish_manifest(
             publisher: manifest.publisher.clone(),
             entries: BTreeMap::new(),
             attestations: BTreeMap::new(),
+            attestations_required: false,
         }
     };
+    let id = manifest.id();
+    enforce_publish_policy(repo, &mut catalog, &id, evidence.as_ref())?;
+    prepare_objects(repo)?;
     let tmpfiles: std::collections::BTreeSet<_> = manifest
         .systemd
         .iter()
@@ -385,7 +396,6 @@ fn publish_manifest(
         }
     }
     manifest.validate(true)?;
-    let id = manifest.id();
     let unchanged_manifest = if let Some(existing) = catalog.entries.get(&id) {
         let previous = load_manifest(repo, existing.clone())?;
         ensure!(
@@ -429,6 +439,48 @@ fn publish_manifest(
     File::open(repo)?.sync_all()?;
     write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)?;
     Ok(id)
+}
+
+fn enforce_publish_policy(
+    repo: &Path,
+    catalog: &mut Catalog,
+    id: &str,
+    evidence: Option<&VerifiedBuild>,
+) -> Result<()> {
+    if !path_present(&repo.join(PUBLISH_POLICY))? {
+        ensure!(
+            !catalog.attestations_required,
+            "protected repository is missing {PUBLISH_POLICY}"
+        );
+        return Ok(());
+    }
+    ensure!(
+        catalog.attestations_required || catalog.entries.is_empty(),
+        "configure publish policy before the repository's first publication"
+    );
+    let bytes = read_limited(
+        Root::open(repo)?.file(PUBLISH_POLICY)?,
+        PUBLISH_POLICY_LIMIT,
+    )?;
+    let policy = publish_policy::parse(std::str::from_utf8(&bytes)?)
+        .with_context(|| format!("reading {PUBLISH_POLICY}"))?;
+    ensure!(
+        policy.publisher == catalog.publisher,
+        "publish policy names a different publisher"
+    );
+    let build = evidence.context("publish policy requires an attested build bundle")?;
+    ensure!(
+        policy.recipes.get(id) == Some(&build.recipe_sha256),
+        "build recipe is not approved for {id}"
+    );
+    let mut approved = false;
+    for path in policy.builder_keys {
+        let key = read_key(&repo.join(path))?;
+        approved |= digest(&key) == build.builder_sha256;
+    }
+    ensure!(approved, "build signer is not authorized by publish policy");
+    catalog.attestations_required = true;
+    Ok(())
 }
 
 fn store_blob(
