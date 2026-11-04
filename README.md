@@ -40,7 +40,7 @@ CONFIG
 "$cps" verify --root image
 ```
 
-To upgrade, publish the revised recipe under a new version and run `cps plan --root image --output upgrade.json update`, then apply the saved plan. Each plan pins a signed catalog and an image revision. Keep the saved plan until apply finishes. If interrupted, rerun `apply` with the same plan. Once writes begin, recovery uses the payloads staged inside the image and can finish offline.
+To upgrade, publish the revised recipe under a new version and run `cps plan --root image --output upgrade.json update`, then apply the saved plan. The plan pins the image revision and the signed catalogs used to resolve packages. Keep the saved plan until apply finishes. If interrupted, rerun `apply` with the same plan. Once writes begin, recovery uses the payloads staged inside the image and can finish offline.
 
 Use `plan exact-install NAME ...` to reconcile an image to the named packages and their required dependencies. The plan previews packages that would be removed. Use `plan remove NAME ...` to remove selected packages from committed image state while offline. Removal fails if a package that remains still requires one of those packages. Both operations preserve locally edited files declared with `preserve=#true`. A saved install, exact-install, remove, or update plan can also be applied to a clone with `boot-env stage`.
 
@@ -189,6 +189,33 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 Sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and the complete release. A failed download leaves the last complete release available. The cache retains previous content-addressed objects for saved plans. Planning and applying can use the last cached release offline. TUF freshness is checked at sync time.
 
 The publisher signs the association between each package and its build evidence. Export and sync carry the evidence with the release. To retrieve it, use `cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-key public.der cps://canopa/demo/hello@1.0.0-0`. Clients need a CPS version that supports attestations before they can read catalogs containing that field.
+
+### Publisher order
+
+An image configuration can declare multiple publisher blocks in search order.
+Give each publisher its own repository or synchronized cache and trust key.
+
+```kdl
+schema-version 1
+publisher "canopa" {
+    repository "/var/lib/cps/canopa"
+    trust-key "/etc/cps/keys/canopa.der"
+}
+publisher "extras" {
+    repository "/var/lib/cps/extras"
+    trust-key "/etc/cps/keys/extras.der"
+}
+```
+
+For a new package, the solver considers versions from the first publisher that
+offers the package name. An installed package stays with its original
+publisher. Each plan that resolves packages pins a signed catalog per publisher,
+and apply checks the same catalog set and stages the selected payloads before
+changing the image. [IPS publisher search order and stickiness](https://docs.oracle.com/cd/E53394_01/html/E54739/gijmo.html)
+
+`list --available` shows the newest version from the selected publisher for each
+name. Use `list --available --all-versions` to see every publisher's catalog
+entries, or a full package ID with `info --available` to inspect a particular one.
 
 ## Manifest and image behavior
 

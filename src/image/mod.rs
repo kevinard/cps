@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use self::root::Root;
 use crate::{
+    kdl_format::{PublisherConfig, read_image_definition},
     model::{FORMAT, Node, validate_publisher},
     repo::{Published, canonical_repo, read_key},
 };
@@ -58,9 +59,79 @@ pub struct Publisher {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum Publishers {
+    Single(Publisher),
+    Ordered(Vec<Publisher>),
+}
+
+impl Publishers {
+    fn new(publishers: Vec<Publisher>) -> Result<Self> {
+        let publishers = match <[Publisher; 1]>::try_from(publishers) {
+            Ok([publisher]) => Self::Single(publisher),
+            Err(publishers) => Self::Ordered(publishers),
+        };
+        publishers.validate()?;
+        Ok(publishers)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[Publisher] {
+        match self {
+            Self::Single(publisher) => std::slice::from_ref(publisher),
+            Self::Ordered(publishers) => publishers,
+        }
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&Publisher> {
+        self.as_slice()
+            .iter()
+            .find(|publisher| publisher.name == name)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.as_slice().is_empty(),
+            "an image requires at least one publisher"
+        );
+        let mut names = BTreeSet::new();
+        for publisher in self.as_slice() {
+            validate_publisher(&publisher.name)?;
+            ensure!(
+                names.insert(&publisher.name),
+                "duplicate publisher {}",
+                publisher.name
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Publisher {
+    fn from_config(name: &str, repo: &Path, key: &Path) -> Result<Self> {
+        validate_publisher(name)?;
+        Ok(Self {
+            name: name.to_owned(),
+            repo: canonical_repo(repo)?,
+            key: read_key(key)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Installed {
     pub published: Published,
     pub explicit: bool,
+}
+
+impl Installed {
+    pub(crate) fn verify(&self, name: &str, publishers: &Publishers) -> Result<()> {
+        let manifest = &self.published.manifest;
+        ensure!(
+            manifest.name == name && publishers.get(&manifest.publisher).is_some(),
+            "invalid installed package identity for {name}"
+        );
+        self.published.verify()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -74,7 +145,8 @@ pub struct Managed {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct State {
     pub settings: Settings,
-    pub publisher: Publisher,
+    #[serde(rename = "publisher")]
+    pub(crate) publishers: Publishers,
     pub installed: BTreeMap<String, Installed>,
     pub paths: BTreeMap<String, Managed>,
 }
@@ -117,16 +189,41 @@ pub fn create_image(
     arch: &str,
     facets: BTreeMap<String, bool>,
 ) -> Result<String> {
-    validate_publisher(publisher)?;
+    let publisher = Publisher::from_config(publisher, repo, trust_key)?;
+    initialize(path, Publishers::Single(publisher), arch, facets)
+}
+
+pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
+    let config = read_image_definition(config)?;
+    let publishers = config
+        .publishers
+        .iter()
+        .map(
+            |PublisherConfig {
+                 name,
+                 repository,
+                 trust_key,
+             }| { Publisher::from_config(name, repository, trust_key) },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    initialize(
+        path,
+        Publishers::new(publishers)?,
+        &config.arch,
+        config.facets,
+    )
+}
+
+fn initialize(
+    path: &Path,
+    publishers: Publishers,
+    arch: &str,
+    facets: BTreeMap<String, bool>,
+) -> Result<String> {
     validate_publisher(arch).context("invalid architecture")?;
     for facet in facets.keys() {
         validate_publisher(facet).context("invalid facet")?;
     }
-    let publisher = Publisher {
-        name: publisher.to_owned(),
-        repo: canonical_repo(repo)?,
-        key: read_key(trust_key)?,
-    };
     let id = new_identity()?;
     let settings = Settings {
         format: FORMAT,
@@ -171,7 +268,7 @@ pub fn create_image(
     )?;
     tx.execute(
         "INSERT INTO publishers VALUES (1, ?1)",
-        [serde_json::to_string(&publisher)?],
+        [serde_json::to_string(&publishers)?],
     )?;
     tx.commit()?;
     drop(db);
@@ -233,8 +330,10 @@ impl Image {
         })
     }
 
-    pub(crate) fn publisher(&self) -> Result<Publisher> {
-        decode(&self.db, "SELECT data FROM publishers WHERE id=1")
+    pub(crate) fn publishers(&self) -> Result<Publishers> {
+        let publishers: Publishers = decode(&self.db, "SELECT data FROM publishers WHERE id=1")?;
+        publishers.validate()?;
+        Ok(publishers)
     }
 
     pub(crate) fn installed(&self) -> Result<BTreeMap<String, Installed>> {
@@ -258,7 +357,7 @@ impl Image {
         ensure!(settings.format == FORMAT, "unsupported image format");
         Ok(State {
             settings,
-            publisher: self.publisher()?,
+            publishers: self.publishers()?,
             installed: self.installed()?,
             paths: decode_rows(&self.db, "SELECT path, data FROM paths")?,
         })

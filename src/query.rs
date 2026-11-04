@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, fmt, path::Path};
 use anyhow::{Context, Result, ensure};
 
 use crate::{
-    image::{Image, Installed, Publisher},
+    image::{Image, Installed, Publisher, Publishers},
     kdl_format::manifest_text,
     model::{Version, validate_digest, validate_name, validate_publisher},
     repo::{catalog_entries, read_package},
@@ -101,21 +101,12 @@ fn available(publisher: &Publisher) -> Result<Vec<CatalogEntry>> {
     Ok(entries)
 }
 
-fn installed(image: &Image, publisher: &Publisher) -> Result<BTreeMap<String, Installed>> {
+fn installed(image: &Image, publishers: &Publishers) -> Result<BTreeMap<String, Installed>> {
     let installed = image.installed()?;
     for (name, package) in &installed {
-        check_installed(name, package, publisher)?;
+        package.verify(name, publishers)?;
     }
     Ok(installed)
-}
-
-fn check_installed(name: &str, package: &Installed, publisher: &Publisher) -> Result<()> {
-    let manifest = &package.published.manifest;
-    ensure!(
-        manifest.name == name && manifest.publisher == publisher.name,
-        "invalid installed package identity for {name}"
-    );
-    package.published.verify()
 }
 
 fn status(package: &Installed) -> Status {
@@ -130,8 +121,8 @@ fn status(package: &Installed) -> Status {
 pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
-    let publisher = image.publisher()?;
-    let installed = installed(&image, &publisher)?;
+    let publishers = image.publishers()?;
+    let installed = installed(&image, &publishers)?;
     if scope == Scope::Installed {
         return Ok(installed
             .into_iter()
@@ -142,7 +133,19 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
             })
             .collect());
     }
-    let mut entries = available(&publisher)?;
+    let mut entries = Vec::new();
+    for publisher in publishers.as_slice() {
+        let mut catalog = available(publisher)?;
+        if scope == Scope::Available {
+            catalog.retain(|entry| {
+                installed
+                    .get(&entry.name)
+                    .is_none_or(|pkg| pkg.published.manifest.publisher == publisher.name)
+            });
+        }
+        entries.extend(catalog);
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     if scope == Scope::Available {
         entries.dedup_by(|a, b| a.name == b.name);
     }
@@ -167,26 +170,50 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
     let selector = Selector::parse(spec)?;
     let image = Image::open_query(root)?;
     image.require_clean()?;
-    let publisher = image.publisher()?;
-    ensure!(
-        selector.publisher.is_none_or(|name| name == publisher.name),
-        "image is configured for publisher {}",
-        publisher.name
-    );
+    let publishers = image.publishers()?;
+    if let Some(name) = selector.publisher {
+        ensure!(
+            publishers.get(name).is_some(),
+            "publisher {name} is not configured in this image"
+        );
+    }
+    let installed = image.installed_package(selector.name)?;
+    if let Some(package) = &installed {
+        package.verify(selector.name, &publishers)?;
+    }
     let accepts = |version| selector.version.is_none_or(|wanted| wanted == version);
     let package = if from_catalog {
-        let entry = available(&publisher)?
-            .into_iter()
-            .find(|entry| entry.name == selector.name && accepts(entry.version))
-            .with_context(|| format!("package is absent from the signed catalog: {spec}"))?;
-        read_package(&publisher.repo, &publisher.name, &entry.id, entry.sha256)?
+        let source = selector.publisher.or_else(|| {
+            installed
+                .as_ref()
+                .map(|pkg| pkg.published.manifest.publisher.as_str())
+        });
+        for publisher in publishers.as_slice() {
+            if source.is_some_and(|name| publisher.name != name) {
+                continue;
+            }
+            let entries = available(publisher)?;
+            if let Some(entry) = entries
+                .into_iter()
+                .find(|entry| entry.name == selector.name && accepts(entry.version))
+            {
+                let package =
+                    read_package(&publisher.repo, &publisher.name, &entry.id, entry.sha256)?;
+                return Ok(manifest_text(&package.manifest));
+            }
+        }
+        anyhow::bail!("package is absent from the signed catalog: {spec}")
     } else {
-        let package = image
-            .installed_package(selector.name)?
-            .filter(|entry| accepts(entry.published.manifest.version))
-            .with_context(|| format!("package is not installed: {spec}"))?;
-        check_installed(selector.name, &package, &publisher)?;
-        package.published
+        installed
+            .filter(|entry| {
+                let manifest = &entry.published.manifest;
+                accepts(manifest.version)
+                    && selector
+                        .publisher
+                        .is_none_or(|name| name == manifest.publisher)
+            })
+            .with_context(|| format!("package is not installed: {spec}"))?
+            .published
     };
     Ok(manifest_text(&package.manifest))
 }

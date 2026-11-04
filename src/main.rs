@@ -10,11 +10,10 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
-    Activation, BuildOptions, BuildWitness, ImageConfig, Plan, Request, SourceLayout,
-    activate_boot_environment, apply, build_with_worker, create_image, fetch_sources,
-    import_sources, list_boot_environments, plan, publish, publish_witnessed_bundle,
-    read_attestation, read_image_config, read_worker_config, release, rollback_boot_environment,
-    stage_boot_environment, verify,
+    Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
+    apply, build_with_worker, create_configured_image, create_image, fetch_sources, import_sources,
+    list_boot_environments, plan, publish, publish_witnessed_bundle, read_attestation,
+    read_worker_config, release, rollback_boot_environment, stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -457,24 +456,17 @@ fn run(command: Command) -> Result<ExitCode> {
             arch,
             facet,
         } => {
-            let config = match config {
-                Some(path) => read_image_config(&path)?,
-                None => ImageConfig {
-                    repository: repo.context("missing repository")?,
-                    publisher: publisher.context("missing publisher")?,
-                    trust_key: trust_key.context("missing trust key")?,
-                    arch: arch.unwrap_or_else(|| std::env::consts::ARCH.to_owned()),
-                    facets: parse_facets(facet)?,
-                },
+            let id = match config {
+                Some(path) => create_configured_image(&root, &path)?,
+                None => create_image(
+                    &root,
+                    &repo.context("missing repository")?,
+                    &publisher.context("missing publisher")?,
+                    &trust_key.context("missing trust key")?,
+                    arch.as_deref().unwrap_or(std::env::consts::ARCH),
+                    parse_facets(facet)?,
+                )?,
             };
-            let id = create_image(
-                &root,
-                &config.repository,
-                &config.publisher,
-                &config.trust_key,
-                &config.arch,
-                config.facets,
-            )?;
             println!("Created image {id} at {}", root.display());
         }
         Command::List {

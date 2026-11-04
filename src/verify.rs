@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 
 use crate::{
     image::{Image, Managed, State, root::Root},
@@ -25,12 +25,7 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
 
 pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>> {
     for (name, package) in &state.installed {
-        let manifest = &package.published.manifest;
-        package.published.verify()?;
-        ensure!(
-            &manifest.name == name && manifest.publisher == state.publisher.name,
-            "invalid installed package identity for {name}"
-        );
+        package.verify(name, &state.publishers)?;
     }
     effective_paths(&state.settings, &state.installed)
 }

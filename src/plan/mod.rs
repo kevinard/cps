@@ -1,3 +1,4 @@
+mod catalogs;
 mod paths;
 mod repair;
 mod resolve;
@@ -14,7 +15,6 @@ use crate::{
     boot::kernel::{self, Artifacts},
     image::{Image, Settings, State, root::Root},
     model::{FORMAT, Node, digest, validate_name},
-    repo::snapshot,
     systemd::{self, Action as SystemdAction},
 };
 
@@ -49,6 +49,8 @@ pub(crate) struct Write {
 #[serde(deny_unknown_fields)]
 struct PackageChange {
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publisher: Option<String>,
     from: Option<String>,
     to: Option<String>,
 }
@@ -70,6 +72,8 @@ pub struct Plan {
     pub(crate) image: String,
     pub(crate) base_revision: u64,
     pub(crate) catalog: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) catalogs: BTreeMap<String, String>,
     pub(crate) request: Request,
     selected: BTreeMap<String, String>,
     package_changes: Vec<PackageChange>,
@@ -90,10 +94,14 @@ impl Plan {
             self.image, self.base_revision
         )];
         for change in &self.package_changes {
+            let name = change.publisher.as_ref().map_or_else(
+                || change.name.clone(),
+                |publisher| format!("cps://{publisher}/{}", change.name),
+            );
             lines.push(match (&change.from, &change.to) {
-                (Some(old), Some(new)) => format!("Update {} {old} -> {new}", change.name),
-                (None, Some(new)) => format!("Install {} {new}", change.name),
-                (Some(old), None) => format!("Remove {} {old}", change.name),
+                (Some(old), Some(new)) => format!("Update {name} {old} -> {new}"),
+                (None, Some(new)) => format!("Install {name} {new}"),
+                (Some(old), None) => format!("Remove {name} {old}"),
                 (None, None) => continue,
             });
         }
@@ -152,17 +160,18 @@ pub(crate) fn build(
     root: &Root,
     mut state: State,
     request: Request,
-    catalog: Option<&str>,
+    saved: Option<&Plan>,
     solver: Option<SolverRevision>,
 ) -> Result<(Plan, State)> {
-    let (catalog, installed, paths) = match &request {
+    let mut catalogs = catalogs::Catalogs::default();
+    let (installed, paths) = match &request {
         Request::Repair { .. } => {
             let paths = crate::verify::manifest_paths(&state)?;
             ensure!(
                 paths == state.paths,
                 "path ownership index differs from installed manifests"
             );
-            (None, state.installed.clone(), paths)
+            (state.installed.clone(), paths)
         }
         Request::Remove { packages } => {
             let names = requested_names(packages)?;
@@ -175,7 +184,7 @@ pub(crate) fn build(
             }
             resolve::check(&installed).context("removal would break installed dependencies")?;
             let paths = effective_paths(&state.settings, &installed)?;
-            (None, installed, paths)
+            (installed, paths)
         }
         _ => {
             let requested = match &request {
@@ -184,22 +193,16 @@ pub(crate) fn build(
                 }
                 _ => BTreeSet::new(),
             };
-            let packages = snapshot(
-                &state.publisher.repo,
-                &state.publisher.name,
-                &state.publisher.key,
-                catalog,
-            )?;
-            let (installed, paths) = resolve::resolve(
+            catalogs = catalogs::load(&state, saved)?;
+            resolve::resolve(
                 &state.installed,
-                &packages.packages,
+                &catalogs.packages,
                 &requested,
                 matches!(request, Request::Update),
                 matches!(request, Request::ExactInstall { .. }),
                 solver,
                 |installed| effective_paths(&state.settings, installed),
-            )?;
-            (Some(packages.sha256), installed, paths)
+            )?
         }
     };
     let revision = state
@@ -219,7 +222,8 @@ pub(crate) fn build(
         solver,
         image: state.settings.id.clone(),
         base_revision: state.settings.revision,
-        catalog,
+        catalog: catalogs.legacy,
+        catalogs: catalogs.pins,
         request,
         selected: installed
             .iter()
@@ -247,8 +251,17 @@ pub(crate) fn build(
             .get(name)
             .map(|new| new.published.manifest.version.to_string());
         if from != to {
+            let publisher = if state.publishers.as_slice().len() > 1 {
+                installed
+                    .get(name)
+                    .or_else(|| state.installed.get(name))
+                    .map(|entry| entry.published.manifest.publisher.clone())
+            } else {
+                None
+            };
             plan.package_changes.push(PackageChange {
                 name: name.clone(),
+                publisher,
                 from,
                 to,
             });

@@ -64,8 +64,18 @@ impl Fixture {
     }
 
     fn package(&self, name: &str, version: &str, actions: String) -> Result<()> {
+        self.package_as("canopa", name, version, actions)
+    }
+
+    fn package_as(
+        &self,
+        publisher: &str,
+        name: &str,
+        version: &str,
+        actions: String,
+    ) -> Result<()> {
         let manifest = format!(
-            "schema-version 1\npackage {name:?} publisher=\"canopa\" version={version:?} {{\n{actions}}}\n"
+            "schema-version 1\npackage {name:?} publisher={publisher:?} version={version:?} {{\n{actions}}}\n"
         );
         fs::write(&self.recipe, manifest)?;
         publish(&self.repo, &self.proto, &self.recipe, &self.private)?;
@@ -98,6 +108,191 @@ impl Fixture {
 
 fn dependency(kind: &str, name: &str, version: &str) -> String {
     format!("    {kind} {name:?} version=\"={version}\"\n")
+}
+
+#[test]
+fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
+    use crate::kdl_format::parse_manifest;
+    use crate::query::{Scope, list_packages, package_manifest};
+
+    let primary = Fixture::new()?;
+    let extra = Fixture::new()?;
+    primary.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        primary.file(COMPOSITOR, "base compositor 1", "0755", "")?,
+    )?;
+    extra.package_as(
+        "extras",
+        "desktop/compositor",
+        "9.0.0-0",
+        extra.file(COMPOSITOR, "extra compositor", "0755", "")?,
+    )?;
+    extra.package_as(
+        "extras",
+        "desktop/plugin",
+        "1.0.0-0",
+        extra.file(PLUGIN, "extra plugin 1", "0644", "")?
+            + "    require \"desktop/compositor\" version=\">=1.0.0-0\"\n",
+    )?;
+    extra.package_as(
+        "extras",
+        "desktop/strict",
+        "1.0.0-0",
+        dependency("require", "desktop/compositor", "9.0.0-0"),
+    )?;
+    let config = primary._dir.path().join("image.kdl");
+    let definition = |extra_key: &Path| {
+        format!(
+            "schema-version 1\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
+             publisher \"extras\" {{\n    repository {:?}\n    trust-key {:?}\n}}\n",
+            extra.repo, extra_key,
+        )
+    };
+    fs::write(&config, definition(&primary.public))?;
+    let wrong_key_root = primary.root.with_extension("wrong-key");
+    crate::create_configured_image(&wrong_key_root, &config)?;
+    let install = |name: &str| Request::Install {
+        packages: vec![name.to_owned()],
+    };
+    let error = format!(
+        "{:#}",
+        plan(&wrong_key_root, install("desktop/plugin")).unwrap_err()
+    );
+    assert!(error.contains("signed catalog for extras") && error.contains("invalid signature"));
+
+    fs::write(&config, definition(&extra.public))?;
+    crate::create_configured_image(&primary.root, &config)?;
+    let plan_for = |request| plan(&primary.root, request);
+    let error = format!("{:#}", plan_for(install("desktop/strict")).unwrap_err());
+    assert!(error.contains("cannot satisfy package constraints"));
+    let all = list_packages(&primary.root, Scope::AllAvailableVersions)?;
+    assert!(
+        all.iter()
+            .any(|row| row.id == "cps://extras/desktop/compositor@9.0.0-0")
+    );
+    let available = list_packages(&primary.root, Scope::Available)?;
+    assert_eq!(
+        available
+            .iter()
+            .find(|row| row.name == "desktop/compositor")
+            .unwrap()
+            .id,
+        "cps://canopa/desktop/compositor@1.0.0-0"
+    );
+    assert_eq!(
+        parse_manifest(&package_manifest(
+            &primary.root,
+            "cps://extras/desktop/compositor",
+            true
+        )?)?
+        .publisher,
+        "extras"
+    );
+    let saved = plan_for(install("desktop/plugin"))?;
+    assert_eq!(saved.catalog, None);
+    assert_eq!(
+        saved
+            .catalogs
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["canopa", "extras"]
+    );
+    assert!(
+        saved
+            .summary()
+            .contains("Install cps://canopa/desktop/compositor 1.0.0-0")
+    );
+    assert!(
+        saved
+            .summary()
+            .contains("Install cps://extras/desktop/plugin 1.0.0-0")
+    );
+
+    primary.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        primary.file(COMPOSITOR, "base compositor 2", "0755", "")?,
+    )?;
+    primary.package(
+        "desktop/plugin",
+        "9.0.0-0",
+        primary.file(PLUGIN, "base plugin", "0644", "")?,
+    )?;
+    extra.package_as(
+        "extras",
+        "desktop/plugin",
+        "2.0.0-0",
+        extra.file(PLUGIN, "extra plugin 2", "0644", "")?,
+    )?;
+    let mut tampered = saved.clone();
+    tampered.catalogs.remove("extras");
+    assert!(
+        apply(&primary.root, &tampered)
+            .unwrap_err()
+            .to_string()
+            .contains("catalogs do not match")
+    );
+    assert!(!primary.root.join(COMPOSITOR).exists());
+    assert_eq!(apply(&primary.root, &saved)?, 1);
+    assert_eq!(
+        fs::read_to_string(primary.root.join(COMPOSITOR))?,
+        "base compositor 1"
+    );
+    assert_eq!(
+        fs::read_to_string(primary.root.join(PLUGIN))?,
+        "extra plugin 1"
+    );
+    assert_eq!(
+        parse_manifest(&package_manifest(&primary.root, "desktop/plugin", true)?)?.publisher,
+        "extras"
+    );
+    let available = list_packages(&primary.root, Scope::Available)?;
+    assert_eq!(
+        available
+            .iter()
+            .find(|row| row.name == "desktop/plugin")
+            .unwrap()
+            .id,
+        "cps://extras/desktop/plugin@2.0.0-0"
+    );
+
+    let update = plan_for(Request::Update)?;
+    interrupt_apply(
+        &primary.root,
+        &primary._dir.path().join("update.json"),
+        &update,
+    )?;
+    let base_offline = primary.repo.with_extension("offline");
+    let extra_offline = extra.repo.with_extension("offline");
+    fs::rename(&primary.repo, &base_offline)?;
+    fs::rename(&extra.repo, &extra_offline)?;
+    assert_eq!(apply(&primary.root, &update)?, 2);
+    assert_eq!(
+        fs::read_to_string(primary.root.join(COMPOSITOR))?,
+        "base compositor 2"
+    );
+    assert_eq!(
+        fs::read_to_string(primary.root.join(PLUGIN))?,
+        "extra plugin 2"
+    );
+    assert!(verify(&primary.root)?.is_empty());
+
+    // Offline repair planning uses installed manifests. Apply reads the
+    // damaged package's payload from its own repository.
+    fs::write(primary.root.join(PLUGIN), "damaged")?;
+    let repair = plan_for(Request::Repair {
+        packages: vec!["desktop/plugin".into()],
+    })?;
+    fs::rename(&extra_offline, &extra.repo)?;
+    assert_eq!(apply(&primary.root, &repair)?, 3);
+    assert_eq!(
+        fs::read_to_string(primary.root.join(PLUGIN))?,
+        "extra plugin 2"
+    );
+    assert!(verify(&primary.root)?.is_empty());
+    Ok(())
 }
 
 #[test]

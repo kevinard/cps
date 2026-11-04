@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -9,7 +9,7 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 
 use crate::{
     boot::kernel::Kernel,
-    model::{Action, Dependency, DependencyTarget, FORMAT, Manifest},
+    model::{Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_publisher},
     systemd::Action as SystemdAction,
 };
 
@@ -405,6 +405,38 @@ pub struct ImageConfig {
 }
 
 pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
+    let ImageDefinition {
+        mut publishers,
+        arch,
+        facets,
+    } = read_image_definition(path)?;
+    ensure!(
+        publishers.len() == 1,
+        "use create_configured_image for multiple publishers"
+    );
+    let publisher = publishers.pop().expect("one publisher");
+    Ok(ImageConfig {
+        publisher: publisher.name,
+        repository: publisher.repository,
+        trust_key: publisher.trust_key,
+        arch,
+        facets,
+    })
+}
+
+pub(crate) struct PublisherConfig {
+    pub name: String,
+    pub repository: PathBuf,
+    pub trust_key: PathBuf,
+}
+
+pub(crate) struct ImageDefinition {
+    pub publishers: Vec<PublisherConfig>,
+    pub arch: String,
+    pub facets: BTreeMap<String, bool>,
+}
+
+pub(crate) fn read_image_definition(path: &Path) -> Result<ImageDefinition> {
     let input = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let parent = fs::canonicalize(path)?
         .parent()
@@ -413,31 +445,40 @@ pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
     parse_image_config(&input, &parent).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn parse_image_config(text: &str, parent: &Path) -> Result<ImageConfig> {
+fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
     let doc = document(text)?;
     schema(&doc)?;
-    let publisher = one(&doc, "publisher")?;
-    let publisher_name = Fields::read(publisher, 1, &[], true)?.string_arg(0)?;
-    let publisher = publisher
-        .children()
-        .context("publisher requires a configuration block")?;
-    let repository = Fields::read(one(publisher, "repository")?, 1, &[], false)?.string_arg(0)?;
-    let trust_key = Fields::read(one(publisher, "trust-key")?, 1, &[], false)?.string_arg(0)?;
-    ensure!(
-        publisher.nodes().len() == 2,
-        "expected repository and trust-key under publisher"
-    );
-    let mut config = ImageConfig {
-        publisher: publisher_name,
-        repository: parent.join(repository),
-        trust_key: parent.join(trust_key),
+    let mut config = ImageDefinition {
+        publishers: Vec::new(),
         arch: std::env::consts::ARCH.to_owned(),
         facets: BTreeMap::new(),
     };
     let mut architecture = false;
+    let mut names = BTreeSet::new();
     for node in doc.nodes() {
         match node.name().value() {
-            "schema-version" | "publisher" => {}
+            "schema-version" => {}
+            "publisher" => {
+                let name = Fields::read(node, 1, &[], true)?.string_arg(0)?;
+                validate_publisher(&name)?;
+                ensure!(names.insert(name.clone()), "duplicate publisher {name}");
+                let children = node
+                    .children()
+                    .context("publisher requires a configuration block")?;
+                let repo =
+                    Fields::read(one(children, "repository")?, 1, &[], false)?.string_arg(0)?;
+                let key =
+                    Fields::read(one(children, "trust-key")?, 1, &[], false)?.string_arg(0)?;
+                ensure!(
+                    children.nodes().len() == 2,
+                    "expected repository and trust-key under publisher"
+                );
+                config.publishers.push(PublisherConfig {
+                    name,
+                    repository: parent.join(repo),
+                    trust_key: parent.join(key),
+                });
+            }
             "architecture" => {
                 ensure!(!architecture, "duplicate architecture node");
                 architecture = true;
@@ -457,6 +498,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageConfig> {
             name => bail!("unknown image configuration node {name}"),
         }
     }
+    ensure!(!config.publishers.is_empty(), "missing publisher node");
     Ok(config)
 }
 
@@ -476,8 +518,14 @@ mod tests {
             facet "doc.man" #false
         "#;
         let parsed = parse_image_config(config, Path::new("/tmp/config"))?;
-        assert_eq!(parsed.repository, Path::new("/tmp/config/../repo"));
-        assert_eq!(parsed.trust_key, Path::new("/etc/keys/canopa.der"));
+        assert_eq!(
+            parsed.publishers[0].repository,
+            Path::new("/tmp/config/../repo")
+        );
+        assert_eq!(
+            parsed.publishers[0].trust_key,
+            Path::new("/etc/keys/canopa.der")
+        );
         assert_eq!(parsed.arch, "aarch64");
         assert!(!parsed.facets["doc.man"]);
         assert!(

@@ -22,7 +22,7 @@ pub use build::{
     build_with_worker,
     sources::{fetch_sources, import_sources},
 };
-pub use image::create_image;
+pub use image::{create_configured_image, create_image};
 pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{Plan, Request, plan};

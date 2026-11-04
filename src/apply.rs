@@ -72,7 +72,7 @@ pub(crate) fn apply_with(
             &image.root,
             state,
             plan.request.clone(),
-            plan.catalog.as_deref(),
+            Some(plan),
             plan.solver,
         )?;
         ensure!(
@@ -83,7 +83,7 @@ pub(crate) fn apply_with(
             &image.root,
             !checked.systemd.is_empty() || checked.kernel_install.is_some(),
         )?;
-        prepare(&stage, &checked.writes, &next.publisher.repo)?;
+        prepare(&stage, &checked.writes, &next)?;
         let pending = Pending {
             id,
             writes: checked.writes,
@@ -175,7 +175,7 @@ fn write_files(
     Ok(())
 }
 
-fn prepare(stage: &File, writes: &[Write], repo: &Path) -> Result<()> {
+fn prepare(stage: &File, writes: &[Write], state: &State) -> Result<()> {
     let dir = Root::fd_path(stage);
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
@@ -185,9 +185,35 @@ fn prepare(stage: &File, writes: &[Write], repo: &Path) -> Result<()> {
             fs::remove_file(entry.path())?;
         }
     }
-    for (hash, node) in payloads(writes) {
+    let payloads = payloads(writes);
+    let mut sources = std::collections::BTreeMap::new();
+    for managed in state.paths.values() {
+        if let Node::File { sha256, .. } = &managed.node
+            && payloads.contains_key(sha256.as_str())
+        {
+            let name = managed
+                .owners
+                .first()
+                .context("file has no owning package")?;
+            let owner = state
+                .installed
+                .get(name)
+                .context("file's owning package is absent")?;
+            sources
+                .entry(sha256.as_str())
+                .or_insert(&owner.published.manifest.publisher);
+        }
+    }
+    for (hash, node) in payloads {
+        let name = sources
+            .get(hash)
+            .with_context(|| format!("no owning publisher for payload {hash}"))?;
+        let publisher = state
+            .publishers
+            .get(name)
+            .with_context(|| format!("publisher {name} is not configured"))?;
         let mut file = NamedTempFile::new_in(&dir)?;
-        stage_blob(repo, node, file.as_file_mut())?;
+        stage_blob(&publisher.repo, node, file.as_file_mut())?;
         file.as_file().sync_all()?;
         file.persist_noclobber(dir.join(hash))?;
     }
