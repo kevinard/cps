@@ -2174,6 +2174,12 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
         "INSERT INTO catalog_archives VALUES ('canopa', ?1)",
         [&archive],
     )?;
+    let payload = f.root.join(".cps/stage").join(digest(b"second"));
+    fs::write(&payload, b"broken")?;
+    let error = crate::resume_transaction(&f.root).unwrap_err();
+    assert!(format!("{error:#}").contains("is corrupt"));
+    assert!(!f.root.join(SECOND).exists());
+    fs::write(payload, b"second")?;
     assert_eq!(crate::resume_transaction(&f.root)?, Some(2));
     assert_eq!(crate::resume_transaction(&f.root)?, None);
     let status = crate::transaction_status(&f.root)?;

@@ -2172,7 +2172,8 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
     let offline = f.repo.with_extension("offline");
     fs::rename(&f.repo, &offline)?;
     assert_eq!(fetch_plan(&staged, &accept)?, 0);
-    interrupt_apply_at(&staged, &f._dir.path().join("accept.json"), &accept, CONFIG)?;
+    let saved = f._dir.path().join("accept.json");
+    interrupt_apply_at(&staged, &saved, &accept, CONFIG)?;
     assert!(
         list_config_updates(&staged)
             .unwrap_err()
@@ -2180,7 +2181,11 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
             .contains("incomplete transaction")
     );
     fs::remove_file(vendor_copy)?;
-    assert_eq!(apply(&staged, &accept)?, 2);
+    fs::remove_file(saved)?;
+    let status = crate::transaction_status(&staged)?;
+    assert_eq!(status.revision, 2);
+    assert_eq!(status.pending.unwrap().target_revision, 2);
+    assert_eq!(crate::resume_transaction(&staged)?, Some(2));
     assert_eq!(apply(&staged, &accept)?, 2);
     assert_eq!(
         fs::read_to_string(staged.join(CONFIG))?,
