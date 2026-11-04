@@ -64,6 +64,8 @@ pub(crate) struct ReleaseProfile {
     pub architecture: String,
     pub facets: BTreeMap<String, bool>,
     pub companions: Vec<CatalogPin>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roots: BTreeMap<String, Version>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elf_library_dirs: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -113,14 +115,20 @@ impl CatalogPin {
             "pinned publisher differs from {publisher}"
         );
         let catalog = read_catalog(repo, &self.sha256, publisher, key)?;
+        self.check_lineage(&catalog, key)?;
+        Ok(catalog)
+    }
+
+    fn check_lineage(&self, catalog: &Catalog, key: &[u8]) -> Result<()> {
         if let Some(lineage) = &self.lineage {
             ensure!(
-                lineage == &CatalogLineage::new(key, &catalog),
-                "signed companion lineage differs from catalog {} for {publisher}",
-                self.sha256
+                lineage == &CatalogLineage::new(key, catalog),
+                "signed companion lineage differs from catalog {} for {}",
+                self.sha256,
+                self.publisher
             );
         }
-        Ok(catalog)
+        Ok(())
     }
 
     pub(crate) fn snapshot(&self, repo: &Path, publisher: &str, key: &[u8]) -> Result<Snapshot> {
@@ -310,6 +318,23 @@ impl Catalog {
                 ensure!(
                     !profile.elf_symbol_versions || next.elf_symbol_versions,
                     "release drops ELF symbol version checking for signed profile {name}"
+                );
+            }
+            if !profile.roots.is_empty() {
+                let next = next
+                    .filter(|next| !next.roots.is_empty())
+                    .with_context(|| {
+                        format!("release drops the composition roots for signed profile {name}")
+                    })?;
+                ensure!(
+                    profile.architecture == next.architecture
+                        && profile.facets == next.facets
+                        && profile
+                            .companions
+                            .iter()
+                            .map(|pin| &pin.publisher)
+                            .eq(next.companions.iter().map(|pin| &pin.publisher)),
+                    "release changes image configuration for signed profile {name}"
                 );
             }
             for pin in &profile.companions {
@@ -752,6 +777,15 @@ fn read_catalog_with_key(
         }
         for facet in profile.facets.keys() {
             validate_publisher(facet).context("invalid signed profile facet")?;
+        }
+        for (root, version) in &profile.roots {
+            validate_name(root)?;
+            ensure!(
+                catalog
+                    .entries
+                    .contains_key(&format!("cps://{publisher}/{root}@{version}")),
+                "signed profile {name} references unavailable root {root}@{version}"
+            );
         }
         let mut publishers = BTreeSet::from([publisher]);
         for pin in &profile.companions {
@@ -1634,6 +1668,7 @@ mod tests {
                 architecture: "x86_64".to_owned(),
                 facets: BTreeMap::new(),
                 companions: vec![pin.clone()],
+                roots: BTreeMap::new(),
                 elf_library_dirs: vec![],
                 elf_symbol_versions: false,
             },
@@ -1730,6 +1765,7 @@ mod tests {
                     architecture: "x86_64".to_owned(),
                     facets: BTreeMap::new(),
                     companions: Vec::new(),
+                    roots: BTreeMap::new(),
                     elf_library_dirs: vec!["/usr/lib".to_owned()],
                     elf_symbol_versions: true,
                 },

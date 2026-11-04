@@ -302,6 +302,160 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
 }
 
 #[test]
+fn upgrade_profile_reuses_signed_baseline_roots_and_companions() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    let uid = geteuid().as_raw();
+    let gid = getegid().as_raw();
+    let root_dir = format!("    dir \"opt/pinned-root\" mode=\"0755\" uid={uid} gid={gid}\n");
+    let companion_dir =
+        format!("    dir \"opt/pinned-companion\" mode=\"0755\" uid={uid} gid={gid}\n");
+    let dependency = "    require \"library/runtime\"\n";
+    seed.package_as("seed", "library/runtime", "1.0.0-0", companion_dir.clone())?;
+    let old_pin = fs::read_to_string(seed.repo.join("current"))?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        format!("{dependency}{root_dir}"),
+    )?;
+    let replacement = f.file("opt/pinned-root", "replacement", "0644", "")?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        format!("{dependency}{replacement}"),
+    )?;
+    f.package("test/retire", "1.0.0-0", String::new())?;
+
+    let write_policy = |version: &str, pin: &str, base: &str, override_pin: &str| {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "builder.der"
+    profile "desktop" architecture="x86_64" {base} {{
+        package "desktop/compositor@{version}"
+        publisher "seed" catalog={:?} {override_pin} {{
+            repository {:?}
+            trust-key {:?}
+        }}
+    }}
+}}
+"#,
+                pin.trim(),
+                seed.repo,
+                seed.public,
+            ),
+        )
+    };
+    write_policy("1.0.0-0", &old_pin, "", "")?;
+    withdraw_package(&f.repo, &f.private, "cps://canopa/test/retire@1.0.0-0")?;
+    let pointer = f.repo.join("current");
+    let signed_base = fs::read_to_string(&pointer)?;
+    let base = format!("upgrade-from={:?}", signed_base.trim());
+    let refresh = f._dir.path().join("refresh.kdl");
+    fs::write(
+        &refresh,
+        format!(
+            "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+            signed_base.trim()
+        ),
+    )?;
+    let rejected = |release: &Path, expected: &str| -> Result<()> {
+        let error = publish_release(&f.repo, &f.private, release).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(fs::read_to_string(&pointer)?, signed_base);
+        Ok(())
+    };
+    let policy = f.repo.join("publish-policy.kdl");
+    fs::write(
+        &policy,
+        fs::read_to_string(&policy)?.replace("architecture=\"x86_64\"", "architecture=\"aarch64\""),
+    )?;
+    rejected(
+        &refresh,
+        "release changes image configuration for signed profile desktop",
+    )?;
+
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{
+    repository {:?}
+    trust-key {:?}
+}}
+publisher "seed" {{
+    repository {:?}
+    trust-key {:?}
+}}
+"#,
+            f.repo, f.public, seed.repo, seed.public,
+        ),
+    )?;
+    create_configured_image(&f.root, &config)?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Install {
+                packages: vec!["desktop/compositor@1.0.0-0".to_owned()],
+            },
+        )?,
+    )?;
+    assert!(f.root.join("opt/pinned-root").is_dir());
+    assert!(f.root.join("opt/pinned-companion").is_dir());
+
+    write_policy("2.0.0-0", &old_pin, &base, "")?;
+    rejected(
+        &refresh,
+        "cannot change between directory and leaf actions at opt/pinned-root",
+    )?;
+
+    // Withdraw the rejected 2.0 layout so the next release can update the companion alone.
+    let retire_newer = f._dir.path().join("withdraw-newer.kdl");
+    fs::write(
+        &retire_newer,
+        format!(
+            "schema-version 1\nrelease \"canopa\" base={:?} {{\n    withdraw \"cps://canopa/desktop/compositor@2.0.0-0\"\n}}\n",
+            signed_base.trim()
+        ),
+    )?;
+    let replacement = seed.file("opt/pinned-companion", "replacement", "0644", "")?;
+    seed.package_as("seed", "library/runtime", "2.0.0-0", replacement)?;
+    let new_pin = fs::read_to_string(seed.repo.join("current"))?;
+    write_policy(
+        "1.0.0-0",
+        &new_pin,
+        &base,
+        &format!("upgrade-from={:?}", new_pin.trim()),
+    )?;
+    rejected(&retire_newer, "differs from the signed baseline pin")?;
+    write_policy("1.0.0-0", &new_pin, &base, "")?;
+    rejected(
+        &retire_newer,
+        "cannot change between directory and leaf actions at opt/pinned-companion",
+    )?;
+
+    seed.package_as("seed", "library/runtime", "3.0.0-0", companion_dir)?;
+    let latest_pin = fs::read_to_string(seed.repo.join("current"))?;
+    write_policy("1.0.0-0", &latest_pin, &base, "")?;
+    publish_release(&f.repo, &f.private, &retire_newer)?;
+    let upgrade = plan(&f.root, Request::Update)?;
+    assert_eq!(upgrade.catalogs["seed"], latest_pin.trim());
+    let staged = f._dir.path().join("staged");
+    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    assert!(staged.join("opt/pinned-root").is_dir());
+    assert!(staged.join("opt/pinned-companion").is_dir());
+    package_manifest(&staged, "cps://seed/library/runtime@3.0.0-0", false)?;
+    package_manifest(&f.root, "cps://seed/library/runtime@1.0.0-0", false)?;
+    Ok(())
+}
+
+#[test]
 fn release_profiles_pin_and_authenticate_sticky_companion_publishers() -> Result<()> {
     let f = Fixture::new()?;
     let seed = Fixture::new()?;

@@ -382,14 +382,21 @@ the release's publisher. Clients need support for profile enforcement to read
 catalogs that record this requirement.
 
 Set `upgrade-from="<signed catalog SHA-256>"` on a profile to also test a rolling
-upgrade from that historical catalog. CPS composes the baseline with the same
-package names, architecture, and facets, choosing the newest baseline versions
-for the profile roots. It runs the ordinary update solver with that installed
-set. The result must reach the candidate profile's requested versions, retain
-only packages available in the candidate, and pass the planner's directory and
+upgrade from that historical catalog. New signed profiles record the exact
+versions of the requested root packages from the checked composition. When the
+baseline has the same named profile, CPS uses its recorded roots and companion
+pins. The architecture, facets, and publisher order must match the baseline
+image configuration. For older catalogs without recorded roots, CPS selects
+the newest baseline versions of the current profile's root package names.
+
+CPS runs the ordinary update solver with the resulting installed set. The
+result must reach the candidate profile's requested versions, retain only
+packages available in the candidate, and pass the planner's directory and
 kernel transition checks. This models the package-managed state of a clean
-image. Live filesystem changes and boot health are checked separately during
-staging and boot.
+image. Live filesystem changes and boot health are checked during staging and
+boot. A profile that records its roots retains its image configuration across
+releases. Use a separate profile name for a new configuration. Upgrade clients
+before publishing profiles with recorded roots.
 
 For a native x86-64 or AArch64 profile, add `elf-check` with the image's
 ordered default library directories.
@@ -443,7 +450,10 @@ signer checks each pinned catalog against its configured trust key. It uses the
 release publisher first, then companions in declaration order. During an
 upgrade check, installed packages keep their original publishers. Set
 `upgrade-from` on a companion to pin a different baseline catalog for that
-publisher. Otherwise both compositions use its `catalog` pin. The primary
+publisher when the baseline lacks a signed record for the profile. If the
+baseline has that record, any companion `upgrade-from` must match its signed
+pin. A baseline without a profile record or a companion override uses the
+candidate's `catalog` pin. The primary
 catalog signs the checked architecture, facets, and ordered companion catalog
 digests. For each companion it also records the signed catalog sequence and
 the fingerprint of the provisioned trust anchor. Images verify both against
