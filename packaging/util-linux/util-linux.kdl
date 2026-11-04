@@ -1,0 +1,18 @@
+schema-version 1
+package "system/util-linux" publisher="canopa-util-linux" version="2.42.4-0" {
+    require "system/elf-runtime"
+    file "usr/bin/blkid" mode="0755" uid=0 gid=0
+    file "usr/bin/mount" mode="0755" uid=0 gid=0
+    file "usr/bin/umount" mode="0755" uid=0 gid=0
+    file "usr/lib/libblkid.so.1" mode="0644" uid=0 gid=0
+    file "usr/lib/libmount.so.1" mode="0644" uid=0 gid=0
+    file "usr/include/blkid/blkid.h" mode="0644" uid=0 gid=0 facet="devel"
+    file "usr/include/libmount/libmount.h" mode="0644" uid=0 gid=0 facet="devel"
+    symlink "usr/lib/libblkid.so" target="libblkid.so.1" uid=0 gid=0 facet="devel"
+    symlink "usr/lib/libmount.so" target="libmount.so.1" uid=0 gid=0 facet="devel"
+    file "usr/lib/pkgconfig/blkid.pc" mode="0644" uid=0 gid=0 facet="devel"
+    file "usr/lib/pkgconfig/mount.pc" mode="0644" uid=0 gid=0 facet="devel"
+    file "usr/share/licenses/util-linux/BSD-3-Clause.txt" mode="0644" uid=0 gid=0
+    file "usr/share/licenses/util-linux/GPL-2.0-or-later.txt" mode="0644" uid=0 gid=0
+    file "usr/share/licenses/util-linux/LGPL-2.1-or-later.txt" mode="0644" uid=0 gid=0
+}

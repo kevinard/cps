@@ -731,6 +731,23 @@ BusyBox output. Both roots are provisioned with the layout before booting.
 The test checks the aliases, shell, and interpreter on the trial and rollback
 boots and fails if systemd reports an unmerged `/usr`.
 
+#### Building util-linux for the boot image
+
+On the x86-64 Arch worker, verify the util-linux 2.42.4 release signature and
+place `util-linux-2.42.4.tar.xz` in a local source directory.
+[util-linux release archive and signature](https://www.kernel.org/pub/linux/utils/util-linux/v2.42/)
+
+```sh
+CPS_UTIL_LINUX_SOURCE_DIR=/path/to/verified-sources \
+tests/build-util-linux.sh target/util-linux-fixture target/usr-base-fixture
+```
+
+The fixture builds `mount`, `umount`, `blkid`, and their libraries twice
+offline. It publishes the matching outputs with signed build evidence, then
+installs the package into the signed merged base and runs the tools with its
+loader. The package also delivers the headers and linker inputs under the
+`devel` facet.
+
 #### Testing a source-built BusyBox
 
 On an x86-64 Arch Linux worker with a native GCC toolchain, run

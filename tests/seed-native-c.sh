@@ -5,18 +5,22 @@ unset LD_LIBRARY_PATH LD_PRELOAD GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPAT
 export PATH=/usr/bin:/bin LC_ALL=C
 umask 022
 
-seed=${1:?usage: seed-native-c.sh PROTOTYPE [--rust|--kernel|--systemd]}
+usage='usage: seed-native-c.sh PROTOTYPE [--rust|--kernel|--systemd|--util-linux]'
+seed=${1:?$usage}
 rust_root=
 kernel=false
 systemd=false
+util_linux=false
 if [[ $# == 2 && $2 == --rust ]]; then
     rust_root=$(rustc --print sysroot)
 elif [[ $# == 2 && $2 == --kernel ]]; then
     kernel=true
 elif [[ $# == 2 && $2 == --systemd ]]; then
     systemd=true
+elif [[ $# == 2 && $2 == --util-linux ]]; then
+    util_linux=true
 elif [[ $# != 1 ]]; then
-    echo 'usage: seed-native-c.sh PROTOTYPE [--rust|--kernel|--systemd]' >&2
+    echo "$usage" >&2
     exit 2
 fi
 mkdir -- "$seed"
@@ -84,6 +88,12 @@ while IFS= read -r file; do
     copy_file "$file" "${file#/}"
 done < <(awk '/^\/usr\/include\/.*[^\/]$/ || /^\/usr\/lib\/[^/]+\.a$/' <<< "$libc_files")
 
+if $util_linux; then
+    for tool in env ls pkg-config printf readlink true xz; do
+        copy_elf "/usr/bin/$tool" "usr/bin/$tool"
+    done
+    ln -s gcc "$seed/usr/bin/cc"
+fi
 if [[ -n $rust_root ]]; then
     rust_host=$(rustc -vV | sed -n 's/^host: //p')
     test -n "$rust_host"
