@@ -804,6 +804,20 @@ Older profiles can still be used with ordinary `plan install`. Use
 `repo publish-release` with `refresh-profiles=#true` to record the
 composition before using `install-profile`.
 
+To install a particular published release, set `bootstrap-catalog` to the
+primary publisher's signed catalog digest.
+
+```kdl
+release-profile "desktop" bootstrap-catalog="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+Keep that catalog and its signed companion catalogs in the configured local
+repositories or retained mirror caches. CPS uses the pin when creating the
+image, looking up available packages, and planning `install-profile`. Cache
+pruning with `--keep-image` retains the pinned catalogs' payloads. The first
+committed `install-profile` consumes the pin, and subsequent plans follow the
+current signed release.
+
 On a profiled image with installed packages, `plan update` uses the current
 profile's exact package set. It can add newly required packages and update
 compatible local additions. It preserves explicit install marks for local

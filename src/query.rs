@@ -114,7 +114,11 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
             .collect());
     }
     let settings = image.settings()?;
-    let pins = publishers.release_pins(&settings.arch, &settings.facets, None)?;
+    let pins = publishers.release_pins(
+        &settings.arch,
+        &settings.facets,
+        settings.bootstrap_catalog.as_deref(),
+    )?;
     let mut entries = Vec::new();
     let mut blocked = BTreeSet::new();
     for publisher in publishers.as_slice() {
@@ -169,7 +173,11 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
     let accepts = |version| selector.version.is_none_or(|wanted| wanted == version);
     let package = if from_catalog {
         let settings = image.settings()?;
-        let pins = publishers.release_pins(&settings.arch, &settings.facets, None)?;
+        let pins = publishers.release_pins(
+            &settings.arch,
+            &settings.facets,
+            settings.bootstrap_catalog.as_deref(),
+        )?;
         let source = selector.publisher.or_else(|| {
             installed
                 .as_ref()

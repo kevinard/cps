@@ -11,7 +11,8 @@ use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
     model::{
-        Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_name, validate_publisher,
+        Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_digest, validate_name,
+        validate_publisher,
     },
     repo::read_limited,
     systemd::Action as SystemdAction,
@@ -559,6 +560,7 @@ pub(crate) struct ImageDefinition {
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
     pub release_profile: Option<String>,
+    pub bootstrap_catalog: Option<String>,
     pub mirrors: BTreeMap<String, MirrorConfig>,
 }
 
@@ -585,6 +587,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         arch: std::env::consts::ARCH.to_owned(),
         facets: BTreeMap::new(),
         release_profile: None,
+        bootstrap_catalog: None,
         mirrors: BTreeMap::new(),
     };
     let mut architecture = false;
@@ -622,9 +625,14 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                     config.release_profile.is_none(),
                     "duplicate release-profile node"
                 );
-                let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                let fields = Fields::read(node, 1, &["bootstrap-catalog"], false)?;
+                let name = fields.string_arg(0)?;
                 validate_name(&name).context("invalid release profile name")?;
                 config.release_profile = Some(name);
+                config.bootstrap_catalog = fields.string("bootstrap-catalog")?;
+                if let Some(catalog) = &config.bootstrap_catalog {
+                    validate_digest(catalog).context("invalid bootstrap catalog")?;
+                }
             }
             "facet" => {
                 let fields = Fields::read(node, 2, &[], false)?;

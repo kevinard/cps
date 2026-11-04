@@ -265,6 +265,10 @@ pub(crate) fn build(
     saved: Option<&Plan>,
     solver: Option<SolverRevision>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
+    ensure!(
+        state.settings.bootstrap_catalog.is_none() || matches!(request, Request::InstallProfile),
+        "install the pinned bootstrap release with plan install-profile first"
+    );
     let mut catalogs = catalogs::Catalogs::default();
     let mut receipts = Vec::new();
     let mut update_profile = matches!(request, Request::UpdateProfile);
@@ -648,6 +652,9 @@ pub(crate) fn build(
                 .context("payload byte count overflow")
         })?;
     state.settings.revision = revision;
+    if state.settings.bootstrap_catalog.take().is_some() {
+        state.settings.format = state.publishers.image_format(false);
+    }
     state
         .settings
         .created_directories

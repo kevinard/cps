@@ -27,6 +27,8 @@ use crate::{
 
 // Earlier binaries must reject protected images instead of ignoring build trust.
 const BUILD_TRUST_IMAGE_FORMAT: u32 = 2;
+// Older binaries must reject an image before they can ignore its bootstrap pin.
+const BOOTSTRAP_IMAGE_FORMAT: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
@@ -43,6 +45,8 @@ pub struct Settings {
     pub(crate) created_directories: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_parent: Option<BootParent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bootstrap_catalog: Option<String>,
     // Absent on images that predate tracking. Their proposals are discovered
     // from the saved vendor copies the first time they are reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,8 +132,10 @@ impl Publishers {
             .find(|publisher| publisher.name == name)
     }
 
-    fn image_format(&self) -> u32 {
-        if self
+    pub(crate) fn image_format(&self, bootstrapping: bool) -> u32 {
+        if bootstrapping {
+            BOOTSTRAP_IMAGE_FORMAT
+        } else if self
             .as_slice()
             .iter()
             .any(|publisher| publisher.build_trust.is_some())
@@ -252,7 +258,7 @@ pub fn create_image(
     facets: BTreeMap<String, bool>,
 ) -> Result<String> {
     let publisher = Publisher::from_config(publisher, repo, trust_key)?;
-    initialize(path, Publishers::Single(publisher), arch, facets)
+    initialize(path, Publishers::Single(publisher), arch, facets, None)
 }
 
 pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
@@ -278,9 +284,24 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
         )
         .collect::<Result<Vec<_>>>()?;
     let publishers = Publishers::new(publishers, config.release_profile)?;
-    let pins = publishers.release_pins(&config.arch, &config.facets, None)?;
+    let profile = publishers.select_profile(
+        &config.arch,
+        &config.facets,
+        config.bootstrap_catalog.as_deref(),
+    )?;
+    if config.bootstrap_catalog.is_some() {
+        ensure!(
+            profile
+                .as_ref()
+                .is_some_and(|profile| !profile.record.composition.is_empty()),
+            "bootstrap catalog has no recorded signed composition for the profile"
+        );
+    }
     for publisher in publishers.as_slice() {
-        if let Some(pin) = pins.get(&publisher.name) {
+        if let Some(pin) = profile
+            .as_ref()
+            .and_then(|profile| profile.pin(&publisher.name))
+        {
             catalog_index(&publisher.repo, &publisher.name, &publisher.key, Some(pin))
                 .with_context(|| {
                     format!(
@@ -290,7 +311,13 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
                 })?;
         }
     }
-    initialize(path, publishers, &config.arch, config.facets)
+    initialize(
+        path,
+        publishers,
+        &config.arch,
+        config.facets,
+        config.bootstrap_catalog,
+    )
 }
 
 fn initialize(
@@ -298,6 +325,7 @@ fn initialize(
     publishers: Publishers,
     arch: &str,
     facets: BTreeMap<String, bool>,
+    bootstrap_catalog: Option<String>,
 ) -> Result<String> {
     validate_publisher(arch).context("invalid architecture")?;
     for facet in facets.keys() {
@@ -305,7 +333,7 @@ fn initialize(
     }
     let id = new_identity()?;
     let settings = Settings {
-        format: publishers.image_format(),
+        format: publishers.image_format(bootstrap_catalog.is_some()),
         id: id.clone(),
         revision: 0,
         publisher_generation: 0,
@@ -315,6 +343,7 @@ fn initialize(
         gid: getegid().as_raw(),
         created_directories: BTreeSet::new(),
         boot_parent: None,
+        bootstrap_catalog,
         config_updates: Some(BTreeMap::new()),
     };
     fs::create_dir_all(path)?;
@@ -450,7 +479,10 @@ impl Image {
     pub(crate) fn settings(&self) -> Result<Settings> {
         let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
         ensure!(
-            matches!(settings.format, FORMAT | BUILD_TRUST_IMAGE_FORMAT),
+            matches!(
+                settings.format,
+                FORMAT | BUILD_TRUST_IMAGE_FORMAT | BOOTSTRAP_IMAGE_FORMAT
+            ),
             "unsupported image format"
         );
         Ok(settings)
@@ -460,8 +492,9 @@ impl Image {
         let settings = self.settings()?;
         let publishers = self.publishers()?;
         ensure!(
-            settings.format == publishers.image_format(),
-            "image format does not match its build trust policy"
+            settings.format == publishers.image_format(settings.bootstrap_catalog.is_some())
+                && (settings.bootstrap_catalog.is_none() || publishers.release_profile().is_some()),
+            "image format does not match its build trust or bootstrap policy"
         );
         Ok(State {
             settings,

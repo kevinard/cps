@@ -276,7 +276,11 @@ pub(super) fn load(
     let profile = state.publishers.select_profile(
         &state.settings.arch,
         &state.settings.facets,
-        saved_pin(&publishers[0].name)?,
+        state
+            .settings
+            .bootstrap_catalog
+            .as_deref()
+            .or(saved_pin(&publishers[0].name)?),
     )?;
     let mut catalogs = Catalogs::default();
     for publisher in publishers {

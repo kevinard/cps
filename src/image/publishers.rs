@@ -221,7 +221,7 @@ fn audit(
             let pins = state.publishers.release_pins(
                 &state.settings.arch,
                 &state.settings.facets,
-                None,
+                state.settings.bootstrap_catalog.as_deref(),
             )?;
             audit_installed_builds(
                 &publisher.repo,
@@ -302,7 +302,7 @@ fn editable_publishers(image: &Image) -> Result<Publishers> {
 
 fn save(image: &mut Image, publishers: Publishers, receipts: &[BuildReceipt]) -> Result<()> {
     let mut settings = image.settings()?;
-    settings.format = publishers.image_format();
+    settings.format = publishers.image_format(settings.bootstrap_catalog.is_some());
     settings.publisher_generation = settings
         .publisher_generation
         .checked_add(1)

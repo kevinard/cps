@@ -1237,6 +1237,54 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(new_plan.catalogs["seed"], latest.trim());
     fetch_plan(&fresh_root, &new_plan)?;
 
+    let bootstrap_config = work.join("bootstrap.kdl");
+    fs::write(
+        &bootstrap_config,
+        fs::read_to_string(&config)?.replace(
+            "release-profile \"desktop\"",
+            &format!(
+                "release-profile \"desktop\" bootstrap-catalog={:?}",
+                first.trim()
+            ),
+        ),
+    )?;
+    let bootstrap_root = work.join("bootstrap-image");
+    create_configured_image(&bootstrap_root, &bootstrap_config)?;
+    let error = plan(&bootstrap_root, Request::Update).unwrap_err();
+    assert!(format!("{error:#}").contains("plan install-profile first"));
+    let bootstrap = plan(&bootstrap_root, Request::InstallProfile)?;
+    assert_eq!(bootstrap.catalogs, saved.catalogs);
+    assert_eq!(
+        list_packages(&bootstrap_root, Scope::Available)?
+            .into_iter()
+            .find(|row| row.name == "library/runtime")
+            .unwrap()
+            .id,
+        "cps://seed/library/runtime@1.0.0-0"
+    );
+    assert!(prune_seed(&[])?.blobs.contains(&(digest(b"old"), 3)));
+    assert!(
+        prune_seed(std::slice::from_ref(&bootstrap_root))?
+            .blobs
+            .is_empty()
+    );
+    let mut wrong_bootstrap = bootstrap.clone();
+    wrong_bootstrap.catalogs = new_plan.catalogs.clone();
+    let error = apply(&bootstrap_root, &wrong_bootstrap).unwrap_err();
+    assert!(format!("{error:#}").contains("differs from the signed release profile"));
+    fetch_plan(&bootstrap_root, &bootstrap)?;
+    assert_eq!(apply(&bootstrap_root, &bootstrap)?, 1);
+    assert_eq!(apply(&bootstrap_root, &bootstrap)?, 1);
+    package_manifest(&bootstrap_root, "cps://seed/library/runtime@1.0.0-0", false)?;
+    let upgrade_bootstrap = plan(&bootstrap_root, Request::Update)?;
+    assert_eq!(upgrade_bootstrap.catalogs, new_plan.catalogs);
+    apply(&bootstrap_root, &upgrade_bootstrap)?;
+    package_manifest(&bootstrap_root, "cps://seed/library/runtime@3.0.0-0", false)?;
+    assert_eq!(
+        fs::read_to_string(primary_cache.join("current"))?.trim(),
+        second
+    );
+
     let broken = crate::repo::sign_profile_with_missing_dependency(
         &f.repo,
         "canopa",
