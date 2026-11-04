@@ -172,6 +172,9 @@ fn resolve<'a>(paths: &'a BTreeMap<String, Managed>, absolute: &str) -> Result<O
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
+    if absolute.ends_with('/') {
+        pending.push_back(".");
+    }
     let mut resolved = Vec::new();
     let mut links = 0;
     while let Some(part) = pending.pop_front() {
@@ -195,6 +198,10 @@ fn resolve<'a>(paths: &'a BTreeMap<String, Managed>, absolute: &str) -> Result<O
                 resolved.pop();
                 if target.starts_with('/') {
                     resolved.clear();
+                }
+                // A trailing slash requires the resolved target to be a directory.
+                if target.ends_with('/') {
+                    pending.push_front(".");
                 }
                 for part in target.rsplit('/').filter(|part| !part.is_empty()) {
                     pending.push_front(part);

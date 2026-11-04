@@ -99,6 +99,11 @@ printf 'not an ELF library\n' > runtime/usr/lib/demo/libcps-demo.so.1
 publish_runtime 4.0.0-0
 write_policy
 reject_refresh 'incompatible ELF dependency libcps-demo.so.1'
+rm -- runtime/usr/lib/demo/libcps-demo.so.1
+ln -s libcps-demo.so.1.0/ runtime/usr/lib/demo/libcps-demo.so.1
+publish_runtime 5.0.0-0
+write_policy
+reject_refresh 'missing ELF dependency libcps-demo.so.1'
 sed -i '/elf-check {/,/        }/d' repo/publish-policy.kdl
 reject_refresh 'release drops ELF checking for signed profile desktop'
 
