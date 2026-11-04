@@ -354,7 +354,14 @@ tests/systemd-boot-vm.sh bless
 
 The script defaults to Arch Linux paths for the kernel, BusyBox, and systemd-boot. Set `CPS_VM_SYSTEMD_BOOT` if the EFI binary is elsewhere. It uses regular files and software emulation.
 
-The blessing fixture also needs the local systemd userspace, util-linux, binutils `strip`, kmod, and kernel support for EFI variables and FAT. It copies the installed VFAT and ISO-8859-1 modules for the running kernel. Set `CPS_VM_KERNEL_RELEASE` for another installed kernel, or `CPS_VM_FAT_BUILTIN=1` if VFAT and its character sets are built in.
+The fixture assembles each root from signed packages and runs `verify --pristine`
+before packing it into the VM disk. Its runtime package imports prebuilt host
+binaries, libraries, and VFAT and ISO-8859-1 modules into a prototype, then
+generates the manifest and publishes it through CPS. The blessing fixture needs
+the local systemd userspace, util-linux, binutils `strip`, kmod, and kernel
+support for EFI variables and FAT. Set `CPS_VM_KERNEL_RELEASE` for another
+installed kernel, or `CPS_VM_FAT_BUILTIN=1` if VFAT and its character sets are
+built in.
 
 For `kernel-upgrade`, provide the original kernel as `CPS_VM_KERNEL` with `CPS_VM_KERNEL_RELEASE`, and the upgrade as `CPS_VM_TRIAL_KERNEL` with `CPS_VM_TRIAL_KERNEL_RELEASE`. Both releases must be distinct, and both kernels need the built-in storage and console support listed above. This scenario also uses `cpio` and the host's `kernel-install` and `90-loaderentry.install` plugin.
 

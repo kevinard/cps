@@ -41,7 +41,7 @@ setup_systemd_guest() {
     local root=$1
     local systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
     local binary unit command
-    mkdir -p "$root"/{proc,sys,run,tmp,var/tmp,efi,etc/systemd/system,usr/lib/systemd/system-generators,usr/local/libexec,vm-modules}
+    mkdir -p "$root"/{etc/systemd/system,usr/bin,usr/lib/systemd/{system,system-generators},usr/local/libexec,vm-modules}
     local programs=(systemd systemd-bless-boot system-generators/systemd-bless-boot-generator)
     if [[ -x "$systemd/systemd-executor" ]]; then programs+=(systemd-executor); fi
     for binary in "${programs[@]}"; do
@@ -54,7 +54,6 @@ setup_systemd_guest() {
         copy_runtime_deps "$root" "$binary"
     done
     copy_runtime_deps "$root" "$(command -v blkid)" # systemd's ESP discovery loads libblkid
-    copy_runtime_deps "$root" "$root/usr/bin/cps"
     for unit in basic.target boot-complete.target local-fs.target multi-user.target \
         paths.target shutdown.target slices.target sockets.target swap.target \
         sysinit.target systemd-bless-boot.service timers.target; do
@@ -63,7 +62,7 @@ setup_systemd_guest() {
     printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
     printf 'root:x:0:\n' > "$root/etc/group"
     printf 'ID=canopa\nPRETTY_NAME="Canopa CPS VM"\n' > "$root/etc/os-release"
-    openssl rand -hex 16 > "$root/etc/machine-id"
+    printf '9b6c080d423b4a6090307e0670659a21\n' > "$root/etc/machine-id"
     mkdir -p "$root/etc/systemd/system.conf.d"
     printf '[Manager]\nDefaultStandardOutput=tty\nDefaultStandardError=inherit\n' > \
         "$root/etc/systemd/system.conf.d/vm-console.conf"
@@ -73,8 +72,14 @@ setup_systemd_guest() {
     cat > "$root/init" <<'GUEST'
 #!/bin/busybox sh
 set -e
+bb=/bin/busybox
 mount=/usr/bin/mount
+# The inactive root contains only packaged paths. Set up runtime mountpoints
+# before starting systemd.
+"$bb" mkdir -p /dev /proc /sys /run /efi
+"$bb" mkdir -p -m 1777 /tmp /var/tmp
 [ -b /dev/vda1 ] || "$mount" -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
 "$mount" -t proc proc /proc
 "$mount" -t sysfs sysfs /sys
 "$mount" -t cgroup2 cgroup2 /sys/fs/cgroup

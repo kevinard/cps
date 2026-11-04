@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run with a writable temporary directory and local, non-Secure-Boot OVMF firmware.
 set -euo pipefail
+umask 022
 
 mode=${1:-fallback}
 case $mode in
@@ -50,7 +51,7 @@ options='ro console=ttyS0 loglevel=3 init=/init'
 root_mib=64
 if $systemd_guest; then
     options='rw console=ttyS0 loglevel=3 init=/init systemd.log_target=console'
-    root_mib=256
+    root_mib=320
 elif [[ $mode == kernel-upgrade ]]; then
     root_mib=128
 fi
@@ -108,32 +109,25 @@ if $systemd_guest; then
     "$cps" publish --repo repo --proto proto --signing-key private.der cps.kdl
     packages+=(system/cps)
 fi
-cat > image.kdl <<'CONFIG'
-schema-version 1
-publisher "canopa" {
-    repository "repo"
-    trust-key "public.der"
-}
-CONFIG
-"$cps" image-create --root base --config image.kdl
-"$cps" plan --root base --output install.json install "${packages[@]}"
-"$cps" apply --root base install.json
-
-mkdir -p base/{boot,bin,dev}
+mkdir -p runtime/{bin,etc}
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
-    touch base/etc/cps-vm-assert-kernel
+    touch runtime/etc/cps-vm-assert-kernel
 else
-    cp "$kernel" base/boot/vmlinuz
+    mkdir -p runtime/boot
+    cp "$kernel" runtime/boot/vmlinuz
 fi
-cp -L "$busybox" base/bin/busybox
-copy_runtime_deps base "$busybox"
+cp -L "$busybox" runtime/bin/busybox
+copy_runtime_deps runtime "$busybox"
 if $systemd_guest; then
-    setup_systemd_guest base
+    setup_systemd_guest runtime
+    copy_runtime_deps runtime proto/usr/bin/cps
     if [[ $mode == rollback ]]; then
-        prepare_fat_modules base "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
+        prepare_fat_modules runtime "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
+        touch runtime/etc/cps-vm-assert-extra-publisher
     fi
 else
-    cat > base/init <<'GUEST'
+    mkdir runtime/dev
+    cat > runtime/init <<'GUEST'
 #!/bin/busybox sh
 set -e
 state=$(/bin/busybox cat /etc/cps-vm-state)
@@ -147,8 +141,23 @@ elif [ "$state" = previous ]; then
     /bin/busybox poweroff -f
 fi
 GUEST
-    chmod 0755 base/init
+    chmod 0755 runtime/init
 fi
+"$cps" manifest generate --proto runtime --publisher canopa --version 1.0.0-0 \
+    --uid "$(id -u)" --gid "$(id -g)" test/boot-runtime > runtime.kdl
+"$cps" publish --repo repo --proto runtime --signing-key private.der runtime.kdl
+packages+=(test/boot-runtime)
+cat > image.kdl <<'CONFIG'
+schema-version 1
+publisher "canopa" {
+    repository "repo"
+    trust-key "public.der"
+}
+CONFIG
+"$cps" image-create --root base --config image.kdl
+"$cps" plan --root base --output install.json install "${packages[@]}"
+"$cps" apply --root base install.json
+"$cps" verify --root base --pristine
 
 base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_uuid" --options "$options")
@@ -168,7 +177,6 @@ package "test/extra-marker" publisher="extras" version="1.0.0-0" {
 MANIFEST
     "$cps" publish --repo extras --proto proto --signing-key extras-private.der extra-marker.kdl
     "$cps" publisher add --root base --repo extras --trust-key extras-public.der extras
-    touch base/etc/cps-vm-assert-extra-publisher
 fi
 
 publish_state 2.0.0-0 trial
@@ -183,8 +191,8 @@ trial_id=${trial_id%% at *}
 diff -r esp-before esp
 test "$(cat base/etc/cps-vm-state)" = previous
 test "$(cat staged/etc/cps-vm-state)" = trial
-"$cps" verify --root base
-"$cps" verify --root staged
+"$cps" verify --root base --pristine
+"$cps" verify --root staged --pristine
 
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     grep -Fq "Prepare Linux $trial_release with kernel-install" update.log
