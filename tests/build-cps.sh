@@ -4,6 +4,7 @@ export LC_ALL=C
 umask 022
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
+source "$project/tests/build-toolchain.sh"
 cps=$(realpath -- "${CPS_TEST_BINARY:-"$project/target/debug/cps"}")
 output=$(realpath -m -- "${1:?usage: build-cps.sh OUTPUT-DIRECTORY [GIT-REVISION]}")
 revision=$(git -C "$project" rev-parse --verify --end-of-options "${2:-HEAD}^{commit}")
@@ -11,6 +12,9 @@ epoch=$(git -C "$project" show -s --format=%ct "$revision")
 registry=$(realpath -- "${CARGO_HOME:-$HOME/.cargo}/registry")
 runtime_sources=$(realpath -- "${CPS_RUNTIME_SOURCE_DIR:?Set CPS_RUNTIME_SOURCE_DIR to the directory containing the pinned SQLite and libseccomp archives}")
 arch=$(uname -m)
+cps_version=0.1.0-2
+sqlite_version=3.54.1-1
+seccomp_version=2.6.1-1
 [[ $arch == x86_64 ]] || { echo 'The ELF runtime seed requires an x86-64 worker' >&2; exit 1; }
 mkdir -m 700 -- "$output"
 work=$(mktemp -d "$output/.private.XXXXXXXX")
@@ -41,46 +45,112 @@ keypair builder
 keypair release
 keypair runtime-seed
 bash "$project/tests/seed-native-c.sh" "$work/native-rust" --rust
+# Preserve the worker's matched loader and C/GCC ABI as a separate signed
+# package that the sandbox and the installed CPS image both consume.
+for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1}; do
+    install -Dm755 "$work/native-rust/$path" "$work/elf-runtime/$path"
+    rm -- "$work/native-rust/$path"
+done
 "$cps" manifest generate --proto "$work/native-rust" --publisher seed --version 1.0.0-0 \
-    build/native-rust > native-rust.kdl
+    --uid "$(id -u)" --gid "$(id -g)" build/native-rust > native-rust.kdl
 "$cps" publish --repo toolchain --proto "$work/native-rust" --signing-key "$work/toolchain.der" native-rust.kdl
+"$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version 1.0.0-0 \
+    --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
+"$cps" publish --repo runtime-seed --proto "$work/elf-runtime" --signing-key "$work/runtime-seed.der" elf-runtime.kdl
+
+printf 'schema-version 1\n' > bootstrap-toolchain.kdl
+pins="$work/publisher-pins"
+append_toolchain_publisher "$pins" bootstrap-toolchain.kdl seed toolchain toolchain-public.der
+append_toolchain_publisher "$pins" bootstrap-toolchain.kdl canopa-runtime-seed runtime-seed runtime-seed-public.der
+toolchain_recipe="$work/toolchain-recipe"
+write_toolchain_recipe() {
+    {
+        printf '    toolchain solver="sat-v1" {\n'
+        cat "$pins"
+        printf '        package "%s"\n' \
+            cps://seed/build/native-rust@1.0.0-0 \
+            cps://canopa-runtime-seed/system/elf-runtime@1.0.0-0 "$@"
+        printf '    }\n'
+    } > "$toolchain_recipe"
+}
+write_toolchain_recipe
 
 fixture_manifest() {
     sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$1"
 }
 build_bundle() {
-    "$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \
-        --source-cache sources --output "$2" --check-reproducible \
-        --builder-signing-key "$work/builder.der" "$1"
+    "$cps" build --toolchain-config "$1" --source-cache sources --output "$3" \
+        --check-reproducible --builder-signing-key "$work/builder.der" "$2"
 }
 for library in sqlite libseccomp; do
     recipe="$project/packaging/runtime/$library"
     fixture_manifest "$recipe.kdl" > "$library.kdl"
-    sed -e "s/@ARCH@/$arch/g" -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
+    sed -e "s/@ARCH@/$arch/g" -e "/^@TOOLCHAIN@\$/ {
+r $toolchain_recipe
+d
+}" \
         -e "s/@MANIFEST_SHA256@/$(sha "$library.kdl")/g" \
         "$recipe.build.kdl.in" > "$library.build.kdl"
     "$cps" source import --from "$runtime_sources" --cache sources "$library.build.kdl"
-    build_bundle "$library.build.kdl" "$library.bundle"
+    build_bundle bootstrap-toolchain.kdl "$library.build.kdl" "$library.bundle"
 done
 
-linker="$work/cps-libraries/usr/lib"
-mkdir -p "$linker/pkgconfig"
-cp sqlite.bundle/proto/usr/lib/libsqlite3.so.0 libseccomp.bundle/proto/usr/lib/libseccomp.so.2 "$linker/"
-ln -s libsqlite3.so.0 "$linker/libsqlite3.so"
-ln -s libseccomp.so.2 "$linker/libseccomp.so"
-cat > "$linker/pkgconfig/sqlite3.pc" <<'PC'
-Name: SQLite
-Description: SQLite library built by CPS
-Version: 3.54.1
-Libs: -L/usr/lib -lsqlite3
-PC
-"$cps" manifest generate --proto "$work/cps-libraries" --publisher seed --version 1.0.0-0 \
-    build/cps-libraries > cps-libraries.kdl
-"$cps" publish --repo toolchain --proto "$work/cps-libraries" --signing-key "$work/toolchain.der" cps-libraries.kdl
+mkdir repo
+cp builder-public.der repo/
+sqlite_recipe=$(sha sqlite.build.kdl)
+seccomp_recipe=$(sha libseccomp.build.kdl)
+write_profile() {
+    local name=$1
+    shift
+    printf '    profile "%s" architecture="%s" {\n' "$name" "$arch"
+    if [[ $name == cps-runtime ]]; then printf '        facet "devel" #false\n'; fi
+    printf '        package "%s"\n' "$@"
+    cat <<PROFILE
+        publisher "canopa-runtime-seed" catalog="$(cat runtime-seed/current)" {
+            repository "../runtime-seed"
+            trust-key "../runtime-seed-public.der"
+        }
+    }
+PROFILE
+}
+write_policy() {
+    local reviewed=${1:-}
+    {
+        cat <<POLICY
+schema-version 1
+publisher "canopa" {
+    builder-key "builder-public.der"
+    approve "system/sqlite" version="$sqlite_version" sha256="$sqlite_recipe"
+    approve "system/libseccomp" version="$seccomp_version" sha256="$seccomp_recipe"
+POLICY
+        write_profile cps-build-libs "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version"
+        if [[ -n $reviewed ]]; then
+            printf '    approve "system/cps" version="%s" sha256="%s"\n' "$cps_version" "$reviewed"
+            write_profile cps-runtime "system/cps@$cps_version"
+        fi
+        printf '}\n'
+    } > repo/publish-policy.kdl
+}
+write_policy
+cat > bootstrap-release.kdl <<RELEASE
+schema-version 1
+release "canopa" base="empty" {
+    bundle "cps://canopa/system/sqlite@$sqlite_version" path="sqlite.bundle" builder-key="builder-public.der" recipe-sha256="$sqlite_recipe"
+    bundle "cps://canopa/system/libseccomp@$seccomp_version" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
+}
+RELEASE
+"$cps" repo publish-release --repo repo --signing-key "$work/release.der" bootstrap-release.kdl
+bootstrap_catalog=$(cat repo/current)
+cp bootstrap-toolchain.kdl toolchain.kdl
+append_toolchain_publisher "$pins" toolchain.kdl canopa repo release-public.der
+write_toolchain_recipe "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"
 
 fixture_manifest "$project/packaging/cps.kdl" > cps.kdl
 sed -e "s/@ARCH@/$arch/g" -e "s/@EPOCH@/$epoch/g" \
-    -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
+    -e "/^@TOOLCHAIN@\$/ {
+r $toolchain_recipe
+d
+}" \
     -e "s/@MANIFEST_SHA256@/$(sha cps.kdl)/g" \
     -e "s/@SOURCE_SIZE@/$(wc -c < "$work/sources/cps.tar.gz")/g" \
     -e "s/@SOURCE_SHA256@/$(sha "$work/sources/cps.tar.gz")/g" \
@@ -89,52 +159,24 @@ sed -e "s/@ARCH@/$arch/g" -e "s/@EPOCH@/$epoch/g" \
     "$project/packaging/cps-build.kdl.in" > build.kdl
 
 "$cps" source import --from "$work/sources" --cache sources build.kdl
-build_bundle build.kdl bundle
-
-# Capture the matching loader and C/GCC ABI for this bootstrap fixture.
-for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1}; do
-    install -Dm755 "/$path" "$work/elf-runtime/$path"
-done
-"$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
-"$cps" publish --repo runtime-seed --proto "$work/elf-runtime" --signing-key "$work/runtime-seed.der" elf-runtime.kdl
-
-mkdir repo
-cp builder-public.der repo/
+build_bundle toolchain.kdl build.kdl bundle
 reviewed=$(sha build.kdl)
-sqlite_recipe=$(sha sqlite.build.kdl)
-seccomp_recipe=$(sha libseccomp.build.kdl)
-cat > repo/publish-policy.kdl <<POLICY
-schema-version 1
-publisher "canopa" {
-    builder-key "builder-public.der"
-    approve "system/cps" version="0.1.0-1" sha256="$reviewed"
-    approve "system/sqlite" version="3.54.1-0" sha256="$sqlite_recipe"
-    approve "system/libseccomp" version="2.6.1-0" sha256="$seccomp_recipe"
-    profile "cps-runtime" architecture="$arch" {
-        package "system/cps@0.1.0-1"
-        publisher "canopa-runtime-seed" catalog="$(cat runtime-seed/current)" {
-            repository "../runtime-seed"
-            trust-key "../runtime-seed-public.der"
-        }
-    }
-}
-POLICY
+write_policy "$reviewed"
+cps_package=cps://canopa/system/cps@$cps_version
 cat > release.kdl <<RELEASE
 schema-version 1
-release "canopa" base="empty" {
-    bundle "cps://canopa/system/sqlite@3.54.1-0" path="sqlite.bundle" builder-key="builder-public.der" recipe-sha256="$sqlite_recipe"
-    bundle "cps://canopa/system/libseccomp@2.6.1-0" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
-    bundle "cps://canopa/system/cps@0.1.0-1" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
+release "canopa" base="$bootstrap_catalog" {
+    bundle "$cps_package" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
 }
 RELEASE
 "$cps" repo publish-release --repo repo --signing-key "$work/release.der" release.kdl
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
-    cps://canopa/system/cps@0.1.0-1 > attestation.json
+    "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
 cat > image.kdl <<CONFIG
 schema-version 1
 release-profile "cps-runtime"
+facet "devel" #false
 publisher "canopa" {
     repository "repo"
     trust-key "release-public.der"
@@ -145,9 +187,14 @@ publisher "canopa-runtime-seed" {
 }
 CONFIG
 "$cps" image-create --root image --config image.kdl
-"$cps" plan --root image --output install.json install cps://canopa/system/cps@0.1.0-1
+"$cps" plan --root image --output install.json install "$cps_package"
 "$cps" apply --root image install.json
 cmp bundle/proto/usr/bin/cps image/usr/bin/cps
+for path in usr/include/{sqlite3,sqlite3ext,seccomp,seccomp-syscalls}.h \
+    usr/lib/pkgconfig/{sqlite3,libseccomp}.pc usr/lib/{libsqlite3,libseccomp}.so; do
+    test ! -e "image/$path"
+    test ! -L "image/$path"
+done
 loader=(env -i "$PWD/image/lib64/ld-linux-x86-64.so.2" --inhibit-cache --library-path "$PWD/image/usr/lib")
 libraries=$("${loader[@]}" --list image/usr/bin/cps)
 for library in libsqlite3.so.0 libseccomp.so.2 libc.so.6 libm.so.6 libgcc_s.so.1; do

@@ -1,6 +1,10 @@
 schema-version 1
-package "system/libseccomp" publisher="canopa" version="2.6.1-0" {
+package "system/libseccomp" publisher="canopa" version="2.6.1-1" {
     require "system/elf-runtime"
     file "usr/lib/libseccomp.so.2" mode="0755" uid=0 gid=0
+    file "usr/include/seccomp.h" mode="0644" uid=0 gid=0 facet="devel"
+    file "usr/include/seccomp-syscalls.h" mode="0644" uid=0 gid=0 facet="devel"
+    file "usr/lib/pkgconfig/libseccomp.pc" mode="0644" uid=0 gid=0 facet="devel"
+    symlink "usr/lib/libseccomp.so" target="libseccomp.so.2" uid=0 gid=0 facet="devel"
     file "usr/share/licenses/libseccomp/LICENSE" mode="0644" uid=0 gid=0
 }

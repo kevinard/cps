@@ -179,23 +179,25 @@ CPS_RUNTIME_SOURCE_DIR=/path/to/runtime-sources tests/build-cps.sh target/cps-fi
 
 The fixture archives the selected Git commit and checks each cached crate
 archive against `Cargo.lock` before vendoring from a fresh offline Cargo home.
-It pins both archives, the package manifest, and a signed catalog containing
-the worker's Rust and C toolchain. CPS builds SQLite and libseccomp twice from
-the pinned upstream archives, then links its own two builds against those exact
-libraries. All three packages carry signed build evidence. The solver installs
-the declared runtime dependencies, and the fixture uses the installed loader
-and libraries to run the installed CPS binary and verify the image. A separate
-signed `runtime-seed` repository contains the worker's prebuilt ELF loader and
-C and GCC runtime libraries. A release profile pins the signed seed catalog
-and checks the complete CPS dependency set before publishing the three builds
-in one catalog.
+It builds SQLite and libseccomp twice offline and publishes both to an initial
+protected catalog. Their packages carry the headers, pkg-config files, and
+linker symlinks under the `devel` facet. The `cps-build-libs` profile
+validates both packages with that facet enabled.
+
+The CPS recipe pins that library catalog, the Rust and C toolchain catalog,
+and the `runtime-seed` catalog with the worker's prebuilt ELF loader and C
+and GCC runtime libraries. After two matching builds, the release adds CPS
+to the catalog and validates the `cps-runtime` profile with `devel` disabled.
+The fixture installs that profile and uses its own loader and libraries to
+run the installed CPS binary and verify the image.
 
 The output includes `source-revision`, the recipes, source cache, toolchain
 repository, protected package repository, and runtime seed repository. Set
 `CPS_VM_CPS_FIXTURE` to that output directory for a systemd VM boot test. The
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
-directory to also use that executable to assemble the guest.
+directory to also use that executable to assemble the guest. Set
+`CPS_VM_CPS_VERSION=0.1.0-1` when reusing the earlier runtime fixture.
 
 ### Preparing a source cache
 
