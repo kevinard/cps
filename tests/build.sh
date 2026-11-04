@@ -510,8 +510,16 @@ publisher "canopa" minimum-builders=2 {
     builder-key "other-public.der"
     approve "demo/hello" version="2.0.0-0" sha256="$hello2_reviewed"
     approve "library/platform" version="1.0.0-0" sha256="$platform_reviewed"
+    profile "base" architecture="$arch" {
+        package "demo/hello"
+    }
 }
 POLICY
+expect_failure 'checking release profile base' "$cps" publish-bundle \
+    --repo witnessed --signing-key signing.der --builder-key builder-public.der \
+    --recipe-sha256 "$hello2_reviewed" --witness other-public.der=hello2-b/attestation.json hello2-a
+test "$(cat witnessed/current)" = "$witnessed_catalog"
+
 cat > wave.kdl <<WAVE
 schema-version 1
 release "canopa" base="$witnessed_catalog" {
@@ -542,6 +550,16 @@ test "$(cat repeat/current)" = "$wave_catalog"
 test "$(find witnessed/catalogs -type f | wc -l)" -eq 2
 "$cps" repo withdrawals --repo witnessed --publisher canopa --trust-key public.der \
     | grep -F 'cps://canopa/demo/hello@1.0.0-0'
+expect_failure 'checking release profile base' "$cps" repo withdraw \
+    --repo witnessed --signing-key signing.der cps://canopa/library/platform@1.0.0-0
+mv witnessed/publish-policy.kdl gate.saved
+expect_failure 'protected repository is missing publish-policy.kdl' "$cps" repo withdraw \
+    --repo witnessed --signing-key signing.der cps://canopa/library/platform@1.0.0-0
+sed '/profile "base"/,+2d' gate.saved > witnessed/publish-policy.kdl
+expect_failure 'requires release composition profiles' "$cps" repo withdraw \
+    --repo witnessed --signing-key signing.der cps://canopa/library/platform@1.0.0-0
+mv gate.saved witnessed/publish-policy.kdl
+test "$(cat witnessed/current)" = "$wave_catalog"
 "$cps" plan --root image --output wave.json update
 "$cps" apply --root image wave.json
 "$cps" verify --root image --pristine

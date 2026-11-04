@@ -30,6 +30,7 @@ const PUBLISH_POLICY_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_RELEASE_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
+mod profiles;
 pub mod release;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,6 +47,8 @@ struct Catalog {
     withdrawals: BTreeMap<String, Withdrawal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<NonZeroU64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    profiles_required: bool,
 }
 
 impl Catalog {
@@ -58,6 +61,7 @@ impl Catalog {
             attestations_required: false,
             withdrawals: BTreeMap::new(),
             sequence: None,
+            profiles_required: false,
         }
     }
 
@@ -90,6 +94,10 @@ impl Catalog {
         ensure!(
             !self.attestations_required || next.attestations_required,
             "release disables the publisher's build evidence requirement"
+        );
+        ensure!(
+            !self.profiles_required || next.profiles_required,
+            "release disables the publisher's composition profile requirement"
         );
         for (id, record) in &self.withdrawals {
             ensure!(
@@ -468,6 +476,8 @@ pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
         key.public_key().as_ref(),
     )?;
     if catalog.withdraw(id)? {
+        let policy = read_publish_policy(repo, &catalog, false)?;
+        check_profiles(repo, &mut catalog, policy.as_ref())?;
         write_catalog(repo, catalog, &key)?;
     }
     Ok(())
@@ -577,16 +587,14 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
         current.as_deref().unwrap_or("empty"),
     );
     let mut catalog = publication_catalog(repo, &release.publisher, &key, current.as_deref())?;
-    let policy = if release
+    let publishes_bundles = release
         .changes
         .iter()
-        .any(|change| matches!(change, publish_release::Change::Bundle { .. }))
-    {
+        .any(|change| matches!(change, publish_release::Change::Bundle { .. }));
+    let policy = read_publish_policy(repo, &catalog, publishes_bundles)?;
+    if publishes_bundles {
         prepare_objects(repo)?;
-        read_publish_policy(repo, &catalog)?
-    } else {
-        None
-    };
+    }
     let mut changed = false;
     for change in release.changes {
         match change {
@@ -628,6 +636,7 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
         }
     }
     if changed {
+        check_profiles(repo, &mut catalog, policy.as_ref())?;
         write_catalog(repo, catalog, &key)
     } else {
         current.context("empty release has no published catalog")
@@ -667,7 +676,7 @@ fn publish_manifest(
     let current = publication_base(repo)?;
     let mut catalog = publication_catalog(repo, &manifest.publisher, key, current.as_deref())?;
     let id = manifest.id();
-    let policy = read_publish_policy(repo, &catalog)?;
+    let policy = read_publish_policy(repo, &catalog, true)?;
     prepare_objects(repo)?;
     if stage_manifest(
         repo,
@@ -677,6 +686,7 @@ fn publish_manifest(
         evidence,
         policy.as_ref(),
     )? {
+        check_profiles(repo, &mut catalog, policy.as_ref())?;
         write_catalog(repo, catalog, key)?;
     }
     Ok(id)
@@ -797,6 +807,7 @@ struct PublicationPolicy {
     approved: BTreeSet<String>,
     recipes: BTreeMap<String, String>,
     minimum_builders: usize,
+    profiles: BTreeMap<String, publish_policy::Profile>,
 }
 
 impl PublicationPolicy {
@@ -821,16 +832,32 @@ impl PublicationPolicy {
     }
 }
 
-fn read_publish_policy(repo: &Path, catalog: &Catalog) -> Result<Option<PublicationPolicy>> {
+fn check_profiles(
+    repo: &Path,
+    catalog: &mut Catalog,
+    policy: Option<&PublicationPolicy>,
+) -> Result<()> {
+    if let Some(policy) = policy.filter(|policy| !policy.profiles.is_empty()) {
+        profiles::check(repo, catalog, &policy.profiles)?;
+        catalog.profiles_required = true;
+    }
+    Ok(())
+}
+
+fn read_publish_policy(
+    repo: &Path,
+    catalog: &Catalog,
+    publishes_bundles: bool,
+) -> Result<Option<PublicationPolicy>> {
     if !path_present(&repo.join(PUBLISH_POLICY))? {
         ensure!(
-            !catalog.attestations_required,
+            !catalog.profiles_required && (!publishes_bundles || !catalog.attestations_required),
             "protected repository is missing {PUBLISH_POLICY}"
         );
         return Ok(None);
     }
     ensure!(
-        catalog.attestations_required || catalog.entries.is_empty(),
+        !publishes_bundles || catalog.attestations_required || catalog.entries.is_empty(),
         "configure publish policy before the repository's first publication"
     );
     let bytes = read_limited(
@@ -843,19 +870,26 @@ fn read_publish_policy(repo: &Path, catalog: &Catalog) -> Result<Option<Publicat
         policy.publisher == catalog.publisher,
         "publish policy names a different publisher"
     );
-    let mut approved = BTreeSet::new();
-    for path in policy.builder_keys {
-        let key = read_key(&repo.join(path))?;
-        approved.insert(digest(&key));
-    }
     ensure!(
-        approved.len() >= policy.minimum_builders,
-        "publish policy has fewer distinct builder keys than its threshold"
+        !catalog.profiles_required || !policy.profiles.is_empty(),
+        "protected repository requires release composition profiles"
     );
+    let mut approved = BTreeSet::new();
+    if publishes_bundles {
+        for path in policy.builder_keys {
+            let key = read_key(&repo.join(path))?;
+            approved.insert(digest(&key));
+        }
+        ensure!(
+            approved.len() >= policy.minimum_builders,
+            "publish policy has fewer distinct builder keys than its threshold"
+        );
+    }
     Ok(Some(PublicationPolicy {
         approved,
         recipes: policy.recipes,
         minimum_builders: policy.minimum_builders,
+        profiles: policy.profiles,
     }))
 }
 
@@ -981,6 +1015,7 @@ mod tests {
                 },
             )]),
             sequence: NonZeroU64::new(1),
+            profiles_required: true,
         };
         let mut next = previous.clone();
         next.sequence = NonZeroU64::new(3);
@@ -989,6 +1024,10 @@ mod tests {
         next.attestations_required = false;
         assert!(previous.check_successor(&next).is_err());
         next.attestations_required = true;
+
+        next.profiles_required = false;
+        assert!(previous.check_successor(&next).is_err());
+        next.profiles_required = true;
 
         next.attestations.remove(&active);
         assert!(previous.check_successor(&next).is_err());

@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail, ensure};
-use kdl::KdlDocument;
+use kdl::{KdlDocument, KdlNode};
 
 use crate::{
     attestation::MAX_BUILDERS,
-    model::{Version, validate_digest, validate_name, validate_publisher},
+    model::{PackageSpec, Version, validate_digest, validate_name, validate_publisher},
 };
 
 use super::{Fields, document, one, schema};
@@ -15,6 +15,67 @@ pub(crate) struct PublishPolicy {
     pub builder_keys: BTreeSet<String>,
     pub minimum_builders: usize,
     pub recipes: BTreeMap<String, String>,
+    pub profiles: BTreeMap<String, Profile>,
+}
+
+pub(crate) struct Profile {
+    pub arch: String,
+    pub facets: BTreeMap<String, bool>,
+    pub packages: BTreeMap<String, Option<Version>>,
+}
+
+fn profile(node: &KdlNode, publisher: &str) -> Result<(String, Profile)> {
+    let fields = Fields::read(node, 1, &["architecture"], true)?;
+    let name = fields.string_arg(0)?;
+    validate_name(&name)?;
+    let arch = fields.required_string("architecture")?;
+    validate_name(&arch).context("invalid profile architecture")?;
+    let mut packages = BTreeMap::new();
+    let mut facets = BTreeMap::new();
+    for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
+        match child.name().value() {
+            "package" => {
+                let selector = Fields::read(child, 1, &[], false)?.string_arg(0)?;
+                let spec = PackageSpec::parse(&selector)?;
+                ensure!(
+                    spec.publisher.is_none_or(|name| name == publisher),
+                    "profile package must belong to {publisher}"
+                );
+                ensure!(
+                    packages
+                        .insert(spec.name.to_owned(), spec.version)
+                        .is_none(),
+                    "duplicate profile package {}",
+                    spec.name
+                );
+            }
+            "facet" => {
+                let fields = Fields::read(child, 2, &[], false)?;
+                let facet = fields.string_arg(0)?;
+                ensure!(!facet.is_empty(), "empty profile facet");
+                let enabled = fields.args[1]
+                    .as_bool()
+                    .context("facet must be #true or #false")?;
+                ensure!(
+                    facets.insert(facet.clone(), enabled).is_none(),
+                    "duplicate profile facet {facet}"
+                );
+            }
+            kind => bail!("unknown profile node {kind}"),
+        }
+    }
+    ensure!(
+        !packages.is_empty(),
+        "profile {name} requires at least one package"
+    );
+    Ok((
+        name,
+        Profile {
+            arch,
+            facets,
+            packages,
+        },
+    ))
 }
 
 pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
@@ -35,6 +96,7 @@ pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
     validate_publisher(&publisher)?;
     let mut builder_keys = BTreeSet::new();
     let mut recipes = BTreeMap::new();
+    let mut profiles = BTreeMap::new();
     for node in node.children().into_iter().flat_map(KdlDocument::nodes) {
         match node.name().value() {
             "builder-key" => {
@@ -58,6 +120,13 @@ pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
                     "duplicate approval for {id}"
                 );
             }
+            "profile" => {
+                let (name, profile) = profile(node, &publisher)?;
+                ensure!(
+                    profiles.insert(name.clone(), profile).is_none(),
+                    "duplicate profile {name}"
+                );
+            }
             name => bail!("unknown publish policy node {name}"),
         }
     }
@@ -70,5 +139,6 @@ pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
         builder_keys,
         minimum_builders,
         recipes,
+        profiles,
     })
 }

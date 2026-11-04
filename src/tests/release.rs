@@ -169,6 +169,52 @@ fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn release_profiles_pin_latest_roots_and_use_image_facets() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(MANPAGE, "base documentation", "0644", "facet=\"doc.man\"")?,
+    )?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        dependency("require", "library/unavailable", "1.0.0-0"),
+    )?;
+    f.package(
+        "desktop/manual",
+        "1.0.0-0",
+        f.file(MANPAGE, "shared documentation", "0644", "")?,
+    )?;
+    f.package("test/retire", "1.0.0-0", String::new())?;
+    let old = fs::read_to_string(f.repo.join("current"))?;
+    let id = "cps://canopa/test/retire@1.0.0-0";
+    let write_policy = |root: &str, docs: bool| {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"builder.der\"\n    profile \"desktop\" architecture=\"x86_64\" {{\n        package {root:?}\n        package \"desktop/manual\"\n        facet \"doc.man\" #{docs}\n    }}\n}}\n",
+            ),
+        )
+    };
+
+    write_policy("desktop/compositor", false)?;
+    let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
+    assert!(format!("{error:#}").contains("library/unavailable"));
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, old);
+
+    write_policy("desktop/compositor@1.0.0-0", true)?;
+    let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
+    assert!(format!("{error:#}").contains(MANPAGE));
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, old);
+
+    write_policy("desktop/compositor@1.0.0-0", false)?;
+    withdraw_package(&f.repo, &f.private, id)?;
+    assert!(list_withdrawals(&f.repo, "canopa", &f.public)?.contains_key(id));
+    Ok(())
+}
+
 fn sign_release(
     fixture: &Fixture,
     mirror: &Path,

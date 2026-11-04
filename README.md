@@ -195,6 +195,28 @@ cps publish-bundle --repo repo --signing-key private.der --builder-key worker-a-
 
 CPS counts distinct authorized keys whose signatures cover the same build statement, including the exact payload hashes and pinned inputs. The release stores those signatures together in the DSSE envelope. The threshold applies at publication. Administrators establish worker independence by assigning keys to separately operated workers.
 
+Add a `profile` inside the policy's `publisher` block to require a representative
+image composition before changing the catalog.
+
+```kdl
+profile "desktop" architecture="x86_64" {
+    package "desktop/base"
+    package "system/kernel@7.2.11-0"
+    facet "doc.man" #false
+}
+```
+
+CPS resolves each profile against the candidate catalog using the image solver
+and the specified architecture and facets. An unversioned profile package
+selects its newest active version. Dependencies can select any compatible active
+version. The check covers dependencies, file ownership, and the consistency of
+selected kernel actions. Publish coordinated changes in one batch when the
+individual changes would break a profile. The first catalog that passes these
+checks records the requirement in its signature. Subsequent publications and
+withdrawals require a policy with at least one profile. Profiles check fresh
+image composition for the release's own publisher. Clients need support for
+profile enforcement to read catalogs that record this requirement.
+
 ## Signed releases and mirrors
 
 Group related package changes and withdrawals in a KDL release file. Use the
