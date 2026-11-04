@@ -220,18 +220,35 @@ pub fn snapshot(
     let catalog = read_catalog(repo, &hash, publisher, key)?;
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {
-        let package = load_manifest(repo, sha256)?;
-        ensure!(
-            package.manifest.id() == id && package.manifest.publisher == publisher,
-            "manifest identity mismatch for {id}"
-        );
-        packages.push(package);
+        packages.push(read_package(repo, publisher, &id, sha256)?);
     }
     Ok(Snapshot {
         sha256: hash,
         packages,
         attestations: catalog.attestations,
     })
+}
+
+pub(crate) fn catalog_entries(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+) -> Result<BTreeMap<String, String>> {
+    Ok(read_catalog(repo, &read_current(repo)?, publisher, key)?.entries)
+}
+
+pub(crate) fn read_package(
+    repo: &Path,
+    publisher: &str,
+    id: &str,
+    sha256: String,
+) -> Result<Published> {
+    let package = load_manifest(repo, sha256)?;
+    ensure!(
+        package.manifest.id() == id && package.manifest.publisher == publisher,
+        "manifest identity mismatch for {id}"
+    );
+    Ok(package)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8], immutable: bool) -> Result<()> {

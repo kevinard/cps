@@ -350,6 +350,81 @@ fn conditional_dependency_tracks_the_selected_runtime_version() -> Result<()> {
 }
 
 #[test]
+fn queries_signed_catalog_and_committed_installs_independently() -> Result<()> {
+    use crate::query::{Scope, Status, list_packages, package_manifest};
+
+    let f = Fixture::new()?;
+    f.package(
+        "library/libdisplay",
+        "1.0.0-0",
+        f.file(LIBRARY, "ABI 1", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        dependency("require", "library/libdisplay", "1.0.0-0")
+            + &f.file(COMPOSITOR, "installed", "0755", "")?,
+    )?;
+    f.create()?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Install {
+                packages: vec!["desktop/compositor".into()],
+            },
+        )?,
+    )?;
+    for version in ["2.0.0-0", "10.0.0-0"] {
+        f.package(
+            "desktop/compositor",
+            version,
+            f.file(COMPOSITOR, version, "0755", "")?,
+        )?;
+    }
+
+    let rows = list_packages(&f.root, Scope::Installed)?;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.id.as_str(), row.status))
+            .collect::<Vec<_>>(),
+        [
+            ("cps://canopa/desktop/compositor@1.0.0-0", Status::Explicit),
+            (
+                "cps://canopa/library/libdisplay@1.0.0-0",
+                Status::Dependency
+            ),
+        ]
+    );
+    let latest = list_packages(&f.root, Scope::Available)?;
+    assert_eq!(latest[0].id, "cps://canopa/desktop/compositor@10.0.0-0");
+    assert_eq!(latest[0].status, Status::Available);
+    let all = list_packages(&f.root, Scope::AllAvailableVersions)?;
+    assert_eq!(
+        all.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        [
+            "cps://canopa/desktop/compositor@10.0.0-0",
+            "cps://canopa/desktop/compositor@2.0.0-0",
+            "cps://canopa/desktop/compositor@1.0.0-0",
+            "cps://canopa/library/libdisplay@1.0.0-0",
+        ]
+    );
+    let found = package_manifest(&f.root, "cps://canopa/desktop/compositor@2.0.0-0", true)?;
+    assert!(found.contains("version=\"2.0.0-0\"") && found.contains(COMPOSITOR));
+    assert!(package_manifest(&f.root, "cps://other/desktop/compositor", true).is_err());
+    assert!(package_manifest(&f.root, "desktop/compositor@2.0.0-0", false).is_err());
+
+    let catalog = fs::read_to_string(f.repo.join("current"))?;
+    fs::write(f.repo.join("catalogs").join(catalog.trim()), b"{}")?;
+    assert!(list_packages(&f.root, Scope::Available).is_err());
+    fs::rename(&f.repo, f._dir.path().join("offline-repo"))?;
+    assert_eq!(list_packages(&f.root, Scope::Installed)?.len(), 2);
+    let found = package_manifest(&f.root, "desktop/compositor", false)?;
+    assert!(found.contains("version=\"1.0.0-0\"") && found.contains(COMPOSITOR));
+    Ok(())
+}
+
+#[test]
 fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
     let f = Fixture::new()?;
     let uid = geteuid().as_raw();

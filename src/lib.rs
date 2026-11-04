@@ -6,6 +6,7 @@ mod image;
 mod kdl_format;
 mod model;
 mod plan;
+pub mod query;
 mod repo;
 mod systemd;
 mod verify;

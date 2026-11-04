@@ -200,6 +200,14 @@ fn decode_rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<BTreeM
 
 impl Image {
     pub fn open(path: &Path, exclusive: bool) -> Result<Self> {
+        Self::open_database(path, exclusive, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    pub(crate) fn open_query(path: &Path) -> Result<Self> {
+        Self::open_database(path, false, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    }
+
+    fn open_database(path: &Path, exclusive: bool, flags: rusqlite::OpenFlags) -> Result<Self> {
         let root = Root::open(path)?;
         let state_dir = root.dir(".cps").context("opening image state")?;
         let lock = root.file(".cps/lock")?;
@@ -212,11 +220,11 @@ impl Image {
             },
         )?;
         root.file(".cps/state.sqlite")?;
-        let db = Connection::open_with_flags(
-            Root::fd_path(&state_dir).join("state.sqlite"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )?;
-        configure(&db)?;
+        let db =
+            Connection::open_with_flags(Root::fd_path(&state_dir).join("state.sqlite"), flags)?;
+        if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE) {
+            configure(&db)?;
+        }
         Ok(Self {
             root,
             db,
@@ -225,13 +233,33 @@ impl Image {
         })
     }
 
+    pub(crate) fn publisher(&self) -> Result<Publisher> {
+        decode(&self.db, "SELECT data FROM publishers WHERE id=1")
+    }
+
+    pub(crate) fn installed(&self) -> Result<BTreeMap<String, Installed>> {
+        decode_rows(&self.db, "SELECT name, data FROM installed")
+    }
+
+    pub(crate) fn installed_package(&self, name: &str) -> Result<Option<Installed>> {
+        let bytes: Option<String> = self
+            .db
+            .query_row("SELECT data FROM installed WHERE name=?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        bytes
+            .map(|bytes| Ok(serde_json::from_str(&bytes)?))
+            .transpose()
+    }
+
     pub fn state(&self) -> Result<State> {
         let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
         ensure!(settings.format == FORMAT, "unsupported image format");
         Ok(State {
             settings,
-            publisher: decode(&self.db, "SELECT data FROM publishers WHERE id=1")?,
-            installed: decode_rows(&self.db, "SELECT name, data FROM installed")?,
+            publisher: self.publisher()?,
+            installed: self.installed()?,
             paths: decode_rows(&self.db, "SELECT path, data FROM paths")?,
         })
     }

@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
+use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, ImageConfig, Plan, Request, activate_boot_environment, apply,
     build_package, create_image, list_boot_environments, plan, publish, publish_bundle,
@@ -85,6 +86,32 @@ enum Command {
         arch: Option<String>,
         #[arg(long, value_name = "NAME=BOOL")]
         facet: Vec<String>,
+    },
+    /// List installed packages or versions in the configured signed catalog
+    List {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        available: bool,
+        #[arg(long, requires = "available")]
+        all_versions: bool,
+    },
+    /// Search package names in the signed catalog or installed image
+    Search {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        installed: bool,
+        term: String,
+    },
+    /// Show an installed or available package's manifest in KDL
+    Info {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        available: bool,
+        #[arg(value_name = "NAME[@VERSION]")]
+        package: String,
     },
     /// Preview and save a package transaction
     Plan {
@@ -251,6 +278,15 @@ fn save(path: &Path, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+fn print_packages(rows: impl IntoIterator<Item = PackageRow>) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "PACKAGE\tSTATE")?;
+    for row in rows {
+        writeln!(out, "{}\t{}", row.id, row.status)?;
+    }
+    Ok(())
+}
+
 fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Build {
@@ -365,6 +401,41 @@ fn run(command: Command) -> Result<ExitCode> {
                 config.facets,
             )?;
             println!("Created image {id} at {}", root.display());
+        }
+        Command::List {
+            root,
+            available,
+            all_versions,
+        } => {
+            let scope = match (available, all_versions) {
+                (true, true) => Scope::AllAvailableVersions,
+                (true, false) => Scope::Available,
+                _ => Scope::Installed,
+            };
+            print_packages(list_packages(&root, scope)?)?;
+        }
+        Command::Search {
+            root,
+            installed,
+            term,
+        } => {
+            let term = term.trim().to_ascii_lowercase();
+            ensure!(!term.is_empty(), "search requires a package name fragment");
+            let scope = if installed {
+                Scope::Installed
+            } else {
+                Scope::Available
+            };
+            let packages = list_packages(&root, scope)?;
+            print_packages(packages.into_iter().filter(|row| row.name.contains(&term)))?;
+        }
+        Command::Info {
+            root,
+            available,
+            package,
+        } => {
+            let manifest = package_manifest(&root, &package, available)?;
+            std::io::stdout().lock().write_all(manifest.as_bytes())?;
         }
         Command::Plan {
             root,
