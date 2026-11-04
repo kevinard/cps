@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     iter,
     path::{Path, PathBuf},
 };
@@ -13,7 +13,8 @@ use crate::{
     model::validate_publisher,
     repo::{
         BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
-        audit_installed_builds, catalog_index, release_profile,
+        audit_installed_builds, canonical_repo, catalog_index, read_selected_catalog,
+        release_profile,
     },
 };
 
@@ -167,6 +168,77 @@ pub fn add_publisher_with_build_trust(
     let mut publishers = configured.as_slice().to_vec();
     publishers.push(publisher);
     save(&mut image, Publishers::new(publishers, None)?, &[])
+}
+
+/// Move one or more configured publishers to authenticated replacement caches.
+pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)]) -> Result<()> {
+    ensure!(
+        !replacements.is_empty(),
+        "specify at least one repository to change"
+    );
+    let mut image = Image::open(root, true)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    let mut publishers = state.publishers.as_slice().to_vec();
+    let mut specified = BTreeSet::new();
+    let mut changed = BTreeSet::new();
+    for (name, repo) in replacements {
+        ensure!(
+            specified.insert(name),
+            "duplicate repository for publisher {name}"
+        );
+        let index = position(&publishers, name)?;
+        let publisher = &mut publishers[index];
+        let repo = canonical_repo(repo)?;
+        if publisher.repo != repo {
+            publisher.repo = repo;
+            changed.insert(name);
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let profile_name = state.publishers.release_profile().map(str::to_owned);
+    let publishers = Publishers::new(publishers, profile_name)?;
+    let profile = publishers.select_profile(
+        &state.settings.arch,
+        &state.settings.facets,
+        state.settings.bootstrap_catalog.as_deref(),
+        None,
+    )?;
+    for publisher in publishers.as_slice() {
+        if profile.is_none() && !changed.contains(&publisher.name) {
+            continue;
+        }
+        let pin = profile
+            .as_ref()
+            .and_then(|profile| profile.pin(&publisher.name));
+        let check = || {
+            let (catalog, hash) =
+                read_selected_catalog(&publisher.repo, &publisher.name, &publisher.key, pin)?;
+            image.check_relocation(&state, publisher, &catalog, &catalog.checkpoint(hash))?;
+            let policies = publisher
+                .build_trust
+                .iter()
+                .chain(pin.and_then(|pin| pin.build_trust.as_ref()));
+            for trust in policies {
+                for key in catalog.publisher_keys(&publisher.key)? {
+                    trust.check_publisher_key(&key)?;
+                }
+            }
+            for (name, package) in &state.installed {
+                if package.published.manifest.publisher == publisher.name {
+                    package.verify(name, &publishers)?;
+                    catalog
+                        .check_installed(&package.published)
+                        .with_context(|| format!("checking installed package {name}"))?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        check().with_context(|| format!("checking replacement catalog for {}", publisher.name))?;
+    }
+    save(&mut image, publishers, &[])
 }
 
 /// Replace the locally provisioned builder policy. Audit installed packages

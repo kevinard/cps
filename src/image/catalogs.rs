@@ -213,6 +213,45 @@ pub(super) fn retain(tx: &Transaction<'_>, settings: &Settings) -> Result<()> {
 }
 
 impl Image {
+    pub(super) fn check_relocation(
+        &self,
+        state: &State,
+        publisher: &Publisher,
+        next: &Catalog,
+        checkpoint: &CatalogCheckpoint,
+    ) -> Result<()> {
+        let settings = &state.settings;
+        settings.check_catalog(&publisher.name, checkpoint)?;
+        let point = settings.catalog_checkpoints.get(&publisher.name);
+        let legacy = settings
+            .archived_profile_catalog
+            .as_deref()
+            .filter(|_| state.publishers.as_slice()[0].name == publisher.name);
+        let Some(previous_hash) = legacy.or(point.map(|point| point.catalog.as_str())) else {
+            return Ok(());
+        };
+        if previous_hash == checkpoint.catalog {
+            return Ok(());
+        }
+        let previous = if let Some(point) = point.filter(|_| settings.catalog_archives) {
+            read_checkpoint(&self.db, publisher, point)?
+        } else if legacy.is_some() {
+            let bytes = read_legacy(&self.db)?;
+            decode_archived_catalog(&bytes, previous_hash, &publisher.name, &publisher.key)?
+        } else {
+            let bytes = catalog_bytes(&publisher.repo, previous_hash).with_context(|| {
+                format!(
+                    "relocation requires the last applied catalog {previous_hash} for {}",
+                    publisher.name
+                )
+            })?;
+            point
+                .context("missing installed checkpoint")?
+                .read_archive(&bytes, &publisher.name, &publisher.key)?
+        };
+        previous.check_successor(next, previous_hash)
+    }
+
     pub(crate) fn check_catalog(
         &self,
         publishers: &Publishers,

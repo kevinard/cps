@@ -2284,6 +2284,12 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     for repo in [&f.repo, &seed.repo] {
         fs::rename(repo, repo.with_extension("offline"))?;
     }
+    let replacements = [
+        ("canopa".to_owned(), f.repo.with_extension("offline")),
+        ("seed".to_owned(), seed.repo.with_extension("offline")),
+    ];
+    let error = crate::set_publisher_repositories(&f.root, &replacements).unwrap_err();
+    assert!(error.to_string().contains("incomplete transaction"));
     apply(&f.root, &install)?;
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     {
@@ -2322,6 +2328,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     let good_primary = fs::read_to_string(&primary_pointer)?;
     let good_seed = fs::read_to_string(&seed_pointer)?;
     let good_plan = plan(&f.root, Request::Update)?;
+    let plain_plan = plan(&plain, Request::Update)?;
 
     fs::write(&seed_pointer, seed_branch)?;
     fs::write(&primary_pointer, primary_branch)?;
@@ -2346,10 +2353,93 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     }
     let error = apply(&f.root, &fork).unwrap_err();
     assert!(format!("{error:#}").contains(reason), "{error:#}");
-    fs::write(primary_pointer, good_primary)?;
-    fs::write(seed_pointer, good_seed)?;
-    apply(&f.root, &good_plan)?;
+
+    for (source, (_, replacement)) in [&f.repo, &seed.repo].into_iter().zip(&replacements) {
+        fs::rename(source, replacement)?;
+    }
+    let settings = || crate::image::Image::open_query(&f.root)?.settings();
+    let before = settings()?;
+    let error = crate::set_publisher_repositories(&f.root, &replacements).unwrap_err();
+    assert!(format!("{error:#}").contains(reason), "{error:#}");
+    assert_eq!(settings()?, before);
+    assert_eq!(crate::list_publishers(&f.root)?[0].repository, f.repo);
+    assert_eq!(crate::list_publishers(&f.root)?[1].repository, seed.repo);
+    let error = crate::set_publisher_repositories(&plain, &replacements[1..]).unwrap_err();
+    assert!(format!("{error:#}").contains(reason), "{error:#}");
+    assert_eq!(crate::list_publishers(&plain)?[0].repository, seed.repo);
+
+    fs::write(replacements[0].1.join("current"), good_primary)?;
+    fs::write(replacements[1].1.join("current"), good_seed)?;
+    crate::set_publisher_repositories(&f.root, &replacements)?;
+    let mut expected = before;
+    expected.publisher_generation += 1;
+    assert_eq!(settings()?, expected);
+    crate::set_publisher_repositories(&f.root, &replacements)?;
+    assert_eq!(settings()?, expected);
+    assert_eq!(
+        crate::list_publishers(&f.root)?[0].repository,
+        replacements[0].1
+    );
+    assert_eq!(
+        crate::list_publishers(&f.root)?[1].repository,
+        replacements[1].1
+    );
+    assert!(
+        apply(&f.root, &good_plan)
+            .unwrap_err()
+            .to_string()
+            .contains("publisher configuration changed")
+    );
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    crate::set_publisher_repositories(&plain, &replacements[1..])?;
+    assert!(
+        apply(&plain, &plain_plan)
+            .unwrap_err()
+            .to_string()
+            .contains("publisher configuration changed")
+    );
     apply(&plain, &plan(&plain, Request::Update)?)?;
+    Ok(())
+}
+
+#[test]
+fn legacy_cache_relocation_requires_the_applied_catalog() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("test/pkg", "1.0.0-0", String::new())?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/pkg".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    let applied = fs::read_to_string(f.repo.join("current"))?;
+    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    db.execute(
+        "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'), '$.format', 4) WHERE id=1",
+        [],
+    )?;
+    db.execute("DROP TABLE catalog_archives", [])?;
+
+    f.package("test/pkg", "2.0.0-0", String::new())?;
+    let replacement = f.repo.with_extension("replacement");
+    fs::rename(&f.repo, &replacement)?;
+    let predecessor = replacement.join("catalogs").join(applied.trim());
+    let bytes = fs::read(&predecessor)?;
+    fs::remove_file(&predecessor)?;
+    let locations = [("canopa".into(), replacement)];
+    let error = crate::set_publisher_repositories(&f.root, &locations).unwrap_err();
+    assert!(format!("{error:#}").contains("relocation requires the last applied catalog"));
+    assert_eq!(crate::list_publishers(&f.root)?[0].repository, f.repo);
+    fs::write(predecessor, bytes)?;
+    crate::set_publisher_repositories(&f.root, &locations)?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert!(verify(&f.root)?.is_empty());
+    assert_eq!(
+        crate::list_publishers(&f.root)?[0].repository,
+        locations[0].1
+    );
     Ok(())
 }
 

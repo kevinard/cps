@@ -21,7 +21,8 @@ use cps::{
     list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
     publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
     rollback_boot_environment, rollback_boot_environment_on_disk, rotate_publisher_key,
-    set_publisher_build_trust, stage_boot_environment, verify, verify_pristine, withdraw_package,
+    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment, verify,
+    verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -248,6 +249,13 @@ enum PublisherCommand {
         build_trust: Option<PathBuf>,
         name: String,
     },
+    /// Replace one or more local repository paths as a single change
+    SetRepository {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, required = true, value_name = "PUBLISHER=PATH", value_parser = parse_repository)]
+        repo: Vec<(String, PathBuf)>,
+    },
     /// Replace a publisher's locally configured builder keys and threshold
     SetBuildTrust {
         #[arg(long)]
@@ -288,6 +296,14 @@ fn parse_witness(value: &str) -> std::result::Result<BuildWitness, String> {
         key: key.into(),
         attestation: attestation.into(),
     })
+}
+
+fn parse_repository(value: &str) -> std::result::Result<(String, PathBuf), String> {
+    let (publisher, path) = value.split_once('=').ok_or("expected PUBLISHER=PATH")?;
+    if publisher.is_empty() || path.is_empty() {
+        return Err("publisher and repository path are required".to_owned());
+    }
+    Ok((publisher.to_owned(), path.into()))
 }
 
 #[derive(Subcommand)]
@@ -943,6 +959,9 @@ fn run(command: Command) -> Result<ExitCode> {
                     &trust_key,
                     build_trust.as_deref(),
                 )?;
+            }
+            PublisherCommand::SetRepository { root, repo } => {
+                set_publisher_repositories(&root, &repo)?;
             }
             PublisherCommand::SetBuildTrust {
                 root,

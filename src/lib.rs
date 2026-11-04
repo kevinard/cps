@@ -32,6 +32,7 @@ pub use generate::{generate_manifest, generate_manifest_for_architecture};
 pub use image::publishers::{
     PublisherInfo, add_publisher, add_publisher_with_build_trust, audit_publisher_builds,
     list_publishers, prefer_publisher, remove_publisher, set_publisher_build_trust,
+    set_publisher_repositories,
 };
 pub use image::{create_configured_image, create_image};
 pub use kdl_format::worker::read_worker_config;

@@ -201,7 +201,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-8`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-9`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -823,13 +823,32 @@ comes from that publisher and at least one publisher remains.
 These changes invalidate outstanding plans for the image and preserve its
 boot environment identity. They are local to the named image root.
 
+Use `publisher set-repository` to move configured publishers to replacement
+local repositories or caches. Supply multiple `--repo` arguments to move
+the paths together in one transaction.
+
+```sh
+cps publisher set-repository --root image \
+    --repo canopa=/srv/cps/canopa --repo extras=/srv/cps/extras
+```
+
+CPS verifies the replacement catalogs with the installed trust keys and
+checks them against the image's catalog checkpoints. Signed profiles validate
+their primary catalog and every pinned companion together. A legacy image
+with only a compact checkpoint requires the last applied catalog in the
+replacement cache if the candidate is newer. An index-only cache works once
+it contains the required signed catalogs. Package payloads are fetched during
+the normal plan and apply workflow. Relocation invalidates outstanding plans
+and preserves the installed packages, boot identity, and applied checkpoints.
+Use the new paths in the KDL configuration used for subsequent mirror syncs.
+
 ### Images that follow a signed release profile
 
 Add `release-profile "desktop"` to the image KDL to follow that profile in the
 first publisher's signed catalog. Configure the same architecture, facets, and
 publisher order as the profile. Each companion repository must have the signed
-catalog referenced by the profile. Publisher changes on a profiled image
-require a new image configuration.
+catalog referenced by the profile. Changing publisher membership or order
+requires a new image configuration. Repository paths can be relocated in place.
 
 On an image with no installed packages, use the profile's checked roots and
 dependencies directly.
@@ -1341,7 +1360,9 @@ a signed release profile. Use a current CPS build on the host and provide the
 signed CPS and BusyBox fixtures. The test installs the signed base
 composition, publishes the companion update, and checks that the profile
 still selects the old kernel. It advances the profile through the automatic
-upgrade check before staging and booting the trial.
+upgrade check before staging and booting the trial. When slot recycling is
+disabled, the test also moves the primary and companion caches together and
+checks that the previous saved plan is stale.
 
 With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to bootstrap
 the base and activate the trial from a rescue VM with a writable virtio disk.

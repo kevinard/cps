@@ -201,6 +201,14 @@ impl CatalogPin {
 }
 
 impl Catalog {
+    pub(crate) fn checkpoint(&self, catalog: String) -> CatalogCheckpoint {
+        CatalogCheckpoint {
+            catalog,
+            sequence: self.sequence,
+            rotations: self.key_rotations.clone(),
+        }
+    }
+
     fn empty(publisher: &str) -> Self {
         Self {
             format: FORMAT,
@@ -848,11 +856,7 @@ pub(crate) fn audit_installed_builds<'a>(
         trust.check_publisher_key(&key)?;
     }
     let mut audit = BuildAudit::default();
-    let history = CatalogCheckpoint {
-        catalog: hash,
-        sequence: catalog.sequence,
-        rotations: catalog.key_rotations.clone(),
-    };
+    let history = catalog.checkpoint(hash);
     check(&history)?;
     for package in installed {
         let id = package.manifest.id();
@@ -1147,7 +1151,7 @@ pub(crate) fn catalog_index(
     })
 }
 
-fn read_selected_catalog(
+pub(crate) fn read_selected_catalog(
     repo: &Path,
     publisher: &str,
     key: &[u8],
