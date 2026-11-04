@@ -84,6 +84,7 @@ fn activate_disk(
         disk: &stage.disk,
         receipt,
         root: install,
+        target: None,
     };
     let update = systemd_boot::activate(root, &esp.tree, activation, Some(deployment))?;
     if let Some(retired) = &update.retired {

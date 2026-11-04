@@ -1,0 +1,222 @@
+use std::{
+    fs::{self, File},
+    io::Seek,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, MetadataExt},
+    },
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, ensure};
+use rustix::fs::{Mode, OFlags, open};
+
+use crate::{image::root::Root, kdl_format::boot_export::ExportReceipt, model::validate_path};
+
+use super::deploy::{
+    OfflineDisk, SECTOR_SIZE, checked_payload, digest_extent, verify_filesystem_at, write_extent,
+};
+
+pub(super) struct DevicePartition {
+    file: File,
+    bytes: u64,
+    esp: File,
+}
+
+impl DevicePartition {
+    pub fn open(
+        device: &Path,
+        esp: &Path,
+        partuuid: &str,
+        write: bool,
+    ) -> Result<(OfflineDisk, Self)> {
+        let esp = fs::canonicalize(esp).context("opening the mounted EFI partition")?;
+        let mount = Root::open(&esp)?;
+        check_esp_mount(&esp, mount.as_file())?;
+        let esp_part = KernelPartition::read(mount.as_file().metadata()?.dev())
+            .context("identifying the mounted EFI partition")?;
+        let target = block_node(device)?;
+        let root_part = KernelPartition::read(target.metadata()?.rdev())
+            .context("identifying the target root partition")?;
+        ensure!(
+            esp_part.disk == root_part.disk,
+            "target root partition and mounted ESP must be on the same GPT disk"
+        );
+        // Claim only the target partition. The fallback and ESP stay accessible.
+        let access = if write { OFlags::RDWR } else { OFlags::RDONLY };
+        let file = File::from(
+            open(
+                Root::fd_path(&target),
+                access | OFlags::EXCL | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .context("claiming the target root partition exclusively")?,
+        );
+        let disk = OfflineDisk::from_sized_file(
+            open_parent(&root_part.disk)?,
+            sectors(&root_part.disk, "size")?,
+        )?;
+        disk.check_device_extents(partuuid, root_part.extent, esp_part.extent)?;
+        let target = Self {
+            file,
+            bytes: root_part.extent.1,
+            esp: mount.as_file().try_clone()?,
+        };
+        Ok((disk, target))
+    }
+
+    pub fn check_esp(&self, path: &Path, locked: &File) -> Result<()> {
+        let original = self.esp.metadata()?;
+        let current = locked.metadata()?;
+        ensure!(
+            (original.dev(), original.ino()) == (current.dev(), current.ino()),
+            "mounted ESP changed during activation"
+        );
+        check_esp_mount(path, locked)
+    }
+
+    pub fn write(&self, image: &Path, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
+        let (mut payload, expected) = checked_payload(image, self.bytes, Some(receipt))?;
+        verify_filesystem_at(
+            &payload,
+            0,
+            self.bytes,
+            partuuid,
+            &receipt.image,
+            receipt.revision,
+        )?;
+        payload.rewind()?;
+        let actual = write_extent(&self.file, 0, self.bytes, &mut payload)?;
+        ensure!(
+            actual == expected && payload.metadata()?.len() == self.bytes,
+            "deployed partition does not match the checked root payload"
+        );
+        self.verify_filesystem(partuuid, receipt)
+    }
+
+    pub fn verify(&self, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
+        ensure!(
+            receipt.bytes == self.bytes
+                && digest_extent(&self.file, 0, self.bytes)? == receipt.sha256,
+            "deployed partition {partuuid} does not match the root export receipt"
+        );
+        self.verify_filesystem(partuuid, receipt)
+    }
+
+    fn verify_filesystem(&self, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
+        verify_filesystem_at(
+            &self.file,
+            0,
+            self.bytes,
+            partuuid,
+            &receipt.image,
+            receipt.revision,
+        )
+    }
+}
+
+struct KernelPartition {
+    disk: PathBuf,
+    extent: (u64, u64),
+}
+
+impl KernelPartition {
+    fn read(device: u64) -> Result<Self> {
+        let name = device_number(device);
+        let path = fs::canonicalize(Path::new("/sys/dev/block").join(&name))?;
+        ensure!(
+            fs::read_to_string(path.join("dev"))?.trim() == name
+                && sysfs_number(&path, "partition").is_ok_and(|number| number != 0),
+            "expected a partition block device"
+        );
+        let disk = path.parent().context("missing parent disk")?.to_owned();
+        let extent = (sectors(&path, "start")?, sectors(&path, "size")?);
+        Ok(Self { disk, extent })
+    }
+}
+
+fn sectors(path: &Path, name: &str) -> Result<u64> {
+    sysfs_number(path, name)?
+        .checked_mul(SECTOR_SIZE)
+        .context("block device extent overflows")
+}
+
+fn sysfs_number(path: &Path, name: &str) -> Result<u64> {
+    Ok(fs::read_to_string(path.join(name))?.trim().parse()?)
+}
+
+fn device_number(device: u64) -> String {
+    format!("{}:{}", libc::major(device), libc::minor(device))
+}
+
+fn block_node(path: &Path) -> Result<File> {
+    let node = fs::canonicalize(path)
+        .with_context(|| format!("opening block device {}", path.display()))?;
+    let file = File::from(open(
+        node,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    ensure!(
+        file.metadata()?.file_type().is_block_device(),
+        "{} is not a block device",
+        path.display()
+    );
+    Ok(file)
+}
+
+fn open_parent(path: &Path) -> Result<File> {
+    let event = fs::read_to_string(path.join("uevent"))?;
+    let name = event
+        .lines()
+        .find_map(|line| line.strip_prefix("DEVNAME="))
+        .context("missing parent block device name")?;
+    validate_path(name)?;
+    let node = block_node(&Path::new("/dev").join(name))?;
+    ensure!(
+        device_number(node.metadata()?.rdev()) == fs::read_to_string(path.join("dev"))?.trim(),
+        "parent disk device differs from kernel metadata"
+    );
+    Ok(File::open(Root::fd_path(&node))?)
+}
+
+fn check_esp_mount(path: &Path, file: &File) -> Result<()> {
+    let device = device_number(file.metadata()?.dev());
+    let mut escaped = Vec::new();
+    for byte in path.as_os_str().as_bytes() {
+        match byte {
+            b' ' => escaped.extend(b"\\040"),
+            b'\t' => escaped.extend(b"\\011"),
+            b'\n' => escaped.extend(b"\\012"),
+            b'\\' => escaped.extend(b"\\134"),
+            byte => escaped.push(*byte),
+        }
+    }
+    let mounts = fs::read("/proc/self/mountinfo").context("reading mounted filesystems")?;
+    let mut found = false;
+    for line in mounts.split(|byte| *byte == b'\n') {
+        let mut fields = line.split(|byte| *byte == b' ');
+        let (Some(number), Some(root), Some(mount), Some(options)) =
+            (fields.nth(2), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if mount != escaped {
+            continue;
+        }
+        let filesystem = fields.skip_while(|field| *field != b"-").nth(1);
+        ensure!(
+            !found
+                && number == device.as_bytes()
+                && root == b"/"
+                && options
+                    .split(|byte| *byte == b',')
+                    .any(|option| option == b"rw")
+                && filesystem == Some(b"vfat"),
+            "--esp must name the root of one writable VFAT mount"
+        );
+        found = true;
+    }
+    ensure!(found, "--esp must name the root of a mounted EFI partition");
+    Ok(())
+}

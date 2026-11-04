@@ -12,9 +12,9 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
-    activate_deployed_boot_environment, add_publisher_with_build_trust, apply,
-    audit_publisher_builds, build_with_toolchain_config, build_with_worker,
-    create_configured_image, create_image, deploy_and_activate_boot_environment,
+    activate_deployed_boot_environment, activate_device_boot_environment,
+    add_publisher_with_build_trust, apply, audit_publisher_builds, build_with_toolchain_config,
+    build_with_worker, create_configured_image, create_image, deploy_and_activate_boot_environment,
     deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
     fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
     list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
@@ -507,6 +507,33 @@ enum BootCommand {
         root_partuuid: String,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Verify or write an unused GPT root partition and activate its staged trial
+    ActivateDevice {
+        #[arg(long)]
+        root: PathBuf,
+        /// Mount point of the writable EFI System Partition
+        #[arg(long)]
+        esp: PathBuf,
+        /// Inactive Linux filesystem partition on the same disk
+        #[arg(long)]
+        device: PathBuf,
+        #[arg(long)]
+        root_partuuid: String,
+        /// KDL receipt produced by boot-env export --receipt
+        #[arg(long)]
+        receipt: PathBuf,
+        /// Write this export before activation. Without it, verify the existing bytes.
+        #[arg(long)]
+        root_image: Option<PathBuf>,
+        #[arg(long, default_value = "boot/vmlinuz")]
+        kernel: String,
+        #[arg(long)]
+        initrd: Option<String>,
+        #[arg(long, default_value = "")]
+        options: String,
+        #[arg(long, default_value_t = 2)]
+        tries: u32,
     },
     /// Publish a systemd-boot entry for a verified environment
     Activate {
@@ -1112,6 +1139,36 @@ fn run(command: Command) -> Result<ExitCode> {
                     "Deployed root to {root_partuuid} in {} (SHA-256 {hash})",
                     output.display()
                 );
+            }
+            BootCommand::ActivateDevice {
+                root,
+                esp,
+                device,
+                root_partuuid,
+                receipt,
+                root_image,
+                kernel,
+                initrd,
+                options,
+                tries,
+            } => {
+                let activation = Activation {
+                    root_partuuid,
+                    kernel,
+                    initrd,
+                    options,
+                    tries,
+                    known_good: false,
+                };
+                let id = activate_device_boot_environment(
+                    &root,
+                    &esp,
+                    &activation,
+                    &device,
+                    &receipt,
+                    root_image.as_deref(),
+                )?;
+                println!("Activated {id}");
             }
             BootCommand::Activate {
                 root,

@@ -19,7 +19,7 @@ use super::{artifact_helper, root_label, systemd_boot::canonical_partuuid};
 use crate::{image::root::Root, kdl_format::boot_export::ExportReceipt, model::digest_reader};
 
 const DISK: &str = "disk.raw";
-const SECTOR_SIZE: u64 = 512;
+pub(super) const SECTOR_SIZE: u64 = 512;
 const LINUX_FILESYSTEM: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
 const EFI_SYSTEM: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -193,7 +193,12 @@ impl OfflineDisk {
     }
 
     fn from_file(file: File) -> Result<Self> {
-        let partitions = read_partitions(&file)?;
+        let bytes = file.metadata()?.len();
+        Self::from_sized_file(file, bytes)
+    }
+
+    pub fn from_sized_file(file: File, bytes: u64) -> Result<Self> {
+        let partitions = read_partitions(&file, bytes)?;
         Ok(Self { file, partitions })
     }
 
@@ -218,6 +223,27 @@ impl OfflineDisk {
         self.partition(&canonical_partuuid(partuuid)?, EFI_SYSTEM)
     }
 
+    pub fn check_device_extents(
+        &self,
+        root: &str,
+        target: (u64, u64),
+        esp: (u64, u64),
+    ) -> Result<()> {
+        let part = self.partition(root, LINUX_FILESYSTEM)?;
+        ensure!(
+            (part.offset, part.bytes) == target,
+            "target device does not match GPT root PARTUUID {root}"
+        );
+        ensure!(
+            self.partitions
+                .values()
+                .any(|part| part.kind.eq_ignore_ascii_case(EFI_SYSTEM)
+                    && (part.offset, part.bytes) == esp),
+            "mounted filesystem does not match a GPT EFI System Partition"
+        );
+        Ok(())
+    }
+
     pub fn write_root(
         &self,
         partuuid: &str,
@@ -225,30 +251,10 @@ impl OfflineDisk {
         receipt: Option<&ExportReceipt>,
     ) -> Result<String> {
         let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
-        let bytes = partition.bytes;
-        let mut payload = offline_file(root_image)?;
-        ensure!(
-            payload.metadata()?.len() == bytes,
-            "root payload size must match the target partition ({bytes} bytes)"
-        );
-        let expected = digest_reader((&mut payload).take(bytes))?;
-        if let Some(receipt) = receipt {
-            ensure!(
-                receipt.bytes == bytes && receipt.sha256 == expected,
-                "root payload does not match the root export receipt"
-            );
-        }
-        let status = artifact_helper("e2fsck", Path::new("/"))
-            .stdin(Stdio::from(payload.try_clone()?))
-            .stdout(Stdio::null())
-            .args(["-f", "-n", "/proc/self/fd/0"])
-            .status()
-            .context("checking the root payload with e2fsck")?;
-        ensure!(status.success(), "e2fsck failed with {status}");
-        payload.rewind()?;
+        let (mut payload, expected) = checked_payload(root_image, partition.bytes, receipt)?;
         let actual = self.write_partition(partition, &mut payload)?;
         ensure!(
-            actual == expected && payload.metadata()?.len() == bytes,
+            actual == expected && payload.metadata()?.len() == partition.bytes,
             "deployed partition does not match the checked root payload"
         );
         Ok(actual)
@@ -266,15 +272,7 @@ impl OfflineDisk {
     }
 
     pub fn write_partition(&self, part: &PartitionExtent, payload: &mut File) -> Result<String> {
-        let mut disk = &self.file;
-        disk.seek(SeekFrom::Start(part.offset))?;
-        let written = io::copy(&mut payload.take(part.bytes), &mut disk)?;
-        ensure!(
-            written == part.bytes,
-            "partition payload was truncated during deployment"
-        );
-        disk.sync_all()?;
-        digest_extent(disk, part.offset, part.bytes)
+        write_extent(&self.file, part.offset, part.bytes, payload)
     }
 
     pub fn verify_payload(&self, partuuid: &str, bytes: u64, sha256: &str) -> Result<()> {
@@ -289,39 +287,101 @@ impl OfflineDisk {
 
     pub fn verify_filesystem(&self, partuuid: &str, image: &str, revision: u64) -> Result<()> {
         let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
-        let output = artifact_helper("blkid", Path::new("/"))
-            .env("BLKID_CONF", "/dev/null")
-            .stdin(Stdio::from(self.file.try_clone()?))
-            .args(["--probe", "--offset", &partition.offset.to_string()])
-            .args(["--size", &partition.bytes.to_string()])
-            .args([
-                "--output",
-                "export",
-                "--match-tag",
-                "UUID",
-                "--match-tag",
-                "TYPE",
-                "--match-tag",
-                "LABEL",
-            ])
-            .arg("/proc/self/fd/0")
-            .output()
-            .context("probing the deployed filesystem with blkid")?;
-        let tags = std::str::from_utf8(&output.stdout)?;
-        let uuid = format!("UUID={image}");
-        let label = format!("LABEL={}", root_label(revision));
-        ensure!(
-            output.status.success()
-                && tags.lines().any(|line| line == "TYPE=ext4")
-                && tags.lines().any(|line| line == uuid)
-                && tags.lines().any(|line| line == label),
-            "partition {partuuid} does not contain the expected ext4 filesystem {image} at revision {revision}"
-        );
-        Ok(())
+        verify_filesystem_at(
+            &self.file,
+            partition.offset,
+            partition.bytes,
+            partuuid,
+            image,
+            revision,
+        )
     }
 }
 
-fn digest_extent(mut disk: &File, offset: u64, bytes: u64) -> Result<String> {
+pub(super) fn checked_payload(
+    root_image: &Path,
+    bytes: u64,
+    receipt: Option<&ExportReceipt>,
+) -> Result<(File, String)> {
+    let mut payload = offline_file(root_image)?;
+    ensure!(
+        payload.metadata()?.len() == bytes,
+        "root payload size must match the target partition ({bytes} bytes)"
+    );
+    let expected = digest_extent(&payload, 0, bytes)?;
+    if let Some(receipt) = receipt {
+        ensure!(
+            receipt.bytes == bytes && receipt.sha256 == expected,
+            "root payload does not match the root export receipt"
+        );
+    }
+    let status = artifact_helper("e2fsck", Path::new("/"))
+        .stdin(Stdio::from(payload.try_clone()?))
+        .stdout(Stdio::null())
+        .args(["-f", "-n", "/proc/self/fd/0"])
+        .status()
+        .context("checking the root payload with e2fsck")?;
+    ensure!(status.success(), "e2fsck failed with {status}");
+    payload.rewind()?;
+    Ok((payload, expected))
+}
+
+pub(super) fn write_extent(
+    mut disk: &File,
+    offset: u64,
+    bytes: u64,
+    payload: &mut File,
+) -> Result<String> {
+    disk.seek(SeekFrom::Start(offset))?;
+    let written = io::copy(&mut payload.take(bytes), &mut disk)?;
+    ensure!(
+        written == bytes,
+        "partition payload was truncated during deployment"
+    );
+    disk.sync_all()?;
+    digest_extent(disk, offset, bytes)
+}
+
+pub(super) fn verify_filesystem_at(
+    disk: &File,
+    offset: u64,
+    bytes: u64,
+    partuuid: &str,
+    image: &str,
+    revision: u64,
+) -> Result<()> {
+    let output = artifact_helper("blkid", Path::new("/"))
+        .env("BLKID_CONF", "/dev/null")
+        .stdin(Stdio::from(disk.try_clone()?))
+        .args(["--probe", "--offset", &offset.to_string()])
+        .args(["--size", &bytes.to_string()])
+        .args([
+            "--output",
+            "export",
+            "--match-tag",
+            "UUID",
+            "--match-tag",
+            "TYPE",
+            "--match-tag",
+            "LABEL",
+        ])
+        .arg("/proc/self/fd/0")
+        .output()
+        .context("probing the deployed filesystem with blkid")?;
+    let tags = std::str::from_utf8(&output.stdout)?;
+    let uuid = format!("UUID={image}");
+    let label = format!("LABEL={}", root_label(revision));
+    ensure!(
+        output.status.success()
+            && tags.lines().any(|line| line == "TYPE=ext4")
+            && tags.lines().any(|line| line == uuid)
+            && tags.lines().any(|line| line == label),
+        "partition {partuuid} does not contain the expected ext4 filesystem {image} at revision {revision}"
+    );
+    Ok(())
+}
+
+pub(super) fn digest_extent(mut disk: &File, offset: u64, bytes: u64) -> Result<String> {
     disk.seek(SeekFrom::Start(offset))?;
     let mut extent = disk.take(bytes);
     let sha256 = digest_reader(&mut extent)?;
@@ -332,16 +392,15 @@ fn digest_extent(mut disk: &File, offset: u64, bytes: u64) -> Result<String> {
     Ok(sha256)
 }
 
-fn read_partitions(disk: &File) -> Result<BTreeMap<String, PartitionExtent>> {
+fn read_partitions(disk: &File, disk_bytes: u64) -> Result<BTreeMap<String, PartitionExtent>> {
     let output = sfdisk(disk, "--json")?;
     let mut table = serde_json::from_slice::<DiskTable>(&output)
         .context("expected a GPT partition table from sfdisk")?
         .partitiontable;
     ensure!(
         table.label == "gpt" && table.unit == "sectors" && table.sectorsize == SECTOR_SIZE,
-        "expected a GPT disk image with 512-byte sectors"
+        "expected a GPT disk with 512-byte sectors"
     );
-    let disk_bytes = disk.metadata()?.len();
     ensure!(
         disk_bytes.is_multiple_of(SECTOR_SIZE)
             && table.firstlba >= 2

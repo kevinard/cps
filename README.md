@@ -981,6 +981,31 @@ For separately provisioned roots, activation accepts the operator's
 partition mapping when both flags are omitted.
 [blkid manual](https://man7.org/linux/man-pages/man8/blkid.8.html)
 
+### Activating a trial on an installed disk
+
+With a known-good base already registered, stage and export the trial as
+above. Use a dedicated, unregistered Linux filesystem partition on the same
+GPT disk as the mounted ESP. The disk must use 512-byte logical sectors,
+and the ext4 export must match the partition size.
+
+```sh
+cps boot-env activate-device --root staged --esp /efi \
+    --device "/dev/disk/by-partuuid/$trial_partuuid" \
+    --root-partuuid "$trial_partuuid" --receipt staged.kdl --root-image staged.ext4
+```
+
+CPS checks the GPT and compares the kernel's device extents to the requested
+root PARTUUID and the writable VFAT mount. It opens the target exclusively,
+checks the registered fallback, writes the export, and verifies the target
+bytes and filesystem identity before publishing the counted boot entry.
+Run with an account that can open the target and parent block devices and
+write the ESP. Keep the root PARTUUIDs unique across attached disks.
+[Linux block device open semantics](https://man7.org/linux/man-pages/man2/open.2.html)
+
+Omit `--root-image` to verify an already deployed trial against its export
+receipt and finish activation. Use the mounted ESP with `boot-env list`
+and `boot-env rollback` as usual.
+
 Activation copies boot files from the selected root and publishes its Boot
 Loader Specification entry last. With manually supplied boot files the
 kernel path defaults to `boot/vmlinuz`. Use `--initrd` if the kernel needs
@@ -1140,6 +1165,12 @@ signed CPS and BusyBox fixtures. The test installs the signed base
 composition, publishes the companion update, and checks that the profile
 still selects the old kernel. It advances the profile through the automatic
 upgrade check before staging and booting the trial.
+
+With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to deploy
+and activate the trial from a rescue VM with a writable virtio disk. The test
+checks rejection of mounted or registered targets and incorrect partition or
+receipt identities. It then verifies the written partition and boots the
+result through the normal blessing and rollback checks.
 
 #### Testing a source-built Linux kernel
 

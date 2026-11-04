@@ -135,6 +135,7 @@ pub(super) struct Deployment<'a> {
     pub disk: &'a OfflineDisk,
     pub receipt: &'a Path,
     pub root: Option<RootDeployment<'a>>,
+    pub target: Option<&'a super::device::DevicePartition>,
 }
 
 pub fn activate_boot_environment(
@@ -158,6 +159,35 @@ pub fn activate_deployed_boot_environment(
         disk: &disk,
         receipt,
         root: None,
+        target: None,
+    };
+    Ok(activate(root, esp, activation, Some(deployment))?.id)
+}
+
+/// Deploy or verify an inactive partition before activating it as a trial.
+pub fn activate_device_boot_environment(
+    root: &Path,
+    esp: &Path,
+    activation: &Activation,
+    device: &Path,
+    receipt: &Path,
+    root_image: Option<&Path>,
+) -> Result<String> {
+    ensure!(
+        !activation.known_good,
+        "device activation requires a staged trial"
+    );
+    let partuuid = canonical_partuuid(&activation.root_partuuid)?;
+    let (disk, target) =
+        super::device::DevicePartition::open(device, esp, &partuuid, root_image.is_some())?;
+    let deployment = Deployment {
+        disk: &disk,
+        receipt,
+        root: root_image.map(|image| RootDeployment {
+            image,
+            replace: None,
+        }),
+        target: Some(&target),
     };
     Ok(activate(root, esp, activation, Some(deployment))?.id)
 }
@@ -249,18 +279,25 @@ pub(super) fn activate(
             "image state differs from the root export receipt"
         );
         if deployment.root.is_none() {
-            deployment
-                .disk
-                .verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
-            deployment
-                .disk
-                .verify_filesystem(&partuuid, &image_id, settings.revision)?;
+            if let Some(target) = deployment.target {
+                target.verify(&partuuid, &receipt)?;
+            } else {
+                deployment
+                    .disk
+                    .verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
+                deployment
+                    .disk
+                    .verify_filesystem(&partuuid, &image_id, settings.revision)?;
+            }
         }
         Some(receipt)
     } else {
         None
     };
     let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
+    if let Some(target) = deployment.and_then(|deployment| deployment.target) {
+        target.check_esp(&esp, &_lock)?;
+    }
     let (policy, existing) = inventory(&esp)?;
     let existing_entry = existing.iter().find(|entry| entry.id == id);
 
@@ -361,14 +398,20 @@ pub(super) fn activate(
             .context("checking the known-good fallback partition")?;
     }
     if let Some(root) = root_deployment {
-        let disk = deployment
-            .context("root deployment requires an offline disk")?
-            .disk;
+        let deployment = deployment.context("root deployment requires a verified disk")?;
         let receipt = receipt
             .as_ref()
             .context("root deployment requires an export receipt")?;
-        disk.write_root(&partuuid, root.image, Some(receipt))?;
-        disk.verify_filesystem(&partuuid, &image_id, settings.revision)?;
+        if let Some(target) = deployment.target {
+            target.write(root.image, &partuuid, receipt)?;
+        } else {
+            deployment
+                .disk
+                .write_root(&partuuid, root.image, Some(receipt))?;
+            deployment
+                .disk
+                .verify_filesystem(&partuuid, &image_id, settings.revision)?;
+        }
     }
     let loader = ensure_dir(&esp, "loader")?;
     let entries = ensure_dir(&loader, "entries")?;

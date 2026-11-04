@@ -9,6 +9,7 @@ case $mode in
     *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade|rollback|capabilities]" >&2; exit 2 ;;
 esac
 recycle=${CPS_VM_RECYCLE_SLOT:-0}
+device_activation=${CPS_VM_DEVICE_ACTIVATION:-0}
 if [[ $recycle == 1 && $mode != rollback ]]; then
     echo 'CPS_VM_RECYCLE_SLOT requires the rollback scenario' >&2
     exit 2
@@ -20,6 +21,10 @@ cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
 cps_version=${CPS_VM_CPS_VERSION:-0.1.0-2}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
+if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
+    echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
+    exit 2
+fi
 kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
 systemd_fixture=${CPS_VM_SYSTEMD_FIXTURE:-}
 usr_base_fixture=${CPS_VM_USR_BASE_FIXTURE:-}
@@ -631,9 +636,11 @@ fi
 "$cps" boot-env export --receipt --root staged --output staged.ext4 --size-mib "$root_mib" > staged.kdl
 test "$(sha256sum base.ext4)" = "$base_payload"
 diff -r esp-before esp
-"$cps" boot-env deploy --disk "$base_disk" --root-image staged.ext4 \
-    --root-partuuid "$trial_uuid" --output deployed.raw
-cmp -n "$((trial_mib * 1024 * 1024))" "$base_disk" deployed.raw
+if [[ $device_activation != 1 ]]; then
+    "$cps" boot-env deploy --disk "$base_disk" --root-image staged.ext4 \
+        --root-partuuid "$trial_uuid" --output deployed.raw
+    cmp -n "$((trial_mib * 1024 * 1024))" "$base_disk" deployed.raw
+fi
 
 mv "esp/EFI/cps/$base_id/vmlinuz.efi" saved-kernel
 if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
@@ -652,11 +659,19 @@ fi
 grep -q 'distinct root PARTUUID' rejected.log
 diff -r esp-before esp
 
-"$cps" boot-env activate --root staged --root-partuuid "$trial_uuid" \
-    --disk deployed.raw --receipt staged.kdl --esp-partuuid "$esp_uuid" --output-disk disk.raw \
-    --options "$options" --tries 2
-cmp -n 1048576 deployed.raw disk.raw
-cmp -i "$((base_mib * 1024 * 1024))" deployed.raw disk.raw
+if [[ $device_activation == 1 ]]; then
+    activate_device_guest
+    cmp -n 1048576 "$base_disk" disk.raw
+    cmp -i "$((base_mib * 1024 * 1024))" -n "$((root_mib * 1024 * 1024))" "$base_disk" disk.raw
+    cmp -i "$((trial_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" disk.raw staged.ext4
+    cmp -i "$(((trial_mib + root_mib) * 1024 * 1024))" "$base_disk" disk.raw
+else
+    "$cps" boot-env activate --root staged --root-partuuid "$trial_uuid" \
+        --disk deployed.raw --receipt staged.kdl --esp-partuuid "$esp_uuid" --output-disk disk.raw \
+        --options "$options" --tries 2
+    cmp -n 1048576 deployed.raw disk.raw
+    cmp -i "$((base_mib * 1024 * 1024))" deployed.raw disk.raw
+fi
 mkdir esp-activated
 mcopy -s -i disk.raw@@1048576 ::/EFI ::/loader esp-activated/
 diff -r esp-before/EFI/BOOT esp-activated/EFI/BOOT
