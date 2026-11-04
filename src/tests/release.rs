@@ -12,7 +12,7 @@ use url::Url;
 
 use super::*;
 use crate::{
-    attestation::{self, Toolchain},
+    attestation::{self, LegacyToolchain, Toolchain},
     create_configured_image, fetch_plan,
     kdl_format::{build, parse_manifest},
     list_obsoletions, list_withdrawals,
@@ -45,7 +45,7 @@ fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)
         &manifest_bytes,
         &build::parse(&recipe)?,
         recipe.as_bytes(),
-        Toolchain {
+        Toolchain::Legacy(LegacyToolchain {
             publisher: "canopa".to_owned(),
             key_sha256: digest(&key),
             catalog_sha256: release.sha256,
@@ -53,7 +53,7 @@ fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)
                 "desktop/compositor".to_owned(),
                 release.packages[0].sha256.clone(),
             )]),
-        },
+        }),
         &BTreeMap::from([(
             COMPOSITOR.to_owned(),
             FileDigest {

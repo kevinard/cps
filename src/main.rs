@@ -10,13 +10,14 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
-    Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
-    add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_plan,
-    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
-    list_boot_environments, list_obsoletions, list_publishers, list_withdrawals, plan,
-    prefer_publisher, publish, publish_release, publish_witnessed_bundle, read_attestation,
-    read_worker_config, release, remove_publisher, rollback_boot_environment, rotate_publisher_key,
-    stage_boot_environment, verify, verify_pristine, withdraw_package,
+    Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, SourceLayout,
+    activate_boot_environment, add_publisher, apply, build_with_toolchain_config,
+    build_with_worker, create_configured_image, create_image, fetch_plan, fetch_sources,
+    fetch_sources_with_local, generate_manifest, import_sources, list_boot_environments,
+    list_obsoletions, list_publishers, list_withdrawals, plan, prefer_publisher, publish,
+    publish_release, publish_witnessed_bundle, read_attestation, read_worker_config, release,
+    remove_publisher, rollback_boot_environment, rotate_publisher_key, stage_boot_environment,
+    verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -35,12 +36,15 @@ enum Command {
     },
     /// Build a package with verified inputs in an offline sandbox
     Build {
-        #[arg(long)]
-        repo: PathBuf,
-        #[arg(long)]
-        publisher: String,
-        #[arg(long)]
-        trust_key: PathBuf,
+        #[arg(long, required_unless_present = "toolchain_config")]
+        repo: Option<PathBuf>,
+        #[arg(long, required_unless_present = "toolchain_config")]
+        publisher: Option<String>,
+        #[arg(long, required_unless_present = "toolchain_config")]
+        trust_key: Option<PathBuf>,
+        /// Worker-local repository and trust key locations for the pinned publishers
+        #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_key"])]
+        toolchain_config: Option<PathBuf>,
         #[arg(long, required_unless_present = "source_cache")]
         sources: Option<PathBuf>,
         #[arg(long, conflicts_with = "sources")]
@@ -481,6 +485,7 @@ fn run(command: Command) -> Result<ExitCode> {
             repo,
             publisher,
             trust_key,
+            toolchain_config,
             sources,
             source_cache,
             output,
@@ -489,18 +494,10 @@ fn run(command: Command) -> Result<ExitCode> {
             builder_signing_key,
             recipe,
         } => {
-            let options = BuildOptions {
-                repo: &repo,
-                publisher: &publisher,
-                trust_key: &trust_key,
-                sources: source_cache
-                    .as_deref()
-                    .or(sources.as_deref())
-                    .context("missing build sources")?,
-                output: &output,
-                check_reproducible,
-                builder_signing_key: builder_signing_key.as_deref(),
-            };
+            let input = source_cache
+                .as_deref()
+                .or(sources.as_deref())
+                .context("missing build sources")?;
             let layout = if source_cache.is_some() {
                 SourceLayout::Cache
             } else {
@@ -511,7 +508,39 @@ fn run(command: Command) -> Result<ExitCode> {
                 .map(read_worker_config)
                 .transpose()?
                 .unwrap_or_default();
-            let id = build_with_worker(&recipe, options, layout, &worker)?;
+            let id = if let Some(config) = toolchain_config {
+                build_with_toolchain_config(
+                    &recipe,
+                    &config,
+                    BuildSettings {
+                        sources: input,
+                        output: &output,
+                        check_reproducible,
+                        builder_signing_key: builder_signing_key.as_deref(),
+                    },
+                    layout,
+                    &worker,
+                )?
+            } else {
+                build_with_worker(
+                    &recipe,
+                    BuildOptions {
+                        repo: repo.as_deref().context("missing toolchain repository")?,
+                        publisher: publisher
+                            .as_deref()
+                            .context("missing toolchain publisher")?,
+                        trust_key: trust_key
+                            .as_deref()
+                            .context("missing toolchain trust key")?,
+                        sources: input,
+                        output: &output,
+                        check_reproducible,
+                        builder_signing_key: builder_signing_key.as_deref(),
+                    },
+                    layout,
+                    &worker,
+                )?
+            };
             println!("Built {id} at {}", output.display());
         }
         Command::Manifest { command } => match command {

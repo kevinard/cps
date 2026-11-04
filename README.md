@@ -119,6 +119,50 @@ Use the digest of the selected repository catalog, such as the digest recorded i
 
 `solver="sat-v1"` pins the toolchain selection algorithm. Recipes written before this setting was introduced retain the original resolver when the setting is absent.
 
+### Building with several publishers
+
+Use a toolchain block with publisher pins when a compiler and its dependencies
+come from separate signed catalogs. Each pin gives the catalog digest and
+the SHA-256 of the raw 32-byte Ed25519 public key. With a CPS DER public
+key, calculate the fingerprint with `tail -c 32 public.der | sha256sum`.
+
+```kdl
+toolchain solver="sat-v1" {
+    publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<key SHA-256>"
+    publisher "tools" catalog="<catalog SHA-256>" key-sha256="<key SHA-256>"
+    package "devel/base"
+    package "cps://tools/devel/compiler@1.0.0-0"
+}
+```
+
+Unqualified packages use the first pinned publisher that offers the name.
+A qualified request can select another pinned publisher. Give the build
+worker a KDL file with locations for those same publishers. Relative paths
+resolve against the worker's configuration file.
+
+```kdl
+schema-version 1
+publisher "canopa" {
+    repository "cache/canopa"
+    trust-key "keys/canopa.der"
+}
+publisher "tools" {
+    repository "cache/tools"
+    trust-key "keys/tools.der"
+}
+```
+
+```sh
+cps build --toolchain-config toolchain.kdl --source-cache source-cache \
+    --output bundle --check-reproducible --builder-signing-key builder.der example.build.kdl
+```
+
+CPS verifies each key and reads the exact signed catalog from its local
+repository. Build evidence for this recipe form records the ordered pins
+and each selected package's publisher, version, and manifest digest.
+Use a CPS version that understands version 2 build evidence when publishing
+these bundles.
+
 ### Building CPS itself
 
 On an x86-64 Arch Linux worker with Rust, the native GCC toolchain, and Python

@@ -6,13 +6,16 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use kdl::KdlDocument;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::model::{FileDigest, validate_digest, validate_name, validate_path, validate_publisher};
+use crate::model::{
+    FileDigest, PackageSpec, validate_digest, validate_name, validate_path, validate_publisher,
+};
 use crate::plan::SolverRevision;
 use crate::repo::read_limited;
 
-use super::{Fields, document, one, schema};
+use super::{Fields, PublisherConfig, document, one, publisher_config, schema};
 
 pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
 
@@ -21,11 +24,24 @@ pub(crate) struct Source {
     pub url: Option<Url>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublisherPin {
+    pub name: String,
+    pub catalog_sha256: String,
+    pub key_sha256: String,
+}
+
+pub(crate) enum ToolchainPins {
+    Single(String),
+    Publishers(Vec<PublisherPin>),
+}
+
 pub(crate) struct BuildRecipe {
     pub solver: Option<SolverRevision>,
     pub arch: String,
     pub epoch: u32,
-    pub catalog: String,
+    pub toolchain: ToolchainPins,
     pub packages: BTreeSet<String>,
     pub manifest: String,
     pub manifest_digest: String,
@@ -34,6 +50,27 @@ pub(crate) struct BuildRecipe {
 }
 
 impl BuildRecipe {
+    pub(crate) fn requested(&self) -> Result<BTreeMap<&str, PackageSpec<'_>>> {
+        let mut requested = BTreeMap::new();
+        for selector in &self.packages {
+            let spec = PackageSpec::parse(selector)?;
+            if let ToolchainPins::Publishers(pins) = &self.toolchain
+                && let Some(name) = spec.publisher
+            {
+                ensure!(
+                    pins.iter().any(|pin| pin.name == name),
+                    "requested toolchain publisher {name} is not pinned"
+                );
+            }
+            ensure!(
+                requested.insert(spec.name, spec).is_none(),
+                "multiple selectors for toolchain package {}",
+                spec.name
+            );
+        }
+        Ok(requested)
+    }
+
     pub(crate) fn source_digests(&self) -> BTreeMap<String, FileDigest> {
         self.sources
             .iter()
@@ -47,6 +84,33 @@ pub(crate) fn read(path: &Path) -> Result<(Vec<u8>, BuildRecipe)> {
     let recipe = parse(std::str::from_utf8(&bytes)?)
         .with_context(|| format!("parsing build recipe {}", path.display()))?;
     Ok((bytes, recipe))
+}
+
+pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, PublisherConfig>> {
+    let bytes = read_limited(File::open(path)?, RECIPE_LIMIT)?;
+    let parent = std::fs::canonicalize(path)?
+        .parent()
+        .context("missing toolchain configuration directory")?
+        .to_owned();
+    let doc = document(std::str::from_utf8(&bytes)?)?;
+    schema(&doc)?;
+    let mut publishers = BTreeMap::new();
+    for node in doc.nodes() {
+        match node.name().value() {
+            "schema-version" => {}
+            "publisher" => {
+                let name = Fields::read(node, 1, &[], true)?.string_arg(0)?;
+                let config = publisher_config(node, name.clone(), &parent)?;
+                ensure!(
+                    publishers.insert(name.clone(), config).is_none(),
+                    "duplicate toolchain publisher {name}"
+                );
+            }
+            name => bail!("unknown toolchain configuration node {name}"),
+        }
+    }
+    ensure!(!publishers.is_empty(), "missing toolchain publisher");
+    Ok(publishers)
 }
 
 pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
@@ -64,35 +128,75 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     let children = build.children().context("build requires a child block")?;
 
     let toolchain = one(children, "toolchain")?;
-    let fields = Fields::read(toolchain, 1, &["solver"], true)?;
-    let catalog = fields.string_arg(0)?;
+    let legacy = toolchain
+        .entries()
+        .iter()
+        .any(|entry| entry.name().is_none());
+    let fields = Fields::read(toolchain, usize::from(legacy), &["solver"], true)?;
     let solver = match fields.string("solver")?.as_deref() {
         None => None,
         Some("sat-v1") => Some(SolverRevision::SatV1),
         Some(name) => bail!("unsupported toolchain solver {name:?}"),
     };
-    validate_digest(&catalog).context("invalid toolchain catalog")?;
     let mut packages = BTreeSet::new();
+    let mut pins = Vec::new();
+    let mut publishers = BTreeSet::new();
     for node in toolchain
         .children()
         .into_iter()
         .flat_map(KdlDocument::nodes)
     {
-        ensure!(
-            node.name().value() == "package",
-            "expected a toolchain package"
-        );
-        let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
-        validate_name(&name)?;
-        ensure!(
-            packages.insert(name.clone()),
-            "duplicate toolchain package {name}"
-        );
+        match node.name().value() {
+            "package" => {
+                let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                if legacy {
+                    validate_name(&name)?;
+                }
+                ensure!(
+                    packages.insert(name.clone()),
+                    "duplicate toolchain package {name}"
+                );
+            }
+            "publisher" if !legacy => {
+                let fields = Fields::read(node, 1, &["catalog", "key-sha256"], false)?;
+                let name = fields.string_arg(0)?;
+                validate_publisher(&name)?;
+                ensure!(
+                    publishers.insert(name.clone()),
+                    "duplicate toolchain publisher {name}"
+                );
+                let catalog_sha256 = fields.required_string("catalog")?;
+                validate_digest(&catalog_sha256).context("invalid toolchain catalog")?;
+                let key_sha256 = fields.required_string("key-sha256")?;
+                validate_digest(&key_sha256).context("invalid toolchain key digest")?;
+                pins.push(PublisherPin {
+                    name,
+                    catalog_sha256,
+                    key_sha256,
+                });
+            }
+            name => bail!("unexpected toolchain node {name}"),
+        }
     }
     ensure!(
         !packages.is_empty(),
         "build requires at least one toolchain package"
     );
+    let toolchain = if legacy {
+        let catalog = fields.string_arg(0)?;
+        validate_digest(&catalog).context("invalid toolchain catalog")?;
+        ToolchainPins::Single(catalog)
+    } else {
+        ensure!(
+            !pins.is_empty(),
+            "build requires a pinned toolchain publisher"
+        );
+        ensure!(
+            solver.is_some(),
+            "publisher pins require an explicit toolchain solver"
+        );
+        ToolchainPins::Publishers(pins)
+    };
 
     let fields = Fields::read(one(children, "manifest")?, 1, &["sha256"], false)?;
     let manifest = fields.string_arg(0)?;
@@ -153,17 +257,19 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
             source.pin.sha256
         );
     }
-    Ok(BuildRecipe {
+    let recipe = BuildRecipe {
         solver,
         arch,
         epoch,
-        catalog,
+        toolchain,
         packages,
         manifest,
         manifest_digest,
         sources,
         script,
-    })
+    };
+    recipe.requested()?;
+    Ok(recipe)
 }
 
 fn source_url(value: &str) -> Result<Url> {

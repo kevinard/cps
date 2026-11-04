@@ -7,7 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek},
     os::unix::fs::{PermissionsExt, symlink},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -18,14 +18,14 @@ use rustix::{
 use tempfile::TempDir;
 
 use crate::{
-    attestation::{self, Toolchain},
+    attestation::{self, LegacyToolchain, PinnedPackage, PinnedToolchain, Toolchain},
     image::root::Root,
     kdl_format::{
-        build::{BuildRecipe, read},
+        build::{BuildRecipe, PublisherPin, ToolchainPins, read, read_toolchain_config},
         parse_manifest,
     },
-    model::{FileDigest, Node, PackageSpec, digest, digest_reader},
-    plan::{Candidates, resolve_packages, select_paths},
+    model::{FileDigest, Node, digest, digest_reader},
+    plan::{CandidateSet, Candidates, resolve_packages, select_paths},
     repo::{MANIFEST_LIMIT, read_key, read_limited, read_signing_key, snapshot, stage_blob},
 };
 
@@ -41,6 +41,22 @@ pub struct BuildOptions<'a> {
     pub output: &'a Path,
     pub check_reproducible: bool,
     pub builder_signing_key: Option<&'a Path>,
+}
+
+pub struct BuildSettings<'a> {
+    pub sources: &'a Path,
+    pub output: &'a Path,
+    pub check_reproducible: bool,
+    pub builder_signing_key: Option<&'a Path>,
+}
+
+enum ToolchainLocation<'a> {
+    Single {
+        repo: &'a Path,
+        publisher: &'a str,
+        trust_key: &'a Path,
+    },
+    Config(&'a Path),
 }
 
 /// Host-side limits for each sandbox run and the collected package outputs.
@@ -121,15 +137,54 @@ pub fn build_with_worker(
     layout: SourceLayout,
     worker: &BuildWorker,
 ) -> Result<String> {
-    let BuildOptions {
-        repo,
-        publisher,
-        trust_key,
+    build_inner(
+        recipe_path,
+        ToolchainLocation::Single {
+            repo: options.repo,
+            publisher: options.publisher,
+            trust_key: options.trust_key,
+        },
+        BuildSettings {
+            sources: options.sources,
+            output: options.output,
+            check_reproducible: options.check_reproducible,
+            builder_signing_key: options.builder_signing_key,
+        },
+        layout,
+        worker,
+    )
+}
+
+/// Build offline using explicitly pinned publishers and worker-local repository locations.
+pub fn build_with_toolchain_config(
+    recipe_path: &Path,
+    config: &Path,
+    settings: BuildSettings<'_>,
+    layout: SourceLayout,
+    worker: &BuildWorker,
+) -> Result<String> {
+    build_inner(
+        recipe_path,
+        ToolchainLocation::Config(config),
+        settings,
+        layout,
+        worker,
+    )
+}
+
+fn build_inner(
+    recipe_path: &Path,
+    location: ToolchainLocation<'_>,
+    settings: BuildSettings<'_>,
+    layout: SourceLayout,
+    worker: &BuildWorker,
+) -> Result<String> {
+    let BuildSettings {
         sources,
         output,
         check_reproducible,
         builder_signing_key,
-    } = options;
+    } = settings;
     ensure!(
         builder_signing_key.is_none() || check_reproducible,
         "builder signing requires --check-reproducible"
@@ -183,7 +238,7 @@ pub fn build_with_worker(
     normalize(&script, recipe.epoch)?;
     let toolchain = work.path().join("toolchain");
     fs::create_dir(&toolchain)?;
-    let resolved_toolchain = prepare_toolchain(&toolchain, repo, publisher, trust_key, &recipe)?;
+    let resolved_toolchain = prepare_toolchain(&toolchain, location, &recipe)?;
 
     let stage = TempDir::new_in(&destination)?;
     let proto = stage.path().join("proto");
@@ -302,35 +357,105 @@ fn stage_sources(root: &Path, input: &Path, recipe: &BuildRecipe, cached: bool) 
     Ok(())
 }
 
+struct ToolchainRepository {
+    pin: PublisherPin,
+    repository: PathBuf,
+    key: Vec<u8>,
+}
+
+fn toolchain_repositories(
+    pins: &ToolchainPins,
+    location: ToolchainLocation<'_>,
+) -> Result<Vec<ToolchainRepository>> {
+    match (pins, location) {
+        (
+            ToolchainPins::Single(catalog),
+            ToolchainLocation::Single {
+                repo,
+                publisher,
+                trust_key,
+            },
+        ) => {
+            let key = read_key(trust_key)?;
+            Ok(vec![ToolchainRepository {
+                pin: PublisherPin {
+                    name: publisher.to_owned(),
+                    catalog_sha256: catalog.clone(),
+                    key_sha256: digest(&key),
+                },
+                repository: repo.to_owned(),
+                key,
+            }])
+        }
+        (ToolchainPins::Publishers(pins), ToolchainLocation::Config(config)) => {
+            let mut config = read_toolchain_config(config)
+                .with_context(|| format!("loading toolchain configuration {}", config.display()))?;
+            ensure!(
+                pins.len() == config.len(),
+                "toolchain configuration does not match the pinned publishers"
+            );
+            pins.iter()
+                .map(|pin| {
+                    let entry = config.remove(&pin.name).with_context(|| {
+                        format!("missing toolchain configuration for {}", pin.name)
+                    })?;
+                    let key = read_key(&entry.trust_key)?;
+                    ensure!(
+                        digest(&key) == pin.key_sha256,
+                        "toolchain key digest mismatch for {}",
+                        pin.name
+                    );
+                    Ok(ToolchainRepository {
+                        pin: pin.clone(),
+                        repository: entry.repository,
+                        key,
+                    })
+                })
+                .collect()
+        }
+        (ToolchainPins::Publishers(_), _) => {
+            bail!("pinned toolchain publishers require a toolchain configuration")
+        }
+        (ToolchainPins::Single(_), _) => {
+            bail!("a legacy toolchain catalog requires a single repository and trust key")
+        }
+    }
+}
+
 fn prepare_toolchain(
     path: &Path,
-    repo: &Path,
-    publisher: &str,
-    trust_key: &Path,
+    location: ToolchainLocation<'_>,
     recipe: &BuildRecipe,
 ) -> Result<Toolchain> {
-    let key = read_key(trust_key)?;
-    let release = snapshot(repo, publisher, &key, Some(&recipe.catalog))
-        .context("loading pinned toolchain catalog")?;
-    let requested = recipe
-        .packages
-        .iter()
-        .map(|name| {
-            (
-                name.as_str(),
-                PackageSpec {
-                    name,
-                    publisher: None,
-                    version: None,
-                },
-            )
+    let repositories = toolchain_repositories(&recipe.toolchain, location)?;
+    let requested = recipe.requested()?;
+    let mut sources: BTreeMap<_, _> = requested
+        .values()
+        .filter_map(|spec| {
+            spec.publisher
+                .map(|publisher| (spec.name.to_owned(), publisher))
         })
         .collect();
+    let mut candidates = CandidateSet::default();
+    let mut paths_by_publisher = BTreeMap::new();
+    for source in &repositories {
+        let pin = &source.pin;
+        let release = snapshot(
+            &source.repository,
+            &pin.name,
+            &source.key,
+            Some(&pin.catalog_sha256),
+        )
+        .with_context(|| format!("loading pinned toolchain catalog for {}", pin.name))?;
+        candidates.add_obsoletions(&mut sources, &pin.name, &release.obsoletions);
+        candidates.add_packages(&mut sources, &pin.name, release.packages);
+        paths_by_publisher.insert(pin.name.as_str(), source.repository.as_path());
+    }
     let (installed, paths) = resolve_packages(
         &BTreeMap::new(),
         Candidates {
-            packages: &release.packages,
-            obsoletions: &release.obsoletions,
+            packages: &candidates.packages,
+            obsoletions: &candidates.obsoletions,
         },
         &requested,
         false,
@@ -368,13 +493,19 @@ fn prepare_toolchain(
             Node::Symlink { target, .. } => symlink(target, &file)?,
             Node::Hardlink { .. } => {}
             Node::File { mode, .. } => {
+                let owner = managed.owners.first().context("unowned toolchain file")?;
+                let publisher = installed[owner].published.manifest.publisher.as_str();
                 let mut destination = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create_new(true)
                     .open(&file)?;
-                stage_blob(repo, &managed.node, &mut destination)
-                    .with_context(|| format!("materializing toolchain file {name}"))?;
+                stage_blob(
+                    paths_by_publisher[publisher],
+                    &managed.node,
+                    &mut destination,
+                )
+                .with_context(|| format!("materializing toolchain file {name}"))?;
                 let mode = if mode & 0o111 == 0 { 0o444 } else { 0o555 };
                 destination.set_permissions(fs::Permissions::from_mode(mode))?;
             }
@@ -400,15 +531,41 @@ fn prepare_toolchain(
     }
     set_mode(path, 0o755)?;
     normalize(path, recipe.epoch)?;
-    Ok(Toolchain {
-        publisher: publisher.to_owned(),
-        key_sha256: digest(&key),
-        catalog_sha256: release.sha256,
-        package_manifests: installed
-            .into_iter()
-            .map(|(name, package)| (name, package.published.sha256))
-            .collect(),
-    })
+    match recipe.toolchain {
+        ToolchainPins::Single(_) => {
+            let pin = repositories
+                .into_iter()
+                .next()
+                .context("missing toolchain repository")?
+                .pin;
+            Ok(Toolchain::Legacy(LegacyToolchain {
+                publisher: pin.name,
+                key_sha256: pin.key_sha256,
+                catalog_sha256: pin.catalog_sha256,
+                package_manifests: installed
+                    .into_iter()
+                    .map(|(name, package)| (name, package.published.sha256))
+                    .collect(),
+            }))
+        }
+        ToolchainPins::Publishers(_) => Ok(Toolchain::Pinned(PinnedToolchain {
+            publishers: repositories.into_iter().map(|source| source.pin).collect(),
+            package_manifests: installed
+                .into_iter()
+                .map(|(name, package)| {
+                    let published = package.published;
+                    (
+                        name,
+                        PinnedPackage {
+                            publisher: published.manifest.publisher,
+                            version: published.manifest.version,
+                            sha256: published.sha256,
+                        },
+                    )
+                })
+                .collect(),
+        })),
+    }
 }
 
 fn run(

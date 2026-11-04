@@ -226,6 +226,74 @@ test ! -e first/proto/unlisted
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
 test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
 
+# Resolve the probe from a separately signed publisher and its shell from the
+# primary catalog. Each repository retains a newer, unusable probe as well.
+install -m755 probe proto/usr/bin/probe
+sed 's/publisher="canopa"/publisher="tools"/' probe.kdl > tools-probe.kdl
+"$cps" publish --repo tools-repo --proto proto --signing-key other.der tools-probe.kdl
+tools_catalog=$(cat tools-repo/current)
+printf 'wrong companion executable\n' > proto/usr/bin/probe
+sed 's/version="1.0.0-0" {/version="2.0.0-0" {/' tools-probe.kdl > tools-newer.kdl
+"$cps" publish --repo tools-repo --proto proto --signing-key other.der tools-newer.kdl
+"$cps" repo withdraw --repo tools-repo --signing-key other.der cps://tools/build/probe@1.0.0-0
+fingerprint() { tail -c 32 -- "$1" | sha256sum | cut -d' ' -f1; }
+awk -v primary="$catalog" -v companion="$tools_catalog" \
+    -v primary_key="$(fingerprint public.der)" -v companion_key="$(fingerprint other-public.der)" '
+    /^    toolchain / {
+        print "    toolchain solver=\"sat-v1\" {"
+        printf "        publisher \"canopa\" catalog=\"%s\" key-sha256=\"%s\"\n", primary, primary_key
+        printf "        publisher \"tools\" catalog=\"%s\" key-sha256=\"%s\"\n", companion, companion_key
+        next
+    }
+    /^        package "build\/probe"/ {
+        print "        package \"cps://tools/build/probe@1.0.0-0\""
+        next
+    }
+    {print}
+' build.kdl > multi-build.kdl
+cat > toolchain.kdl <<'CONFIG'
+schema-version 1
+publisher "tools" {
+    repository "tools-repo"
+    trust-key "other-public.der"
+}
+publisher "canopa" {
+    repository "repo"
+    trust-key "public.der"
+}
+CONFIG
+"$cps" build --toolchain-config toolchain.kdl --source-cache cache \
+    --builder-signing-key builder.der --check-reproducible --output multi multi-build.kdl
+cmp first/proto/hello multi/proto/hello
+"$cps" publish-bundle --repo multi-output --signing-key signing.der --builder-key builder-public.der \
+    --recipe-sha256 "$(sha multi-build.kdl)" multi
+"$cps" repo attestation --repo multi-output --publisher canopa --trust-key public.der \
+    cps://canopa/demo/hello@1.0.0-0 > multi-evidence.json
+python3 - "$catalog" "$tools_catalog" <<'PYTHON'
+import base64
+import json
+import sys
+
+with open("multi-evidence.json") as f:
+    evidence = json.loads(base64.b64decode(json.load(f)["payload"]))
+assert evidence["predicateType"] == "urn:canopa:cps:build-provenance:v2"
+toolchain = evidence["predicate"]["toolchain"]
+assert [(p["name"], p["catalog_sha256"]) for p in toolchain["publishers"]] == [
+    ("canopa", sys.argv[1]), ("tools", sys.argv[2])
+]
+assert toolchain["package_manifests"]["build/shell"]["publisher"] == "canopa"
+assert toolchain["package_manifests"]["build/probe"]["publisher"] == "tools"
+assert toolchain["package_manifests"]["build/probe"]["version"] == "1.0.0-0"
+PYTHON
+sed 's/other-public.der/public.der/' toolchain.kdl > wrong-key.kdl
+if "$cps" build --toolchain-config wrong-key.kdl --source-cache cache \
+    --output rejected-multi multi-build.kdl > rejected-multi.log 2>&1; then
+    echo 'Accepted a toolchain key outside the recipe pins' >&2
+    exit 1
+fi
+grep -F 'toolchain key digest mismatch for tools' rejected-multi.log
+test ! -e rejected-multi
+
 cat > limits.kdl <<'KDL'
 schema-version 1
 worker timeout-seconds=2 scratch-bytes=1048576 file-bytes=4096 output-bytes=4 log-bytes=128
