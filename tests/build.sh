@@ -510,7 +510,7 @@ publisher "canopa" minimum-builders=2 {
     builder-key "other-public.der"
     approve "demo/hello" version="2.0.0-0" sha256="$hello2_reviewed"
     approve "library/platform" version="1.0.0-0" sha256="$platform_reviewed"
-    profile "base" architecture="$arch" {
+    profile "base" architecture="$arch" upgrade-from="$witnessed_catalog" {
         package "demo/hello"
     }
 }

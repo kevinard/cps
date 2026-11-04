@@ -215,6 +215,76 @@ fn release_profiles_pin_latest_roots_and_use_image_facets() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("library/legacy", "1.0.0-0", String::new())?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        dependency("require", "library/legacy", "1.0.0-0"),
+    )?;
+    f.package(
+        "desktop/session",
+        "1.0.0-0",
+        dependency("require", "library/legacy", "1.0.0-0"),
+    )?;
+    f.package(
+        "test/layout",
+        "1.0.0-0",
+        "    dir \"opt/layout\" mode=\"0755\" uid=0 gid=0\n".to_owned(),
+    )?;
+    let baseline = fs::read_to_string(f.repo.join("current"))?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        dependency("exclude", "library/legacy", "1.0.0-0"),
+    )?;
+    f.package("desktop/session", "2.0.0-0", String::new())?;
+    f.package(
+        "test/layout",
+        "2.0.0-0",
+        f.file("opt/layout", "replacement", "0644", "")?,
+    )?;
+    f.package("test/retire", "1.0.0-0", String::new())?;
+    let old = fs::read_to_string(f.repo.join("current"))?;
+    let id = "cps://canopa/test/retire@1.0.0-0";
+    let write_policy = |root: &str| {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"builder.der\"\n    profile \"desktop\" architecture=\"x86_64\" upgrade-from={:?} {{\n        package {root:?}\n    }}\n}}\n",
+                baseline.trim(),
+            ),
+        )
+    };
+    write_policy("desktop/compositor")?;
+    let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("update selects cps://canopa/desktop/compositor@1.0.0-0 instead of cps://canopa/desktop/compositor@2.0.0-0"), "{message}");
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, old);
+
+    write_policy("desktop/session")?;
+    let error =
+        withdraw_package(&f.repo, &f.private, "cps://canopa/library/legacy@1.0.0-0").unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("update retains unavailable package cps://canopa/library/legacy@1.0.0-0"),
+        "{message}"
+    );
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, old);
+
+    write_policy("test/layout")?;
+    let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("cannot change between directory and leaf actions at opt/layout"),
+        "{message}"
+    );
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, old);
+    Ok(())
+}
+
 fn sign_release(
     fixture: &Fixture,
     mirror: &Path,

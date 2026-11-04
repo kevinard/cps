@@ -22,14 +22,19 @@ pub(crate) struct Profile {
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
     pub packages: BTreeMap<String, Option<Version>>,
+    pub upgrade_from: Option<String>,
 }
 
 fn profile(node: &KdlNode, publisher: &str) -> Result<(String, Profile)> {
-    let fields = Fields::read(node, 1, &["architecture"], true)?;
+    let fields = Fields::read(node, 1, &["architecture", "upgrade-from"], true)?;
     let name = fields.string_arg(0)?;
     validate_name(&name)?;
     let arch = fields.required_string("architecture")?;
     validate_name(&arch).context("invalid profile architecture")?;
+    let upgrade_from = fields.string("upgrade-from")?;
+    if let Some(hash) = &upgrade_from {
+        validate_digest(hash).context("invalid profile upgrade catalog digest")?;
+    }
     let mut packages = BTreeMap::new();
     let mut facets = BTreeMap::new();
     for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
@@ -74,6 +79,7 @@ fn profile(node: &KdlNode, publisher: &str) -> Result<(String, Profile)> {
             arch,
             facets,
             packages,
+            upgrade_from,
         },
     ))
 }

@@ -477,7 +477,12 @@ pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
     )?;
     if catalog.withdraw(id)? {
         let policy = read_publish_policy(repo, &catalog, false)?;
-        check_profiles(repo, &mut catalog, policy.as_ref())?;
+        check_profiles(
+            repo,
+            &mut catalog,
+            policy.as_ref(),
+            key.public_key().as_ref(),
+        )?;
         write_catalog(repo, catalog, &key)?;
     }
     Ok(())
@@ -636,7 +641,12 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
         }
     }
     if changed {
-        check_profiles(repo, &mut catalog, policy.as_ref())?;
+        check_profiles(
+            repo,
+            &mut catalog,
+            policy.as_ref(),
+            key.public_key().as_ref(),
+        )?;
         write_catalog(repo, catalog, &key)
     } else {
         current.context("empty release has no published catalog")
@@ -686,7 +696,12 @@ fn publish_manifest(
         evidence,
         policy.as_ref(),
     )? {
-        check_profiles(repo, &mut catalog, policy.as_ref())?;
+        check_profiles(
+            repo,
+            &mut catalog,
+            policy.as_ref(),
+            key.public_key().as_ref(),
+        )?;
         write_catalog(repo, catalog, key)?;
     }
     Ok(id)
@@ -836,9 +851,10 @@ fn check_profiles(
     repo: &Path,
     catalog: &mut Catalog,
     policy: Option<&PublicationPolicy>,
+    key: &[u8],
 ) -> Result<()> {
     if let Some(policy) = policy.filter(|policy| !policy.profiles.is_empty()) {
-        profiles::check(repo, catalog, &policy.profiles)?;
+        profiles::check(repo, catalog, &policy.profiles, key)?;
         catalog.profiles_required = true;
     }
     Ok(())

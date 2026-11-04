@@ -95,6 +95,17 @@ pub(crate) fn selected(
     Ok(selected)
 }
 
+pub(crate) fn transition(
+    previous: Option<Artifacts>,
+    next: Option<Artifacts>,
+) -> Result<Option<Artifacts>> {
+    ensure!(
+        previous.is_none() || next.is_some(),
+        "transaction would remove the image's selected kernel"
+    );
+    Ok(next.filter(|selected| Some(selected) != previous.as_ref()))
+}
+
 fn owned_digest(paths: &BTreeMap<String, Managed>, name: &str, path: &str) -> Option<String> {
     let managed = paths.get(path)?;
     match &managed.node {

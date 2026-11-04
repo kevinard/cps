@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -18,7 +18,9 @@ use crate::{
     systemd::{self, Action as SystemdAction},
 };
 
-pub(crate) use paths::{effective_paths, hardlink_groups, select_paths};
+pub(crate) use paths::{
+    check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
+};
 pub(crate) use resolve::{check as check_dependencies, resolve as resolve_packages};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -243,13 +245,10 @@ pub(crate) fn build(
         .revision
         .checked_add(1)
         .context("image revision exhausted")?;
-    let previous_kernel = kernel::selected(&state.installed, &state.paths)?;
-    let kernel = kernel::selected(&installed, &paths)?;
-    ensure!(
-        previous_kernel.is_none() || kernel.is_some(),
-        "transaction would remove the image's selected kernel"
-    );
-    let kernel_install = kernel.filter(|selected| Some(selected) != previous_kernel.as_ref());
+    let kernel_install = kernel::transition(
+        kernel::selected(&state.installed, &state.paths)?,
+        kernel::selected(&installed, &paths)?,
+    )?;
     let mut plan = Plan {
         format: FORMAT,
         solver,
@@ -321,21 +320,16 @@ pub(crate) fn build(
             continue;
         }
         if let (Some(old), Some(new)) = (before, after) {
-            ensure!(
-                old.node.is_dir() == new.node.is_dir(),
-                "cannot change between directory and leaf actions at {path}"
-            );
+            check_path_type(path, old, new)?;
         }
         let observed = root.inspect(path)?;
         let destination = match after {
             Some(target) if target.node.is_dir() => match &observed {
                 None => Some(target.node.clone()),
-                Some(existing)
-                    if existing == &target.node || (target.implicit && existing.is_dir()) =>
-                {
+                Some(existing) => {
+                    check_directory(path, existing, target)?;
                     observed.clone()
                 }
-                Some(_) => bail!("directory or metadata conflict at {path}"),
             },
             Some(target) => {
                 ensure!(

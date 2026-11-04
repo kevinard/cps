@@ -217,6 +217,16 @@ withdrawals require a policy with at least one profile. Profiles check fresh
 image composition for the release's own publisher. Clients need support for
 profile enforcement to read catalogs that record this requirement.
 
+Set `upgrade-from="<signed catalog SHA-256>"` on a profile to also test a rolling
+upgrade from that historical catalog. CPS composes the baseline with the same
+package names, architecture, and facets, choosing the newest baseline versions
+for the profile roots. It runs the ordinary update solver with that installed
+set. The result must reach the candidate profile's requested versions, retain
+only packages available in the candidate, and pass the planner's directory and
+kernel transition checks. This models the package-managed state of a clean
+image. Live filesystem changes and boot health are checked separately during
+staging and boot.
+
 ## Signed releases and mirrors
 
 Group related package changes and withdrawals in a KDL release file. Use the
