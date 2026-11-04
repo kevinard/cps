@@ -214,7 +214,7 @@ pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
         .publishers
         .get(name)
         .with_context(|| format!("publisher {name} is not configured"))?;
-    let profile = builds::read_profile(&image.db, &state)?;
+    let profile = catalogs::read_profile(&image.db, &state)?;
     if let Some(signed) = profile
         .as_ref()
         .and_then(|profile| profile.companions.iter().find(|pin| pin.publisher == name))

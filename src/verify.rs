@@ -26,12 +26,18 @@ pub fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
         .root
         .offline_path()
         .context("pristine verification requires an inactive image")?;
-    check_state(&image.root, &image.state()?, true)
+    check_image(&image, true)
 }
 
 pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     image.require_clean()?;
-    verify_state(&image.root, &image.state()?)
+    check_image(image, false)
+}
+
+fn check_image(image: &Image, pristine: bool) -> Result<Vec<Finding>> {
+    let state = image.state()?;
+    image.verify_catalog_archives(&state)?;
+    check_state(&image.root, &state, pristine)
 }
 
 pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>> {

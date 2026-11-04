@@ -144,6 +144,9 @@ pub(crate) fn apply_with(
             pending.id == id,
             "a different plan is pending; rerun apply with that plan"
         );
+        image
+            .verify_catalog_archives(&pending.next)
+            .context("verifying catalog archives for the pending transaction")?;
         let offline = offline_target(
             &image.root,
             !pending.systemd.is_empty() || pending.kernel_install.is_some(),

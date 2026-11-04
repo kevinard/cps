@@ -36,7 +36,7 @@ pub mod release;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Catalog {
+pub(crate) struct Catalog {
     format: u32,
     publisher: String,
     entries: BTreeMap<String, CatalogEntry>,
@@ -185,6 +185,15 @@ impl CatalogPin {
         Ok(())
     }
 
+    pub(crate) fn check_archive(&self, catalog: &Catalog, hash: &str, key: &[u8]) -> Result<()> {
+        ensure!(
+            self.publisher == catalog.publisher && self.sha256 == hash,
+            "archived catalog for {} differs from the signed profile pin",
+            self.publisher
+        );
+        self.check_lineage(catalog, key)
+    }
+
     pub(crate) fn snapshot(&self, repo: &Path, publisher: &str, key: &[u8]) -> Result<Snapshot> {
         let catalog = self.read(repo, publisher, key)?;
         catalog_snapshot(repo, catalog, self.sha256.clone(), key)
@@ -215,6 +224,18 @@ impl Catalog {
             let withdrawn = self.withdrawals.get(id)?;
             Some((&withdrawn.manifest, withdrawn.attestation.as_deref()))
         }
+    }
+
+    pub(crate) fn check_installed(&self, package: &Published) -> Result<Option<&str>> {
+        let (entry, attestation) = self
+            .package_record(&package.manifest.id())
+            .context("package is absent from the signed catalog")?;
+        ensure!(
+            entry.manifest_digest() == package.sha256,
+            "installed manifest digest differs from the signed catalog"
+        );
+        entry.check_architecture(&package.manifest)?;
+        Ok(attestation)
     }
 
     fn publisher_keys(&self, anchor: &[u8]) -> Result<Vec<[u8; 32]>> {
@@ -609,6 +630,20 @@ pub(crate) struct CatalogCheckpoint {
 }
 
 impl CatalogCheckpoint {
+    pub(crate) fn read_archive(
+        &self,
+        bytes: &[u8],
+        publisher: &str,
+        key: &[u8],
+    ) -> Result<Catalog> {
+        let catalog = decode_archived_catalog(bytes, &self.catalog, publisher, key)?;
+        ensure!(
+            self.sequence == catalog.sequence && self.rotations == catalog.key_rotations,
+            "catalog checkpoint metadata mismatch"
+        );
+        Ok(catalog)
+    }
+
     pub(crate) fn check(&self, next: &Self) -> Result<()> {
         if self.catalog == next.catalog {
             ensure!(self == next, "catalog checkpoint metadata mismatch");
@@ -796,15 +831,9 @@ pub(crate) fn audit_installed_builds<'a>(
         let id = package.manifest.id();
         let installed_record = || {
             package.verify()?;
-            let (entry, attestation) = catalog
-                .package_record(&id)
-                .context("package is absent from the signed catalog")?;
-            ensure!(
-                entry.manifest_digest() == package.sha256,
-                "installed manifest digest differs from the signed catalog"
-            );
-            entry.check_architecture(&package.manifest)?;
-            attestation.with_context(|| format!("no build attestation for {id}"))
+            catalog
+                .check_installed(package)?
+                .with_context(|| format!("no build attestation for {id}"))
         };
         let result = installed_record()
             .with_context(|| format!("checking installed manifest for {id}"))
@@ -1124,21 +1153,7 @@ pub(crate) fn release_profile(
     ))
 }
 
-pub(crate) fn archived_release_profile(
-    bytes: &[u8],
-    hash: &str,
-    publisher: &str,
-    key: &[u8],
-    name: &str,
-) -> Result<ReleaseProfile> {
-    take_profile(
-        &mut decode_archived_catalog(bytes, hash, publisher, key)?,
-        hash,
-        name,
-    )
-}
-
-fn decode_archived_catalog(
+pub(crate) fn decode_archived_catalog(
     bytes: &[u8],
     hash: &str,
     publisher: &str,
@@ -1170,7 +1185,11 @@ pub(crate) fn check_catalog_successor(
     previous.check_successor(&next, previous_hash)
 }
 
-fn take_profile(catalog: &mut Catalog, hash: &str, name: &str) -> Result<ReleaseProfile> {
+pub(crate) fn take_profile(
+    catalog: &mut Catalog,
+    hash: &str,
+    name: &str,
+) -> Result<ReleaseProfile> {
     catalog.release_profiles.remove(name).with_context(|| {
         format!(
             "catalog {hash} for {} has no signed release profile {name}",

@@ -663,6 +663,10 @@ impl Image {
         Ok(())
     }
 
+    pub(crate) fn verify_catalog_archives(&self, state: &State) -> Result<()> {
+        catalogs::verify(&self.db, state)
+    }
+
     pub fn record_pending(
         &mut self,
         data: &impl Serialize,
@@ -674,6 +678,7 @@ impl Image {
         if repo_backed {
             catalogs::save(&tx, next)?;
         }
+        catalogs::verify(&tx, next)?;
         builds::save(&tx, &next.publishers, receipts)?;
         tx.execute(
             "INSERT INTO pending VALUES (1, ?1)",

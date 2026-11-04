@@ -2106,6 +2106,76 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
 }
 
 #[test]
+fn offline_verification_checks_catalog_admission_and_pending_archives() -> Result<()> {
+    let f = Fixture::new()?;
+    let install = |name: &str| {
+        plan(
+            &f.root,
+            Request::Install {
+                packages: vec![name.to_owned()],
+            },
+        )
+    };
+    f.package("test/retired", "1.0.0-0", String::new())?;
+    f.create()?;
+    apply(&f.root, &install("test/retired")?)?;
+    withdraw_package(&f.repo, &f.private, "cps://canopa/test/retired@1.0.0-0")?;
+
+    const SECOND: &str = "usr/share/test/second";
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "first", "0755", "")? + &f.file(SECOND, "second", "0644", "")?,
+    )?;
+    let plan = install("desktop/compositor")?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("pending.json"),
+        &plan,
+        COMPOSITOR,
+    )?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let archive: Vec<u8> = db.query_row(
+        "SELECT catalog FROM catalog_archives WHERE publisher='canopa'",
+        [],
+        |row| row.get(0),
+    )?;
+    db.execute("DELETE FROM catalog_archives WHERE publisher='canopa'", [])?;
+    let error = apply(&f.root, &plan).unwrap_err();
+    assert!(format!("{error:#}").contains("reading the archived catalog for canopa"));
+    assert!(!f.root.join(SECOND).exists());
+    db.execute(
+        "INSERT INTO catalog_archives VALUES ('canopa', ?1)",
+        [&archive],
+    )?;
+    apply(&f.root, &plan)?;
+    assert_eq!(fs::read_to_string(f.root.join(SECOND))?, "second");
+    assert!(verify(&f.root)?.is_empty());
+
+    let document: String = db.query_row(
+        "SELECT json_extract(data, '$.published.document') FROM installed WHERE name='test/retired'",
+        [],
+        |row| row.get(0),
+    )?;
+    let edited = format!("{document}\n");
+    db.execute(
+        "UPDATE installed SET data=json_set(data, '$.published.document', ?1, '$.published.sha256', ?2)
+         WHERE name='test/retired'",
+        (&edited, digest(edited.as_bytes())),
+    )?;
+    let error = verify(&f.root).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("installed manifest digest differs from the signed catalog")
+    );
+    let error = crate::verify_pristine(&f.root).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("installed manifest digest differs from the signed catalog")
+    );
+    Ok(())
+}
+
+#[test]
 fn standalone_and_companion_publishers_keep_withdrawals_after_cache_replacement() -> Result<()> {
     let f = Fixture::new()?;
     let seed = Fixture::new()?;
@@ -2216,6 +2286,33 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     }
     apply(&f.root, &install)?;
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    {
+        let cached = seed.repo.with_extension("offline").join("catalogs");
+        let previous = fs::read_to_string(cached.join(seed_branch.trim()))?;
+        let applied = fs::read(cached.join(applied_seed.trim()))?;
+        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        let settings: String =
+            db.query_row("SELECT data FROM image WHERE id=1", [], |row| row.get(0))?;
+        db.execute(
+            "UPDATE image SET data=json_set(data, '$.catalog_checkpoints.seed.catalog', ?1,
+             '$.catalog_checkpoints.seed.sequence', json_extract(?2, '$.catalog.sequence')) WHERE id=1",
+            (seed_branch.trim(), &previous),
+        )?;
+        db.execute(
+            "UPDATE catalog_archives SET catalog=?1 WHERE publisher='seed'",
+            [previous.as_bytes()],
+        )?;
+        let error = verify(&f.root).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("archived catalog for seed differs from the signed profile pin")
+        );
+        db.execute("UPDATE image SET data=?1 WHERE id=1", [settings])?;
+        db.execute(
+            "UPDATE catalog_archives SET catalog=?1 WHERE publisher='seed'",
+            [applied],
+        )?;
+    }
     for repo in [&f.repo, &seed.repo] {
         fs::rename(repo.with_extension("offline"), repo)?;
     }
