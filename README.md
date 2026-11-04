@@ -708,6 +708,29 @@ with `CPS_VM_KERNEL_FIXTURE` to test the source-built trial kernel. The fixture
 still uses host mount and module-loading commands in the guest and the host's
 systemd helpers for offline staging.
 
+#### Testing a merged `/usr` image
+
+Build the merged base from the CPS fixture's signed runtime catalog and build
+BusyBox for canonical installation under `/usr/bin`.
+
+```sh
+tests/build-usr-base.sh target/usr-base-fixture target/cps-fixture
+CPS_BUSYBOX_MERGED_USR=1 tests/build-busybox.sh target/busybox-usr-fixture
+```
+
+The signed `system/filesystem` package owns the compatibility links. The ELF
+runtime package places the x86-64 interpreter under `/usr/lib`. Applications
+can still start through `/lib64`, and scripts can use `/bin/sh`. Package file
+actions use canonical paths. CPS rejects file actions beneath compatibility
+links and can verify their exact targets with `verify --pristine`.
+[systemd filesystem hierarchy requirements](https://systemd.io/SYSTEMD_FILE_HIERARCHY_REQUIREMENTS/)
+
+Set `CPS_VM_USR_BASE_FIXTURE` to the merged base output alongside the signed
+systemd fixture, and point the BusyBox repository and key at the merged
+BusyBox output. Both roots are provisioned with the layout before booting.
+The test checks the aliases, shell, and interpreter on the trial and rollback
+boots and fails if systemd reports an unmerged `/usr`.
+
 #### Testing a source-built BusyBox
 
 On an x86-64 Arch Linux worker with a native GCC toolchain, run

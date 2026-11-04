@@ -1,14 +1,21 @@
 # Helpers for the QEMU fixture. This is sourced by systemd-boot-vm.sh.
 
 copy_runtime_deps() {
-    local root=$1 binary=$2 links library
+    local root=$1 binary=$2 merged=${3:-} links library directory
     links=$(ldd "$binary" 2>&1 || :)
     if [[ $links == *'not found'* ]]; then
         printf '%s\n' "$links" >&2
         return 1
     fi
     while read -r library; do
-        cp -L --parents "$library" "$root/"
+        if [[ -n $merged ]]; then
+            # Keep the SONAME while resolving the trusted host directory aliases.
+            directory=$(realpath -e -- "${library%/*}")
+            mkdir -p -- "$root$directory"
+            cp -L -- "$library" "$root$directory/${library##*/}"
+        else
+            cp -L --parents "$library" "$root/"
+        fi
     done < <(awk '/=> \// { print $3 } /^[[:space:]]*\// { print $1 }' <<< "$links")
 }
 
@@ -86,7 +93,7 @@ MANIFEST
 }
 
 setup_systemd_guest() {
-    local root=$1 signed=${2:-}
+    local root=$1 signed=${2:-} merged=${3:-}
     local systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
     local binary unit command
     mkdir -p "$root"/{etc/systemd/system,usr/bin,usr/lib/systemd/{system,system-generators},usr/local/libexec,vm-modules}
@@ -111,7 +118,7 @@ setup_systemd_guest() {
     for command in "${commands[@]}"; do
         binary=$(command -v "$command")
         cp -L "$binary" "$root/usr/bin/$command"
-        copy_runtime_deps "$root" "$binary"
+        copy_runtime_deps "$root" "$binary" "$merged"
     done
     printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
     printf 'root:x:0:\n' > "$root/etc/group"
@@ -172,6 +179,13 @@ set -e
 bb=/bin/busybox
 [ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
 state=$("$bb" cat /etc/cps-vm-boot-state)
+if [ -f /etc/cps-vm-assert-merged-usr ]; then
+    for path in /bin /sbin /lib /lib64 /usr/sbin /usr/lib64; do [ -L "$path" ]; done
+    [ /bin/busybox -ef /usr/bin/busybox ]
+    [ /lib64/ld-linux-x86-64.so.2 -ef /usr/lib/ld-linux-x86-64.so.2 ]
+    /bin/sh -ec 'test "$1" = merged' sh merged
+    printf 'CPS_VM_USR: %s merged\n' "$state"
+fi
 if [ -f /etc/cps-vm-assert-built-systemd ]; then
     [ /proc/1/exe -ef /usr/lib/systemd/systemd ]
     version=$(/usr/lib/systemd/systemd --version)

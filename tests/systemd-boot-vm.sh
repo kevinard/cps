@@ -16,6 +16,7 @@ cps_fixture=${CPS_VM_CPS_FIXTURE:-}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
 systemd_fixture=${CPS_VM_SYSTEMD_FIXTURE:-}
+usr_base_fixture=${CPS_VM_USR_BASE_FIXTURE:-}
 systemd_efi=usr/lib/systemd/boot/efi/systemd-bootx64.efi
 profiled=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
@@ -29,6 +30,9 @@ busybox=${CPS_VM_BUSYBOX:-/usr/lib/initcpio/busybox}
 busybox_repo=${CPS_VM_BUSYBOX_REPO:-}
 busybox_key=${CPS_VM_BUSYBOX_TRUST_KEY:-}
 busybox_package=cps://canopa-bootstrap/system/busybox@1.37.0-0
+if [[ -n $usr_base_fixture ]]; then
+    busybox_package=cps://canopa-bootstrap/system/busybox@1.37.0-1
+fi
 code=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE to x86-64 OVMF_CODE}
 vars=${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS to the matching OVMF_VARS template}
 qemu_data=${CPS_VM_QEMU_DATA:-}
@@ -62,6 +66,7 @@ if [[ -n $cps_fixture ]]; then
             --trust-key "$cps_fixture/release-public.der" "cps://canopa/$package" >/dev/null
     done
     elf_runtime_paths=(lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1})
+    elf_runtime=$cps_fixture
     cps_library_paths=(usr/lib/{libsqlite3.so.0,libseccomp.so.2})
 fi
 if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
@@ -84,6 +89,12 @@ if [[ -n $systemd_fixture ]]; then
     $profiled || { echo 'CPS_VM_SYSTEMD_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
     "$cps" repo attestation --repo "$systemd_fixture/repo" --publisher canopa-systemd \
         --trust-key "$systemd_fixture/release-public.der" cps://canopa-systemd/system/systemd-vm@262.1.0-0 >/dev/null
+fi
+if [[ -n $usr_base_fixture ]]; then
+    [[ -n $systemd_fixture ]] || { echo 'CPS_VM_USR_BASE_FIXTURE requires the signed systemd fixture' >&2; exit 2; }
+    usr_base_fixture=$(realpath -- "$usr_base_fixture")
+    elf_runtime=$usr_base_fixture
+    elf_runtime_paths[0]=usr/lib/ld-linux-x86-64.so.2
 fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
@@ -177,8 +188,13 @@ MANIFEST
 }
 
 profile_companions() {
-    printf '%s\n' "$fixture_publisher repo public.der" 'canopa signed-cps cps-public.der' \
-        'canopa-runtime-seed signed-seed seed-public.der' 'canopa-bootstrap signed-busybox busybox-public.der' \
+    printf '%s\n' "$fixture_publisher repo public.der" 'canopa signed-cps cps-public.der'
+    if [[ -n $usr_base_fixture ]]; then
+        printf '%s\n' 'canopa-usr-base signed-seed seed-public.der'
+    else
+        printf '%s\n' 'canopa-runtime-seed signed-seed seed-public.der'
+    fi
+    printf '%s\n' 'canopa-bootstrap signed-busybox busybox-public.der' \
         'extras extras extras-public.der'
     if [[ -n $kernel_fixture ]]; then
         printf '%s\n' 'canopa-kernel signed-kernel kernel-public.der'
@@ -243,7 +259,7 @@ elif $systemd_guest; then
     "$cps" publish --repo repo --proto proto --signing-key private.der cps.kdl
     packages+=(system/cps)
 fi
-mkdir -p runtime/{bin,etc}
+mkdir -p runtime/etc
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     touch runtime/etc/cps-vm-assert-kernel
 else
@@ -254,18 +270,19 @@ if [[ -n $busybox_repo ]]; then
     packages+=("$busybox_package")
     if $systemd_guest; then touch runtime/etc/cps-vm-assert-built-busybox; fi
 else
+    mkdir -p runtime/bin
     cp -L "$busybox" runtime/bin/busybox
     copy_runtime_deps runtime "$busybox"
 fi
 if $systemd_guest; then
-    setup_systemd_guest runtime "$systemd_fixture"
+    setup_systemd_guest runtime "$systemd_fixture" "$usr_base_fixture"
     if [[ $mode == capabilities ]]; then
         setup_capability_guest runtime "$cps" "$project/tests/file-capabilities-guest.sh"
     fi
     if [[ -n $cps_fixture ]]; then
         # Leave runtime ownership to the packages selected from the signed repositories.
         for path in "${elf_runtime_paths[@]}"; do
-            if [[ -f runtime/$path ]]; then cmp "runtime/$path" "$cps_fixture/image/$path"; fi
+            if [[ -f runtime/$path ]]; then cmp "runtime/$path" "$elf_runtime/image/$path"; fi
             rm -f -- "runtime/$path"
         done
         for path in "${cps_library_paths[@]}"; do rm -f -- "runtime/$path"; done
@@ -279,6 +296,9 @@ if $systemd_guest; then
             rm -- "runtime/usr/lib/$library"
         done
         rm -f -- runtime/usr/lib/libsystemd.so.0
+    fi
+    if [[ -n $usr_base_fixture ]]; then
+        touch runtime/etc/cps-vm-assert-merged-usr
     fi
     if [[ $mode == rollback ]]; then
         if [[ -n $kernel_fixture ]]; then
@@ -314,10 +334,15 @@ packages+=(test/boot-runtime)
 if $profiled; then
     publish_extra_marker
     cp -a -- "$cps_fixture/repo" signed-cps
-    cp -a -- "$cps_fixture/runtime-seed" signed-seed
     cp -a -- "$busybox_repo" signed-busybox
     cp -- "$cps_fixture/release-public.der" cps-public.der
-    cp -- "$cps_fixture/runtime-seed-public.der" seed-public.der
+    if [[ -n $usr_base_fixture ]]; then
+        cp -a -- "$usr_base_fixture/repo" signed-seed
+        cp -- "$usr_base_fixture/release-public.der" seed-public.der
+    else
+        cp -a -- "$cps_fixture/runtime-seed" signed-seed
+        cp -- "$cps_fixture/runtime-seed-public.der" seed-public.der
+    fi
     cp -- "$busybox_key" busybox-public.der
     boot_kernel_dependency='    require "system/kernel"'
     if [[ -n $kernel_fixture ]]; then
@@ -386,14 +411,21 @@ fi
 "$cps" plan --root base --output install.json install "${packages[@]}"
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
+if [[ -n $usr_base_fixture ]]; then
+    test "$(readlink base/bin)" = usr/bin
+    test "$(readlink base/lib64)" = usr/lib
+fi
 if [[ -n $systemd_fixture ]]; then
     cmp "base/$systemd_efi" "$efi"
     cmp base/usr/lib/systemd/systemd "$systemd_fixture/image/usr/lib/systemd/systemd"
     cp -- "base/$systemd_efi" esp/EFI/BOOT/BOOTX64.EFI
 fi
 if [[ -n $cps_fixture ]]; then
-    for path in usr/bin/cps "${cps_library_paths[@]}" "${elf_runtime_paths[@]}"; do
+    for path in usr/bin/cps "${cps_library_paths[@]}"; do
         cmp "base/$path" "$cps_fixture/image/$path"
+    done
+    for path in "${elf_runtime_paths[@]}"; do
+        cmp "base/$path" "$elf_runtime/image/$path"
     done
 fi
 if $profiled; then
@@ -643,6 +675,12 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$managers" = $'CPS_VM_SYSTEMD: trial v262.1\nCPS_VM_SYSTEMD: trial v262.1'
             printf '%s\n' "$managers"
         fi
+        if [[ -n $usr_base_fixture ]]; then
+            layouts=$(tr -d '\r' < serial.log | grep '^CPS_VM_USR: ' || :)
+            test "$layouts" = $'CPS_VM_USR: trial merged\nCPS_VM_USR: trial merged'
+            if grep -F 'unmerged-usr' serial.log; then exit 1; fi
+            printf '%s\n' "$layouts"
+        fi
         publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
@@ -682,6 +720,10 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         fi
         if [[ -n $systemd_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_SYSTEMD: previous v262.1'
+        fi
+        if [[ -n $usr_base_fixture ]]; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_USR: previous merged'
+            if grep -F 'unmerged-usr' rollback.log; then exit 1; fi
         fi
         printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
     fi
