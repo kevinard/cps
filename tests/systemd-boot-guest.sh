@@ -86,26 +86,32 @@ MANIFEST
 }
 
 setup_systemd_guest() {
-    local root=$1
+    local root=$1 signed=${2:-}
     local systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
     local binary unit command
     mkdir -p "$root"/{etc/systemd/system,usr/bin,usr/lib/systemd/{system,system-generators},usr/local/libexec,vm-modules}
-    local programs=(systemd systemd-bless-boot system-generators/systemd-bless-boot-generator)
-    if [[ -x "$systemd/systemd-executor" ]]; then programs+=(systemd-executor); fi
-    for binary in "${programs[@]}"; do
-        cp -L "$systemd/$binary" "$root/usr/lib/systemd/$binary"
-        copy_runtime_deps "$root" "$systemd/$binary"
-    done
-    for command in systemctl mount insmod; do
+    local commands=(mount insmod)
+    if [[ -z $signed ]]; then
+        local programs=(systemd systemd-bless-boot system-generators/systemd-bless-boot-generator)
+        if [[ -x "$systemd/systemd-executor" ]]; then programs+=(systemd-executor); fi
+        for binary in "${programs[@]}"; do
+            cp -L "$systemd/$binary" "$root/usr/lib/systemd/$binary"
+            copy_runtime_deps "$root" "$systemd/$binary"
+        done
+        commands+=(systemctl)
+        for unit in basic.target boot-complete.target local-fs.target multi-user.target \
+            paths.target shutdown.target slices.target sockets.target swap.target \
+            sysinit.target systemd-bless-boot.service timers.target; do
+            cp -L "$systemd/system/$unit" "$root/usr/lib/systemd/system/"
+        done
+        copy_runtime_deps "$root" "$(command -v blkid)" # systemd's ESP discovery loads libblkid
+    else
+        touch "$root/etc/cps-vm-assert-built-systemd"
+    fi
+    for command in "${commands[@]}"; do
         binary=$(command -v "$command")
         cp -L "$binary" "$root/usr/bin/$command"
         copy_runtime_deps "$root" "$binary"
-    done
-    copy_runtime_deps "$root" "$(command -v blkid)" # systemd's ESP discovery loads libblkid
-    for unit in basic.target boot-complete.target local-fs.target multi-user.target \
-        paths.target shutdown.target slices.target sockets.target swap.target \
-        sysinit.target systemd-bless-boot.service timers.target; do
-        cp -L "$systemd/system/$unit" "$root/usr/lib/systemd/system/"
     done
     printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
     printf 'root:x:0:\n' > "$root/etc/group"
@@ -166,6 +172,12 @@ set -e
 bb=/bin/busybox
 [ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
 state=$("$bb" cat /etc/cps-vm-boot-state)
+if [ -f /etc/cps-vm-assert-built-systemd ]; then
+    [ /proc/1/exe -ef /usr/lib/systemd/systemd ]
+    version=$(/usr/lib/systemd/systemd --version)
+    case "$version" in 'systemd 262 (v262.1)'*) ;; *) exit 1 ;; esac
+    printf 'CPS_VM_SYSTEMD: %s v262.1\n' "$state"
+fi
 if [ -f /etc/cps-vm-assert-built-busybox ]; then
     version=$("$bb" --help 2>&1 | {
         IFS=' ' read -r name release rest

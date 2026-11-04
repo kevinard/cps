@@ -681,6 +681,33 @@ configuration directly from the fixture repository. This kernel has built-in
 virtio, ext4, and VFAT support and boots the QEMU test root without an initrd.
 The previous root keeps its original kernel and initrd.
 
+#### Testing source-built systemd and systemd-boot
+
+On the x86-64 Arch worker, provide Meson, Ninja, Python, Jinja2, pyelftools,
+gperf, patchelf, and the libmount, libblkid, and libseccomp headers. Place the
+`v262.1` source archive in the source directory as `systemd-262.1.tar.gz`.
+[systemd v262.1 release](https://github.com/systemd/systemd/releases/tag/v262.1)
+
+```sh
+CPS_SYSTEMD_SOURCE_DIR=/path/to/verified-sources \
+CPS_SYSTEMD_CPS_FIXTURE=target/cps-fixture \
+tests/build-systemd.sh target/systemd-fixture
+```
+
+The fixture pins the archive and the signed worker toolchain. It builds the
+VM's systemd components twice offline and publishes the matching outputs with
+signed build evidence. It also publishes a separate seed for the worker's
+prebuilt libmount and libblkid. Set `CPS_SYSTEMD_TOOLS_ROOT` to a trusted
+extracted Arch package tree if gperf, patchelf, Jinja2, and pyelftools are
+available there instead of on the worker.
+
+Set `CPS_VM_SYSTEMD_FIXTURE` to the build output for signed-profile rollback.
+The test installs systemd from the signed repository, copies the installed EFI
+loader to the ESP, and checks the packaged PID 1 on each boot. Combine this
+with `CPS_VM_KERNEL_FIXTURE` to test the source-built trial kernel. The fixture
+still uses host mount and module-loading commands in the guest and the host's
+systemd helpers for offline staging.
+
 #### Testing a source-built BusyBox
 
 On an x86-64 Arch Linux worker with a native GCC toolchain, run

@@ -15,9 +15,15 @@ cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
+systemd_fixture=${CPS_VM_SYSTEMD_FIXTURE:-}
+systemd_efi=usr/lib/systemd/boot/efi/systemd-bootx64.efi
 profiled=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
+if [[ -n $systemd_fixture ]]; then
+    systemd_fixture=$(realpath -- "$systemd_fixture")
+    efi="$systemd_fixture/image/$systemd_efi"
+fi
 kernel=${CPS_VM_KERNEL:-/boot/vmlinuz-linux}
 busybox=${CPS_VM_BUSYBOX:-/usr/lib/initcpio/busybox}
 busybox_repo=${CPS_VM_BUSYBOX_REPO:-}
@@ -74,6 +80,11 @@ if [[ -n $kernel_fixture ]]; then
     "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
         --trust-key "$kernel_fixture/release-public.der" "$kernel_package" >/dev/null
 fi
+if [[ -n $systemd_fixture ]]; then
+    $profiled || { echo 'CPS_VM_SYSTEMD_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
+    "$cps" repo attestation --repo "$systemd_fixture/repo" --publisher canopa-systemd \
+        --trust-key "$systemd_fixture/release-public.der" cps://canopa-systemd/system/systemd-vm@262.1.0-0 >/dev/null
+fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
     if [[ -z $kernel_fixture ]]; then
@@ -103,7 +114,7 @@ elif [[ $mode == kernel-upgrade ]]; then
     root_mib=128
 fi
 mkdir -p esp/EFI/BOOT proto/etc
-cp "$efi" esp/EFI/BOOT/BOOTX64.EFI
+if [[ -z $systemd_fixture ]]; then cp "$efi" esp/EFI/BOOT/BOOTX64.EFI; fi
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
 openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 
@@ -171,6 +182,10 @@ profile_companions() {
         'extras extras extras-public.der'
     if [[ -n $kernel_fixture ]]; then
         printf '%s\n' 'canopa-kernel signed-kernel kernel-public.der'
+    fi
+    if [[ -n $systemd_fixture ]]; then
+        printf '%s\n' 'canopa-systemd signed-systemd systemd-public.der' \
+            'canopa-systemd-seed signed-systemd-seed systemd-seed-public.der'
     fi
 }
 
@@ -243,7 +258,7 @@ else
     copy_runtime_deps runtime "$busybox"
 fi
 if $systemd_guest; then
-    setup_systemd_guest runtime
+    setup_systemd_guest runtime "$systemd_fixture"
     if [[ $mode == capabilities ]]; then
         setup_capability_guest runtime "$cps" "$project/tests/file-capabilities-guest.sh"
     fi
@@ -257,6 +272,13 @@ if $systemd_guest; then
         touch runtime/etc/cps-vm-assert-cps-runtime
     else
         copy_runtime_deps runtime proto/usr/bin/cps
+    fi
+    if [[ -n $systemd_fixture ]]; then
+        for library in libblkid.so.1 libmount.so.1; do
+            cmp "runtime/usr/lib/$library" "$systemd_fixture/image/usr/lib/$library"
+            rm -- "runtime/usr/lib/$library"
+        done
+        rm -f -- runtime/usr/lib/libsystemd.so.0
     fi
     if [[ $mode == rollback ]]; then
         if [[ -n $kernel_fixture ]]; then
@@ -303,6 +325,14 @@ if $profiled; then
         cp -- "$kernel_fixture/release-public.der" kernel-public.der
         boot_kernel_dependency=
     fi
+    boot_systemd_dependency=
+    if [[ -n $systemd_fixture ]]; then
+        cp -a -- "$systemd_fixture/repo" signed-systemd
+        cp -a -- "$systemd_fixture/runtime-seed" signed-systemd-seed
+        cp -- "$systemd_fixture/release-public.der" systemd-public.der
+        cp -- "$systemd_fixture/runtime-seed-public.der" systemd-seed-public.der
+        boot_systemd_dependency='    require "system/systemd-vm"'
+    fi
     openssl genpkey -algorithm ED25519 -outform DER -out profile-private.der
     openssl pkey -inform DER -in profile-private.der -pubout -outform DER -out profile-public.der
     cat > boot-stack.kdl <<MANIFEST
@@ -311,6 +341,7 @@ package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
     require "test/boot-state"
     require "test/boot-runtime"
 $boot_kernel_dependency
+$boot_systemd_dependency
     require "system/cps"
     require "system/busybox"
 }
@@ -355,6 +386,11 @@ fi
 "$cps" plan --root base --output install.json install "${packages[@]}"
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
+if [[ -n $systemd_fixture ]]; then
+    cmp "base/$systemd_efi" "$efi"
+    cmp base/usr/lib/systemd/systemd "$systemd_fixture/image/usr/lib/systemd/systemd"
+    cp -- "base/$systemd_efi" esp/EFI/BOOT/BOOTX64.EFI
+fi
 if [[ -n $cps_fixture ]]; then
     for path in usr/bin/cps "${cps_library_paths[@]}" "${elf_runtime_paths[@]}"; do
         cmp "base/$path" "$cps_fixture/image/$path"
@@ -602,6 +638,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$runtimes" = $'CPS_VM_CPS_RUNTIME: trial verified\nCPS_VM_CPS_RUNTIME: trial verified'
             printf '%s\n' "$runtimes"
         fi
+        if [[ -n $systemd_fixture ]]; then
+            managers=$(tr -d '\r' < serial.log | grep '^CPS_VM_SYSTEMD: ' || :)
+            test "$managers" = $'CPS_VM_SYSTEMD: trial v262.1\nCPS_VM_SYSTEMD: trial v262.1'
+            printf '%s\n' "$managers"
+        fi
         publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
@@ -638,6 +679,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         test "$rollback_obsoletions" = 'CPS_VM_OBSOLETION: previous retained'
         if [[ -n $cps_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_CPS_RUNTIME: previous verified'
+        fi
+        if [[ -n $systemd_fixture ]]; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_SYSTEMD: previous v262.1'
         fi
         printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
     fi
