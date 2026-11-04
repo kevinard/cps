@@ -117,6 +117,14 @@ UNIT
 set -e
 bb=/bin/busybox
 state=$("$bb" cat /etc/cps-vm-state)
+if [ -f /etc/cps-vm-assert-built-busybox ]; then
+    version=$("$bb" --help 2>&1 | {
+        IFS=' ' read -r name release rest
+        [ "$name" = BusyBox ]
+        printf '%s' "$release"
+    })
+    printf 'CPS_VM_BUSYBOX: %s\n' "$version"
+fi
 if [ -f /etc/cps-vm-assert-kernel ]; then
     printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$("$bb" uname -r)"
 fi

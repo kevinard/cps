@@ -365,4 +365,22 @@ built in.
 
 For `kernel-upgrade`, provide the original kernel as `CPS_VM_KERNEL` with `CPS_VM_KERNEL_RELEASE`, and the upgrade as `CPS_VM_TRIAL_KERNEL` with `CPS_VM_TRIAL_KERNEL_RELEASE`. Both releases must be distinct, and both kernels need the built-in storage and console support listed above. This scenario also uses `cpio` and the host's `kernel-install` and `90-loaderentry.install` plugin.
 
-The `rollback` scenario adds a second signed publisher after the base environment is activated. The upgrade pulls a dependency from that publisher. After systemd blesses the trial and reboots it as the default, the test runs `boot-env list` and `boot-env rollback` against the ESP. It boots the same VM disk again and checks for the previous kernel and the absence of the added package. Both kernels need VFAT support. To load modules from extracted kernel packages, set `CPS_VM_KERNEL_MODULES_ROOT` and `CPS_VM_TRIAL_MODULES_ROOT` to the roots containing their indexed `lib/modules` trees.
+The `rollback` scenario adds another signed publisher after the base environment is activated. The upgrade pulls a dependency from that publisher. After systemd blesses the trial and reboots it as the default, the test runs `boot-env list` and `boot-env rollback` against the ESP. It boots the same VM disk again and checks for the previous kernel and the absence of the added package. Both kernels need VFAT support. To load modules from extracted kernel packages, set `CPS_VM_KERNEL_MODULES_ROOT` and `CPS_VM_TRIAL_MODULES_ROOT` to the roots containing their indexed `lib/modules` trees.
+
+#### Testing a source-built BusyBox
+
+On an x86-64 Arch Linux worker with a native GCC toolchain, run
+`tests/build-busybox.sh target/busybox-fixture` with a new output directory.
+It signs a seed catalog containing the worker's compiler and utilities, then
+pins that catalog and the upstream BusyBox archive in the recipe. CPS compiles
+the static binary twice in fresh sandboxes and publishes it to an
+attestation-required test repository. Set `CPS_BUSYBOX_SOURCE_DIR` to a
+directory containing the pinned archive to run without network access.
+The seed catalog identifies the prebuilt compiler used by this test.
+[BusyBox release archives](https://busybox.net/downloads/)
+
+To use that package in the VM, set `CPS_VM_BUSYBOX_REPO` to
+`target/busybox-fixture/repo` and `CPS_VM_BUSYBOX_TRUST_KEY` to
+`target/busybox-fixture/release-public.der`. The fixture installs the exact
+package from that publisher and the systemd guest reports the BusyBox version
+on each boot.

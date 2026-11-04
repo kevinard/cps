@@ -16,6 +16,9 @@ qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
 kernel=${CPS_VM_KERNEL:-/boot/vmlinuz-linux}
 busybox=${CPS_VM_BUSYBOX:-/usr/lib/initcpio/busybox}
+busybox_repo=${CPS_VM_BUSYBOX_REPO:-}
+busybox_key=${CPS_VM_BUSYBOX_TRUST_KEY:-}
+busybox_package=cps://canopa-bootstrap/system/busybox@1.37.0-0
 code=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE to x86-64 OVMF_CODE}
 vars=${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS to the matching OVMF_VARS template}
 qemu_data=${CPS_VM_QEMU_DATA:-}
@@ -23,7 +26,15 @@ qemu_data=${CPS_VM_QEMU_DATA:-}
 for command in "$qemu" mkfs.fat mcopy mdir mkfs.ext4 sfdisk openssl timeout; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
-for file in "$cps" "$efi" "$kernel" "$busybox" "$code" "$vars"; do
+if [[ -n $busybox_repo || -n $busybox_key ]]; then
+    busybox_repo=$(realpath -- "${busybox_repo:?Set CPS_VM_BUSYBOX_REPO}")
+    busybox_key=$(realpath -- "${busybox_key:?Set CPS_VM_BUSYBOX_TRUST_KEY}")
+    "$cps" repo attestation --repo "$busybox_repo" --publisher canopa-bootstrap \
+        --trust-key "$busybox_key" "$busybox_package" >/dev/null
+else
+    test -r "$busybox" || { echo "Missing input: $busybox" >&2; exit 1; }
+fi
+for file in "$cps" "$efi" "$kernel" "$code" "$vars"; do
     test -r "$file" || { echo "Missing input: $file" >&2; exit 1; }
 done
 
@@ -116,8 +127,13 @@ else
     mkdir -p runtime/boot
     cp "$kernel" runtime/boot/vmlinuz
 fi
-cp -L "$busybox" runtime/bin/busybox
-copy_runtime_deps runtime "$busybox"
+if [[ -n $busybox_repo ]]; then
+    packages+=("$busybox_package")
+    if $systemd_guest; then touch runtime/etc/cps-vm-assert-built-busybox; fi
+else
+    cp -L "$busybox" runtime/bin/busybox
+    copy_runtime_deps runtime "$busybox"
+fi
 if $systemd_guest; then
     setup_systemd_guest runtime
     copy_runtime_deps runtime proto/usr/bin/cps
@@ -155,6 +171,9 @@ publisher "canopa" {
 }
 CONFIG
 "$cps" image-create --root base --config image.kdl
+if [[ -n $busybox_repo ]]; then
+    "$cps" publisher add --root base --repo "$busybox_repo" --trust-key "$busybox_key" canopa-bootstrap
+fi
 "$cps" plan --root base --output install.json install "${packages[@]}"
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
@@ -305,7 +324,22 @@ run_vm() {
         return 1
     fi
 }
+check_busybox() {
+    if [[ -n $busybox_repo ]] && $systemd_guest; then
+        local log=$1
+        tr -d '\r' < "$log" | awk '
+            /^CPS_VM_BOOT: / { boots++ }
+            /^CPS_VM_BUSYBOX: / {
+                print
+                if ($0 != "CPS_VM_BUSYBOX: v1.37.0") invalid = 1
+                versions++
+            }
+            END { exit (invalid || boots == 0 || boots != versions) }
+        '
+    fi
+}
 run_vm serial.log
+check_busybox serial.log
 
 case $mode in
     bless|rollback) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
@@ -362,6 +396,7 @@ if [[ $mode == bless || $mode == rollback ]]; then
         cmp previous.conf "esp/loader/entries/$base_id.conf"
         mcopy -o -i disk.raw@@1048576 esp/loader/loader.conf ::/loader/loader.conf
         run_vm rollback.log
+        check_busybox rollback.log
         rollback_boots=$(tr -d '\r' < rollback.log | grep '^CPS_VM_BOOT: ' || :)
         rollback_kernels=$(tr -d '\r' < rollback.log | grep '^CPS_VM_KERNEL: ' || :)
         rollback_publishers=$(tr -d '\r' < rollback.log | grep '^CPS_VM_PUBLISHER: ' || :)
