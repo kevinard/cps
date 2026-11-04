@@ -652,6 +652,12 @@ VFAT support. To load modules from extracted kernel packages, set
 `CPS_VM_KERNEL_MODULES_ROOT` and `CPS_VM_TRIAL_MODULES_ROOT` to the roots
 containing their indexed `lib/modules` trees.
 
+Set `CPS_VM_RELEASE_PROFILE=1` in the rollback test to assemble the roots from
+a signed release profile. Use a current CPS build on the host and provide the
+signed CPS and BusyBox fixtures. The test publishes the companion update,
+checks that the installed profile still selects the old kernel, and advances
+the profile before staging and booting the trial.
+
 #### Testing a source-built BusyBox
 
 On an x86-64 Arch Linux worker with a native GCC toolchain, run

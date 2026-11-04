@@ -13,6 +13,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
+profiled=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
 kernel=${CPS_VM_KERNEL:-/boot/vmlinuz-linux}
@@ -54,6 +55,13 @@ if [[ -n $cps_fixture ]]; then
     done
     elf_runtime_paths=(lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1})
     cps_library_paths=(usr/lib/{libsqlite3.so.0,libseccomp.so.2})
+fi
+if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
+    [[ $mode == rollback && -n $cps_fixture && -n $busybox_repo ]] || {
+        echo 'CPS_VM_RELEASE_PROFILE requires rollback and signed CPS and BusyBox fixtures' >&2
+        exit 2
+    }
+    profiled=true
 fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
@@ -123,6 +131,47 @@ package "system/kernel" publisher="$fixture_publisher" version="$version" {
 }
 MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der kernel.kdl
+}
+
+publish_extra_marker() {
+    openssl genpkey -algorithm ED25519 -outform DER -out extras-private.der
+    openssl pkey -inform DER -in extras-private.der -pubout -outform DER -out extras-public.der
+    printf 'extras\n' > proto/etc/cps-vm-extra-marker
+    cat > extra-marker.kdl <<MANIFEST
+schema-version 1
+package "test/extra-marker" publisher="extras" version="1.0.0-0" {
+    file "etc/cps-vm-extra-marker" mode="0644" uid=$(id -u) gid=$(id -g)
+}
+MANIFEST
+    "$cps" publish --repo extras --proto proto --signing-key extras-private.der extra-marker.kdl
+}
+
+profile_companions() {
+    printf '%s\n' "$fixture_publisher repo public.der" 'canopa signed-cps cps-public.der' \
+        'canopa-runtime-seed signed-seed seed-public.der' 'canopa-bootstrap signed-busybox busybox-public.der' \
+        'extras extras extras-public.der'
+}
+
+refresh_vm_profile() {
+    local baseline=${1:-} baseline_test=${2:-} upgrade= companion_upgrade=
+    local name repository key
+    if [[ -n $baseline ]]; then upgrade=" upgrade-from=\"$baseline\""; fi
+    {
+        printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
+        printf '    profile "boot" architecture="%s"%s {\n        package "test/boot-stack"\n' "$(uname -m)" "$upgrade"
+        while read -r name repository key; do
+            companion_upgrade=
+            if [[ $repository == repo && -n $baseline_test ]]; then
+                companion_upgrade=" upgrade-from=\"$baseline_test\""
+            fi
+            printf '        publisher "%s" catalog="%s"%s {\n' "$name" "$(cat "$repository/current")" "$companion_upgrade"
+            printf '            repository "../%s"\n            trust-key "../%s"\n        }\n' "$repository" "$key"
+        done < <(profile_companions)
+        printf '    }\n}\n'
+    } > profile-repo/publish-policy.kdl
+    printf 'schema-version 1\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
+        "$(cat profile-repo/current)" > profile-release.kdl
+    "$cps" repo publish-release --repo profile-repo --signing-key profile-private.der profile-release.kdl
 }
 
 if [[ $mode == rollback ]]; then
@@ -214,21 +263,61 @@ fi
     --uid "$(id -u)" --gid "$(id -g)" test/boot-runtime > runtime.kdl
 "$cps" publish --repo repo --proto runtime --signing-key private.der runtime.kdl
 packages+=(test/boot-runtime)
-cat > image.kdl <<CONFIG
+if $profiled; then
+    publish_extra_marker
+    cp -a -- "$cps_fixture/repo" signed-cps
+    cp -a -- "$cps_fixture/runtime-seed" signed-seed
+    cp -a -- "$busybox_repo" signed-busybox
+    cp -- "$cps_fixture/release-public.der" cps-public.der
+    cp -- "$cps_fixture/runtime-seed-public.der" seed-public.der
+    cp -- "$busybox_key" busybox-public.der
+    openssl genpkey -algorithm ED25519 -outform DER -out profile-private.der
+    openssl pkey -inform DER -in profile-private.der -pubout -outform DER -out profile-public.der
+    cat > boot-stack.kdl <<'MANIFEST'
+schema-version 1
+package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
+    require "test/boot-state"
+    require "test/boot-runtime"
+    require "system/kernel"
+    require "system/cps"
+    require "system/busybox"
+}
+MANIFEST
+    "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der boot-stack.kdl
+    base_test_catalog=$(cat repo/current)
+    refresh_vm_profile
+    base_profile_catalog=$(cat profile-repo/current)
+    {
+        cat <<'CONFIG'
+schema-version 1
+release-profile "boot"
+publisher "vm-profile" {
+    repository "profile-repo"
+    trust-key "profile-public.der"
+}
+CONFIG
+        while read -r name repository key; do
+            printf 'publisher "%s" {\n    repository "%s"\n    trust-key "%s"\n}\n' "$name" "$repository" "$key"
+        done < <(profile_companions)
+    } > image.kdl
+    packages=(test/boot-stack)
+else
+    cat > image.kdl <<CONFIG
 schema-version 1
 publisher "$fixture_publisher" {
     repository "repo"
     trust-key "public.der"
 }
 CONFIG
+fi
 "$cps" image-create --root base --config image.kdl
-if [[ -n $cps_fixture ]]; then
+if ! $profiled && [[ -n $cps_fixture ]]; then
     "$cps" publisher add --root base --repo "$cps_fixture/repo" \
         --trust-key "$cps_fixture/release-public.der" canopa
     "$cps" publisher add --root base --repo "$cps_fixture/runtime-seed" \
         --trust-key "$cps_fixture/runtime-seed-public.der" canopa-runtime-seed
 fi
-if [[ -n $busybox_repo ]]; then
+if ! $profiled && [[ -n $busybox_repo ]]; then
     "$cps" publisher add --root base --repo "$busybox_repo" --trust-key "$busybox_key" canopa-bootstrap
 fi
 "$cps" plan --root base --output install.json install "${packages[@]}"
@@ -239,6 +328,10 @@ if [[ -n $cps_fixture ]]; then
         cmp "base/$path" "$cps_fixture/image/$path"
     done
 fi
+if $profiled; then
+    env -i base/lib64/ld-linux-x86-64.so.2 --inhibit-cache --library-path "$PWD/base/usr/lib" \
+        base/usr/bin/cps publisher list --root base >/dev/null
+fi
 
 base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_uuid" --options "$options")
@@ -247,17 +340,10 @@ test -f "esp/loader/entries/$base_id.conf"
 if [[ $mode == rollback ]]; then
     # A new upgrade should still be testable from an explicitly selected base.
     "$cps" boot-env rollback --esp esp "$base_id"
-    openssl genpkey -algorithm ED25519 -outform DER -out extras-private.der
-    openssl pkey -inform DER -in extras-private.der -pubout -outform DER -out extras-public.der
-    printf 'extras\n' > proto/etc/cps-vm-extra-marker
-    cat > extra-marker.kdl <<MANIFEST
-schema-version 1
-package "test/extra-marker" publisher="extras" version="1.0.0-0" {
-    file "etc/cps-vm-extra-marker" mode="0644" uid=$(id -u) gid=$(id -g)
-}
-MANIFEST
-    "$cps" publish --repo extras --proto proto --signing-key extras-private.der extra-marker.kdl
-    "$cps" publisher add --root base --repo extras --trust-key extras-public.der extras
+    if ! $profiled; then
+        publish_extra_marker
+        "$cps" publisher add --root base --repo extras --trust-key extras-public.der extras
+    fi
 fi
 
 publish_state 2.0.0-0 trial
@@ -272,6 +358,16 @@ release "$fixture_publisher" base="$(cat repo/current)" {
 }
 RELEASE
     "$cps" repo publish-release --repo repo --signing-key private.der retirement.kdl
+fi
+if $profiled; then
+    "$cps" plan --root base --output before-profile.json update > before-profile.log
+    grep -Fq "\"$base_test_catalog\"" before-profile.json
+    if grep -q 'Update .*system/kernel' before-profile.log; then
+        echo 'The companion update escaped its signed profile pin' >&2
+        exit 1
+    fi
+    echo 'Verified the signed profile kept the previous kernel after the companion advanced'
+    refresh_vm_profile "$base_profile_catalog" "$base_test_catalog"
 fi
 "$cps" plan --root base --output update.json update | tee update.log
 cp -a esp esp-before
