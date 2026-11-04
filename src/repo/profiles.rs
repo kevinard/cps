@@ -29,16 +29,16 @@ type Composition = (BTreeMap<String, Installed>, BTreeMap<String, Managed>);
 struct CompanionCatalogs<'a> {
     name: &'a str,
     repo: &'a Path,
+    key: Vec<u8>,
     pin: CatalogPin,
     current: Snapshot,
-    baseline: Option<Snapshot>,
+    upgrade_from: Option<&'a str>,
 }
 
 impl<'a> CompanionCatalogs<'a> {
     fn load(
         companion: &'a Companion,
         previous: Option<&CatalogPin>,
-        baseline: Option<&CatalogPin>,
         primary_keys: &[[u8; 32]],
     ) -> Result<Self> {
         let config = &companion.config;
@@ -51,42 +51,6 @@ impl<'a> CompanionCatalogs<'a> {
                 )
             })?;
         let lineage = CatalogLineage::new(&key, &catalog);
-        let baseline = if let Some(pin) = baseline {
-            ensure!(
-                companion
-                    .upgrade_from
-                    .as_ref()
-                    .is_none_or(|hash| *hash == pin.sha256),
-                "companion upgrade-from for {} differs from the signed baseline pin {}",
-                config.name,
-                pin.sha256
-            );
-            if pin.sha256 == companion.catalog {
-                pin.check_lineage(&catalog, &key)?;
-                None
-            } else {
-                Some(
-                    pin.snapshot(&config.repository, &config.name, &key)
-                        .with_context(|| {
-                            format!(
-                                "reading baseline companion catalog {} for {}",
-                                pin.sha256, config.name
-                            )
-                        })?,
-                )
-            }
-        } else {
-            companion
-                .upgrade_from
-                .as_deref()
-                .filter(|hash| *hash != companion.catalog)
-                .map(|hash| {
-                    snapshot(&config.repository, &config.name, &key, Some(hash)).with_context(
-                        || format!("reading companion catalog {hash} for {}", config.name),
-                    )
-                })
-                .transpose()?
-        };
         if let Some(previous) = previous {
             if let Some(old) = &previous.lineage {
                 ensure!(
@@ -133,6 +97,7 @@ impl<'a> CompanionCatalogs<'a> {
         Ok(Self {
             name: &config.name,
             repo: &config.repository,
+            key,
             pin: CatalogPin {
                 publisher: config.name.clone(),
                 sha256: companion.catalog.clone(),
@@ -140,14 +105,52 @@ impl<'a> CompanionCatalogs<'a> {
                 lineage: Some(lineage),
             },
             current,
-            baseline,
+            upgrade_from: companion.upgrade_from.as_deref(),
         })
+    }
+
+    fn baseline(&self, signed: Option<&CatalogPin>, explicit: bool) -> Result<Option<Snapshot>> {
+        let override_hash = self.upgrade_from.filter(|_| explicit);
+        if let Some(pin) = signed {
+            ensure!(
+                override_hash.is_none_or(|hash| hash == pin.sha256),
+                "companion upgrade-from for {} differs from the signed baseline pin {}",
+                self.name,
+                pin.sha256
+            );
+            if pin.sha256 == self.pin.sha256 {
+                ensure!(
+                    pin.lineage.is_none() || pin.lineage == self.pin.lineage,
+                    "signed companion lineage differs from catalog {} for {}",
+                    pin.sha256,
+                    self.name
+                );
+                return Ok(None);
+            }
+            return pin
+                .snapshot(self.repo, self.name, &self.key)
+                .with_context(|| {
+                    format!(
+                        "reading baseline companion catalog {} for {}",
+                        pin.sha256, self.name
+                    )
+                })
+                .map(Some);
+        }
+        override_hash
+            .filter(|hash| *hash != self.pin.sha256)
+            .map(|hash| {
+                snapshot(self.repo, self.name, &self.key, Some(hash))
+                    .with_context(|| format!("reading companion catalog {hash} for {}", self.name))
+            })
+            .transpose()
     }
 }
 
 pub(super) fn check(
     repo: &Path,
     catalog: &Catalog,
+    current_hash: Option<&str>,
     profiles: &BTreeMap<String, Profile>,
     key: &[u8],
 ) -> Result<BTreeMap<String, ReleaseProfile>> {
@@ -159,52 +162,18 @@ pub(super) fn check(
     let mut baselines = BTreeMap::new();
     let mut checked = BTreeMap::new();
     for (name, profile) in profiles {
-        let baseline = profile
-            .upgrade_from
-            .as_deref()
-            .map(|hash| {
-                let stored = match baselines.entry(hash) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        let baseline = read_catalog(repo, hash, &catalog.publisher, key)?;
-                        let packages = load_packages(repo, &baseline)?;
-                        entry.insert((baseline, packages))
-                    }
-                };
-                Ok::<_, anyhow::Error>((hash, &stored.0, &stored.1))
-            })
-            .transpose()
-            .with_context(|| format!("reading upgrade catalog for profile {name}"))?;
-        let historical = baseline.and_then(|(_, baseline, _)| baseline.release_profiles.get(name));
-        if let Some(historical) = historical {
-            ensure!(
-                historical.architecture == profile.arch
-                    && historical.facets == profile.facets
-                    && historical
-                        .companions
-                        .iter()
-                        .map(|pin| &pin.publisher)
-                        .eq(profile
-                            .companions
-                            .iter()
-                            .map(|companion| &companion.config.name)),
-                "image configuration differs from the signed baseline for release profile {name}"
-            );
-        }
         let previous = catalog.release_profiles.get(name);
         let companions = profile
             .companions
             .iter()
-            .enumerate()
-            .map(|(index, companion)| {
+            .map(|companion| {
                 let previous = previous.and_then(|profile| {
                     profile
                         .companions
                         .iter()
                         .find(|pin| pin.publisher == companion.config.name)
                 });
-                let baseline = historical.map(|profile| &profile.companions[index]);
-                CompanionCatalogs::load(companion, previous, baseline, &primary_keys)
+                CompanionCatalogs::load(companion, previous, &primary_keys)
             })
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("loading companion publishers for release profile {name}"))?;
@@ -213,7 +182,14 @@ pub(super) fn check(
             .keys()
             .map(|name| (name.clone(), catalog.publisher.as_str()))
             .collect::<BTreeMap<_, _>>();
-        let current = candidates(catalog, &packages, &companions, false, sources);
+        let current = candidates(
+            catalog,
+            &packages,
+            companions
+                .iter()
+                .map(|companion| (companion.name, &companion.current)),
+            sources,
+        );
         let (target, paths) = compose(
             &current,
             profile,
@@ -227,41 +203,45 @@ pub(super) fn check(
             .with_context(|| format!("checking companion builds for release profile {name}"))?;
         runtime::check(repo, &catalog.publisher, profile, &target, &paths)
             .with_context(|| format!("checking ELF closure for release profile {name}"))?;
-        if let Some((hash, baseline, baseline_packages)) = baseline {
+        let explicit = profile.upgrade_from.as_deref();
+        let immediate = current_hash.filter(|hash| {
+            Some(*hash) != explicit
+                && previous.is_some_and(|profile| !profile.composition.is_empty())
+        });
+        for (hash, explicit) in explicit
+            .map(|hash| (hash, true))
+            .into_iter()
+            .chain(immediate.map(|hash| (hash, false)))
+        {
             (|| {
-                let roots = match historical.filter(|profile| !profile.roots.is_empty()) {
-                    Some(historical) => historical
-                        .roots
-                        .iter()
-                        .map(|(name, version)| (name.as_str(), Some(*version)))
-                        .collect::<Vec<_>>(),
-                    None => profile
-                        .packages
-                        .keys()
-                        .map(|name| (name.as_str(), None))
-                        .collect(),
+                let (baseline, baseline_packages) = match baselines.entry(hash) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let baseline = read_catalog(repo, hash, &catalog.publisher, key)?;
+                        let packages = load_packages(repo, &baseline)?;
+                        entry.insert((baseline, packages))
+                    }
                 };
-                let sources = roots
-                    .iter()
-                    .map(|(name, _)| ((*name).to_owned(), baseline.publisher.as_str()))
-                    .collect();
-                let baseline = candidates(baseline, baseline_packages, &companions, true, sources);
-                let (before, old_paths) = if let Some(historical) =
-                    historical.filter(|profile| !profile.composition.is_empty())
-                {
-                    let installed = baseline
-                        .replay(historical)
-                        .context("replaying the baseline image")?;
-                    let paths = profile_paths(profile, &installed)?;
-                    (installed, paths)
-                } else {
-                    compose(&baseline, profile, roots).context("composing the baseline image")?
-                };
+                let (before, old_paths) = baseline_image(
+                    baseline,
+                    baseline_packages,
+                    baseline.release_profiles.get(name),
+                    profile,
+                    &companions,
+                    explicit,
+                )?;
                 let sticky = before
                     .iter()
                     .map(|(name, pkg)| (name.clone(), pkg.published.manifest.publisher.as_str()))
                     .collect();
-                let current = candidates(catalog, &packages, &companions, false, sticky);
+                let current = candidates(
+                    catalog,
+                    &packages,
+                    companions
+                        .iter()
+                        .map(|companion| (companion.name, &companion.current)),
+                    sticky,
+                );
                 let (after, paths) = check_upgrade(&before, old_paths, &current, &target, profile)?;
                 check_companion_builds(&companions, &after)?;
                 runtime::check(repo, &catalog.publisher, profile, &after, &paths)
@@ -294,6 +274,72 @@ pub(super) fn check(
     Ok(checked)
 }
 
+fn baseline_image(
+    catalog: &Catalog,
+    packages: &[Published],
+    historical: Option<&ReleaseProfile>,
+    profile: &Profile,
+    companions: &[CompanionCatalogs<'_>],
+    explicit: bool,
+) -> Result<Composition> {
+    if let Some(historical) = historical {
+        ensure!(
+            historical.architecture == profile.arch
+                && historical.facets == profile.facets
+                && historical
+                    .companions
+                    .iter()
+                    .map(|pin| pin.publisher.as_str())
+                    .eq(companions.iter().map(|companion| companion.name)),
+            "image configuration differs from the signed baseline"
+        );
+    }
+    let snapshots = companions
+        .iter()
+        .enumerate()
+        .map(|(index, companion)| {
+            companion.baseline(
+                historical.map(|profile| &profile.companions[index]),
+                explicit,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let snapshots = companions
+        .iter()
+        .zip(&snapshots)
+        .map(|(companion, snapshot)| {
+            (
+                companion.name,
+                snapshot.as_ref().unwrap_or(&companion.current),
+            )
+        });
+    let roots = match historical.filter(|profile| !profile.roots.is_empty()) {
+        Some(historical) => historical
+            .roots
+            .iter()
+            .map(|(name, version)| (name.as_str(), Some(*version)))
+            .collect::<Vec<_>>(),
+        None => profile
+            .packages
+            .keys()
+            .map(|name| (name.as_str(), None))
+            .collect(),
+    };
+    let sources = roots
+        .iter()
+        .map(|(name, _)| ((*name).to_owned(), catalog.publisher.as_str()))
+        .collect();
+    let baseline = candidates(catalog, packages, snapshots, sources);
+    if let Some(historical) = historical.filter(|profile| !profile.composition.is_empty()) {
+        let installed = baseline
+            .replay(historical)
+            .context("replaying the baseline image")?;
+        let paths = profile_paths(profile, &installed)?;
+        return Ok((installed, paths));
+    }
+    compose(&baseline, profile, roots).context("composing the baseline image")
+}
+
 fn check_companion_builds(
     companions: &[CompanionCatalogs<'_>],
     installed: &BTreeMap<String, Installed>,
@@ -318,21 +364,15 @@ fn check_companion_builds(
 fn candidates<'a>(
     catalog: &'a Catalog,
     packages: &'a [Published],
-    companions: &'a [CompanionCatalogs<'_>],
-    baseline: bool,
+    companions: impl IntoIterator<Item = (&'a str, &'a Snapshot)>,
     mut sources: BTreeMap<String, &'a str>,
 ) -> CandidateSet<&'a Published> {
     let mut selected = CandidateSet::default();
     selected.add_obsoletions(&mut sources, &catalog.publisher, &catalog.obsoletions);
     selected.add_packages(&mut sources, &catalog.publisher, packages);
-    for companion in companions {
-        let snapshot = if baseline {
-            companion.baseline.as_ref().unwrap_or(&companion.current)
-        } else {
-            &companion.current
-        };
-        selected.add_obsoletions(&mut sources, companion.name, &snapshot.obsoletions);
-        selected.add_packages(&mut sources, companion.name, &snapshot.packages);
+    for (name, snapshot) in companions {
+        selected.add_obsoletions(&mut sources, name, &snapshot.obsoletions);
+        selected.add_packages(&mut sources, name, &snapshot.packages);
     }
     selected
 }

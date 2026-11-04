@@ -396,9 +396,10 @@ publisher "canopa" {{
             ),
         )
     };
+    let pointer = f.repo.join("current");
+    let unsigned_base = fs::read_to_string(&pointer)?;
     write_policy("1.0.0-0", &old_pin, "", "")?;
     withdraw_package(&f.repo, &f.private, "cps://canopa/test/retire@1.0.0-0")?;
-    let pointer = f.repo.join("current");
     let signed_base = fs::read_to_string(&pointer)?;
     let base = format!("upgrade-from={:?}", signed_base.trim());
     let refresh = f._dir.path().join("refresh.kdl");
@@ -422,7 +423,7 @@ publisher "canopa" {{
     )?;
     rejected(
         &refresh,
-        "release changes image configuration for signed profile desktop",
+        "image configuration differs from the signed baseline",
     )?;
 
     let config = f._dir.path().join("image.kdl");
@@ -459,7 +460,15 @@ publisher "seed" {{
     let error = plan(&f.root, Request::InstallProfile).unwrap_err();
     assert!(format!("{error:#}").contains("requires an image with no installed packages"));
 
-    write_policy("2.0.0-0", &old_pin, &base, "")?;
+    write_policy("2.0.0-0", &old_pin, "", "")?;
+    rejected(
+        &refresh,
+        "cannot change between directory and leaf actions at opt/pinned-root",
+    )?;
+    // The older catalog would select 2.0 in its baseline, so only the
+    // mandatory check from the signed profile at 1.0 detects the transition.
+    let older = format!("upgrade-from={:?}", unsigned_base.trim());
+    write_policy("2.0.0-0", &old_pin, &older, "")?;
     rejected(
         &refresh,
         "cannot change between directory and leaf actions at opt/pinned-root",
@@ -484,7 +493,7 @@ publisher "seed" {{
         &format!("upgrade-from={:?}", new_pin.trim()),
     )?;
     rejected(&retire_newer, "differs from the signed baseline pin")?;
-    write_policy("1.0.0-0", &new_pin, &base, "")?;
+    write_policy("1.0.0-0", &new_pin, "", "")?;
     rejected(
         &retire_newer,
         "cannot change between directory and leaf actions at opt/pinned-companion",
@@ -492,8 +501,19 @@ publisher "seed" {{
 
     seed.package_as("seed", "library/runtime", "3.0.0-0", companion_dir)?;
     let latest_pin = fs::read_to_string(seed.repo.join("current"))?;
-    write_policy("1.0.0-0", &latest_pin, &base, "")?;
-    publish_release(&f.repo, &f.private, &retire_newer)?;
+    write_policy("1.0.0-0", &latest_pin, "", "")?;
+    let next = publish_release(&f.repo, &f.private, &retire_newer)?;
+    write_policy("1.0.0-0", &latest_pin, &older, "")?;
+    fs::write(
+        &refresh,
+        format!("schema-version 1\nrelease \"canopa\" base={next:?} refresh-profiles=#true\n"),
+    )?;
+    let error = publish_release(&f.repo, &f.private, &refresh).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("checking upgrade from {}", unsigned_base.trim())),
+        "{error:#}"
+    );
+    assert_eq!(fs::read_to_string(&pointer)?.trim(), next);
     let upgrade = plan(&f.root, Request::Update)?;
     assert_eq!(upgrade.catalogs["seed"], latest_pin.trim());
     let staged = f._dir.path().join("staged");

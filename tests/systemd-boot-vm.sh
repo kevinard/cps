@@ -270,19 +270,13 @@ profile_companions() {
 }
 
 refresh_vm_profile() {
-    local baseline=${1:-} baseline_test=${2:-} upgrade= companion_upgrade=
     local name repository key
-    if [[ -n $baseline ]]; then upgrade=" upgrade-from=\"$baseline\""; fi
     {
         printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
-        printf '    profile "boot" architecture="%s"%s {\n        package "test/boot-stack"\n' "$(uname -m)" "$upgrade"
+        printf '    profile "boot" architecture="%s" {\n        package "test/boot-stack"\n' "$(uname -m)"
         printf '        facet "devel" #false\n'
         while read -r name repository key; do
-            companion_upgrade=
-            if [[ $repository == repo && -n $baseline_test ]]; then
-                companion_upgrade=" upgrade-from=\"$baseline_test\""
-            fi
-            printf '        publisher "%s" catalog="%s"%s {\n' "$name" "$(cat "$repository/current")" "$companion_upgrade"
+            printf '        publisher "%s" catalog="%s" {\n' "$name" "$(cat "$repository/current")"
             printf '            repository "../%s"\n            trust-key "../%s"\n        }\n' "$repository" "$key"
         done < <(profile_companions)
         printf '    }\n}\n'
@@ -448,7 +442,6 @@ MANIFEST
     "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der boot-stack.kdl
     base_test_catalog=$(cat repo/current)
     refresh_vm_profile
-    base_profile_catalog=$(cat profile-repo/current)
     {
         cat <<'CONFIG'
 schema-version 1
@@ -463,7 +456,6 @@ CONFIG
             printf 'publisher "%s" {\n    repository "%s"\n    trust-key "%s"\n}\n' "$name" "$repository" "$key"
         done < <(profile_companions)
     } > image.kdl
-    packages=(test/boot-stack)
 else
     cat > image.kdl <<CONFIG
 schema-version 1
@@ -484,7 +476,11 @@ fi
 if ! $profiled && [[ -n $busybox_repo ]]; then
     "$cps" publisher add --root base --repo "$busybox_repo" --trust-key "$busybox_key" canopa-bootstrap
 fi
-"$cps" plan --root base --output install.json install "${packages[@]}"
+if $profiled; then
+    "$cps" plan --root base --output install.json install-profile
+else
+    "$cps" plan --root base --output install.json install "${packages[@]}"
+fi
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
 check_runtime_packages() {
@@ -579,7 +575,7 @@ if $profiled; then
         exit 1
     fi
     echo 'Verified the signed profile kept the previous kernel after the companion advanced'
-    refresh_vm_profile "$base_profile_catalog" "$base_test_catalog"
+    refresh_vm_profile
 fi
 "$cps" plan --root base --output update.json update | tee update.log
 cp -a esp esp-before
@@ -863,12 +859,8 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             # Start from the disk with the blessed upgrade, before rollback.
             configs=$(tr -d '\r' < serial.log | grep '^CPS_VM_CONFIG: ')
             test "$configs" = $'CPS_VM_CONFIG: trial administrator-setting\nCPS_VM_CONFIG: trial administrator-setting'
-            if $profiled; then
-                previous_profile=$(cat profile-repo/current)
-                previous_test=$(cat repo/current)
-            fi
             publish_state 3.0.0-0 recycled
-            if $profiled; then refresh_vm_profile "$previous_profile" "$previous_test"; fi
+            if $profiled; then refresh_vm_profile; fi
             "$cps" plan --root staged --output recycle.json update | tee recycle-plan.log
             grep -Fq 'test/boot-state 2.0.0-0 -> 3.0.0-0' recycle-plan.log
             result=$("$cps" boot-env stage --source staged --root recycled recycle.json)

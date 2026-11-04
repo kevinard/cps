@@ -1092,9 +1092,10 @@ pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
         !path_present(&repo.join(".tuf"))?,
         "cannot withdraw from a TUF-managed repository cache"
     );
+    let current = read_current(repo)?;
     let mut catalog = read_catalog_with_key(
         repo,
-        &read_current(repo)?,
+        &current,
         publisher,
         keys::Trust::Current(key.public_key().as_ref()),
     )?;
@@ -1103,6 +1104,7 @@ pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
         check_profiles(
             repo,
             &mut catalog,
+            Some(&current),
             policy.as_ref(),
             key.public_key().as_ref(),
         )?;
@@ -1306,6 +1308,7 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
         check_profiles(
             repo,
             &mut catalog,
+            current.as_deref(),
             policy.as_ref(),
             key.public_key().as_ref(),
         )?;
@@ -1367,6 +1370,7 @@ fn publish_manifest(
         check_profiles(
             repo,
             &mut catalog,
+            current.as_deref(),
             policy.as_ref(),
             key.public_key().as_ref(),
         )?;
@@ -1535,6 +1539,7 @@ impl PublicationPolicy {
 fn check_profiles(
     repo: &Path,
     catalog: &mut Catalog,
+    current: Option<&str>,
     policy: Option<&PublicationPolicy>,
     key: &[u8],
 ) -> Result<()> {
@@ -1543,7 +1548,7 @@ fn check_profiles(
             .key_rotations
             .first()
             .map_or(key, |rotation| rotation.previous_key());
-        let release_profiles = profiles::check(repo, catalog, &policy.profiles, anchor)?;
+        let release_profiles = profiles::check(repo, catalog, current, &policy.profiles, anchor)?;
         catalog.check_profile_guards(&release_profiles)?;
         catalog.profiles_required = true;
         catalog.release_profiles = release_profiles;

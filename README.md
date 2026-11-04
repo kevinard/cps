@@ -381,10 +381,13 @@ withdrawals require a policy with at least one profile. Profile roots come from
 the release's publisher. Clients need support for profile enforcement to read
 catalogs that record this requirement.
 
-Set `upgrade-from="<signed catalog SHA-256>"` on a profile to also test a rolling
-upgrade from that historical catalog. New signed profiles record the exact
-versions of the requested roots and the manifest digest of every package in
-the checked composition. When the baseline has the same named profile, CPS
+Once a profile has a signed composition, CPS checks an upgrade from the
+current release before publishing its successor. Set
+`upgrade-from="<signed catalog SHA-256>"` to check an additional historical
+release, or to provide a baseline before the first composition is signed.
+New signed profiles record the exact versions of the requested roots and
+the manifest digest of every package in the checked composition. When
+the baseline has the same named profile, CPS
 replays its recorded composition using its companion pins. With older
 profiles that record only root versions, it resolves dependencies from
 those roots. The architecture, facets, and publisher order must match the
@@ -1053,9 +1056,10 @@ the guest across rollback.
 
 Set `CPS_VM_RELEASE_PROFILE=1` in the rollback test to assemble the roots from
 a signed release profile. Use a current CPS build on the host and provide the
-signed CPS and BusyBox fixtures. The test publishes the companion update,
-checks that the installed profile still selects the old kernel, and advances
-the profile before staging and booting the trial.
+signed CPS and BusyBox fixtures. The test installs the signed base
+composition, publishes the companion update, and checks that the profile
+still selects the old kernel. It advances the profile through the automatic
+upgrade check before staging and booting the trial.
 
 #### Testing a source-built Linux kernel
 
