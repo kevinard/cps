@@ -163,7 +163,15 @@ cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
     --source-cache source-cache --output hello-build --check-reproducible hello.build.kdl
 ```
 
-For local sources, `cps source import --from sources --cache source-cache hello.build.kdl` fills the same cache offline. Builds read the cache offline and verify each input again before staging it under its recipe path. The existing `--sources` option accepts a directory laid out by recipe path.
+Use `cps source fetch --from sources --cache source-cache hello.build.kdl`
+when a recipe combines checked-in patches with upstream downloads. CPS checks
+the local directory for uncached inputs and uses the recipe URLs for missing
+files. A local file that fails verification stops the fetch.
+
+`cps source import --from sources --cache source-cache hello.build.kdl` fills
+the same cache offline. Builds read the cache offline and verify each input
+again before staging it under its recipe path. The `--sources` build option
+accepts a directory laid out by recipe path.
 
 ### Building and publishing with signed evidence
 

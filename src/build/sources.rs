@@ -27,15 +27,20 @@ pub(super) const OBJECTS: &str = "sha256";
 
 /// Fetch missing pinned inputs over HTTPS and verify every object in the recipe.
 pub fn fetch_sources(recipe: &Path, cache: &Path) -> Result<usize> {
-    cache_sources(recipe, cache, None)
+    cache_sources(recipe, cache, None, true)
+}
+
+/// Prefer local recipe inputs and fetch missing ones over HTTPS.
+pub fn fetch_sources_with_local(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
+    cache_sources(recipe, cache, Some(Root::open(from)?), true)
 }
 
 /// Verify and cache pinned inputs from a local directory, offline.
 pub fn import_sources(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
-    cache_sources(recipe, cache, Some(Root::open(from)?))
+    cache_sources(recipe, cache, Some(Root::open(from)?), false)
 }
 
-fn cache_sources(recipe: &Path, cache: &Path, local: Option<Root>) -> Result<usize> {
+fn cache_sources(recipe: &Path, cache: &Path, local: Option<Root>, fetch: bool) -> Result<usize> {
     let (_, recipe) = build::read(recipe)?;
     fs::create_dir_all(cache)?;
     let cache = Root::open(cache)?.ensure_dir(OBJECTS)?;
@@ -60,10 +65,14 @@ fn cache_sources(recipe: &Path, cache: &Path, local: Option<Root>) -> Result<usi
             Err(err) => return Err(err.context(format!("opening cached source {}", pin.sha256))),
         }
         let mut temp = NamedTempFile::new_in(&directory)?;
-        if let Some(root) = &local {
-            let (name, file) = find_local(root, &aliases)?;
+        let local_file = match &local {
+            Some(root) => find_local(root, &aliases)?,
+            None => None,
+        };
+        if let Some((name, file)) = local_file {
             copy_verified(file, temp.as_file_mut(), pin, name)?;
         } else {
+            ensure!(fetch, "no local source file for {name}");
             let (name, url) = aliases
                 .iter()
                 .find_map(|(name, source)| source.url.as_ref().map(|url| (*name, url)))
@@ -91,15 +100,15 @@ fn cache_sources(recipe: &Path, cache: &Path, local: Option<Root>) -> Result<usi
     Ok(recipe.sources.len())
 }
 
-fn find_local<'a>(root: &Root, aliases: &[(&'a str, &Source)]) -> Result<(&'a str, File)> {
+fn find_local<'a>(root: &Root, aliases: &[(&'a str, &Source)]) -> Result<Option<(&'a str, File)>> {
     for &(name, _) in aliases {
         match root.file(name) {
-            Ok(file) => return Ok((name, file)),
+            Ok(file) => return Ok(Some((name, file))),
             Err(err) if err.downcast_ref::<Errno>() == Some(&Errno::NOENT) => {}
             Err(err) => return Err(err.context(format!("opening source {name}"))),
         }
     }
-    anyhow::bail!("no local source file for {}", aliases[0].0)
+    Ok(None)
 }
 
 pub(super) fn copy_verified(

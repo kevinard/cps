@@ -12,11 +12,11 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
     add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_plan,
-    fetch_sources, generate_manifest, import_sources, list_boot_environments, list_obsoletions,
-    list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
-    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
-    rollback_boot_environment, rotate_publisher_key, stage_boot_environment, verify,
-    verify_pristine, withdraw_package,
+    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
+    list_boot_environments, list_obsoletions, list_publishers, list_withdrawals, plan,
+    prefer_publisher, publish, publish_release, publish_witnessed_bundle, read_attestation,
+    read_worker_config, release, remove_publisher, rollback_boot_environment, rotate_publisher_key,
+    stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -180,6 +180,9 @@ enum SourceCommand {
     Fetch {
         #[arg(long)]
         cache: PathBuf,
+        /// Prefer files from this directory before using recipe URLs
+        #[arg(long)]
+        from: Option<PathBuf>,
         recipe: PathBuf,
     },
     /// Verify and cache sources from a local directory
@@ -458,7 +461,14 @@ fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Source { command } => {
             let count = match command {
-                SourceCommand::Fetch { cache, recipe } => fetch_sources(&recipe, &cache)?,
+                SourceCommand::Fetch {
+                    cache,
+                    from,
+                    recipe,
+                } => match from {
+                    Some(from) => fetch_sources_with_local(&recipe, &cache, &from)?,
+                    None => fetch_sources(&recipe, &cache)?,
+                },
                 SourceCommand::Import {
                     cache,
                     from,

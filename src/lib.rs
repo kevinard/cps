@@ -22,7 +22,7 @@ pub use boot::{
 pub use build::{
     BuildOptions, BuildWorker, SourceLayout, build, build_cached_package, build_package,
     build_with_worker,
-    sources::{fetch_sources, import_sources},
+    sources::{fetch_sources, fetch_sources_with_local, import_sources},
 };
 pub use generate::generate_manifest;
 pub use image::publishers::{

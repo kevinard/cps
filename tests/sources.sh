@@ -113,6 +113,21 @@ reject short 'source is shorter than its pinned size'
 reject long 'source exceeded its pinned size'
 reject redirect 'expected HTTP 200'
 
+mkdir -p mixed/nested
+printf patch > mixed/fix.patch
+patch_digest=$(sha256sum mixed/fix.patch | cut -d' ' -f1)
+recipe " url=\"$base/payload\"" "source \"fix.patch\" sha256=\"$patch_digest\" size=5" > mixed.kdl
+"$cps" source fetch --cache mixed-cache --from mixed mixed.kdl
+cmp mixed/fix.patch "mixed-cache/sha256/$patch_digest"
+cmp expected "mixed-cache/sha256/$digest"
+printf xyz > mixed/nested/input
+if "$cps" source fetch --cache mixed-rejected --from mixed mixed.kdl > reject.log 2>&1; then
+    echo 'a corrupt local input fell back to the upstream URL' >&2
+    exit 1
+fi
+grep -F 'source digest or length mismatch for nested/input' reject.log
+test ! -e "mixed-rejected/sha256/$digest"
+
 kill "$server"
 wait "$server" 2>/dev/null || :
 server=
