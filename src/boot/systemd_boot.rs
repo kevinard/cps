@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 use super::{
     check_image_integrity,
     deploy::{OfflineDisk, offline_file},
-    device::mounted_esp_disk,
+    device::{is_fat, mounted_esp_disk},
     entry_id, kernel,
 };
 use crate::{
@@ -170,7 +170,7 @@ pub fn activate_deployed_boot_environment(
     Ok(activate(root, esp, activation, Some(deployment))?.id)
 }
 
-/// Deploy or verify an inactive partition before activating it as a trial.
+/// Deploy or verify an inactive partition before publishing its boot entry.
 pub fn activate_device_boot_environment(
     root: &Path,
     esp: &Path,
@@ -179,10 +179,6 @@ pub fn activate_device_boot_environment(
     receipt: &Path,
     root_deployment: Option<RootDeployment<'_>>,
 ) -> Result<String> {
-    ensure!(
-        !activation.known_good,
-        "device activation requires a staged trial"
-    );
     let partuuid = canonical_partuuid(&activation.root_partuuid)?;
     let (disk, target) =
         super::device::DevicePartition::open(device, esp, &partuuid, root_deployment.is_some())?;
@@ -300,6 +296,11 @@ pub(super) fn activate(
     let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     if let Some(target) = deployment.and_then(|deployment| deployment.target) {
         target.check_esp(&esp, &_lock)?;
+    } else {
+        ensure!(
+            !is_fat(&_lock)?,
+            "use boot-env activate-device for a mounted VFAT ESP"
+        );
     }
     let (policy, existing) = inventory(&esp)?;
     let existing_entry = existing.iter().find(|entry| entry.id == id);
@@ -321,6 +322,10 @@ pub(super) fn activate(
     }
     .render();
     if let Some(entry) = existing_entry {
+        ensure!(
+            !activation.known_good || entry.tries.is_none(),
+            "the registered boot environment is a trial"
+        );
         ensure!(
             entry.tries != Some(0),
             "boot attempts are exhausted; stage a new environment"

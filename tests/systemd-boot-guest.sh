@@ -55,7 +55,7 @@ run_device_guest() {
         cp -a -- "$stage" "$inputs/staged"
         cp --sparse=always -- "$stage.ext4" "$inputs/staged.ext4"
         cp -- "$stage.kdl" "$inputs/staged.kdl"
-        cp -- base.kdl "$inputs/"
+        if [[ $mode != bootstrap ]]; then cp -- base.kdl "$inputs/"; fi
     fi
     {
         printf '#!/bin/sh\nset -eu\nbase_uuid=%q\ntrial_uuid=%q\noptions=%q\n' \
@@ -82,7 +82,24 @@ reject() {
     /bin/busybox grep -Fq "$expected" /tmp/rejected
 }
 GUEST
-        if [[ $mode == initial ]]; then
+        if [[ $mode == bootstrap ]]; then
+            cat <<'GUEST'
+if cps boot-env activate --known-good --root /staged --esp /esp \
+    --root-partuuid "$base_uuid" --options "$options" > /tmp/rejected 2>&1; then
+    echo 'CPS_VM_DEVICE: unchecked activation wrote the mounted ESP'
+    exit 1
+fi
+/bin/busybox grep -F 'use boot-env activate-device for a mounted VFAT ESP' /tmp/rejected
+set -- --esp /esp --device /dev/vda2 --root-partuuid "$base_uuid" --receipt /staged.kdl
+reject 'use --known-good to bootstrap' "$@" --root-image /staged.ext4
+reject 'root payload size must match' "$@" --known-good --root-image /staged.kdl
+test ! -e /esp/loader
+result=$(activate "$@" --known-good --root-image /staged.ext4)
+reject 'environment is already registered' "$@" --known-good --root-image /staged.ext4
+test "$(activate "$@" --known-good)" = "$result"
+printf 'CPS_VM_BOOTSTRAP: %s\n' "${result#Activated }"
+GUEST
+        elif [[ $mode == initial ]]; then
             cat <<'GUEST'
 mount -t ext4 -o ro,noload /dev/vda2 /fallback
 reject 'claiming the target root partition exclusively' --esp /esp --device /dev/vda2 \
@@ -217,8 +234,9 @@ test ! -e "$marker"
 test ! -e "/esp/EFI/cps/$base_id"
 GUEST
         fi
+        if [[ $mode != bootstrap ]]; then printf '/bin/busybox umount /fallback\n'; fi
         cat <<'GUEST'
-/bin/busybox umount /esp /fallback
+/bin/busybox umount /esp
 echo 'CPS_VM_DEVICE: operation completed'
 GUEST
     } > "$inputs/init"

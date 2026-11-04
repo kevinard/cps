@@ -539,13 +539,22 @@ truncate -s 96M esp.fat
 mkfs.fat -F 32 esp.fat >/dev/null
 mcopy -s -i esp.fat esp/EFI ::/
 dd if=esp.fat of=template.raw bs=1M seek=1 conv=notrunc,sparse status=none
-"$cps" boot-env deploy --disk template.raw --root-image base.ext4 \
-    --root-partuuid "$base_uuid" --output base.raw
-base_id=$("$cps" boot-env activate --known-good --root base \
-    --disk base.raw --receipt base.kdl --esp-partuuid "$esp_uuid" --output-disk bootable-base.raw \
-    --root-partuuid "$base_uuid" --options "$options")
-base_id=${base_id#Activated }
 base_disk=bootable-base.raw
+if [[ $device_activation == 1 ]]; then
+    run_device_guest bootstrap template.raw "$base_disk" base
+    base_id=$(sed -n 's/^CPS_VM_BOOTSTRAP: //p' device-bootstrap-activation.log)
+    test -n "$base_id"
+    cmp -n 1048576 template.raw "$base_disk"
+    cmp -i "$((base_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" "$base_disk" base.ext4
+    cmp -i "$((trial_mib * 1024 * 1024))" template.raw "$base_disk"
+else
+    "$cps" boot-env deploy --disk template.raw --root-image base.ext4 \
+        --root-partuuid "$base_uuid" --output base.raw
+    base_id=$("$cps" boot-env activate --known-good --root base \
+        --disk base.raw --receipt base.kdl --esp-partuuid "$esp_uuid" --output-disk "$base_disk" \
+        --root-partuuid "$base_uuid" --options "$options")
+    base_id=${base_id#Activated }
+fi
 if [[ $mode == rollback ]]; then
     # A new upgrade should still be testable from an explicitly selected base.
     "$cps" boot-env rollback --disk "$base_disk" --esp-partuuid "$esp_uuid" \

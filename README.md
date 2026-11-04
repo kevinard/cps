@@ -977,9 +977,32 @@ revision label. For a trial, it checks those two identifiers on the
 registered fallback partition of the same disk. Keep the disk offline
 through activation. The receipt describes the freshly deployed root,
 whose bytes can change after boot.
-For separately provisioned roots, activation accepts the operator's
-partition mapping when both flags are omitted.
+For a detached ESP directory, activation accepts the operator's partition
+mapping when both flags are omitted. Activation on a mounted VFAT ESP
+requires `activate-device`.
 [blkid manual](https://man7.org/linux/man-pages/man8/blkid.8.html)
+
+### Provisioning the first root on an installed disk
+
+Start with an inactive CPS base image and a dedicated GPT disk with
+512-byte logical sectors. Mount its writable VFAT ESP with systemd-boot
+already installed and no boot entries registered. Choose an unmounted
+Linux filesystem partition for the base. Set the export size to match that
+partition exactly.
+
+```sh
+cps boot-env export --root /scratch/base --output /scratch/base.ext4 \
+    --size-mib 2048 --receipt > /scratch/base.kdl
+cps boot-env activate-device --known-good --root /scratch/base --esp /efi \
+    --device "/dev/disk/by-partuuid/$base_partuuid" \
+    --root-partuuid "$base_partuuid" \
+    --receipt /scratch/base.kdl --root-image /scratch/base.ext4
+```
+
+The command writes the selected partition and verifies it before publishing
+the first entry. `--known-good` makes that entry the initial default without
+a trial counter. If the root was already written, omit `--root-image` to
+verify its bytes against the receipt and finish registration.
 
 ### Activating a trial on an installed disk
 
@@ -1055,8 +1078,8 @@ filesystem, verifies the written files, and publishes a new disk image
 with the remaining partitions intact. Boot the output disk. This mode
 uses mtools and dosfstools and supports ESPs up to 1 GiB. An unprivileged
 caller can set `CPS_ESP_TOOLS_DIR` to the absolute path of a trusted tool
-directory. For a mounted or detached ESP, use `--esp` to operate on its
-directory. [fsck.fat manual](https://man7.org/linux/man-pages/man8/fsck.fat.8.html)
+directory. Use `activate --esp` for a detached ESP directory and
+`activate-device --esp` for a mounted ESP. [fsck.fat manual](https://man7.org/linux/man-pages/man8/fsck.fat.8.html)
 
 For FAT32, CPS can clear a leftover dirty flag in its private copy
 when the primary and backup boot sectors otherwise agree. The copy still
@@ -1208,11 +1231,12 @@ composition, publishes the companion update, and checks that the profile
 still selects the old kernel. It advances the profile through the automatic
 upgrade check before staging and booting the trial.
 
-With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to deploy
-and activate the trial from a rescue VM with a writable virtio disk. The test
-checks rejection of mounted or registered targets and incorrect partition or
-receipt identities. It then verifies the written partition and boots the
-result through the normal blessing and rollback checks. Rollback runs
+With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to bootstrap
+the base and activate the trial from a rescue VM with a writable virtio disk.
+The test checks rejection of unchecked ESP writes, mounted or registered root
+targets, and incorrect partition or receipt identities. It then verifies the
+written partitions and boots the result through the blessing and rollback
+checks. Rollback runs
 against the mounted ESP in the rescue VM and rejects a mismatched root
 before selecting and booting the original kernel.
 Combine it with `CPS_VM_RECYCLE_SLOT=1` to also exercise direct replacement,

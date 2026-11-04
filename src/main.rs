@@ -508,7 +508,7 @@ enum BootCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Verify or write an inactive GPT root partition and activate its staged trial
+    /// Verify or write an inactive GPT root partition and publish its boot entry
     ActivateDevice {
         #[arg(long)]
         root: PathBuf,
@@ -537,6 +537,9 @@ enum BootCommand {
         options: String,
         #[arg(long, default_value_t = 2)]
         tries: u32,
+        /// Bootstrap the first entry using an already known-good base image
+        #[arg(long, conflicts_with = "replace")]
+        known_good: bool,
     },
     /// Publish a systemd-boot entry for a verified environment
     Activate {
@@ -1155,6 +1158,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 initrd,
                 options,
                 tries,
+                known_good,
             } => {
                 let activation = Activation {
                     root_partuuid,
@@ -1162,7 +1166,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     initrd,
                     options,
                     tries,
-                    known_good: false,
+                    known_good,
                 };
                 let id = activate_device_boot_environment(
                     &root,

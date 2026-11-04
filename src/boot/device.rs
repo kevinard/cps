@@ -17,8 +17,12 @@ use super::deploy::{
     OfflineDisk, SECTOR_SIZE, checked_payload, digest_extent, verify_filesystem_at, write_extent,
 };
 
+pub(super) fn is_fat(file: &File) -> Result<bool> {
+    Ok(fstatfs(file)?.f_type == libc::MSDOS_SUPER_MAGIC)
+}
+
 pub(super) fn mounted_esp_disk(path: &Path, locked: &File) -> Result<Option<OfflineDisk>> {
-    if fstatfs(locked)?.f_type != libc::MSDOS_SUPER_MAGIC {
+    if !is_fat(locked)? {
         return Ok(None);
     }
     let esp = esp_partition(path, locked)?;
