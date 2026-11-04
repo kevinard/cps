@@ -110,7 +110,13 @@ pub enum Dependency {
     Require(DependencyTarget),
     Incorporate(DependencyTarget),
     Exclude(DependencyTarget),
-    RequireAny { alternatives: Vec<DependencyTarget> },
+    RequireAny {
+        alternatives: Vec<DependencyTarget>,
+    },
+    Conditional {
+        target: DependencyTarget,
+        predicate: DependencyTarget,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -168,6 +174,12 @@ impl Dependency {
                     );
                 }
                 Ok(())
+            }
+            Self::Conditional { target, predicate } => {
+                target.validate()?;
+                predicate
+                    .validate()
+                    .context("invalid conditional predicate")
             }
         }
     }

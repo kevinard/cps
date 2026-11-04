@@ -279,6 +279,77 @@ fn requires_one_compatible_backend_and_checks_removal_offline() -> Result<()> {
 }
 
 #[test]
+fn conditional_dependency_tracks_the_selected_runtime_version() -> Result<()> {
+    let f = Fixture::new()?;
+    const RUNTIME: &str = "usr/lib/cps/runtime";
+    f.package(
+        "desktop/app",
+        "1.0.0-0",
+        concat!(
+            "    conditional \"desktop/plugin\" version=\"=2.0.0-0\" ",
+            "when=\"runtime/desktop\" when-version=\">=2.0.0-0\"\n",
+        )
+        .into(),
+    )?;
+    f.package(
+        "runtime/desktop",
+        "1.0.0-0",
+        f.file(RUNTIME, "runtime v1", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/plugin",
+        "1.0.0-0",
+        f.file(PLUGIN, "plugin v1", "0644", "")?,
+    )?;
+    f.create()?;
+    let install = |name: &str| Request::Install {
+        packages: vec![name.into()],
+    };
+    apply(&f.root, &plan(&f.root, install("desktop/app"))?)?;
+    assert!(!f.root.join(RUNTIME).exists());
+    assert!(!f.root.join(PLUGIN).exists());
+
+    apply(&f.root, &plan(&f.root, install("runtime/desktop"))?)?;
+    assert_eq!(fs::read_to_string(f.root.join(RUNTIME))?, "runtime v1");
+    assert!(!f.root.join(PLUGIN).exists());
+    f.package(
+        "runtime/desktop",
+        "2.0.0-0",
+        f.file(RUNTIME, "runtime v2", "0644", "")?,
+    )?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(RUNTIME))?, "runtime v1");
+
+    f.package(
+        "desktop/plugin",
+        "2.0.0-0",
+        f.file(PLUGIN, "plugin v2", "0644", "")?,
+    )?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(RUNTIME))?, "runtime v2");
+    assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "plugin v2");
+
+    fs::rename(&f.repo, f._dir.path().join("offline-repo"))?;
+    let remove = |names: &[&str]| Request::Remove {
+        packages: names.iter().map(|name| name.to_string()).collect(),
+    };
+    let error = format!(
+        "{:#}",
+        plan(&f.root, remove(&["desktop/plugin"])).unwrap_err()
+    );
+    assert!(
+        error.contains("requires desktop/plugin =2.0.0-0 when runtime/desktop >=2.0.0-0"),
+        "{error}"
+    );
+    apply(
+        &f.root,
+        &plan(&f.root, remove(&["desktop/plugin", "runtime/desktop"]))?,
+    )?;
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
     let f = Fixture::new()?;
     let uid = geteuid().as_raw();

@@ -122,14 +122,19 @@ fn search<'a>(
         .with_context(|| format!("no candidate for {name}"))?;
     let mut failure = None;
     for package in versions {
-        if package
-            .manifest
-            .dependency
-            .iter()
-            .any(|dependency| matches!(dependency, Dependency::RequireAny { .. }))
+        if let Some(action) =
+            package
+                .manifest
+                .dependency
+                .iter()
+                .find_map(|dependency| match dependency {
+                    Dependency::RequireAny { .. } => Some("require-any"),
+                    Dependency::Conditional { .. } => Some("conditional"),
+                    _ => None,
+                })
         {
             failure = Some(anyhow::anyhow!(
-                "{} requires solver sat-v1 for require-any",
+                "{} requires solver sat-v1 for {action}",
                 package.manifest.id()
             ));
             continue;
@@ -159,7 +164,7 @@ fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {
             let (target, exclude) = match dependency {
                 Dependency::Require(target) | Dependency::Incorporate(target) => (target, false),
                 Dependency::Exclude(target) => (target, true),
-                Dependency::RequireAny { .. } => continue,
+                Dependency::RequireAny { .. } | Dependency::Conditional { .. } => continue,
             };
             if let Some(selected_target) = selected.get(target.package.as_str()) {
                 let verb = if exclude { "excludes" } else { "requires" };
@@ -219,6 +224,12 @@ pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
                             .join(", ")
                     );
                 }
+                Dependency::Conditional { target, predicate } => ensure!(
+                    !selected_matches(&selected, predicate)?
+                        || selected_matches(&selected, target)?,
+                    "{} requires {target} when {predicate} is installed",
+                    package.manifest.id(),
+                ),
                 _ => {}
             }
         }

@@ -149,7 +149,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
         match name {
-            "require" | "incorporate" | "exclude" | "require-any" => manifest
+            "require" | "incorporate" | "exclude" | "require-any" | "conditional" => manifest
                 .dependency
                 .push(parse_dependency(node).with_context(|| format!("{name} dependency"))?),
             "file" | "dir" | "symlink" => manifest
@@ -213,6 +213,19 @@ fn parse_dependency(node: &KdlNode) -> Result<Dependency> {
                 })
                 .collect::<Result<_>>()?;
             Dependency::RequireAny { alternatives }
+        }
+        "conditional" => {
+            let fields = Fields::read(node, 1, &["version", "when", "when-version"], false)?;
+            Dependency::Conditional {
+                target: DependencyTarget {
+                    package: fields.string_arg(0)?,
+                    version: fields.string("version")?,
+                },
+                predicate: DependencyTarget {
+                    package: fields.required_string("when")?,
+                    version: fields.string("when-version")?,
+                },
+            }
         }
         name => bail!("unknown dependency {name}"),
     };
@@ -301,6 +314,14 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                         .iter()
                         .map(|target| target_node("package", target)),
                 );
+                node
+            }
+            Dependency::Conditional { target, predicate } => {
+                let mut node = target_node("conditional", target);
+                node.insert("when", predicate.package.as_str());
+                if let Some(version) = &predicate.version {
+                    node.insert("when-version", version.as_str());
+                }
                 node
             }
         });

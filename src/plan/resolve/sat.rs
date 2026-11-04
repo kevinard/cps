@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use resolvo::{
-    Candidates, Condition, ConditionId, Dependencies, DependencyProvider,
+    Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
     HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem, SolvableId, Solver,
     SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
     utils::{Pool, VersionSet},
@@ -76,6 +76,16 @@ impl<'a> Universe<'a> {
                         Dependency::RequireAny { alternatives } => {
                             let union = universe.alternatives(alternatives, retained)?;
                             dependencies.requirements.push(union.into());
+                        }
+                        Dependency::Conditional { target, predicate } => {
+                            let predicate = universe.target(predicate, false)?;
+                            let condition = universe
+                                .pool
+                                .intern_condition(Condition::Requirement(predicate));
+                            dependencies.requirements.push(ConditionalRequirement {
+                                condition: Some(condition),
+                                requirement: universe.target(target, false)?.into(),
+                            });
                         }
                     }
                 }
