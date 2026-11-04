@@ -990,6 +990,11 @@ paths. Use writable scratch space outside the mounted root for the plan,
 staged tree, and export. CPS holds a shared image lock while copying and
 rejects nested mounts, including bind mounts.
 
+`apply` requires an inactive working image. CPS rejects package transactions
+against the running root and against a mounted ext4 root with a CPS revision
+label, including during a rescue boot. Ext4 root labels consisting of exactly
+16 lowercase hexadecimal digits are reserved for these deployments.
+
 ```sh
 mount -t ext4 -o ro,noload "/dev/disk/by-partuuid/$base_partuuid" /mnt/canopa
 cps plan --root /mnt/canopa --output /scratch/upgrade.json update
@@ -1211,7 +1216,8 @@ With those options and `CPS_VM_RELEASE_PROFILE=1`, set
 `CPS_VM_INSTALLED_STAGE=1` to plan and stage the second upgrade inside the
 rescue VM from the first upgrade's read-only root partition. This variant
 checks that state written during the first boot reaches the staged tree and
-that the fallback partition stays byte-for-byte intact during deployment.
+that the fallback partition stays byte-for-byte intact during deployment. It
+also checks that `apply` rejects a writable copy of the deployed root.
 
 #### Testing a source-built Linux kernel
 

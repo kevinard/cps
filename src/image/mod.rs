@@ -379,15 +379,28 @@ fn decode_rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<BTreeM
 
 impl Image {
     pub fn open(path: &Path, exclusive: bool) -> Result<Self> {
-        Self::open_database(path, exclusive, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        Self::open_database(
+            Root::open(path)?,
+            exclusive,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
     }
 
     pub(crate) fn open_query(path: &Path) -> Result<Self> {
-        Self::open_database(path, false, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        Self::open_database(
+            Root::open(path)?,
+            false,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
     }
 
-    fn open_database(path: &Path, exclusive: bool, flags: rusqlite::OpenFlags) -> Result<Self> {
+    pub(crate) fn open_for_apply(path: &Path) -> Result<Self> {
         let root = Root::open(path)?;
+        crate::boot::check_package_write_root(&root)?;
+        Self::open_database(root, true, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    fn open_database(root: Root, exclusive: bool, flags: rusqlite::OpenFlags) -> Result<Self> {
         let state_dir = root.dir(".cps").context("opening image state")?;
         let lock = root.file(".cps/lock")?;
         flock(

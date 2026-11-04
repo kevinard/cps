@@ -16,7 +16,7 @@ use crate::{
         root::{ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader},
-    plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads},
+    plan::{Plan, Write, build, config_update_prefix, hardlink_groups, payloads},
     repo::{BuildReceipt, release::fetch_payloads, stage_blob},
     systemd::{self, Action as SystemdAction},
     verify::verify_state,
@@ -97,15 +97,12 @@ pub(crate) fn apply_with(
     mut after_write: impl FnMut(&Write),
 ) -> Result<u64> {
     let id = plan.id()?;
-    let mut image = Image::open(path, true)?;
+    let mut image = Image::open_for_apply(path)?;
     let state = image.state()?;
     ensure!(
         plan.image == state.settings.id,
         "plan targets a different image"
     );
-    if matches!(plan.request, Request::ResolveConfig { .. }) {
-        image.root.offline_path()?;
-    }
     let stage = image.stage()?;
     let (mut pending, offline) = if let Some(pending) = image.pending::<Pending>()? {
         ensure!(

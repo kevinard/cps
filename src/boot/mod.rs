@@ -15,8 +15,9 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use rustix::{
-    fs::{AtFlags, FileType, RenameFlags, renameat_with, statat, syncfs},
+    fs::{AtFlags, FileType, RenameFlags, fstatfs, renameat_with, statat, syncfs},
     io::Errno,
+    ioctl::{Opcode, Updater, ioctl, opcode},
 };
 
 use crate::{
@@ -150,6 +151,30 @@ fn entry_id(image: &str, revision: u64) -> String {
 fn root_label(revision: u64) -> String {
     // A full revision fits in the 16 bytes available for an ext4 label.
     format!("{revision:016x}")
+}
+
+pub(crate) fn check_package_write_root(root: &Root) -> Result<()> {
+    root.offline_path()
+        .context("use boot-env stage to prepare package changes from an installed root")?;
+    let directory = root.as_file();
+    // Inode 2 is the ext4 filesystem root, including through a bind mount.
+    if directory.metadata()?.ino() != 2 || fstatfs(directory)?.f_type != libc::EXT4_SUPER_MAGIC {
+        return Ok(());
+    }
+    const GETFSLABEL: Opcode = opcode::read::<[u8; 256]>(0x94, 49);
+    let mut label = [0u8; 256];
+    // SAFETY: FS_IOC_GETFSLABEL writes at most FSLABEL_MAX bytes to this buffer.
+    unsafe { ioctl(directory, Updater::<GETFSLABEL, _>::new(&mut label)) }
+        .context("checking the mounted ext4 root label before applying package changes")?;
+    let deployed = label[16] == 0
+        && label[..16]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+    ensure!(
+        !deployed,
+        "use boot-env stage to prepare package changes from a deployed ext4 root"
+    );
+    Ok(())
 }
 
 fn check_image_integrity(image: &Image) -> Result<()> {

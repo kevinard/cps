@@ -16,11 +16,11 @@ pub struct Finding {
 }
 
 pub fn verify(path: &Path) -> Result<Vec<Finding>> {
-    verify_image(&Image::open(path, false)?)
+    verify_image(&Image::open_query(path)?)
 }
 
 pub fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
-    let image = Image::open(path, false)?;
+    let image = Image::open_query(path)?;
     image.require_clean()?;
     image
         .root

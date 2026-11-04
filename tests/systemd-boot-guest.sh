@@ -40,14 +40,17 @@ activate_device_guest() {
     done
     if [[ $mode == installed ]]; then
         # The image database records absolute repository locations.
-        mkdir -p "$inputs$PWD" "$inputs/scratch"
+        mkdir -p "$inputs$PWD" "$inputs/scratch" "$inputs/installed-copy"
         cp -a -- profile-repo profile-public.der "$inputs$PWD/"
         while read -r name repository key; do
             cp -a -- "$repository" "$key" "$inputs$PWD/"
         done < <(profile_companions)
         truncate -s "$((root_mib * 2 + 128))M" scratch.raw
         mke2fs -q -F -t ext4 scratch.raw
-        scratch_args=(-drive if=virtio,format=raw,file=scratch.raw)
+        dd if="$source" of=installed-copy.raw bs=1M skip="$trial_mib" count="$root_mib" \
+            conv=sparse status=none
+        scratch_args=(-drive if=virtio,format=raw,file=scratch.raw
+                      -drive if=virtio,format=raw,file=installed-copy.raw)
     else
         cp -a -- "$stage" "$inputs/staged"
         cp --sparse=always -- "$stage.ext4" "$inputs/staged.ext4"
@@ -108,8 +111,25 @@ bb=/bin/busybox
 mount -t ext4 -o ro,noload /dev/vda3 /fallback
 mount -t ext4 /dev/vdc /scratch
 test "$("$bb" cat /fallback/etc/cps-vm-booted-source)" = booted
+cps verify --root /fallback
 cps plan --root /fallback --output /scratch/upgrade.json update > /tmp/plan
 "$bb" grep -F 'test/boot-state 2.0.0-0 -> 3.0.0-0' /tmp/plan
+if cps apply --root / /scratch/upgrade.json > /tmp/rejected 2>&1; then
+    echo 'CPS_VM_DEVICE: applied a plan to the running root'
+    exit 1
+fi
+"$bb" grep -F 'operation requires an inactive image root' /tmp/rejected
+mount -t ext4 /dev/vdd /installed-copy
+: > /installed-copy/.write-probe
+before=$("$bb" sha256sum /installed-copy/.cps/state.sqlite)
+if cps apply --root /installed-copy /scratch/upgrade.json > /tmp/rejected 2>&1; then
+    echo 'CPS_VM_DEVICE: applied a plan to a deployed root'
+    exit 1
+fi
+"$bb" grep -F 'use boot-env stage to prepare package changes from a deployed ext4 root' /tmp/rejected
+test "$("$bb" sha256sum /installed-copy/.cps/state.sqlite)" = "$before"
+test "$("$bb" cat /installed-copy/etc/cps-vm-state)" = trial
+"$bb" umount /installed-copy
 mount --bind /fallback/etc /fallback/run
 if cps boot-env stage --source /fallback --root /scratch/recycled /scratch/upgrade.json > /tmp/rejected 2>&1; then
     echo 'CPS_VM_DEVICE: staged a root with a nested bind mount'
