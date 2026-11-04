@@ -1,5 +1,6 @@
 mod builds;
 mod catalogs;
+pub(crate) mod history;
 pub(crate) mod publishers;
 pub(crate) mod root;
 
@@ -754,7 +755,12 @@ impl Image {
             .optional()?)
     }
 
-    pub fn commit(&mut self, plan: &str, state: &State) -> Result<()> {
+    pub fn commit(
+        &mut self,
+        plan: &str,
+        state: &State,
+        details: &history::TransactionDetails,
+    ) -> Result<()> {
         let tx = self.db.transaction()?;
         tx.execute(
             "UPDATE image SET data=?1 WHERE id=1",
@@ -782,6 +788,7 @@ impl Image {
             "INSERT INTO history VALUES (?1, ?2)",
             params![plan, state.settings.revision],
         )?;
+        history::record(&tx, plan, state.settings.revision, details)?;
         tx.execute("DELETE FROM pending WHERE id=1", [])?;
         tx.commit()?;
         Ok(())

@@ -22,7 +22,8 @@ use cps::{
     publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
     resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
     rotate_publisher_key, set_publisher_build_trust, set_publisher_repositories,
-    stage_boot_environment, transaction_status, verify, verify_pristine, withdraw_package,
+    stage_boot_environment, transaction_details, transaction_history, transaction_status, verify,
+    verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -465,6 +466,20 @@ enum TransactionCommand {
     Resume {
         #[arg(long)]
         root: PathBuf,
+    },
+    /// List completed transactions, most recent first
+    History {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Show the recorded details of a completed plan as JSON
+    Show {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(value_name = "PLAN_SHA256")]
+        plan: String,
     },
 }
 
@@ -1189,6 +1204,21 @@ fn run(command: Command) -> Result<ExitCode> {
                 } else {
                     println!("No pending transaction");
                 }
+            }
+            TransactionCommand::History { root, limit } => {
+                let history = transaction_history(&root, limit)?;
+                println!("REVISION\tPLAN\tOPERATION");
+                for entry in history {
+                    let operation = entry
+                        .details
+                        .as_ref()
+                        .map_or("legacy", |details| details.request.operation());
+                    println!("{}\t{}\t{operation}", entry.revision, entry.plan_id);
+                }
+            }
+            TransactionCommand::Show { root, plan } => {
+                let entry = transaction_details(&root, &plan)?;
+                println!("{}", serde_json::to_string_pretty(&entry)?);
             }
         },
         Command::Fetch { root, plan } => {

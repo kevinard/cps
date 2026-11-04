@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     boot::kernel::{self, Artifacts},
     image::{
-        Image, Installed, Managed, Settings, State, publisher_generation_is_initial, root::Root,
+        Image, Installed, Managed, Settings, State, history::TransactionDetails,
+        publisher_generation_is_initial, root::Root,
     },
     model::{FORMAT, Node, PackageSpec, digest, validate_name, validate_publisher},
     repo::{BuildReceipt, Published},
@@ -65,6 +66,23 @@ pub enum Request {
     UpdateProfile,
 }
 
+impl Request {
+    pub fn operation(&self) -> &'static str {
+        match self {
+            Self::Install { .. } => "install",
+            Self::ExactInstall { .. } => "exact-install",
+            Self::InstallProfile => "install-profile",
+            Self::Remove { .. } => "remove",
+            Self::Autoremove => "autoremove",
+            Self::ChangeFacet { .. } => "change-facet",
+            Self::Repair { .. } => "repair",
+            Self::ResolveConfig { .. } => "resolve-config",
+            Self::Update => "update",
+            Self::UpdateProfile => "update-profile",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Write {
@@ -88,12 +106,12 @@ pub(crate) struct ConfigMove {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PackageChange {
-    name: String,
+pub struct PackageChange {
+    pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    publisher: Option<String>,
-    from: Option<String>,
-    to: Option<String>,
+    pub publisher: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -135,6 +153,31 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub(crate) fn transaction_details(&self, state: &State) -> TransactionDetails {
+        let mut catalogs = self.catalogs.clone();
+        if let Some(hash) = &self.catalog {
+            catalogs.insert(state.publishers.as_slice()[0].name.clone(), hash.clone());
+        }
+        TransactionDetails {
+            base_image: self.image.clone(),
+            base_revision: self.base_revision,
+            request: self.request.clone(),
+            package_changes: self.package_changes.clone(),
+            catalogs,
+            planned_path_changes: self
+                .writes
+                .iter()
+                .filter(|write| write.before != write.after || write.detach)
+                .count(),
+            payload_bytes: self.payload_bytes,
+            systemd_actions: self.systemd.len(),
+            kernel_release: self
+                .kernel_install
+                .as_ref()
+                .map(|artifacts| artifacts.kernel.release.clone()),
+        }
+    }
+
     pub fn summary(&self) -> String {
         let mut lines = vec![format!(
             "Image {} at revision {}",

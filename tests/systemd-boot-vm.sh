@@ -23,7 +23,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-13}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-14}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -104,7 +104,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[0-3]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-4]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -123,10 +123,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-3]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-4]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-3]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-4]) protected_profiles=true ;;
     esac
 fi
 if [[ -n $kernel_fixture ]]; then
@@ -706,6 +706,14 @@ else
     "$cps" verify --root staged --pristine
 fi
 check_runtime_packages staged
+if $profiled; then
+    trial_plan=$("$cps" transaction history --root staged --limit 1 | awk -F '\t' '$1 == 2 && $3 == "update-profile" {print $2}')
+    "$cps" transaction show --root staged "$trial_plan" > trial-history.json
+    grep -Fq "\"kernel_release\": \"$trial_release\"" trial-history.json
+    grep -Fq '"base_revision": 1' trial-history.json
+    "$cps" transaction history --root base --limit 1 | grep -Fq $'\tinstall-profile'
+    echo 'Verified committed history in both boot environments'
+fi
 
 if [[ $mode == rollback ]]; then
     cp "$primary_pointer" trial-catalog

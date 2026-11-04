@@ -266,7 +266,7 @@ pub(crate) fn apply_with(path: &Path, plan: &Plan, after_write: impl FnMut(&Writ
         }),
     };
     image.record_pending(&pending, pending.work().next, &receipts, repo_backed)?;
-    finish(&mut image, &stage, pending, offline, after_write)
+    finish(&mut image, &stage, pending, None, offline, after_write)
 }
 
 pub fn resume_transaction(path: &Path) -> Result<Option<u64>> {
@@ -315,13 +315,14 @@ fn resume_pending(
         "pending transaction has an invalid offline phase"
     );
     let stage = image.stage()?;
-    finish(image, &stage, pending, offline, after_write)
+    finish(image, &stage, pending, saved, offline, after_write)
 }
 
 fn finish(
     image: &mut Image,
     stage: &File,
     mut pending: PendingRecord,
+    saved: Option<&Plan>,
     offline: Option<std::path::PathBuf>,
     mut after_write: impl FnMut(&Write),
 ) -> Result<u64> {
@@ -356,7 +357,11 @@ fn finish(
         }
     }
     let revision = work.next.settings.revision;
-    image.commit(work.id, work.next)?;
+    let plan = match &pending {
+        PendingRecord::Journaled { journaled } => &journaled.plan,
+        _ => saved.context("missing verified plan for the pending transaction")?,
+    };
+    image.commit(work.id, work.next, &plan.transaction_details(work.next))?;
     Ok(revision)
 }
 

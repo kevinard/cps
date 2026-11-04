@@ -1844,6 +1844,43 @@ fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
     assert_eq!(apply(&f.root, &install)?, 1);
     assert!(verify(&f.root)?.is_empty());
+    let install_id = install.id()?;
+    assert!(
+        crate::transaction_details(&f.root, &install_id)?
+            .details
+            .is_some()
+    );
+    db.execute("DROP TABLE transaction_details", [])?;
+    assert!(
+        crate::transaction_details(&f.root, &install_id)?
+            .details
+            .is_none()
+    );
+    let remove = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &remove)?;
+    let entries = crate::transaction_history(&f.root, 20)?;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].plan_id, remove.id()?);
+    assert_eq!(entries[1].plan_id, install_id);
+    assert!(entries[1].details.is_none());
+    assert_eq!(crate::transaction_history(&f.root, 1)?.len(), 1);
+    assert!(crate::transaction_history(&f.root, 0).is_err());
+    assert!(crate::transaction_details(&f.root, &digest(b"unknown")).is_err());
+    db.execute(
+        "UPDATE transaction_details SET data='{}' WHERE plan=?1",
+        [remove.id()?],
+    )?;
+    let error = crate::transaction_details(&f.root, &remove.id()?).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("transaction details digest mismatch")
+    );
     Ok(())
 }
 
@@ -2185,6 +2222,9 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
     let status = crate::transaction_status(&staged)?;
     assert_eq!(status.revision, 2);
     assert_eq!(status.pending.unwrap().target_revision, 2);
+    let before = crate::transaction_history(&staged, 10)?;
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].plan_id, upgrade.id()?);
     assert_eq!(crate::resume_transaction(&staged)?, Some(2));
     assert_eq!(apply(&staged, &accept)?, 2);
     assert_eq!(
@@ -2206,6 +2246,33 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
         "vendor version two"
     );
     assert!(list_config_updates(&staged)?.is_empty());
+    let history = crate::transaction_history(&staged, 10)?;
+    assert_eq!(
+        history
+            .iter()
+            .map(|entry| (entry.revision, entry.plan_id.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (2, restore.id()?),
+            (2, keep.id()?),
+            (2, accept.id()?),
+            (2, upgrade.id()?),
+            (1, initial.id()?)
+        ]
+    );
+    let restored = history[0].details.as_ref().unwrap();
+    assert_eq!(restored.base_image, original.id);
+    assert_eq!(restored.base_revision, 2);
+    assert_eq!(restored.request, review(RESTORE, ConfigChoice::Vendor));
+    let upgraded = history[3].details.as_ref().unwrap();
+    assert_eq!(upgraded.base_image, upgrade.image);
+    assert_eq!(
+        upgraded.catalogs["canopa"],
+        upgrade.catalog.as_ref().unwrap().as_str()
+    );
+    assert_eq!(upgraded.package_changes[0].from.as_deref(), Some("1.0.0-0"));
+    assert_eq!(upgraded.package_changes[0].to.as_deref(), Some("2.0.0-0"));
+    assert_eq!(crate::transaction_history(&f.root, 10)?.len(), 1);
     let resolved = crate::image::Image::open_query(&staged)?.settings()?;
     assert_eq!(
         (resolved.id, resolved.revision, resolved.boot_parent),

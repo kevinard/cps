@@ -148,6 +148,9 @@ rm upgrade.json
 mv repo repo-offline
 "$cps" transaction resume --root recover
 "$cps" transaction status --root recover | grep -Fx 'No pending transaction'
+plan_id=$("$cps" transaction history --root recover --limit 1 | awk -F '\t' '$1 == 2 && $3 == "update" {print $2}')
+"$cps" transaction show --root recover "$plan_id" > completed.json
+grep -Fq '"systemd_actions": 5' completed.json
 "$cps" verify --root recover
 test "$(grep -c "^$user:" recover/etc/passwd)" = 1
 test -d "recover$host_tmpfiles"

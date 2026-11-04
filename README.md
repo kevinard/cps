@@ -53,6 +53,15 @@ plan and staged payloads from the image journal. You can also rerun `apply`
 with the same saved plan. Transactions recorded by earlier CPS versions
 require their original saved plan. Use the current CPS to resume a new journal.
 
+Use `cps transaction history --root image` to list completed plans, newest
+first. The default limit is 20 entries. Use
+`cps transaction show --root image PLAN_SHA256` for a JSON record of the
+request, package changes, catalog digests, and planned action counts. The record
+commits with the image state, works offline, and follows the source image's
+history when staging a boot environment. Older entries show their plan digest
+and revision. History uses commit order within a revision and omits wall-clock
+timestamps so independently provisioned images can still match byte for byte.
+
 Run `cps verify --root image --pristine` to check a freshly assembled offline
 root. It checks all package paths, including preserved configuration and
 implicit directories, and reports unmanaged paths outside the reserved
@@ -212,7 +221,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-13`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-14`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache

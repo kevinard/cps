@@ -32,6 +32,9 @@ pub use build::{
     sources::{fetch_sources, fetch_sources_with_local, import_sources},
 };
 pub use generate::{generate_manifest, generate_manifest_for_architecture};
+pub use image::history::{
+    HistoryEntry, TransactionDetails, transaction_details, transaction_history,
+};
 pub use image::publishers::{
     PublisherInfo, add_publisher, add_publisher_with_build_trust, audit_publisher_builds,
     list_publishers, prefer_publisher, remove_publisher, set_publisher_build_trust,
@@ -40,7 +43,9 @@ pub use image::publishers::{
 pub use image::{create_configured_image, create_image};
 pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
-pub use plan::{ConfigChoice, ConfigUpdate, Plan, Request, list_config_updates, plan};
+pub use plan::{
+    ConfigChoice, ConfigUpdate, PackageChange, Plan, Request, list_config_updates, plan,
+};
 pub use repo::{
     BuildAudit, BuildWitness, list_obsoletions, list_withdrawals, publish, publish_bundle,
     publish_release, publish_witnessed_bundle, read_attestation, release, rotate_publisher_key,
