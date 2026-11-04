@@ -34,7 +34,7 @@ pub use plan::{Plan, Request, plan};
 pub use repo::{
     BuildWitness, publish, publish_bundle, publish_witnessed_bundle, read_attestation, release,
 };
-pub use verify::{Finding, verify};
+pub use verify::{Finding, verify, verify_pristine};
 
 #[cfg(test)]
 mod tests;

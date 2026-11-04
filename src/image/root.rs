@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::{
     fs::{
         AtFlags, FileType, Mode, OFlags, ResolveFlags, Stat, chownat, fchmod, fchown, fstat,
-        mkdirat, open, openat2, readlinkat, renameat, statat, symlinkat, unlinkat,
+        listxattr, mkdirat, open, openat2, readlinkat, renameat, statat, symlinkat, unlinkat,
     },
     io::Errno,
     process::{Gid, Uid},
@@ -34,12 +34,22 @@ impl Root {
         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
     }
 
+    pub(crate) fn has_xattrs(entry: &File) -> Result<bool> {
+        // An empty buffer queries the size without allocating or reading values.
+        let empty: &mut [u8] = &mut [];
+        match listxattr(Self::fd_path(entry), empty) {
+            Ok(size) => Ok(size != 0),
+            Err(Errno::NOTSUP) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn offline_path(&self) -> Result<PathBuf> {
         let image = self.0.metadata()?;
         let host = fs::metadata("/")?;
         ensure!(
             (image.dev(), image.ino()) != (host.dev(), host.ino()),
-            "systemd actions require an inactive image root"
+            "operation requires an inactive image root"
         );
         let path = fs::read_link(Self::fd_path(&self.0))?;
         let current = fs::metadata(&path)?;

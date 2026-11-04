@@ -205,6 +205,68 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
 }
 
 #[test]
+fn pristine_verification_checks_the_complete_offline_root() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let f = Fixture::new()?;
+    let actions = f.file(COMPOSITOR, "tool", "0755", "")?
+        + &f.file(CONFIG, "vendor", "0644", "preserve=#true")?;
+    f.package("test/pristine", "1.0.0-0", actions)?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/pristine".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
+
+    let config = f.root.join(CONFIG);
+    fs::write(&config, "local configuration")?;
+    let usr = f.root.join("usr");
+    fs::set_permissions(&usr, fs::Permissions::from_mode(0o700))?;
+    let unowned = f.root.join("unowned");
+    fs::create_dir(&unowned)?;
+    symlink("/", unowned.join("outside"))?;
+    let tool = f.root.join(COMPOSITOR);
+    let alias = f.root.with_extension("outside");
+    fs::hard_link(&tool, &alias)?;
+    rustix::fs::setxattr(
+        &tool,
+        "user.cps-test",
+        b"value",
+        rustix::fs::XattrFlags::empty(),
+    )?;
+
+    let normal = verify(&f.root)?;
+    assert_eq!(normal.len(), 1);
+    assert!(!normal[0].is_error);
+    let pristine = crate::verify_pristine(&f.root)?;
+    assert_eq!(pristine.len(), 5);
+    for detail in [
+        CONFIG,
+        "usr: content, type, or metadata differs",
+        "unmanaged path \"unowned\"",
+        "unexpected hard link",
+        "unexpected extended attributes",
+    ] {
+        assert!(
+            pristine
+                .iter()
+                .any(|finding| finding.is_error && finding.message.contains(detail))
+        );
+    }
+    fs::remove_file(alias)?;
+    rustix::fs::removexattr(&tool, "user.cps-test")?;
+    fs::remove_dir_all(unowned)?;
+    fs::set_permissions(&usr, fs::Permissions::from_mode(0o755))?;
+    fs::write(&config, "vendor")?;
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
     use crate::kdl_format::parse_manifest;
     use crate::query::{Scope, list_packages, package_manifest};

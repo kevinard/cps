@@ -1,10 +1,7 @@
-use std::{fs::File, path::Path};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
-use rustix::{
-    fs::{FileType, listxattr, readlinkat},
-    io::Errno,
-};
+use rustix::fs::{FileType, readlinkat};
 
 use crate::{
     image::root::Root,
@@ -44,7 +41,11 @@ pub fn generate_manifest(
                 mode <= 0o777,
                 "unsupported special permission bits at {path:?}"
             );
-            check_xattrs(entry, path)?;
+            ensure!(
+                !Root::has_xattrs(entry)
+                    .with_context(|| format!("listing attributes at {path:?}"))?,
+                "unsupported extended attributes at {path:?}"
+            );
             Ok::<_, anyhow::Error>(format!("{mode:04o}"))
         };
         let action = match kind {
@@ -95,14 +96,4 @@ pub fn generate_manifest(
         "manifest exceeds {MANIFEST_LIMIT} bytes"
     );
     Ok(text)
-}
-
-fn check_xattrs(entry: &File, path: &str) -> Result<()> {
-    // An empty buffer queries the size without allocating or reading values.
-    let empty: &mut [u8] = &mut [];
-    match listxattr(Root::fd_path(entry), empty) {
-        Ok(0) | Err(Errno::NOTSUP) => Ok(()),
-        Ok(_) => bail!("unsupported extended attributes at {path:?}"),
-        Err(error) => Err(error).with_context(|| format!("listing attributes at {path:?}")),
-    }
 }

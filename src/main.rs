@@ -15,6 +15,7 @@ use cps::{
     generate_manifest, import_sources, list_boot_environments, list_publishers, plan,
     prefer_publisher, publish, publish_witnessed_bundle, read_attestation, read_worker_config,
     release, remove_publisher, rollback_boot_environment, stage_boot_environment, verify,
+    verify_pristine,
 };
 
 #[derive(Parser)]
@@ -154,6 +155,9 @@ enum Command {
     Verify {
         #[arg(long)]
         root: PathBuf,
+        /// Require an inactive root with pristine package paths and no unmanaged entries
+        #[arg(long)]
+        pristine: bool,
     },
     /// Manage systemd-boot environments
     BootEnv {
@@ -615,8 +619,12 @@ fn run(command: Command) -> Result<ExitCode> {
             let saved = load_plan(&plan)?;
             println!("Image revision {}", apply(&root, &saved)?);
         }
-        Command::Verify { root } => {
-            let findings = verify(&root)?;
+        Command::Verify { root, pristine } => {
+            let findings = if pristine {
+                verify_pristine(&root)?
+            } else {
+                verify(&root)?
+            };
             for finding in &findings {
                 if finding.is_error {
                     eprintln!("error: {}", finding.message);

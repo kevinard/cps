@@ -42,6 +42,14 @@ CONFIG
 
 To upgrade, publish the revised recipe under a new version and run `cps plan --root image --output upgrade.json update`, then apply the saved plan. The plan pins the image revision and the signed catalogs used to resolve packages. Keep the saved plan until apply finishes. If interrupted, rerun `apply` with the same plan. Once writes begin, recovery uses the payloads staged inside the image and can finish offline.
 
+Run `cps verify --root image --pristine` to check a freshly assembled offline
+root. It checks all package paths, including preserved configuration and
+implicit directories, and reports unmanaged paths outside the reserved
+`.cps` state directory. It also rejects unexpected hard links to regular files
+and extended attributes on managed regular files and directories. Use regular
+`verify` after provisioning or booting, when the system can generate files
+outside package ownership.
+
 Use `plan exact-install NAME ...` to reconcile an image to the named packages and their required dependencies. The plan previews packages that would be removed. Use `plan remove NAME ...` to remove selected packages from committed image state while offline. Removal fails if a package that remains still requires one of those packages. Both operations preserve locally edited files declared with `preserve=#true`. A saved install, exact-install, remove, or update plan can also be applied to a clone with `boot-env stage`.
 
 Use `cps plan --root image --output repair.json repair [NAME ...]` to repair
