@@ -201,7 +201,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-7`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-8`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -340,7 +340,10 @@ catalog digest, and publisher key history in the image database. The archive
 follows the installed versions in each boot environment. `audit-builds`
 rechecks those signatures against the installed manifest, the recorded
 publisher key history, and the image's current builder policy, even without
-the repository.
+the repository. Where the image has a signed catalog archive, the envelope
+must match the attestation digest admitted by the publisher for that exact
+manifest. The same check applies when reusing archived evidence during a
+signed profile upgrade.
 
 By default, CPS checks the current or profile-pinned catalog's publisher key
 history and audits every installed package before saving the policy. For a
@@ -348,7 +351,10 @@ package without an archived receipt, it checks the installed manifest
 against the signed catalog and reads the referenced evidence from the
 repository cache. This covers withdrawn packages whose evidence is still
 cached. Run `set-build-trust` with the same policy to archive that evidence
-for future offline audits.
+for future offline audits. When this records evidence from a later catalog,
+CPS keeps one additional signed catalog per publisher to authenticate the
+receipt offline. The installed image's catalog checkpoint stays at its
+applied revision.
 
 For immediate key revocation, use `set-build-trust --future-only` to change
 admission policy even with the repository offline. Use `audit-builds` to

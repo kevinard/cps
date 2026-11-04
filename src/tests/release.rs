@@ -2646,6 +2646,82 @@ fn tuf_obsoletion_removes_only_when_dependencies_allow_and_preserves_history() -
 }
 
 #[test]
+fn offline_build_audit_requires_the_catalog_admitted_attestation() -> Result<()> {
+    let f = Fixture::new()?;
+    let builder = Fixture::new()?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "verified payload", "0755", "")?,
+    )?;
+    let pointer = f.repo.join("current");
+    let initial = fs::read_to_string(&pointer)?;
+    let recipe = fs::read(&f.recipe)?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+
+    f.package("test/extra", "1.0.0-0", String::new())?;
+    let branch = fs::read_to_string(&pointer)?;
+    fs::write(&f.recipe, recipe)?;
+    let (_, envelope) = attach_evidence(&f, initial.trim(), &builder)?;
+    let admitted = fs::read_to_string(&pointer)?;
+    fs::write(&pointer, &branch)?;
+    let (_, alternative) = attach_evidence(&f, branch.trim(), &builder)?;
+    assert_ne!(envelope, alternative);
+    fs::write(&pointer, &admitted)?;
+
+    let policy = f._dir.path().join("policy.kdl");
+    fs::write(
+        &policy,
+        format!(
+            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            builder.public
+        ),
+    )?;
+    crate::set_publisher_build_trust(&f.root, "canopa", &policy, false)?;
+    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let supplemental: String = db.query_row(
+        "SELECT hash FROM build_admission_catalogs WHERE publisher='canopa'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(supplemental, admitted.trim());
+    let offline = f.repo.with_extension("offline");
+    for advance in [false, true] {
+        if advance {
+            apply(&f.root, &plan(&f.root, Request::Update)?)?;
+            db.execute("DELETE FROM build_admission_catalogs", [])?;
+        }
+        fs::rename(&f.repo, &offline)?;
+        let audit = crate::audit_publisher_builds(&f.root, "canopa")?;
+        assert_eq!(audit.verified, 1, "{:?}", audit.failures);
+        db.execute(
+            "UPDATE build_receipts SET receipt=json_set(receipt, '$.attestation', ?1), envelope=?2",
+            (digest(&alternative), &alternative),
+        )?;
+        let audit = crate::audit_publisher_builds(&f.root, "canopa")?;
+        assert_eq!(audit.verified, 0);
+        assert_eq!(audit.failures.len(), 1);
+        assert!(
+            audit.failures[0]
+                .contains("archived build attestation differs from the signed catalog")
+        );
+        db.execute(
+            "UPDATE build_receipts SET receipt=json_set(receipt, '$.attestation', ?1), envelope=?2",
+            (digest(&envelope), &envelope),
+        )?;
+        fs::rename(&offline, &f.repo)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn signed_build_trust_checks_retained_companion_packages() -> Result<()> {
     let f = Fixture::new()?;
     let seed = Fixture::new()?;
@@ -2766,8 +2842,15 @@ publisher "seed" {{
 
     {
         let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        // The same valid DSSE envelope with different bytes has a different
+        // digest and must not stand in for the catalog's admitted object.
+        let mut alternative = envelope.clone();
+        alternative.push(b'\n');
         assert_eq!(
-            db.execute("UPDATE build_receipts SET envelope=x'00'", [])?,
+            db.execute(
+                "UPDATE build_receipts SET receipt=json_set(receipt, '$.attestation', ?1), envelope=?2",
+                (digest(&alternative), alternative),
+            )?,
             1
         );
     }

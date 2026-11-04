@@ -3,17 +3,117 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::{Publishers, State};
-use crate::{attestation::ATTESTATION_LIMIT, repo::BuildReceipt};
+use super::{Publisher, Publishers, Settings, State, catalogs};
+use crate::{
+    attestation::ATTESTATION_LIMIT,
+    model::validate_digest,
+    repo::{BuildReceipt, CATALOG_LIMIT, Catalog, catalog_bytes, decode_archived_catalog},
+};
 
 const RECEIPT_LIMIT: u64 = 128 * 1024;
 
 pub(super) fn exists(db: &Connection) -> Result<bool> {
+    table_exists(db, "build_receipts")
+}
+
+fn table_exists(db: &Connection, name: &str) -> Result<bool> {
     Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='build_receipts')",
-        [],
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
         |row| row.get(0),
     )?)
+}
+
+pub(super) fn admission_catalog(
+    db: &Connection,
+    publisher: &Publisher,
+) -> Result<Option<(Catalog, String)>> {
+    if !table_exists(db, "build_admission_catalogs")? {
+        return Ok(None);
+    }
+    let archived = db
+        .query_row(
+            "SELECT hash, CASE WHEN length(CAST(catalog AS BLOB)) <= ?2 THEN catalog END
+         FROM build_admission_catalogs WHERE publisher=?1",
+            (&publisher.name, CATALOG_LIMIT),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )
+        .optional()?;
+    archived
+        .map(|(hash, bytes)| -> Result<_> {
+            validate_digest(&hash)?;
+            let bytes = bytes.context("archived build admission catalog exceeds size limit")?;
+            let catalog = decode_archived_catalog(&bytes, &hash, &publisher.name, &publisher.key)?;
+            Ok((catalog, hash))
+        })
+        .transpose()
+        .with_context(|| format!("reading archived build admission for {}", publisher.name))
+}
+
+pub(super) fn save_audit(
+    tx: &Transaction<'_>,
+    publishers: &Publishers,
+    settings: &Settings,
+    receipts: &[BuildReceipt],
+) -> Result<()> {
+    let Some(first) = receipts.first() else {
+        return Ok(());
+    };
+    let publisher = publishers
+        .get(&first.publisher)
+        .context("missing build receipt publisher")?;
+    let hash = first.catalog();
+    ensure!(
+        receipts
+            .iter()
+            .all(|receipt| receipt.publisher == first.publisher && receipt.catalog() == hash),
+        "build audit receipts must share a signed catalog"
+    );
+    let point = settings.catalog_checkpoints.get(&publisher.name);
+    if !settings.catalog_archives || point.is_none_or(|point| point.catalog != hash) {
+        let bytes = catalog_bytes(&publisher.repo, hash)?;
+        let catalog = decode_archived_catalog(&bytes, hash, &publisher.name, &publisher.key)?;
+        if let Some((previous, previous_hash)) = admission_catalog(tx, publisher)?
+            && previous_hash != hash
+        {
+            previous
+                .check_successor(&catalog, &previous_hash)
+                .context("checking build admission catalog succession")?;
+        }
+        if let Some(point) = point.filter(|_| settings.catalog_archives) {
+            catalogs::read_checkpoint(tx, publisher, point)?
+                .check_successor(&catalog, &point.catalog)
+                .context("checking build admission against the applied catalog")?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS build_admission_catalogs (
+                publisher TEXT PRIMARY KEY, hash TEXT NOT NULL CHECK(length(hash)=64), catalog BLOB NOT NULL
+             )",
+        )?;
+        tx.execute(
+            "INSERT INTO build_admission_catalogs VALUES (?1, ?2, ?3)
+             ON CONFLICT(publisher) DO UPDATE SET hash=excluded.hash, catalog=excluded.catalog",
+            (&publisher.name, hash, bytes),
+        )?;
+    }
+    save(tx, publishers, receipts)
+}
+
+pub(super) fn retain_admission(tx: &Transaction<'_>, publishers: &Publishers) -> Result<()> {
+    if !table_exists(tx, "build_admission_catalogs")? {
+        return Ok(());
+    }
+    let mut select = tx.prepare("SELECT publisher FROM build_admission_catalogs")?;
+    let archived = select
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut delete = tx.prepare("DELETE FROM build_admission_catalogs WHERE publisher=?1")?;
+    for name in archived {
+        if publishers.get(&name).is_none() {
+            delete.execute([name])?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn save(

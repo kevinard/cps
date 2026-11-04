@@ -186,7 +186,8 @@ pub fn set_publisher_build_trust(
     let receipts = if future_only {
         Vec::new()
     } else {
-        let audit = audit(&image, &state, publisher, &trust, true)?;
+        let profile = catalogs::read_profile(&image.db, &state)?;
+        let audit = audit(&image, &state, publisher, profile.as_ref(), &trust, true)?;
         ensure!(
             audit.failures.is_empty(),
             "installed build audit failed for {name}\n{}",
@@ -200,7 +201,7 @@ pub fn set_publisher_build_trust(
         save(&mut image, Publishers::new(publishers, profile)?, &receipts)?;
     } else if !receipts.is_empty() {
         let tx = image.db.transaction()?;
-        builds::save(&tx, &state.publishers, &receipts)?;
+        builds::save_audit(&tx, &state.publishers, &state.settings, &receipts)?;
         tx.commit()?;
     }
     Ok(())
@@ -228,7 +229,8 @@ pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
         {
             policies.push(local);
         }
-        let (mut audit, missing) = audit_archived(&image, &state, publisher, &policies)?;
+        let (mut audit, missing) =
+            audit_archived(&image, &state, publisher, profile.as_ref(), &policies)?;
         audit.failures.extend(missing.into_iter().map(|package| {
             format!(
                 "missing archived build evidence for {}",
@@ -240,17 +242,18 @@ pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
     let trust = publisher.build_trust.as_ref().with_context(|| {
         format!("publisher {name} has no local or archived signed build trust policy")
     })?;
-    audit(&image, &state, publisher, trust, false)
+    audit(&image, &state, publisher, profile.as_ref(), trust, false)
 }
 
 fn audit(
     image: &Image,
     state: &State,
     publisher: &Publisher,
+    profile: Option<&ReleaseProfile>,
     trust: &BuildTrust,
     check_current: bool,
 ) -> Result<BuildAudit> {
-    let (mut audit, missing) = audit_archived(image, state, publisher, &[trust])?;
+    let (mut audit, missing) = audit_archived(image, state, publisher, profile, &[trust])?;
     if check_current || !missing.is_empty() {
         let repository_audit = || {
             let pins = image.release_pins(&state.publishers, &state.settings)?;
@@ -286,16 +289,28 @@ fn audit_archived<'a>(
     image: &Image,
     state: &'a State,
     publisher: &Publisher,
+    profile: Option<&ReleaseProfile>,
     policies: &[&BuildTrust],
 ) -> Result<(BuildAudit, Vec<&'a Published>)> {
     let mut audit = BuildAudit::default();
-    let archive = builds::exists(&image.db)?;
-    let installed = state
+    let mut installed = state
         .installed
         .values()
         .map(|package| &package.published)
-        .filter(|package| package.manifest.publisher == publisher.name);
+        .filter(|package| package.manifest.publisher == publisher.name)
+        .peekable();
     let mut missing = Vec::new();
+    if installed.peek().is_none() {
+        return Ok((audit, missing));
+    }
+    let applied = catalogs::read_applied(&image.db, state, publisher, profile)?;
+    ensure!(
+        !state.settings.catalog_archives || applied.is_some(),
+        "missing catalog checkpoint for installed publisher {}",
+        publisher.name
+    );
+    let archive = builds::exists(&image.db)?;
+    let mut supplemental = None;
     for package in installed {
         if !archive {
             missing.push(package);
@@ -306,13 +321,59 @@ fn audit_archived<'a>(
                 missing.push(package);
                 continue;
             }
-            Ok(Some((receipt, bytes))) => policies
-                .iter()
-                .try_for_each(|trust| receipt.verify(&bytes, package, &publisher.key, trust)),
+            Ok(Some((receipt, bytes))) => (|| {
+                let admitted = match &applied {
+                    Some((catalog, _)) => catalog
+                        .check_installed(package)?
+                        .map(|hash| (catalog, hash)),
+                    None => None,
+                };
+                let (catalog, expected) = if let Some(admitted) = admitted {
+                    admitted
+                } else {
+                    if supplemental.is_none() {
+                        let found = builds::admission_catalog(&image.db, publisher)?;
+                        if let (Some((applied, applied_hash)), Some((catalog, hash))) =
+                            (&applied, &found)
+                            && hash != applied_hash
+                        {
+                            applied.check_successor(catalog, applied_hash).context(
+                                "checking archived build admission against the applied catalog",
+                            )?;
+                        }
+                        supplemental = Some(found);
+                    }
+                    let Some((catalog, _)) = supplemental.as_ref().and_then(Option::as_ref) else {
+                        if applied.is_some() {
+                            // Re-audit old receipts whose later catalog was never saved.
+                            return Ok(false);
+                        }
+                        // Legacy images can have receipts without their full catalog.
+                        policies.iter().try_for_each(|trust| {
+                            receipt.verify(&bytes, package, &publisher.key, trust)
+                        })?;
+                        return Ok(true);
+                    };
+                    let hash = catalog
+                        .check_installed(package)?
+                        .context("no signed catalog admission for archived build attestation")?;
+                    (catalog, hash)
+                };
+                receipt.check_attestation(expected)?;
+                let publisher_keys = catalog.publisher_keys(&publisher.key)?;
+                policies.iter().try_for_each(|trust| {
+                    for key in &publisher_keys {
+                        trust.check_publisher_key(key)?;
+                    }
+                    receipt.verify(&bytes, package, &publisher.key, trust)
+                })?;
+                Ok(true)
+            })(),
             Err(error) => Err(error),
         };
         match result {
-            Ok(()) => audit.verified += 1,
+            Ok(true) => audit.verified += 1,
+            Ok(false) => missing.push(package),
             Err(error) => audit.failures.push(format!(
                 "checking archived build evidence for {}: {error:#}",
                 package.manifest.id()
@@ -383,7 +444,8 @@ fn save(image: &mut Image, publishers: Publishers, receipts: &[BuildReceipt]) ->
         .checked_add(1)
         .context("publisher generation exhausted")?;
     let tx = image.db.transaction()?;
-    builds::save(&tx, &publishers, receipts)?;
+    builds::save_audit(&tx, &publishers, &settings, receipts)?;
+    builds::retain_admission(&tx, &publishers)?;
     catalogs::retain(&tx, &settings)?;
     tx.execute(
         "UPDATE publishers SET data=?1 WHERE id=1",

@@ -238,7 +238,7 @@ impl Catalog {
         Ok(attestation)
     }
 
-    fn publisher_keys(&self, anchor: &[u8]) -> Result<Vec<[u8; 32]>> {
+    pub(crate) fn publisher_keys(&self, anchor: &[u8]) -> Result<Vec<[u8; 32]>> {
         let mut keys = vec![
             anchor
                 .try_into()
@@ -254,8 +254,14 @@ impl Catalog {
 
     fn take_build_evidence(&mut self, hash: &str, key: &[u8]) -> Result<BuildEvidence> {
         let publisher_keys = self.publisher_keys(key)?;
+        let mut attestations = std::mem::take(&mut self.attestations);
+        attestations.extend(
+            self.withdrawals
+                .iter()
+                .filter_map(|(id, withdrawn)| Some((id.clone(), withdrawn.attestation.clone()?))),
+        );
         Ok(BuildEvidence {
-            attestations: std::mem::take(&mut self.attestations),
+            attestations,
             publisher_keys,
             history: CatalogCheckpoint {
                 catalog: hash.to_owned(),
@@ -335,7 +341,7 @@ impl Catalog {
         Ok(true)
     }
 
-    fn check_successor(&self, next: &Self, previous_hash: &str) -> Result<()> {
+    pub(crate) fn check_successor(&self, next: &Self, previous_hash: &str) -> Result<()> {
         check_catalog_sequence(self.sequence, next.sequence)?;
         keys::check_successor(
             &self.key_rotations,
@@ -694,6 +700,18 @@ impl BuildReceipt {
         read_object(repo, "attestations", &self.attestation, ATTESTATION_LIMIT)
     }
 
+    pub(crate) fn catalog(&self) -> &str {
+        &self.history.catalog
+    }
+
+    pub(crate) fn check_attestation(&self, expected: &str) -> Result<()> {
+        ensure!(
+            self.attestation == expected,
+            "archived build attestation differs from the signed catalog"
+        );
+        Ok(())
+    }
+
     pub(crate) fn verify(
         &self,
         bytes: &[u8],
@@ -726,6 +744,15 @@ impl BuildReceipt {
 }
 
 impl BuildEvidence {
+    pub(crate) fn check_receipt(&self, package: &Published, receipt: &BuildReceipt) -> Result<()> {
+        let id = package.manifest.id();
+        let expected = self
+            .attestations
+            .get(&id)
+            .with_context(|| format!("no build attestation for {id}"))?;
+        receipt.check_attestation(expected)
+    }
+
     pub(crate) fn verify_policies(
         &self,
         repo: &Path,

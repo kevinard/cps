@@ -37,6 +37,7 @@ impl SelectedBuilds {
         };
         self.evidence.check_keys(trust)?;
         if let Some((receipt, envelope)) = image.archived_build(&package.sha256)?
+            && self.evidence.check_receipt(package, &receipt).is_ok()
             && receipt
                 .verify(&envelope, package, &publisher.key, trust)
                 .is_ok()

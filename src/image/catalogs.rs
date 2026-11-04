@@ -54,7 +54,7 @@ fn read_legacy(db: &Connection) -> Result<Vec<u8>> {
     bytes.context("archived profile catalog exceeds size limit")
 }
 
-fn read_checkpoint(
+pub(super) fn read_checkpoint(
     db: &Connection,
     publisher: &Publisher,
     point: &CatalogCheckpoint,
@@ -108,6 +108,36 @@ pub(super) fn read_profile(db: &Connection, state: &State) -> Result<Option<Rele
     read_primary(db, state)?
         .map(|(mut catalog, hash)| profile(&mut catalog, hash, name, state))
         .transpose()
+}
+
+pub(super) fn read_applied<'a>(
+    db: &Connection,
+    state: &'a State,
+    publisher: &Publisher,
+    signed: Option<&ReleaseProfile>,
+) -> Result<Option<(Catalog, &'a str)>> {
+    if state.publishers.release_profile().is_some()
+        && state.publishers.as_slice()[0].name == publisher.name
+    {
+        return read_primary(db, state);
+    }
+    if !state.settings.catalog_archives {
+        return Ok(None);
+    }
+    let point = state.settings.catalog_checkpoints.get(&publisher.name);
+    let Some(point) = point else {
+        return Ok(None);
+    };
+    let catalog = read_checkpoint(db, publisher, point)?;
+    if let Some(pin) = signed.and_then(|profile| {
+        profile
+            .companions
+            .iter()
+            .find(|pin| pin.publisher == publisher.name)
+    }) {
+        pin.check_archive(&catalog, &point.catalog, &publisher.key)?;
+    }
+    Ok(Some((catalog, &point.catalog)))
 }
 
 fn check_installed(catalog: &Catalog, publisher: &Publisher, state: &State) -> Result<()> {
