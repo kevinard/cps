@@ -214,6 +214,7 @@ fn build_inner(
     );
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
     manifest.validate(false)?;
+    manifest.check_architecture(&recipe.arch)?;
     let paths = manifest.payload_paths();
 
     let destination = fs::canonicalize(parent(output))?;
@@ -458,7 +459,7 @@ fn prepare_toolchain(
         )
         .with_context(|| format!("loading pinned toolchain catalog for {}", pin.name))?;
         candidates.add_obsoletions(&mut sources, &pin.name, &release.obsoletions);
-        candidates.add_packages(&mut sources, &pin.name, release.packages);
+        candidates.add_packages(&mut sources, &pin.name, &recipe.arch, release.packages);
         paths_by_publisher.insert(pin.name.as_str(), source.repository.as_path());
         if let Some(trust) = &source.build_trust {
             builds.insert(

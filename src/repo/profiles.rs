@@ -185,6 +185,7 @@ pub(super) fn check(
         let current = candidates(
             catalog,
             &packages,
+            &profile.arch,
             companions
                 .iter()
                 .map(|companion| (companion.name, &companion.current)),
@@ -257,6 +258,7 @@ pub(super) fn check(
                 let current = candidates(
                     catalog,
                     &packages,
+                    &profile.arch,
                     companions
                         .iter()
                         .map(|companion| (companion.name, &companion.current)),
@@ -335,7 +337,7 @@ fn baseline_image(
         .iter()
         .map(|(name, _)| ((*name).to_owned(), catalog.publisher.as_str()))
         .collect();
-    let baseline = candidates(catalog, packages, snapshots, sources);
+    let baseline = candidates(catalog, packages, &profile.arch, snapshots, sources);
     if let Some(historical) = historical.filter(|profile| !profile.composition.is_empty()) {
         let installed = baseline
             .replay(historical)
@@ -370,15 +372,16 @@ fn check_companion_builds(
 fn candidates<'a>(
     catalog: &'a Catalog,
     packages: &'a [Published],
+    architecture: &str,
     companions: impl IntoIterator<Item = (&'a str, &'a Snapshot)>,
     mut sources: BTreeMap<String, &'a str>,
 ) -> CandidateSet<&'a Published> {
     let mut selected = CandidateSet::default();
     selected.add_obsoletions(&mut sources, &catalog.publisher, &catalog.obsoletions);
-    selected.add_packages(&mut sources, &catalog.publisher, packages);
+    selected.add_packages(&mut sources, &catalog.publisher, architecture, packages);
     for (name, snapshot) in companions {
         selected.add_obsoletions(&mut sources, name, &snapshot.obsoletions);
-        selected.add_packages(&mut sources, name, &snapshot.packages);
+        selected.add_packages(&mut sources, name, architecture, &snapshot.packages);
     }
     selected
 }
@@ -387,7 +390,7 @@ fn load_packages(repo: &Path, catalog: &Catalog) -> Result<Vec<Published>> {
     catalog
         .entries
         .iter()
-        .map(|(id, manifest)| read_package(repo, &catalog.publisher, id, manifest.clone()))
+        .map(|(id, entry)| read_package(repo, &catalog.publisher, id, entry))
         .collect()
 }
 

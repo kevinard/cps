@@ -143,12 +143,13 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         doc.nodes().len() == 2,
         "expected only schema-version and package nodes"
     );
-    let fields = Fields::read(package, 1, &["publisher", "version"], true)?;
+    let fields = Fields::read(package, 1, &["publisher", "version", "architecture"], true)?;
     let mut manifest = Manifest {
         format: FORMAT,
         name: fields.string_arg(0)?,
         publisher: fields.required_string("publisher")?,
         version: fields.required_string("version")?.parse()?,
+        architecture: fields.string("architecture")?,
         dependency: Vec::new(),
         action: Vec::new(),
         systemd: Vec::new(),
@@ -333,6 +334,9 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     package.push(manifest.name.as_str());
     package.insert("publisher", manifest.publisher.as_str());
     package.insert("version", manifest.version.to_string());
+    if let Some(architecture) = &manifest.architecture {
+        package.insert("architecture", architecture.as_str());
+    }
     let children = package.ensure_children().nodes_mut();
     for dependency in &manifest.dependency {
         children.push(match dependency {

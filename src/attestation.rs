@@ -108,6 +108,7 @@ impl BuildTrust {
             statement.predicate.package == manifest.id() && statement.predicate.identical_runs == 2,
             "build attestation does not match the package or the reproducibility requirement"
         );
+        manifest.check_architecture(&statement.predicate.architecture)?;
         validate_digest(&statement.predicate.recipe_sha256)?;
         let mut subjects = subjects(statement.subject)?;
         ensure!(
@@ -512,6 +513,7 @@ pub(crate) fn verify_bundle(
     );
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
     manifest.validate(false)?;
+    manifest.check_architecture(&recipe.arch)?;
     ensure!(
         manifest.id() == predicate.package,
         "build attestation names a different package"

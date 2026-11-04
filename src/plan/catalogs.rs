@@ -121,6 +121,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
             if profile.composition.get(name) != Some(&package.sha256) {
                 continue;
             }
+            package.manifest.check_architecture(&profile.architecture)?;
             ensure!(
                 self.obsoletions
                     .get(name)
@@ -223,13 +224,14 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         &mut self,
         sources: &mut BTreeMap<String, &'a str>,
         publisher: &'a str,
+        architecture: &str,
         packages: impl IntoIterator<Item = P>,
     ) {
-        self.packages.extend(
-            packages
-                .into_iter()
-                .filter(|pkg| claim_source(sources, publisher, &pkg.borrow().manifest.name)),
-        );
+        self.packages.extend(packages.into_iter().filter(|pkg| {
+            let manifest = &pkg.borrow().manifest;
+            manifest.supports_architecture(architecture)
+                && claim_source(sources, publisher, &manifest.name)
+        }));
     }
 }
 
@@ -361,9 +363,12 @@ pub(super) fn load(
                 .pins
                 .insert(publisher.name.clone(), snapshot.sha256);
         }
-        catalogs
-            .candidates
-            .add_packages(&mut sources, &publisher.name, snapshot.packages);
+        catalogs.candidates.add_packages(
+            &mut sources,
+            &publisher.name,
+            &state.settings.arch,
+            snapshot.packages,
+        );
         let profile_trust = signed.and_then(|pin| pin.build_trust.clone());
         if publisher.build_trust.is_some() || profile_trust.is_some() {
             catalogs.builds.insert(

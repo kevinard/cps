@@ -29,6 +29,19 @@ pub fn generate_manifest(
     uid: u32,
     gid: u32,
 ) -> Result<String> {
+    generate_manifest_for_architecture(proto, publisher, name, version, uid, gid, None)
+}
+
+/// Generate an unsigned manifest for a portable or architecture-specific package.
+pub fn generate_manifest_for_architecture(
+    proto: &Path,
+    publisher: &str,
+    name: &str,
+    version: &str,
+    uid: u32,
+    gid: u32,
+    architecture: Option<&str>,
+) -> Result<String> {
     validate_name(name)?;
     validate_publisher(publisher)?;
     ensure!(uid != u32::MAX && gid != u32::MAX, "invalid owner");
@@ -37,6 +50,7 @@ pub fn generate_manifest(
         publisher: publisher.to_owned(),
         name: name.to_owned(),
         version: version.parse()?,
+        architecture: architecture.map(str::to_owned),
         dependency: Vec::new(),
         action: Vec::new(),
         systemd: Vec::new(),

@@ -175,6 +175,191 @@ fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
 }
 
 #[test]
+fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    let payload = "usr/lib/runtime";
+    let publish_runtime =
+        |fixture: &Fixture, publisher: &str, arch: &str, version: &str| -> Result<()> {
+            fixture.file(payload, arch, "0644", "")?;
+            let manifest = crate::generate_manifest_for_architecture(
+                &fixture.proto,
+                publisher,
+                "library/runtime",
+                version,
+                geteuid().as_raw(),
+                getegid().as_raw(),
+                Some(arch),
+            )?;
+            fs::write(&fixture.recipe, manifest)?;
+            publish(
+                &fixture.repo,
+                &fixture.proto,
+                &fixture.recipe,
+                &fixture.private,
+            )?;
+            Ok(())
+        };
+    publish_runtime(&f, "canopa", "x86_64", "2.0.0-0")?;
+    publish_runtime(&seed, "seed", "aarch64", "1.0.0-0")?;
+    f.package(
+        "desktop/session",
+        "1.0.0-0",
+        "    require \"library/runtime\"\n".to_owned(),
+    )?;
+    let base = fs::read_to_string(f.repo.join("current"))?;
+    let seed_pin = fs::read_to_string(seed.repo.join("current"))?;
+    let profile = |arch, root| {
+        format!(
+            r#"    profile "{arch}" architecture="{arch}" {{
+        package "{root}"
+        publisher "seed" catalog={:?} {{
+            repository {:?}
+            trust-key {:?}
+        }}
+    }}
+"#,
+            seed_pin.trim(),
+            seed.repo,
+            seed.public
+        )
+    };
+    let publish_profiles = |arm_root| -> Result<String> {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"unused.der\"\n{}{}\n}}\n",
+                profile("x86_64", "desktop/session"),
+                profile("aarch64", arm_root),
+            ),
+        )?;
+        let release = f._dir.path().join("release.kdl");
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                base.trim(),
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)
+    };
+    let error = publish_profiles("library/runtime").unwrap_err();
+    assert!(format!("{error:#}").contains("profile package library/runtime is unavailable"));
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, base);
+    let release = publish_profiles("desktop/session")?;
+
+    let expires = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let mirror = |fixture: &Fixture, publisher| -> Result<(PathBuf, Url, Url)> {
+        let root = fixture._dir.path().join("root.json");
+        let key = fixture._dir.path().join("tuf.der");
+        let mirror = fixture._dir.path().join("mirror");
+        sign_root(&root, &key, None)?;
+        sign_publisher_release(fixture, &mirror, 1, expires, &root, &key, publisher)?;
+        Ok((
+            root,
+            Url::from_directory_path(mirror.join("metadata")).unwrap(),
+            Url::from_directory_path(mirror.join("targets")).unwrap(),
+        ))
+    };
+    let (root, metadata, targets) = mirror(&f, "canopa")?;
+    let (seed_root, seed_metadata, seed_targets) = mirror(&seed, "seed")?;
+    for (arch, expected, incompatible) in [
+        (
+            "x86_64",
+            "cps://canopa/library/runtime@2.0.0-0",
+            "cps://seed/library/runtime",
+        ),
+        (
+            "aarch64",
+            "cps://seed/library/runtime@1.0.0-0",
+            "cps://canopa/library/runtime",
+        ),
+    ] {
+        let work = f._dir.path().join(arch);
+        fs::create_dir(&work)?;
+        let config = work.join("image.kdl");
+        fs::write(
+            &config,
+            format!(
+                r#"schema-version 1
+architecture "{arch}"
+release-profile "{arch}"
+publisher "canopa" {{ repository "canopa"; trust-key {:?}; }}
+publisher "seed" {{ repository "seed"; trust-key {:?}; }}
+mirror "canopa" root={root:?} metadata="{metadata}" targets="{targets}"
+mirror "seed" root={seed_root:?} metadata="{seed_metadata}" targets="{seed_targets}"
+"#,
+                f.public, seed.public,
+            ),
+        )?;
+        assert_eq!(mirror_release::sync_profile(&config, true)?, release);
+        let image = work.join("image");
+        create_configured_image(&image, &config)?;
+        let available = list_packages(&image, Scope::AllAvailableVersions)?;
+        let matches = available
+            .iter()
+            .filter(|row| row.name == "library/runtime")
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(matches, [expected]);
+        assert!(package_manifest(&image, incompatible, true).is_err());
+        let manifest = parse_manifest(&package_manifest(&image, expected, true)?)?;
+        assert_eq!(manifest.architecture.as_deref(), Some(arch));
+        assert!(
+            plan(
+                &image,
+                Request::Install {
+                    packages: vec![incompatible.to_owned()]
+                }
+            )
+            .is_err()
+        );
+        let install = plan(&image, Request::InstallProfile)?;
+        fetch_plan(&image, &install)?;
+        apply(&image, &install)?;
+        assert_eq!(fs::read_to_string(image.join(payload))?, arch);
+        assert!(verify(&image)?.iter().all(|finding| !finding.is_error));
+    }
+    Ok(())
+}
+
+#[test]
+fn bundle_cannot_claim_a_different_architecture_than_its_build() -> Result<()> {
+    let f = Fixture::new()?;
+    let action = f.file(COMPOSITOR, "different target", "0755", "")?;
+    fs::write(
+        &f.recipe,
+        format!(
+            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" architecture=\"aarch64\" {{\n{action}}}\n"
+        ),
+    )?;
+    publish(&f.repo, &f.proto, &f.recipe, &f.private)?;
+    let catalog = fs::read_to_string(f.repo.join("current"))?;
+    let builder = Fixture::new()?;
+    let error = attach_evidence(&f, catalog.trim(), &builder).unwrap_err();
+    assert!(format!("{error:#}").contains("targets architecture aarch64, expected x86_64"));
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, catalog);
+    let release = snapshot(
+        &f.repo,
+        "canopa",
+        &read_key(&f.public)?,
+        Some(catalog.trim()),
+    )?;
+    let package = &release.packages[0];
+    let published = FileDigest {
+        sha256: package.sha256.clone(),
+        size: fs::metadata(f.repo.join("manifests").join(&package.sha256))?.len(),
+    };
+    let trust = attestation::BuildTrust::load(1, std::slice::from_ref(&builder.public))?;
+    let envelope = fs::read(f._dir.path().join("bundle/attestation.json"))?;
+    let error = trust
+        .verify(&envelope, &package.manifest, published)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("targets architecture aarch64, expected x86_64"));
+    Ok(())
+}
+
+#[test]
 fn release_profiles_pin_latest_roots_and_use_image_facets() -> Result<()> {
     let f = Fixture::new()?;
     f.package(

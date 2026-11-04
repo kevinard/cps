@@ -16,7 +16,7 @@ use cps::{
     add_publisher_with_build_trust, apply, audit_publisher_builds, build_with_toolchain_config,
     build_with_worker, create_configured_image, create_image, deploy_and_activate_boot_environment,
     deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
-    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
+    fetch_sources, fetch_sources_with_local, generate_manifest_for_architecture, import_sources,
     list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
     list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
     publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
@@ -218,6 +218,8 @@ enum ManifestCommand {
         publisher: String,
         #[arg(long)]
         version: String,
+        #[arg(long)]
+        architecture: Option<String>,
         #[arg(long, default_value_t = 0)]
         uid: u32,
         #[arg(long, default_value_t = 0)]
@@ -714,11 +716,20 @@ fn run(command: Command) -> Result<ExitCode> {
                 proto,
                 publisher,
                 version,
+                architecture,
                 uid,
                 gid,
                 name,
             } => {
-                let text = generate_manifest(&proto, &publisher, &name, &version, uid, gid)?;
+                let text = generate_manifest_for_architecture(
+                    &proto,
+                    &publisher,
+                    &name,
+                    &version,
+                    uid,
+                    gid,
+                    architecture.as_deref(),
+                )?;
                 std::io::stdout().lock().write_all(text.as_bytes())?;
             }
         },

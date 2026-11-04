@@ -89,6 +89,7 @@ pub(crate) fn select_paths(
     let mut sizes = BTreeMap::new();
     let mut config_names = BTreeMap::new();
     for (name, package) in installed {
+        package.published.manifest.check_architecture(arch)?;
         let publisher = &package.published.manifest.publisher;
         let mut selected = BTreeSet::new();
         for action in &package.published.manifest.action {

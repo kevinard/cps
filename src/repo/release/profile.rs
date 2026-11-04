@@ -176,13 +176,16 @@ fn check_composition(
             .transpose()?;
         candidates.add_obsoletions(&mut origins, source.publisher, &catalog.obsoletions);
         // A publisher claims a name even when its versions miss the locked digest.
-        for (id, hash) in catalog.entries {
+        for (id, entry) in catalog.entries {
             let spec = PackageSpec::parse(&id)?;
             let Some(expected) = profile.composition.get(spec.name) else {
                 continue;
             };
-            if claim_source(&mut origins, source.publisher, spec.name) && &hash == expected {
-                let package = read_package(repo, source.publisher, &id, hash)?;
+            if entry.supports_architecture(&profile.architecture)
+                && claim_source(&mut origins, source.publisher, spec.name)
+                && entry.manifest_digest() == expected
+            {
+                let package = read_package(repo, source.publisher, &id, &entry)?;
                 if let Some(evidence) = &evidence {
                     evidence.verify_policies(repo, &package, signed, local.as_ref())?;
                 }

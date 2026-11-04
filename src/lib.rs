@@ -28,7 +28,7 @@ pub use build::{
     build_package, build_with_toolchain_config, build_with_worker,
     sources::{fetch_sources, fetch_sources_with_local, import_sources},
 };
-pub use generate::generate_manifest;
+pub use generate::{generate_manifest, generate_manifest_for_architecture};
 pub use image::publishers::{
     PublisherInfo, add_publisher, add_publisher_with_build_trust, audit_publisher_builds,
     list_publishers, prefer_publisher, remove_publisher, set_publisher_build_trust,

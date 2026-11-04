@@ -541,6 +541,8 @@ pub struct Manifest {
     pub publisher: String,
     pub name: String,
     pub version: Version,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
     #[serde(default)]
     pub dependency: Vec<Dependency>,
     #[serde(default)]
@@ -552,6 +554,23 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub(crate) fn supports_architecture(&self, architecture: &str) -> bool {
+        self.architecture
+            .as_deref()
+            .is_none_or(|target| target == architecture)
+    }
+
+    pub(crate) fn check_architecture(&self, architecture: &str) -> Result<()> {
+        if let Some(target) = &self.architecture {
+            ensure!(
+                target == architecture,
+                "{} targets architecture {target}, expected {architecture}",
+                self.id()
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_payloads(
         mut self,
         artifacts: &BTreeMap<String, FileDigest>,
@@ -594,6 +613,9 @@ impl Manifest {
         );
         validate_publisher(&self.publisher)?;
         validate_name(&self.name)?;
+        if let Some(architecture) = &self.architecture {
+            validate_publisher(architecture).context("invalid package architecture")?;
+        }
         for dependency in &self.dependency {
             dependency.validate()?;
         }
@@ -602,6 +624,15 @@ impl Manifest {
             action
                 .validate(published)
                 .with_context(|| format!("action {}", action.path()))?;
+            if let (Some(architecture), (_, Some(target))) =
+                (&self.architecture, action.selectors())
+            {
+                ensure!(
+                    architecture == target,
+                    "action {} targets {target}, but its package targets {architecture}",
+                    action.path()
+                );
+            }
             if actions
                 .insert((action.path(), action.selectors()), action)
                 .is_some()

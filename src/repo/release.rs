@@ -25,9 +25,9 @@ use crate::{
 };
 
 use super::{
-    CATALOG_LIMIT, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot, catalog_snapshot,
-    load_manifest, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
-    read_current, read_key, read_limited, read_pointer, write_atomic,
+    CATALOG_LIMIT, CatalogEntry, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot,
+    catalog_snapshot, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
+    read_current, read_key, read_limited, read_package, read_pointer, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -568,19 +568,22 @@ async fn cache_objects(
     verified: &Repository,
     repo: &Path,
     publisher: &str,
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, CatalogEntry>,
     attestations: BTreeSet<String>,
     full: bool,
 ) -> Result<()> {
     let mut packages = Vec::with_capacity(entries.len());
-    for (id, sha256) in entries {
-        fetch_object(verified, repo, "manifests", &sha256, MANIFEST_LIMIT, None).await?;
-        let package = load_manifest(repo, sha256)?;
-        ensure!(
-            package.manifest.id() == id && package.manifest.publisher == publisher,
-            "manifest identity mismatch for {id}"
-        );
-        packages.push(package);
+    for (id, entry) in entries {
+        fetch_object(
+            verified,
+            repo,
+            "manifests",
+            entry.manifest_digest(),
+            MANIFEST_LIMIT,
+            None,
+        )
+        .await?;
+        packages.push(read_package(repo, publisher, &id, &entry)?);
     }
     for (sha256, length) in release_blobs(&packages)? {
         if full {

@@ -39,7 +39,7 @@ pub mod release;
 struct Catalog {
     format: u32,
     publisher: String,
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, CatalogEntry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     attestations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -108,11 +108,17 @@ impl ReleaseProfile {
         for (root, version) in &self.roots {
             validate_name(root)?;
             let id = format!("cps://{}/{root}@{version}", catalog.publisher);
-            let manifest = catalog.entries.get(&id).with_context(|| {
+            let entry = catalog.entries.get(&id).with_context(|| {
                 format!("signed profile {name} references unavailable root {root}@{version}")
             })?;
             ensure!(
-                self.composition.is_empty() || self.composition.get(root) == Some(manifest),
+                entry.supports_architecture(&self.architecture),
+                "signed profile {name} has an incompatible architecture for root {root}@{version}"
+            );
+            ensure!(
+                self.composition.is_empty()
+                    || self.composition.get(root).map(String::as_str)
+                        == Some(entry.manifest_digest()),
                 "signed profile {name} has a different manifest for root {root}@{version}"
             );
         }
@@ -202,9 +208,9 @@ impl Catalog {
         }
     }
 
-    fn package_record(&self, id: &str) -> Option<(&str, Option<&str>)> {
-        if let Some(hash) = self.entries.get(id) {
-            Some((hash, self.attestations.get(id).map(String::as_str)))
+    fn package_record(&self, id: &str) -> Option<(&CatalogEntry, Option<&str>)> {
+        if let Some(entry) = self.entries.get(id) {
+            Some((entry, self.attestations.get(id).map(String::as_str)))
         } else {
             let withdrawn = self.withdrawals.get(id)?;
             Some((&withdrawn.manifest, withdrawn.attestation.as_deref()))
@@ -467,9 +473,56 @@ impl Catalog {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum CatalogEntry {
+    Portable(String),
+    Targeted {
+        manifest: String,
+        architecture: String,
+    },
+}
+
+impl CatalogEntry {
+    pub(crate) fn manifest_digest(&self) -> &str {
+        match self {
+            Self::Portable(manifest) | Self::Targeted { manifest, .. } => manifest,
+        }
+    }
+
+    fn architecture(&self) -> Option<&str> {
+        match self {
+            Self::Portable(_) => None,
+            Self::Targeted { architecture, .. } => Some(architecture),
+        }
+    }
+
+    pub(crate) fn supports_architecture(&self, architecture: &str) -> bool {
+        self.architecture()
+            .is_none_or(|target| target == architecture)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_digest(self.manifest_digest())?;
+        if let Some(architecture) = self.architecture() {
+            validate_publisher(architecture).context("invalid catalog package architecture")?;
+        }
+        Ok(())
+    }
+
+    fn check_architecture(&self, manifest: &Manifest) -> Result<()> {
+        ensure!(
+            self.architecture() == manifest.architecture.as_deref(),
+            "catalog architecture differs from the manifest for {}",
+            manifest.id()
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Withdrawal {
-    manifest: String,
+    manifest: CatalogEntry,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attestation: Option<String>,
 }
@@ -745,13 +798,14 @@ pub(crate) fn audit_installed_builds<'a>(
         let id = package.manifest.id();
         let installed_record = || {
             package.verify()?;
-            let (manifest, attestation) = catalog
+            let (entry, attestation) = catalog
                 .package_record(&id)
                 .context("package is absent from the signed catalog")?;
             ensure!(
-                manifest == package.sha256,
+                entry.manifest_digest() == package.sha256,
                 "installed manifest digest differs from the signed catalog"
             );
+            entry.check_architecture(&package.manifest)?;
             attestation.with_context(|| format!("no build attestation for {id}"))
         };
         let result = installed_record()
@@ -912,7 +966,7 @@ fn decode_catalog(
             );
         }
     }
-    for (id, manifest) in &catalog.entries {
+    for (id, entry) in &catalog.entries {
         let spec = PackageSpec::parse(id)?;
         let version = spec
             .version
@@ -928,7 +982,7 @@ fn decode_catalog(
                 .is_none_or(|cutoff| version > *cutoff),
             "catalog advertises obsolete package {id}"
         );
-        validate_digest(manifest)?;
+        entry.validate()?;
     }
     for (name, cutoff) in &catalog.obsoletions {
         validate_name(name)?;
@@ -960,7 +1014,7 @@ fn decode_catalog(
             exact_publisher(id)? == publisher && !catalog.entries.contains_key(id),
             "invalid withdrawal for {id}"
         );
-        validate_digest(&withdrawal.manifest)?;
+        withdrawal.manifest.validate()?;
         if let Some(digest) = &withdrawal.attestation {
             validate_digest(digest)?;
             ensure!(
@@ -1003,8 +1057,8 @@ fn catalog_snapshot(
 ) -> Result<Snapshot> {
     let builds = catalog.take_build_evidence(&hash, key)?;
     let mut packages = Vec::with_capacity(catalog.entries.len());
-    for (id, sha256) in catalog.entries {
-        packages.push(read_package(repo, &catalog.publisher, &id, sha256)?);
+    for (id, entry) in catalog.entries {
+        packages.push(read_package(repo, &catalog.publisher, &id, &entry)?);
     }
     Ok(Snapshot {
         sha256: hash,
@@ -1016,7 +1070,7 @@ fn catalog_snapshot(
 }
 
 pub(crate) struct CatalogIndex {
-    pub entries: BTreeMap<String, String>,
+    pub entries: BTreeMap<String, CatalogEntry>,
     pub obsoletions: BTreeMap<String, Version>,
     pub checkpoint: CatalogCheckpoint,
 }
@@ -1112,13 +1166,14 @@ pub(crate) fn read_package(
     repo: &Path,
     publisher: &str,
     id: &str,
-    sha256: String,
+    entry: &CatalogEntry,
 ) -> Result<Published> {
-    let package = load_manifest(repo, sha256)?;
+    let package = load_manifest(repo, entry.manifest_digest().to_owned())?;
     ensure!(
         package.manifest.id() == id && package.manifest.publisher == publisher,
         "manifest identity mismatch for {id}"
     );
+    entry.check_architecture(&package.manifest)?;
     Ok(package)
 }
 
@@ -1272,7 +1327,7 @@ pub fn list_withdrawals(
     Ok(catalog
         .withdrawals
         .into_iter()
-        .map(|(id, withdrawal)| (id, withdrawal.manifest))
+        .map(|(id, withdrawal)| (id, withdrawal.manifest.manifest_digest().to_owned()))
         .collect())
 }
 
@@ -1564,26 +1619,33 @@ fn stage_manifest(
         .collect::<Result<_>>()?;
     let manifest = manifest.with_payloads(&artifacts)?;
     let unchanged_manifest = if let Some(existing) = catalog.entries.get(&id) {
-        let previous = load_manifest(repo, existing.clone())?;
+        let previous = read_package(repo, &catalog.publisher, &id, existing)?;
         ensure!(
             previous.manifest == manifest,
             "{id} was already published with different content"
         );
         true
     } else {
-        let manifest = manifest_text(&manifest);
+        let document = manifest_text(&manifest);
         ensure!(
-            manifest.len() as u64 <= MANIFEST_LIMIT,
+            document.len() as u64 <= MANIFEST_LIMIT,
             "manifest exceeds {MANIFEST_LIMIT} bytes"
         );
-        let sha256 = store(repo, "manifests", manifest.as_bytes())?;
-        catalog.entries.insert(id.clone(), sha256);
+        let sha256 = store(repo, "manifests", document.as_bytes())?;
+        let entry = match manifest.architecture {
+            Some(architecture) => CatalogEntry::Targeted {
+                manifest: sha256,
+                architecture,
+            },
+            None => CatalogEntry::Portable(sha256),
+        };
+        catalog.entries.insert(id.clone(), entry);
         false
     };
     if let Some(evidence) = evidence {
         if let Some(manifest) = &evidence.published_manifest {
             ensure!(
-                catalog.entries[&id] == manifest.sha256,
+                catalog.entries[&id].manifest_digest() == manifest.sha256,
                 "build attestation names a different published manifest for {id}"
             );
         }
@@ -1912,7 +1974,7 @@ mod tests {
         let base = digest(b"base catalog");
         let active = "cps://canopa/desktop@2.0.0-0".to_owned();
         let withdrawn = "cps://canopa/desktop@1.0.0-0".to_owned();
-        let manifest = digest(b"active manifest");
+        let manifest = CatalogEntry::Portable(digest(b"active manifest"));
         let attestation = digest(b"build evidence");
         let previous = Catalog {
             format: FORMAT,
@@ -1923,7 +1985,7 @@ mod tests {
             withdrawals: BTreeMap::from([(
                 withdrawn.clone(),
                 Withdrawal {
-                    manifest: digest(b"withdrawn manifest"),
+                    manifest: CatalogEntry::Portable(digest(b"withdrawn manifest")),
                     attestation: None,
                 },
             )]),

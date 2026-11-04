@@ -139,7 +139,7 @@ add_file() {
 
 shell=$(command -v bash)
 {
-    printf 'schema-version 1\npackage "build/shell" publisher="canopa" version="1.0.0-0" {\n'
+    printf 'schema-version 1\npackage "build/shell" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
     add_file "$shell" bin/sh
     interpreter=$(readelf -l "$shell" | sed -n 's/^.*Requesting program interpreter: \([^]]*\)].*$/\1/p')
     test -n "$interpreter"
@@ -152,7 +152,7 @@ shell=$(command -v bash)
 "$cps" publish --repo repo --proto proto --signing-key signing.der shell.kdl
 
 {
-    printf 'schema-version 1\npackage "build/probe" publisher="canopa" version="1.0.0-0" {\n'
+    printf 'schema-version 1\npackage "build/probe" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
     printf '    require "build/shell" version="=1.0.0-0"\n'
     install -D -m755 probe proto/usr/bin/probe
     printf '    file "usr/bin/probe" mode="0755" uid=0 gid=0 capabilities="cap_net_raw=ep"\n'
@@ -171,7 +171,7 @@ printf 'hello from pinned input\n' > sources/input
 printf 'outside\n' > host-only
 cat > manifest.kdl <<MANIFEST
 schema-version 1
-package "demo/hello" publisher="canopa" version="1.0.0-0" {
+package "demo/hello" publisher="canopa" version="1.0.0-0" architecture="$arch" {
     file "hello" mode="0644" uid=$uid gid=$gid
     hardlink "hello-alias" target="hello"
 }
@@ -213,6 +213,18 @@ export CPS_TEST_SECRET=should-be-cleared
 build_package() {
     "$cps" build --repo repo --publisher canopa --trust-key public.der "$@"
 }
+other_arch=aarch64
+if [[ $arch == aarch64 ]]; then other_arch=x86_64; fi
+mv manifest.kdl native-manifest.kdl
+sed "s/architecture=\"$arch\"/architecture=\"$other_arch\"/" native-manifest.kdl > manifest.kdl
+recipe '    exit 99' > wrong-architecture.kdl
+if build_package --sources sources --output wrong-architecture wrong-architecture.kdl > wrong-architecture.log 2>&1; then
+    echo 'Build accepted a manifest for a different architecture' >&2
+    exit 1
+fi
+grep -F "targets architecture $other_arch, expected $arch" wrong-architecture.log
+test ! -e wrong-architecture
+mv native-manifest.kdl manifest.kdl
 "$cps" source import --from sources --cache cache build.kdl
 "$cps" source fetch --cache cache build.kdl
 build_package --source-cache cache --builder-signing-key builder.der --check-reproducible --output first build.kdl
@@ -498,7 +510,7 @@ assert set(statement['predicate']['toolchain']['package_manifests']) == {'build/
 subjects = {subject['name']: subject for subject in statement['subject']}
 assert set(subjects) == {'manifest.kdl', 'published-manifest.kdl', 'proto/hello'}
 catalog = json.loads((Path('release/catalogs') / Path('release/current').read_text().strip()).read_bytes())
-manifest_hash = catalog['catalog']['entries']['cps://canopa/demo/hello@1.0.0-0']
+manifest_hash = catalog['catalog']['entries']['cps://canopa/demo/hello@1.0.0-0']['manifest']
 manifest = (Path('release/manifests') / manifest_hash).read_bytes()
 published = subjects['published-manifest.kdl']
 assert published['digest']['sha256'] == manifest_hash == hashlib.sha256(manifest).hexdigest()
@@ -609,10 +621,15 @@ def rewritten_repo(name, rewrite):
     (repo / 'current').write_text(updated + '\n')
 
 def change_mode(repo, catalog):
-    original = (repo / 'manifests' / catalog['entries'][package]).read_bytes()
+    entry = catalog['entries'][package]
+    original = (repo / 'manifests' / entry['manifest']).read_bytes()
     changed = original.replace(b'mode="0644"', b'mode="0755"')
     assert changed != original
-    catalog['entries'][package] = store(repo / 'manifests', changed)
+    entry['manifest'] = store(repo / 'manifests', changed)
+
+def change_architecture(repo, catalog):
+    entry = catalog['entries'][package]
+    entry['architecture'] = 'aarch64' if entry['architecture'] == 'x86_64' else 'x86_64'
 
 def repeat_signature(repo, catalog):
     evidence = json.loads((repo / 'attestations' / catalog['attestations'][package]).read_bytes())
@@ -620,11 +637,15 @@ def repeat_signature(repo, catalog):
     catalog['attestations'][package] = store(repo / 'attestations', encode(evidence))
 
 rewritten_repo('changed-mode', change_mode)
+rewritten_repo('changed-architecture', change_architecture)
 rewritten_repo('repeated-signature', repeat_signature)
 PYTHON
 protected_image changed-mode changed-mode-image
 expect_failure 'build attestation does not cover the exact published manifest' \
     "$cps" plan --root changed-mode-image --output rejected.json install demo/hello
+protected_image changed-architecture changed-architecture-image
+expect_failure 'catalog architecture differs from the manifest' \
+    "$cps" plan --root changed-architecture-image --output rejected.json install demo/hello
 protected_image repeated-signature repeated-signature-image
 expect_failure 'requires 2 trusted builder signatures, found 1' \
     "$cps" plan --root repeated-signature-image --output rejected.json install demo/hello
@@ -686,7 +707,7 @@ rotated_catalog=$(cat witnessed/current)
 printf 'hello from pinned input\n' > sources/input
 cat > manifest.kdl <<MANIFEST
 schema-version 1
-package "demo/hello" publisher="canopa" version="2.0.0-0" {
+package "demo/hello" publisher="canopa" version="2.0.0-0" architecture="$arch" {
     require "library/platform" version="=1.0.0-0"
     file "hello" mode="0644" uid=$uid gid=$gid
     hardlink "hello-alias" target="hello"

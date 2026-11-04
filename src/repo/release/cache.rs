@@ -135,8 +135,8 @@ pub fn prune_payloads(
     for hash in catalogs {
         let catalog = read_catalog(&repo, &hash, publisher, &key)
             .with_context(|| format!("reading kept catalog {hash}"))?;
-        for (id, manifest) in catalog.entries {
-            let package = read_package(&repo, publisher, &id, manifest)?;
+        for (id, entry) in catalog.entries {
+            let package = read_package(&repo, publisher, &id, &entry)?;
             live.extend(release_blobs([&package])?.into_keys().map(str::to_owned));
         }
     }

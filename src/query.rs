@@ -11,8 +11,8 @@ use anyhow::{Context, Result, ensure};
 use crate::{
     image::{Image, Installed, Publisher, Publishers, Settings},
     kdl_format::manifest_text,
-    model::{PackageSpec, Version, validate_digest},
-    repo::{CatalogPin, catalog_index, read_package},
+    model::{PackageSpec, Version},
+    repo::{CatalogEntry, CatalogPin, catalog_index, read_package},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,22 +46,25 @@ pub struct PackageRow {
     pub status: Status,
 }
 
-struct CatalogEntry {
+struct AvailablePackage {
     id: String,
     name: String,
     version: Version,
-    sha256: String,
+    entry: CatalogEntry,
 }
 
 fn available(
     settings: &Settings,
     publisher: &Publisher,
     pin: Option<&CatalogPin>,
-) -> Result<(Vec<CatalogEntry>, BTreeMap<String, Version>)> {
+) -> Result<(Vec<AvailablePackage>, BTreeMap<String, Version>)> {
     let index = catalog_index(&publisher.repo, &publisher.name, &publisher.key, pin)?;
     settings.check_catalog(&publisher.name, &index.checkpoint)?;
     let mut entries = Vec::new();
-    for (id, sha256) in index.entries {
+    for (id, entry) in index.entries {
+        if !entry.supports_architecture(&settings.arch) {
+            continue;
+        }
         let selector =
             PackageSpec::parse(&id).with_context(|| format!("invalid catalog ID {id}"))?;
         ensure!(
@@ -71,12 +74,11 @@ fn available(
         let version = selector
             .version
             .with_context(|| format!("catalog entry {id} has no version"))?;
-        validate_digest(&sha256)?;
-        entries.push(CatalogEntry {
+        entries.push(AvailablePackage {
             name: selector.name.to_owned(),
             id,
             version,
-            sha256,
+            entry,
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| b.version.cmp(&a.version)));
@@ -142,7 +144,7 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
         .map(|entry| {
             let status = installed
                 .get(&entry.name)
-                .filter(|package| package.published.sha256 == entry.sha256)
+                .filter(|package| package.published.sha256 == entry.entry.manifest_digest())
                 .map_or(Status::Available, status);
             PackageRow {
                 id: entry.id,
@@ -208,7 +210,7 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
                         )
                     })?;
                 let package =
-                    read_package(&publisher.repo, &publisher.name, &entry.id, entry.sha256)?;
+                    read_package(&publisher.repo, &publisher.name, &entry.id, &entry.entry)?;
                 return Ok(manifest_text(&package.manifest));
             }
         }
