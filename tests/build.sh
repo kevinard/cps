@@ -34,6 +34,7 @@ cat > probe.c <<'C'
 #include <sys/syscall.h>
 #include <sys/resource.h>
 #include <sys/utsname.h>
+#include <sys/xattr.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -121,6 +122,8 @@ int main(int argc, char **argv) {
     assert(open("/sources/input", O_WRONLY) < 0);
     assert(chmod("/sources/input", 0644) < 0 && errno == EROFS);
     assert(chmod("/bin/sh", 0755) < 0 && errno == EROFS);
+    assert(getxattr("/usr/bin/probe", "security.capability", NULL, 0) < 0 &&
+           (errno == ENODATA || errno == ENOTSUP));
     puts("sandbox isolation verified");
 }
 C
@@ -151,7 +154,8 @@ shell=$(command -v bash)
 {
     printf 'schema-version 1\npackage "build/probe" publisher="canopa" version="1.0.0-0" {\n'
     printf '    require "build/shell" version="=1.0.0-0"\n'
-    add_file probe usr/bin/probe
+    install -D -m755 probe proto/usr/bin/probe
+    printf '    file "usr/bin/probe" mode="0755" uid=0 gid=0 capabilities="cap_net_raw=ep"\n'
     printf '    hardlink "usr/bin/probe-alias" target="usr/bin/probe"\n'
     printf '}\n'
 } > probe.kdl

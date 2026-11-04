@@ -5,8 +5,8 @@ umask 022
 
 mode=${1:-fallback}
 case $mode in
-    fallback|bless|health-fail|kernel-upgrade|rollback) ;;
-    *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade|rollback]" >&2; exit 2 ;;
+    fallback|bless|health-fail|kernel-upgrade|rollback|capabilities) ;;
+    *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade|rollback|capabilities]" >&2; exit 2 ;;
 esac
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
@@ -39,7 +39,9 @@ for file in "$cps" "$efi" "$kernel" "$code" "$vars"; do
 done
 
 systemd_guest=false
-if [[ $mode == bless || $mode == health-fail || $mode == rollback ]]; then systemd_guest=true; fi
+if [[ $mode == bless || $mode == health-fail || $mode == rollback || $mode == capabilities ]]; then
+    systemd_guest=true
+fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
     trial_kernel=${CPS_VM_TRIAL_KERNEL:?Set CPS_VM_TRIAL_KERNEL to the second kernel}
@@ -138,6 +140,9 @@ fi
 if $systemd_guest; then
     setup_systemd_guest runtime
     copy_runtime_deps runtime proto/usr/bin/cps
+    if [[ $mode == capabilities ]]; then
+        setup_capability_guest runtime "$cps" "$project/tests/file-capabilities-guest.sh"
+    fi
     if [[ $mode == rollback ]]; then
         prepare_fat_modules runtime "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
         touch runtime/etc/cps-vm-assert-extra-publisher
@@ -345,7 +350,7 @@ run_vm serial.log
 check_busybox serial.log
 
 case $mode in
-    bless|rollback) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
+    bless|rollback|capabilities) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
     health-fail) expected=$'CPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: previous' ;;
     fallback|kernel-upgrade) expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous' ;;
 esac
@@ -369,7 +374,7 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
 fi
 mcopy -i disk.raw@@1048576 "::/loader/entries/$base_id.conf" previous.conf
 cmp "esp/loader/entries/$base_id.conf" previous.conf
-if [[ $mode == bless || $mode == rollback ]]; then
+if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
     mcopy -i disk.raw@@1048576 "::/loader/entries/$trial_id.conf" blessed.conf
     cmp "esp/loader/entries/$trial_id+2.conf" blessed.conf
     listing=$(mdir -b -i disk.raw@@1048576 ::/loader/entries)
@@ -378,6 +383,9 @@ if [[ $mode == bless || $mode == rollback ]]; then
         exit 1
     fi
     printf '%s\nVerified systemd-boot blessed %s.conf\n' "$boots" "$trial_id"
+    if [[ $mode == capabilities ]]; then
+        tr -d '\r' < serial.log | grep -Fx 'CPS_VM_CAPABILITIES: verified'
+    fi
     if [[ $mode == rollback ]]; then
         publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'

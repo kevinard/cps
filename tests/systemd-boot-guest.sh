@@ -37,6 +37,54 @@ prepare_fat_modules() {
     done <<< "$dependencies"
 }
 
+setup_capability_guest() {
+    local root=$1 cps=$2 script=$3
+    local data="$root/usr/lib/cps-cap-test"
+    local command binary version flags
+    mkdir -p "$data" cap-proto/bin
+    for command in cp getcap setcap setpriv; do
+        binary=$(command -v "$command")
+        cp -L "$binary" "$root/usr/bin/$command"
+        copy_runtime_deps "$root" "$binary"
+    done
+    cp "$script" "$root/usr/local/libexec/cps-vm-capabilities"
+    env -u LD_LIBRARY_PATH -u LD_PRELOAD cc -O2 -Wall -Wextra -Werror -static -x c \
+        -o cap-proto/bin/raw-probe - <<'C'
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void)
+{
+    if (getuid() != 65534 || geteuid() != 65534)
+        return 1;
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (fd >= 0)
+        return close(fd) != 0;
+    if (errno == EPERM)
+        return 77;
+    perror("raw socket");
+    return 1;
+}
+C
+    openssl genpkey -algorithm ED25519 -outform DER -out cap-private.der
+    openssl pkey -inform DER -in cap-private.der -pubout -outform DER -out "$data/public.der"
+    for version in 1 2; do
+        flags=
+        if [[ $version == 1 ]]; then flags='capabilities="cap_net_raw=ep"'; fi
+        cat > cap.kdl <<MANIFEST
+schema-version 1
+package "test/raw-probe" publisher="captest" version="$version.0.0-0" {
+    file "bin/raw-probe" mode="0755" uid=0 gid=0 $flags
+    hardlink "bin/raw-probe-alias" target="bin/raw-probe"
+}
+MANIFEST
+        "$cps" publish --repo "$data/repo" --proto cap-proto --signing-key cap-private.der cap.kdl
+    done
+}
+
 setup_systemd_guest() {
     local root=$1
     local systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
@@ -135,6 +183,10 @@ if [ -f /etc/cps-vm-assert-extra-publisher ]; then
         publisher=$("$bb" cat /etc/cps-vm-extra-marker)
     fi
     printf 'CPS_VM_PUBLISHER: %s %s\n' "$state" "$publisher"
+fi
+if [ "$state" = trial ] && [ -f /run/cps-vm-counted ] &&
+    [ -f /usr/local/libexec/cps-vm-capabilities ]; then
+    "$bb" sh /usr/local/libexec/cps-vm-capabilities
 fi
 if [ "$state" = previous ]; then
     printf 'CPS_VM_BOOT: previous\n'

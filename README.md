@@ -391,6 +391,12 @@ built in.
 
 For `kernel-upgrade`, provide the original kernel as `CPS_VM_KERNEL` with `CPS_VM_KERNEL_RELEASE`, and the upgrade as `CPS_VM_TRIAL_KERNEL` with `CPS_VM_TRIAL_KERNEL_RELEASE`. Both releases must be distinct, and both kernels need the built-in storage and console support listed above. This scenario also uses `cpio` and the host's `kernel-install` and `90-loaderentry.install` plugin.
 
+The `capabilities` scenario also requires a C compiler with static libc,
+`setpriv`, `getcap`, and `setcap`. It tests a signed capability-bearing
+package inside the disposable guest, including failed preflight without
+`CAP_SETFCAP`, raw socket access as an unprivileged user, repair, cloning,
+and capability removal during an upgrade.
+
 The `rollback` scenario adds another signed publisher after the base environment is activated. The upgrade pulls a dependency from that publisher. After systemd blesses the trial and reboots it as the default, the test runs `boot-env list` and `boot-env rollback` against the ESP. It boots the same VM disk again and checks for the previous kernel and the absence of the added package. Both kernels need VFAT support. To load modules from extracted kernel packages, set `CPS_VM_KERNEL_MODULES_ROOT` and `CPS_VM_TRIAL_MODULES_ROOT` to the roots containing their indexed `lib/modules` trees.
 
 #### Testing a source-built BusyBox
