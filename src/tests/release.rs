@@ -24,8 +24,11 @@ use crate::{
     rotate_publisher_key, withdraw_package,
 };
 
-fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)> {
-    let builder = Fixture::new()?;
+fn attach_evidence(
+    fixture: &Fixture,
+    catalog: &str,
+    builder: &Fixture,
+) -> Result<(String, Vec<u8>)> {
     let bundle = fixture._dir.path().join("bundle");
     fs::create_dir_all(bundle.join("proto/usr/bin"))?;
     let manifest_bytes = fs::read(&fixture.recipe)?;
@@ -37,7 +40,7 @@ fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)
         digest(&manifest_bytes),
     );
     let key = read_key(&fixture.public)?;
-    let release = snapshot(&fixture.repo, "canopa", &key, Some(catalog))?;
+    let release = snapshot(&fixture.repo, &manifest.publisher, &key, Some(catalog))?;
     let payload = fs::read(fixture.proto.join(COMPOSITOR))?;
     let envelope = attestation::sign(
         &read_signing_key(&builder.private)?,
@@ -46,7 +49,7 @@ fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)
         &build::parse(&recipe)?,
         recipe.as_bytes(),
         Toolchain::Legacy(LegacyToolchain {
-            publisher: "canopa".to_owned(),
+            publisher: manifest.publisher.clone(),
             key_sha256: digest(&key),
             catalog_sha256: release.sha256,
             package_manifests: BTreeMap::from([(
@@ -492,7 +495,7 @@ publisher "seed" {{
     let legacy = {
         let image = crate::image::Image::open(&newer_root, false)?;
         crate::plan::build(
-            &image.root,
+            &image,
             image.state()?,
             Request::Update,
             Some(&manual),
@@ -1854,6 +1857,142 @@ fn tuf_obsoletion_removes_only_when_dependencies_allow_and_preserves_history() -
 }
 
 #[test]
+fn signed_build_trust_checks_retained_companion_packages() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    let builder = Fixture::new()?;
+    seed.package_as(
+        "seed",
+        "desktop/compositor",
+        "1.0.0-0",
+        seed.file(COMPOSITOR, "guarded", "0755", "")?,
+    )?;
+    let seed_pointer = seed.repo.join("current");
+    let initial = fs::read_to_string(&seed_pointer)?;
+    let (_, envelope) = attach_evidence(&seed, initial.trim(), &builder)?;
+    let local = "library/local";
+    seed.package_as("seed", local, "1.0.0-0", String::new())?;
+    let pin = fs::read_to_string(seed_pointer)?;
+    let pin = pin.trim();
+    f.package(
+        "desktop/session",
+        "1.0.0-0",
+        "    require \"desktop/compositor\"\n".to_owned(),
+    )?;
+
+    let publish_profile = |build_trust: &str| -> Result<String> {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "builder.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/session"
+        publisher "seed" catalog="{pin}" {{
+            repository {:?}
+            trust-key {:?}
+            {build_trust}
+        }}
+    }}
+}}
+"#,
+                seed.repo, seed.public,
+            ),
+        )?;
+        let release = f._dir.path().join("refresh.kdl");
+        let base = fs::read_to_string(f.repo.join("current"))?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                base.trim(),
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)
+    };
+    let first = publish_profile("")?;
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{
+    repository {:?}
+    trust-key {:?}
+}}
+publisher "seed" {{
+    repository {:?}
+    trust-key {:?}
+}}
+"#,
+            f.repo, f.public, seed.repo, seed.public,
+        ),
+    )?;
+    create_configured_image(&f.root, &config)?;
+    apply(&f.root, &plan(&f.root, Request::InstallProfile)?)?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec![local.to_owned()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+
+    let second = publish_profile(&format!(
+        "build-trust {{ builder-key {:?}; }}",
+        builder.public
+    ))?;
+    assert_ne!(first, second);
+    let error = plan(&f.root, Request::Update).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("checking retained cps://seed/library/local@1.0.0-0")
+            && message.contains("no build attestation"),
+        "{message}",
+    );
+
+    let remove = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec![local.to_owned()],
+        },
+    )?;
+    apply(&f.root, &remove)?;
+    let upgrade = plan(&f.root, Request::Update)?;
+    assert_eq!(upgrade.catalogs["canopa"], second);
+    fetch_plan(&f.root, &upgrade)?;
+    apply(&f.root, &upgrade)?;
+
+    let attestation = seed.repo.join("attestations").join(digest(&envelope));
+    fs::remove_file(&attestation)?;
+    let followup = plan(&f.root, Request::Update)?;
+    fetch_plan(&f.root, &followup)?;
+    apply(&f.root, &followup)?;
+
+    {
+        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        assert_eq!(
+            db.execute("UPDATE build_receipts SET envelope=x'00'", [])?,
+            1
+        );
+    }
+    let error = plan(&f.root, Request::Update).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("reading build attestation"),
+        "{error:#}"
+    );
+    fs::write(&attestation, envelope)?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    fs::remove_file(&attestation)?;
+    plan(&f.root, Request::Update)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "guarded");
+    Ok(())
+}
+
+#[test]
 fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
     let f = Fixture::new()?;
     let work = f._dir.path();
@@ -1905,7 +2044,7 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
         "2.0.0-0",
         f.file(COMPOSITOR, "new", "0755", "")?,
     )?;
-    let (id, envelope) = attach_evidence(&f, &initial)?;
+    let (id, envelope) = attach_evidence(&f, &initial, &Fixture::new()?)?;
     sign_release(&f, &second, 2, fresh, &anchor, &tuf_key)?;
     let blob = digest(b"new");
     let target = second.join("targets").join(format!("{blob}.blobs-{blob}"));
@@ -2054,7 +2193,7 @@ fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()>
         "2.0.0-0",
         f.file(COMPOSITOR, "withdrawn", "0755", "")?,
     )?;
-    let (id, envelope) = attach_evidence(&f, previous.trim())?;
+    let (id, envelope) = attach_evidence(&f, previous.trim(), &Fixture::new()?)?;
     let original = work.join("original");
     let resurrected = work.join("resurrected");
     sign_release(&f, &original, 1, fresh, &anchor, &tuf_key)?;

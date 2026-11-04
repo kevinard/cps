@@ -533,6 +533,13 @@ impl Image {
         self.root.dir(".cps/stage")
     }
 
+    pub(crate) fn archived_build(&self, manifest: &str) -> Result<Option<(BuildReceipt, Vec<u8>)>> {
+        if !builds::exists(&self.db)? {
+            return Ok(None);
+        }
+        builds::read(&self.db, manifest)
+    }
+
     pub fn pending<T: DeserializeOwned>(&self) -> Result<Option<T>> {
         let record = self
             .db

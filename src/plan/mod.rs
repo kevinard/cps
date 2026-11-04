@@ -248,23 +248,17 @@ pub fn plan(path: &Path, request: Request) -> Result<Plan> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
-    Ok(build(
-        &image.root,
-        state,
-        request,
-        None,
-        Some(SolverRevision::SatV1),
-    )?
-    .0)
+    Ok(build(&image, state, request, None, Some(SolverRevision::SatV1))?.0)
 }
 
 pub(crate) fn build(
-    root: &Root,
+    image: &Image,
     mut state: State,
     request: Request,
     saved: Option<&Plan>,
     solver: Option<SolverRevision>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
+    let root = &image.root;
     ensure!(
         state.settings.bootstrap_catalog.is_none() || matches!(request, Request::InstallProfile),
         "install the pinned bootstrap release with plan install-profile first"
@@ -361,7 +355,7 @@ pub(crate) fn build(
                     |installed| effective_paths(&state.settings, installed),
                 )?
             };
-            receipts = catalogs.verify_builds(&state, &installed)?;
+            receipts = catalogs.verify_builds(image, &state, &installed)?;
             (installed, paths)
         }
     };

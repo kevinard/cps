@@ -52,7 +52,7 @@ pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     if image.applied(&plan.id()?)?.is_some() {
         return Ok(0);
     }
-    let (checked, next, _) = check_plan(&image.root, state, plan)?;
+    let (checked, next, _) = check_plan(&image, state, plan)?;
     if checked.config_update_revision.is_some() {
         return Ok(0);
     }
@@ -74,7 +74,11 @@ pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     Ok(count)
 }
 
-fn check_plan(root: &Root, state: State, plan: &Plan) -> Result<(Plan, State, Vec<BuildReceipt>)> {
+fn check_plan(
+    image: &Image,
+    state: State,
+    plan: &Plan,
+) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     ensure!(
         plan.base_revision == state.settings.revision,
         "stale plan for revision {}; image is at revision {}",
@@ -83,7 +87,7 @@ fn check_plan(root: &Root, state: State, plan: &Plan) -> Result<(Plan, State, Ve
     );
     plan.check_publisher_generation(&state.settings)?;
     let (checked, next, receipts) =
-        build(root, state, plan.request.clone(), Some(plan), plan.solver)?;
+        build(image, state, plan.request.clone(), Some(plan), plan.solver)?;
     ensure!(
         &checked == plan,
         "saved plan differs from the verified plan; generate a new plan"
@@ -118,7 +122,7 @@ pub(crate) fn apply_with(
         if let Some(revision) = image.applied(&id)? {
             return Ok(revision);
         }
-        let (checked, next, receipts) = check_plan(&image.root, state, plan)?;
+        let (checked, next, receipts) = check_plan(&image, state, plan)?;
         let offline = offline_target(
             &image.root,
             !checked.systemd.is_empty() || checked.kernel_install.is_some(),

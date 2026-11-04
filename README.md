@@ -492,14 +492,16 @@ build-trust minimum-builders=2 {
 ```
 
 The primary signs the companion's builder keys and threshold with its
-catalog pin. Images following the profile verify that policy when planning
-and applying new or changed companion packages, including packages beyond
-the release's tested composition. Any independently configured image
-policy for that publisher must also pass. Use that local policy to audit
-archived evidence with `publisher audit-builds`. Later catalogs can rotate
-the signed policy and must retain a builder policy for the guarded
-companion in that profile. Upgrade clients before consuming profiles with
-this requirement.
+catalog pin. Images following the profile verify that policy for all
+companion packages selected by an install or update, including unchanged
+packages and packages outside the release's tested composition. For
+unchanged packages, CPS reuses archived evidence that satisfies the signed
+policy or checks the attestation in the pinned catalog. New and changed
+packages must also satisfy any independently configured image policy for
+their publisher. Use that local policy to audit archived evidence with
+`publisher audit-builds`. Later catalogs can rotate the signed policy and
+must retain a builder policy for the guarded companion in that profile.
+Upgrade clients before consuming profiles with this requirement.
 
 ## Signed releases and mirrors
 

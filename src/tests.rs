@@ -1116,7 +1116,7 @@ fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
         let request = Request::Install {
             packages: vec!["desktop/app".into()],
         };
-        crate::plan::build(&image.root, image.state()?, request, None, None)?.0
+        crate::plan::build(&image, image.state()?, request, None, None)?.0
     };
     let saved = serde_json::to_vec(&legacy)?;
     assert!(
@@ -2185,7 +2185,7 @@ fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> 
     };
     let legacy = {
         let image = crate::image::Image::open(&f.root, false)?;
-        crate::plan::build(&image.root, image.state()?, request.clone(), None, None)?.0
+        crate::plan::build(&image, image.state()?, request.clone(), None, None)?.0
     };
     assert!(!legacy.summary().contains("Prune if empty"));
     let removal = plan(&f.root, request)?;

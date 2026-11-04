@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use super::{Plan, SolverRevision, resolve};
 use crate::{
     attestation::BuildTrust,
-    image::{Installed, State},
+    image::{Image, Installed, Publisher, State},
     model::{PackageSpec, Version},
     repo::{BuildEvidence, BuildReceipt, Published, ReleaseProfile, snapshot},
 };
@@ -24,35 +24,67 @@ struct SelectedBuilds {
     profile_trust: Option<BuildTrust>,
 }
 
+impl SelectedBuilds {
+    fn verify_retained(
+        &self,
+        image: &Image,
+        publisher: &Publisher,
+        package: &Published,
+    ) -> Result<Option<BuildReceipt>> {
+        let Some(trust) = &self.profile_trust else {
+            return Ok(None);
+        };
+        self.evidence.check_keys(trust)?;
+        if let Some((receipt, envelope)) = image.archived_build(&package.sha256)?
+            && receipt
+                .verify(&envelope, package, &publisher.key, trust)
+                .is_ok()
+        {
+            return Ok(None);
+        }
+        self.evidence
+            .verify(&publisher.repo, [trust], package)
+            .map(Some)
+            .with_context(|| {
+                format!(
+                    "checking retained {} against signed build trust",
+                    package.manifest.id()
+                )
+            })
+    }
+}
+
 impl Catalogs {
     pub(super) fn verify_builds(
         &self,
+        image: &Image,
         state: &State,
         installed: &BTreeMap<String, Installed>,
     ) -> Result<Vec<BuildReceipt>> {
         let mut receipts = Vec::new();
         for (name, package) in installed {
-            if state
-                .installed
-                .get(name)
-                .is_some_and(|previous| previous.published.sha256 == package.published.sha256)
-            {
-                continue;
-            }
             let publisher = state
                 .publishers
                 .get(&package.published.manifest.publisher)
                 .context("missing publisher for selected package")?;
-            if let Some(builds) = self.builds.get(&publisher.name)
-                && let Some(receipt) = builds.evidence.verify_policies(
+            let Some(builds) = self.builds.get(&publisher.name) else {
+                continue;
+            };
+            let retained = state
+                .installed
+                .get(name)
+                .is_some_and(|previous| previous.published.sha256 == package.published.sha256);
+            let receipt = if retained {
+                builds.verify_retained(image, publisher, &package.published)?
+            } else {
+                builds.evidence.verify_policies(
                     &publisher.repo,
                     &package.published,
                     builds.profile_trust.as_ref(),
                     publisher.build_trust.as_ref(),
                 )?
-            {
-                receipts.push(receipt);
-            }
+            };
+            receipts.extend(receipt);
         }
         Ok(receipts)
     }
