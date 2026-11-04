@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{FileType, readlinkat};
@@ -9,6 +12,12 @@ use crate::{
     model::{Action, FORMAT, Manifest, validate_name, validate_publisher},
     repo::MANIFEST_LIMIT,
 };
+
+struct LinkGroup {
+    target: String,
+    links: usize,
+    seen: usize,
+}
 
 /// Generate an unsigned manifest for review before publishing.
 pub fn generate_manifest(
@@ -32,6 +41,7 @@ pub fn generate_manifest(
         systemd: Vec::new(),
         kernel: None,
     };
+    let mut groups = BTreeMap::new();
     let root = Root::open(proto)?;
     root.walk(None, |path, entry, info| {
         let kind = FileType::from_raw_mode(info.st_mode);
@@ -58,10 +68,33 @@ pub fn generate_manifest(
                 arch: None,
             },
             FileType::RegularFile => {
-                ensure!(
-                    info.st_nlink == 1,
-                    "unsupported hard-linked file at {path:?}"
-                );
+                if info.st_nlink > 1 {
+                    let links = info.st_nlink as usize;
+                    match groups.entry((info.st_dev, info.st_ino)) {
+                        Entry::Vacant(group) => {
+                            group.insert(LinkGroup {
+                                target: path.to_owned(),
+                                links,
+                                seen: 1,
+                            });
+                        }
+                        Entry::Occupied(mut group) => {
+                            let group = group.get_mut();
+                            ensure!(
+                                group.links == links,
+                                "hard link group changed while scanning {path:?}"
+                            );
+                            group.seen += 1;
+                            manifest.action.push(Action::Hardlink {
+                                path: path.to_owned(),
+                                target: group.target.clone(),
+                                facet: None,
+                                arch: None,
+                            });
+                            return Ok(true);
+                        }
+                    }
+                }
                 Action::File {
                     path: path.to_owned(),
                     mode: mode()?,
@@ -74,21 +107,34 @@ pub fn generate_manifest(
                     size: None,
                 }
             }
-            FileType::Symlink => Action::Symlink {
-                path: path.to_owned(),
-                target: readlinkat(entry, "", Vec::new())?
-                    .into_string()
-                    .with_context(|| format!("non-UTF-8 symlink target at {path:?}"))?,
-                uid,
-                gid,
-                facet: None,
-                arch: None,
-            },
+            FileType::Symlink => {
+                ensure!(
+                    info.st_nlink == 1,
+                    "unsupported hard-linked symlink at {path:?}"
+                );
+                Action::Symlink {
+                    path: path.to_owned(),
+                    target: readlinkat(entry, "", Vec::new())?
+                        .into_string()
+                        .with_context(|| format!("non-UTF-8 symlink target at {path:?}"))?,
+                    uid,
+                    gid,
+                    facet: None,
+                    arch: None,
+                }
+            }
             _ => bail!("unsupported filesystem object at {path:?}"),
         };
         manifest.action.push(action);
         Ok(true)
     })?;
+    for group in groups.values() {
+        ensure!(
+            group.seen == group.links,
+            "hard link group for {:?} extends outside the prototype or changed while scanning",
+            group.target
+        );
+    }
     manifest.validate(false)?;
     let text = manifest_text(&manifest);
     ensure!(

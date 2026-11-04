@@ -303,7 +303,7 @@ fn adding_a_hardlink_checks_the_unchanged_target_before_writing() -> Result<()> 
 
 #[test]
 fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()> {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     let f = Fixture::new()?;
     let uid = geteuid().as_raw();
@@ -322,8 +322,15 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o751))?;
         }
         let payload = proto.join("usr/bin/tool #1");
-        fs::write(&payload, "tool payload")?;
-        fs::set_permissions(&payload, fs::Permissions::from_mode(0o755))?;
+        let alias = proto.join("usr/bin/z-tool");
+        let (first, second) = if reverse {
+            (&alias, &payload)
+        } else {
+            (&payload, &alias)
+        };
+        fs::write(first, "tool payload")?;
+        fs::set_permissions(first, fs::Permissions::from_mode(0o755))?;
+        fs::hard_link(first, second)?;
         symlink("tool #1", proto.join("usr/bin/link"))?;
         symlink("/outside-the-prototype", proto.join("external"))?;
         Ok(())
@@ -335,7 +342,12 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
     assert_eq!(manifest, generate(&other)?);
     let parsed = crate::kdl_format::parse_manifest(&manifest)?;
     parsed.validate(false)?;
-    assert_eq!(parsed.action.len(), 7);
+    assert_eq!(parsed.action.len(), 8);
+    assert!(parsed.action.iter().any(|action| matches!(
+        action,
+        crate::model::Action::Hardlink { path, target, .. }
+            if path == "usr/bin/z-tool" && target == "usr/bin/tool #1"
+    )));
 
     fs::write(&f.recipe, manifest)?;
     publish(&f.repo, &f.proto, &f.recipe, &f.private)?;
@@ -347,7 +359,11 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
         },
     )?;
     apply(&f.root, &install)?;
-    assert!(verify(&f.root)?.is_empty());
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
+    assert_eq!(
+        fs::metadata(f.root.join("usr/bin/tool #1"))?.ino(),
+        fs::metadata(f.root.join("usr/bin/z-tool"))?.ino()
+    );
     assert_eq!(
         fs::read_to_string(f.root.join("usr/bin/link"))?,
         "tool payload"
@@ -363,13 +379,13 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
     );
 
     let file = f.proto.join("usr/bin/tool #1");
-    let hardlink = f.proto.join("hardlink");
+    let hardlink = f.proto.with_extension("outside-link");
     fs::hard_link(&file, &hardlink)?;
     assert!(
         generate(&f.proto)
             .unwrap_err()
             .to_string()
-            .contains("hard-linked file")
+            .contains("extends outside the prototype")
     );
     fs::remove_file(hardlink)?;
     fs::set_permissions(&file, fs::Permissions::from_mode(0o4755))?;

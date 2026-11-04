@@ -134,10 +134,10 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
                 return Ok(false);
             };
             let kind = FileType::from_raw_mode(info.st_mode);
-            let links = 1 + aliases.get(path).map_or(0, Vec::len) as u64;
+            let links = 1 + aliases.get(path).map_or(0, Vec::len);
             if kind == FileType::RegularFile
                 && !matches!(managed.node, Node::Hardlink { .. })
-                && info.st_nlink != links
+                && info.st_nlink as usize != links
             {
                 findings.push(Finding {
                     is_error: true,
