@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    iter,
     path::{Path, PathBuf},
 };
 
@@ -11,14 +12,27 @@ use crate::{
     kdl_format::read_build_trust,
     model::validate_publisher,
     repo::{
-        BuildAudit, BuildReceipt, CatalogPin, audit_installed_builds, catalog_index,
-        release_profile,
+        BuildAudit, BuildReceipt, CatalogPin, ReleaseProfile, audit_installed_builds,
+        catalog_index, release_profile,
     },
 };
 
 pub struct PublisherInfo {
     pub name: String,
     pub repository: PathBuf,
+}
+
+pub(crate) struct SelectedProfile {
+    primary: CatalogPin,
+    pub record: ReleaseProfile,
+}
+
+impl SelectedProfile {
+    pub(crate) fn pin(&self, publisher: &str) -> Option<&CatalogPin> {
+        iter::once(&self.primary)
+            .chain(&self.record.companions)
+            .find(|pin| pin.publisher == publisher)
+    }
 }
 
 impl Publishers {
@@ -28,8 +42,23 @@ impl Publishers {
         facets: &BTreeMap<String, bool>,
         primary_pin: Option<&str>,
     ) -> Result<BTreeMap<String, CatalogPin>> {
-        let Some(name) = self.release_profile() else {
+        let Some(selected) = self.select_profile(arch, facets, primary_pin)? else {
             return Ok(BTreeMap::new());
+        };
+        Ok(iter::once(selected.primary)
+            .chain(selected.record.companions)
+            .map(|pin| (pin.publisher.clone(), pin))
+            .collect())
+    }
+
+    pub(crate) fn select_profile(
+        &self,
+        arch: &str,
+        facets: &BTreeMap<String, bool>,
+        primary_pin: Option<&str>,
+    ) -> Result<Option<SelectedProfile>> {
+        let Some(name) = self.release_profile() else {
+            return Ok(None);
         };
         let (primary, companions) = self
             .as_slice()
@@ -53,17 +82,10 @@ impl Publishers {
                 .eq(profile.companions.iter().map(|pin| &pin.publisher)),
             "image publisher order differs from signed release profile {name}"
         );
-        let mut pins = BTreeMap::from([(
-            primary.name.clone(),
-            CatalogPin::primary(primary.name.clone(), hash),
-        )]);
-        pins.extend(
-            profile
-                .companions
-                .into_iter()
-                .map(|pin| (pin.publisher.clone(), pin)),
-        );
-        Ok(pins)
+        Ok(Some(SelectedProfile {
+            primary: CatalogPin::primary(primary.name.clone(), hash),
+            record: profile,
+        }))
     }
 }
 

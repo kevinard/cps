@@ -138,7 +138,7 @@ publisher "runtime" {
 }
 CONFIG
 "$cps" image-create --root image --config image.kdl
-"$cps" plan --root image --output install.json install demo/app
+"$cps" plan --root image --output install.json install-profile
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine
 test -L image/usr/lib/demo/libcps-demo.so.1

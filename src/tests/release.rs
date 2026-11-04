@@ -18,7 +18,7 @@ use crate::{
     list_obsoletions, list_withdrawals,
     model::FileDigest,
     publish_bundle, publish_release,
-    query::{Scope, list_packages, package_manifest},
+    query::{Scope, Status, list_packages, package_manifest},
     read_attestation, release as mirror_release,
     repo::{read_key, read_signing_key, snapshot},
     rotate_publisher_key, withdraw_package,
@@ -218,6 +218,54 @@ fn release_profiles_pin_latest_roots_and_use_image_facets() -> Result<()> {
 }
 
 #[test]
+fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("library/runtime", "1.0.0-0", String::new())?;
+    f.package("library/runtime", "2.0.0-0", String::new())?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        "    require \"library/runtime\"\n".to_owned(),
+    )?;
+    let release = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
+    let version = "1.0.0-0".parse()?;
+    let composition = release
+        .packages
+        .iter()
+        .filter(|package| package.manifest.version == version)
+        .map(|package| (package.manifest.name.clone(), package.sha256.clone()))
+        .collect();
+    let profile = crate::repo::ReleaseProfile {
+        architecture: "x86_64".to_owned(),
+        facets: BTreeMap::new(),
+        companions: Vec::new(),
+        roots: BTreeMap::from([("desktop/compositor".to_owned(), version)]),
+        composition,
+        elf_library_dirs: Vec::new(),
+        elf_symbol_versions: false,
+    };
+    let mut candidates = crate::plan::CandidateSet {
+        packages: release.packages,
+        obsoletions: BTreeMap::new(),
+    };
+    let installed = candidates.replay(&profile)?;
+    let locked = &profile.composition["library/runtime"];
+    assert_eq!(&installed["library/runtime"].published.sha256, locked);
+    candidates
+        .packages
+        .retain(|package| &package.sha256 != locked);
+    let error = candidates.replay(&profile).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("signed profile package library/runtime"),
+        "{error:#}"
+    );
+    f.create()?;
+    let error = plan(&f.root, Request::InstallProfile).unwrap_err();
+    assert!(format!("{error:#}").contains("requires a configured signed release profile"));
+    Ok(())
+}
+
+#[test]
 fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Result<()> {
     let f = Fixture::new()?;
     f.package("library/legacy", "1.0.0-0", String::new())?;
@@ -397,17 +445,19 @@ publisher "seed" {{
         ),
     )?;
     create_configured_image(&f.root, &config)?;
-    apply(
-        &f.root,
-        &plan(
-            &f.root,
-            Request::Install {
-                packages: vec!["desktop/compositor@1.0.0-0".to_owned()],
-            },
-        )?,
-    )?;
+    apply(&f.root, &plan(&f.root, Request::InstallProfile)?)?;
     assert!(f.root.join("opt/pinned-root").is_dir());
     assert!(f.root.join("opt/pinned-companion").is_dir());
+    let installed = list_packages(&f.root, Scope::Installed)?;
+    assert_eq!(installed.len(), 2);
+    assert!(installed.iter().any(|row| {
+        row.id == "cps://canopa/desktop/compositor@1.0.0-0" && row.status == Status::Explicit
+    }));
+    assert!(installed.iter().any(|row| {
+        row.id == "cps://seed/library/runtime@1.0.0-0" && row.status == Status::Dependency
+    }));
+    let error = plan(&f.root, Request::InstallProfile).unwrap_err();
+    assert!(format!("{error:#}").contains("requires an image with no installed packages"));
 
     write_policy("2.0.0-0", &old_pin, &base, "")?;
     rejected(
@@ -631,12 +681,7 @@ publisher "canopa" {{
             .any(|entry| entry.id == "cps://seed/library/runtime@1.0.0-0")
     );
     assert!(package_manifest(&f.root, "cps://seed/library/runtime@2.0.0-0", true).is_err());
-    let saved = plan(
-        &f.root,
-        Request::Install {
-            packages: vec!["desktop/compositor".to_owned()],
-        },
-    )?;
+    let saved = plan(&f.root, Request::InstallProfile)?;
     assert_eq!(saved.catalogs["seed"], old_pin.trim());
     let mut altered = saved.clone();
     altered
@@ -886,12 +931,7 @@ publisher "seed" {{
         ),
     )?;
     create_configured_image(&f.root, &config)?;
-    let saved = plan(
-        &f.root,
-        Request::Install {
-            packages: vec!["desktop/compositor".to_owned()],
-        },
-    )?;
+    let saved = plan(&f.root, Request::InstallProfile)?;
     assert_eq!(saved.catalogs["seed"], previous.trim());
     fetch_plan(&f.root, &saved)?;
     assert_eq!(fs::read(seed_cache.join(&blob))?, b"old");

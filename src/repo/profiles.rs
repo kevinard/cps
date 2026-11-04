@@ -246,8 +246,17 @@ pub(super) fn check(
                     .map(|(name, _)| ((*name).to_owned(), baseline.publisher.as_str()))
                     .collect();
                 let baseline = candidates(baseline, baseline_packages, &companions, true, sources);
-                let (before, old_paths) =
-                    compose(&baseline, profile, roots).context("composing the baseline image")?;
+                let (before, old_paths) = if let Some(historical) =
+                    historical.filter(|profile| !profile.composition.is_empty())
+                {
+                    let installed = baseline
+                        .replay(historical)
+                        .context("replaying the baseline image")?;
+                    let paths = profile_paths(profile, &installed)?;
+                    (installed, paths)
+                } else {
+                    compose(&baseline, profile, roots).context("composing the baseline image")?
+                };
                 let sticky = before
                     .iter()
                     .map(|(name, pkg)| (name.clone(), pkg.published.manifest.publisher.as_str()))
@@ -268,6 +277,10 @@ pub(super) fn check(
                     .packages
                     .keys()
                     .map(|name| (name.clone(), target[name].published.manifest.version))
+                    .collect(),
+                composition: target
+                    .into_iter()
+                    .map(|(name, package)| (name, package.published.sha256))
                     .collect(),
                 companions: companions
                     .into_iter()

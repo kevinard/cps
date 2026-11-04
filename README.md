@@ -383,11 +383,13 @@ catalogs that record this requirement.
 
 Set `upgrade-from="<signed catalog SHA-256>"` on a profile to also test a rolling
 upgrade from that historical catalog. New signed profiles record the exact
-versions of the requested root packages from the checked composition. When the
-baseline has the same named profile, CPS uses its recorded roots and companion
-pins. The architecture, facets, and publisher order must match the baseline
-image configuration. For older catalogs without recorded roots, CPS selects
-the newest baseline versions of the current profile's root package names.
+versions of the requested roots and the manifest digest of every package in
+the checked composition. When the baseline has the same named profile, CPS
+replays its recorded composition using its companion pins. With older
+profiles that record only root versions, it resolves dependencies from
+those roots. The architecture, facets, and publisher order must match the
+baseline image configuration. For catalogs without recorded roots, CPS
+selects the newest baseline versions of the current profile's root names.
 
 CPS runs the ordinary update solver with the resulting installed set. The
 result must reach the candidate profile's requested versions, retain only
@@ -396,7 +398,7 @@ kernel transition checks. This models the package-managed state of a clean
 image. Live filesystem changes and boot health are checked during staging and
 boot. A profile that records its roots retains its image configuration across
 releases. Use a separate profile name for a new configuration. Upgrade clients
-before publishing profiles with recorded roots.
+before publishing profiles with signed compositions.
 
 For a native x86-64 or AArch64 profile, add `elf-check` with the image's
 ordered default library directories.
@@ -710,6 +712,22 @@ first publisher's signed catalog. Configure the same architecture, facets, and
 publisher order as the profile. Each companion repository must have the signed
 catalog referenced by the profile. Publisher changes on a profiled image
 require a new image configuration.
+
+On an image with no installed packages, use the profile's checked roots and
+dependencies directly.
+
+```sh
+cps plan --root image --output install.json install-profile
+cps fetch --root image --plan install.json  # for an index-only mirror cache
+cps apply --root image --plan install.json
+```
+
+CPS checks every manifest digest against the signed composition, then
+checks dependencies, paths, and configured build trust before using the
+normal transaction. It marks the profile roots as explicitly installed.
+Older profiles can still be used with ordinary `plan install`. Use
+`repo publish-release` with `refresh-profiles=#true` to record the
+composition before using `install-profile`.
 
 Available-package queries and new plans use the primary publisher's current
 catalog and the companion digests it signs. Saved plans use their original

@@ -66,10 +66,37 @@ pub(crate) struct ReleaseProfile {
     pub companions: Vec<CatalogPin>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roots: BTreeMap<String, Version>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub composition: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elf_library_dirs: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub elf_symbol_versions: bool,
+}
+
+impl ReleaseProfile {
+    fn validate_composition(&self, name: &str, catalog: &Catalog) -> Result<()> {
+        ensure!(
+            self.composition.is_empty() || !self.roots.is_empty(),
+            "signed profile {name} has a composition without roots"
+        );
+        for (package, manifest) in &self.composition {
+            validate_name(package)?;
+            validate_digest(manifest)?;
+        }
+        for (root, version) in &self.roots {
+            validate_name(root)?;
+            let id = format!("cps://{}/{root}@{version}", catalog.publisher);
+            let manifest = catalog.entries.get(&id).with_context(|| {
+                format!("signed profile {name} references unavailable root {root}@{version}")
+            })?;
+            ensure!(
+                self.composition.is_empty() || self.composition.get(root) == Some(manifest),
+                "signed profile {name} has a different manifest for root {root}@{version}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -337,6 +364,11 @@ impl Catalog {
                     "release changes image configuration for signed profile {name}"
                 );
             }
+            ensure!(
+                profile.composition.is_empty()
+                    || next.is_some_and(|next| !next.composition.is_empty()),
+                "release drops the checked composition for signed profile {name}"
+            );
             for pin in &profile.companions {
                 let candidate = next.and_then(|next| {
                     next.companions
@@ -778,15 +810,7 @@ fn read_catalog_with_key(
         for facet in profile.facets.keys() {
             validate_publisher(facet).context("invalid signed profile facet")?;
         }
-        for (root, version) in &profile.roots {
-            validate_name(root)?;
-            ensure!(
-                catalog
-                    .entries
-                    .contains_key(&format!("cps://{publisher}/{root}@{version}")),
-                "signed profile {name} references unavailable root {root}@{version}"
-            );
-        }
+        profile.validate_composition(name, &catalog)?;
         let mut publishers = BTreeSet::from([publisher]);
         for pin in &profile.companions {
             validate_publisher(&pin.publisher)?;
@@ -1669,6 +1693,7 @@ mod tests {
                 facets: BTreeMap::new(),
                 companions: vec![pin.clone()],
                 roots: BTreeMap::new(),
+                composition: BTreeMap::new(),
                 elf_library_dirs: vec![],
                 elf_symbol_versions: false,
             },
@@ -1766,6 +1791,7 @@ mod tests {
                     facets: BTreeMap::new(),
                     companions: Vec::new(),
                     roots: BTreeMap::new(),
+                    composition: BTreeMap::new(),
                     elf_library_dirs: vec!["/usr/lib".to_owned()],
                     elf_symbol_versions: true,
                 },

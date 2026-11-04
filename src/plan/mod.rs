@@ -40,6 +40,7 @@ pub(crate) enum SolverRevision {
 pub enum Request {
     Install { packages: Vec<String> },
     ExactInstall { packages: Vec<String> },
+    InstallProfile,
     Remove { packages: Vec<String> },
     Repair { packages: Vec<String> },
     ResolveConfig { path: String, take: ConfigChoice },
@@ -288,6 +289,17 @@ pub(crate) fn build(
             (installed, paths)
         }
         _ => {
+            let install_profile = matches!(request, Request::InstallProfile);
+            if install_profile {
+                ensure!(
+                    state.publishers.release_profile().is_some(),
+                    "install-profile requires a configured signed release profile"
+                );
+                ensure!(
+                    state.installed.is_empty(),
+                    "install-profile requires an image with no installed packages"
+                );
+            }
             let requested = match &request {
                 Request::Install { packages } | Request::ExactInstall { packages } => {
                     catalogs::requested(&state, packages)?
@@ -295,18 +307,32 @@ pub(crate) fn build(
                 _ => BTreeMap::new(),
             };
             catalogs = catalogs::load(&state, &requested, saved)?;
-            let (installed, paths) = resolve::resolve(
-                &state.installed,
-                Candidates {
-                    packages: &catalogs.candidates.packages,
-                    obsoletions: &catalogs.candidates.obsoletions,
-                },
-                &requested,
-                matches!(request, Request::Update),
-                matches!(request, Request::ExactInstall { .. }),
-                solver,
-                |installed| effective_paths(&state.settings, installed),
-            )?;
+            let (installed, paths) = if install_profile {
+                let profile = catalogs
+                    .profile
+                    .as_ref()
+                    .context("missing signed release profile")?;
+                ensure!(
+                    !profile.composition.is_empty(),
+                    "signed release profile has no recorded composition"
+                );
+                let installed = catalogs.candidates.replay(profile)?;
+                let paths = effective_paths(&state.settings, &installed)?;
+                (installed, paths)
+            } else {
+                resolve::resolve(
+                    &state.installed,
+                    Candidates {
+                        packages: &catalogs.candidates.packages,
+                        obsoletions: &catalogs.candidates.obsoletions,
+                    },
+                    &requested,
+                    matches!(request, Request::Update),
+                    matches!(request, Request::ExactInstall { .. }),
+                    solver,
+                    |installed| effective_paths(&state.settings, installed),
+                )?
+            };
             receipts = catalogs.verify_builds(&state, &installed)?;
             (installed, paths)
         }

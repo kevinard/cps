@@ -2,12 +2,12 @@ use std::{borrow::Borrow, collections::BTreeMap};
 
 use anyhow::{Context, Result, ensure};
 
-use super::Plan;
+use super::{Plan, resolve};
 use crate::{
     attestation::BuildTrust,
     image::{Installed, State},
     model::{PackageSpec, Version},
-    repo::{BuildEvidence, BuildReceipt, Published, snapshot},
+    repo::{BuildEvidence, BuildReceipt, Published, ReleaseProfile, snapshot},
 };
 
 #[derive(Default)]
@@ -15,6 +15,7 @@ pub(super) struct Catalogs {
     pub legacy: Option<String>,
     pub pins: BTreeMap<String, String>,
     pub candidates: CandidateSet<Published>,
+    pub profile: Option<ReleaseProfile>,
     builds: BTreeMap<String, SelectedBuilds>,
 }
 
@@ -75,6 +76,39 @@ impl<P> Default for CandidateSet<P> {
 }
 
 impl<P: Borrow<Published>> CandidateSet<P> {
+    pub(crate) fn replay(&self, profile: &ReleaseProfile) -> Result<BTreeMap<String, Installed>> {
+        let mut installed = BTreeMap::new();
+        for package in self.packages.iter().map(Borrow::borrow) {
+            let name = &package.manifest.name;
+            if profile.composition.get(name) != Some(&package.sha256) {
+                continue;
+            }
+            ensure!(
+                self.obsoletions
+                    .get(name)
+                    .is_none_or(|cutoff| package.manifest.version > *cutoff),
+                "signed profile package {} is obsolete",
+                package.manifest.id()
+            );
+            let entry = Installed {
+                published: package.clone(),
+                explicit: profile.roots.contains_key(name),
+            };
+            ensure!(
+                installed.insert(name.clone(), entry).is_none(),
+                "duplicate manifest for signed profile package {name}"
+            );
+        }
+        for (name, hash) in &profile.composition {
+            ensure!(
+                installed.contains_key(name),
+                "signed profile package {name} with manifest {hash} is unavailable"
+            );
+        }
+        resolve::check(&installed).context("checking dependencies of the signed composition")?;
+        Ok(installed)
+    }
+
     pub(crate) fn add_obsoletions<'a>(
         &mut self,
         sources: &mut BTreeMap<String, &'a str>,
@@ -176,7 +210,7 @@ pub(super) fn load(
             }
         }
     };
-    let release_pins = state.publishers.release_pins(
+    let profile = state.publishers.select_profile(
         &state.settings.arch,
         &state.settings.facets,
         saved_pin(&publishers[0].name)?,
@@ -184,7 +218,9 @@ pub(super) fn load(
     let mut catalogs = Catalogs::default();
     for publisher in publishers {
         let pin = saved_pin(&publisher.name)?;
-        let signed = release_pins.get(&publisher.name);
+        let signed = profile
+            .as_ref()
+            .and_then(|profile| profile.pin(&publisher.name));
         let snapshot = if let Some(required) = signed {
             ensure!(
                 saved.is_none() || pin == Some(required.sha256.as_str()),
@@ -232,5 +268,6 @@ pub(super) fn load(
             );
         }
     }
+    catalogs.profile = profile.map(|profile| profile.record);
     Ok(catalogs)
 }

@@ -799,7 +799,10 @@ sed '/^schema-version 1/a release-profile "base"' protected-image.kdl > profiled
 "$cps" image-create --root profiled --config profiled-image.kdl
 "$cps" publisher set-build-trust --root profiled --policy rotated-trust.kdl canopa
 expect_failure 'signed release profile fixes this image' "$cps" publisher prefer --root profiled canopa
-"$cps" plan --root profiled --output profiled.json install demo/hello
+"$cps" plan --root profiled --output profiled.json install-profile
+"$cps" apply --root profiled profiled.json
+"$cps" verify --root profiled --pristine
+"$cps" publisher audit-builds --root profiled canopa | grep -F 'Verified build evidence for 2 installed package'
 mv witnessed witnessed-offline
 "$cps" publisher audit-builds --root guarded-staged canopa | grep -F 'Verified build evidence for 2 installed package'
 expect_failure 'requires 2 trusted builder signatures, found 1' "$cps" publisher audit-builds --root guarded canopa

@@ -402,6 +402,8 @@ enum PlanCommand {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+    /// Install the configured signed release profile into an image with no packages
+    InstallProfile,
     /// Remove installed packages without contacting the repository
     Remove {
         #[arg(required = true)]
@@ -921,6 +923,7 @@ fn run(command: Command) -> Result<ExitCode> {
             let request = match request {
                 PlanCommand::Install { packages } => Request::Install { packages },
                 PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
+                PlanCommand::InstallProfile => Request::InstallProfile,
                 PlanCommand::Remove { packages } => Request::Remove { packages },
                 PlanCommand::Repair { packages } => Request::Repair { packages },
                 PlanCommand::ResolveConfig { path, take } => Request::ResolveConfig { path, take },
