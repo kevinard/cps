@@ -11,8 +11,8 @@ use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
     model::{
-        Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_digest, validate_name,
-        validate_publisher,
+        Action, Dependency, DependencyTarget, FORMAT, Manifest, NIL_UUID, is_uuid, validate_digest,
+        validate_name, validate_publisher,
     },
     repo::read_limited,
     systemd::Action as SystemdAction,
@@ -456,8 +456,13 @@ pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
         arch,
         facets,
         release_profile,
+        image_id,
         ..
     } = read_image_definition(path)?;
+    ensure!(
+        image_id.is_none(),
+        "use create_configured_image for an explicit image-id"
+    );
     ensure!(
         publishers.len() == 1 && release_profile.is_none() && publishers[0].build_trust.is_none(),
         "use create_configured_image for multiple publishers, a release profile, or build trust"
@@ -561,6 +566,7 @@ pub(crate) struct ImageDefinition {
     pub facets: BTreeMap<String, bool>,
     pub release_profile: Option<String>,
     pub bootstrap_catalog: Option<String>,
+    pub image_id: Option<String>,
     pub mirrors: BTreeMap<String, MirrorConfig>,
 }
 
@@ -588,6 +594,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         facets: BTreeMap::new(),
         release_profile: None,
         bootstrap_catalog: None,
+        image_id: None,
         mirrors: BTreeMap::new(),
     };
     let mut architecture = false;
@@ -619,6 +626,15 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 ensure!(!architecture, "duplicate architecture node");
                 architecture = true;
                 config.arch = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+            }
+            "image-id" => {
+                ensure!(config.image_id.is_none(), "duplicate image-id node");
+                let id = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                ensure!(
+                    is_uuid(&id) && id != NIL_UUID,
+                    "image-id must be a nonzero UUID"
+                );
+                config.image_id = Some(id.to_ascii_lowercase());
             }
             "release-profile" => {
                 ensure!(
@@ -672,6 +688,7 @@ mod tests {
             }
             architecture "aarch64"
             facet "doc.man" #false
+            image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"
         "#;
         let parsed = parse_image_config(config, Path::new("/tmp/config"))?;
         assert_eq!(
@@ -684,6 +701,20 @@ mod tests {
         );
         assert_eq!(parsed.arch, "aarch64");
         assert!(!parsed.facets["doc.man"]);
+        assert_eq!(
+            parsed.image_id.as_deref(),
+            Some("a47593c2-e985-42d2-92b6-44c7057e1e96")
+        );
+        assert!(
+            parse_image_config(
+                &config.replace("A47593C2-E985-42D2-92B6-44C7057E1E96", NIL_UUID),
+                Path::new("/tmp")
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("image-id must be a nonzero UUID")
+        );
         assert!(
             parse_image_config(
                 &format!("{config}\nfacet \"doc.man\" #true\n"),

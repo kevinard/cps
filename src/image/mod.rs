@@ -258,7 +258,14 @@ pub fn create_image(
     facets: BTreeMap<String, bool>,
 ) -> Result<String> {
     let publisher = Publisher::from_config(publisher, repo, trust_key)?;
-    initialize(path, Publishers::Single(publisher), arch, facets, None)
+    initialize(
+        path,
+        Publishers::Single(publisher),
+        arch,
+        facets,
+        None,
+        None,
+    )
 }
 
 pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
@@ -317,6 +324,7 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
         &config.arch,
         config.facets,
         config.bootstrap_catalog,
+        config.image_id,
     )
 }
 
@@ -326,12 +334,13 @@ fn initialize(
     arch: &str,
     facets: BTreeMap<String, bool>,
     bootstrap_catalog: Option<String>,
+    image_id: Option<String>,
 ) -> Result<String> {
     validate_publisher(arch).context("invalid architecture")?;
     for facet in facets.keys() {
         validate_publisher(facet).context("invalid facet")?;
     }
-    let id = new_identity()?;
+    let id = image_id.map_or_else(new_identity, Ok)?;
     let settings = Settings {
         format: publishers.image_format(bootstrap_catalog.is_some()),
         id: id.clone(),

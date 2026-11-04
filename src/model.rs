@@ -42,6 +42,16 @@ pub fn validate_digest(hash: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+pub(crate) fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
 pub fn validate_path(path: &str) -> Result<()> {
     ensure!(
         !path.contains('\0') && path.split('/').all(|part| !matches!(part, "" | "." | "..")),

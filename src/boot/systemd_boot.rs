@@ -19,7 +19,7 @@ use super::{
 use crate::{
     image::{Image, root::Root},
     kdl_format::boot_export::ExportReceipt,
-    model::digest_reader,
+    model::{digest_reader, is_uuid},
 };
 
 use self::policy::{BootEntry, LoaderPolicy, inventory};
@@ -638,14 +638,7 @@ fn verify_fallback_artifacts(esp: &Path, id: &str, entry: &str) -> Result<()> {
 }
 
 pub(super) fn canonical_partuuid(value: &str) -> Result<String> {
-    ensure!(
-        value.len() == 36
-            && value.bytes().enumerate().all(|(i, c)| match i {
-                8 | 13 | 18 | 23 => c == b'-',
-                _ => c.is_ascii_hexdigit(),
-            }),
-        "expected a GPT PARTUUID in UUID form"
-    );
+    ensure!(is_uuid(value), "expected a GPT PARTUUID in UUID form");
     Ok(value.to_ascii_lowercase())
 }
 

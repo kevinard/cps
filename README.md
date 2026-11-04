@@ -818,6 +818,19 @@ pruning with `--keep-image` retains the pinned catalogs' payloads. The first
 committed `install-profile` consumes the pin, and subsequent plans follow the
 current signed release.
 
+For reproducible release images, also set `image-id` to the release image's
+UUID. This fixes the initial image identity used in saved plans, ext4 exports,
+and boot entries.
+
+```kdl
+image-id "a47593c2-e985-42d2-92b6-44c7057e1e96"
+```
+
+To compare independent builds, use the same signed bootstrap catalog, image
+configuration, canonical repository paths, builder UID and GID, and
+`SOURCE_DATE_EPOCH`. Use the same GPT template for byte-identical disk
+images. A staged upgrade receives a fresh image identity.
+
 On a profiled image with installed packages, `plan update` uses the current
 profile's exact package set. It can add newly required packages and update
 compatible local additions. It preserves explicit install marks for local
@@ -1279,6 +1292,11 @@ rescue VM from the first upgrade's read-only root partition. This variant
 checks that state written during the first boot reaches the staged tree and
 that the fallback partition stays byte-for-byte intact during deployment. It
 also checks that `apply` rejects a writable copy of the deployed root.
+
+With `CPS_VM_RELEASE_PROFILE=1`, offline disk activation, and
+`SOURCE_DATE_EPOCH` set, use `CPS_VM_REPROVISION=1` to install the signed
+profile in two fresh roots and compare the saved plans, ext4 exports, KDL
+receipts, and full GPT disks before booting the upgrade scenario.
 
 #### Testing a source-built Linux kernel
 

@@ -16,13 +16,16 @@ use serde::Deserialize;
 use tempfile::TempDir;
 
 use super::{artifact_helper, root_label, systemd_boot::canonical_partuuid};
-use crate::{image::root::Root, kdl_format::boot_export::ExportReceipt, model::digest_reader};
+use crate::{
+    image::root::Root,
+    kdl_format::boot_export::ExportReceipt,
+    model::{NIL_UUID, digest_reader},
+};
 
 const DISK: &str = "disk.raw";
 pub(super) const SECTOR_SIZE: u64 = 512;
 const LINUX_FILESYSTEM: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
 const EFI_SYSTEM: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
-const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Deploy an exported root to one partition in a new offline GPT disk image.
 pub fn deploy_boot_environment(

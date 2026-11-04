@@ -11,6 +11,7 @@ esac
 recycle=${CPS_VM_RECYCLE_SLOT:-0}
 device_activation=${CPS_VM_DEVICE_ACTIVATION:-0}
 installed_stage=${CPS_VM_INSTALLED_STAGE:-0}
+reprovision=${CPS_VM_REPROVISION:-0}
 if [[ $recycle == 1 && $mode != rollback ]]; then
     echo 'CPS_VM_RECYCLE_SLOT requires the rollback scenario' >&2
     exit 2
@@ -28,6 +29,10 @@ if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]];
 fi
 if [[ $installed_stage == 1 && ( $device_activation != 1 || $recycle != 1 || ${CPS_VM_RELEASE_PROFILE:-0} != 1 ) ]]; then
     echo 'CPS_VM_INSTALLED_STAGE requires device activation, slot reuse, and a signed release profile' >&2
+    exit 2
+fi
+if [[ $reprovision == 1 && ( $device_activation == 1 || ${CPS_VM_RELEASE_PROFILE:-0} != 1 || -z ${SOURCE_DATE_EPOCH:-} ) ]]; then
+    echo 'CPS_VM_REPROVISION requires offline disk activation, a signed release profile, and SOURCE_DATE_EPOCH' >&2
     exit 2
 fi
 kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
@@ -456,13 +461,18 @@ MANIFEST
     {
         cat <<'CONFIG'
 schema-version 1
-release-profile "boot"
 facet "devel" #false
 publisher "vm-profile" {
     repository "profile-repo"
     trust-key "profile-public.der"
 }
 CONFIG
+        if [[ $reprovision == 1 ]]; then
+            printf 'image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"\n'
+            printf 'release-profile "boot" bootstrap-catalog="%s"\n' "$(cat profile-repo/current)"
+        else
+            printf 'release-profile "boot"\n'
+        fi
         while read -r name repository key; do
             printf 'publisher "%s" {\n    repository "%s"\n    trust-key "%s"\n}\n' "$name" "$repository" "$key"
         done < <(profile_companions)
@@ -494,6 +504,13 @@ else
 fi
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
+if [[ $reprovision == 1 ]]; then
+    "$cps" image-create --root repro-base --config image.kdl
+    "$cps" plan --root repro-base --output repro-install.json install-profile
+    cmp install.json repro-install.json
+    "$cps" apply --root repro-base repro-install.json
+    "$cps" verify --root repro-base --pristine
+fi
 check_runtime_packages() {
     local root=$1 path
     if [[ -n $cps_fixture ]]; then
@@ -554,6 +571,19 @@ else
         --disk base.raw --receipt base.kdl --esp-partuuid "$esp_uuid" --output-disk "$base_disk" \
         --root-partuuid "$base_uuid" --options "$options")
     base_id=${base_id#Activated }
+fi
+if [[ $reprovision == 1 ]]; then
+    test "$base_id" = cps-a47593c2-e985-42d2-92b6-44c7057e1e96-1
+    "$cps" boot-env export --receipt --root repro-base --output repro-base.ext4 \
+        --size-mib "$root_mib" > repro-base.kdl
+    cmp base.ext4 repro-base.ext4
+    cmp base.kdl repro-base.kdl
+    "$cps" boot-env activate --known-good --root repro-base \
+        --disk template.raw --receipt repro-base.kdl --esp-partuuid "$esp_uuid" \
+        --output-disk repro-base.raw --root-partuuid "$base_uuid" \
+        --options "$options" --root-image repro-base.ext4
+    cmp "$base_disk" repro-base.raw
+    echo 'Verified independent signed-profile installations produced byte-identical boot disks'
 fi
 if [[ $mode == rollback ]]; then
     # A new upgrade should still be testable from an explicitly selected base.
