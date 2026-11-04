@@ -23,7 +23,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-15}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-16}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -47,6 +47,7 @@ systemd_efi=usr/lib/systemd/boot/efi/systemd-bootx64.efi
 profiled=false
 signed_cps_builds=false
 protected_profiles=false
+package_intent=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
 if [[ -n $systemd_fixture ]]; then
@@ -104,7 +105,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[0-5]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-6]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -123,11 +124,12 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-5]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-6]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-5]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-6]) protected_profiles=true ;;
     esac
+    if [[ $cps_version == 0.1.0-16 ]]; then package_intent=true; fi
 fi
 if [[ -n $kernel_fixture ]]; then
     $profiled || { echo 'CPS_VM_KERNEL_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
@@ -390,6 +392,7 @@ if $systemd_guest; then
         if $protected_profiles; then
             touch runtime/etc/cps-vm-assert-profile-protection
         fi
+        if $package_intent; then touch runtime/etc/cps-vm-assert-package-intent; fi
     else
         copy_runtime_deps runtime proto/usr/bin/cps
     fi
@@ -1004,6 +1007,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
             test "$reconciled" = $'CPS_VM_PROFILE_RECONCILE: trial removed\nCPS_VM_PROFILE_RECONCILE: trial removed'
             printf '%s\n' "$reconciled"
         fi
+        if $package_intent; then
+            intent_checks=$(tr -d '\r' < serial.log | grep '^CPS_VM_PACKAGE_INTENT: ')
+            test "$intent_checks" = $'CPS_VM_PACKAGE_INTENT: trial verified\nCPS_VM_PACKAGE_INTENT: trial verified'
+            printf '%s\n' "$intent_checks"
+        fi
         "$cps" boot-env list --disk disk.raw --esp-partuuid "$esp_uuid" | tee before-rollback.log
         assert_default() {
             awk -F '\t' -v id="$1" -v part="$2" -v release="$3" \
@@ -1049,6 +1057,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
         fi
         if $protected_profiles; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_PROFILE_PROTECTION: previous verified'
+        fi
+        if $package_intent; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_PACKAGE_INTENT: previous verified'
         fi
         if [[ -n $systemd_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_SYSTEMD: previous v262.1'

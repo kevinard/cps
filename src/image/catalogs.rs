@@ -215,6 +215,13 @@ pub(super) fn retain(tx: &Transaction<'_>, settings: &Settings) -> Result<()> {
 }
 
 impl Image {
+    pub(crate) fn profile_intent(&self, state: &State) -> Result<ProfileIntent> {
+        match &state.settings.profile_intent {
+            Some(intent) => Ok(intent.clone()),
+            None => self.reconstruct_profile_intent(state),
+        }
+    }
+
     pub(crate) fn reconstruct_profile_intent(&self, state: &State) -> Result<ProfileIntent> {
         // The archive can have advanced during a local install. Only use its
         // roots to classify explicit marks if it describes the applied set.

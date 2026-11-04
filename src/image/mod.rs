@@ -109,6 +109,12 @@ pub struct BootParent {
 }
 
 impl Settings {
+    pub(crate) fn next_revision(&self) -> Result<u64> {
+        self.revision
+            .checked_add(1)
+            .context("image revision exhausted")
+    }
+
     pub(crate) fn check_profile_packages(
         &self,
         installed: &BTreeMap<String, Installed>,

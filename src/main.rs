@@ -8,9 +8,11 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use cps::query::{PackageRow, Scope, list_facets, list_packages, package_manifest};
+use cps::query::{
+    PackageRow, Scope, list_facets, list_package_intent, list_packages, package_manifest,
+};
 use cps::{
-    Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, Plan, Request,
+    Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, MarkChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
     activate_deployed_boot_environment, activate_device_boot_environment,
     add_publisher_with_build_trust, apply, audit_publisher_builds, build_with_toolchain_config,
@@ -139,6 +141,9 @@ enum Command {
         available: bool,
         #[arg(long, requires = "available")]
         all_versions: bool,
+        /// Show local requests and roles in the installed release profile
+        #[arg(long, conflicts_with = "available")]
+        intent: bool,
     },
     /// Search package names in the signed catalog or installed image
     Search {
@@ -504,6 +509,13 @@ enum PlanCommand {
     },
     /// Install the configured signed release profile into an image with no packages
     InstallProfile,
+    /// Change local request marks without installing or removing packages
+    Mark {
+        #[arg(value_enum)]
+        choice: MarkChoice,
+        #[arg(required = true, value_name = "PACKAGE")]
+        packages: Vec<String>,
+    },
     /// Remove installed packages without contacting the repository
     Remove {
         #[arg(required = true)]
@@ -1083,13 +1095,23 @@ fn run(command: Command) -> Result<ExitCode> {
             root,
             available,
             all_versions,
+            intent,
         } => {
-            let scope = match (available, all_versions) {
-                (true, true) => Scope::AllAvailableVersions,
-                (true, false) => Scope::Available,
-                _ => Scope::Installed,
-            };
-            print_packages(list_packages(&root, scope)?)?;
+            if intent {
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "PACKAGE\tLOCAL REQUEST\tPROFILE")?;
+                for row in list_package_intent(&root)? {
+                    let request = if row.requested { "yes" } else { "-" };
+                    writeln!(out, "{}\t{request}\t{}", row.id, row.profile)?;
+                }
+            } else {
+                let scope = match (available, all_versions) {
+                    (true, true) => Scope::AllAvailableVersions,
+                    (true, false) => Scope::Available,
+                    _ => Scope::Installed,
+                };
+                print_packages(list_packages(&root, scope)?)?;
+            }
         }
         Command::Search {
             root,
@@ -1150,6 +1172,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::Install { packages } => Request::Install { packages },
                 PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
                 PlanCommand::InstallProfile => Request::InstallProfile,
+                PlanCommand::Mark { choice, packages } => Request::Mark { choice, packages },
                 PlanCommand::Remove { packages } => Request::Remove { packages },
                 PlanCommand::Autoremove => Request::Autoremove,
                 PlanCommand::ChangeFacet { facets } => Request::ChangeFacet {

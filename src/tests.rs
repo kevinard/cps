@@ -1136,6 +1136,87 @@ fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
 }
 
 #[test]
+fn marks_installed_package_requests_offline_without_touching_files() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    use crate::{
+        MarkChoice,
+        query::{ProfileRole, list_package_intent},
+    };
+
+    let f = Fixture::new()?;
+    let runtime = "library/runtime";
+    let tool = "desktop/tool";
+    f.package(runtime, "1.0.0-0", f.file(LIBRARY, "runtime", "0644", "")?)?;
+    f.package(tool, "1.0.0-0", dependency("require", runtime, "1.0.0-0"))?;
+    f.create()?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Install {
+                packages: vec![tool.into()],
+            },
+        )?,
+    )?;
+    let file = f.root.join(LIBRARY);
+    let inode = file.metadata()?.ino();
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+
+    let mark = |choice, package: &str| {
+        plan(
+            &f.root,
+            Request::Mark {
+                choice,
+                packages: vec![package.into()],
+            },
+        )
+    };
+    let stale = mark(MarkChoice::Automatic, tool)?;
+    let error = mark(MarkChoice::Explicit, "library/runtime@2.0.0-0").unwrap_err();
+    assert!(format!("{error:#}").contains("does not match the requested version"));
+    let promoted = mark(MarkChoice::Explicit, "cps://canopa/library/runtime@1.0.0-0")?;
+    assert!(promoted.summary().contains("as locally requested"));
+    assert!(promoted.writes.is_empty() && promoted.systemd.is_empty());
+    assert!(promoted.kernel_install.is_none() && promoted.catalogs.is_empty());
+    assert_eq!(crate::fetch_plan(&f.root, &promoted)?, 0);
+    assert_eq!(apply(&f.root, &promoted)?, 2);
+    assert_eq!(apply(&f.root, &promoted)?, 2);
+    assert!(format!("{:#}", apply(&f.root, &stale).unwrap_err()).contains("stale plan"));
+    let history = crate::transaction_details(&f.root, &promoted.id()?)?
+        .details
+        .unwrap();
+    assert_eq!(history.intent_changes, promoted.intent_changes);
+    assert!(history.package_changes.is_empty());
+    assert_eq!(history.planned_path_changes, 0);
+
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Remove {
+                packages: vec![tool.into()],
+            },
+        )?,
+    )?;
+    let rows = list_package_intent(&f.root)?;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].requested);
+    assert_eq!(rows[0].profile, ProfileRole::None);
+    let cleanup = plan(&f.root, Request::Autoremove)?;
+    assert!(cleanup.writes.is_empty());
+    let demoted = mark(MarkChoice::Automatic, runtime)?;
+    assert!(demoted.summary().contains("as automatic"));
+    apply(&f.root, &demoted)?;
+    assert_eq!(file.metadata()?.ino(), inode);
+    assert_eq!(fs::read_to_string(&file)?, "runtime");
+    assert!(!list_package_intent(&f.root)?[0].requested);
+    apply(&f.root, &plan(&f.root, Request::Autoremove)?)?;
+    assert!(!file.exists());
+    Ok(())
+}
+
+#[test]
 fn autoremove_preserves_installed_roots_and_resumes_offline() -> Result<()> {
     use crate::query::{Scope, Status, list_packages};
 

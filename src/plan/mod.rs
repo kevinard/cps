@@ -1,5 +1,6 @@
 mod catalogs;
 mod config;
+mod intent;
 mod paths;
 mod repair;
 mod resolve;
@@ -25,6 +26,7 @@ use crate::{
 
 pub(crate) use catalogs::{CandidateSet, claim_source};
 pub use config::{ConfigChoice, ConfigUpdate, list_config_updates};
+pub use intent::{IntentChange, MarkChoice};
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
 };
@@ -50,6 +52,10 @@ pub enum Request {
         packages: Vec<String>,
     },
     InstallProfile,
+    Mark {
+        choice: MarkChoice,
+        packages: Vec<String>,
+    },
     Remove {
         packages: Vec<String>,
     },
@@ -74,6 +80,7 @@ impl Request {
             Self::Install { .. } => "install",
             Self::ExactInstall { .. } => "exact-install",
             Self::InstallProfile => "install-profile",
+            Self::Mark { .. } => "mark",
             Self::Remove { .. } => "remove",
             Self::Autoremove => "autoremove",
             Self::ChangeFacet { .. } => "change-facet",
@@ -144,6 +151,8 @@ pub struct Plan {
     pub(crate) request: Request,
     selected: BTreeMap<String, String>,
     package_changes: Vec<PackageChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) intent_changes: Vec<IntentChange>,
     transfers: Vec<Transfer>,
     preserved: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +166,40 @@ pub struct Plan {
 }
 
 impl Plan {
+    fn with_selection(
+        settings: &Settings,
+        request: Request,
+        saved: Option<&Plan>,
+        solver: Option<SolverRevision>,
+        installed: &BTreeMap<String, Installed>,
+    ) -> Self {
+        Self {
+            format: FORMAT,
+            solver,
+            image: settings.id.clone(),
+            base_revision: settings.revision,
+            publisher_generation: settings.publisher_generation,
+            prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
+            track_profile_intent: false,
+            catalog: None,
+            catalogs: BTreeMap::new(),
+            request,
+            selected: installed
+                .iter()
+                .map(|(name, pkg)| (name.clone(), pkg.published.sha256.clone()))
+                .collect(),
+            package_changes: Vec::new(),
+            intent_changes: Vec::new(),
+            transfers: Vec::new(),
+            preserved: Vec::new(),
+            config_update_revision: None,
+            writes: Vec::new(),
+            systemd: Vec::new(),
+            kernel_install: None,
+            payload_bytes: 0,
+        }
+    }
+
     pub(crate) fn transaction_details(&self, state: &State) -> TransactionDetails {
         let mut catalogs = self.catalogs.clone();
         if let Some(hash) = &self.catalog {
@@ -167,6 +210,7 @@ impl Plan {
             base_revision: self.base_revision,
             request: self.request.clone(),
             package_changes: self.package_changes.clone(),
+            intent_changes: self.intent_changes.clone(),
             catalogs,
             planned_path_changes: self
                 .writes
@@ -198,6 +242,17 @@ impl Plan {
                 (Some(old), None) => format!("Remove {name} {old}"),
                 (None, None) => continue,
             });
+        }
+        if matches!(self.request, Request::Mark { .. }) && self.intent_changes.is_empty() {
+            lines.push("Package requests already match the requested state".to_owned());
+        }
+        for change in &self.intent_changes {
+            let mark = if change.requested {
+                "locally requested"
+            } else {
+                "automatic"
+            };
+            lines.push(format!("Mark {} as {mark}", change.package));
         }
         if let Request::ChangeFacet { facets } = &self.request {
             for (name, value) in facets {
@@ -317,10 +372,7 @@ impl Plan {
         let revision = if self.config_update_revision.is_some() {
             before.revision
         } else {
-            before
-                .revision
-                .checked_add(1)
-                .context("image revision exhausted")?
+            before.next_revision()?
         };
         ensure!(
             after.id == before.id
@@ -449,6 +501,15 @@ pub(crate) fn build(
         state.settings.bootstrap_catalog.is_none() || matches!(request, Request::InstallProfile),
         "install the pinned bootstrap release with plan install-profile first"
     );
+    if let Request::Mark { choice, packages } = &request {
+        let (installed, intent_changes) = intent::mark(image, &mut state, *choice, packages)?;
+        let mut plan = Plan::with_selection(&state.settings, request, saved, solver, &installed);
+        plan.intent_changes = intent_changes;
+        state.settings.revision = state.settings.next_revision()?;
+        state.settings.format = state.publishers.image_format(&state.settings);
+        state.installed = installed;
+        return Ok((plan, state, Vec::new()));
+    }
     let mut catalogs = catalogs::Catalogs::default();
     let mut receipts = Vec::new();
     let mut next_facets = None;
@@ -667,43 +728,29 @@ pub(crate) fn build(
     let revision = if matches!(request, Request::ResolveConfig { .. }) {
         state.settings.revision
     } else {
-        state
-            .settings
-            .revision
-            .checked_add(1)
-            .context("image revision exhausted")?
+        state.settings.next_revision()?
     };
     let kernel_install = kernel::transition(
         kernel::selected(&state.installed, &state.paths)?,
         kernel::selected(&installed, &paths)?,
     )?;
     let mut plan = Plan {
-        format: FORMAT,
-        solver,
-        image: state.settings.id.clone(),
-        base_revision: state.settings.revision,
-        publisher_generation: state.settings.publisher_generation,
-        prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
         track_profile_intent,
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
-        request: if update_profile {
-            Request::UpdateProfile
-        } else {
-            request
-        },
-        selected: installed
-            .iter()
-            .map(|(name, pkg)| (name.clone(), pkg.published.sha256.clone()))
-            .collect(),
-        package_changes: Vec::new(),
-        transfers: Vec::new(),
-        preserved: Vec::new(),
-        config_update_revision: None,
-        writes: Vec::new(),
         systemd: systemd::plan_actions(&state, &installed, &paths),
         kernel_install,
-        payload_bytes: 0,
+        ..Plan::with_selection(
+            &state.settings,
+            if update_profile {
+                Request::UpdateProfile
+            } else {
+                request
+            },
+            saved,
+            solver,
+            &installed,
+        )
     };
     for name in state
         .installed

@@ -46,6 +46,62 @@ pub struct PackageRow {
     pub status: Status,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileRole {
+    Root,
+    Dependency,
+    Protected,
+    None,
+}
+
+impl fmt::Display for ProfileRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Root => "root",
+            Self::Dependency => "dependency",
+            Self::Protected => "protected",
+            Self::None => "-",
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct PackageIntentRow {
+    pub id: String,
+    pub requested: bool,
+    pub profile: ProfileRole,
+}
+
+/// List effective local requests and roles in the applied profile, offline.
+pub fn list_package_intent(root: &Path) -> Result<Vec<PackageIntentRow>> {
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    image.verify_catalog_archives(&state)?;
+    let intent = image.profile_intent(&state)?;
+    state
+        .installed
+        .iter()
+        .map(|(name, package)| {
+            package.verify(name, &state.publishers)?;
+            let profile = if !state.settings.profile_packages.contains_key(name) {
+                ProfileRole::None
+            } else if intent.roots.contains(name) {
+                ProfileRole::Root
+            } else if intent.roots.is_empty() {
+                ProfileRole::Protected
+            } else {
+                ProfileRole::Dependency
+            };
+            Ok(PackageIntentRow {
+                id: package.published.manifest.id(),
+                requested: intent.local.contains(name),
+                profile,
+            })
+        })
+        .collect()
+}
+
 /// Read explicitly configured facet values from the committed image.
 pub fn list_facets(root: &Path) -> Result<BTreeMap<String, bool>> {
     let image = Image::open_query(root)?;

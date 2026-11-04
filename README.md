@@ -110,6 +110,7 @@ hashes and lengths. [IPS prototype manifest generation](https://docs.oracle.com/
 
 ```sh
 cps list --root image
+cps list --root image --intent
 cps list --root image --available --all-versions
 cps search --root image hello
 cps info --root image demo/hello
@@ -117,6 +118,24 @@ cps info --root image --available demo/hello@1.0.0-0
 ```
 
 `list` shows installed packages and their explicit or dependency status. With `--available` it shows the newest version of each package in the signed catalog. `search` matches package name fragments in that catalog, or in the installed set with `--installed`. `info` prints a verified manifest in KDL, including dependencies and file actions. It accepts a name, a name and version, or a full CPS package ID. Installed queries work offline. Available queries use the configured local repository or cache.
+
+`list --intent` shows effective local requests separately from the roles in
+the applied signed profile. It reports `protected` for legacy profile
+packages whose exact roles cannot be recovered from the image archive.
+
+```sh
+cps plan --root image --output mark.json mark explicit demo/hello
+cps apply --root image mark.json
+```
+
+Use `mark automatic` to clear a local request. Both operations accept
+installed package IDs or names and work with the repository offline.
+They change the marks in the image database and record them in transaction
+history. Package files and versions stay in place. Automatic packages can
+be removed later by `autoremove` or signed profile reconciliation if the
+resulting image has no use for them. A signed profile root stays protected
+even after its local request is cleared. Apply marks to an inactive image
+or stage the saved plan in a boot environment.
 
 ## Building packages from source
 
@@ -221,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-15`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-16`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -940,8 +959,8 @@ On a profiled image with installed packages, `plan update` reconciles the
 image to the current signed composition plus the packages the operator
 explicitly requested and their dependencies. A previous profile default
 leaves the image if the new profile and local packages no longer require it.
-The package can remain published for manual installation. Use `plan install`
-to keep a default as a local choice, even when it is already installed.
+The package can remain published for manual installation. Use
+`plan mark explicit` to keep an installed default as a local choice.
 `plan exact-install` replaces the local choices while preserving the signed
 composition. Signed obsoletion rules still apply. A profile update fails if
 the signed set requires a downgrade or a publisher switch.
@@ -980,8 +999,8 @@ removing unused dependencies. CPS solves from the explicitly installed
 packages using their installed versions and the installed dependency
 candidates. It keeps the dependencies needed by that solution, including a
 compatible alternative and any conditional dependencies that apply. The
-plan and apply work offline. To keep a dependency explicitly, request it
-with `plan install` and its exact installed version before planning cleanup.
+plan and apply work offline. Use `plan mark explicit` to keep an installed
+dependency before planning cleanup.
 
 Run `cargo test` for the desktop upgrade and interruption test.
 

@@ -540,6 +540,18 @@ if [ -f /etc/cps-vm-assert-profile-protection ]; then
     [ ! -e /run/remove-profile.json ]
     printf 'CPS_VM_PROFILE_PROTECTION: %s verified\n' "$state"
 fi
+if [ -f /etc/cps-vm-assert-package-intent ]; then
+    /usr/bin/cps list --root / --intent > /run/package-intent
+    "$bb" grep -Fxq "$(printf 'cps://vm-profile/test/boot-stack@1.0.0-0\t-\troot')" /run/package-intent
+    /usr/bin/cps plan --root / --output /run/mark-intent.json mark explicit test/boot-stack \
+        > /run/mark-intent.log
+    "$bb" grep -Fxq 'Mark cps://vm-profile/test/boot-stack@1.0.0-0 as locally requested' /run/mark-intent.log
+    if /usr/bin/cps apply --root / /run/mark-intent.json > /run/mark-rejected.log 2>&1; then
+        exit 1
+    fi
+    "$bb" grep -Fq 'use boot-env stage to prepare package changes from an installed root' /run/mark-rejected.log
+    printf 'CPS_VM_PACKAGE_INTENT: %s verified\n' "$state"
+fi
 if [ -f /etc/cps-vm-assert-extra-publisher ]; then
     publisher=absent
     if [ -f /etc/cps-vm-extra-marker ]; then

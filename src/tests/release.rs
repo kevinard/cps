@@ -621,6 +621,11 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
 
 #[test]
 fn profile_updates_reconcile_defaults_and_keep_operator_roots() -> Result<()> {
+    use crate::{
+        MarkChoice,
+        query::{ProfileRole, list_package_intent},
+    };
+
     let f = Fixture::new()?;
     let legacy = "usr/lib/desktop/legacy";
     let default = "usr/share/desktop/default";
@@ -703,15 +708,11 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     for root in [&f.root, &exact_root] {
         create_configured_image(root, &config)?;
         apply(root, &plan(root, Request::InstallProfile)?)?;
-        apply(
-            root,
-            &plan(
-                root,
-                Request::Install {
-                    packages: vec![format!("cps://canopa/{optional}@1.0.0-0"), addon.into()],
-                },
-            )?,
-        )?;
+        let mut packages = vec![addon.into()];
+        if root == &exact_root {
+            packages.push(format!("cps://canopa/{optional}@1.0.0-0"));
+        }
+        apply(root, &plan(root, Request::Install { packages })?)?;
     }
     apply(
         &exact_root,
@@ -724,6 +725,39 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     )?;
     package_manifest(&exact_root, optional, false)?;
 
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    let mark = |root: &Path, choice| {
+        apply(
+            root,
+            &plan(
+                root,
+                Request::Mark {
+                    choice,
+                    packages: vec![optional.into()],
+                },
+            )?,
+        )
+    };
+    mark(&f.root, MarkChoice::Explicit)?;
+    mark(&exact_root, MarkChoice::Explicit)?;
+    mark(&exact_root, MarkChoice::Automatic)?;
+    for (root, requested) in [(&f.root, true), (&exact_root, false)] {
+        let rows = list_package_intent(root)?;
+        assert!(
+            rows.iter()
+                .any(|row| row.id == "cps://canopa/desktop/optional@1.0.0-0"
+                    && row.requested == requested
+                    && row.profile == ProfileRole::Root)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.id == "cps://canopa/library/shared@1.0.0-0"
+                    && !row.requested
+                    && row.profile == ProfileRole::Dependency)
+        );
+    }
+    fs::rename(&offline, &f.repo)?;
     publish_profile("2.0.0-0", "package \"desktop/new-default\"")?;
     let staged = f._dir.path().join("staged");
     let upgrade = plan(&f.root, Request::Update)?;
@@ -738,8 +772,8 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
         &interrupted,
         default,
     )?;
-    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
-    assert_eq!(crate::resume_transaction(&exact_root)?, Some(4));
+    fs::rename(&f.repo, &offline)?;
+    assert_eq!(crate::resume_transaction(&exact_root)?, Some(6));
     for (root, keeps_optional) in [(&staged, true), (&exact_root, false)] {
         assert!(!root.join(legacy).exists());
         assert_eq!(fs::read_to_string(root.join(default))?, "new");
