@@ -1772,6 +1772,21 @@ fn restores_disabled_config_proposals_and_moves_local_edits_after_upgrade() -> R
         "third default"
     );
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    apply(&f.root, &plan(&f.root, toggle(Some(false)))?)?;
+    let remove = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &remove)?;
+    let state = crate::image::Image::open_query(&f.root)?.state()?;
+    assert!(state.settings.dormant_configs.is_empty());
+    assert!(state.installed.is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join(NEW_PATH))?,
+        "local preferences"
+    );
     Ok(())
 }
 
