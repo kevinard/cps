@@ -1,0 +1,7 @@
+schema-version 1
+package "system/kernel-qemu" publisher="canopa-kernel" version="6.12.115-0" {
+    file "usr/lib/modules/6.12.115-cps-vm/vmlinuz" mode="0644" uid=0 gid=0 arch="x86_64"
+    file "usr/lib/modules/6.12.115-cps-vm/config" mode="0644" uid=0 gid=0 arch="x86_64"
+    file "usr/share/licenses/kernel-qemu/GPL-2.0" mode="0644" uid=0 gid=0
+    kernel-install "6.12.115-cps-vm"
+}

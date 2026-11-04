@@ -5,12 +5,15 @@ unset LD_LIBRARY_PATH LD_PRELOAD GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPAT
 export PATH=/usr/bin:/bin LC_ALL=C
 umask 022
 
-seed=${1:?usage: seed-native-c.sh PROTOTYPE [--rust]}
+seed=${1:?usage: seed-native-c.sh PROTOTYPE [--rust|--kernel]}
 rust_root=
+kernel=false
 if [[ $# == 2 && $2 == --rust ]]; then
     rust_root=$(rustc --print sysroot)
+elif [[ $# == 2 && $2 == --kernel ]]; then
+    kernel=true
 elif [[ $# != 1 ]]; then
-    echo 'usage: seed-native-c.sh PROTOTYPE [--rust]' >&2
+    echo 'usage: seed-native-c.sh PROTOTYPE [--rust|--kernel]' >&2
     exit 2
 fi
 mkdir -- "$seed"
@@ -90,4 +93,17 @@ if [[ -n $rust_root ]]; then
     for tool in gzip ls pkg-config ranlib rmdir; do
         copy_elf "/usr/bin/$tool" "usr/bin/$tool"
     done
+fi
+if $kernel; then
+    for tool in bison flex gzip ls m4 pkg-config readelf realpath sha1sum true xz; do
+        copy_elf "/usr/bin/$tool" "usr/bin/$tool"
+    done
+    copy_elf "${CPS_KERNEL_BC:-/usr/bin/bc}" usr/bin/bc
+    # x86's objtool links against libelf, also used by the seeded binutils.
+    for path in usr/include/{gelf,libelf}.h usr/lib/{libelf.so.1,pkgconfig/libelf.pc}; do
+        copy_file "/$path" "$path"
+    done
+    ln -s libelf.so.1 "$seed/usr/lib/libelf.so"
+    mkdir -p -- "$seed/usr/share"
+    cp -RL -- /usr/share/bison "$seed/usr/share/"
 fi
