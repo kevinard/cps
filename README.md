@@ -1097,8 +1097,12 @@ cps boot-env rollback --disk bootable-next.raw --esp-partuuid "$esp_partuuid" \
     --output-disk rolled-back.raw
 ```
 
-Disk rollback checks that the selected root's filesystem UUID and revision
-match its registered entry before changing the default.
+Rollback on a disk image or a mounted VFAT ESP checks that the selected
+root's ext4 UUID and revision match its registered entry before changing
+the default. For a mounted ESP, CPS reads the parent GPT disk and locates the
+root by PARTUUID on that disk. The command requires read access to the disk
+and write access to the ESP. For a detached ESP directory, the operator
+supplies the partition mapping.
 
 The list marks the default configured on the ESP and shows each registered root's partition UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. Rollback selects the default environment's recorded parent unless an ID is supplied. Entries from earlier CPS versions use the previous known-good revision. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
@@ -1208,7 +1212,9 @@ With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to deploy
 and activate the trial from a rescue VM with a writable virtio disk. The test
 checks rejection of mounted or registered targets and incorrect partition or
 receipt identities. It then verifies the written partition and boots the
-result through the normal blessing and rollback checks.
+result through the normal blessing and rollback checks. Rollback runs
+against the mounted ESP in the rescue VM and rejects a mismatched root
+before selecting and booting the original kernel.
 Combine it with `CPS_VM_RECYCLE_SLOT=1` to also exercise direct replacement,
 recovery from a partial write after retirement, and boot and rollback of
 the recovered upgrade.

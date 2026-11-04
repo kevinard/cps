@@ -666,7 +666,7 @@ grep -q 'distinct root PARTUUID' rejected.log
 diff -r esp-before esp
 
 if [[ $device_activation == 1 ]]; then
-    activate_device_guest initial "$base_disk" disk.raw staged
+    run_device_guest initial "$base_disk" disk.raw staged
     cmp -n 1048576 "$base_disk" disk.raw
     cmp -i "$((base_mib * 1024 * 1024))" -n "$((root_mib * 1024 * 1024))" "$base_disk" disk.raw
     cmp -i "$((trial_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" disk.raw staged.ext4
@@ -835,8 +835,13 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
                 '$1 == "*" && $2 == "known-good" && $3 == id && $4 == part && index($5, release) {found=1} END {exit !found}' "$4"
         }
         assert_default "$trial_id" "$trial_uuid" "$trial_release" before-rollback.log
-        result=$("$cps" boot-env rollback --disk disk.raw --esp-partuuid "$esp_uuid" --output-disk rollback.raw)
-        test "$result" = "Selected $base_id for the next boot"
+        if [[ $device_activation == 1 ]]; then
+            run_device_guest rollback disk.raw rollback.raw
+            cmp -n 1048576 disk.raw rollback.raw
+        else
+            result=$("$cps" boot-env rollback --disk disk.raw --esp-partuuid "$esp_uuid" --output-disk rollback.raw)
+            test "$result" = "Selected $base_id for the next boot"
+        fi
         "$cps" boot-env list --disk rollback.raw --esp-partuuid "$esp_uuid" | tee after-rollback.log
         assert_default "$base_id" "$base_uuid" "$base_release" after-rollback.log
         grep -Fq "$trial_id" after-rollback.log
@@ -883,7 +888,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             publish_state 3.0.0-0 recycled
             if $profiled; then refresh_vm_profile; fi
             if [[ $installed_stage == 1 ]]; then
-                activate_device_guest installed disk.raw recycled.raw
+                run_device_guest installed disk.raw recycled.raw
                 recycled_id=$(sed -n 's/^CPS_VM_INSTALLED_STAGE: //p' device-installed-activation.log)
                 test -n "$recycled_id"
             else
@@ -908,8 +913,8 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
                 "$cps" boot-env export --receipt --root recycled --output recycled.ext4 \
                     --size-mib "$root_mib" > recycled.kdl
                 if [[ $device_activation == 1 ]]; then
-                    activate_device_guest replace disk.raw replaced.raw recycled
-                    activate_device_guest resume disk.raw recycled.raw recycled
+                    run_device_guest replace disk.raw replaced.raw recycled
+                    run_device_guest resume disk.raw recycled.raw recycled
                     cmp -i "$((base_mib * 1024 * 1024))" replaced.raw recycled.raw
                     for output in replaced.raw recycled.raw; do
                         cmp -i "$((base_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" \

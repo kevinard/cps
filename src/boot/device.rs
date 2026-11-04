@@ -9,13 +9,23 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use rustix::fs::{Mode, OFlags, open};
+use rustix::fs::{Mode, OFlags, fstatfs, open};
 
 use crate::{image::root::Root, kdl_format::boot_export::ExportReceipt, model::validate_path};
 
 use super::deploy::{
     OfflineDisk, SECTOR_SIZE, checked_payload, digest_extent, verify_filesystem_at, write_extent,
 };
+
+pub(super) fn mounted_esp_disk(path: &Path, locked: &File) -> Result<Option<OfflineDisk>> {
+    if fstatfs(locked)?.f_type != libc::MSDOS_SUPER_MAGIC {
+        return Ok(None);
+    }
+    let esp = esp_partition(path, locked)?;
+    let disk = esp.open_disk()?;
+    disk.check_esp_extent(esp.extent)?;
+    Ok(Some(disk))
+}
 
 pub(super) struct DevicePartition {
     file: File,
@@ -32,9 +42,7 @@ impl DevicePartition {
     ) -> Result<(OfflineDisk, Self)> {
         let esp = fs::canonicalize(esp).context("opening the mounted EFI partition")?;
         let mount = Root::open(&esp)?;
-        check_esp_mount(&esp, mount.as_file())?;
-        let esp_part = KernelPartition::read(mount.as_file().metadata()?.dev())
-            .context("identifying the mounted EFI partition")?;
+        let esp_part = esp_partition(&esp, mount.as_file())?;
         let target = block_node(device)?;
         let root_part = KernelPartition::read(target.metadata()?.rdev())
             .context("identifying the target root partition")?;
@@ -52,10 +60,7 @@ impl DevicePartition {
             )
             .context("claiming the target root partition exclusively")?,
         );
-        let disk = OfflineDisk::from_sized_file(
-            open_parent(&root_part.disk)?,
-            sectors(&root_part.disk, "size")?,
-        )?;
+        let disk = esp_part.open_disk()?;
         disk.check_device_extents(partuuid, root_part.extent, esp_part.extent)?;
         let target = Self {
             file,
@@ -137,6 +142,15 @@ impl KernelPartition {
         let extent = (sectors(&path, "start")?, sectors(&path, "size")?);
         Ok(Self { disk, extent })
     }
+
+    fn open_disk(&self) -> Result<OfflineDisk> {
+        OfflineDisk::from_sized_file(open_parent(&self.disk)?, sectors(&self.disk, "size")?)
+    }
+}
+
+fn esp_partition(path: &Path, file: &File) -> Result<KernelPartition> {
+    check_esp_mount(path, file)?;
+    KernelPartition::read(file.metadata()?.dev()).context("identifying the mounted EFI partition")
 }
 
 fn sectors(path: &Path, name: &str) -> Result<u64> {

@@ -13,6 +13,7 @@ use tempfile::NamedTempFile;
 use super::{
     check_image_integrity,
     deploy::{OfflineDisk, offline_file},
+    device::mounted_esp_disk,
     entry_id, kernel,
 };
 use crate::{
@@ -58,7 +59,12 @@ pub fn rollback_boot_environment(esp: &Path, id: Option<&str>) -> Result<String>
 
 pub(super) fn rollback(esp: &Path, id: Option<&str>, disk: Option<&OfflineDisk>) -> Result<String> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
-    let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
+    let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
+    let mounted = if disk.is_none() {
+        mounted_esp_disk(&esp, &lock)?
+    } else {
+        None
+    };
     let (policy, entries) = inventory(&esp)?;
     let policy = policy.context("no CPS boot environments registered")?;
     let target = if let Some(id) = id {
@@ -79,7 +85,7 @@ pub(super) fn rollback(esp: &Path, id: Option<&str>, disk: Option<&OfflineDisk>)
         }
     };
     verify_fallback_artifacts(&esp, &target.id, &target.description)?;
-    if let Some(disk) = disk {
+    if let Some(disk) = disk.or(mounted.as_ref()) {
         let (image, revision) = policy::entry_identity(&target.id)?;
         disk.verify_filesystem(&target.partuuid, image, revision)
             .context("checking the rollback root partition")?;

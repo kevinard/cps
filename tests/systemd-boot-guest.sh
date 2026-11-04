@@ -21,7 +21,7 @@ copy_runtime_deps() {
 
 # Boot a rescue root with the inputs on a read-only disk.
 # The writable disk is the one later booted through systemd-boot.
-activate_device_guest() {
+run_device_guest() {
     local mode=$1 source=$2 output=$3 stage=${4:-}
     local inputs="device-$mode-inputs"
     local program binary name repository key data_args=() scratch_args=()
@@ -51,7 +51,7 @@ activate_device_guest() {
             conv=sparse status=none
         scratch_args=(-drive if=virtio,format=raw,file=scratch.raw
                       -drive if=virtio,format=raw,file=installed-copy.raw)
-    else
+    elif [[ $mode != rollback ]]; then
         cp -a -- "$stage" "$inputs/staged"
         cp --sparse=always -- "$stage.ext4" "$inputs/staged.ext4"
         cp -- "$stage.kdl" "$inputs/staged.kdl"
@@ -103,6 +103,32 @@ reject 'environment is already registered' --esp /esp --device /dev/vda3 \
     --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4
 activate --esp /esp --device /dev/vda3 \
     --root-partuuid "$trial_uuid" --receipt /staged.kdl
+GUEST
+        elif [[ $mode == rollback ]]; then
+            printf 'base_id=%q\n' "$base_id"
+            cat <<'GUEST'
+bb=/bin/busybox
+mount -t ext4 -o ro,noload /dev/vda2 /fallback
+entry="/esp/loader/entries/$base_id.conf"
+before=$("$bb" sha256sum /esp/loader/loader.conf)
+reject_rollback() {
+    expected=$1
+    shift
+    if cps boot-env rollback "$@" > /tmp/rejected 2>&1; then
+        echo 'CPS_VM_DEVICE: unexpected rollback'
+        exit 1
+    fi
+    "$bb" grep -F "$expected" /tmp/rejected
+    test "$("$bb" sha256sum /esp/loader/loader.conf)" = "$before"
+}
+reject_rollback 'must name the root of a mounted EFI partition' --esp /esp/EFI "$base_id"
+"$bb" cp "$entry" /tmp/entry.conf
+"$bb" sed "s/root=PARTUUID=$base_uuid/root=PARTUUID=$trial_uuid/" /tmp/entry.conf > "$entry"
+reject_rollback 'does not contain the expected ext4 filesystem' --esp /esp "$base_id"
+"$bb" cat /tmp/entry.conf > "$entry"
+result=$(cps boot-env rollback --esp /esp)
+test "$result" = "Selected $base_id for the next boot"
+printf '%s\n' "$result"
 GUEST
         elif [[ $mode == installed ]]; then
             printf 'base_id=%q\nroot_mib=%q\n' "$base_id" "$root_mib"
@@ -193,7 +219,7 @@ GUEST
         fi
         cat <<'GUEST'
 /bin/busybox umount /esp /fallback
-echo 'CPS_VM_DEVICE: activated verified inactive partition'
+echo 'CPS_VM_DEVICE: operation completed'
 GUEST
     } > "$inputs/init"
     chmod 0755 "$inputs/init"
@@ -212,7 +238,7 @@ GUEST
     }
     tr -d '\r' < "device-$mode.log" > "device-$mode-activation.log"
     cat "device-$mode-activation.log"
-    grep -Fxq 'CPS_VM_DEVICE: activated verified inactive partition' "device-$mode-activation.log"
+    grep -Fxq 'CPS_VM_DEVICE: operation completed' "device-$mode-activation.log"
     if [[ $mode == resume ]]; then
         grep -Fxq 'CPS_VM_DEVICE: resuming after a partial root write' "device-$mode-activation.log"
     fi

@@ -234,6 +234,10 @@ impl OfflineDisk {
             (part.offset, part.bytes) == target,
             "target device does not match GPT root PARTUUID {root}"
         );
+        self.check_esp_extent(esp)
+    }
+
+    pub fn check_esp_extent(&self, esp: (u64, u64)) -> Result<()> {
         ensure!(
             self.partitions
                 .values()
