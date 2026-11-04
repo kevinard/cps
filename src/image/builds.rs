@@ -3,33 +3,13 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::{Publishers, State};
+use super::{Publishers, State, catalogs};
 use crate::{
     attestation::ATTESTATION_LIMIT,
-    repo::{BuildReceipt, CATALOG_LIMIT, ReleaseProfile, archived_release_profile, catalog_bytes},
+    repo::{BuildReceipt, CATALOG_LIMIT, ReleaseProfile, archived_release_profile},
 };
 
 const RECEIPT_LIMIT: u64 = 128 * 1024;
-
-pub(super) fn save_profile(tx: &Transaction<'_>, state: &State) -> Result<()> {
-    let Some(hash) = &state.settings.archived_profile_catalog else {
-        return Ok(());
-    };
-    let primary = &state.publishers.as_slice()[0];
-    let bytes =
-        catalog_bytes(&primary.repo, hash).context("archiving the signed profile catalog")?;
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS build_profile (
-            id INTEGER PRIMARY KEY CHECK(id=1), catalog BLOB NOT NULL
-         )",
-    )?;
-    tx.execute(
-        "INSERT INTO build_profile VALUES (1, ?1)
-         ON CONFLICT(id) DO UPDATE SET catalog=excluded.catalog WHERE catalog!=excluded.catalog",
-        [bytes],
-    )?;
-    Ok(())
-}
 
 pub(super) fn read_profile_catalog(db: &Connection) -> Result<Vec<u8>> {
     let bytes: Option<Vec<u8>> = db
@@ -44,19 +24,24 @@ pub(super) fn read_profile_catalog(db: &Connection) -> Result<Vec<u8>> {
 }
 
 pub(super) fn read_profile(db: &Connection, state: &State) -> Result<Option<ReleaseProfile>> {
-    let Some(hash) = &state.settings.archived_profile_catalog else {
+    let Some(name) = state.publishers.release_profile() else {
         return Ok(None);
     };
-    let name = state
-        .publishers
-        .release_profile()
-        .context("missing image profile")?;
     let (primary, companions) = state
         .publishers
         .as_slice()
         .split_first()
         .context("missing primary publisher")?;
-    let bytes = read_profile_catalog(db)?;
+    let (hash, bytes) = if state.settings.catalog_archives {
+        let Some(point) = state.settings.catalog_checkpoints.get(&primary.name) else {
+            return Ok(None);
+        };
+        (&point.catalog, catalogs::read(db, &primary.name)?)
+    } else if let Some(hash) = &state.settings.archived_profile_catalog {
+        (hash, read_profile_catalog(db)?)
+    } else {
+        return Ok(None);
+    };
     let profile = archived_release_profile(&bytes, hash, &primary.name, &primary.key, name)?;
     profile.check_image(
         name,

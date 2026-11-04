@@ -54,12 +54,14 @@ struct AvailablePackage {
 }
 
 fn available(
+    image: &Image,
+    publishers: &Publishers,
     settings: &Settings,
     publisher: &Publisher,
     pin: Option<&CatalogPin>,
 ) -> Result<(Vec<AvailablePackage>, BTreeMap<String, Version>)> {
     let index = catalog_index(&publisher.repo, &publisher.name, &publisher.key, pin)?;
-    settings.check_catalog(&publisher.name, &index.checkpoint)?;
+    image.check_catalog(publishers, settings, publisher, &index.checkpoint)?;
     let mut entries = Vec::new();
     for (id, entry) in index.entries {
         if !entry.supports_architecture(&settings.arch) {
@@ -122,8 +124,13 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
     let mut entries = Vec::new();
     let mut blocked = BTreeSet::new();
     for publisher in publishers.as_slice() {
-        let (mut catalog, obsoletions) =
-            available(&settings, publisher, pins.get(&publisher.name))?;
+        let (mut catalog, obsoletions) = available(
+            &image,
+            &publishers,
+            &settings,
+            publisher,
+            pins.get(&publisher.name),
+        )?;
         if scope == Scope::Available {
             let from_source = |name: &str| {
                 installed
@@ -184,8 +191,13 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
             if source.is_some_and(|name| publisher.name != name) {
                 continue;
             }
-            let (entries, obsoletions) =
-                available(&settings, publisher, pins.get(&publisher.name))?;
+            let (entries, obsoletions) = available(
+                &image,
+                &publishers,
+                &settings,
+                publisher,
+                pins.get(&publisher.name),
+            )?;
             let mut named = entries
                 .into_iter()
                 .filter(|entry| entry.name == selector.name)

@@ -2047,14 +2047,16 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     {
         let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
         db.execute(
-            "UPDATE image SET data=json_remove(data, '$.build_profile_catalog') WHERE id=1",
+            "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'), '$.format', 5)
+             WHERE id=1",
             [],
         )?;
         let error = plan(&f.root, Request::Update).unwrap_err();
         assert!(format!("{error:#}").contains("release drops or changes the withdrawal"));
         db.execute(
-            "UPDATE image SET data=json_set(data, '$.build_profile_catalog', ?1) WHERE id=1",
-            [applied.trim()],
+            "UPDATE image SET data=json_set(data, '$.catalog_archives', json('true'), '$.format', 6)
+             WHERE id=1",
+            [],
         )?;
     }
     fs::remove_file(f.repo.join("catalogs").join(applied.trim()))?;
@@ -2100,6 +2102,157 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     assert_eq!(plan(&f.root, Request::Update)?, good_plan);
     apply(&f.root, &good_plan)?;
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    Ok(())
+}
+
+#[test]
+fn standalone_and_companion_publishers_keep_withdrawals_after_cache_replacement() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    for name in [
+        "library/runtime",
+        "test/retired",
+        "test/successor",
+        "test/fork-one",
+        "test/fork-two",
+    ] {
+        seed.package_as("seed", name, "1.0.0-0", String::new())?;
+    }
+    f.package(
+        "desktop/base",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "base", "0755", "")? + "    require \"library/runtime\"\n",
+    )?;
+    let retire = |name| {
+        withdraw_package(
+            &seed.repo,
+            &seed.private,
+            &format!("cps://seed/test/{name}@1.0.0-0"),
+        )
+    };
+    let primary_pointer = f.repo.join("current");
+    let seed_pointer = seed.repo.join("current");
+    let publish_profile = || -> Result<()> {
+        let pin = fs::read_to_string(&seed_pointer)?;
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "unused.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/base"
+        publisher "seed" catalog={:?} {{
+            repository {:?}
+            trust-key {:?}
+        }}
+    }}
+}}
+"#,
+                pin.trim(),
+                seed.repo,
+                seed.public,
+            ),
+        )?;
+        let release = f._dir.path().join("refresh.kdl");
+        let base = fs::read_to_string(&primary_pointer)?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                base.trim(),
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)?;
+        Ok(())
+    };
+    publish_profile()?;
+    let primary_branch = fs::read_to_string(&primary_pointer)?;
+    let seed_branch = fs::read_to_string(&seed_pointer)?;
+    retire("retired")?;
+    let applied_seed = fs::read_to_string(&seed_pointer)?;
+    publish_profile()?;
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            f.repo, f.public, seed.repo, seed.public,
+        ),
+    )?;
+    let plain = f._dir.path().join("plain");
+    create_image(
+        &plain,
+        &seed.repo,
+        "seed",
+        &seed.public,
+        "x86_64",
+        BTreeMap::new(),
+    )?;
+    apply(
+        &plain,
+        &plan(
+            &plain,
+            Request::Install {
+                packages: vec!["library/runtime".into()],
+            },
+        )?,
+    )?;
+    create_configured_image(&f.root, &config)?;
+    let install = plan(&f.root, Request::InstallProfile)?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("pending.json"),
+        &install,
+        COMPOSITOR,
+    )?;
+    for repo in [&f.repo, &seed.repo] {
+        fs::rename(repo, repo.with_extension("offline"))?;
+    }
+    apply(&f.root, &install)?;
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    for repo in [&f.repo, &seed.repo] {
+        fs::rename(repo.with_extension("offline"), repo)?;
+    }
+
+    retire("successor")?;
+    publish_profile()?;
+    let good_primary = fs::read_to_string(&primary_pointer)?;
+    let good_seed = fs::read_to_string(&seed_pointer)?;
+    let good_plan = plan(&f.root, Request::Update)?;
+
+    fs::write(&seed_pointer, seed_branch)?;
+    fs::write(&primary_pointer, primary_branch)?;
+    retire("fork-one")?;
+    publish_profile()?;
+    retire("fork-two")?;
+    publish_profile()?;
+    fs::remove_file(seed.repo.join("catalogs").join(applied_seed.trim()))?;
+    let reason = "release drops or changes the withdrawal for cps://seed/test/retired";
+    for image in [&f.root, &plain] {
+        let error = plan(image, Request::Update).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        let error = list_packages(image, Scope::Available).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        let error = package_manifest(image, "cps://seed/library/runtime", true).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+    }
+    let mut fork = good_plan.clone();
+    for (publisher, pointer) in [("canopa", &primary_pointer), ("seed", &seed_pointer)] {
+        fork.catalogs
+            .insert(publisher.into(), fs::read_to_string(pointer)?.trim().into());
+    }
+    let error = apply(&f.root, &fork).unwrap_err();
+    assert!(format!("{error:#}").contains(reason), "{error:#}");
+    fs::write(primary_pointer, good_primary)?;
+    fs::write(seed_pointer, good_seed)?;
+    apply(&f.root, &good_plan)?;
+    apply(&plain, &plan(&plain, Request::Update)?)?;
     Ok(())
 }
 
@@ -2582,16 +2735,20 @@ publisher "seed" {{
 
     let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
     assert_eq!(
-        db.execute("UPDATE build_profile SET catalog=?1", [old_catalog])?,
+        db.execute(
+            "UPDATE catalog_archives SET catalog=?1 WHERE publisher='canopa'",
+            [old_catalog],
+        )?,
         1,
     );
     let Err(error) = crate::audit_publisher_builds(&f.root, "seed") else {
         panic!("audit accepted a different signed profile catalog");
     };
-    assert!(format!("{error:#}").contains("archived profile catalog digest mismatch"));
+    assert!(format!("{error:#}").contains("archived catalog digest mismatch"));
     assert_eq!(
         db.execute(
-            "UPDATE image SET data=json_set(data, '$.build_profile_catalog', ?1) WHERE id=1",
+            "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'),
+             '$.build_profile_catalog', ?1, '$.format', 5) WHERE id=1",
             [first],
         )?,
         1,

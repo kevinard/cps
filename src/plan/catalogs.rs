@@ -331,9 +331,12 @@ pub(super) fn load(
             snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
         }
         .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
-        state
-            .settings
-            .check_catalog(&publisher.name, &snapshot.builds.history)?;
+        image.check_catalog(
+            &state.publishers,
+            &state.settings,
+            publisher,
+            &snapshot.builds.history,
+        )?;
         catalogs
             .checkpoints
             .insert(publisher.name.clone(), snapshot.builds.history.clone());

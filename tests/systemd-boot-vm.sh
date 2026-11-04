@@ -21,7 +21,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-5}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-6}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -44,6 +44,7 @@ util_linux_package=cps://canopa-util-linux/system/util-linux@2.42.4-0
 systemd_efi=usr/lib/systemd/boot/efi/systemd-bootx64.efi
 profiled=false
 signed_cps_builds=false
+protected_profiles=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
 if [[ -n $systemd_fixture ]]; then
@@ -100,7 +101,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-2|0.1.0-3|0.1.0-4|0.1.0-5) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-2|0.1.0-3|0.1.0-4|0.1.0-5|0.1.0-6) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -119,7 +120,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-3|0.1.0-4|0.1.0-5) signed_cps_builds=true ;;
+        0.1.0-3|0.1.0-4|0.1.0-5|0.1.0-6) signed_cps_builds=true ;;
+    esac
+    case $cps_version in
+        0.1.0-5|0.1.0-6) protected_profiles=true ;;
     esac
 fi
 if [[ -n $kernel_fixture ]]; then
@@ -370,7 +374,7 @@ if $systemd_guest; then
         for path in "${cps_library_paths[@]}"; do rm -f -- "runtime/$path"; done
         touch runtime/etc/cps-vm-assert-cps-runtime
         if $signed_cps_builds; then touch runtime/etc/cps-vm-assert-cps-builds; fi
-        if $profiled && [[ $cps_version == 0.1.0-5 ]]; then
+        if $protected_profiles; then
             touch runtime/etc/cps-vm-assert-profile-protection
         fi
     else
@@ -878,7 +882,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$audits" = $'CPS_VM_CPS_BUILDS: trial verified\nCPS_VM_CPS_BUILDS: trial verified'
             printf '%s\n' "$audits"
         fi
-        if $profiled && [[ $cps_version == 0.1.0-5 ]]; then
+        if $protected_profiles; then
             protections=$(tr -d '\r' < serial.log | grep '^CPS_VM_PROFILE_PROTECTION: ')
             test "$protections" = $'CPS_VM_PROFILE_PROTECTION: trial verified\nCPS_VM_PROFILE_PROTECTION: trial verified'
             printf '%s\n' "$protections"
@@ -948,7 +952,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         if $signed_cps_builds; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_CPS_BUILDS: previous verified'
         fi
-        if $profiled && [[ $cps_version == 0.1.0-5 ]]; then
+        if $protected_profiles; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_PROFILE_PROTECTION: previous verified'
         fi
         if [[ -n $systemd_fixture ]]; then

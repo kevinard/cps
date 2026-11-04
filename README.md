@@ -201,7 +201,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-5`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-6`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -521,14 +521,14 @@ known rotation. The check works with a replacement cache that lacks the
 previous catalog. An unsequenced legacy catalog starts providing sequence
 protection when the image first applies a sequenced catalog.
 
-When an image follows a signed release profile, CPS also archives the full
-primary catalog it applied. Before accepting a different primary catalog,
-CPS checks it against that signed archive. The new catalog must preserve
-published manifests, withdrawals, obsoletions, and profile safeguards even
-when the configured cache no longer has the earlier catalog. For an
-existing image with only the compact checkpoint, CPS checks the earlier
-catalog if it is still cached. The next repository-backed profile
-transaction creates the image archive.
+CPS also archives one signed catalog per applied publisher. A different
+catalog must preserve published manifests, withdrawals, obsoletions, and
+profile safeguards, even when the cache lacks the earlier catalog. This
+applies to both profile companions and independently configured publishers.
+For an image with only a compact checkpoint, CPS checks the earlier
+catalog if it is still cached. The next repository-backed transaction
+creates the per-publisher archives. Upgrade CPS in the target image before
+that transaction so it can read the new image format.
 
 Each boot environment keeps its own checkpoints. An older release can still
 be installed into a new image using its signed bootstrap catalog or booted

@@ -1,4 +1,5 @@
 mod builds;
+mod catalogs;
 pub(crate) mod publishers;
 pub(crate) mod root;
 
@@ -33,6 +34,8 @@ const BOOTSTRAP_IMAGE_FORMAT: u32 = 3;
 const CHECKPOINT_IMAGE_FORMAT: u32 = 4;
 // Older writers would discard the installed profile's package requirements.
 const PROFILE_IMAGE_FORMAT: u32 = 5;
+// Older writers would advance checkpoints without keeping the catalogs.
+const CATALOG_ARCHIVE_IMAGE_FORMAT: u32 = 6;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
@@ -59,6 +62,8 @@ pub struct Settings {
     pub(crate) archived_profile_catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalog_checkpoints: BTreeMap<String, CatalogCheckpoint>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) catalog_archives: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) profile_packages: BTreeMap<String, String>,
     // Absent on images that predate tracking. Their proposals are discovered
@@ -174,6 +179,8 @@ impl Publishers {
     pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
         if settings.bootstrap_catalog.is_some() {
             BOOTSTRAP_IMAGE_FORMAT
+        } else if settings.catalog_archives {
+            CATALOG_ARCHIVE_IMAGE_FORMAT
         } else if !settings.profile_packages.is_empty() {
             PROFILE_IMAGE_FORMAT
         } else if !settings.catalog_checkpoints.is_empty() {
@@ -399,6 +406,7 @@ fn initialize(
         bootstrap_catalog,
         archived_profile_catalog: None,
         catalog_checkpoints: BTreeMap::new(),
+        catalog_archives: false,
         profile_packages: BTreeMap::new(),
         config_updates: Some(BTreeMap::new()),
     };
@@ -543,6 +551,7 @@ impl Image {
                     | BOOTSTRAP_IMAGE_FORMAT
                     | CHECKPOINT_IMAGE_FORMAT
                     | PROFILE_IMAGE_FORMAT
+                    | CATALOG_ARCHIVE_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -558,6 +567,12 @@ impl Image {
                     || (publishers.release_profile().is_some()
                         && settings.catalog_checkpoints.is_empty())),
             "image format does not match its repository policy"
+        );
+        ensure!(
+            !settings.catalog_archives
+                || (settings.archived_profile_catalog.is_none()
+                    && settings.bootstrap_catalog.is_none()),
+            "catalog archives conflict with legacy profile state"
         );
         ensure!(
             settings.profile_packages.is_empty()
@@ -657,7 +672,7 @@ impl Image {
     ) -> Result<()> {
         let tx = self.db.transaction()?;
         if repo_backed {
-            builds::save_profile(&tx, next)?;
+            catalogs::save(&tx, next)?;
         }
         builds::save(&tx, &next.publishers, receipts)?;
         tx.execute(
@@ -701,6 +716,9 @@ impl Image {
             )?;
         }
         builds::prune(&tx, state)?;
+        if state.settings.catalog_archives {
+            tx.execute("DROP TABLE IF EXISTS build_profile", [])?;
+        }
         tx.execute("DELETE FROM paths", [])?;
         for (path, managed) in &state.paths {
             tx.execute(

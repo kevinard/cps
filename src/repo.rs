@@ -777,7 +777,7 @@ pub(crate) fn audit_installed_builds<'a>(
     publisher: &str,
     key: &[u8],
     pin: Option<&CatalogPin>,
-    previous: Option<&CatalogCheckpoint>,
+    check: impl FnOnce(&CatalogCheckpoint) -> Result<()>,
     trust: &BuildTrust,
     installed: impl IntoIterator<Item = &'a Published>,
 ) -> Result<BuildAudit> {
@@ -791,9 +791,7 @@ pub(crate) fn audit_installed_builds<'a>(
         sequence: catalog.sequence,
         rotations: catalog.key_rotations.clone(),
     };
-    if let Some(previous) = previous {
-        previous.check(&history)?;
-    }
+    check(&history)?;
     for package in installed {
         let id = package.manifest.id();
         let installed_record = || {
@@ -1146,14 +1144,11 @@ fn decode_archived_catalog(
     publisher: &str,
     key: &[u8],
 ) -> Result<Catalog> {
-    ensure!(
-        digest(bytes) == hash,
-        "archived profile catalog digest mismatch"
-    );
+    ensure!(digest(bytes) == hash, "archived catalog digest mismatch");
     decode_catalog(bytes, hash, publisher, keys::Trust::Anchor(key))
 }
 
-pub(crate) fn check_profile_successor(
+pub(crate) fn check_catalog_successor(
     repo: &Path,
     publisher: &str,
     key: &[u8],

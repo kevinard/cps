@@ -452,18 +452,8 @@ pub(crate) fn build(
                 state.settings.check_profile_packages(&installed)?;
             }
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
-            if catalogs.profile.is_some() {
-                let primary = &state.publishers.as_slice()[0];
-                state.settings.archived_profile_catalog = Some(
-                    state
-                        .settings
-                        .catalog_checkpoints
-                        .get(&primary.name)
-                        .context("missing primary catalog for signed profile")?
-                        .catalog
-                        .clone(),
-                );
-            }
+            state.settings.catalog_archives = true;
+            state.settings.archived_profile_catalog = None;
             (installed, paths)
         }
     };

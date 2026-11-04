@@ -6,14 +6,14 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Image, Publisher, Publishers, Settings, State, builds};
+use super::{Image, Publisher, Publishers, Settings, State, builds, catalogs};
 use crate::{
     attestation::BuildTrust,
     kdl_format::read_build_trust,
     model::validate_publisher,
     repo::{
         BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
-        audit_installed_builds, catalog_index, check_profile_successor, release_profile,
+        audit_installed_builds, catalog_index, release_profile,
     },
 };
 
@@ -50,23 +50,13 @@ impl Image {
             settings.bootstrap_catalog.as_deref().or(primary_pin),
             checkpoint,
         )?;
-        let archived_hash = settings.archived_profile_catalog.as_deref();
-        let previous = archived_hash.or(checkpoint.map(|point| point.catalog.as_str()));
-        if let (Some(selected), Some(previous)) = (&selected, previous)
-            && previous != selected.primary.sha256
-        {
-            let archived = archived_hash
-                .map(|_| builds::read_profile_catalog(&self.db))
-                .transpose()?;
-            check_profile_successor(
-                &primary.repo,
-                &primary.name,
-                &primary.key,
-                previous,
-                archived.as_deref(),
+        if let Some(selected) = &selected {
+            self.check_catalog_transition(
+                settings,
+                primary,
                 &selected.primary.sha256,
-            )
-            .with_context(|| format!("checking profile catalog successor for {}", primary.name))?;
+                settings.archived_profile_catalog.as_deref(),
+            )?;
         }
         Ok(selected)
     }
@@ -165,7 +155,7 @@ pub fn add_publisher_with_build_trust(
             name,
             &publisher.key,
             None,
-            None,
+            |_| Ok(()),
             &trust,
             [],
         )?;
@@ -269,7 +259,7 @@ fn audit(
                 &publisher.name,
                 &publisher.key,
                 pins.get(&publisher.name),
-                state.settings.catalog_checkpoints.get(&publisher.name),
+                |next| image.check_catalog(&state.publishers, &state.settings, publisher, next),
                 trust,
                 missing.iter().copied(),
             )
@@ -394,6 +384,7 @@ fn save(image: &mut Image, publishers: Publishers, receipts: &[BuildReceipt]) ->
         .context("publisher generation exhausted")?;
     let tx = image.db.transaction()?;
     builds::save(&tx, &publishers, receipts)?;
+    catalogs::retain(&tx, &settings)?;
     tx.execute(
         "UPDATE publishers SET data=?1 WHERE id=1",
         [serde_json::to_string(&publishers)?],
