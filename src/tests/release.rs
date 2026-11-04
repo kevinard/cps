@@ -358,19 +358,26 @@ fn upgrade_profile_reuses_signed_baseline_roots_and_companions() -> Result<()> {
     let root_dir = format!("    dir \"opt/pinned-root\" mode=\"0755\" uid={uid} gid={gid}\n");
     let companion_dir =
         format!("    dir \"opt/pinned-companion\" mode=\"0755\" uid={uid} gid={gid}\n");
-    let dependency = "    require \"library/runtime\"\n";
+    let runtime_requirement = "    require \"library/runtime\"\n";
     seed.package_as("seed", "library/runtime", "1.0.0-0", companion_dir.clone())?;
     let old_pin = fs::read_to_string(seed.repo.join("current"))?;
     f.package(
         "desktop/compositor",
         "1.0.0-0",
-        format!("{dependency}{root_dir}"),
+        format!("{runtime_requirement}{root_dir}"),
     )?;
     let replacement = f.file("opt/pinned-root", "replacement", "0644", "")?;
     f.package(
         "desktop/compositor",
         "2.0.0-0",
-        format!("{dependency}{replacement}"),
+        format!("{runtime_requirement}{replacement}"),
+    )?;
+    f.package("desktop/addon", "1.0.0-0", String::new())?;
+    f.package("desktop/addon", "2.0.0-0", String::new())?;
+    f.package(
+        "desktop/runtime-plugin",
+        "1.0.0-0",
+        dependency("require", "library/runtime", "1.0.0-0"),
     )?;
     f.package("test/retire", "1.0.0-0", String::new())?;
 
@@ -425,6 +432,11 @@ publisher "canopa" {{
         &refresh,
         "image configuration differs from the signed baseline",
     )?;
+    write_policy("1.0.0-0", &old_pin, "", "")?;
+    assert_eq!(
+        publish_release(&f.repo, &f.private, &refresh)?,
+        signed_base.trim()
+    );
 
     let config = f._dir.path().join("image.kdl");
     fs::write(
@@ -459,6 +471,63 @@ publisher "seed" {{
     }));
     let error = plan(&f.root, Request::InstallProfile).unwrap_err();
     assert!(format!("{error:#}").contains("requires an image with no installed packages"));
+    let same_release = plan(&f.root, Request::Update)?;
+    assert_eq!(same_release.request, Request::UpdateProfile);
+    assert!(!same_release.summary().contains("Update "));
+    let newer_root = f._dir.path().join("locally-newer-image");
+    create_configured_image(&newer_root, &config)?;
+    let manual = plan(
+        &newer_root,
+        Request::Install {
+            packages: vec!["desktop/compositor@2.0.0-0".to_owned()],
+        },
+    )?;
+    apply(&newer_root, &manual)?;
+    let error = plan(&newer_root, Request::Update).unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("signed profile would downgrade cps://canopa/desktop/compositor@2.0.0-0"),
+        "{error:#}"
+    );
+    let legacy = {
+        let image = crate::image::Image::open(&newer_root, false)?;
+        crate::plan::build(
+            &image.root,
+            image.state()?,
+            Request::Update,
+            Some(&manual),
+            manual.solver,
+        )?
+        .0
+    };
+    assert_eq!(legacy.request, Request::Update);
+    apply(&newer_root, &legacy)?;
+    package_manifest(
+        &newer_root,
+        "cps://canopa/desktop/compositor@2.0.0-0",
+        false,
+    )?;
+
+    let conflicting_root = f._dir.path().join("conflicting-image");
+    create_configured_image(&conflicting_root, &config)?;
+    apply(
+        &conflicting_root,
+        &plan(&conflicting_root, Request::InstallProfile)?,
+    )?;
+    let plugin = plan(
+        &conflicting_root,
+        Request::Install {
+            packages: vec!["desktop/runtime-plugin".to_owned()],
+        },
+    )?;
+    apply(&conflicting_root, &plugin)?;
+    let addon = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/addon@1.0.0-0".to_owned()],
+        },
+    )?;
+    apply(&f.root, &addon)?;
 
     write_policy("2.0.0-0", &old_pin, "", "")?;
     rejected(
@@ -514,7 +583,18 @@ publisher "seed" {{
         "{error:#}"
     );
     assert_eq!(fs::read_to_string(&pointer)?.trim(), next);
+    let error = plan(&conflicting_root, Request::Update).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("library/runtime"),
+        "{error:#}"
+    );
+    package_manifest(
+        &conflicting_root,
+        "cps://seed/library/runtime@1.0.0-0",
+        false,
+    )?;
     let upgrade = plan(&f.root, Request::Update)?;
+    assert_eq!(upgrade.request, Request::UpdateProfile);
     assert_eq!(upgrade.catalogs["seed"], latest_pin.trim());
     let staged = f._dir.path().join("staged");
     crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
@@ -522,6 +602,9 @@ publisher "seed" {{
     assert!(staged.join("opt/pinned-companion").is_dir());
     package_manifest(&staged, "cps://seed/library/runtime@3.0.0-0", false)?;
     package_manifest(&f.root, "cps://seed/library/runtime@1.0.0-0", false)?;
+    assert!(list_packages(&staged, Scope::Installed)?.iter().any(|row| {
+        row.id == "cps://canopa/desktop/addon@2.0.0-0" && row.status == Status::Explicit
+    }));
     Ok(())
 }
 
@@ -1148,6 +1231,13 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(fs::read(f.root.join(payload))?, b"old");
     apply(&fresh_root, &new_plan)?;
     assert_eq!(fs::read(fresh_root.join(payload))?, b"latest");
+    let update = plan(&f.root, Request::Update)?;
+    assert_eq!(update.request, Request::UpdateProfile);
+    assert_eq!(update.catalogs["seed"], latest.trim());
+    let staged = work.join("staged-profile");
+    crate::stage_boot_environment(&f.root, &staged, &update)?;
+    assert_eq!(fs::read(staged.join(payload))?, b"latest");
+    assert_eq!(fs::read(f.root.join(payload))?, b"old");
     Ok(())
 }
 

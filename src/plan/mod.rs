@@ -45,6 +45,7 @@ pub enum Request {
     Repair { packages: Vec<String> },
     ResolveConfig { path: String, take: ConfigChoice },
     Update,
+    UpdateProfile,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -266,6 +267,7 @@ pub(crate) fn build(
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let mut catalogs = catalogs::Catalogs::default();
     let mut receipts = Vec::new();
+    let mut update_profile = matches!(request, Request::UpdateProfile);
     let (installed, paths) = match &request {
         Request::Repair { .. } | Request::ResolveConfig { .. } => {
             let paths = crate::verify::manifest_paths(&state)?;
@@ -307,6 +309,13 @@ pub(crate) fn build(
                 _ => BTreeMap::new(),
             };
             catalogs = catalogs::load(&state, &requested, saved)?;
+            update_profile |= saved.is_none()
+                && matches!(request, Request::Update)
+                && !state.installed.is_empty()
+                && catalogs
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| !profile.composition.is_empty());
             let (installed, paths) = if install_profile {
                 let profile = catalogs
                     .profile
@@ -319,6 +328,21 @@ pub(crate) fn build(
                 let installed = catalogs.candidates.replay(profile)?;
                 let paths = effective_paths(&state.settings, &installed)?;
                 (installed, paths)
+            } else if update_profile {
+                let profile = catalogs
+                    .profile
+                    .as_ref()
+                    .context("missing signed release profile")?;
+                ensure!(
+                    !profile.composition.is_empty(),
+                    "signed release profile has no recorded composition"
+                );
+                catalogs.candidates.update_profile(
+                    &state.installed,
+                    profile,
+                    solver,
+                    |installed| effective_paths(&state.settings, installed),
+                )?
             } else {
                 resolve::resolve(
                     &state.installed,
@@ -361,7 +385,11 @@ pub(crate) fn build(
         prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
-        request,
+        request: if update_profile {
+            Request::UpdateProfile
+        } else {
+            request
+        },
         selected: installed
             .iter()
             .map(|(name, pkg)| (name.clone(), pkg.published.sha256.clone()))

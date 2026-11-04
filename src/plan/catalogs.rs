@@ -2,7 +2,7 @@ use std::{borrow::Borrow, collections::BTreeMap};
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Plan, resolve};
+use super::{Plan, SolverRevision, resolve};
 use crate::{
     attestation::BuildTrust,
     image::{Installed, State},
@@ -112,6 +112,65 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         }
         resolve::check(&installed).context("checking dependencies of the signed composition")?;
         Ok(installed)
+    }
+
+    pub(crate) fn update_profile<T>(
+        &self,
+        before: &BTreeMap<String, Installed>,
+        profile: &ReleaseProfile,
+        solver: Option<SolverRevision>,
+        compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
+    ) -> Result<(BTreeMap<String, Installed>, T)> {
+        let locked = self.replay(profile)?;
+        let mut requested = BTreeMap::new();
+        for (name, package) in &locked {
+            let manifest = &package.published.manifest;
+            if let Some(previous) = before.get(name) {
+                let previous = &previous.published.manifest;
+                ensure!(
+                    previous.publisher == manifest.publisher,
+                    "signed profile would change the publisher of {}",
+                    previous.id()
+                );
+                ensure!(
+                    previous.version <= manifest.version,
+                    "signed profile would downgrade {} to {}",
+                    previous.id(),
+                    manifest.version
+                );
+            }
+            requested.insert(
+                name.as_str(),
+                PackageSpec {
+                    publisher: Some(&manifest.publisher),
+                    name,
+                    version: Some(manifest.version),
+                },
+            );
+        }
+        let packages = self.packages.iter().map(Borrow::borrow).filter(|pkg| {
+            profile
+                .composition
+                .get(&pkg.manifest.name)
+                .is_none_or(|hash| hash == &pkg.sha256)
+        });
+        let (mut installed, paths) = resolve::resolve(
+            before,
+            resolve::Candidates {
+                packages,
+                obsoletions: &self.obsoletions,
+            },
+            &requested,
+            true,
+            false,
+            solver,
+            compose,
+        )?;
+        for (name, package) in &mut installed {
+            package.explicit = profile.roots.contains_key(name)
+                || before.get(name).is_some_and(|old| old.explicit);
+        }
+        Ok((installed, paths))
     }
 
     pub(crate) fn add_obsoletions<'a>(

@@ -394,14 +394,17 @@ those roots. The architecture, facets, and publisher order must match the
 baseline image configuration. For catalogs without recorded roots, CPS
 selects the newest baseline versions of the current profile's root names.
 
-CPS runs the ordinary update solver with the resulting installed set. The
-result must reach the candidate profile's requested versions, retain only
-packages available in the candidate, and pass the planner's directory and
-kernel transition checks. This models the package-managed state of a clean
-image. Live filesystem changes and boot health are checked during staging and
-boot. A profile that records its roots retains its image configuration across
-releases. Use a separate profile name for a new configuration. Upgrade clients
-before publishing profiles with signed compositions.
+CPS runs the update planner with the resulting installed set. For a signed
+baseline profile, the candidate's signed package set supplies exact
+constraints. A baseline catalog without a signed profile uses the ordinary
+solver with the candidate's root versions as the acceptance check. The
+result must retain only packages available in the candidate and pass the
+planner's directory and kernel transition checks. This models the managed
+package state of a clean image. Live changes and boot health are checked during
+staging and boot. A profile that records its roots retains its image
+configuration across releases. Use a separate profile name for a new
+configuration. Upgrade clients before publishing profiles with signed
+compositions.
 
 For a native x86-64 or AArch64 profile, add `elf-check` with the image's
 ordered default library directories.
@@ -777,6 +780,14 @@ normal transaction. It marks the profile roots as explicitly installed.
 Older profiles can still be used with ordinary `plan install`. Use
 `repo publish-release` with `refresh-profiles=#true` to record the
 composition before using `install-profile`.
+
+On a profiled image with installed packages, `plan update` uses the current
+profile's exact package set. It can add newly required packages and update
+compatible local additions. It preserves explicit install marks for local
+packages, and signed obsoletion rules still retire old packages. A profile
+update fails if reaching the signed set requires a downgrade or a publisher
+switch. Save and apply the plan normally, or stage it in a boot environment.
+Existing saved update plans retain the selection rules used to create them.
 
 Available-package queries and new plans use the primary publisher's current
 catalog and the companion digests it signs. Saved plans use their original

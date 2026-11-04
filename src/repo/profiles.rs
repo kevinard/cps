@@ -203,6 +203,25 @@ pub(super) fn check(
             .with_context(|| format!("checking companion builds for release profile {name}"))?;
         runtime::check(repo, &catalog.publisher, profile, &target, &paths)
             .with_context(|| format!("checking ELF closure for release profile {name}"))?;
+        let next = ReleaseProfile {
+            architecture: profile.arch.clone(),
+            facets: profile.facets.clone(),
+            roots: profile
+                .packages
+                .keys()
+                .map(|name| (name.clone(), target[name].published.manifest.version))
+                .collect(),
+            composition: target
+                .iter()
+                .map(|(name, package)| (name.clone(), package.published.sha256.clone()))
+                .collect(),
+            companions: companions
+                .iter()
+                .map(|companion| companion.pin.clone())
+                .collect(),
+            elf_library_dirs: profile.elf_library_dirs.clone(),
+            elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
+        };
         let explicit = profile.upgrade_from.as_deref();
         let immediate = current_hash.filter(|hash| {
             Some(*hash) != explicit
@@ -222,10 +241,11 @@ pub(super) fn check(
                         entry.insert((baseline, packages))
                     }
                 };
+                let historical = baseline.release_profiles.get(name);
                 let (before, old_paths) = baseline_image(
                     baseline,
                     baseline_packages,
-                    baseline.release_profiles.get(name),
+                    historical,
                     profile,
                     &companions,
                     explicit,
@@ -242,34 +262,20 @@ pub(super) fn check(
                         .map(|companion| (companion.name, &companion.current)),
                     sticky,
                 );
-                let (after, paths) = check_upgrade(&before, old_paths, &current, &target, profile)?;
+                let (after, paths) = check_upgrade(
+                    &before,
+                    old_paths,
+                    &current,
+                    &target,
+                    &next,
+                    historical.is_some(),
+                )?;
                 check_companion_builds(&companions, &after)?;
                 runtime::check(repo, &catalog.publisher, profile, &after, &paths)
             })()
             .with_context(|| format!("checking upgrade from {hash} for release profile {name}"))?;
         }
-        checked.insert(
-            name.clone(),
-            ReleaseProfile {
-                architecture: profile.arch.clone(),
-                facets: profile.facets.clone(),
-                roots: profile
-                    .packages
-                    .keys()
-                    .map(|name| (name.clone(), target[name].published.manifest.version))
-                    .collect(),
-                composition: target
-                    .into_iter()
-                    .map(|(name, package)| (name, package.published.sha256))
-                    .collect(),
-                companions: companions
-                    .into_iter()
-                    .map(|companion| companion.pin)
-                    .collect(),
-                elf_library_dirs: profile.elf_library_dirs.clone(),
-                elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
-            },
-        );
+        checked.insert(name.clone(), next);
     }
     Ok(checked)
 }
@@ -457,33 +463,42 @@ fn check_upgrade(
     old_paths: BTreeMap<String, Managed>,
     catalogs: &CandidateSet<&Published>,
     target: &BTreeMap<String, Installed>,
-    profile: &Profile,
+    profile: &ReleaseProfile,
+    locked: bool,
 ) -> Result<Composition> {
-    let (after, new_paths) = resolve_packages(
-        before,
-        Candidates {
-            packages: catalogs.packages.iter().copied(),
-            obsoletions: &catalogs.obsoletions,
-        },
-        &BTreeMap::new(),
-        true,
-        false,
-        Some(SolverRevision::SatV1),
-        |installed| profile_paths(&profile.arch, &profile.facets, installed),
-    )?;
-    for name in profile.packages.keys() {
-        let expected = &target[name].published;
-        let selected = &after
-            .get(name)
-            .with_context(|| format!("update removes profile root {name}"))?
-            .published;
-        ensure!(
-            selected.sha256 == expected.sha256,
-            "update selects {} instead of {}",
-            selected.manifest.id(),
-            expected.manifest.id(),
-        );
-    }
+    let solver = Some(SolverRevision::SatV1);
+    let compose = |installed: &_| profile_paths(&profile.architecture, &profile.facets, installed);
+    let (after, new_paths) = if locked {
+        catalogs.update_profile(before, profile, solver, compose)?
+    } else {
+        let result = resolve_packages(
+            before,
+            Candidates {
+                packages: catalogs.packages.iter().copied(),
+                obsoletions: &catalogs.obsoletions,
+            },
+            &BTreeMap::new(),
+            true,
+            false,
+            solver,
+            compose,
+        )?;
+        for name in profile.roots.keys() {
+            let expected = &target[name].published;
+            let selected = &result
+                .0
+                .get(name)
+                .with_context(|| format!("update removes profile root {name}"))?
+                .published;
+            ensure!(
+                selected.sha256 == expected.sha256,
+                "update selects {} instead of {}",
+                selected.manifest.id(),
+                expected.manifest.id(),
+            );
+        }
+        result
+    };
     let available: BTreeSet<_> = catalogs.packages.iter().map(|pkg| &pkg.sha256).collect();
     for package in after.values() {
         let id = package.published.manifest.id();
