@@ -547,6 +547,14 @@ impl Image {
                 publishers.release_profile().is_some() && settings.bootstrap_catalog.is_none(),
                 "archived build policy requires an installed release profile"
             );
+            let primary = &publishers.as_slice()[0];
+            ensure!(
+                settings
+                    .catalog_checkpoints
+                    .get(&primary.name)
+                    .is_none_or(|checkpoint| checkpoint.catalog == *hash),
+                "archived build policy differs from the installed primary catalog"
+            );
         }
         Ok(State {
             settings,

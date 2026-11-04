@@ -1278,8 +1278,10 @@ and capability removal during an upgrade.
 
 The `rollback` scenario adds another signed publisher after activating the base
 environment. The upgrade installs a dependency from that publisher and removes
-an obsolete dependency. After systemd blesses the trial and reboots it as the
-default, the test runs `boot-env list` and `boot-env rollback` against the disk.
+an obsolete dependency. The staged root rejects a replay of the base
+catalog while the base root still accepts that catalog. After systemd
+blesses the trial and reboots it as the default, the test runs
+`boot-env list` and `boot-env rollback` against the disk.
 It boots the resulting disk and checks that the previous kernel and retired
 dependency are present and that the added package is absent. Both kernels need
 VFAT support. To load modules from extracted kernel packages, set

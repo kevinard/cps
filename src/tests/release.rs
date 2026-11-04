@@ -2077,7 +2077,7 @@ publisher "seed" {{
     plan(&f.root, Request::Update)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "guarded");
 
-    let old_catalog = fs::read(f.repo.join("catalogs").join(first))?;
+    let old_catalog = fs::read(f.repo.join("catalogs").join(&first))?;
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
     fs::rename(&seed.repo, seed.repo.with_extension("offline"))?;
     apply(&interrupted, &install)?;
@@ -2123,6 +2123,20 @@ publisher "seed" {{
         panic!("audit accepted a different signed profile catalog");
     };
     assert!(format!("{error:#}").contains("archived profile catalog digest mismatch"));
+    assert_eq!(
+        db.execute(
+            "UPDATE image SET data=json_set(data, '$.build_profile_catalog', ?1) WHERE id=1",
+            [first],
+        )?,
+        1,
+    );
+    let Err(error) = crate::audit_publisher_builds(&f.root, "seed") else {
+        panic!("audit accepted a signed policy from before the catalog checkpoint");
+    };
+    assert!(
+        format!("{error:#}")
+            .contains("archived build policy differs from the installed primary catalog")
+    );
     Ok(())
 }
 

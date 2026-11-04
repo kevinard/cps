@@ -587,6 +587,9 @@ if [[ $reprovision == 1 ]]; then
 fi
 if [[ $mode == rollback ]]; then
     # A new upgrade should still be testable from an explicitly selected base.
+    primary_pointer=repo/current
+    if $profiled; then primary_pointer=profile-repo/current; fi
+    cp "$primary_pointer" base-catalog
     "$cps" boot-env rollback --disk "$base_disk" --esp-partuuid "$esp_uuid" \
         --output-disk pinned-base.raw "$base_id"
     base_disk=pinned-base.raw
@@ -639,6 +642,18 @@ grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
 "$cps" verify --root base --pristine
 "$cps" verify --root staged --pristine
 check_runtime_packages staged
+
+if [[ $mode == rollback ]]; then
+    cp "$primary_pointer" trial-catalog
+    cp base-catalog "$primary_pointer"
+    "$cps" plan --root base --output base-catalog-plan.json update >/dev/null
+    if "$cps" plan --root staged --output replay.json update > replay.log 2>&1; then
+        echo 'The staged environment accepted a replayed primary catalog' >&2
+        exit 1
+    fi
+    grep -F 'publisher catalog rollback or fork' replay.log
+    mv trial-catalog "$primary_pointer"
+fi
 
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     grep -Fq "Prepare Linux $trial_release with kernel-install" update.log
