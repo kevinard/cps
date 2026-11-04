@@ -4,17 +4,24 @@ export LC_ALL=C
 umask 022
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
+source "$project/tests/build-toolchain.sh"
 cps=$(realpath -- "${CPS_TEST_BINARY:-"$project/target/debug/cps"}")
 output=$(realpath -m -- "${1:?usage: build-systemd.sh OUTPUT-DIRECTORY}")
 sources=$(realpath -- "${CPS_SYSTEMD_SOURCE_DIR:?Set CPS_SYSTEMD_SOURCE_DIR to the verified systemd archive directory}")
 runtime=$(realpath -- "${CPS_SYSTEMD_CPS_FIXTURE:?Set CPS_SYSTEMD_CPS_FIXTURE to the source-built CPS fixture}")
 util_linux=${CPS_SYSTEMD_UTIL_LINUX_FIXTURE:-}
 util_package=cps://canopa-util-linux/system/util-linux@2.42.4-0
-seccomp_package=cps://canopa/system/libseccomp@2.6.1-0
-systemd_version=262.1.0-0
+seccomp_version=${CPS_SYSTEMD_LIBSECCOMP_VERSION:-2.6.1-1}
+seccomp_package=cps://canopa/system/libseccomp@$seccomp_version
+case $seccomp_version in
+    2.6.1-0) packaged_seccomp=0; systemd_version=262.1.0-0 ;;
+    2.6.1-1) packaged_seccomp=1; systemd_version=262.1.0-3 ;;
+    *) echo "Unsupported libseccomp fixture version: $seccomp_version" >&2; exit 2 ;;
+esac
 if [[ -n $util_linux ]]; then
     util_linux=$(realpath -- "$util_linux")
     systemd_version=262.1.0-2
+    if [[ $packaged_seccomp == 1 ]]; then systemd_version=262.1.0-4; fi
 fi
 CPS_SYSTEMD_TOOLS_ROOT=$(realpath -- "${CPS_SYSTEMD_TOOLS_ROOT:-/}")
 export CPS_SYSTEMD_TOOLS_ROOT
@@ -30,23 +37,6 @@ keypair() {
 }
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 
-toolchain_publisher() {
-    local name=$1 repository=$2 key=$3
-    local fingerprint
-    fingerprint=$(tail -c 32 -- "$key" | sha256sum | cut -d' ' -f1)
-    printf '        publisher "%s" catalog="%s" key-sha256="%s"\n' \
-        "$name" "$(cat "$repository/current")" "$fingerprint" >> "$work/toolchain-recipe"
-    printf 'publisher "%s" {\n    repository %s\n    trust-key %s\n}\n' \
-        "$name" "$(kdl_string "$repository")" "$(kdl_string "$key")" >> toolchain.kdl
-}
-
-kdl_string() {
-    local value=$1
-    value=${value//\\/\\\\}
-    value=${value//\"/\\\"}
-    printf '"%s"' "$value"
-}
-
 keypair toolchain
 keypair builder
 keypair release
@@ -56,42 +46,56 @@ add_util_linux() {
 }
 seed_args=()
 packaged_libs=0
+configured=false
+if [[ -n $util_linux || $packaged_seccomp == 1 ]]; then
+    configured=true
+    seed_args=(--uid "$(id -u)" --gid "$(id -g)")
+fi
 if [[ -n $util_linux ]]; then
     "$cps" repo attestation --repo "$util_linux/repo" --publisher canopa-util-linux \
         --trust-key "$util_linux/release-public.der" "$util_package" > util-linux-attestation.json
-    seed_args=(--uid "$(id -u)" --gid "$(id -g)")
     packaged_libs=1
 else
     keypair runtime-seed
 fi
 "$cps" repo attestation --repo "$runtime/repo" --publisher canopa --trust-key "$runtime/release-public.der" \
     "$seccomp_package" > libseccomp-attestation.json
-CPS_SYSTEMD_PACKAGED_LIBS=$packaged_libs bash "$project/tests/seed-native-c.sh" "$work/native-systemd" --systemd
-if [[ -n $util_linux ]]; then
+CPS_SYSTEMD_PACKAGED_LIBS=$packaged_libs CPS_SYSTEMD_PACKAGED_SECCOMP=$packaged_seccomp \
+    bash "$project/tests/seed-native-c.sh" "$work/native-systemd" --systemd
+if $configured; then
     # These paths come from the pinned ELF runtime and library packages.
-    for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1,libseccomp.so.2,libblkid.so.1,libmount.so.1}; do
+    for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1,libseccomp.so.2}; do
         rm -f -- "$work/native-systemd/$path"
     done
+    if [[ -n $util_linux ]]; then
+        rm -f -- "$work/native-systemd/usr/lib/"{libblkid,libmount}.so.1
+    fi
 else
     "$cps" verify --root "$runtime/image" --pristine
     install -Dm755 "$runtime/image/usr/lib/libseccomp.so.2" "$work/native-systemd/usr/lib/libseccomp.so.2"
 fi
-ln -s libseccomp.so.2 "$work/native-systemd/usr/lib/libseccomp.so"
+if [[ $packaged_seccomp == 0 ]]; then
+    ln -s libseccomp.so.2 "$work/native-systemd/usr/lib/libseccomp.so"
+fi
 "$cps" manifest generate --proto "$work/native-systemd" --publisher seed --version 1.0.0-0 \
     "${seed_args[@]}" build/native-systemd > native-systemd.kdl
 "$cps" publish --repo toolchain --proto "$work/native-systemd" --signing-key "$work/toolchain.der" native-systemd.kdl
 
 toolchain_input=(--repo toolchain --publisher seed --trust-key toolchain-public.der)
-if [[ -n $util_linux ]]; then
+if $configured; then
     printf 'schema-version 1\n' > toolchain.kdl
-    printf '    toolchain solver="sat-v1" {\n' > "$work/toolchain-recipe"
-    toolchain_publisher seed toolchain toolchain-public.der
-    toolchain_publisher canopa-util-linux "$util_linux/repo" "$util_linux/release-public.der"
-    toolchain_publisher canopa "$runtime/repo" "$runtime/release-public.der"
-    toolchain_publisher canopa-runtime-seed "$runtime/runtime-seed" "$runtime/runtime-seed-public.der"
-    printf '        package "%s"\n' cps://seed/build/native-systemd@1.0.0-0 "$util_package" "$seccomp_package" \
-        >> "$work/toolchain-recipe"
-    printf '    }\n' >> "$work/toolchain-recipe"
+    pins="$work/toolchain-recipe"
+    printf '    toolchain solver="sat-v1" {\n' > "$pins"
+    roots=(cps://seed/build/native-systemd@1.0.0-0 "$seccomp_package")
+    append_toolchain_publisher "$pins" toolchain.kdl seed toolchain toolchain-public.der
+    if [[ -n $util_linux ]]; then
+        append_toolchain_publisher "$pins" toolchain.kdl canopa-util-linux "$util_linux/repo" "$util_linux/release-public.der"
+        roots+=("$util_package")
+    fi
+    append_toolchain_publisher "$pins" toolchain.kdl canopa "$runtime/repo" "$runtime/release-public.der"
+    append_toolchain_publisher "$pins" toolchain.kdl canopa-runtime-seed "$runtime/runtime-seed" "$runtime/runtime-seed-public.der"
+    printf '        package "%s"\n' "${roots[@]}" >> "$pins"
+    printf '    }\n' >> "$pins"
     toolchain_input=(--toolchain-config toolchain.kdl)
 else
     cat > "$work/toolchain-recipe" <<TOOLCHAIN
@@ -104,6 +108,9 @@ fi
 recipe="$project/packaging/systemd"
 sed -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
     -e "s/version=\"262.1.0-0\"/version=\"$systemd_version\"/" "$recipe/vm.kdl" > systemd.kdl
+if [[ $packaged_seccomp == 1 ]]; then
+    sed -i 's/>=2.6.1-0/>=2.6.1-1/' systemd.kdl
+fi
 if [[ -n $util_linux ]]; then
     sed -i 's/require "system\/systemd-vm-libs"/require "system\/util-linux" version="=2.42.4-0"/' systemd.kdl
 fi
@@ -143,7 +150,8 @@ POLICY
 package=cps://canopa-systemd/system/systemd-vm@$systemd_version
 "$cps" repo attestation --repo repo --publisher canopa-systemd --trust-key release-public.der "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa-systemd --trust-key release-public.der
+"$cps" image-create --root image --repo repo --publisher canopa-systemd --trust-key release-public.der \
+    --facet devel=false
 if [[ -n $util_linux ]]; then
     add_util_linux image
 else

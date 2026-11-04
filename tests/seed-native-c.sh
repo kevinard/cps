@@ -150,9 +150,12 @@ if $systemd; then
     for module in elftools jinja2; do
         cp -RL -- "$tools_root$site/$module" "$seed$site/"
     done
-    for path in usr/include/{seccomp.h,seccomp-syscalls.h} usr/lib/pkgconfig/{libseccomp,libsystemd}.pc; do
-        copy_file "/$path" "$path"
-    done
+    copy_file /usr/lib/pkgconfig/libsystemd.pc usr/lib/pkgconfig/libsystemd.pc
+    if [[ ${CPS_SYSTEMD_PACKAGED_SECCOMP:-0} != 1 ]]; then
+        for path in usr/include/{seccomp.h,seccomp-syscalls.h} usr/lib/pkgconfig/libseccomp.pc; do
+            copy_file "/$path" "$path"
+        done
+    fi
     if [[ ${CPS_SYSTEMD_PACKAGED_LIBS:-0} != 1 ]]; then
         copy_elf /usr/bin/mount usr/bin/mount
         for path in usr/include/{blkid/blkid.h,libmount/libmount.h} \
