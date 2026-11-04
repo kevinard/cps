@@ -61,11 +61,16 @@ openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 
 publish_state() {
     local version=$1 state=$2
+    local dependency=
+    if [[ $mode == rollback && $state == trial ]]; then
+        dependency='    require "test/extra-marker"'
+    fi
     printf '%s\n' "$state" > proto/etc/cps-vm-state
     cat > manifest.kdl <<MANIFEST
 schema-version 1
 package "test/boot-state" publisher="canopa" version="$version" {
     file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
+$dependency
 }
 MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
@@ -152,6 +157,18 @@ test -f "esp/loader/entries/$base_id.conf"
 if [[ $mode == rollback ]]; then
     # A new upgrade should still be testable from an explicitly selected base.
     "$cps" boot-env rollback --esp esp "$base_id"
+    openssl genpkey -algorithm ED25519 -outform DER -out extras-private.der
+    openssl pkey -inform DER -in extras-private.der -pubout -outform DER -out extras-public.der
+    printf 'extras\n' > proto/etc/cps-vm-extra-marker
+    cat > extra-marker.kdl <<MANIFEST
+schema-version 1
+package "test/extra-marker" publisher="extras" version="1.0.0-0" {
+    file "etc/cps-vm-extra-marker" mode="0644" uid=$(id -u) gid=$(id -g)
+}
+MANIFEST
+    "$cps" publish --repo extras --proto proto --signing-key extras-private.der extra-marker.kdl
+    "$cps" publisher add --root base --repo extras --trust-key extras-public.der extras
+    touch base/etc/cps-vm-assert-extra-publisher
 fi
 
 publish_state 2.0.0-0 trial
@@ -224,6 +241,9 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
 fi
 
 if [[ $mode == rollback ]]; then
+    grep -Fq 'Install cps://extras/test/extra-marker 1.0.0-0' update.log
+    test ! -e base/etc/cps-vm-extra-marker
+    test "$(cat staged/etc/cps-vm-extra-marker)" = extras
     cp esp/loader/loader.conf config-before-rejected-rollback
     if "$cps" boot-env rollback --esp esp "$trial_id" 2> rejected.log; then
         echo 'Rollback accepted an unblessed trial' >&2
@@ -314,6 +334,8 @@ if [[ $mode == bless || $mode == rollback ]]; then
     fi
     printf '%s\nVerified systemd-boot blessed %s.conf\n' "$boots" "$trial_id"
     if [[ $mode == rollback ]]; then
+        publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
+        test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         # Bring the VM's blessed entry back into the offline ESP directory.
         rm "esp/loader/entries/$trial_id+2.conf"
         cp blessed.conf "esp/loader/entries/$trial_id.conf"
@@ -334,12 +356,14 @@ if [[ $mode == bless || $mode == rollback ]]; then
         run_vm rollback.log
         rollback_boots=$(tr -d '\r' < rollback.log | grep '^CPS_VM_BOOT: ' || :)
         rollback_kernels=$(tr -d '\r' < rollback.log | grep '^CPS_VM_KERNEL: ' || :)
+        rollback_publishers=$(tr -d '\r' < rollback.log | grep '^CPS_VM_PUBLISHER: ' || :)
         if [[ $rollback_boots != 'CPS_VM_BOOT: previous' || $rollback_kernels != "CPS_VM_KERNEL: previous $base_release" ]]; then
             printf 'Unexpected rollback boot:\n%s\n%s\n' "$rollback_boots" "$rollback_kernels" >&2
             tail -80 rollback.log >&2
             exit 1
         fi
-        printf '%s\n%s\n' "$rollback_boots" "$rollback_kernels"
+        test "$rollback_publishers" = 'CPS_VM_PUBLISHER: previous absent'
+        printf '%s\n%s\n%s\n' "$rollback_boots" "$rollback_kernels" "$rollback_publishers"
     fi
     exit 0
 fi

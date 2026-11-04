@@ -115,6 +115,13 @@ state=$("$bb" cat /etc/cps-vm-state)
 if [ -f /etc/cps-vm-assert-kernel ]; then
     printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$("$bb" uname -r)"
 fi
+if [ -f /etc/cps-vm-assert-extra-publisher ]; then
+    publisher=absent
+    if [ -f /etc/cps-vm-extra-marker ]; then
+        publisher=$("$bb" cat /etc/cps-vm-extra-marker)
+    fi
+    printf 'CPS_VM_PUBLISHER: %s %s\n' "$state" "$publisher"
+fi
 if [ "$state" = previous ]; then
     printf 'CPS_VM_BOOT: previous\n'
 elif [ -f /run/cps-vm-counted ]; then
