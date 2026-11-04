@@ -1,4 +1,5 @@
 mod paths;
+mod repair;
 mod resolve;
 
 use std::{
@@ -32,6 +33,7 @@ pub enum Request {
     Install { packages: Vec<String> },
     ExactInstall { packages: Vec<String> },
     Remove { packages: Vec<String> },
+    Repair { packages: Vec<String> },
     Update,
 }
 
@@ -104,6 +106,11 @@ impl Plan {
         for path in &self.preserved {
             lines.push(format!("Preserve local config {path}"));
         }
+        if matches!(self.request, Request::Repair { .. }) {
+            for write in &self.writes {
+                lines.push(format!("Repair {}", write.path));
+            }
+        }
         for effect in &self.systemd {
             lines.push(format!(
                 "Offline systemd {} {}",
@@ -149,6 +156,14 @@ pub(crate) fn build(
     solver: Option<SolverRevision>,
 ) -> Result<(Plan, State)> {
     let (catalog, installed, paths) = match &request {
+        Request::Repair { .. } => {
+            let paths = crate::verify::manifest_paths(&state)?;
+            ensure!(
+                paths == state.paths,
+                "path ownership index differs from installed manifests"
+            );
+            (None, state.installed.clone(), paths)
+        }
         Request::Remove { packages } => {
             let names = requested_names(packages)?;
             let mut installed = state.installed.clone();
@@ -240,7 +255,12 @@ pub(crate) fn build(
         }
     }
 
-    let mut writes = BTreeMap::new();
+    let mut writes = match &plan.request {
+        Request::Repair { packages } => {
+            repair::writes(root, &state, packages, &mut plan.preserved)?
+        }
+        _ => BTreeMap::new(),
+    };
     for path in state
         .paths
         .keys()

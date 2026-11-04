@@ -44,6 +44,16 @@ To upgrade, publish the revised recipe under a new version and run `cps plan --r
 
 Use `plan exact-install NAME ...` to reconcile an image to the named packages and their required dependencies. The plan previews packages that would be removed. Use `plan remove NAME ...` to remove selected packages from committed image state while offline. Removal fails if a package that remains still requires one of those packages. Both operations preserve locally edited files declared with `preserve=#true`. A saved install, exact-install, remove, or update plan can also be applied to a clone with `boot-env stage`.
 
+Use `cps plan --root image --output repair.json repair [NAME ...]` to repair
+selected installed packages, or omit the names to check all installed packages.
+Apply the saved plan with `cps apply --root image repair.json`. CPS restores
+managed files, symlinks, and missing directories from the installed manifests.
+File payloads come from the configured local repository or cache and are checked
+against the installed digests before any writes. Repair preserves edited or
+removed configuration files declared with `preserve=#true`. Resolve metadata
+conflicts on existing explicit directories and conflicts with special files or
+unexpected directories before retrying the plan.
+
 ## Finding and inspecting packages
 
 ```sh

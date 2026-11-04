@@ -238,6 +238,8 @@ enum PlanCommand {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+    /// Restore damaged paths from the installed package versions
+    Repair { packages: Vec<String> },
     /// Update the installed package set
     Update,
 }
@@ -519,6 +521,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::Install { packages } => Request::Install { packages },
                 PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
                 PlanCommand::Remove { packages } => Request::Remove { packages },
+                PlanCommand::Repair { packages } => Request::Repair { packages },
                 PlanCommand::Update => Request::Update,
             };
             let plan = plan(&root, request)?;

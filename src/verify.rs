@@ -1,9 +1,9 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Result, ensure};
 
 use crate::{
-    image::{Image, State, root::Root},
+    image::{Image, Managed, State, root::Root},
     model::{Node, validate_path},
     plan::{check_dependencies, effective_paths},
 };
@@ -23,8 +23,7 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     verify_state(&image.root, &image.state()?)
 }
 
-pub(crate) fn verify_state(root: &Root, state: &State) -> Result<Vec<Finding>> {
-    let mut findings = Vec::new();
+pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>> {
     for (name, package) in &state.installed {
         let manifest = &package.published.manifest;
         package.published.verify()?;
@@ -33,13 +32,18 @@ pub(crate) fn verify_state(root: &Root, state: &State) -> Result<Vec<Finding>> {
             "invalid installed package identity for {name}"
         );
     }
+    effective_paths(&state.settings, &state.installed)
+}
+
+pub(crate) fn verify_state(root: &Root, state: &State) -> Result<Vec<Finding>> {
+    let expected = manifest_paths(state)?;
+    let mut findings = Vec::new();
     if let Err(error) = check_dependencies(&state.installed) {
         findings.push(Finding {
             is_error: true,
             message: error.to_string(),
         });
     }
-    let expected = effective_paths(&state.settings, &state.installed)?;
     if expected != state.paths {
         findings.push(Finding {
             is_error: true,

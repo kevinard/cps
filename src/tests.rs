@@ -619,22 +619,7 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
         f.file(COMPOSITOR, "later publication", "0755", "")?,
     )?;
     let saved = f._dir.path().join("upgrade.json");
-    fs::write(&saved, serde_json::to_vec(&upgrade)?)?;
-    let worker = Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "tests::install_upgrade_and_resume_offline",
-            "--nocapture",
-        ])
-        .env("CPS_TEST_IMAGE", &f.root)
-        .env("CPS_TEST_PLAN", &saved)
-        .output()?;
-    assert_eq!(
-        worker.status.code(),
-        Some(INTERRUPTED),
-        "{}",
-        String::from_utf8_lossy(&worker.stderr)
-    );
+    interrupt_apply(&f.root, &saved, &upgrade)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 2");
     assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "plugin 1");
     assert!(
@@ -678,6 +663,26 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
     Ok(())
 }
 
+fn interrupt_apply(root: &Path, saved: &Path, plan: &Plan) -> Result<()> {
+    fs::write(saved, serde_json::to_vec(plan)?)?;
+    let worker = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "tests::install_upgrade_and_resume_offline",
+            "--nocapture",
+        ])
+        .env("CPS_TEST_IMAGE", root)
+        .env("CPS_TEST_PLAN", saved)
+        .output()?;
+    assert_eq!(
+        worker.status.code(),
+        Some(INTERRUPTED),
+        "{}",
+        String::from_utf8_lossy(&worker.stderr)
+    );
+    Ok(())
+}
+
 fn interrupt_apply_worker(root: &Path, saved: &Path) -> Result<()> {
     let plan: Plan = serde_json::from_slice(&fs::read(saved)?)?;
     apply_with(root, &plan, |write| {
@@ -686,6 +691,130 @@ fn interrupt_apply_worker(root: &Path, saved: &Path) -> Result<()> {
         }
     })?;
     panic!("fixture did not replace the compositor");
+}
+
+#[test]
+fn repair_installed_files_and_resume_offline() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    const REMOVED_CONFIG: &str = "etc/canopa/optional.conf";
+    const LINK: &str = "usr/bin/compositor";
+    let f = Fixture::new()?;
+    let uid = geteuid().as_raw();
+    let gid = getegid().as_raw();
+    let mut actions = f.file(COMPOSITOR, "compositor 1", "0755", "")?;
+    actions += &f.file(PLUGIN, "plugin 1", "0644", "")?;
+    actions += &f.file(CONFIG, "vendor config", "0644", "preserve=#true")?;
+    actions += &f.file(REMOVED_CONFIG, "optional", "0644", "preserve=#true")?;
+    actions += &format!("    symlink {LINK:?} target=\"canopa-compositor\" uid={uid} gid={gid}\n");
+    f.package("desktop/compositor", "1.0.0-0", actions)?;
+    f.package(
+        "library/libdisplay",
+        "1.0.0-0",
+        f.file(LIBRARY, "display ABI 1", "0644", "")?,
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into(), "library/libdisplay".into()],
+        },
+    )?;
+    assert_eq!(apply(&f.root, &install)?, 1);
+
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "newer release", "0755", "")?,
+    )?;
+    fs::remove_file(f.repo.join("current"))?;
+    fs::write(f.root.join(COMPOSITOR), "damaged")?;
+    fs::set_permissions(f.root.join(COMPOSITOR), fs::Permissions::from_mode(0o600))?;
+    fs::remove_dir_all(f.root.join("usr/lib/canopa"))?;
+    fs::write(f.root.join(CONFIG), "administrator edit")?;
+    fs::remove_file(f.root.join(REMOVED_CONFIG))?;
+    fs::write(f.root.join(LIBRARY), "other package drift")?;
+    fs::remove_file(f.root.join(LINK))?;
+    symlink("unexpected-target", f.root.join(LINK))?;
+
+    let request = Request::Repair {
+        packages: vec!["desktop/compositor".into()],
+    };
+    let repair = plan(&f.root, request.clone())?;
+    assert_eq!(repair.catalog, None);
+    let summary = repair.summary();
+    for path in [COMPOSITOR, PLUGIN, LINK, "usr/lib/canopa"] {
+        assert!(summary.contains(&format!("Repair {path}")));
+    }
+    for path in [CONFIG, REMOVED_CONFIG] {
+        assert!(summary.contains(&format!("Preserve local config {path}")));
+    }
+    assert!(!summary.contains(LIBRARY));
+
+    let blob = f.repo.join("blobs").join(digest(b"plugin 1"));
+    fs::write(&blob, "plugin ?")?;
+    assert!(
+        apply(&f.root, &repair)
+            .unwrap_err()
+            .to_string()
+            .contains("payload digest mismatch")
+    );
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "damaged");
+    assert!(!f.root.join("usr/lib/canopa").exists());
+    fs::write(&blob, "plugin 1")?;
+    interrupt_apply(&f.root, &f._dir.path().join("repair.json"), &repair)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 1");
+    assert!(!f.root.join(PLUGIN).exists());
+    assert!(verify(&f.root).is_err());
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    assert_eq!(apply(&f.root, &repair)?, 2);
+    assert_eq!(apply(&f.root, &repair)?, 2);
+    assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "plugin 1");
+    assert_eq!(
+        fs::read_link(f.root.join(LINK))?,
+        Path::new("canopa-compositor")
+    );
+    assert_eq!(
+        fs::metadata(f.root.join(COMPOSITOR))?.permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join(CONFIG))?,
+        "administrator edit"
+    );
+    assert!(!f.root.join(REMOVED_CONFIG).exists());
+    assert!(plan(&f.root, request.clone())?.writes.is_empty());
+    let errors: Vec<_> = verify(&f.root)?
+        .into_iter()
+        .filter(|finding| finding.is_error)
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains(LIBRARY));
+
+    fs::remove_file(f.root.join(COMPOSITOR))?;
+    fs::create_dir(f.root.join(COMPOSITOR))?;
+    let unrelated = f.root.join(COMPOSITOR).join("local");
+    fs::write(&unrelated, "local data")?;
+    assert!(
+        plan(&f.root, request)
+            .unwrap_err()
+            .to_string()
+            .contains("path type conflict")
+    );
+    assert_eq!(fs::read_to_string(unrelated)?, "local data");
+    fs::remove_dir_all(f.root.join(COMPOSITOR))?;
+
+    let all = plan(
+        &f.root,
+        Request::Repair {
+            packages: Vec::new(),
+        },
+    )?;
+    fs::rename(&offline, &f.repo)?;
+    assert_eq!(apply(&f.root, &all)?, 3);
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    Ok(())
 }
 
 #[test]
