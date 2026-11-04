@@ -216,7 +216,7 @@ cps repo sync --repo /var/lib/cps/canopa --root canopa-root.json \
 
 Point `image-create` or the KDL image configuration at this cache. Give write access to the account that runs sync and keep the cache outside all boot roots on persistent storage. CPS uses the original provisioned root to identify the repository on each sync and stores authenticated root rotations and replay state under `.tuf`. Sync accepts HTTPS or a local `file:///` mirror, with trailing slashes on both URLs.
 
-Sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and the complete release. A failed download leaves the last complete release available. The cache retains previous content-addressed objects for saved plans. Planning and applying can use the last cached release offline. TUF freshness is checked at sync time.
+Sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and the complete release. A failed download leaves the last complete release available. Sync can repair a damaged cache object when the current mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can use the last cached release offline. TUF freshness is checked at sync time.
 
 Each new publication or withdrawal advances a sequence signed by the CPS
 publisher. Sync remembers the newest authenticated catalog even if downloading

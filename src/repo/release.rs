@@ -317,7 +317,8 @@ async fn fetch_object(
     let name = format!("{kind}/{hash}");
     if let Some(file) = download(verified, &name, repo, limit, Some(hash), length).await? {
         let path = repo.join(name);
-        file.persist_noclobber(&path)?;
+        // A verified download may repair a corrupted object at this digest.
+        file.persist(&path)?;
         File::open(path.parent().context("missing object directory")?)?.sync_all()?;
     }
     Ok(())
@@ -348,12 +349,11 @@ async fn download(
     );
     if hash.is_some() && path_present(&repo.join(name))? {
         let existing = Root::open(repo)?.file(name)?;
-        ensure!(
-            existing.metadata()?.len() == target.length
-                && digest_reader(existing.take(target.length.saturating_add(1)))? == signed_hash,
-            "corrupt cached object {name}"
-        );
-        return Ok(None);
+        if existing.metadata()?.len() == target.length
+            && digest_reader(existing.take(target.length.saturating_add(1)))? == signed_hash
+        {
+            return Ok(None);
+        }
     }
 
     let parent = Path::new(name).parent().context("missing target parent")?;

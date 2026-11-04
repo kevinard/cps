@@ -259,6 +259,22 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
     let upgraded = refresh(&second)?;
     assert_ne!(upgraded, initial);
     assert_eq!(refresh(&second)?, upgraded);
+
+    // A failed repair leaves the cache untouched. Correct targets can replace
+    // locally corrupted content even when the release pointer stays the same.
+    let cached_blob = cache.join("blobs").join(&blob);
+    fs::write(&cached_blob, b"bad")?;
+    fs::write(&target, b"old")?;
+    let corrupt = refresh(&second).unwrap_err();
+    assert!(format!("{corrupt:#}").contains("Hash mismatch"));
+    assert_eq!(fs::read(&cached_blob)?, b"bad");
+    assert_eq!(fs::read_to_string(cache.join("current"))?.trim(), upgraded);
+    fs::write(&target, b"new")?;
+    let cached_catalog = cache.join("catalogs").join(&upgraded);
+    fs::write(&cached_catalog, b"truncated catalog")?;
+    assert_eq!(refresh(&second)?, upgraded);
+    assert_eq!(fs::read(&cached_blob)?, b"new");
+    assert_eq!(digest(&fs::read(&cached_catalog)?), upgraded);
     assert_eq!(
         read_attestation(&cache, "canopa", &f.public, &id)?,
         envelope
