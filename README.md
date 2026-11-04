@@ -144,7 +144,7 @@ runtime libraries.
 The output includes `source-revision`, the recipe, source cache, toolchain
 repository, and protected package repository. To run the VM boot tests with
 the resulting binary, point `CPS_BIN` at `image/usr/bin/cps` inside the output
-directory.
+directory. The VM fixture copies the release executable byte for byte.
 
 ### Preparing a source cache
 
@@ -568,7 +568,7 @@ The fixture assembles each root from signed packages and runs `verify --pristine
 before packing it into the VM disk. Its runtime package imports prebuilt host
 binaries, libraries, and VFAT and ISO-8859-1 modules into a prototype, then
 generates the manifest and publishes it through CPS. The blessing fixture needs
-the local systemd userspace, util-linux, binutils `strip`, kmod, and kernel
+the local systemd userspace, util-linux, binutils `readelf` and `strip`, kmod, and kernel
 support for EFI variables and FAT. Set `CPS_VM_KERNEL_RELEASE` for another
 installed kernel, or `CPS_VM_FAT_BUILTIN=1` if VFAT and its character sets are
 built in.

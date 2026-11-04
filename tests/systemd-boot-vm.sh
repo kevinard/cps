@@ -130,7 +130,12 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
 fi
 if $systemd_guest; then
     mkdir -p proto/usr/{bin,lib/systemd/system}
-    strip --strip-debug -o proto/usr/bin/cps "$cps"
+    sections=$(readelf --wide --section-headers "$cps")
+    if [[ $sections =~ [[:space:]]\.z?debug_ ]]; then
+        strip --strip-debug -o proto/usr/bin/cps "$cps"
+    else
+        cp -- "$cps" proto/usr/bin/cps
+    fi
     cp "$project/packaging/systemd/cps-boot-health.service" proto/usr/lib/systemd/system/
     sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/cps.kdl" > cps.kdl
     "$cps" publish --repo repo --proto proto --signing-key private.der cps.kdl
