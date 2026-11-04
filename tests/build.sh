@@ -34,10 +34,42 @@ cat > probe.c <<'C'
 #include <sys/syscall.h>
 #include <sys/resource.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "cgroup-tasks") == 0) {
+        pid_t children[32];
+        unsigned count = 0;
+        for (; count < sizeof(children) / sizeof(children[0]); count++) {
+            pid_t child = fork();
+            if (child < 0) {
+                assert(errno == EAGAIN);
+                break;
+            }
+            if (child == 0)
+                for (;;) pause();
+            children[count] = child;
+        }
+        assert(count > 0 && count < sizeof(children) / sizeof(children[0]));
+        puts("build task ceiling reached");
+        fflush(stdout);
+        sleep(3);
+        for (unsigned i = 0; i < count; i++) {
+            assert(kill(children[i], SIGKILL) == 0);
+            assert(waitpid(children[i], NULL, 0) == children[i]);
+        }
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "cgroup-memory") == 0) {
+        const size_t size = 128 * 1024 * 1024;
+        volatile unsigned char *bytes = malloc(size);
+        assert(bytes != NULL);
+        for (size_t i = 0; i < size; i += 4096)
+            bytes[i] = 1;
+        return 0;
+    }
     if (argc == 3 && strcmp(argv[1], "runaway") == 0) {
         pid_t child = fork();
         assert(child >= 0);
@@ -217,6 +249,61 @@ test ! -e runaway
 if pgrep -f -- "^probe runaway $token$"; then
     echo 'sandbox child survived the build deadline' >&2
     exit 1
+fi
+
+if [[ -n ${CPS_TEST_CGROUP_ROOT:-} ]]; then
+    cgroup_config() {
+        cat <<CGROUP
+schema-version 1
+worker timeout-seconds=$1 {
+    cgroup "$2" cpu-percent=50 memory-bytes=67108864 tasks=16
+}
+CGROUP
+    }
+    cgroup_config 15 "$CPS_TEST_CGROUP_ROOT" > cgroup.kdl
+    cgroup_config 2 "$CPS_TEST_CGROUP_ROOT" > cgroup-timeout.kdl
+    cgroup_config 2 "$work" > invalid-cgroup.kdl
+    recipe '    probe cgroup-tasks
+    printf "bounded" > "$DESTDIR/hello"' > cgroup.build.kdl
+    build_package --sources sources --worker-config cgroup.kdl --output bounded cgroup.build.kdl > cgroup.log 2>&1 &
+    job=$!
+    for _ in {1..100}; do
+        grep -qF 'build task ceiling reached' cgroup.log && break
+        kill -0 "$job" 2>/dev/null || { cat cgroup.log >&2; exit 1; }
+        sleep 0.05
+    done
+    grep -F 'build task ceiling reached' cgroup.log
+    job_group=$(find "$CPS_TEST_CGROUP_ROOT" -maxdepth 1 -type d -name '.cps-build-*')
+    test -n "$job_group"
+    test "$(cat "$job_group/cpu.max")" = '50000 100000'
+    test "$(cat "$job_group/memory.max")" = 67108864
+    test "$(cat "$job_group/memory.swap.max")" = 0
+    test "$(cat "$job_group/pids.current")" = 16
+    grep -E '^max [1-9][0-9]*$' "$job_group/pids.events"
+    wait "$job"
+    test ! -e "$job_group"
+    test "$(cat bounded/proto/hello)" = bounded
+
+    recipe '    exec probe cgroup-memory' > oom.kdl
+    if build_package --sources sources --worker-config cgroup.kdl --output oom oom.kdl 2> oom.log; then
+        echo 'build exceeded its cgroup memory limit' >&2
+        exit 1
+    fi
+    grep -F 'isolated build exceeded its cgroup memory limit' oom.log
+    test ! -e oom
+    if build_package --sources sources --worker-config cgroup-timeout.kdl --output cgroup-runaway runaway.kdl 2> cgroup-runaway.log; then
+        echo 'runaway build unexpectedly succeeded inside a cgroup' >&2
+        exit 1
+    fi
+    grep -F 'isolated build exceeded its 2-second deadline' cgroup-runaway.log
+    test ! -e cgroup-runaway
+    test -z "$(find "$CPS_TEST_CGROUP_ROOT" -maxdepth 1 -name '.cps-build-*')"
+    if build_package --sources sources --worker-config invalid-cgroup.kdl --output invalid-cgroup runaway.kdl 2> invalid-cgroup.log; then
+        echo 'build ran with an invalid cgroup' >&2
+        exit 1
+    fi
+    grep -F 'is not a cgroup v2 directory' invalid-cgroup.log
+    test ! -e invalid-cgroup
 fi
 
 recipe '    probe unstable > "$DESTDIR/hello"' > unstable.kdl

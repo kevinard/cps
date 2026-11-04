@@ -16,7 +16,10 @@ use rustix::{
     process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
 };
 
-use super::BuildWorker;
+use super::{
+    BuildWorker,
+    cgroup::{self, Cgroup},
+};
 
 fn filter() -> Result<File> {
     let mut rules = ScmpFilterContext::new(ScmpAction::Allow)?;
@@ -67,6 +70,9 @@ pub(super) fn run(
     epoch: u32,
     worker: &BuildWorker,
 ) -> Result<()> {
+    let group = worker.cgroup.as_ref().map(Cgroup::create).transpose()?;
+    let enter = group.as_ref().map(Cgroup::processes).transpose()?;
+    let killer = group.as_ref().map(Cgroup::killer).transpose()?;
     let filter = filter().context("creating seccomp build policy")?;
     let mut command = Command::new("/usr/bin/bwrap");
     command
@@ -166,6 +172,17 @@ pub(super) fn run(
             if libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as _) != 0 {
                 return Err(io::Error::last_os_error());
             }
+            if let Some(file) = &enter {
+                // cgroup.procs treats 0 as the writing process. The fd is close-on-exec.
+                let pid = b"0\n";
+                let written = libc::write(file.as_raw_fd(), pid.as_ptr().cast(), pid.len());
+                if written < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if written as usize != pid.len() {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+            }
             fcntl_setfd(&filter, FdFlags::empty())?;
             Ok(())
         });
@@ -174,12 +191,23 @@ pub(super) fn run(
         .spawn()
         .context("starting rootless bubblewrap build")?;
     drop(command);
-    monitor(child, logs, worker)
+    let result = monitor(child, logs, worker, killer);
+    if let Some(group) = group {
+        let oom = group.oom_killed();
+        group.finish()?;
+        ensure!(!oom?, "isolated build exceeded its cgroup memory limit");
+    }
+    result
 }
 
-fn monitor(mut child: Child, mut logs: PipeReader, worker: &BuildWorker) -> Result<()> {
+fn monitor(
+    mut child: Child,
+    mut logs: PipeReader,
+    worker: &BuildWorker,
+    killer: Option<File>,
+) -> Result<()> {
     let (finished, watchdog) =
-        match start_watchdog(&child, Duration::from_secs(worker.timeout_secs)) {
+        match start_watchdog(&child, Duration::from_secs(worker.timeout_secs), killer) {
             Ok(watchdog) => watchdog,
             Err(error) => {
                 let _ = child.kill();
@@ -210,6 +238,7 @@ fn monitor(mut child: Child, mut logs: PipeReader, worker: &BuildWorker) -> Resu
 fn start_watchdog(
     child: &Child,
     timeout: Duration,
+    mut killer: Option<File>,
 ) -> Result<(mpsc::Sender<()>, thread::JoinHandle<io::Result<bool>>)> {
     let pid = Pid::from_raw(i32::try_from(child.id())?).context("invalid sandbox PID")?;
     let pidfd = pidfd_open(pid, PidfdFlags::empty())?;
@@ -218,10 +247,13 @@ fn start_watchdog(
         .name("cps-build-watchdog".to_owned())
         .spawn(move || {
             if receiver.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
-                match pidfd_send_signal(&pidfd, Signal::KILL) {
-                    Ok(()) | Err(Errno::SRCH) => return Ok(true),
-                    Err(error) => return Err(error.into()),
-                }
+                let killed_group = killer.as_mut().map(cgroup::kill).transpose();
+                let killed_process = pidfd_send_signal(&pidfd, Signal::KILL);
+                killed_group?;
+                return match killed_process {
+                    Ok(()) | Err(Errno::SRCH) => Ok(true),
+                    Err(error) => Err(error.into()),
+                };
             }
             Ok(false)
         })?;

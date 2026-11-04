@@ -1,8 +1,14 @@
-use std::{fs::File, path::Path};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{build::BuildWorker, repo::read_limited};
+use crate::{
+    build::{BuildWorker, cgroup::CgroupLimits},
+    repo::read_limited,
+};
 
 use super::{Fields, document, one, schema};
 
@@ -20,8 +26,9 @@ fn parse(text: &str) -> Result<BuildWorker> {
         doc.nodes().len() == 2,
         "expected schema-version and worker nodes"
     );
+    let node = one(&doc, "worker")?;
     let fields = Fields::read(
-        one(&doc, "worker")?,
+        node,
         0,
         &[
             "timeout-seconds",
@@ -30,8 +37,47 @@ fn parse(text: &str) -> Result<BuildWorker> {
             "output-bytes",
             "log-bytes",
         ],
-        false,
+        true,
     )?;
+    let cgroup = node
+        .children()
+        .map(|children| -> Result<CgroupLimits> {
+            ensure!(
+                children.nodes().len() == 1,
+                "expected one cgroup node in the worker block"
+            );
+            let fields = Fields::read(
+                one(children, "cgroup")?,
+                1,
+                &["cpu-percent", "memory-bytes", "tasks"],
+                false,
+            )?;
+            let root = PathBuf::from(fields.string_arg(0)?);
+            ensure!(root.is_absolute(), "cgroup root must be an absolute path");
+            let cpu_percent = fields
+                .integer("cpu-percent")?
+                .context("missing cgroup cpu-percent")?;
+            let memory_bytes = fields
+                .integer("memory-bytes")?
+                .context("missing cgroup memory-bytes")?;
+            let tasks = fields.integer("tasks")?.context("missing cgroup tasks")?;
+            ensure!(
+                (1..=100_000).contains(&cpu_percent),
+                "cgroup cpu-percent is out of range"
+            );
+            ensure!(
+                (1..=i64::MAX as u64).contains(&memory_bytes),
+                "cgroup memory-bytes is out of range"
+            );
+            ensure!(tasks > 0, "cgroup tasks must be positive");
+            Ok(CgroupLimits {
+                root,
+                cpu_percent,
+                memory_bytes,
+                tasks,
+            })
+        })
+        .transpose()?;
     let defaults = BuildWorker::default();
     let worker = BuildWorker {
         timeout_secs: fields
@@ -45,6 +91,7 @@ fn parse(text: &str) -> Result<BuildWorker> {
             .integer("output-bytes")?
             .unwrap_or(defaults.output_bytes),
         log_bytes: fields.integer("log-bytes")?.unwrap_or(defaults.log_bytes),
+        cgroup,
     };
     ensure!(
         (1..=7 * 24 * 60 * 60).contains(&worker.timeout_secs),

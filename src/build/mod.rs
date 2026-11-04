@@ -1,3 +1,4 @@
+pub(crate) mod cgroup;
 mod sandbox;
 pub(crate) mod sources;
 
@@ -49,6 +50,7 @@ pub struct BuildWorker {
     pub(crate) file_bytes: u64,
     pub(crate) output_bytes: u64,
     pub(crate) log_bytes: u64,
+    pub(crate) cgroup: Option<cgroup::CgroupLimits>,
 }
 
 impl Default for BuildWorker {
@@ -59,6 +61,7 @@ impl Default for BuildWorker {
             file_bytes: 8 << 30,
             output_bytes: 16 << 30,
             log_bytes: 16 << 20,
+            cgroup: None,
         }
     }
 }
