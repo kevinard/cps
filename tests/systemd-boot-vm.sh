@@ -82,6 +82,7 @@ publish_state() {
 schema-version 1
 package "test/boot-state" publisher="canopa" version="$version" {
     file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
+    hardlink "etc/cps-vm-boot-state" target="etc/cps-vm-state"
 $dependency
 }
 MANIFEST
@@ -146,7 +147,8 @@ else
     cat > runtime/init <<'GUEST'
 #!/bin/busybox sh
 set -e
-state=$(/bin/busybox cat /etc/cps-vm-state)
+[ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
+state=$(/bin/busybox cat /etc/cps-vm-boot-state)
 printf 'CPS_VM_BOOT: %s\n' "$state"
 if [ -f /etc/cps-vm-assert-kernel ]; then
     printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$(/bin/busybox uname -r)"
@@ -210,6 +212,7 @@ trial_id=${trial_id%% at *}
 diff -r esp-before esp
 test "$(cat base/etc/cps-vm-state)" = previous
 test "$(cat staged/etc/cps-vm-state)" = trial
+grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
 "$cps" verify --root base --pristine
 "$cps" verify --root staged --pristine
 

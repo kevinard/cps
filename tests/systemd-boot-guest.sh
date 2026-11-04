@@ -108,7 +108,7 @@ After=multi-user.target systemd-bless-boot.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/cps-vm-observe
+ExecStart=/usr/local/libexec/cps-vm-observe-linked
 StandardOutput=tty
 StandardError=inherit
 UNIT
@@ -116,7 +116,8 @@ UNIT
 #!/bin/busybox sh
 set -e
 bb=/bin/busybox
-state=$("$bb" cat /etc/cps-vm-state)
+[ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
+state=$("$bb" cat /etc/cps-vm-boot-state)
 if [ -f /etc/cps-vm-assert-built-busybox ]; then
     version=$("$bb" --help 2>&1 | {
         IFS=' ' read -r name release rest
@@ -153,4 +154,5 @@ fi
 exec "$bb" poweroff -f
 GUEST
     chmod 0755 "$root/init" "$root/usr/local/libexec/cps-vm-observe"
+    ln "$root/usr/local/libexec/cps-vm-observe" "$root/usr/local/libexec/cps-vm-observe-linked"
 }
