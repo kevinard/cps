@@ -738,8 +738,8 @@ The previous root keeps its original kernel and initrd.
 #### Testing source-built systemd and systemd-boot
 
 On the x86-64 Arch worker, provide Meson, Ninja, Python, Jinja2, pyelftools,
-gperf, patchelf, and libseccomp headers. The standalone fixture also uses the
-worker's libmount and libblkid headers. Place the
+gperf, and patchelf. The standalone fixture also uses the worker's libmount
+and libblkid headers. Place the
 `v262.1` source archive in the source directory as `systemd-262.1.tar.gz`.
 [systemd v262.1 release](https://github.com/systemd/systemd/releases/tag/v262.1)
 
@@ -751,8 +751,9 @@ tests/build-systemd.sh target/systemd-fixture
 
 The fixture pins the archive and the signed worker toolchain. It builds the
 VM's systemd components twice offline and publishes the matching outputs with
-signed build evidence. It also publishes a separate seed for the worker's
-prebuilt libmount and libblkid. Set `CPS_SYSTEMD_TOOLS_ROOT` to a trusted
+signed build evidence. The standalone build publishes systemd revision
+`262.1.0-3` and a separate seed for the worker's prebuilt libmount and
+libblkid. Set `CPS_SYSTEMD_TOOLS_ROOT` to a trusted
 extracted Arch package tree if gperf, patchelf, Jinja2, and pyelftools are
 available there instead of on the worker.
 
@@ -804,19 +805,20 @@ loader. The package also delivers the headers and linker inputs under the
 `devel` facet.
 
 Set `CPS_SYSTEMD_UTIL_LINUX_FIXTURE=target/util-linux-fixture` when running
-`tests/build-systemd.sh`. Systemd package revision `262.1.0-2` uses the
-util-linux package and the libseccomp and ELF runtime binaries directly
-from their pinned publisher catalogs. The build evidence records those
-package origins. The compiler seed supplies the libseccomp headers and
-pkg-config metadata.
+`tests/build-systemd.sh`. Systemd package revision `262.1.0-4` uses the
+util-linux, libseccomp, and ELF runtime packages directly from their pinned
+publisher catalogs. The libseccomp headers, pkg-config metadata, and library
+come from the same signed package. Set `CPS_SYSTEMD_LIBSECCOMP_VERSION=2.6.1-0`
+to build against an earlier CPS fixture.
 
 For signed-profile rollback, set `CPS_VM_UTIL_LINUX_FIXTURE` to the util-linux
 output, `CPS_VM_SYSTEMD_FIXTURE` to the matching systemd build, and
 `CPS_VM_USR_BASE_FIXTURE` to the merged base. The release profile pins the
 util-linux catalog with the `devel` facet disabled. The guest mounts the ESP
 with the packaged `mount` and probes it with `blkid` on the trial, default
-reboot, and rollback. To use an existing systemd revision `262.1.0-1`
-fixture with this profile, set `CPS_VM_SYSTEMD_VERSION=262.1.0-1`.
+reboot, and rollback. The VM defaults to the matching systemd revision for
+the selected CPS fixture. Set `CPS_VM_SYSTEMD_VERSION=262.1.0-1` to reuse
+that earlier systemd revision.
 
 #### Testing a source-built BusyBox
 

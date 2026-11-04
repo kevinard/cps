@@ -13,12 +13,13 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-2}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
 systemd_fixture=${CPS_VM_SYSTEMD_FIXTURE:-}
 usr_base_fixture=${CPS_VM_USR_BASE_FIXTURE:-}
 util_linux_fixture=${CPS_VM_UTIL_LINUX_FIXTURE:-}
-systemd_version=262.1.0-0
+systemd_version=262.1.0-3
 util_linux_package=cps://canopa-util-linux/system/util-linux@2.42.4-0
 systemd_efi=usr/lib/systemd/boot/efi/systemd-bootx64.efi
 profiled=false
@@ -72,7 +73,13 @@ if [[ -n $cps_fixture ]]; then
     $systemd_guest || { echo 'CPS_VM_CPS_FIXTURE requires a systemd guest' >&2; exit 2; }
     cps_fixture=$(realpath -- "$cps_fixture")
     fixture_publisher=vm-test
-    for package in system/cps@0.1.0-1 system/sqlite@3.54.1-0 system/libseccomp@2.6.1-0; do
+    case $cps_version in
+        0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
+        0.1.0-2) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
+    esac
+    cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
+    for package in "${cps_packages[@]}"; do
         "$cps" repo attestation --repo "$cps_fixture/repo" --publisher canopa \
             --trust-key "$cps_fixture/release-public.der" "cps://canopa/$package" >/dev/null
     done
@@ -99,7 +106,11 @@ fi
 if [[ -n $util_linux_fixture ]]; then
     [[ -n $usr_base_fixture ]] || { echo 'CPS_VM_UTIL_LINUX_FIXTURE requires the merged /usr fixture' >&2; exit 2; }
     util_linux_fixture=$(realpath -- "$util_linux_fixture")
-    systemd_version=262.1.0-2
+    if [[ $cps_version == 0.1.0-2 ]]; then
+        systemd_version=262.1.0-4
+    else
+        systemd_version=262.1.0-2
+    fi
     "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
         --trust-key "$util_linux_fixture/release-public.der" "$util_linux_package" >/dev/null
 fi
@@ -235,7 +246,7 @@ refresh_vm_profile() {
     {
         printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
         printf '    profile "boot" architecture="%s"%s {\n        package "test/boot-stack"\n' "$(uname -m)" "$upgrade"
-        if [[ -n $util_linux_fixture ]]; then printf '        facet "devel" #false\n'; fi
+        printf '        facet "devel" #false\n'
         while read -r name repository key; do
             companion_upgrade=
             if [[ $repository == repo && -n $baseline_test ]]; then
@@ -268,7 +279,7 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     packages+=(system/kernel)
 fi
 if [[ -n $cps_fixture ]]; then
-    packages+=(cps://canopa/system/cps@0.1.0-1)
+    for package in "${cps_packages[@]}"; do packages+=("cps://canopa/$package"); done
 elif $systemd_guest; then
     mkdir -p proto/usr/{bin,lib/systemd/system}
     sections=$(readelf --wide --section-headers "$cps")
@@ -398,7 +409,9 @@ package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
     require "test/boot-runtime"
 $boot_kernel_dependency
 $boot_systemd_dependency
-    require "system/cps"
+    require "system/cps" version="=$cps_version"
+    require "system/sqlite" version="=$sqlite_version"
+    require "system/libseccomp" version="=$seccomp_version"
     require "system/busybox" version="=$busybox_version"
 }
 MANIFEST
@@ -410,12 +423,12 @@ MANIFEST
         cat <<'CONFIG'
 schema-version 1
 release-profile "boot"
+facet "devel" #false
 publisher "vm-profile" {
     repository "profile-repo"
     trust-key "profile-public.der"
 }
 CONFIG
-        if [[ -n $util_linux_fixture ]]; then printf 'facet "devel" #false\n'; fi
         while read -r name repository key; do
             printf 'publisher "%s" {\n    repository "%s"\n    trust-key "%s"\n}\n' "$name" "$repository" "$key"
         done < <(profile_companions)
@@ -424,6 +437,7 @@ CONFIG
 else
     cat > image.kdl <<CONFIG
 schema-version 1
+facet "devel" #false
 publisher "$fixture_publisher" {
     repository "repo"
     trust-key "public.der"
@@ -443,8 +457,15 @@ fi
 "$cps" plan --root base --output install.json install "${packages[@]}"
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
-check_util_linux() {
+check_runtime_packages() {
     local root=$1 path
+    if [[ -n $cps_fixture ]]; then
+        for path in usr/include/{sqlite3,sqlite3ext,seccomp,seccomp-syscalls}.h \
+            usr/lib/pkgconfig/{sqlite3,libseccomp}.pc usr/lib/{libsqlite3,libseccomp}.so; do
+            test ! -e "$root/$path"
+            test ! -L "$root/$path"
+        done
+    fi
     if [[ -z $util_linux_fixture ]]; then return; fi
     for path in usr/bin/{blkid,mount,umount} usr/lib/{libblkid,libmount}.so.1; do
         cmp "$root/$path" "$util_linux_fixture/image/$path"
@@ -452,7 +473,7 @@ check_util_linux() {
     test ! -e "$root/usr/include/libmount/libmount.h"
     test ! -L "$root/usr/lib/libmount.so"
 }
-check_util_linux base
+check_runtime_packages base
 if [[ -n $usr_base_fixture ]]; then
     test "$(readlink base/bin)" = usr/bin
     test "$(readlink base/lib64)" = usr/lib
@@ -527,7 +548,7 @@ test "$(cat staged/etc/cps-vm-state)" = trial
 grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
 "$cps" verify --root base --pristine
 "$cps" verify --root staged --pristine
-check_util_linux staged
+check_runtime_packages staged
 
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     grep -Fq "Prepare Linux $trial_release with kernel-install" update.log
