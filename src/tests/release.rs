@@ -1964,6 +1964,9 @@ publisher "seed" {{
     let upgrade = plan(&f.root, Request::Update)?;
     assert_eq!(upgrade.catalogs["canopa"], second);
     fetch_plan(&f.root, &upgrade)?;
+    let staged = f._dir.path().join("staged");
+    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    assert!(crate::audit_publisher_builds(&f.root, "seed").is_err());
     apply(&f.root, &upgrade)?;
 
     let attestation = seed.repo.join("attestations").join(digest(&envelope));
@@ -1986,9 +1989,66 @@ publisher "seed" {{
     );
     fs::write(&attestation, envelope)?;
     apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    let interrupted = f._dir.path().join("interrupted");
+    create_configured_image(&interrupted, &config)?;
+    let install = plan(&interrupted, Request::InstallProfile)?;
+    interrupt_apply_at(
+        &interrupted,
+        &f._dir.path().join("pending-profile.json"),
+        &install,
+        COMPOSITOR,
+    )?;
+
     fs::remove_file(&attestation)?;
     plan(&f.root, Request::Update)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "guarded");
+
+    let old_catalog = fs::read(f.repo.join("catalogs").join(first))?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    fs::rename(&seed.repo, seed.repo.with_extension("offline"))?;
+    apply(&interrupted, &install)?;
+    for root in [&f.root, &staged, &interrupted] {
+        let audit = crate::audit_publisher_builds(root, "seed")?;
+        assert_eq!(audit.verified, 1);
+        assert!(audit.failures.is_empty(), "{:?}", audit.failures);
+    }
+    let remove = plan(
+        &interrupted,
+        Request::Remove {
+            packages: vec![
+                "desktop/session".to_owned(),
+                "desktop/compositor".to_owned(),
+            ],
+        },
+    )?;
+    apply(&interrupted, &remove)?;
+    let audit = crate::audit_publisher_builds(&interrupted, "seed")?;
+    assert_eq!(audit.verified, 0);
+    assert!(audit.failures.is_empty(), "{:?}", audit.failures);
+
+    let other_builder = Fixture::new()?;
+    let local_policy = f._dir.path().join("local-trust.kdl");
+    fs::write(
+        &local_policy,
+        format!(
+            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            other_builder.public,
+        ),
+    )?;
+    crate::set_publisher_build_trust(&staged, "seed", &local_policy, true)?;
+    let audit = crate::audit_publisher_builds(&staged, "seed")?;
+    assert_eq!(audit.verified, 0);
+    assert_eq!(audit.failures.len(), 1);
+
+    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    assert_eq!(
+        db.execute("UPDATE build_profile SET catalog=?1", [old_catalog])?,
+        1,
+    );
+    let Err(error) = crate::audit_publisher_builds(&f.root, "seed") else {
+        panic!("audit accepted a different signed profile catalog");
+    };
+    assert!(format!("{error:#}").contains("archived profile catalog digest mismatch"));
     Ok(())
 }
 

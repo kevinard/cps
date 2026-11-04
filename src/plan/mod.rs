@@ -356,6 +356,24 @@ pub(crate) fn build(
                 )?
             };
             receipts = catalogs.verify_builds(image, &state, &installed)?;
+            state.settings.build_profile_catalog =
+                if catalogs.profile.as_ref().is_some_and(|profile| {
+                    profile
+                        .companions
+                        .iter()
+                        .any(|pin| pin.build_trust.is_some())
+                }) {
+                    let primary = &state.publishers.as_slice()[0];
+                    Some(
+                        catalogs
+                            .pins
+                            .get(&primary.name)
+                            .context("missing primary catalog for signed build policy")?
+                            .clone(),
+                    )
+                } else {
+                    None
+                };
             (installed, paths)
         }
     };

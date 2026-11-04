@@ -23,7 +23,7 @@ use crate::{
     systemd::{self, Action as SystemdAction},
 };
 
-const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
+pub(crate) const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const TMPFILES_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY_LIMIT: u64 = 1024 * 1024;
@@ -825,8 +825,21 @@ fn read_catalog_with_key(
     publisher: &str,
     trust: keys::Trust<'_>,
 ) -> Result<Catalog> {
-    let signed: SignedCatalog =
-        serde_json::from_slice(&read_object(repo, "catalogs", hash, CATALOG_LIMIT)?)?;
+    let bytes = catalog_bytes(repo, hash)?;
+    decode_catalog(&bytes, hash, publisher, trust)
+}
+
+pub(crate) fn catalog_bytes(repo: &Path, hash: &str) -> Result<Vec<u8>> {
+    read_object(repo, "catalogs", hash, CATALOG_LIMIT)
+}
+
+fn decode_catalog(
+    bytes: &[u8],
+    hash: &str,
+    publisher: &str,
+    trust: keys::Trust<'_>,
+) -> Result<Catalog> {
+    let signed: SignedCatalog = serde_json::from_slice(bytes)?;
     let catalog = signed.catalog;
     ensure!(catalog.format == FORMAT, "unsupported catalog format");
     ensure!(
@@ -1016,13 +1029,35 @@ pub(crate) fn release_profile(
     name: &str,
 ) -> Result<(String, ReleaseProfile)> {
     let hash = pin.map_or_else(|| read_current(repo), |hash| Ok(hash.to_owned()))?;
-    let profile = read_catalog(repo, &hash, publisher, key)?
-        .release_profiles
-        .remove(name)
-        .with_context(|| {
-            format!("catalog {hash} for {publisher} has no signed release profile {name}")
-        })?;
+    let profile = take_profile(read_catalog(repo, &hash, publisher, key)?, &hash, name)?;
     Ok((hash, profile))
+}
+
+pub(crate) fn archived_release_profile(
+    bytes: &[u8],
+    hash: &str,
+    publisher: &str,
+    key: &[u8],
+    name: &str,
+) -> Result<ReleaseProfile> {
+    ensure!(
+        digest(bytes) == hash,
+        "archived profile catalog digest mismatch"
+    );
+    take_profile(
+        decode_catalog(bytes, hash, publisher, keys::Trust::Anchor(key))?,
+        hash,
+        name,
+    )
+}
+
+fn take_profile(mut catalog: Catalog, hash: &str, name: &str) -> Result<ReleaseProfile> {
+    catalog.release_profiles.remove(name).with_context(|| {
+        format!(
+            "catalog {hash} for {} has no signed release profile {name}",
+            catalog.publisher
+        )
+    })
 }
 
 pub fn list_obsoletions(repo: &Path, publisher: &str, key: &Path) -> Result<Vec<String>> {

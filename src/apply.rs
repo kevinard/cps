@@ -128,6 +128,7 @@ pub(crate) fn apply_with(
             !checked.systemd.is_empty() || checked.kernel_install.is_some(),
         )?;
         prepare(&image.root, &stage, &checked, &next)?;
+        let repo_backed = checked.catalog.is_some() || !checked.catalogs.is_empty();
         let pending = Pending {
             id,
             writes: checked.writes,
@@ -136,7 +137,7 @@ pub(crate) fn apply_with(
             kernel_install: checked.kernel_install,
             files_ready: false,
         };
-        image.record_pending(&pending, &pending.next.publishers, &receipts)?;
+        image.record_pending(&pending, &pending.next, &receipts, repo_backed)?;
         (pending, offline)
     };
 

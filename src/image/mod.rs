@@ -21,7 +21,7 @@ use self::root::Root;
 use crate::{
     attestation::BuildTrust,
     kdl_format::{PublisherConfig, read_image_definition},
-    model::{FORMAT, Node, validate_name, validate_publisher},
+    model::{FORMAT, Node, validate_digest, validate_name, validate_publisher},
     repo::{BuildReceipt, Published, canonical_repo, catalog_index, read_key},
 };
 
@@ -47,6 +47,8 @@ pub struct Settings {
     pub boot_parent: Option<BootParent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bootstrap_catalog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) build_profile_catalog: Option<String>,
     // Absent on images that predate tracking. Their proposals are discovered
     // from the saved vendor copies the first time they are reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,6 +355,7 @@ fn initialize(
         created_directories: BTreeSet::new(),
         boot_parent: None,
         bootstrap_catalog,
+        build_profile_catalog: None,
         config_updates: Some(BTreeMap::new()),
     };
     fs::create_dir_all(path)?;
@@ -505,6 +508,13 @@ impl Image {
                 && (settings.bootstrap_catalog.is_none() || publishers.release_profile().is_some()),
             "image format does not match its build trust or bootstrap policy"
         );
+        if let Some(hash) = &settings.build_profile_catalog {
+            validate_digest(hash).context("invalid archived build profile catalog")?;
+            ensure!(
+                publishers.release_profile().is_some() && settings.bootstrap_catalog.is_none(),
+                "archived build policy requires an installed release profile"
+            );
+        }
         Ok(State {
             settings,
             publishers,
@@ -566,11 +576,15 @@ impl Image {
     pub fn record_pending(
         &mut self,
         data: &impl Serialize,
-        publishers: &Publishers,
+        next: &State,
         receipts: &[BuildReceipt],
+        repo_backed: bool,
     ) -> Result<()> {
         let tx = self.db.transaction()?;
-        builds::save(&tx, publishers, receipts)?;
+        if repo_backed {
+            builds::save_profile(&tx, next)?;
+        }
+        builds::save(&tx, &next.publishers, receipts)?;
         tx.execute(
             "INSERT INTO pending VALUES (1, ?1)",
             [serde_json::to_string(data)?],

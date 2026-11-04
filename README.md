@@ -498,10 +498,15 @@ packages and packages outside the release's tested composition. For
 unchanged packages, CPS reuses archived evidence that satisfies the signed
 policy or checks the attestation in the pinned catalog. New and changed
 packages must also satisfy any independently configured image policy for
-their publisher. Use that local policy to audit archived evidence with
-`publisher audit-builds`. Later catalogs can rotate the signed policy and
-must retain a builder policy for the guarded companion in that profile.
-Upgrade clients before consuming profiles with this requirement.
+their publisher. Applying a guarded plan also archives the primary catalog
+that signed the companion policy. Use
+`cps publisher audit-builds --root image seed` to verify installed packages
+against that signed policy and any local policy for the companion, even when
+the repositories are offline. Images created by older clients can archive
+the signed policy by applying a new guarded plan. Later catalogs can rotate
+the signed policy and must retain a builder policy for the guarded companion
+in that profile. Upgrade clients before consuming profiles with this
+requirement.
 
 ## Signed releases and mirrors
 

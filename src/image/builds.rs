@@ -4,9 +4,63 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{Publishers, State};
-use crate::{attestation::ATTESTATION_LIMIT, repo::BuildReceipt};
+use crate::{
+    attestation::ATTESTATION_LIMIT,
+    repo::{BuildReceipt, CATALOG_LIMIT, ReleaseProfile, archived_release_profile, catalog_bytes},
+};
 
 const RECEIPT_LIMIT: u64 = 128 * 1024;
+
+pub(super) fn save_profile(tx: &Transaction<'_>, state: &State) -> Result<()> {
+    let Some(hash) = &state.settings.build_profile_catalog else {
+        return Ok(());
+    };
+    let primary = &state.publishers.as_slice()[0];
+    let bytes = catalog_bytes(&primary.repo, hash).context("archiving the signed build policy")?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS build_profile (
+            id INTEGER PRIMARY KEY CHECK(id=1), catalog BLOB NOT NULL
+         )",
+    )?;
+    tx.execute(
+        "INSERT INTO build_profile VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET catalog=excluded.catalog WHERE catalog!=excluded.catalog",
+        [bytes],
+    )?;
+    Ok(())
+}
+
+pub(super) fn read_profile(db: &Connection, state: &State) -> Result<Option<ReleaseProfile>> {
+    let Some(hash) = &state.settings.build_profile_catalog else {
+        return Ok(None);
+    };
+    let name = state
+        .publishers
+        .release_profile()
+        .context("missing image profile")?;
+    let (primary, companions) = state
+        .publishers
+        .as_slice()
+        .split_first()
+        .context("missing primary publisher")?;
+    let bytes: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT CASE WHEN length(CAST(catalog AS BLOB)) <= ?1 THEN catalog END
+             FROM build_profile WHERE id=1",
+            [CATALOG_LIMIT],
+            |row| row.get(0),
+        )
+        .context("reading the archived profile catalog")?;
+    let bytes = bytes.context("archived profile catalog exceeds size limit")?;
+    let profile = archived_release_profile(&bytes, hash, &primary.name, &primary.key, name)?;
+    profile.check_image(
+        name,
+        &state.settings.arch,
+        &state.settings.facets,
+        companions.iter().map(|publisher| publisher.name.as_str()),
+    )?;
+    Ok(Some(profile))
+}
 
 pub(super) fn exists(db: &Connection) -> Result<bool> {
     Ok(db.query_row(

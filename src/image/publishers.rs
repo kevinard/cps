@@ -12,7 +12,7 @@ use crate::{
     kdl_format::read_build_trust,
     model::validate_publisher,
     repo::{
-        BuildAudit, BuildReceipt, CatalogPin, ReleaseProfile, audit_installed_builds,
+        BuildAudit, BuildReceipt, CatalogPin, Published, ReleaseProfile, audit_installed_builds,
         catalog_index, release_profile,
     },
 };
@@ -174,8 +174,31 @@ pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
         .publishers
         .get(name)
         .with_context(|| format!("publisher {name} is not configured"))?;
+    let profile = builds::read_profile(&image.db, &state)?;
+    if let Some(signed) = profile
+        .as_ref()
+        .and_then(|profile| profile.companions.iter().find(|pin| pin.publisher == name))
+        .and_then(|pin| pin.build_trust.as_ref())
+    {
+        let mut policies = vec![signed];
+        if let Some(local) = publisher
+            .build_trust
+            .as_ref()
+            .filter(|local| *local != signed)
+        {
+            policies.push(local);
+        }
+        let (mut audit, missing) = audit_archived(&image, &state, publisher, &policies)?;
+        audit.failures.extend(missing.into_iter().map(|package| {
+            format!(
+                "missing archived build evidence for {}",
+                package.manifest.id()
+            )
+        }));
+        return Ok(audit);
+    }
     let trust = publisher.build_trust.as_ref().with_context(|| {
-        format!("publisher {name} has no locally configured build trust policy")
+        format!("publisher {name} has no local or archived signed build trust policy")
     })?;
     audit(&image, &state, publisher, trust, false)
 }
@@ -187,35 +210,7 @@ fn audit(
     trust: &BuildTrust,
     check_current: bool,
 ) -> Result<BuildAudit> {
-    let mut audit = BuildAudit::default();
-    let archive = builds::exists(&image.db)?;
-    let installed = state
-        .installed
-        .values()
-        .map(|package| &package.published)
-        .filter(|package| package.manifest.publisher == publisher.name);
-    let mut missing = Vec::new();
-    for package in installed {
-        if !archive {
-            missing.push(package);
-            continue;
-        }
-        let result = match builds::read(&image.db, &package.sha256) {
-            Ok(None) => {
-                missing.push(package);
-                continue;
-            }
-            Ok(Some((receipt, bytes))) => receipt.verify(&bytes, package, &publisher.key, trust),
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(()) => audit.verified += 1,
-            Err(error) => audit.failures.push(format!(
-                "checking archived build evidence for {}: {error:#}",
-                package.manifest.id()
-            )),
-        }
-    }
+    let (mut audit, missing) = audit_archived(image, state, publisher, &[trust])?;
     if check_current || !missing.is_empty() {
         let repository_audit = || {
             let pins = state.publishers.release_pins(
@@ -248,6 +243,46 @@ fn audit(
         }
     }
     Ok(audit)
+}
+
+fn audit_archived<'a>(
+    image: &Image,
+    state: &'a State,
+    publisher: &Publisher,
+    policies: &[&BuildTrust],
+) -> Result<(BuildAudit, Vec<&'a Published>)> {
+    let mut audit = BuildAudit::default();
+    let archive = builds::exists(&image.db)?;
+    let installed = state
+        .installed
+        .values()
+        .map(|package| &package.published)
+        .filter(|package| package.manifest.publisher == publisher.name);
+    let mut missing = Vec::new();
+    for package in installed {
+        if !archive {
+            missing.push(package);
+            continue;
+        }
+        let result = match builds::read(&image.db, &package.sha256) {
+            Ok(None) => {
+                missing.push(package);
+                continue;
+            }
+            Ok(Some((receipt, bytes))) => policies
+                .iter()
+                .try_for_each(|trust| receipt.verify(&bytes, package, &publisher.key, trust)),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => audit.verified += 1,
+            Err(error) => audit.failures.push(format!(
+                "checking archived build evidence for {}: {error:#}",
+                package.manifest.id()
+            )),
+        }
+    }
+    Ok((audit, missing))
 }
 
 pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
