@@ -201,9 +201,8 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-4`. Set `CPS_VM_CPS_VERSION=0.1.0-3` to reuse
-the previous guest fixture. Use an architecture-aware host CPS to assemble
-images containing the new package.
+to package revision `0.1.0-5`. Use the current host and guest CPS to assemble
+and boot images with protected profiles.
 
 ### Preparing a source cache
 
@@ -825,6 +824,10 @@ cps apply --root image --plan install.json
 CPS checks every manifest digest against the signed composition, then
 checks dependencies, paths, and configured build trust before using the
 normal transaction. It marks the profile roots as explicitly installed.
+The image records the manifest digests of the applied composition. Local
+installs, exact installs, removals, and dependency cleanup preserve that
+composition. Exact installs reconcile local additions around the protected
+packages. Only a signed profile update can replace the protected set.
 Older profiles can still be used with ordinary `plan install`. Use
 `repo publish-release` with `refresh-profiles=#true` to record the
 composition before using `install-profile`.
@@ -866,6 +869,10 @@ packages, and signed obsoletion rules still retire old packages. A profile
 update fails if reaching the signed set requires a downgrade or a publisher
 switch. Save and apply the plan normally, or stage it in a boot environment.
 Existing saved update plans retain the selection rules used to create them.
+For images created before composition protection, applying a signed profile
+update establishes the protected set. Upgrade the CPS binary in the target
+image before applying the first protected profile. Older clients reject the
+new image state and cannot resume the transaction that first writes it.
 
 Available-package queries and new plans use the primary publisher's current
 catalog and the companion digests it signs. Saved plans use their original

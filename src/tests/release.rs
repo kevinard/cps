@@ -454,6 +454,156 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
 }
 
 #[test]
+fn local_transactions_preserve_the_applied_signed_composition() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    seed.package_as("seed", "library/z", "1.0.0-0", String::new())?;
+    let seed_pointer = seed.repo.join("current");
+    let previous = fs::read_to_string(&seed_pointer)?;
+    seed.package_as("seed", "library/a", "1.0.0-0", String::new())?;
+    let next = fs::read_to_string(seed_pointer)?;
+    f.package(
+        "desktop/base",
+        "1.0.0-0",
+        r#"    require-any {
+        package "library/a"
+        package "library/z"
+    }
+"#
+        .into(),
+    )?;
+    f.package(
+        "desktop/tool",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "previous", "0755", "")?,
+    )?;
+    f.package(
+        "desktop/tool",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "next", "0755", "")?,
+    )?;
+    f.package(
+        "desktop/addon",
+        "1.0.0-0",
+        "    require \"library/a\"\n".into(),
+    )?;
+    let publish_profile = |version: &str, pin: &str| -> Result<()> {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "unused.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/base"
+        package "desktop/tool@{version}"
+        publisher "seed" catalog={:?} {{
+            repository {:?}
+            trust-key {:?}
+        }}
+    }}
+}}
+"#,
+                pin.trim(),
+                seed.repo,
+                seed.public
+            ),
+        )?;
+        let release = f._dir.path().join("refresh.kdl");
+        let base = fs::read_to_string(f.repo.join("current"))?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                base.trim(),
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)?;
+        Ok(())
+    };
+    publish_profile("1.0.0-0", &previous)?;
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            f.repo, f.public, seed.repo, seed.public,
+        ),
+    )?;
+    create_configured_image(&f.root, &config)?;
+    let install = plan(&f.root, Request::InstallProfile)?;
+    let offline = f.repo.with_extension("offline");
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("install-profile.json"),
+        &install,
+        COMPOSITOR,
+    )?;
+    fs::rename(&f.repo, &offline)?;
+    apply(&f.root, &install)?;
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    fs::rename(&offline, &f.repo)?;
+
+    // The available signed profile can move ahead before the image applies it.
+    publish_profile("2.0.0-0", &next)?;
+    let error = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/tool@2.0.0-0".into()],
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("protected by the installed signed profile"));
+    let exact = plan(
+        &f.root,
+        Request::ExactInstall {
+            packages: vec!["desktop/addon".into()],
+        },
+    )?;
+    apply(&f.root, &exact)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "previous");
+    let installed = list_packages(&f.root, Scope::Installed)?;
+    assert_eq!(installed.len(), 5);
+    assert!(
+        installed
+            .iter()
+            .any(|row| row.name == "library/z" && row.status == Status::Dependency)
+    );
+
+    fs::rename(&f.repo, &offline)?;
+    let remove = |name: &str| Request::Remove {
+        packages: vec![name.into()],
+    };
+    for name in ["desktop/tool", "library/z"] {
+        let error = plan(&f.root, remove(name)).unwrap_err();
+        assert!(format!("{error:#}").contains("protected by the installed signed profile"));
+    }
+    apply(&f.root, &plan(&f.root, remove("desktop/addon"))?)?;
+    apply(&f.root, &plan(&f.root, Request::Autoremove)?)?;
+    assert!(package_manifest(&f.root, "library/a", false).is_err());
+    package_manifest(&f.root, "library/z", false)?;
+
+    fs::rename(&offline, &f.repo)?;
+    let upgrade = plan(&f.root, Request::Update)?;
+    let staged = f._dir.path().join("staged");
+    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "next");
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "previous");
+    fs::rename(&f.repo, &offline)?;
+    assert!(plan(&f.root, remove("library/z")).is_err());
+    assert!(plan(&staged, remove("library/a")).is_err());
+    apply(&staged, &plan(&staged, Request::Autoremove)?)?;
+    assert!(package_manifest(&staged, "library/z", false).is_err());
+    assert!(verify(&staged)?.iter().all(|finding| !finding.is_error));
+    Ok(())
+}
+
+#[test]
 fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Result<()> {
     let f = Fixture::new()?;
     f.package("library/legacy", "1.0.0-0", String::new())?;
@@ -2271,7 +2421,7 @@ publisher "seed" {{
         assert_eq!(audit.verified, 1);
         assert!(audit.failures.is_empty(), "{:?}", audit.failures);
     }
-    let remove = plan(
+    let error = plan(
         &interrupted,
         Request::Remove {
             packages: vec![
@@ -2279,10 +2429,11 @@ publisher "seed" {{
                 "desktop/compositor".to_owned(),
             ],
         },
-    )?;
-    apply(&interrupted, &remove)?;
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("protected by the installed signed profile"));
     let audit = crate::audit_publisher_builds(&interrupted, "seed")?;
-    assert_eq!(audit.verified, 0);
+    assert_eq!(audit.verified, 1);
     assert!(audit.failures.is_empty(), "{:?}", audit.failures);
 
     let other_builder = Fixture::new()?;

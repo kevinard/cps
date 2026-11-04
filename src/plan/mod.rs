@@ -14,9 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     boot::kernel::{self, Artifacts},
-    image::{Image, Settings, State, publisher_generation_is_initial, root::Root},
+    image::{
+        Image, Installed, Managed, Settings, State, publisher_generation_is_initial, root::Root,
+    },
     model::{FORMAT, Node, PackageSpec, digest, validate_name},
-    repo::BuildReceipt,
+    repo::{BuildReceipt, Published},
     systemd::{self, Action as SystemdAction},
 };
 
@@ -252,6 +254,59 @@ pub fn plan(path: &Path, request: Request) -> Result<Plan> {
     Ok(build(&image, state, request, None, Some(SolverRevision::SatV1))?.0)
 }
 
+fn resolve_local<'a>(
+    state: &'a State,
+    available: Candidates<'_, impl IntoIterator<Item = &'a Published>>,
+    requested: &BTreeMap<&'a str, PackageSpec<'a>>,
+    update: bool,
+    exact: bool,
+    solver: Option<SolverRevision>,
+) -> Result<(BTreeMap<String, Installed>, BTreeMap<String, Managed>)> {
+    let mut pinned = requested.clone();
+    for name in state.settings.profile_packages.keys() {
+        let manifest = &state.installed[name].published.manifest;
+        ensure!(
+            requested
+                .get(name.as_str())
+                .and_then(|spec| spec.version)
+                .is_none_or(|version| version == manifest.version),
+            "{name} is protected by the installed signed profile; apply a signed profile update to change it"
+        );
+        ensure!(
+            available
+                .obsoletions
+                .get(name)
+                .is_none_or(|cutoff| manifest.version > *cutoff),
+            "the current catalog obsoletes protected package {name}; apply a signed profile update first"
+        );
+        pinned.insert(
+            name.as_str(),
+            PackageSpec {
+                publisher: Some(&manifest.publisher),
+                name,
+                version: Some(manifest.version),
+            },
+        );
+    }
+    let (mut installed, paths) = resolve::resolve(
+        &state.installed,
+        available,
+        &pinned,
+        update,
+        exact,
+        solver,
+        |installed| effective_paths(&state.settings, installed),
+    )?;
+    state.settings.check_profile_packages(&installed)?;
+    for name in state.settings.profile_packages.keys() {
+        installed
+            .get_mut(name)
+            .expect("checked profile package")
+            .explicit = requested.contains_key(name.as_str()) || state.installed[name].explicit;
+    }
+    Ok((installed, paths))
+}
+
 pub(crate) fn build(
     image: &Image,
     mut state: State,
@@ -285,6 +340,7 @@ pub(crate) fn build(
                     "package is not installed: {name}"
                 );
             }
+            state.settings.check_profile_packages(&installed)?;
             resolve::check(&installed).context("removal would break installed dependencies")?;
             let paths = effective_paths(&state.settings, &installed)?;
             (installed, paths)
@@ -306,8 +362,8 @@ pub(crate) fn build(
                     )
                 })
                 .collect();
-            resolve::resolve(
-                &state.installed,
+            resolve_local(
+                &state,
                 Candidates {
                     packages: std::iter::empty(),
                     obsoletions: &BTreeMap::new(),
@@ -316,7 +372,6 @@ pub(crate) fn build(
                 false,
                 true,
                 solver,
-                |installed| effective_paths(&state.settings, installed),
             )?
         }
         _ => {
@@ -373,8 +428,8 @@ pub(crate) fn build(
                     |installed| effective_paths(&state.settings, installed),
                 )?
             } else {
-                resolve::resolve(
-                    &state.installed,
+                resolve_local(
+                    &state,
                     Candidates {
                         packages: &catalogs.candidates.packages,
                         obsoletions: &catalogs.candidates.obsoletions,
@@ -383,10 +438,19 @@ pub(crate) fn build(
                     matches!(request, Request::Update),
                     matches!(request, Request::ExactInstall { .. }),
                     solver,
-                    |installed| effective_paths(&state.settings, installed),
                 )?
             };
             receipts = catalogs.verify_builds(image, &state, &installed)?;
+            if install_profile || update_profile {
+                state.settings.profile_packages.clone_from(
+                    &catalogs
+                        .profile
+                        .as_ref()
+                        .expect("applied profile")
+                        .composition,
+                );
+                state.settings.check_profile_packages(&installed)?;
+            }
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
             state.settings.build_profile_catalog =
                 if catalogs.profile.as_ref().is_some_and(|profile| {
@@ -697,9 +761,7 @@ pub(crate) fn build(
         })?;
     state.settings.revision = revision;
     state.settings.bootstrap_catalog = None;
-    state.settings.format = state
-        .publishers
-        .image_format(false, !state.settings.catalog_checkpoints.is_empty());
+    state.settings.format = state.publishers.image_format(&state.settings);
     state
         .settings
         .created_directories

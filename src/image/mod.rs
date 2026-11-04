@@ -31,6 +31,8 @@ const BUILD_TRUST_IMAGE_FORMAT: u32 = 2;
 const BOOTSTRAP_IMAGE_FORMAT: u32 = 3;
 // Older writers would discard the catalog checkpoints.
 const CHECKPOINT_IMAGE_FORMAT: u32 = 4;
+// Older writers would discard the installed profile's package requirements.
+const PROFILE_IMAGE_FORMAT: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
@@ -53,6 +55,8 @@ pub struct Settings {
     pub(crate) build_profile_catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalog_checkpoints: BTreeMap<String, CatalogCheckpoint>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) profile_packages: BTreeMap<String, String>,
     // Absent on images that predate tracking. Their proposals are discovered
     // from the saved vendor copies the first time they are reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +74,22 @@ pub struct BootParent {
 }
 
 impl Settings {
+    pub(crate) fn check_profile_packages(
+        &self,
+        installed: &BTreeMap<String, Installed>,
+    ) -> Result<()> {
+        for (name, digest) in &self.profile_packages {
+            validate_digest(digest).context("invalid signed profile manifest digest")?;
+            ensure!(
+                installed
+                    .get(name)
+                    .is_some_and(|package| &package.published.sha256 == digest),
+                "{name} is protected by the installed signed profile; apply a signed profile update to change it"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_catalog(&self, publisher: &str, next: &CatalogCheckpoint) -> Result<()> {
         if let Some(previous) = self.catalog_checkpoints.get(publisher) {
             previous.check(next).with_context(|| {
@@ -147,10 +167,12 @@ impl Publishers {
             .find(|publisher| publisher.name == name)
     }
 
-    pub(crate) fn image_format(&self, bootstrapping: bool, checkpointed: bool) -> u32 {
-        if bootstrapping {
+    pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
+        if settings.bootstrap_catalog.is_some() {
             BOOTSTRAP_IMAGE_FORMAT
-        } else if checkpointed {
+        } else if !settings.profile_packages.is_empty() {
+            PROFILE_IMAGE_FORMAT
+        } else if !settings.catalog_checkpoints.is_empty() {
             CHECKPOINT_IMAGE_FORMAT
         } else if self
             .as_slice()
@@ -359,8 +381,8 @@ fn initialize(
         validate_publisher(facet).context("invalid facet")?;
     }
     let id = image_id.map_or_else(new_identity, Ok)?;
-    let settings = Settings {
-        format: publishers.image_format(bootstrap_catalog.is_some(), false),
+    let mut settings = Settings {
+        format: FORMAT,
         id: id.clone(),
         revision: 0,
         publisher_generation: 0,
@@ -373,8 +395,10 @@ fn initialize(
         bootstrap_catalog,
         build_profile_catalog: None,
         catalog_checkpoints: BTreeMap::new(),
+        profile_packages: BTreeMap::new(),
         config_updates: Some(BTreeMap::new()),
     };
+    settings.format = publishers.image_format(&settings);
     fs::create_dir_all(path)?;
     Root::open(path)?;
     ensure!(
@@ -514,6 +538,7 @@ impl Image {
                     | BUILD_TRUST_IMAGE_FORMAT
                     | BOOTSTRAP_IMAGE_FORMAT
                     | CHECKPOINT_IMAGE_FORMAT
+                    | PROFILE_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -524,15 +549,18 @@ impl Image {
         let settings = self.settings()?;
         let publishers = self.publishers()?;
         ensure!(
-            settings.format
-                == publishers.image_format(
-                    settings.bootstrap_catalog.is_some(),
-                    !settings.catalog_checkpoints.is_empty()
-                )
+            settings.format == publishers.image_format(&settings)
                 && (settings.bootstrap_catalog.is_none()
                     || (publishers.release_profile().is_some()
                         && settings.catalog_checkpoints.is_empty())),
             "image format does not match its repository policy"
+        );
+        ensure!(
+            settings.profile_packages.is_empty()
+                || (publishers.release_profile().is_some()
+                    && settings.bootstrap_catalog.is_none()
+                    && !settings.catalog_checkpoints.is_empty()),
+            "protected packages require an installed signed profile"
         );
         for (publisher, checkpoint) in &settings.catalog_checkpoints {
             ensure!(
@@ -556,10 +584,12 @@ impl Image {
                 "archived build policy differs from the installed primary catalog"
             );
         }
+        let installed = self.installed()?;
+        settings.check_profile_packages(&installed)?;
         Ok(State {
             settings,
             publishers,
-            installed: self.installed()?,
+            installed,
             paths: decode_rows(&self.db, "SELECT path, data FROM paths")?,
         })
     }

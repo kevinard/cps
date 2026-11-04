@@ -514,6 +514,15 @@ if [ -f /etc/cps-vm-assert-cps-builds ]; then
     [ "$audit" = 'Verified build evidence for 3 installed package(s) from canopa' ]
     printf 'CPS_VM_CPS_BUILDS: %s verified\n' "$state"
 fi
+if [ -f /etc/cps-vm-assert-profile-protection ]; then
+    if /usr/bin/cps plan --root / --output /run/remove-profile.json remove test/boot-stack \
+        > /run/remove-profile.log 2>&1; then
+        exit 1
+    fi
+    "$bb" grep -Fq 'test/boot-stack is protected by the installed signed profile' /run/remove-profile.log
+    [ ! -e /run/remove-profile.json ]
+    printf 'CPS_VM_PROFILE_PROTECTION: %s verified\n' "$state"
+fi
 if [ -f /etc/cps-vm-assert-extra-publisher ]; then
     publisher=absent
     if [ -f /etc/cps-vm-extra-marker ]; then

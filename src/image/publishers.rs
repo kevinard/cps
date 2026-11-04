@@ -353,10 +353,7 @@ fn save(image: &mut Image, publishers: Publishers, receipts: &[BuildReceipt]) ->
     settings
         .catalog_checkpoints
         .retain(|name, _| publishers.get(name).is_some());
-    settings.format = publishers.image_format(
-        settings.bootstrap_catalog.is_some(),
-        !settings.catalog_checkpoints.is_empty(),
-    );
+    settings.format = publishers.image_format(&settings);
     settings.publisher_generation = settings
         .publisher_generation
         .checked_add(1)

@@ -38,13 +38,16 @@ struct Pending {
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum PendingRecord<P> {
+    Profiled { profiled: P },
     Checkpointed { checkpointed: P },
     Legacy(P),
 }
 
 impl Pending {
     fn record(&self) -> PendingRecord<&Self> {
-        if self.next.settings.catalog_checkpoints.is_empty() {
+        if !self.next.settings.profile_packages.is_empty() {
+            PendingRecord::Profiled { profiled: self }
+        } else if self.next.settings.catalog_checkpoints.is_empty() {
             PendingRecord::Legacy(self)
         } else {
             // Older clients must fail before resuming a transaction that
@@ -129,6 +132,7 @@ pub(crate) fn apply_with(
     let stage = image.stage()?;
     let (mut pending, offline) = if let Some(record) = image.pending::<PendingRecord<Pending>>()? {
         let pending = match record {
+            PendingRecord::Profiled { profiled } => profiled,
             PendingRecord::Checkpointed { checkpointed } => checkpointed,
             PendingRecord::Legacy(pending) => pending,
         };
