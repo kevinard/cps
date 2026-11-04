@@ -4,7 +4,7 @@ pub(crate) mod sources;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{self, Seek},
+    io::{self, Read, Seek},
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
 };
@@ -42,6 +42,33 @@ pub struct BuildOptions<'a> {
     pub builder_signing_key: Option<&'a Path>,
 }
 
+/// Host-side limits for each sandbox run and the collected package outputs.
+pub struct BuildWorker {
+    pub(crate) timeout_secs: u64,
+    pub(crate) scratch_bytes: u64,
+    pub(crate) file_bytes: u64,
+    pub(crate) output_bytes: u64,
+    pub(crate) log_bytes: u64,
+}
+
+impl Default for BuildWorker {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 3600,
+            scratch_bytes: 8 << 30,
+            file_bytes: 8 << 30,
+            output_bytes: 16 << 30,
+            log_bytes: 16 << 20,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum SourceLayout {
+    Directory,
+    Cache,
+}
+
 /// Build one package using sources and a package toolchain pinned by the recipe.
 pub fn build(
     recipe_path: &Path,
@@ -67,18 +94,29 @@ pub fn build(
 }
 
 pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<String> {
-    build_with_sources(recipe_path, options, false)
+    build_with_worker(
+        recipe_path,
+        options,
+        SourceLayout::Directory,
+        &BuildWorker::default(),
+    )
 }
 
 /// Build offline using pinned objects from a source cache.
 pub fn build_cached_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<String> {
-    build_with_sources(recipe_path, options, true)
+    build_with_worker(
+        recipe_path,
+        options,
+        SourceLayout::Cache,
+        &BuildWorker::default(),
+    )
 }
 
-fn build_with_sources(
+pub fn build_with_worker(
     recipe_path: &Path,
     options: BuildOptions<'_>,
-    cached: bool,
+    layout: SourceLayout,
+    worker: &BuildWorker,
 ) -> Result<String> {
     let BuildOptions {
         repo,
@@ -130,7 +168,12 @@ fn build_with_sources(
     let work = TempDir::new_in(&destination)?;
     let inputs = work.path().join("sources");
     fs::create_dir(&inputs)?;
-    stage_sources(sources, &inputs, &recipe, cached)?;
+    stage_sources(
+        sources,
+        &inputs,
+        &recipe,
+        matches!(layout, SourceLayout::Cache),
+    )?;
     let script = work.path().join("build.sh");
     fs::write(&script, &recipe.script)?;
     set_mode(&script, 0o444)?;
@@ -142,25 +185,9 @@ fn build_with_sources(
     let stage = TempDir::new_in(&destination)?;
     let proto = stage.path().join("proto");
     fs::create_dir(&proto)?;
-    let artifacts = run(
-        &toolchain,
-        &inputs,
-        &script,
-        work.path(),
-        &recipe,
-        &paths,
-        Some(&proto),
-    )?;
+    let artifacts = run(work.path(), recipe.epoch, worker, &paths, Some(&proto))?;
     if check_reproducible {
-        let repeated = run(
-            &toolchain,
-            &inputs,
-            &script,
-            work.path(),
-            &recipe,
-            &paths,
-            None,
-        )?;
+        let repeated = run(work.path(), recipe.epoch, worker, &paths, None)?;
         for (path, hash) in &artifacts {
             ensure!(
                 repeated.get(path) == Some(hash),
@@ -358,23 +385,37 @@ fn prepare_toolchain(
 }
 
 fn run(
-    toolchain: &Path,
-    sources: &Path,
-    script: &Path,
     work: &Path,
-    recipe: &BuildRecipe,
+    epoch: u32,
+    worker: &BuildWorker,
     paths: &BTreeSet<&str>,
     proto: Option<&Path>,
 ) -> Result<BTreeMap<String, FileDigest>> {
     let output = TempDir::new_in(work)?;
-    sandbox::run(toolchain, sources, script, output.path(), recipe.epoch)?;
+    sandbox::run(
+        &work.join("toolchain"),
+        &work.join("sources"),
+        &work.join("build.sh"),
+        output.path(),
+        epoch,
+        worker,
+    )?;
     let root = Root::open(output.path())?;
     let mut artifacts = BTreeMap::new();
     let mut directories: BTreeSet<_> = proto.into_iter().map(Path::to_owned).collect();
+    let mut remaining = worker.output_bytes;
     for path in paths {
-        let mut source = root
+        let source = root
             .file(path)
             .with_context(|| format!("opening declared build output {path}"))?;
+        let size = source.metadata()?.len();
+        remaining = remaining.checked_sub(size).with_context(|| {
+            format!(
+                "declared outputs exceed {} bytes at {path}",
+                worker.output_bytes
+            )
+        })?;
+        let mut source = source.take(size.saturating_add(1));
         let artifact = if let Some(proto) = proto {
             let destination = proto.join(path);
             fs::create_dir_all(parent(&destination))?;
@@ -390,14 +431,16 @@ fn run(
                 .write(true)
                 .create_new(true)
                 .open(&destination)?;
-            let size = io::copy(&mut source, &mut file)?;
+            ensure!(
+                io::copy(&mut source, &mut file)? == size,
+                "build output changed size at {path}"
+            );
             file.rewind()?;
             let hash = digest_reader(&mut file)?;
             set_mode(&destination, 0o644)?;
-            normalize(&destination, recipe.epoch)?;
+            normalize(&destination, epoch)?;
             FileDigest { sha256: hash, size }
         } else {
-            let size = source.metadata()?.len();
             FileDigest {
                 sha256: digest_reader(&mut source)?,
                 size,
@@ -407,7 +450,7 @@ fn run(
     }
     for directory in directories.iter().rev() {
         set_mode(directory, 0o755)?;
-        normalize(directory, recipe.epoch)?;
+        normalize(directory, epoch)?;
     }
     Ok(artifacts)
 }

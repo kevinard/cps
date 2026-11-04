@@ -10,10 +10,11 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
-    Activation, BuildOptions, BuildWitness, ImageConfig, Plan, Request, activate_boot_environment,
-    apply, build_cached_package, build_package, create_image, fetch_sources, import_sources,
-    list_boot_environments, plan, publish, publish_witnessed_bundle, read_attestation,
-    read_image_config, release, rollback_boot_environment, stage_boot_environment, verify,
+    Activation, BuildOptions, BuildWitness, ImageConfig, Plan, Request, SourceLayout,
+    activate_boot_environment, apply, build_with_worker, create_image, fetch_sources,
+    import_sources, list_boot_environments, plan, publish, publish_witnessed_bundle,
+    read_attestation, read_image_config, read_worker_config, release, rollback_boot_environment,
+    stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -46,6 +47,8 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         check_reproducible: bool,
+        #[arg(long)]
+        worker_config: Option<PathBuf>,
         #[arg(long, requires = "check_reproducible")]
         builder_signing_key: Option<PathBuf>,
         recipe: PathBuf,
@@ -346,6 +349,7 @@ fn run(command: Command) -> Result<ExitCode> {
             source_cache,
             output,
             check_reproducible,
+            worker_config,
             builder_signing_key,
             recipe,
         } => {
@@ -361,11 +365,17 @@ fn run(command: Command) -> Result<ExitCode> {
                 check_reproducible,
                 builder_signing_key: builder_signing_key.as_deref(),
             };
-            let id = if source_cache.is_some() {
-                build_cached_package(&recipe, options)?
+            let layout = if source_cache.is_some() {
+                SourceLayout::Cache
             } else {
-                build_package(&recipe, options)?
+                SourceLayout::Directory
             };
+            let worker = worker_config
+                .as_deref()
+                .map(read_worker_config)
+                .transpose()?
+                .unwrap_or_default();
+            let id = build_with_worker(&recipe, options, layout, &worker)?;
             println!("Built {id} at {}", output.display());
         }
         Command::Publish {

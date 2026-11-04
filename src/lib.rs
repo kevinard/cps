@@ -18,10 +18,12 @@ pub use boot::{
     rollback_boot_environment, stage_boot_environment,
 };
 pub use build::{
-    BuildOptions, build, build_cached_package, build_package,
+    BuildOptions, BuildWorker, SourceLayout, build, build_cached_package, build_package,
+    build_with_worker,
     sources::{fetch_sources, import_sources},
 };
 pub use image::create_image;
+pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{Plan, Request, plan};
 pub use repo::{

@@ -1,14 +1,22 @@
 use std::{
     fs::File,
-    io::{self, Read, Seek, Write},
+    io::{self, PipeReader, Read, Seek, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::mpsc::{self, RecvTimeoutError},
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall, scmp_cmp};
-use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::{
+    io::{Errno, FdFlags, fcntl_setfd},
+    process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
+};
+
+use super::BuildWorker;
 
 fn filter() -> Result<File> {
     let mut rules = ScmpFilterContext::new(ScmpAction::Allow)?;
@@ -57,6 +65,7 @@ pub(super) fn run(
     script: &Path,
     output: &Path,
     epoch: u32,
+    worker: &BuildWorker,
 ) -> Result<()> {
     let filter = filter().context("creating seccomp build policy")?;
     let mut command = Command::new("/usr/bin/bwrap");
@@ -92,22 +101,18 @@ pub(super) fn run(
         .arg("--bind")
         .arg(output)
         .arg("/out")
-        .args([
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/run",
-            "--tmpfs",
-            "/build",
-            "--dir",
-            "/build/home",
-            "--chdir",
-            "/build",
-        ]);
+        .args(["--proc", "/proc", "--dev", "/dev"]);
+    for (path, size) in [
+        ("/tmp", worker.scratch_bytes),
+        ("/run", worker.scratch_bytes.min(64 << 20)),
+        ("/build", worker.scratch_bytes),
+    ] {
+        command
+            .arg("--size")
+            .arg(size.to_string())
+            .args(["--tmpfs", path]);
+    }
+    command.args(["--dir", "/build/home", "--chdir", "/build"]);
     let epoch = epoch.to_string();
     for (key, value) in [
         ("PATH", "/usr/bin:/bin"),
@@ -125,7 +130,7 @@ pub(super) fn run(
     ] {
         command.args(["--setenv", key, value]);
     }
-    let (mut logs, writer) = io::pipe()?;
+    let (logs, writer) = io::pipe()?;
     command
         .args([
             "--",
@@ -139,14 +144,24 @@ pub(super) fn run(
         .stderr(writer);
     // Only async-signal-safe system calls run here. Bubblewrap consumes the policy descriptor,
     // and the recipe's standard streams are private pipes or null.
+    let file_bytes = worker.file_bytes;
     unsafe {
         command.pre_exec(move || {
-            let core = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
-                return Err(io::Error::last_os_error());
+            for (resource, limit) in [(libc::RLIMIT_CORE, 0), (libc::RLIMIT_FSIZE, file_bytes)] {
+                let mut inherited = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(resource, &mut inherited) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: inherited.rlim_cur.min(limit),
+                    rlim_max: inherited.rlim_max.min(limit),
+                };
+                if libc::setrlimit(resource, &limit) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             if libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as _) != 0 {
                 return Err(io::Error::last_os_error());
@@ -155,32 +170,87 @@ pub(super) fn run(
             Ok(())
         });
     }
-    let mut child = command
+    let child = command
         .spawn()
         .context("starting rootless bubblewrap build")?;
     drop(command);
-    let copied = relay_logs(&mut logs, &mut io::stderr().lock());
+    monitor(child, logs, worker)
+}
+
+fn monitor(mut child: Child, mut logs: PipeReader, worker: &BuildWorker) -> Result<()> {
+    let (finished, watchdog) =
+        match start_watchdog(&child, Duration::from_secs(worker.timeout_secs)) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("starting build watchdog"));
+            }
+        };
+    let copied = relay_logs(&mut logs, &mut io::stderr().lock(), worker.log_bytes);
     if copied.is_err() {
         let _ = child.kill();
     }
-    let status = child.wait()?;
+    let status = child.wait();
+    drop(finished);
+    let expired = watchdog
+        .join()
+        .map_err(|_| anyhow::anyhow!("build watchdog panicked"))??;
+    ensure!(
+        !expired,
+        "isolated build exceeded its {}-second deadline",
+        worker.timeout_secs
+    );
     copied.context("relaying build logs")?;
+    let status = status?;
     ensure!(status.success(), "isolated build failed with {status}");
     Ok(())
 }
 
-fn relay_logs(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
+fn start_watchdog(
+    child: &Child,
+    timeout: Duration,
+) -> Result<(mpsc::Sender<()>, thread::JoinHandle<io::Result<bool>>)> {
+    let pid = Pid::from_raw(i32::try_from(child.id())?).context("invalid sandbox PID")?;
+    let pidfd = pidfd_open(pid, PidfdFlags::empty())?;
+    let (finished, receiver) = mpsc::channel::<()>();
+    let watchdog = thread::Builder::new()
+        .name("cps-build-watchdog".to_owned())
+        .spawn(move || {
+            if receiver.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
+                match pidfd_send_signal(&pidfd, Signal::KILL) {
+                    Ok(()) | Err(Errno::SRCH) => return Ok(true),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(false)
+        })?;
+    Ok((finished, watchdog))
+}
+
+fn relay_logs(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    mut remaining: u64,
+) -> io::Result<()> {
     let mut buffer = [0u8; 8192];
+    let mut truncated = false;
     loop {
         let length = input.read(&mut buffer)?;
         if length == 0 {
             return Ok(());
         }
-        for byte in &mut buffer[..length] {
+        let visible = (length as u64).min(remaining) as usize;
+        for byte in &mut buffer[..visible] {
             if !byte.is_ascii_graphic() && !matches!(*byte, b' ' | b'\t' | b'\n') {
                 *byte = b'?';
             }
         }
-        output.write_all(&buffer[..length])?;
+        output.write_all(&buffer[..visible])?;
+        remaining -= visible as u64;
+        if visible < length && !truncated {
+            output.write_all(b"\n[cps: build log limit reached]\n")?;
+            truncated = true;
+        }
     }
 }

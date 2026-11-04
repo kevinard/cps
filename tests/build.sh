@@ -24,17 +24,48 @@ cat > probe.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "runaway") == 0) {
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            assert(setsid() >= 0);
+            assert(signal(SIGTERM, SIG_IGN) != SIG_ERR);
+            printf("detached build child started %s\n", argv[2]);
+            fflush(stdout);
+        }
+        for (;;) pause();
+    }
+    if (argc == 2 && strcmp(argv[1], "limits") == 0) {
+        const char *scratch[] = {"/build", "/tmp", "/run"};
+        for (unsigned i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
+            struct statvfs stats;
+            assert(statvfs(scratch[i], &stats) == 0);
+            assert(stats.f_blocks * stats.f_frsize == 1048576);
+        }
+        struct rlimit limit;
+        assert(getrlimit(RLIMIT_FSIZE, &limit) == 0);
+        assert(limit.rlim_cur == 4096 && limit.rlim_max == 4096);
+        assert(signal(SIGXFSZ, SIG_IGN) != SIG_ERR);
+        int fd = open("/out/too-large", O_CREAT | O_WRONLY, 0644);
+        assert(fd >= 0);
+        assert(ftruncate(fd, 4097) < 0 && errno == EFBIG);
+        puts("worker scratch and file limits verified");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "unstable") == 0) {
         struct timespec now;
         assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
@@ -155,6 +186,38 @@ build_package --sources sources --builder-signing-key other.der --check-reproduc
 test ! -e first/proto/unlisted
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
 test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
+
+cat > limits.kdl <<'KDL'
+schema-version 1
+worker timeout-seconds=2 scratch-bytes=1048576 file-bytes=4096 output-bytes=4 log-bytes=128
+KDL
+recipe '    probe limits
+    printf "%2048s\n" "log output"
+    printf "hello" > "$DESTDIR/hello"' > limits.build.kdl
+if build_package --sources sources --worker-config limits.kdl --output limited limits.build.kdl 2> limits.log; then
+    echo 'oversized bundle unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'worker scratch and file limits verified' limits.log
+grep -F 'build log limit reached' limits.log
+grep -F 'declared outputs exceed 4 bytes at hello' limits.log
+test "$(wc -c < limits.log)" -lt 512
+test ! -e limited
+
+token="cps-runaway-$$"
+recipe "    exec probe runaway $token" > runaway.kdl
+if timeout 15 "$cps" build --repo repo --publisher canopa --trust-key public.der --sources sources \
+    --worker-config limits.kdl --output runaway runaway.kdl 2> runaway.log; then
+    echo 'runaway build unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F "detached build child started $token" runaway.log
+grep -F 'isolated build exceeded its 2-second deadline' runaway.log
+test ! -e runaway
+if pgrep -f -- "^probe runaway $token$"; then
+    echo 'sandbox child survived the build deadline' >&2
+    exit 1
+fi
 
 recipe '    probe unstable > "$DESTDIR/hello"' > unstable.kdl
 if build_package --sources sources --check-reproducible --output unstable unstable.kdl 2> unstable.log; then
