@@ -11,9 +11,9 @@ use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
-    add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_sources,
-    generate_manifest, import_sources, list_boot_environments, list_publishers, list_withdrawals,
-    plan, prefer_publisher, publish, publish_witnessed_bundle, read_attestation,
+    add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_plan,
+    fetch_sources, generate_manifest, import_sources, list_boot_environments, list_publishers,
+    list_withdrawals, plan, prefer_publisher, publish, publish_witnessed_bundle, read_attestation,
     read_worker_config, release, remove_publisher, rollback_boot_environment,
     stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
@@ -144,6 +144,13 @@ enum Command {
         output: PathBuf,
         #[command(subcommand)]
         request: PlanCommand,
+    },
+    /// Fetch the verified payloads required by a saved plan
+    Fetch {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        plan: PathBuf,
     },
     /// Apply or resume a saved plan
     Apply {
@@ -298,6 +305,9 @@ enum RepoCommand {
         publisher: String,
         #[arg(long)]
         trust_key: PathBuf,
+        /// Cache the catalog, manifests, and build evidence without downloading payloads
+        #[arg(long)]
+        index_only: bool,
     },
 }
 
@@ -551,10 +561,16 @@ fn run(command: Command) -> Result<ExitCode> {
                 targets,
                 publisher,
                 trust_key,
+                index_only,
             } => {
+                let sync = if index_only {
+                    release::sync_index
+                } else {
+                    release::sync
+                };
                 println!(
                     "Synchronized {}",
-                    release::sync(&repo, &root, &metadata, &targets, &publisher, &trust_key)?
+                    sync(&repo, &root, &metadata, &targets, &publisher, &trust_key)?
                 );
             }
         },
@@ -652,6 +668,11 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Apply { root, plan } => {
             let saved = load_plan(&plan)?;
             println!("Image revision {}", apply(&root, &saved)?);
+        }
+        Command::Fetch { root, plan } => {
+            let saved = load_plan(&plan)?;
+            let count = fetch_plan(&root, &saved)?;
+            println!("Verified {count} plan payloads");
         }
         Command::Verify { root, pristine } => {
             let findings = if pristine {

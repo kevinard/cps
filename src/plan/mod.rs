@@ -537,6 +537,10 @@ fn requested_names(packages: &[String]) -> Result<BTreeSet<String>> {
     Ok(packages.iter().cloned().collect())
 }
 
+pub(crate) fn config_update_prefix(revision: u64) -> String {
+    format!(".cps/config-updates/{revision}/")
+}
+
 fn stage_config(
     root: &Root,
     settings: &Settings,
@@ -545,7 +549,7 @@ fn stage_config(
     node: &Node,
     writes: &mut BTreeMap<String, Write>,
 ) -> Result<()> {
-    let path = format!(".cps/config-updates/{revision}/{path}");
+    let path = format!("{}{path}", config_update_prefix(revision));
     for (index, _) in path.match_indices('/').skip(1) {
         let parent = &path[..index];
         if !writes.contains_key(parent) {

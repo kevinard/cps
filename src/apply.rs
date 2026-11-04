@@ -11,10 +11,10 @@ use tempfile::NamedTempFile;
 
 use crate::{
     boot::kernel::Artifacts,
-    image::{Image, Managed, State, root::Root},
+    image::{Image, Managed, Publisher, State, root::Root},
     model::{Node, digest_reader},
-    plan::{Plan, Write, build, hardlink_groups, payloads},
-    repo::stage_blob,
+    plan::{Plan, Write, build, config_update_prefix, hardlink_groups, payloads},
+    repo::{release::fetch_payloads, stage_blob},
     systemd::{self, Action as SystemdAction},
     verify::verify_state,
 };
@@ -32,8 +32,56 @@ struct Pending {
     files_ready: bool,
 }
 
+type PublisherPayloads<'a> = (&'a Publisher, BTreeMap<&'a str, &'a Node>);
+
 pub fn apply(path: &Path, plan: &Plan) -> Result<u64> {
     apply_with(path, plan, |_| {})
+}
+
+pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
+    let image = Image::open_query(path)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    ensure!(
+        plan.image == state.settings.id,
+        "plan targets a different image"
+    );
+    if image.applied(&plan.id()?)?.is_some() {
+        return Ok(0);
+    }
+    let (checked, next) = check_plan(&image.root, state, plan)?;
+    let mut count = 0;
+    for (publisher, blobs) in payload_sources(&checked.writes, &next)? {
+        let blobs = blobs
+            .into_iter()
+            .map(|(hash, node)| {
+                let Node::File { size, .. } = node else {
+                    unreachable!("payloads contain only files");
+                };
+                (hash, *size)
+            })
+            .collect::<BTreeMap<_, _>>();
+        count += blobs.len();
+        fetch_payloads(publisher, blobs)
+            .with_context(|| format!("preparing payloads from {}", publisher.name))?;
+    }
+    Ok(count)
+}
+
+fn check_plan(root: &Root, state: State, plan: &Plan) -> Result<(Plan, State)> {
+    ensure!(
+        plan.base_revision == state.settings.revision,
+        "stale plan for revision {}; image is at revision {}",
+        plan.base_revision,
+        state.settings.revision
+    );
+    plan.check_publisher_generation(&state.settings)?;
+    let (checked, next) = build(root, state, plan.request.clone(), Some(plan), plan.solver)?;
+    ensure!(
+        &checked == plan,
+        "saved plan differs from the verified plan; generate a new plan"
+    );
+    Ok((checked, next))
 }
 
 pub(crate) fn apply_with(
@@ -63,24 +111,7 @@ pub(crate) fn apply_with(
         if let Some(revision) = image.applied(&id)? {
             return Ok(revision);
         }
-        ensure!(
-            plan.base_revision == state.settings.revision,
-            "stale plan for revision {}; image is at revision {}",
-            plan.base_revision,
-            state.settings.revision
-        );
-        plan.check_publisher_generation(&state.settings)?;
-        let (checked, next) = build(
-            &image.root,
-            state,
-            plan.request.clone(),
-            Some(plan),
-            plan.solver,
-        )?;
-        ensure!(
-            &checked == plan,
-            "saved plan differs from the verified plan; generate a new plan"
-        );
+        let (checked, next) = check_plan(&image.root, state, plan)?;
         let offline = offline_target(
             &image.root,
             !checked.systemd.is_empty() || checked.kernel_install.is_some(),
@@ -247,40 +278,61 @@ fn prepare(stage: &File, writes: &[Write], state: &State) -> Result<()> {
                 .with_context(|| format!("checking file capability support for {}", write.path))?;
         }
     }
-    let payloads = payloads(writes);
-    let mut sources = std::collections::BTreeMap::new();
-    for managed in state.paths.values() {
-        if let Node::File { sha256, .. } = &managed.node
-            && payloads.contains_key(sha256.as_str())
-        {
-            let name = managed
-                .owners
-                .first()
-                .context("file has no owning package")?;
-            let owner = state
-                .installed
-                .get(name)
-                .context("file's owning package is absent")?;
-            sources
-                .entry(sha256.as_str())
-                .or_insert(&owner.published.manifest.publisher);
+    for (publisher, blobs) in payload_sources(writes, state)? {
+        for (hash, node) in blobs {
+            let mut file = NamedTempFile::new_in(&dir)?;
+            stage_blob(&publisher.repo, node, file.as_file_mut())?;
+            file.as_file().sync_all()?;
+            file.persist_noclobber(dir.join(hash))?;
         }
-    }
-    for (hash, node) in payloads {
-        let name = sources
-            .get(hash)
-            .with_context(|| format!("no owning publisher for payload {hash}"))?;
-        let publisher = state
-            .publishers
-            .get(name)
-            .with_context(|| format!("publisher {name} is not configured"))?;
-        let mut file = NamedTempFile::new_in(&dir)?;
-        stage_blob(&publisher.repo, node, file.as_file_mut())?;
-        file.as_file().sync_all()?;
-        file.persist_noclobber(dir.join(hash))?;
     }
     stage.sync_all()?;
     Ok(())
+}
+
+fn payload_sources<'a>(
+    writes: &'a [Write],
+    state: &'a State,
+) -> Result<Vec<PublisherPayloads<'a>>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut by_publisher = BTreeMap::<_, BTreeMap<_, _>>::new();
+    let config_updates = config_update_prefix(state.settings.revision);
+    for write in writes.iter().filter(|write| write.replaces_file()) {
+        let Some(node @ Node::File { sha256, .. }) = &write.after else {
+            unreachable!("only file replacements require a payload");
+        };
+        if !seen.insert(sha256) {
+            continue;
+        }
+        let path = write
+            .path
+            .strip_prefix(&config_updates)
+            .unwrap_or(&write.path);
+        let name = state
+            .paths
+            .get(path)
+            .and_then(|managed| managed.owners.first())
+            .with_context(|| format!("file has no owning package: {}", write.path))?;
+        let owner = state
+            .installed
+            .get(name)
+            .context("file's owning package is absent")?;
+        let publisher = owner.published.manifest.publisher.as_str();
+        by_publisher
+            .entry(publisher)
+            .or_default()
+            .insert(sha256.as_str(), node);
+    }
+    by_publisher
+        .into_iter()
+        .map(|(name, blobs)| {
+            let publisher = state
+                .publishers
+                .get(name)
+                .with_context(|| format!("publisher {name} is not configured"))?;
+            Ok((publisher, blobs))
+        })
+        .collect()
 }
 
 fn checked_payload(root: &Root, node: &Node) -> Result<File> {

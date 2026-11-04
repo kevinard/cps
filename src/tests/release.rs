@@ -13,6 +13,7 @@ use url::Url;
 use super::*;
 use crate::{
     attestation::{self, Toolchain},
+    fetch_plan,
     kdl_format::{build, parse_manifest},
     list_withdrawals,
     model::FileDigest,
@@ -130,9 +131,21 @@ fn sign_release(
     root: &Path,
     tuf_key: &Path,
 ) -> Result<()> {
+    sign_publisher_release(fixture, mirror, version, expires, root, tuf_key, "canopa")
+}
+
+fn sign_publisher_release(
+    fixture: &Fixture,
+    mirror: &Path,
+    version: u64,
+    expires: Timestamp,
+    root: &Path,
+    tuf_key: &Path,
+    publisher: &str,
+) -> Result<()> {
     fs::create_dir(mirror)?;
     let export = mirror.join("export");
-    mirror_release::export(&fixture.repo, "canopa", &fixture.public, &export)?;
+    mirror_release::export(&fixture.repo, publisher, &fixture.public, &export)?;
     let version = NonZeroU64::new(version).expect("nonzero release version");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -548,5 +561,135 @@ fn tuf_cache_remembers_a_newer_publisher_catalog_after_a_failed_download() -> Re
     assert_eq!(refresh("restored")?, second.trim());
     assert_eq!(refresh("restored")?, second.trim());
     assert_eq!(fs::read_to_string(cache.join("current"))?, second);
+    Ok(())
+}
+
+#[test]
+fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
+    let f = Fixture::new()?;
+    let extras = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let mirror = work.join("mirror");
+    let cache = work.join("cache");
+    let extra_anchor = work.join("extras-root.json");
+    let extra_tuf_key = work.join("extras-tuf-key.der");
+    sign_root(&extra_anchor, &extra_tuf_key, None)?;
+    let extra_mirror = work.join("extras-mirror");
+    let extra_cache = work.join("extras-cache");
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+
+    extras.package_as(
+        "extras",
+        "library/libdisplay",
+        "1.0.0-0",
+        extras.file(LIBRARY, "library", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "program", "0755", "")?
+            + &dependency("require", "library/libdisplay", "1.0.0-0"),
+    )?;
+    f.package(
+        "desktop/unused",
+        "1.0.0-0",
+        f.file(PLUGIN, "unused", "0644", "")?,
+    )?;
+    sign_release(&f, &mirror, 1, fresh, &anchor, &tuf_key)?;
+    sign_publisher_release(
+        &extras,
+        &extra_mirror,
+        1,
+        fresh,
+        &extra_anchor,
+        &extra_tuf_key,
+        "extras",
+    )?;
+    let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+    let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+    let blob = |content: &[u8]| cache.join("blobs").join(digest(content));
+    let target = |content: &[u8]| {
+        let hash = digest(content);
+        mirror.join("targets").join(format!("{hash}.blobs-{hash}"))
+    };
+    fs::remove_file(target(b"unused"))?;
+    let hash = mirror_release::sync_index(
+        &cache,
+        &anchor,
+        metadata.as_str(),
+        targets.as_str(),
+        "canopa",
+        &f.public,
+    )?;
+    let extra_metadata = Url::from_directory_path(extra_mirror.join("metadata")).unwrap();
+    let extra_targets = Url::from_directory_path(extra_mirror.join("targets")).unwrap();
+    mirror_release::sync_index(
+        &extra_cache,
+        &extra_anchor,
+        extra_metadata.as_str(),
+        extra_targets.as_str(),
+        "extras",
+        &extras.public,
+    )?;
+    assert_eq!(fs::read_dir(cache.join("blobs"))?.count(), 0);
+    assert_eq!(fs::read_dir(extra_cache.join("blobs"))?.count(), 0);
+    create_image(
+        &f.root,
+        &cache,
+        "canopa",
+        &f.public,
+        "x86_64",
+        BTreeMap::new(),
+    )?;
+    crate::add_publisher(&f.root, "extras", &extra_cache, &extras.public)?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".to_owned()],
+        },
+    )?;
+    assert!(apply(&f.root, &install).is_err());
+    assert!(!f.root.join(COMPOSITOR).exists());
+
+    let mut tampered = install.clone();
+    tampered.writes.first_mut().unwrap().path = "usr/bin/other".to_owned();
+    let error = fetch_plan(&f.root, &tampered).unwrap_err();
+    assert!(error.to_string().contains("differs from the verified plan"));
+    assert_eq!(fs::read_dir(cache.join("blobs"))?.count(), 0);
+
+    fs::write(target(b"program"), b"corrupt")?;
+    let error = fetch_plan(&f.root, &install).unwrap_err();
+    assert!(format!("{error:#}").contains("Hash mismatch"));
+    assert!(!blob(b"program").exists());
+    assert!(!f.root.join(COMPOSITOR).exists());
+    assert_eq!(fs::read_to_string(cache.join("current"))?.trim(), hash);
+    fs::write(target(b"program"), b"program")?;
+    assert_eq!(fetch_plan(&f.root, &install)?, 2);
+    assert_eq!(fs::read_dir(cache.join("blobs"))?.count(), 1);
+    assert_eq!(fs::read_dir(extra_cache.join("blobs"))?.count(), 1);
+    assert!(!blob(b"unused").exists());
+
+    let offline = work.join("offline");
+    let extra_offline = work.join("extras-offline");
+    fs::rename(&mirror, &offline)?;
+    fs::rename(&extra_mirror, &extra_offline)?;
+    assert_eq!(fetch_plan(&f.root, &install)?, 2);
+    apply(&f.root, &install)?;
+    assert_eq!(fs::read(f.root.join(COMPOSITOR))?, b"program");
+    assert_eq!(fs::read(f.root.join(LIBRARY))?, b"library");
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+
+    fs::rename(&extra_offline, &extra_mirror)?;
+    fs::remove_file(extra_cache.join("blobs").join(digest(b"library")))?;
+    fs::write(f.root.join(LIBRARY), b"damaged")?;
+    let repair = plan(&f.root, Request::Repair { packages: vec![] })?;
+    assert_eq!(fetch_plan(&f.root, &repair)?, 1);
+    fs::rename(&extra_mirror, &extra_offline)?;
+    apply(&f.root, &repair)?;
+    assert_eq!(fs::read(f.root.join(LIBRARY))?, b"library");
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     Ok(())
 }

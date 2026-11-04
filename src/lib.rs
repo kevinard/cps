@@ -14,7 +14,7 @@ mod systemd;
 mod transport;
 mod verify;
 
-pub use apply::apply;
+pub use apply::{apply, fetch_plan};
 pub use boot::{
     Activation, BootEnvironment, activate_boot_environment, list_boot_environments,
     rollback_boot_environment, stage_boot_environment,

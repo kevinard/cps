@@ -216,7 +216,27 @@ cps repo sync --repo /var/lib/cps/canopa --root canopa-root.json \
 
 Point `image-create` or the KDL image configuration at this cache. Give write access to the account that runs sync and keep the cache outside all boot roots on persistent storage. CPS uses the original provisioned root to identify the repository on each sync and stores authenticated root rotations and replay state under `.tuf`. Sync accepts HTTPS or a local `file:///` mirror, with trailing slashes on both URLs.
 
-Sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and the complete release. A failed download leaves the last complete release available. Sync can repair a damaged cache object when the current mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can use the last cached release offline. TUF freshness is checked at sync time.
+Full sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and downloads the complete release. A failed download leaves the previous cache available. Sync can repair a damaged cache object when the mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can work offline once the required metadata and payloads are cached.
+
+For an image that uses a small part of a mirror, add `--index-only` to `repo sync`.
+This caches the catalog, manifests, and build evidence and verifies the signed
+TUF target entries for payloads. Fetch the files for the resulting plan before
+applying or staging it.
+
+```sh
+cps plan --root image --output upgrade.json update
+cps fetch --root image --plan upgrade.json
+cps apply --root image --plan upgrade.json
+```
+
+Fetch revalidates the plan against the image and its pinned catalogs. If a
+required payload is missing or damaged, fetch refreshes TUF metadata using the
+mirror endpoints saved by `repo sync` and verifies the exact target. Use the
+sync account to fetch into its cache. Fetch leaves the image and the cache's
+current catalog unchanged. A payload absent from the mirror must already be in
+the local cache, which matters when an older plan references a withdrawn
+version. Use full `repo sync` when provisioning a toolchain cache for offline
+builds.
 
 Each new publication or withdrawal advances a sequence signed by the CPS
 publisher. Sync remembers the newest authenticated catalog even if downloading
