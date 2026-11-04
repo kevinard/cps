@@ -311,7 +311,7 @@ enum RepoCommand {
         #[arg(long)]
         trust_key: PathBuf,
     },
-    /// Export the current catalog and its objects for TUF signing
+    /// Export signed catalogs and their objects for TUF signing
     Export {
         #[arg(long)]
         repo: PathBuf,
@@ -321,6 +321,9 @@ enum RepoCommand {
         trust_key: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        /// Include a historical catalog and its objects in this mirror release
+        #[arg(long = "retain-catalog")]
+        retained: Vec<String>,
     },
     /// Verify and cache a release from a TUF mirror
     Sync {
@@ -610,10 +613,13 @@ fn run(command: Command) -> Result<ExitCode> {
                 publisher,
                 trust_key,
                 output,
+                retained,
             } => {
                 println!(
                     "Exported {}",
-                    release::export(&repo, &publisher, &trust_key, &output)?
+                    release::export_with_retained(
+                        &repo, &publisher, &trust_key, &output, &retained
+                    )?
                 );
             }
             RepoCommand::Sync {

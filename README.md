@@ -317,6 +317,17 @@ cps repo export --repo repo --publisher canopa --trust-key public.der --output r
 
 The export includes the catalog pointer, signed catalog, and the manifests and payloads for active packages. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
 
+When a signed release profile still references an older companion catalog,
+include that digest in the companion mirror's export with
+`--retain-catalog SHA256`. Repeat the option for up to 32 historical catalogs.
+Sign the `retained` file and the exported objects together as TUF targets. Sync
+verifies the retained catalogs and their relation to the current catalog, then
+caches their objects without advancing the pointer or replay checkpoint to a
+historical digest. Index-only sync leaves their payloads for plan-specific fetch.
+Move primary profiles to an updated companion catalog when rolling out a fix.
+The old catalog remains selectable by profiles and saved plans that pin it while
+its objects are available.
+
 Provision the initial TUF root and the CPS publisher public key through a trusted channel. Sync into a new cache on a Linux filesystem that supports atomic directory exchange.
 
 ```sh

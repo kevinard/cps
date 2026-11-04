@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{DirBuilder, File, OpenOptions},
     io::{Read, Seek, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt},
@@ -25,9 +25,9 @@ use crate::{
 };
 
 use super::{
-    CATALOG_LIMIT, MANIFEST_LIMIT, Published, Root, load_manifest, lock_repo, parse_current,
-    path_present, prepare_objects, read_catalog, read_current, read_key, read_limited,
-    read_pointer, snapshot, write_atomic,
+    CATALOG_LIMIT, MANIFEST_LIMIT, Published, Root, Snapshot, catalog_snapshot, load_manifest,
+    lock_repo, parse_current, path_present, prepare_objects, read_catalog, read_current, read_key,
+    read_limited, read_pointer, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -37,6 +37,9 @@ const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
 const ENDPOINTS_LIMIT: u64 = 8192;
 const PAYLOAD_DOWNLOADS: usize = 8;
 const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
+const RETAINED: &str = "retained";
+const MAX_RETAINED: usize = 32;
+const RETAINED_LIMIT: u64 = (65 * MAX_RETAINED) as u64;
 const CHECKPOINT_FILES: [(&str, u64); 4] = [
     ("root.json", ROOT_LIMIT),
     ("timestamp.json", ROOT_LIMIT),
@@ -406,8 +409,59 @@ async fn materialize(
         // Remember the signed catalog even when its payloads cannot be fetched.
         write_atomic(&checkpoint, format!("{hash}\n").as_bytes(), false)?;
     }
-    let mut packages = Vec::with_capacity(catalog.entries.len());
-    for (id, sha256) in catalog.entries {
+    let mut entries = BTreeMap::new();
+    let mut attestations = BTreeSet::new();
+    if verified
+        .targets()
+        .signed
+        .targets
+        .contains_key(&TargetName::new(RETAINED)?)
+    {
+        let file = download(verified, RETAINED, repo, RETAINED_LIMIT, None, None)
+            .await?
+            .context("missing retained catalog list download")?;
+        let document = String::from_utf8(read_limited(file.reopen()?, RETAINED_LIMIT)?)?;
+        let retained = retained_catalogs(document.lines(), &hash)?;
+        for pin in retained {
+            fetch_object(verified, repo, "catalogs", pin, CATALOG_LIMIT, None).await?;
+            let previous = read_catalog(repo, pin, publisher, key)?;
+            previous.check_successor(&catalog, pin).with_context(|| {
+                format!("checking retained catalog {pin} against current {hash}")
+            })?;
+            entries.extend(previous.entries);
+            attestations.extend(previous.attestations.into_values());
+        }
+    }
+    entries.extend(catalog.entries);
+    attestations.extend(catalog.attestations.into_values());
+    cache_objects(verified, repo, publisher, entries, attestations, full).await?;
+    Ok(hash)
+}
+
+fn retained_catalogs<'a>(
+    pins: impl IntoIterator<Item = &'a str>,
+    current: &str,
+) -> Result<BTreeSet<&'a str>> {
+    let mut retained = BTreeSet::new();
+    for pin in pins {
+        validate_digest(pin)?;
+        ensure!(pin != current, "current catalog cannot also be retained");
+        ensure!(retained.insert(pin), "duplicate retained catalog {pin}");
+        ensure!(retained.len() <= MAX_RETAINED, "too many retained catalogs");
+    }
+    Ok(retained)
+}
+
+async fn cache_objects(
+    verified: &Repository,
+    repo: &Path,
+    publisher: &str,
+    entries: BTreeMap<String, String>,
+    attestations: BTreeSet<String>,
+    full: bool,
+) -> Result<()> {
+    let mut packages = Vec::with_capacity(entries.len());
+    for (id, sha256) in entries {
         fetch_object(verified, repo, "manifests", &sha256, MANIFEST_LIMIT, None).await?;
         let package = load_manifest(repo, sha256)?;
         ensure!(
@@ -429,18 +483,18 @@ async fn materialize(
             )?;
         }
     }
-    for sha256 in catalog.attestations.values() {
+    for sha256 in attestations {
         fetch_object(
             verified,
             repo,
             "attestations",
-            sha256,
+            &sha256,
             ATTESTATION_LIMIT,
             None,
         )
         .await?;
     }
-    Ok(hash)
+    Ok(())
 }
 
 fn release_blobs(packages: &[Published]) -> Result<BTreeMap<&str, u64>> {
@@ -552,47 +606,48 @@ async fn download(
 
 /// Export the signed catalog and its reachable objects as a tree of TUF targets.
 pub fn export(repo: &Path, publisher: &str, trust_key: &Path, output: &Path) -> Result<String> {
-    let release = snapshot(repo, publisher, &read_key(trust_key)?, None)?;
+    export_with_retained(repo, publisher, trust_key, output, &[])
+}
+
+/// Include retained signed catalogs and their objects in the current TUF target set.
+pub fn export_with_retained(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    output: &Path,
+    retained: &[String],
+) -> Result<String> {
+    let key = read_key(trust_key)?;
+    let current = read_current(repo)?;
+    let retained = retained_catalogs(retained.iter().map(String::as_str), &current)?;
+    let catalog = read_catalog(repo, &current, publisher, &key)?;
     let root = Root::open(repo)?;
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let stage = TempDir::new_in(parent)?;
-    export_object(
-        &root,
-        stage.path(),
-        "catalogs",
-        &release.sha256,
-        CATALOG_LIMIT,
-        None,
-    )?;
-    for package in &release.packages {
-        export_object(
-            &root,
-            stage.path(),
-            "manifests",
-            &package.sha256,
-            MANIFEST_LIMIT,
-            None,
-        )?;
+    for pin in &retained {
+        let previous = read_catalog(repo, pin, publisher, &key)?;
+        previous.check_successor(&catalog, pin).with_context(|| {
+            format!("checking retained catalog {pin} against current {current}")
+        })?;
+        let release = catalog_snapshot(repo, previous, (*pin).to_owned())?;
+        export_catalog(&root, stage.path(), &release)?;
     }
-    for (hash, length) in release_blobs(&release.packages)? {
-        export_object(&root, stage.path(), "blobs", hash, length, Some(length))?;
-    }
-    for hash in release.attestations.values() {
-        export_object(
-            &root,
-            stage.path(),
-            "attestations",
-            hash,
-            ATTESTATION_LIMIT,
-            None,
-        )?;
+    let release = catalog_snapshot(repo, catalog, current.clone())?;
+    export_catalog(&root, stage.path(), &release)?;
+    if !retained.is_empty() {
+        let mut document = String::new();
+        for pin in retained {
+            document.push_str(pin);
+            document.push('\n');
+        }
+        write_atomic(&stage.path().join(RETAINED), document.as_bytes(), false)?;
     }
     write_atomic(
         &stage.path().join("current"),
-        format!("{}\n", release.sha256).as_bytes(),
+        format!("{current}\n").as_bytes(),
         false,
     )?;
 
@@ -608,7 +663,35 @@ pub fn export(repo: &Path, publisher: &str, trust_key: &Path, output: &Path) -> 
         RenameFlags::NOREPLACE,
     )?;
     directory.sync_all()?;
-    Ok(release.sha256)
+    Ok(current)
+}
+
+fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> {
+    export_object(
+        root,
+        output,
+        "catalogs",
+        &release.sha256,
+        CATALOG_LIMIT,
+        None,
+    )?;
+    for package in &release.packages {
+        export_object(
+            root,
+            output,
+            "manifests",
+            &package.sha256,
+            MANIFEST_LIMIT,
+            None,
+        )?;
+    }
+    for (hash, length) in release_blobs(&release.packages)? {
+        export_object(root, output, "blobs", hash, length, Some(length))?;
+    }
+    for hash in release.attestations.values() {
+        export_object(root, output, "attestations", hash, ATTESTATION_LIMIT, None)?;
+    }
+    Ok(())
 }
 
 fn export_object(
@@ -620,12 +703,21 @@ fn export_object(
     length: Option<u64>,
 ) -> Result<()> {
     let name = format!("{kind}/{hash}");
+    let destination = output.join(format!("{kind}-{hash}"));
+    if path_present(&destination)? {
+        let size = std::fs::metadata(destination)?.len();
+        ensure!(
+            size <= limit && length.is_none_or(|length| size == length),
+            "conflicting object length for {name}"
+        );
+        return Ok(());
+    }
     let source = root.file(&name)?;
     let mut dest = OpenOptions::new()
         .create_new(true)
         .write(true)
         .read(true)
-        .open(output.join(format!("{kind}-{hash}")))?;
+        .open(destination)?;
     let copied = std::io::copy(&mut source.take(limit.saturating_add(1)), &mut dest)?;
     dest.rewind()?;
     ensure!(

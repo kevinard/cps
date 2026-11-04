@@ -499,9 +499,13 @@ pub fn snapshot(
         None => read_current(repo)?,
     };
     let catalog = read_catalog(repo, &hash, publisher, key)?;
+    catalog_snapshot(repo, catalog, hash)
+}
+
+fn catalog_snapshot(repo: &Path, catalog: Catalog, hash: String) -> Result<Snapshot> {
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {
-        packages.push(read_package(repo, publisher, &id, sha256)?);
+        packages.push(read_package(repo, &catalog.publisher, &id, sha256)?);
     }
     Ok(Snapshot {
         sha256: hash,

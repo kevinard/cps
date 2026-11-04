@@ -502,6 +502,17 @@ fn sign_publisher_release(
     fs::create_dir(mirror)?;
     let export = mirror.join("export");
     mirror_release::export(&fixture.repo, publisher, &fixture.public, &export)?;
+    sign_export(&export, mirror, version, expires, root, tuf_key)
+}
+
+fn sign_export(
+    export: &Path,
+    mirror: &Path,
+    version: u64,
+    expires: Timestamp,
+    root: &Path,
+    tuf_key: &Path,
+) -> Result<()> {
     let version = NonZeroU64::new(version).expect("nonzero release version");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -515,7 +526,7 @@ fn sign_publisher_release(
                 .snapshot_version(version)
                 .timestamp_expires(expires)
                 .timestamp_version(version);
-            for entry in fs::read_dir(&export)? {
+            for entry in fs::read_dir(export)? {
                 let entry = entry?;
                 let name = entry.file_name().into_string().expect("ASCII target name");
                 editor.add_target(name, Target::from_path(entry.path()).await?)?;
@@ -526,10 +537,169 @@ fn sign_publisher_release(
             let signed = editor.sign(&keys).await?;
             signed.write(mirror.join("metadata")).await?;
             signed
-                .copy_targets(&export, mirror.join("targets"), PathExists::Fail)
+                .copy_targets(export, mirror.join("targets"), PathExists::Fail)
                 .await?;
             Ok(())
         })
+}
+
+#[test]
+fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    let payload = "usr/lib/runtime.marker";
+    seed.package_as(
+        "seed",
+        "library/runtime",
+        "1.0.0-0",
+        seed.file(payload, "old", "0644", "")?,
+    )?;
+    let previous = fs::read_to_string(seed.repo.join("current"))?;
+    seed.package_as(
+        "seed",
+        "library/runtime",
+        "2.0.0-0",
+        seed.file(payload, "new", "0644", "")?,
+    )?;
+    withdraw_package(
+        &seed.repo,
+        &seed.private,
+        "cps://seed/library/runtime@1.0.0-0",
+    )?;
+    let current = fs::read_to_string(seed.repo.join("current"))?;
+
+    let work = f._dir.path();
+    let mirror = work.join("mirror");
+    fs::create_dir(&mirror)?;
+    let export = mirror.join("export");
+    let invalid = mirror_release::export_with_retained(
+        &seed.repo,
+        "seed",
+        &seed.public,
+        &export,
+        &[current.trim().to_owned()],
+    )
+    .unwrap_err();
+    assert!(
+        invalid
+            .to_string()
+            .contains("current catalog cannot also be retained")
+    );
+    assert!(!export.exists());
+    mirror_release::export_with_retained(
+        &seed.repo,
+        "seed",
+        &seed.public,
+        &export,
+        &[previous.trim().to_owned()],
+    )?;
+    assert_eq!(fs::read_to_string(export.join("retained"))?, previous);
+    assert_eq!(fs::read_to_string(export.join("current"))?, current);
+
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_export(&export, &mirror, 1, fresh, &anchor, &tuf_key)?;
+    let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+    let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+    let seed_cache = work.join("seed-cache");
+    let hash = mirror_release::sync_index(
+        &seed_cache,
+        &anchor,
+        metadata.as_str(),
+        targets.as_str(),
+        "seed",
+        &seed.public,
+    )?;
+    assert_eq!(hash, current.trim());
+    assert_eq!(
+        fs::read_to_string(seed_cache.join(".tuf/catalog"))?,
+        current
+    );
+    let key = read_key(&seed.public)?;
+    let now = snapshot(&seed_cache, "seed", &key, None)?;
+    assert_eq!(now.packages.len(), 1);
+    assert_eq!(
+        now.packages[0].manifest.id(),
+        "cps://seed/library/runtime@2.0.0-0"
+    );
+    let blob = format!("blobs/{}", digest(b"old"));
+    assert!(!seed_cache.join(&blob).exists());
+
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        dependency("require", "library/runtime", "1.0.0-0"),
+    )?;
+    f.package("test/retire", "1.0.0-0", String::new())?;
+    fs::write(
+        f.repo.join("publish-policy.kdl"),
+        format!(
+            r#"schema-version 1
+publisher "canopa" {{
+    builder-key "builder.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/compositor"
+        publisher "seed" catalog={:?} {{
+            repository {:?}
+            trust-key {:?}
+        }}
+    }}
+}}
+"#,
+            previous.trim(),
+            seed.repo,
+            seed.public
+        ),
+    )?;
+    withdraw_package(&f.repo, &f.private, "cps://canopa/test/retire@1.0.0-0")?;
+    let config = work.join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{
+    repository {:?}
+    trust-key {:?}
+}}
+publisher "seed" {{
+    repository {:?}
+    trust-key {:?}
+}}
+"#,
+            f.repo, f.public, seed_cache, seed.public
+        ),
+    )?;
+    create_configured_image(&f.root, &config)?;
+    let saved = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".to_owned()],
+        },
+    )?;
+    assert_eq!(saved.catalogs["seed"], previous.trim());
+    fetch_plan(&f.root, &saved)?;
+    assert_eq!(fs::read(seed_cache.join(&blob))?, b"old");
+
+    let full = work.join("full-cache");
+    mirror_release::sync(
+        &full,
+        &anchor,
+        metadata.as_str(),
+        targets.as_str(),
+        "seed",
+        &seed.public,
+    )?;
+    assert_eq!(fs::read_to_string(full.join("current"))?, current);
+    assert_eq!(fs::read(full.join(&blob))?, b"old");
+    fs::rename(&mirror, work.join("offline-mirror"))?;
+    apply(&f.root, &saved)?;
+    assert_eq!(fs::read(f.root.join(payload))?, b"old");
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, current);
+    Ok(())
 }
 
 #[test]
