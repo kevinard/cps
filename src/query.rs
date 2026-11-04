@@ -57,12 +57,7 @@ fn available(
     publisher: &Publisher,
     pin: Option<&CatalogPin>,
 ) -> Result<(Vec<CatalogEntry>, BTreeMap<String, Version>)> {
-    let index = catalog_index(
-        &publisher.repo,
-        &publisher.name,
-        &publisher.key,
-        pin.map(|pin| pin.sha256.as_str()),
-    )?;
+    let index = catalog_index(&publisher.repo, &publisher.name, &publisher.key, pin)?;
     let mut entries = Vec::new();
     for (id, sha256) in index.entries {
         let selector =

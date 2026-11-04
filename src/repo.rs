@@ -77,6 +77,56 @@ pub(crate) struct CatalogPin {
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_trust: Option<BuildTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<CatalogLineage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogLineage {
+    anchor_sha256: String,
+    sequence: u64,
+}
+
+impl CatalogLineage {
+    fn new(key: &[u8], catalog: &Catalog) -> Self {
+        Self {
+            anchor_sha256: digest(key),
+            sequence: catalog.sequence.map_or(0, NonZeroU64::get),
+        }
+    }
+}
+
+impl CatalogPin {
+    pub(crate) fn primary(publisher: String, sha256: String) -> Self {
+        Self {
+            publisher,
+            sha256,
+            build_trust: None,
+            lineage: None,
+        }
+    }
+
+    fn read(&self, repo: &Path, publisher: &str, key: &[u8]) -> Result<Catalog> {
+        ensure!(
+            self.publisher == publisher,
+            "pinned publisher differs from {publisher}"
+        );
+        let catalog = read_catalog(repo, &self.sha256, publisher, key)?;
+        if let Some(lineage) = &self.lineage {
+            ensure!(
+                lineage == &CatalogLineage::new(key, &catalog),
+                "signed companion lineage differs from catalog {} for {publisher}",
+                self.sha256
+            );
+        }
+        Ok(catalog)
+    }
+
+    pub(crate) fn snapshot(&self, repo: &Path, publisher: &str, key: &[u8]) -> Result<Snapshot> {
+        let catalog = self.read(repo, publisher, key)?;
+        catalog_snapshot(repo, catalog, self.sha256.clone(), key)
+    }
 }
 
 impl Catalog {
@@ -262,18 +312,43 @@ impl Catalog {
                     "release drops ELF symbol version checking for signed profile {name}"
                 );
             }
-            for pin in profile
-                .companions
-                .iter()
-                .filter(|pin| pin.build_trust.is_some())
-            {
-                ensure!(
-                    next.is_some_and(|next| next.companions.iter().any(|candidate| {
-                        candidate.publisher == pin.publisher && candidate.build_trust.is_some()
-                    })),
-                    "release drops companion build trust for {} in signed profile {name}",
-                    pin.publisher
-                );
+            for pin in &profile.companions {
+                let candidate = next.and_then(|next| {
+                    next.companions
+                        .iter()
+                        .find(|next| next.publisher == pin.publisher)
+                });
+                if pin.build_trust.is_some() {
+                    ensure!(
+                        candidate.is_some_and(|next| next.build_trust.is_some()),
+                        "release drops companion build trust for {} in signed profile {name}",
+                        pin.publisher
+                    );
+                }
+                if let Some(previous) = &pin.lineage {
+                    let (candidate, lineage) = candidate
+                        .and_then(|pin| pin.lineage.as_ref().map(|lineage| (pin, lineage)))
+                        .with_context(|| {
+                            format!(
+                                "release drops companion lineage for {} in signed profile {name}",
+                                pin.publisher
+                            )
+                        })?;
+                    ensure!(
+                        previous.anchor_sha256 == lineage.anchor_sha256,
+                        "release changes companion trust anchor for {} in signed profile {name}",
+                        pin.publisher
+                    );
+                    ensure!(
+                        if candidate.sha256 == pin.sha256 {
+                            lineage.sequence == previous.sequence
+                        } else {
+                            lineage.sequence > previous.sequence
+                        },
+                        "companion catalog rollback or fork for {} in signed profile {name}",
+                        pin.publisher
+                    );
+                }
             }
         }
         Ok(())
@@ -521,12 +596,11 @@ pub(crate) fn audit_installed_builds<'a>(
     repo: &Path,
     publisher: &str,
     key: &[u8],
-    pinned: Option<&str>,
+    pin: Option<&CatalogPin>,
     trust: &BuildTrust,
     installed: impl IntoIterator<Item = &'a Published>,
 ) -> Result<BuildAudit> {
-    let hash = pinned.map_or_else(|| read_current(repo), |hash| Ok(hash.to_owned()))?;
-    let catalog = read_catalog(repo, &hash, publisher, key)?;
+    let (catalog, hash) = read_selected_catalog(repo, publisher, key, pin)?;
     for key in catalog.publisher_keys(key)? {
         trust.check_publisher_key(&key)?;
     }
@@ -683,6 +757,9 @@ fn read_catalog_with_key(
         for pin in &profile.companions {
             validate_publisher(&pin.publisher)?;
             validate_digest(&pin.sha256)?;
+            if let Some(lineage) = &pin.lineage {
+                validate_digest(&lineage.anchor_sha256)?;
+            }
             ensure!(
                 publishers.insert(pin.publisher.as_str()),
                 "duplicate publisher {} in signed profile {name}",
@@ -805,14 +882,26 @@ pub(crate) fn catalog_index(
     repo: &Path,
     publisher: &str,
     key: &[u8],
-    pin: Option<&str>,
+    pin: Option<&CatalogPin>,
 ) -> Result<CatalogIndex> {
-    let hash = pin.map_or_else(|| read_current(repo), |hash| Ok(hash.to_owned()))?;
-    let catalog = read_catalog(repo, &hash, publisher, key)?;
+    let (catalog, _) = read_selected_catalog(repo, publisher, key, pin)?;
     Ok(CatalogIndex {
         entries: catalog.entries,
         obsoletions: catalog.obsoletions,
     })
+}
+
+fn read_selected_catalog(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    pin: Option<&CatalogPin>,
+) -> Result<(Catalog, String)> {
+    if let Some(pin) = pin {
+        return Ok((pin.read(repo, publisher, key)?, pin.sha256.clone()));
+    }
+    let hash = read_current(repo)?;
+    Ok((read_catalog(repo, &hash, publisher, key)?, hash))
 }
 
 pub(crate) fn release_profile(
@@ -1517,6 +1606,70 @@ pub fn canonical_repo(repo: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_lineage_guards_primary_successors_and_matches_the_companion() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        prepare_objects(repo.path())?;
+        let key = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let signer = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let anchor = signer.public_key().as_ref();
+        let pin = CatalogPin {
+            publisher: "seed".to_owned(),
+            sha256: write_catalog(repo.path(), Catalog::empty("seed"), &signer)?,
+            build_trust: None,
+            lineage: Some(CatalogLineage {
+                anchor_sha256: digest(anchor),
+                sequence: 1,
+            }),
+        };
+        pin.read(repo.path(), "seed", anchor)?;
+
+        let mut previous = Catalog::empty("canopa");
+        previous.profiles_required = true;
+        previous.sequence = NonZeroU64::new(1);
+        previous.release_profiles.insert(
+            "desktop".to_owned(),
+            ReleaseProfile {
+                architecture: "x86_64".to_owned(),
+                facets: BTreeMap::new(),
+                companions: vec![pin.clone()],
+                elf_library_dirs: vec![],
+                elf_symbol_versions: false,
+            },
+        );
+        let previous_hash = digest(b"previous primary catalog");
+        let mut next = previous.clone();
+        next.sequence = NonZeroU64::new(2);
+        previous.check_successor(&next, &previous_hash)?;
+        let changed_pin = |update: CatalogPin, expected: &str| {
+            let mut successor = next.clone();
+            successor
+                .release_profiles
+                .get_mut("desktop")
+                .unwrap()
+                .companions = vec![update];
+            let error = previous
+                .check_successor(&successor, &previous_hash)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        };
+        let mut update = pin.clone();
+        update.lineage = None;
+        changed_pin(update, "release drops companion lineage");
+        let mut update = pin.clone();
+        update.sha256 = digest(b"companion catalog at the same sequence");
+        changed_pin(update, "companion catalog rollback or fork");
+        let mut update = pin.clone();
+        update.lineage.as_mut().unwrap().anchor_sha256 = digest(b"another key");
+        changed_pin(update, "release changes companion trust anchor");
+        let mut update = pin;
+        update.lineage.as_mut().unwrap().sequence = 2;
+        let error = update.read(repo.path(), "seed", anchor).unwrap_err();
+        assert!(format!("{error:#}").contains("signed companion lineage differs"));
+        changed_pin(update, "companion catalog rollback or fork");
+        Ok(())
+    }
 
     #[test]
     fn legacy_catalog_signatures_and_first_sequence() -> Result<()> {

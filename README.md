@@ -445,7 +445,20 @@ upgrade check, installed packages keep their original publishers. Set
 `upgrade-from` on a companion to pin a different baseline catalog for that
 publisher. Otherwise both compositions use its `catalog` pin. The primary
 catalog signs the checked architecture, facets, and ordered companion catalog
-digests. A configured image can use those digests directly.
+digests. For each companion it also records the signed catalog sequence and
+the fingerprint of the provisioned trust anchor. Images verify both against
+the pinned companion catalog and their configured key.
+
+When advancing a profile's companion pin, keep the previous catalog object in
+the publishing machine's companion repository or cache. CPS checks that the
+new companion catalog advances the sequence and preserves known package
+identities, withdrawals, attestations, and key handoffs. Primary mirror sync
+rejects successors that drop recorded companion lineage, replace its trust
+anchor, or reuse a sequence with another digest. A signing-key rotation through
+an authenticated handoff still uses the original anchor. An older primary
+catalog with no lineage remains readable, and publishing an updated profile
+records lineage for its pins. Upgrade clients before distributing those
+profiles. Saved plans continue to use their original catalog set.
 
 Add a `build-trust` block inside a companion publisher to require version 3
 build evidence for the companion packages in the fresh composition and in

@@ -281,18 +281,13 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
     let pins = publishers.release_pins(&config.arch, &config.facets, None)?;
     for publisher in publishers.as_slice() {
         if let Some(pin) = pins.get(&publisher.name) {
-            catalog_index(
-                &publisher.repo,
-                &publisher.name,
-                &publisher.key,
-                Some(&pin.sha256),
-            )
-            .with_context(|| {
-                format!(
-                    "reading pinned catalog {} for {}",
-                    pin.sha256, publisher.name
-                )
-            })?;
+            catalog_index(&publisher.repo, &publisher.name, &publisher.key, Some(pin))
+                .with_context(|| {
+                    format!(
+                        "reading pinned catalog {} for {}",
+                        pin.sha256, publisher.name
+                    )
+                })?;
         }
     }
     initialize(path, publishers, &config.arch, config.facets)

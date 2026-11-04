@@ -55,11 +55,7 @@ impl Publishers {
         );
         let mut pins = BTreeMap::from([(
             primary.name.clone(),
-            CatalogPin {
-                publisher: primary.name.clone(),
-                sha256: hash,
-                build_trust: None,
-            },
+            CatalogPin::primary(primary.name.clone(), hash),
         )]);
         pins.extend(
             profile
@@ -214,7 +210,7 @@ fn audit(
                 &publisher.repo,
                 &publisher.name,
                 &publisher.key,
-                pins.get(&publisher.name).map(|pin| pin.sha256.as_str()),
+                pins.get(&publisher.name),
                 trust,
                 missing.iter().copied(),
             )

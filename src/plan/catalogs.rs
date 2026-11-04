@@ -183,18 +183,19 @@ pub(super) fn load(
     )?;
     let mut catalogs = Catalogs::default();
     for publisher in publishers {
-        let mut pin = saved_pin(&publisher.name)?;
+        let pin = saved_pin(&publisher.name)?;
         let signed = release_pins.get(&publisher.name);
-        if let Some(required) = signed {
+        let snapshot = if let Some(required) = signed {
             ensure!(
                 saved.is_none() || pin == Some(required.sha256.as_str()),
                 "saved plan catalog for {} differs from the signed release profile",
                 publisher.name
             );
-            pin = Some(&required.sha256);
+            required.snapshot(&publisher.repo, &publisher.name, &publisher.key)
+        } else {
+            snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
         }
-        let snapshot = snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
-            .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
+        .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
         catalogs
             .candidates
             .add_obsoletions(&mut sources, &publisher.name, &snapshot.obsoletions);

@@ -386,6 +386,13 @@ fn profiled_image_follows_signed_catalog_set_and_recovers_saved_plans() -> Resul
         seed.file(payload, "new", "0644", "")?,
     )?;
     let new_pin = fs::read_to_string(seed.repo.join("current"))?;
+    // Create a same-sequence fork and extend it without the real second release.
+    fs::write(seed.repo.join("current"), &old_pin)?;
+    seed.package_as("seed", "library/fork", "1.0.0-0", String::new())?;
+    let equal_fork = fs::read_to_string(seed.repo.join("current"))?;
+    seed.package_as("seed", "library/fork", "2.0.0-0", String::new())?;
+    let newer_fork = fs::read_to_string(seed.repo.join("current"))?;
+    fs::write(seed.repo.join("current"), &new_pin)?;
     f.package(
         "desktop/compositor",
         "1.0.0-0",
@@ -494,11 +501,35 @@ publisher "canopa" {{
     assert!(format!("{error:#}").contains("release base is stale"));
     let second = refresh(&first)?;
     assert_ne!(first, second);
+    for (pin, expected) in [
+        (&old_pin, "publisher catalog rollback or fork"),
+        (&equal_fork, "publisher catalog rollback or fork"),
+        (
+            &newer_fork,
+            "release drops or changes the published manifest",
+        ),
+    ] {
+        write_policy(pin)?;
+        let error = refresh(&second).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(fs::read_to_string(&pointer)?.trim(), second);
+    }
+    let rotated = Fixture::new()?;
+    let rotated_pin = rotate_publisher_key(
+        &seed.repo,
+        "seed",
+        new_pin.trim(),
+        &seed.private,
+        &rotated.private,
+    )?;
+    write_policy(&rotated_pin)?;
+    let third = refresh(&second)?;
+    assert_ne!(second, third);
     fs::remove_file(seed.repo.join("current"))?;
     apply(&f.root, &saved)?;
     assert_eq!(fs::read_to_string(f.root.join(payload))?, "old");
     let upgrade = plan(&f.root, Request::Update)?;
-    assert_eq!(upgrade.catalogs["seed"], new_pin.trim());
+    assert_eq!(upgrade.catalogs["seed"], rotated_pin);
     let staged = f._dir.path().join("staged");
     crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(staged.join(payload))?, "new");
