@@ -40,7 +40,18 @@ CONFIG
 "$cps" verify --root image
 ```
 
-To upgrade, publish the revised recipe under a new version and run `cps plan --root image --output upgrade.json update`, then apply the saved plan. The plan pins the image revision and the signed catalogs used to resolve packages. Keep the saved plan until apply finishes. If interrupted, rerun `apply` with the same plan. Once writes begin, recovery uses the payloads staged inside the image and can finish offline.
+To upgrade, publish the revised recipe under a new version and run `cps plan --root image --output upgrade.json update`, then apply the saved plan. The plan pins the image revision and the signed catalogs used to resolve packages. Once CPS has staged the payloads and recorded the transaction, it can finish offline.
+
+```sh
+cps transaction status --root image
+cps transaction resume --root image
+```
+
+Status shows the pending plan and whether CPS is still writing files or has
+reached the offline systemd and kernel actions. Resume uses the verified
+plan and staged payloads from the image journal. You can also rerun `apply`
+with the same saved plan. Transactions recorded by earlier CPS versions
+require their original saved plan. Use the current CPS to resume a new journal.
 
 Run `cps verify --root image --pristine` to check a freshly assembled offline
 root. It checks all package paths, including preserved configuration and
@@ -201,7 +212,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-12`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-13`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache

@@ -705,7 +705,7 @@ impl Image {
                 .query_row("SELECT EXISTS(SELECT 1 FROM pending)", [], |row| row.get(0))?;
         ensure!(
             !pending,
-            "image has an incomplete transaction; rerun apply with the same plan"
+            "image has an incomplete transaction; use transaction status or rerun apply with the same plan"
         );
         Ok(())
     }

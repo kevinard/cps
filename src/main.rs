@@ -20,9 +20,9 @@ use cps::{
     list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
     list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
     publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
-    rollback_boot_environment, rollback_boot_environment_on_disk, rotate_publisher_key,
-    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment, verify,
-    verify_pristine, withdraw_package,
+    resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
+    rotate_publisher_key, set_publisher_build_trust, set_publisher_repositories,
+    stage_boot_environment, transaction_status, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -177,6 +177,11 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
         plan: PathBuf,
+    },
+    /// Inspect or resume an interrupted image transaction
+    Transaction {
+        #[command(subcommand)]
+        command: TransactionCommand,
     },
     /// Check an image against its installed manifests, offline
     Verify {
@@ -444,6 +449,20 @@ enum RepoCommand {
 enum ConfigCommand {
     /// List pending vendor configuration copies
     List {
+        #[arg(long)]
+        root: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum TransactionCommand {
+    /// Show whether the image has an interrupted transaction
+    Status {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Finish a journaled transaction using the files already staged in the image
+    Resume {
         #[arg(long)]
         root: PathBuf,
     },
@@ -1133,6 +1152,45 @@ fn run(command: Command) -> Result<ExitCode> {
             let saved = load_plan(&plan)?;
             println!("Image revision {}", apply(&root, &saved)?);
         }
+        Command::Transaction { command } => match command {
+            TransactionCommand::Status { root } => {
+                let status = transaction_status(&root)?;
+                if let Some(pending) = status.pending {
+                    if let Some(summary) = &pending.plan_summary {
+                        println!("{summary}");
+                    } else {
+                        println!("Image revision {}", status.revision);
+                    }
+                    println!(
+                        "Pending plan {} targets revision {}",
+                        pending.plan_id, pending.target_revision
+                    );
+                    println!(
+                        "{}",
+                        if pending.files_ready {
+                            "Offline actions pending"
+                        } else {
+                            "File writes pending"
+                        }
+                    );
+                    if pending.plan_summary.is_some() {
+                        println!("Recover with transaction resume");
+                    } else {
+                        println!("Recover with apply and the original saved plan");
+                    }
+                } else {
+                    println!("Image revision {}", status.revision);
+                    println!("No pending transaction");
+                }
+            }
+            TransactionCommand::Resume { root } => {
+                if let Some(revision) = resume_transaction(&root)? {
+                    println!("Image revision {revision}");
+                } else {
+                    println!("No pending transaction");
+                }
+            }
+        },
         Command::Fetch { root, plan } => {
             let saved = load_plan(&plan)?;
             let count = fetch_plan(&root, &saved)?;

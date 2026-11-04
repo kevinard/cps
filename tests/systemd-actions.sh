@@ -141,8 +141,13 @@ if "$cps" verify --root recover > retry.log 2>&1; then
 fi
 grep -q 'incomplete transaction' retry.log
 cp "base/etc/tmpfiles.d/$scope.conf" recover/etc/tmpfiles.d/
+"$cps" transaction status --root recover > recovery-status.log
+grep -Fq 'Offline actions pending' recovery-status.log
+grep -Fq 'Recover with transaction resume' recovery-status.log
+rm upgrade.json
 mv repo repo-offline
-"$cps" apply --root recover upgrade.json
+"$cps" transaction resume --root recover
+"$cps" transaction status --root recover | grep -Fx 'No pending transaction'
 "$cps" verify --root recover
 test "$(grep -c "^$user:" recover/etc/passwd)" = 1
 test -d "recover$host_tmpfiles"

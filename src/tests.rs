@@ -1791,6 +1791,63 @@ fn restores_disabled_config_proposals_and_moves_local_edits_after_upgrade() -> R
 }
 
 #[test]
+fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "compositor", "0755", "")?,
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("legacy-plan.json"),
+        &install,
+        COMPOSITOR,
+    )?;
+    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let journal: String =
+        db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
+    let journal: serde_json::Value = serde_json::from_str(&journal)?;
+    let record = &journal["journaled"];
+    let legacy = serde_json::json!({"archived": {
+        "id": record["id"], "writes": record["plan"]["writes"], "next": record["next"]
+    }});
+    db.execute(
+        "UPDATE pending SET data=?1 WHERE id=1",
+        [legacy.to_string()],
+    )?;
+    let status = crate::transaction_status(&f.root)?;
+    assert!(status.pending.unwrap().plan_summary.is_none());
+    let error = crate::resume_transaction(&f.root).unwrap_err();
+    assert!(error.to_string().contains("requires its saved plan"));
+    db.execute(
+        "UPDATE pending SET data=json_set(data, '$.archived.writes[0].path', 'wrong') WHERE id=1",
+        [],
+    )?;
+    let error = apply(&f.root, &install).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("pending actions differ from the verified plan")
+    );
+    db.execute(
+        "UPDATE pending SET data=?1 WHERE id=1",
+        [legacy.to_string()],
+    )?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert_eq!(apply(&f.root, &install)?, 1);
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn install_upgrade_and_resume_offline() -> Result<()> {
     if let (Some(root), Some(saved)) = (
         std::env::var_os("CPS_TEST_IMAGE"),

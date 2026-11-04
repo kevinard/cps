@@ -259,6 +259,47 @@ impl Plan {
         Ok(digest(&serde_json::to_vec(self)?))
     }
 
+    pub(crate) fn check_recovery_state(&self, current: &State, next: &State) -> Result<()> {
+        let before = &current.settings;
+        let after = &next.settings;
+        ensure!(
+            self.image == before.id && self.base_revision == before.revision,
+            "pending plan does not match the committed image revision"
+        );
+        self.check_publisher_generation(before)?;
+        let revision = if self.config_update_revision.is_some() {
+            before.revision
+        } else {
+            before
+                .revision
+                .checked_add(1)
+                .context("image revision exhausted")?
+        };
+        ensure!(
+            after.id == before.id
+                && after.revision == revision
+                && after.publisher_generation == before.publisher_generation
+                && after.boot_parent == before.boot_parent
+                && after.arch == before.arch
+                && after.uid == before.uid
+                && after.gid == before.gid
+                && next.publishers == current.publishers
+                && after.format == next.publishers.image_format(after),
+            "pending state does not match the image identity or transaction revision"
+        );
+        ensure!(
+            self.selected
+                .iter()
+                .map(|(name, hash)| (name, hash.as_str()))
+                .eq(next
+                    .installed
+                    .iter()
+                    .map(|(name, pkg)| (name, pkg.published.sha256.as_str()))),
+            "pending package selection differs from the verified plan"
+        );
+        Ok(())
+    }
+
     pub(crate) fn check_publisher_generation(&self, settings: &Settings) -> Result<()> {
         ensure!(
             self.publisher_generation == settings.publisher_generation,

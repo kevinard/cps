@@ -14,7 +14,10 @@ mod systemd;
 mod transport;
 mod verify;
 
-pub use apply::{apply, fetch_plan};
+pub use apply::{
+    PendingTransaction, TransactionStatus, apply, fetch_plan, resume_transaction,
+    transaction_status,
+};
 pub use boot::{
     Activation, BootEnvironment, RootDeployment, activate_boot_environment,
     activate_boot_environment_on_disk, activate_deployed_boot_environment,

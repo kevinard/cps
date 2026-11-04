@@ -2128,28 +2128,58 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
         f.file(COMPOSITOR, "first", "0755", "")? + &f.file(SECOND, "second", "0644", "")?,
     )?;
     let plan = install("desktop/compositor")?;
-    interrupt_apply_at(
-        &f.root,
-        &f._dir.path().join("pending.json"),
-        &plan,
-        COMPOSITOR,
-    )?;
+    let saved = f._dir.path().join("pending.json");
+    interrupt_apply_at(&f.root, &saved, &plan, COMPOSITOR)?;
+    fs::remove_file(saved)?;
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
     let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let status = crate::transaction_status(&f.root)?;
+    assert_eq!(status.revision, 1);
+    let pending = status.pending.unwrap();
+    assert_eq!(pending.plan_id, plan.id()?);
+    assert_eq!(pending.target_revision, 2);
+    assert!(!pending.files_ready);
+    assert_eq!(pending.plan_summary, Some(plan.summary()));
+    let journal: String =
+        db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
+    for (field, reason) in [
+        (
+            "$.journaled.plan.payload_bytes",
+            "journaled plan digest mismatch",
+        ),
+        (
+            "$.journaled.next.settings.revision",
+            "journaled image state digest mismatch",
+        ),
+    ] {
+        db.execute(
+            "UPDATE pending SET data=json_set(?1, ?2, 0) WHERE id=1",
+            (&journal, field),
+        )?;
+        let error = crate::resume_transaction(&f.root).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        assert!(!f.root.join(SECOND).exists());
+    }
+    db.execute("UPDATE pending SET data=?1 WHERE id=1", [&journal])?;
     let archive: Vec<u8> = db.query_row(
         "SELECT catalog FROM catalog_archives WHERE publisher='canopa'",
         [],
         |row| row.get(0),
     )?;
     db.execute("DELETE FROM catalog_archives WHERE publisher='canopa'", [])?;
-    let error = apply(&f.root, &plan).unwrap_err();
+    let error = crate::resume_transaction(&f.root).unwrap_err();
     assert!(format!("{error:#}").contains("reading the archived catalog for canopa"));
     assert!(!f.root.join(SECOND).exists());
     db.execute(
         "INSERT INTO catalog_archives VALUES ('canopa', ?1)",
         [&archive],
     )?;
-    apply(&f.root, &plan)?;
+    assert_eq!(crate::resume_transaction(&f.root)?, Some(2));
+    assert_eq!(crate::resume_transaction(&f.root)?, None);
+    let status = crate::transaction_status(&f.root)?;
+    assert_eq!(status.revision, 2);
+    assert!(status.pending.is_none());
+    assert_eq!(apply(&f.root, &plan)?, 2);
     assert_eq!(fs::read_to_string(f.root.join(SECOND))?, "second");
     assert!(verify(&f.root)?.is_empty());
 
