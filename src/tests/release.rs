@@ -2291,6 +2291,18 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     let error = crate::set_publisher_repositories(&f.root, &replacements).unwrap_err();
     assert!(error.to_string().contains("incomplete transaction"));
     apply(&f.root, &install)?;
+    let error = plan(
+        &f.root,
+        Request::ChangeFacet {
+            facets: BTreeMap::from([("doc.man".into(), Some(false))]),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the signed release profile fixes this image's facets")
+    );
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     {
         let cached = seed.repo.with_extension("offline").join("catalogs");

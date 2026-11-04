@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use cps::query::{PackageRow, Scope, list_packages, package_manifest};
+use cps::query::{PackageRow, Scope, list_facets, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
@@ -124,6 +124,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// List the image's configured facet overrides
+    Facet {
+        #[arg(long)]
+        root: PathBuf,
     },
     /// List installed packages or versions in the configured signed catalogs
     List {
@@ -453,6 +458,11 @@ enum PlanCommand {
     },
     /// Remove dependencies no longer needed by explicitly installed packages
     Autoremove,
+    /// Change facet selection for installed package actions
+    ChangeFacet {
+        #[arg(required = true, value_name = "NAME=true|false|default")]
+        facets: Vec<String>,
+    },
     /// Reconcile an image to the requested packages and their dependencies
     ExactInstall {
         #[arg(required = true)]
@@ -624,6 +634,29 @@ fn parse_facets(entries: Vec<String>) -> Result<BTreeMap<String, bool>> {
             .context("expected --facet NAME=BOOL")?;
         ensure!(
             facets.insert(name.to_owned(), value.parse()?).is_none(),
+            "duplicate facet {name}"
+        );
+    }
+    Ok(facets)
+}
+
+fn parse_facet_changes(entries: Vec<String>) -> Result<BTreeMap<String, Option<bool>>> {
+    let mut facets = BTreeMap::new();
+    for entry in entries {
+        let (name, value) = entry
+            .split_once('=')
+            .context("expected NAME=true|false|default")?;
+        let value = if value == "default" {
+            None
+        } else {
+            Some(
+                value
+                    .parse()
+                    .context("facet value must be true, false, or default")?,
+            )
+        };
+        ensure!(
+            facets.insert(name.to_owned(), value).is_none(),
             "duplicate facet {name}"
         );
     }
@@ -1068,6 +1101,12 @@ fn run(command: Command) -> Result<ExitCode> {
                 }
             }
         }
+        Command::Facet { root } => {
+            println!("FACET\tVALUE");
+            for (facet, value) in list_facets(&root)? {
+                println!("{facet}\t{value}");
+            }
+        }
         Command::Plan {
             root,
             output,
@@ -1079,6 +1118,9 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::InstallProfile => Request::InstallProfile,
                 PlanCommand::Remove { packages } => Request::Remove { packages },
                 PlanCommand::Autoremove => Request::Autoremove,
+                PlanCommand::ChangeFacet { facets } => Request::ChangeFacet {
+                    facets: parse_facet_changes(facets)?,
+                },
                 PlanCommand::Repair { packages } => Request::Repair { packages },
                 PlanCommand::ResolveConfig { path, take } => Request::ResolveConfig { path, take },
                 PlanCommand::Update => Request::Update,

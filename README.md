@@ -201,7 +201,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-10`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-11`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -957,6 +957,24 @@ with `plan install` and its exact installed version before planning cleanup.
 
 Run `cargo test` for the desktop upgrade and interruption test.
 
+### Changing facets on an existing image
+
+```sh
+cps facet --root image
+cps plan --root image --output facets.json change-facet doc.man=true devel=false
+cps fetch --root image --plan facets.json
+cps apply --root image --plan facets.json
+```
+
+`facet` lists explicit overrides. Use `NAME=default` to remove an override and
+restore the default enabled selection. A facet change uses the installed
+manifests and leaves package versions and catalog checkpoints in place. It
+can be staged in a boot environment and resumed like an ordinary plan.
+Enabling an action may require its payload from the repository or cache.
+Disabling an action preserves locally edited configuration under the same
+rules as package removal. A later enable reports a conflict if that unmanaged
+file still occupies the path. Signed release profiles fix their facet policy.
+
 ### Reviewing configuration updates
 
 When package permissions or ownership change on an edited file, CPS
@@ -1312,6 +1330,9 @@ catalog in the trial partition after activation. It checks for the catalog
 digest error and verifies that systemd-boot falls back after both attempts. The
 `kernel-upgrade` scenario checks the kernel and initrd on the ESP and reports
 `uname -r` from both roots.
+The `facet-change` scenario stages documentation from the installed manifest,
+checks the blessed trial after reboot, and rolls back to the original facet
+selection.
 
 Build with `cargo build`. Run [the export test](tests/boot-export.sh) with
 e2fsprogs, OpenSSL, and `setfattr` to check the payload and failure cleanup.

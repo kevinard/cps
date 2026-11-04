@@ -1575,6 +1575,100 @@ fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
 }
 
 #[test]
+fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    const ALIAS: &str = "usr/share/man/man1/compositor.1";
+    let f = Fixture::new()?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "compositor 1", "0755", "")?
+            + &f.file(MANPAGE, "manpage 1", "0644", "facet=\"doc.man\"")?
+            + &f.file(
+                CONFIG,
+                "vendor settings",
+                "0644",
+                "preserve=#true facet=\"doc.man\"",
+            )?
+            + &format!("    hardlink {ALIAS:?} target={MANPAGE:?} facet=\"doc.man\"\n"),
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    let before = crate::image::Image::open_query(&f.root)?.state()?;
+    assert!(!f.root.join(MANPAGE).exists());
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "compositor 2", "0755", "")?,
+    )?;
+    let set = |value| Request::ChangeFacet {
+        facets: BTreeMap::from([("doc.man".into(), value)]),
+    };
+    let enable = plan(&f.root, set(None))?;
+    assert!(
+        enable
+            .summary()
+            .contains("Reset facet doc.man to its default")
+    );
+    assert!(enable.summary().contains(&format!("Add {MANPAGE}")));
+    assert!(enable.catalog.is_none() && enable.catalogs.is_empty());
+    let staged = f._dir.path().join("staged");
+    crate::stage_boot_environment(&f.root, &staged, &enable)?;
+    assert!(!f.root.join(MANPAGE).exists());
+    assert_eq!(fs::read_to_string(staged.join(MANPAGE))?, "manpage 1");
+    assert!(crate::query::list_facets(&staged)?.is_empty());
+    assert!(crate::verify_pristine(&staged)?.is_empty());
+
+    interrupt_apply_at(&f.root, &f._dir.path().join("facet.json"), &enable, MANPAGE)?;
+    assert!(!f.root.join(ALIAS).exists());
+    assert!(crate::query::list_facets(&f.root).is_err());
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert_eq!(apply(&f.root, &enable)?, before.settings.revision + 1);
+    assert_eq!(
+        fs::metadata(f.root.join(MANPAGE))?.ino(),
+        fs::metadata(f.root.join(ALIAS))?.ino()
+    );
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 1");
+    let after = crate::image::Image::open_query(&f.root)?.state()?;
+    assert_eq!(after.installed, before.installed);
+    assert_eq!(
+        after.settings.catalog_checkpoints,
+        before.settings.catalog_checkpoints
+    );
+    assert!(after.settings.facets.is_empty());
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
+
+    fs::write(f.root.join(CONFIG), "administrator settings")?;
+    let disable = plan(&f.root, set(Some(false)))?;
+    assert!(
+        disable
+            .summary()
+            .contains(&format!("Preserve local config {CONFIG}"))
+    );
+    apply(&f.root, &disable)?;
+    assert!(!f.root.join(MANPAGE).exists() && !f.root.join(ALIAS).exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join(CONFIG))?,
+        "administrator settings"
+    );
+    assert_eq!(
+        crate::query::list_facets(&f.root)?,
+        BTreeMap::from([("doc.man".into(), false)])
+    );
+    assert!(verify(&f.root)?.is_empty());
+    let error = plan(&f.root, set(None)).unwrap_err();
+    assert!(error.to_string().contains("unmanaged path already exists"));
+    Ok(())
+}
+
+#[test]
 fn install_upgrade_and_resume_offline() -> Result<()> {
     if let (Some(root), Some(saved)) = (
         std::env::var_os("CPS_TEST_IMAGE"),

@@ -46,6 +46,13 @@ pub struct PackageRow {
     pub status: Status,
 }
 
+/// Read explicitly configured facet values from the committed image.
+pub fn list_facets(root: &Path) -> Result<BTreeMap<String, bool>> {
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    Ok(image.settings()?.facets)
+}
+
 struct AvailablePackage {
     id: String,
     name: String,

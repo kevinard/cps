@@ -7,8 +7,8 @@ mode=${1:-fallback}
 health_failure=false
 case $mode in
     health-fail|catalog-health-fail) health_failure=true ;;
-    fallback|bless|kernel-upgrade|rollback|capabilities) ;;
-    *) echo "Usage: $0 [fallback|bless|health-fail|catalog-health-fail|kernel-upgrade|rollback|capabilities]" >&2; exit 2 ;;
+    fallback|bless|kernel-upgrade|rollback|capabilities|facet-change) ;;
+    *) echo "Usage: $0 [fallback|bless|health-fail|catalog-health-fail|kernel-upgrade|rollback|capabilities|facet-change]" >&2; exit 2 ;;
 esac
 recycle=${CPS_VM_RECYCLE_SLOT:-0}
 device_activation=${CPS_VM_DEVICE_ACTIVATION:-0}
@@ -23,7 +23,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-10}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-11}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -94,7 +94,7 @@ for file in "$cps" "$efi" "$kernel" "$code" "$vars"; do
 done
 
 systemd_guest=false
-if $health_failure || [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
+if $health_failure || [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == facet-change ]]; then
     systemd_guest=true
 fi
 fixture_publisher=canopa
@@ -104,7 +104,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-10) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[01]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -123,10 +123,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-10) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[01]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-10) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[01]) protected_profiles=true ;;
     esac
 fi
 if [[ -n $kernel_fixture ]]; then
@@ -209,7 +209,12 @@ openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 
 publish_state() {
     local version=$1 state=$2
-    local dependency= config_action= policy_mode=0644
+    local dependency= config_action= policy_mode=0644 facet_action=
+    if [[ $mode == facet-change ]]; then
+        mkdir -p proto/usr/share/man/man1
+        printf 'trial\n' > proto/usr/share/man/man1/cps-vm.1
+        facet_action="    file \"usr/share/man/man1/cps-vm.1\" mode=\"0644\" uid=$(id -u) gid=$(id -g) facet=\"doc.man\""
+    fi
     if [[ $mode == rollback ]]; then
         case $state in
             previous) dependency='    require "test/legacy-marker"' ;;
@@ -236,6 +241,7 @@ package "test/boot-state" publisher="$fixture_publisher" version="$version" {
     file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
     hardlink "etc/cps-vm-boot-state" target="etc/cps-vm-state"
 $config_action
+$facet_action
 $dependency
 }
 MANIFEST
@@ -349,6 +355,7 @@ elif $systemd_guest; then
     packages+=(system/cps)
 fi
 mkdir -p runtime/etc
+if [[ $mode == facet-change ]]; then touch runtime/etc/cps-vm-assert-facet; fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     touch runtime/etc/cps-vm-assert-kernel
 else
@@ -508,6 +515,7 @@ publisher "$fixture_publisher" {
     trust-key "public.der"
 }
 CONFIG
+    if [[ $mode == facet-change ]]; then printf 'facet "doc.man" #false\n' >> image.kdl; fi
 fi
 "$cps" image-create --root base --config image.kdl
 if ! $profiled && [[ -n $cps_fixture ]]; then
@@ -624,7 +632,7 @@ mcopy -s -i "$base_disk@@1048576" ::/loader esp/
 mcopy -s -i "$base_disk@@1048576" ::/EFI/cps esp/EFI/
 test -f "esp/loader/entries/$base_id.conf"
 
-publish_state 2.0.0-0 trial
+if [[ $mode != facet-change ]]; then publish_state 2.0.0-0 trial; fi
 if [[ -z $kernel_fixture && ( $mode == kernel-upgrade || $mode == rollback ) ]]; then
     publish_kernel 2.0.0-0 "$trial_release" "$trial_kernel"
 fi
@@ -669,15 +677,25 @@ if $profiled; then
         echo 'Verified atomic relocation of the signed profile repositories'
     fi
 fi
-"$cps" plan --root base --output update.json update | tee update.log
+request=(update)
+if [[ $mode == facet-change ]]; then request=(change-facet doc.man=default); fi
+"$cps" plan --root base --output update.json "${request[@]}" | tee update.log
 cp -a esp esp-before
 trial=$("$cps" boot-env stage --source base --root staged update.json)
 trial_id=${trial#Staged }
 trial_id=${trial_id%% at *}
 diff -r esp-before esp
 test "$(cat base/etc/cps-vm-state)" = previous
-test "$(cat staged/etc/cps-vm-state)" = trial
-grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
+if [[ $mode == facet-change ]]; then
+    test ! -e base/usr/share/man/man1/cps-vm.1
+    test "$(cat staged/usr/share/man/man1/cps-vm.1)" = trial
+    cmp base/etc/cps-vm-state staged/etc/cps-vm-state
+    cmp <("$cps" list --root base) <("$cps" list --root staged)
+    grep -Fq 'Add usr/share/man/man1/cps-vm.1' update.log
+else
+    test "$(cat staged/etc/cps-vm-state)" = trial
+    grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
+fi
 "$cps" verify --root base --pristine
 "$cps" verify --root staged --pristine
 check_runtime_packages staged
@@ -866,7 +884,7 @@ run_vm serial.log
 check_busybox serial.log
 
 case $mode in
-    bless|rollback|capabilities) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
+    bless|rollback|capabilities|facet-change) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
     health-fail|catalog-health-fail) expected=$'CPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: previous' ;;
     fallback|kernel-upgrade) expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous' ;;
 esac
@@ -890,9 +908,18 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
 fi
 mcopy -i disk.raw@@1048576 "::/loader/entries/$base_id.conf" previous.conf
 cmp "esp/loader/entries/$base_id.conf" previous.conf
-if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
+if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == facet-change ]]; then
     mcopy -i disk.raw@@1048576 "::/loader/entries/$trial_id.conf" blessed.conf
     cmp "esp/loader/entries/$trial_id+2.conf" blessed.conf
+    if [[ $mode == facet-change ]]; then
+        facets=$(tr -d '\r' < serial.log | grep '^CPS_VM_FACET: ')
+        test "$facets" = $'CPS_VM_FACET: trial docs present\nCPS_VM_FACET: trial docs present'
+        printf '%s\n' "$facets"
+        "$cps" boot-env rollback --disk disk.raw --esp-partuuid "$esp_uuid" --output-disk rollback.raw
+        run_vm rollback.log rollback.raw
+        tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_FACET: previous docs absent'
+        tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_BOOT: previous'
+    fi
     listing=$(mdir -b -i disk.raw@@1048576 ::/loader/entries)
     if grep -Fq "$trial_id+" <<< "$listing"; then
         echo "A counted trial entry remains after blessing" >&2

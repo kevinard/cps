@@ -452,6 +452,18 @@ set -e
 bb=/bin/busybox
 [ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
 state=$("$bb" cat /etc/cps-vm-boot-state)
+if [ -f /etc/cps-vm-assert-facet ]; then
+    facets=$(/usr/bin/cps facet --root /)
+    if [ -f /usr/share/man/man1/cps-vm.1 ]; then
+        state=$("$bb" cat /usr/share/man/man1/cps-vm.1)
+        [ "$facets" = "$(printf 'FACET\tVALUE\ndevel\tfalse')" ]
+        printf 'CPS_VM_FACET: %s docs present\n' "$state"
+    else
+        [ "$state" = previous ]
+        [ "$facets" = "$(printf 'FACET\tVALUE\ndevel\tfalse\ndoc.man\tfalse')" ]
+        printf 'CPS_VM_FACET: previous docs absent\n'
+    fi
+fi
 if [ -f /etc/cps-vm-assert-installed-stage ] && [ "$state" = trial ]; then
     printf 'booted\n' > /etc/cps-vm-booted-source
 fi

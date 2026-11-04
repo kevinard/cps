@@ -1,5 +1,5 @@
 schema-version 1
-package "system/cps" publisher="canopa" version="0.1.0-10" architecture="x86_64" {
+package "system/cps" publisher="canopa" version="0.1.0-11" architecture="x86_64" {
     require "system/elf-runtime"
     require "system/libseccomp" version=">=2.6.1-1"
     require "system/sqlite" version=">=3.54.1-1"

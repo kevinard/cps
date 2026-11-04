@@ -17,7 +17,7 @@ use crate::{
     image::{
         Image, Installed, Managed, Settings, State, publisher_generation_is_initial, root::Root,
     },
-    model::{FORMAT, Node, PackageSpec, digest, validate_name},
+    model::{FORMAT, Node, PackageSpec, digest, validate_name, validate_publisher},
     repo::{BuildReceipt, Published},
     systemd::{self, Action as SystemdAction},
 };
@@ -40,13 +40,27 @@ pub(crate) enum SolverRevision {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Install { packages: Vec<String> },
-    ExactInstall { packages: Vec<String> },
+    Install {
+        packages: Vec<String>,
+    },
+    ExactInstall {
+        packages: Vec<String>,
+    },
     InstallProfile,
-    Remove { packages: Vec<String> },
+    Remove {
+        packages: Vec<String>,
+    },
     Autoremove,
-    Repair { packages: Vec<String> },
-    ResolveConfig { path: String, take: ConfigChoice },
+    ChangeFacet {
+        facets: BTreeMap<String, Option<bool>>,
+    },
+    Repair {
+        packages: Vec<String>,
+    },
+    ResolveConfig {
+        path: String,
+        take: ConfigChoice,
+    },
     Update,
     UpdateProfile,
 }
@@ -137,6 +151,26 @@ impl Plan {
                 (Some(old), None) => format!("Remove {name} {old}"),
                 (None, None) => continue,
             });
+        }
+        if let Request::ChangeFacet { facets } = &self.request {
+            for (name, value) in facets {
+                lines.push(match value {
+                    Some(value) => format!("Set facet {name}={value}"),
+                    None => format!("Reset facet {name} to its default"),
+                });
+            }
+            for write in &self.writes {
+                match (&write.before, &write.after) {
+                    (None, Some(Node::Dir { .. } | Node::Hardlink { .. })) => (),
+                    (None, Some(_)) => lines.push(format!("Add {}", write.path)),
+                    (Some(Node::Dir { .. }), None) => (),
+                    (Some(_), None) => lines.push(format!("Remove {}", write.path)),
+                    (Some(before), Some(after)) if before != after => {
+                        lines.push(format!("Replace {}", write.path));
+                    }
+                    _ => (),
+                }
+            }
         }
         for transfer in &self.transfers {
             lines.push(format!(
@@ -321,8 +355,38 @@ pub(crate) fn build(
     );
     let mut catalogs = catalogs::Catalogs::default();
     let mut receipts = Vec::new();
+    let mut next_facets = None;
     let mut update_profile = matches!(request, Request::UpdateProfile);
     let (installed, paths) = match &request {
+        Request::ChangeFacet { facets } => {
+            ensure!(
+                state.publishers.release_profile().is_none(),
+                "the signed release profile fixes this image's facets"
+            );
+            ensure!(!facets.is_empty(), "specify at least one facet change");
+            ensure!(
+                crate::verify::manifest_paths(&state)? == state.paths,
+                "path ownership index differs from installed manifests"
+            );
+            image.verify_catalog_archives(&state)?;
+            let mut settings = state.settings.facets.clone();
+            for (name, value) in facets {
+                validate_publisher(name).with_context(|| format!("invalid facet {name:?}"))?;
+                if let Some(value) = value {
+                    settings.insert(name.clone(), *value);
+                } else {
+                    settings.remove(name);
+                }
+            }
+            let paths = select_paths(
+                &state.settings.arch,
+                &settings,
+                state.settings.directory(),
+                &state.installed,
+            )?;
+            next_facets = Some(settings);
+            (state.installed.clone(), paths)
+        }
         Request::Repair { .. } | Request::ResolveConfig { .. } => {
             let paths = crate::verify::manifest_paths(&state)?;
             ensure!(
@@ -745,6 +809,9 @@ pub(crate) fn build(
         })?;
     state.settings.revision = revision;
     state.settings.bootstrap_catalog = None;
+    if let Some(facets) = next_facets {
+        state.settings.facets = facets;
+    }
     state.settings.format = state.publishers.image_format(&state.settings);
     state
         .settings

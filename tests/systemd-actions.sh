@@ -157,3 +157,26 @@ test ! -e "$host_started"
 test "$(sha256sum /etc/passwd /etc/group)" = "$host_accounts"
 "$cps" verify --root base
 echo 'Verified sysusers, tmpfiles, and presets only changed the staged root'
+
+mv repo-offline repo
+facet_rule="$scope-facet.conf"
+printf 'd /var/lib/%s-facet 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$facet_rule"
+cat > package.kdl <<MANIFEST
+schema-version 1
+package "test/optional-tmpfiles" publisher="canopa" version="1.0.0-0" {
+    file "usr/lib/tmpfiles.d/$facet_rule" mode="0644" uid=$uid gid=$gid facet="optional"
+    tmpfiles "$facet_rule"
+}
+MANIFEST
+publish
+"$cps" image-create --root facet-base --repo repo --publisher canopa --trust-key public.der --facet optional=false
+"$cps" plan --root facet-base --output facet-install.json install test/optional-tmpfiles
+"$cps" apply --root facet-base facet-install.json
+"$cps" plan --root facet-base --output facet-enable.json change-facet optional=default | tee facet-preview.log
+grep -Fq "Offline systemd tmpfiles $facet_rule" facet-preview.log
+"$cps" boot-env stage --source facet-base --root facet-staged facet-enable.json
+test -d "facet-staged/var/lib/$scope-facet"
+test ! -e "facet-base/var/lib/$scope-facet"
+test ! -e "/var/lib/$scope-facet"
+"$cps" verify --root facet-staged
+echo 'Verified a newly selected tmpfiles declaration only ran in the staged root'
