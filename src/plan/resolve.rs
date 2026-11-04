@@ -1,7 +1,10 @@
+mod sat;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use super::SolverRevision;
 use crate::{image::Installed, model::DependencyKind, repo::Published};
 
 pub fn resolve(
@@ -10,6 +13,7 @@ pub fn resolve(
     requested: &BTreeSet<String>,
     update: bool,
     exact: bool,
+    solver: Option<SolverRevision>,
 ) -> Result<BTreeMap<String, Installed>> {
     let mut candidates = BTreeMap::<_, Vec<_>>::new();
     for package in packages
@@ -47,14 +51,22 @@ pub fn resolve(
         versions.dedup_by(|a, b| a.sha256 == b.sha256);
     }
 
-    let wanted = installed
+    let wanted: BTreeSet<_> = installed
         .keys()
         .filter(|_| !exact)
         .chain(requested)
         .map(String::as_str)
         .collect();
-    let mut selected = BTreeMap::new();
-    search(&candidates, wanted, &mut selected).context("cannot satisfy package constraints")?;
+    let selected = match solver {
+        Some(SolverRevision::SatV1) => sat::solve(&candidates, &wanted)?,
+        None => {
+            // Existing saved plans and pinned build recipes retain their original selection order.
+            let mut selected = BTreeMap::new();
+            search(&candidates, wanted, &mut selected)
+                .context("cannot satisfy package constraints")?;
+            selected
+        }
+    };
     Ok(selected
         .into_iter()
         .map(|(name, pkg)| {
@@ -110,6 +122,17 @@ fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {
     for package in selected.values() {
         for dependency in &package.manifest.dependency {
             if let Some(target) = selected.get(dependency.package.as_str()) {
+                if dependency.kind == DependencyKind::Exclude
+                    && !dependency.matches(target.manifest.version)?
+                {
+                    bail!(
+                        "{} excludes {} {}, but selected {}",
+                        package.manifest.id(),
+                        dependency.package,
+                        dependency.version.as_deref().unwrap_or("at any version"),
+                        target.manifest.id()
+                    );
+                }
                 ensure!(
                     dependency.matches(target.manifest.version)?,
                     "{} requires {} {} when present, but selected {}",

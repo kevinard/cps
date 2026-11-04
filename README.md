@@ -51,7 +51,7 @@ Run `cps build` as an unprivileged user on an x86-64 or AArch64 Linux worker. It
 ```kdl
 schema-version 1
 build architecture="x86_64" epoch=1700000000 {
-    toolchain "<catalog SHA-256>" {
+    toolchain "<catalog SHA-256>" solver="sat-v1" {
         package "devel/base"
     }
     manifest "hello.kdl" sha256="<manifest SHA-256>"
@@ -64,6 +64,8 @@ build architecture="x86_64" epoch=1700000000 {
 ```
 
 Use the digest of the selected repository catalog, such as the digest recorded in its `current` file at recipe preparation. Replace the manifest and source hashes with their SHA-256 digests and set `size` to the source byte count. The manifest path is relative to the recipe. Source paths are relative to `--sources`. The example toolchain package must provide the shell, compiler, and utilities through its dependencies.
+
+`solver="sat-v1"` pins the toolchain selection algorithm. Recipes written before this setting was introduced retain the original resolver when the setting is absent.
 
 ```sh
 cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
@@ -123,7 +125,8 @@ The publisher signs the association between each package and its build evidence.
 ## Manifest and image behavior
 
 - Manifests and image configuration use KDL 2 and begin with `schema-version 1`. Paths in image configuration resolve relative to the configuration file. It also accepts `architecture "x86_64"` and `facet "doc.man" #false`. Convert old TOML recipes before publishing new versions. Existing JSON manifest objects stay readable under their original digests.
-- Versions have the numeric form `major.minor.patch-revision`. Inside a package block, declare dependencies as `require "library/libdisplay" version=">=1.0.0-0, <2.0.0-0"` or `incorporate "library/libdisplay" version="=1.0.0-0"`. Only `require` pulls in an absent package.
+- Versions have the numeric form `major.minor.patch-revision`. Inside a package block, declare dependencies as `require "library/libdisplay" version=">=1.0.0-0, <2.0.0-0"` or `incorporate "library/libdisplay" version="=1.0.0-0"`. Use `exclude "library/libdisplay" version=">=2.0.0-0"` to reject a range when the package is present. Omit the version to exclude every version of that package. Only `require` pulls in an absent package.
+- New plans use Resolvo to resolve compatible versions and report incompatible requirements. Saved plans record their solver version so apply can verify the same selection against the pinned catalog. Plans created before solver versioning retain their original behavior. [Resolvo](https://github.com/prefix-dev/resolvo)
 - Actions support `file`, `dir`, and `symlink`. A symlink specifies `target` in place of `mode`. The optional `arch` and `facet` selectors match image policy. Facets default to enabled and can be set with `image-create --facet doc.man=false`.
 - Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. When the vendor file changes, find its new copy in `image/.cps/config-updates/<revision>/`.
 - The image must be inactive and reside on one filesystem. The prototype rejects directory metadata changes and transitions between a directory and a file or symlink. Directories left behind when their ownership ends are retained.

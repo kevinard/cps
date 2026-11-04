@@ -149,12 +149,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
         match name {
-            "require" | "incorporate" => {
+            "require" | "incorporate" | "exclude" => {
                 let fields = Fields::read(node, 1, &["version"], false).context(name.to_owned())?;
-                let kind = if name == "require" {
-                    DependencyKind::Require
-                } else {
-                    DependencyKind::Incorporate
+                let kind = match name {
+                    "require" => DependencyKind::Require,
+                    "incorporate" => DependencyKind::Incorporate,
+                    _ => DependencyKind::Exclude,
                 };
                 manifest.dependency.push(Dependency {
                     kind,
@@ -259,6 +259,7 @@ pub fn manifest_text(manifest: &Manifest) -> String {
         let mut node = KdlNode::new(match dependency.kind {
             DependencyKind::Require => "require",
             DependencyKind::Incorporate => "incorporate",
+            DependencyKind::Exclude => "exclude",
         });
         node.push(dependency.package.as_str());
         if let Some(version) = &dependency.version {

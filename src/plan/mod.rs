@@ -18,6 +18,12 @@ use crate::{
 
 pub(crate) use resolve::{check as check_dependencies, resolve as resolve_packages};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SolverRevision {
+    SatV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -55,6 +61,8 @@ struct Transfer {
 #[serde(deny_unknown_fields)]
 pub struct Plan {
     format: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) solver: Option<SolverRevision>,
     pub(crate) image: String,
     pub(crate) base_revision: u64,
     pub(crate) catalog: Option<String>,
@@ -121,7 +129,14 @@ pub fn plan(path: &Path, request: Request) -> Result<Plan> {
     let image = Image::open(path, false)?;
     image.require_clean()?;
     let state = image.state()?;
-    Ok(build(&image.root, state, request, None)?.0)
+    Ok(build(
+        &image.root,
+        state,
+        request,
+        None,
+        Some(SolverRevision::SatV1),
+    )?
+    .0)
 }
 
 pub(crate) fn effective_paths(
@@ -215,6 +230,7 @@ pub(crate) fn build(
     mut state: State,
     request: Request,
     catalog: Option<&str>,
+    solver: Option<SolverRevision>,
 ) -> Result<(Plan, State)> {
     let (catalog, installed) = match &request {
         Request::Remove { packages } => {
@@ -248,6 +264,7 @@ pub(crate) fn build(
                 &requested,
                 matches!(request, Request::Update),
                 matches!(request, Request::ExactInstall { .. }),
+                solver,
             )?;
             (Some(packages.sha256), installed)
         }
@@ -267,6 +284,7 @@ pub(crate) fn build(
     let kernel_install = kernel.filter(|selected| Some(selected) != previous_kernel.as_ref());
     let mut plan = Plan {
         format: FORMAT,
+        solver,
         image: state.settings.id.clone(),
         base_revision: state.settings.revision,
         catalog,

@@ -112,7 +112,7 @@ recipe() {
     cat <<RECIPE
 schema-version 1
 build architecture="$arch" epoch=1700000000 {
-    toolchain "$catalog" {
+    toolchain "$catalog" solver="sat-v1" {
         package "build/probe"
     }
     manifest "manifest.kdl" sha256="$(sha manifest.kdl)"

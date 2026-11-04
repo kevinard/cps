@@ -73,6 +73,7 @@ pub(crate) fn apply_with(
             state,
             plan.request.clone(),
             plan.catalog.as_deref(),
+            plan.solver,
         )?;
         ensure!(
             &checked == plan,

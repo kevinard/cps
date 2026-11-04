@@ -62,7 +62,7 @@ pub fn validate_publisher(publisher: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Version([u32; 4]);
 
 impl FromStr for Version {
@@ -109,6 +109,7 @@ impl<'de> Deserialize<'de> for Version {
 pub enum DependencyKind {
     Require,
     Incorporate,
+    Exclude,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -121,25 +122,42 @@ pub struct Dependency {
 
 impl Dependency {
     pub fn matches(&self, version: Version) -> Result<bool> {
-        let Some(constraint) = &self.version else {
-            return Ok(true);
-        };
-        let mut matches = true;
-        for clause in constraint.split(',').map(str::trim) {
-            let (operator, bound) = [">=", "<=", "=", ">", "<"]
-                .into_iter()
-                .find_map(|op| clause.strip_prefix(op).map(|value| (op, value)))
-                .with_context(|| format!("invalid constraint {constraint:?}"))?;
-            let bound = bound.parse::<Version>()?;
-            matches &= match operator {
-                ">=" => version >= bound,
-                "<=" => version <= bound,
-                ">" => version > bound,
-                "<" => version < bound,
-                _ => version == bound,
-            };
-        }
-        Ok(matches)
+        Ok(
+            VersionConstraint::parse(self.version.as_deref())?.matches(version)
+                != (self.kind == DependencyKind::Exclude),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub(crate) struct VersionConstraint(Vec<(&'static str, Version)>);
+
+impl VersionConstraint {
+    pub(crate) fn parse(constraint: Option<&str>) -> Result<Self> {
+        let clauses = constraint
+            .into_iter()
+            .flat_map(|constraint| constraint.split(','));
+        clauses
+            .map(|clause| {
+                let clause = clause.trim();
+                let (operator, bound) = [">=", "<=", "=", ">", "<"]
+                    .into_iter()
+                    .find_map(|op| clause.strip_prefix(op).map(|value| (op, value)))
+                    .with_context(|| format!("invalid constraint {clause:?}"))?;
+                Ok((operator, bound.parse()?))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Self)
+    }
+
+    pub(crate) fn matches(&self, version: Version) -> bool {
+        self.0.iter().all(|&(operator, bound)| match operator {
+            ">=" => version >= bound,
+            "<=" => version <= bound,
+            ">" => version > bound,
+            "<" => version < bound,
+            _ => version == bound,
+        })
     }
 }
 

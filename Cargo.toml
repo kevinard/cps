@@ -21,6 +21,7 @@ libc = "0.2"
 libseccomp = "0.4"
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+resolvo = "0.12"
 tokio = { version = "1", features = ["rt"] }
 tough = "0.24"
 url = "2"

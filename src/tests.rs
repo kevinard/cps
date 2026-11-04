@@ -101,6 +101,100 @@ fn dependency(kind: &str, name: &str, version: &str) -> String {
 }
 
 #[test]
+fn solver_honors_exclusions_and_explains_impossible_requests() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "library/libdisplay",
+        "1.0.0-0",
+        f.file(LIBRARY, "ABI 1", "0644", "")?,
+    )?;
+    f.package(
+        "library/libdisplay",
+        "2.0.0-0",
+        f.file(LIBRARY, "ABI 2", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/app",
+        "1.0.0-0",
+        "    require \"library/libdisplay\"\n".into(),
+    )?;
+    f.package(
+        "policy/desktop",
+        "1.0.0-0",
+        concat!(
+            "    exclude \"library/libdisplay\" version=\">=2.0.0-0\"\n",
+            "    exclude \"desktop/experimental\"\n",
+        )
+        .into(),
+    )?;
+    f.package("desktop/experimental", "1.0.0-0", String::new())?;
+    f.package(
+        "desktop/plugin",
+        "1.0.0-0",
+        dependency("require", "library/libdisplay", "2.0.0-0"),
+    )?;
+    f.create()?;
+    let install = |names: &[&str]| Request::Install {
+        packages: names.iter().map(|name| name.to_string()).collect(),
+    };
+    let selected = plan(&f.root, install(&["desktop/app", "policy/desktop"]))?;
+    apply(&f.root, &selected)?;
+    assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "ABI 1");
+
+    for name in ["desktop/plugin", "desktop/experimental"] {
+        let error = plan(&f.root, install(&[name])).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot satisfy package constraints"),
+            "{message}"
+        );
+        assert!(
+            message.contains(name) && message.contains("policy/desktop"),
+            "{message}"
+        );
+    }
+
+    f.package("policy/desktop", "2.0.0-0", String::new())?;
+    let update = plan(&f.root, Request::Update)?;
+    apply(&f.root, &update)?;
+    assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "ABI 2");
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "desktop/app",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "old", "0755", "")?,
+    )?;
+    f.create()?;
+    let legacy = {
+        let image = crate::image::Image::open(&f.root, false)?;
+        let request = Request::Install {
+            packages: vec!["desktop/app".into()],
+        };
+        crate::plan::build(&image.root, image.state()?, request, None, None)?.0
+    };
+    let saved = serde_json::to_vec(&legacy)?;
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&saved)?
+            .get("solver")
+            .is_none()
+    );
+    f.package(
+        "desktop/app",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "new", "0755", "")?,
+    )?;
+    apply(&f.root, &serde_json::from_slice(&saved)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
+    Ok(())
+}
+
+#[test]
 fn install_upgrade_and_resume_offline() -> Result<()> {
     if let (Some(root), Some(saved)) = (
         std::env::var_os("CPS_TEST_IMAGE"),

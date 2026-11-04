@@ -279,6 +279,7 @@ fn prepare_toolchain(
         &recipe.packages,
         false,
         true,
+        recipe.solver,
     )
     .context("resolving build toolchain")?;
     let implicit = Node::Dir {

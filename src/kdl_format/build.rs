@@ -4,10 +4,12 @@ use anyhow::{Context, Result, bail, ensure};
 use kdl::KdlDocument;
 
 use crate::model::{FileDigest, validate_digest, validate_name, validate_path, validate_publisher};
+use crate::plan::SolverRevision;
 
 use super::{Fields, document, one, schema};
 
 pub(crate) struct BuildRecipe {
+    pub solver: Option<SolverRevision>,
     pub arch: String,
     pub epoch: u32,
     pub catalog: String,
@@ -33,7 +35,13 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     let children = build.children().context("build requires a child block")?;
 
     let toolchain = one(children, "toolchain")?;
-    let catalog = Fields::read(toolchain, 1, &[], true)?.string_arg(0)?;
+    let fields = Fields::read(toolchain, 1, &["solver"], true)?;
+    let catalog = fields.string_arg(0)?;
+    let solver = match fields.string("solver")?.as_deref() {
+        None => None,
+        Some("sat-v1") => Some(SolverRevision::SatV1),
+        Some(name) => bail!("unsupported toolchain solver {name:?}"),
+    };
     validate_digest(&catalog).context("invalid toolchain catalog")?;
     let mut packages = BTreeSet::new();
     for node in toolchain
@@ -91,6 +99,7 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         }
     }
     Ok(BuildRecipe {
+        solver,
         arch,
         epoch,
         catalog,
