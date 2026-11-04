@@ -1,13 +1,17 @@
 schema-version 1
-build architecture="@ARCH@" epoch=1727395200 {
+build architecture="@ARCH@" epoch=1778641860 {
     toolchain "@CATALOG_SHA256@" solver="sat-v1" {
         package "build/native-c"
     }
     manifest "busybox.kdl" sha256="@MANIFEST_SHA256@"
-    source "busybox-1.37.0.tar.bz2" size=2565764 sha256="3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4" url="https://busybox.net/downloads/busybox-1.37.0.tar.bz2"
+    source "busybox-1.38.0.tar.bz2" size=2695723 sha256="34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2" url="https://busybox.net/downloads/busybox-1.38.0.tar.bz2"
+    source "CVE-2026-38754.patch" size=1844 sha256="42e072567b70fba049ef36946b85462f2725d22668f0007f8d056314f84a263e"
+    source "CVE-2026-38755.patch" size=1665 sha256="fa9cf8d6abd547a7bbeecf77f79fc260cdce3a8902d7f82a7f127aabb8dccb60"
     script """
-    tar -xjf "$CPS_SOURCES/busybox-1.37.0.tar.bz2"
-    cd busybox-1.37.0
+    tar -xjf "$CPS_SOURCES/busybox-1.38.0.tar.bz2"
+    cd busybox-1.38.0
+    patch --batch --forward --fuzz=0 -p1 -i "$CPS_SOURCES/CVE-2026-38754.patch"
+    patch --batch --forward --fuzz=0 -p1 -i "$CPS_SOURCES/CVE-2026-38755.patch"
     cat > boot.config <<'CONFIG'
     CONFIG_BUSYBOX=y
     CONFIG_SHOW_USAGE=y
@@ -17,6 +21,7 @@ build architecture="@ARCH@" epoch=1727395200 {
     CONFIG_ASH_PRINTF=y
     CONFIG_ASH_TEST=y
     CONFIG_CAT=y
+    CONFIG_INSMOD=y
     CONFIG_MKDIR=y
     CONFIG_POWEROFF=y
     CONFIG_REBOOT=y

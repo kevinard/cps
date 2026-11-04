@@ -1,0 +1,2 @@
+# Unified diffs prefix context lines with a space before existing tabs.
+*.patch whitespace=-space-before-tab

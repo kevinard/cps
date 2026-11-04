@@ -8,11 +8,11 @@ source_dir=${CPS_BUSYBOX_SOURCE_DIR:-}
 if [[ -n $source_dir ]]; then source_dir=$(realpath -- "$source_dir"); fi
 manifest=busybox.kdl
 binary=bin/busybox
-version=1.37.0-0
+version=1.38.0-0
 if [[ ${CPS_BUSYBOX_MERGED_USR:-0} == 1 ]]; then
     manifest=busybox-usr.kdl
     binary=usr/bin/busybox
-    version=1.37.0-1
+    version=1.38.0-1
 fi
 package="cps://canopa-bootstrap/system/busybox@$version"
 mkdir -m 700 -- "$output"
@@ -29,7 +29,7 @@ sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 keypair toolchain
 keypair builder
 keypair release
-bash "$project/tests/seed-native-c.sh" "$work/native-c"
+bash "$project/tests/seed-native-c.sh" "$work/native-c" --busybox
 "$cps" manifest generate --proto "$work/native-c" --publisher seed --version 1.0.0-0 \
     build/native-c > native-c.kdl
 "$cps" publish --repo toolchain --proto "$work/native-c" --signing-key "$work/toolchain.der" native-c.kdl
@@ -40,10 +40,13 @@ sed -e "s/@ARCH@/$(uname -m)/g" -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/
     -e "s|@BUSYBOX_PATH@|$binary|g" \
     "$project/packaging/busybox/build.kdl.in" > build.kdl
 
+mkdir "$work/inputs"
+cp -- "$project/packaging/busybox/"CVE-2026-*.patch "$work/inputs/"
 if [[ -n $source_dir ]]; then
-    "$cps" source import --from "$source_dir" --cache sources build.kdl
+    cp --reflink=auto -- "$source_dir/busybox-1.38.0.tar.bz2" "$work/inputs/"
+    "$cps" source import --from "$work/inputs" --cache sources build.kdl
 else
-    "$cps" source fetch --cache sources build.kdl
+    "$cps" source fetch --from "$work/inputs" --cache sources build.kdl
 fi
 "$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \
     --source-cache sources --output bundle --check-reproducible \
@@ -69,12 +72,19 @@ POLICY
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine
 cmp "bundle/proto/$binary" "image/$binary"
-if [[ $version == 1.37.0-1 ]]; then
+if [[ $manifest == busybox-usr.kdl ]]; then
     test "$(readlink image/usr/bin/sh)" = busybox
     image/usr/bin/sh -ec 'test "$1" = merged' sh merged
 fi
+test "$(readlink "image/${binary%/*}/insmod")" = busybox
+"image/${binary%/*}/insmod" --help 2>&1 | grep -F 'Usage: insmod FILE'
+if error=$(ulimit -c 0; "image/$binary" ash -c 'recurse() { recurse; }; recurse' 2>&1); then
+    echo 'Expected the ash recursion guard to reject unbounded recursion' >&2
+    exit 1
+fi
+grep -F 'function recursion limit exceeded' <<< "$error"
 applets=$("image/$binary" --list)
-if [[ $applets != $'ash\ncat\nmkdir\npoweroff\nreboot\nsh\nsync\nuname' ]]; then
+if [[ $applets != $'ash\ncat\ninsmod\nmkdir\npoweroff\nreboot\nsh\nsync\nuname' ]]; then
     printf 'Unexpected BusyBox applets\n%s\n' "$applets" >&2
     exit 1
 fi

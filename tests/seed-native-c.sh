@@ -5,12 +5,13 @@ unset LD_LIBRARY_PATH LD_PRELOAD GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPAT
 export PATH=/usr/bin:/bin LC_ALL=C
 umask 022
 
-usage='usage: seed-native-c.sh PROTOTYPE [--rust|--kernel|--systemd|--util-linux]'
+usage='usage: seed-native-c.sh PROTOTYPE [--rust|--kernel|--systemd|--util-linux|--busybox]'
 seed=${1:?$usage}
 rust_root=
 kernel=false
 systemd=false
 util_linux=false
+busybox=false
 if [[ $# == 2 && $2 == --rust ]]; then
     rust_root=$(rustc --print sysroot)
 elif [[ $# == 2 && $2 == --kernel ]]; then
@@ -19,6 +20,8 @@ elif [[ $# == 2 && $2 == --systemd ]]; then
     systemd=true
 elif [[ $# == 2 && $2 == --util-linux ]]; then
     util_linux=true
+elif [[ $# == 2 && $2 == --busybox ]]; then
+    busybox=true
 elif [[ $# != 1 ]]; then
     echo "$usage" >&2
     exit 2
@@ -88,6 +91,9 @@ while IFS= read -r file; do
     copy_file "$file" "${file#/}"
 done < <(awk '/^\/usr\/include\/.*[^\/]$/ || /^\/usr\/lib\/[^/]+\.a$/' <<< "$libc_files")
 
+if $busybox; then
+    copy_elf /usr/bin/patch usr/bin/patch
+fi
 if $util_linux; then
     for tool in env ls pkg-config printf readlink true xz; do
         copy_elf "/usr/bin/$tool" "usr/bin/$tool"

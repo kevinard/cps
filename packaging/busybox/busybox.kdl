@@ -1,5 +1,6 @@
 schema-version 1
-package "system/busybox" publisher="canopa-bootstrap" version="1.37.0-0" {
+package "system/busybox" publisher="canopa-bootstrap" version="1.38.0-0" {
     file "bin/busybox" mode="0755" uid=0 gid=0
+    symlink "bin/insmod" target="busybox" uid=0 gid=0
     file "usr/share/licenses/busybox/LICENSE" mode="0644" uid=0 gid=0
 }
