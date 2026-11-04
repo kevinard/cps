@@ -76,8 +76,11 @@ openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 publish_state() {
     local version=$1 state=$2
     local dependency=
-    if [[ $mode == rollback && $state == trial ]]; then
-        dependency='    require "test/extra-marker"'
+    if [[ $mode == rollback ]]; then
+        case $state in
+            previous) dependency='    require "test/legacy-marker"' ;;
+            trial) dependency='    require "test/extra-marker"' ;;
+        esac
     fi
     printf '%s\n' "$state" > proto/etc/cps-vm-state
     cat > manifest.kdl <<MANIFEST
@@ -109,6 +112,16 @@ MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der kernel.kdl
 }
 
+if [[ $mode == rollback ]]; then
+    printf 'legacy\n' > proto/etc/cps-vm-legacy-marker
+    cat > legacy-marker.kdl <<MANIFEST
+schema-version 1
+package "test/legacy-marker" publisher="canopa" version="1.0.0-0" {
+    file "etc/cps-vm-legacy-marker" mode="0644" uid=$(id -u) gid=$(id -g)
+}
+MANIFEST
+    "$cps" publish --repo repo --proto proto --signing-key private.der legacy-marker.kdl
+fi
 publish_state 1.0.0-0 previous
 packages=(test/boot-state)
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
@@ -209,6 +222,15 @@ publish_state 2.0.0-0 trial
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     publish_kernel 2.0.0-0 "$trial_release" "$trial_kernel"
 fi
+if [[ $mode == rollback ]]; then
+    cat > retirement.kdl <<RELEASE
+schema-version 1
+release "canopa" base="$(cat repo/current)" {
+    obsolete "cps://canopa/test/legacy-marker@2.0.0-0"
+}
+RELEASE
+    "$cps" repo publish-release --repo repo --signing-key private.der retirement.kdl
+fi
 "$cps" plan --root base --output update.json update | tee update.log
 cp -a esp esp-before
 trial=$("$cps" boot-env stage --source base --root staged update.json)
@@ -277,8 +299,11 @@ fi
 
 if [[ $mode == rollback ]]; then
     grep -Fq 'Install cps://extras/test/extra-marker 1.0.0-0' update.log
+    grep -Fq 'Remove cps://canopa/test/legacy-marker 1.0.0-0' update.log
     test ! -e base/etc/cps-vm-extra-marker
     test "$(cat staged/etc/cps-vm-extra-marker)" = extras
+    test "$(cat base/etc/cps-vm-legacy-marker)" = legacy
+    test ! -e staged/etc/cps-vm-legacy-marker
     cp esp/loader/loader.conf config-before-rejected-rollback
     if "$cps" boot-env rollback --esp esp "$trial_id" 2> rejected.log; then
         echo 'Rollback accepted an unblessed trial' >&2
@@ -389,6 +414,8 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
     if [[ $mode == rollback ]]; then
         publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
+        obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
+        test "$obsoletions" = $'CPS_VM_OBSOLETION: trial removed\nCPS_VM_OBSOLETION: trial removed'
         # Bring the VM's blessed entry back into the offline ESP directory.
         rm "esp/loader/entries/$trial_id+2.conf"
         cp blessed.conf "esp/loader/entries/$trial_id.conf"
@@ -411,13 +438,15 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         rollback_boots=$(tr -d '\r' < rollback.log | grep '^CPS_VM_BOOT: ' || :)
         rollback_kernels=$(tr -d '\r' < rollback.log | grep '^CPS_VM_KERNEL: ' || :)
         rollback_publishers=$(tr -d '\r' < rollback.log | grep '^CPS_VM_PUBLISHER: ' || :)
+        rollback_obsoletions=$(tr -d '\r' < rollback.log | grep '^CPS_VM_OBSOLETION: ' || :)
         if [[ $rollback_boots != 'CPS_VM_BOOT: previous' || $rollback_kernels != "CPS_VM_KERNEL: previous $base_release" ]]; then
             printf 'Unexpected rollback boot:\n%s\n%s\n' "$rollback_boots" "$rollback_kernels" >&2
             tail -80 rollback.log >&2
             exit 1
         fi
         test "$rollback_publishers" = 'CPS_VM_PUBLISHER: previous absent'
-        printf '%s\n%s\n%s\n' "$rollback_boots" "$rollback_kernels" "$rollback_publishers"
+        test "$rollback_obsoletions" = 'CPS_VM_OBSOLETION: previous retained'
+        printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
     fi
     exit 0
 fi

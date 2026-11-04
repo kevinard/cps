@@ -183,6 +183,13 @@ if [ -f /etc/cps-vm-assert-extra-publisher ]; then
         publisher=$("$bb" cat /etc/cps-vm-extra-marker)
     fi
     printf 'CPS_VM_PUBLISHER: %s %s\n' "$state" "$publisher"
+    if [ "$state" = trial ]; then
+        [ ! -e /etc/cps-vm-legacy-marker ]
+        printf 'CPS_VM_OBSOLETION: trial removed\n'
+    else
+        [ "$("$bb" cat /etc/cps-vm-legacy-marker)" = legacy ]
+        printf 'CPS_VM_OBSOLETION: previous retained\n'
+    fi
 fi
 if [ "$state" = trial ] && [ -f /run/cps-vm-counted ] &&
     [ -f /usr/local/libexec/cps-vm-capabilities ]; then
