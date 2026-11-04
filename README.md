@@ -1006,6 +1006,20 @@ Omit `--root-image` to verify an already deployed trial against its export
 receipt and finish activation. Use the mounted ESP with `boot-env list`
 and `boot-env rollback` as usual.
 
+After a successful upgrade, you can reuse the older slot by passing
+`--replace "$old_environment_id"` with `--root-image` and the older root's
+device and PARTUUID. CPS verifies the new export, durably retires the old
+boot entry and artifacts, and writes the root while the selected known-good
+environment stays available. A mounted slot or a trial with attempts left
+cannot be replaced.
+
+If writing the slot is interrupted, rerun the replacement command with the
+same `--replace` ID. CPS records that ID on the ESP until it has verified
+the new root. If CPS reports that the replacement ID is unknown, use the
+original command without `--replace` to finish deployment into the now
+unregistered slot. If the new environment is already registered, omit
+`--root-image` and `--replace` to verify it and finish activation.
+
 Activation copies boot files from the selected root and publishes its Boot
 Loader Specification entry last. With manually supplied boot files the
 kernel path defaults to `boot/vmlinuz`. Use `--initrd` if the kernel needs
@@ -1171,6 +1185,9 @@ and activate the trial from a rescue VM with a writable virtio disk. The test
 checks rejection of mounted or registered targets and incorrect partition or
 receipt identities. It then verifies the written partition and boots the
 result through the normal blessing and rollback checks.
+Combine it with `CPS_VM_RECYCLE_SLOT=1` to also exercise direct replacement,
+recovery from a partial write after retirement, and boot and rollback of
+the recovered upgrade.
 
 #### Testing a source-built Linux kernel
 

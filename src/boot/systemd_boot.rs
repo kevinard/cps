@@ -123,7 +123,7 @@ pub struct Activation {
     pub known_good: bool,
 }
 
-/// A root payload to deploy as part of an atomic offline activation.
+/// A root payload to deploy before activation, optionally replacing a retired slot.
 #[derive(Clone, Copy)]
 pub struct RootDeployment<'a> {
     pub image: &'a Path,
@@ -171,7 +171,7 @@ pub fn activate_device_boot_environment(
     activation: &Activation,
     device: &Path,
     receipt: &Path,
-    root_image: Option<&Path>,
+    root_deployment: Option<RootDeployment<'_>>,
 ) -> Result<String> {
     ensure!(
         !activation.known_good,
@@ -179,14 +179,11 @@ pub fn activate_device_boot_environment(
     );
     let partuuid = canonical_partuuid(&activation.root_partuuid)?;
     let (disk, target) =
-        super::device::DevicePartition::open(device, esp, &partuuid, root_image.is_some())?;
+        super::device::DevicePartition::open(device, esp, &partuuid, root_deployment.is_some())?;
     let deployment = Deployment {
         disk: &disk,
         receipt,
-        root: root_image.map(|image| RootDeployment {
-            image,
-            replace: None,
-        }),
+        root: root_deployment,
         target: Some(&target),
     };
     Ok(activate(root, esp, activation, Some(deployment))?.id)
@@ -345,6 +342,15 @@ pub(super) fn activate(
         replace.is_none() || select_trial,
         "a slot replacement requires a new trial and a known-good base"
     );
+    let marker = esp.join(format!("loader/entries/{partuuid}.cps-retired"));
+    let pending = read_regular(&marker)?;
+    if let Some(pending) = &pending {
+        ensure!(
+            deployment.is_some_and(|deployment| deployment.target.is_some())
+                && replace.is_some_and(|id| pending.strip_suffix(b"\n") == Some(id.as_bytes())),
+            "an interrupted slot replacement must be resumed with activate-device and its original --replace ID"
+        );
+    }
     let mut retired = None;
     if let Some(fallback) = fallback.as_deref().filter(|_| select_trial) {
         let base = find_known_good(&existing, fallback)
@@ -358,12 +364,22 @@ pub(super) fn activate(
         );
         verify_fallback_artifacts(&esp, fallback, &base.description)?;
         if let Some(replace) = replace {
+            ensure!(
+                replace != base.id && partuuid != base.partuuid,
+                "cannot replace the known-good base"
+            );
             let disk = deployment
-                .context("slot replacement requires an offline disk")?
+                .context("slot replacement requires a verified disk")?
                 .disk;
-            retired = Some(check_replacement(
-                disk, &existing, replace, &partuuid, base,
-            )?);
+            if let Some(entry) = existing.iter().find(|entry| entry.id == replace) {
+                retired = Some(check_replacement(disk, entry, &partuuid)?);
+            } else {
+                ensure!(
+                    pending.is_some(),
+                    "unknown replacement boot environment {replace}"
+                );
+                policy::entry_identity(replace)?;
+            }
         }
         ensure!(
             !existing.iter().any(|entry| entry.id != id
@@ -403,7 +419,19 @@ pub(super) fn activate(
             .as_ref()
             .context("root deployment requires an export receipt")?;
         if let Some(target) = deployment.target {
-            target.write(root.image, &partuuid, receipt)?;
+            let payload = target.prepare(root.image, &partuuid, receipt)?;
+            if let Some(replace) = replace {
+                if matches!(policy, Some(LoaderPolicy::Pinned { .. })) {
+                    let base = fallback.as_deref().context("missing known-good base")?;
+                    LoaderPolicy::pinned(base).write(&esp.join("loader/loader.conf"))?;
+                }
+                retire_device_entry(&esp, &marker, replace, retired.take())?;
+            }
+            target.write(payload, &partuuid, receipt)?;
+            if replace.is_some() {
+                fs::remove_file(&marker)?;
+                File::open(esp.join("loader/entries"))?.sync_all()?;
+            }
         } else {
             deployment
                 .disk
@@ -459,19 +487,10 @@ pub(super) fn activate(
 
 fn check_replacement(
     disk: &OfflineDisk,
-    entries: &[BootEntry],
-    id: &str,
+    entry: &BootEntry,
     partuuid: &str,
-    base: &BootEntry,
 ) -> Result<RetiredEntry> {
-    let entry = entries
-        .iter()
-        .find(|entry| entry.id == id)
-        .with_context(|| format!("unknown replacement boot environment {id}"))?;
-    ensure!(
-        entry.id != base.id && partuuid != base.partuuid,
-        "cannot replace the known-good base"
-    );
+    let id = &entry.id;
     ensure!(
         entry.partuuid == partuuid,
         "replacement entry {id} belongs to a different root PARTUUID"
@@ -489,9 +508,46 @@ fn check_replacement(
         .and_then(|name| name.to_str())
         .context("invalid boot entry filename")?;
     Ok(RetiredEntry {
-        id: id.to_owned(),
+        id: id.clone(),
         file: file.to_owned(),
     })
+}
+
+fn retire_device_entry(
+    esp: &Path,
+    marker: &Path,
+    id: &str,
+    retired: Option<RetiredEntry>,
+) -> Result<()> {
+    // Remember the retired identity before removing its boot entry. The
+    // directory fsync must complete before any write to the root partition.
+    install(marker, io::Cursor::new(format!("{id}\n")))?;
+    let entries = File::open(esp.join("loader/entries"))?;
+    if let Some(retired) = retired {
+        fs::remove_file(esp.join("loader/entries").join(retired.file))?;
+    }
+    entries.sync_all()?;
+
+    let artifacts = esp.join("EFI/cps").join(id);
+    match File::open(&artifacts) {
+        Ok(dir) => {
+            for name in ["vmlinuz.efi", "initramfs.img"] {
+                match fs::remove_file(artifacts.join(name)) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            dir.sync_all()?;
+            if fs::read_dir(&artifacts)?.next().is_none() {
+                fs::remove_dir(&artifacts)?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    File::open(esp.join("EFI/cps"))?.sync_all()?;
+    Ok(())
 }
 
 fn read_export_receipt(path: &Path) -> Result<ExportReceipt> {

@@ -75,8 +75,8 @@ impl DevicePartition {
         check_esp_mount(path, locked)
     }
 
-    pub fn write(&self, image: &Path, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
-        let (mut payload, expected) = checked_payload(image, self.bytes, Some(receipt))?;
+    pub fn prepare(&self, image: &Path, partuuid: &str, receipt: &ExportReceipt) -> Result<File> {
+        let (mut payload, _) = checked_payload(image, self.bytes, Some(receipt))?;
         verify_filesystem_at(
             &payload,
             0,
@@ -86,9 +86,13 @@ impl DevicePartition {
             receipt.revision,
         )?;
         payload.rewind()?;
+        Ok(payload)
+    }
+
+    pub fn write(&self, mut payload: File, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
         let actual = write_extent(&self.file, 0, self.bytes, &mut payload)?;
         ensure!(
-            actual == expected && payload.metadata()?.len() == self.bytes,
+            actual == receipt.sha256 && payload.metadata()?.len() == self.bytes,
             "deployed partition does not match the checked root payload"
         );
         self.verify_filesystem(partuuid, receipt)

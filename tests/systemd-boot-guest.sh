@@ -22,20 +22,24 @@ copy_runtime_deps() {
 # Boot a rescue root with the exported trial on a read-only input disk.
 # The writable disk is the one later booted through systemd-boot.
 activate_device_guest() {
+    local mode=$1 source=$2 output=$3 stage=$4
+    local inputs="device-$mode-inputs"
     local program binary data_args=()
-    mkdir -p device-inputs/{bin,usr/bin,dev,proc,sys,tmp,esp,fallback}
-    cp -L -- "$busybox" device-inputs/bin/busybox
-    copy_runtime_deps device-inputs "$busybox"
-    ln -s busybox device-inputs/bin/sh
-    strip --strip-debug -o device-inputs/usr/bin/cps "$cps"
-    copy_runtime_deps device-inputs "$cps"
+    mkdir -p "$inputs"/{bin,usr/bin,dev,proc,sys,tmp,esp,fallback}
+    cp -L -- "$busybox" "$inputs/bin/busybox"
+    copy_runtime_deps "$inputs" "$busybox"
+    ln -s busybox "$inputs/bin/sh"
+    strip --strip-debug -o "$inputs/usr/bin/cps" "$cps"
+    copy_runtime_deps "$inputs" "$cps"
     for program in mount sfdisk blkid e2fsck; do
         binary=$(command -v "$program")
-        cp -L -- "$binary" "device-inputs/usr/bin/$program"
-        copy_runtime_deps device-inputs "$binary"
+        cp -L -- "$binary" "$inputs/usr/bin/$program"
+        copy_runtime_deps "$inputs" "$binary"
     done
-    cp -a -- staged device-inputs/
-    cp --sparse=always -- staged.ext4 staged.kdl base.kdl device-inputs/
+    cp -a -- "$stage" "$inputs/staged"
+    cp --sparse=always -- "$stage.ext4" "$inputs/staged.ext4"
+    cp -- "$stage.kdl" "$inputs/staged.kdl"
+    cp -- base.kdl "$inputs/"
     {
         printf '#!/bin/sh\nset -eu\nbase_uuid=%q\ntrial_uuid=%q\noptions=%q\n' \
             "$base_uuid" "$trial_uuid" "$options"
@@ -47,17 +51,23 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
 mount -t vfat /dev/vda1 /esp
-mount -t ext4 -o ro,noload /dev/vda2 /fallback
+activate() {
+    cps boot-env activate-device --root /staged --options "$options" "$@"
+}
 reject() {
     expected=$1
     shift
-    if cps boot-env activate-device --root /staged --options "$options" "$@" > /tmp/rejected 2>&1; then
+    if activate "$@" > /tmp/rejected 2>&1; then
         echo "CPS_VM_DEVICE: unexpected activation"
         exit 1
     fi
     /bin/busybox cat /tmp/rejected
     /bin/busybox grep -Fq "$expected" /tmp/rejected
 }
+GUEST
+        if [[ $mode == initial ]]; then
+            cat <<'GUEST'
+mount -t ext4 -o ro,noload /dev/vda2 /fallback
 reject 'claiming the target root partition exclusively' --esp /esp --device /dev/vda2 \
     --root-partuuid "$base_uuid" --receipt /staged.kdl --root-image /staged.ext4
 /bin/busybox umount /fallback
@@ -70,33 +80,70 @@ reject 'must name the root of a mounted EFI partition' --esp /esp/EFI --device /
 reject 'receipt is for a different image or revision' --esp /esp --device /dev/vda3 \
     --root-partuuid "$trial_uuid" --receipt /base.kdl --root-image /staged.ext4
 mount -t ext4 -o ro,noload /dev/vda2 /fallback
-cps boot-env activate-device --root /staged --esp /esp --device /dev/vda3 \
-    --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4 --options "$options"
+activate --esp /esp --device /dev/vda3 \
+    --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4
 reject 'environment is already registered' --esp /esp --device /dev/vda3 \
     --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4
-cps boot-env activate-device --root /staged --esp /esp --device /dev/vda3 \
-    --root-partuuid "$trial_uuid" --receipt /staged.kdl --options "$options"
+activate --esp /esp --device /dev/vda3 \
+    --root-partuuid "$trial_uuid" --receipt /staged.kdl
+GUEST
+        else
+            printf 'mode=%q\nbase_id=%q\ntrial_id=%q\n' "$mode" "$base_id" "$trial_id"
+            cat <<'GUEST'
+mount -t ext4 -o ro,noload /dev/vda3 /fallback
+old="/esp/loader/entries/$base_id.conf"
+marker="/esp/loader/entries/$base_uuid.cps-retired"
+set -- --esp /esp --device /dev/vda2 --root-partuuid "$base_uuid" --receipt /staged.kdl
+reject 'cannot replace the known-good base' "$@" --replace "$trial_id" --root-image /staged.ext4
+reject 'distinct root PARTUUID' "$@" --root-image /staged.ext4
+reject 'root payload size must match' "$@" --replace "$base_id" --root-image /base.kdl
+test -f "$old"
+test ! -e "$marker"
+if [ "$mode" = resume ]; then
+    # Recreate the durable state after retirement and an interrupted root write.
+    printf '%s\n' "$base_id" > "$marker"
+    /bin/busybox rm "$old"
+    /bin/busybox sync
+    /bin/busybox dd if=/dev/zero of=/dev/vda2 bs=1M count=1 conv=fsync
+    cps boot-env list --esp /esp > /tmp/environments
+    /bin/busybox grep -F "$trial_id" /tmp/environments | /bin/busybox grep '^\*'
+    if /bin/busybox grep -F "$base_id" /tmp/environments; then
+        exit 1
+    fi
+    reject 'an interrupted slot replacement' "$@" --root-image /staged.ext4
+    echo 'CPS_VM_DEVICE: resuming after a partial root write'
+fi
+activate "$@" --replace "$base_id" --root-image /staged.ext4
+test ! -e "$old"
+test ! -e "$marker"
+test ! -e "/esp/EFI/cps/$base_id"
+GUEST
+        fi
+        cat <<'GUEST'
 /bin/busybox umount /esp /fallback
 echo 'CPS_VM_DEVICE: activated verified inactive partition'
 GUEST
-    } > device-inputs/init
-    chmod 0755 device-inputs/init
-    truncate -s "$((root_mib + 256))M" device-inputs.raw
-    mke2fs -q -F -t ext4 -d device-inputs device-inputs.raw
-    cp --reflink=auto --sparse=always "$base_disk" disk.raw
+    } > "$inputs/init"
+    chmod 0755 "$inputs/init"
+    truncate -s "$((root_mib + 256))M" "$inputs.raw"
+    mke2fs -q -F -t ext4 -d "$inputs" "$inputs.raw"
+    cp --reflink=auto --sparse=always "$source" "$output"
     if [[ -n $qemu_data ]]; then data_args=(-L "$qemu_data"); fi
     timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${data_args[@]}" \
         -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
-        -serial file:device.log -kernel "$trial_kernel" \
+        -serial "file:device-$mode.log" -kernel "$trial_kernel" \
         -append 'root=/dev/vdb rootfstype=ext4 rootwait ro console=ttyS0 loglevel=3 init=/init' \
-        -drive if=virtio,format=raw,file=disk.raw \
-        -drive if=virtio,format=raw,readonly=on,file=device-inputs.raw || {
-        tail -80 device.log >&2
+        -drive "if=virtio,format=raw,file=$output" \
+        -drive "if=virtio,format=raw,readonly=on,file=$inputs.raw" || {
+        tail -80 "device-$mode.log" >&2
         return 1
     }
-    tr -d '\r' < device.log > device-activation.log
-    cat device-activation.log
-    grep -Fxq 'CPS_VM_DEVICE: activated verified inactive partition' device-activation.log
+    tr -d '\r' < "device-$mode.log" > "device-$mode-activation.log"
+    cat "device-$mode-activation.log"
+    grep -Fxq 'CPS_VM_DEVICE: activated verified inactive partition' "device-$mode-activation.log"
+    if [[ $mode == resume ]]; then
+        grep -Fxq 'CPS_VM_DEVICE: resuming after a partial root write' "device-$mode-activation.log"
+    fi
 }
 
 prepare_fat_modules() {

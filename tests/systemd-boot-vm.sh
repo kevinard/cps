@@ -660,7 +660,7 @@ grep -q 'distinct root PARTUUID' rejected.log
 diff -r esp-before esp
 
 if [[ $device_activation == 1 ]]; then
-    activate_device_guest
+    activate_device_guest initial "$base_disk" disk.raw staged
     cmp -n 1048576 "$base_disk" disk.raw
     cmp -i "$((base_mib * 1024 * 1024))" -n "$((root_mib * 1024 * 1024))" "$base_disk" disk.raw
     cmp -i "$((trial_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" disk.raw staged.ext4
@@ -896,11 +896,23 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$("$cps" config list --root recycled)" = 'No pending configuration updates'
             "$cps" boot-env export --receipt --root recycled --output recycled.ext4 \
                 --size-mib "$root_mib" > recycled.kdl
-            result=$("$cps" boot-env activate --root recycled --root-image recycled.ext4 \
-                --root-partuuid "$base_uuid" --replace "$base_id" \
-                --disk disk.raw --receipt recycled.kdl --esp-partuuid "$esp_uuid" \
-                --output-disk recycled.raw --options "$options")
-            test "$result" = "Activated $recycled_id"
+            if [[ $device_activation == 1 ]]; then
+                activate_device_guest replace disk.raw replaced.raw recycled
+                activate_device_guest resume disk.raw recycled.raw recycled
+                cmp -i "$((base_mib * 1024 * 1024))" replaced.raw recycled.raw
+                for output in replaced.raw recycled.raw; do
+                    cmp -i "$((base_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" \
+                        "$output" recycled.ext4
+                    "$cps" boot-env list --disk "$output" --esp-partuuid "$esp_uuid" > "$output.list"
+                done
+                cmp replaced.raw.list recycled.raw.list
+            else
+                result=$("$cps" boot-env activate --root recycled --root-image recycled.ext4 \
+                    --root-partuuid "$base_uuid" --replace "$base_id" \
+                    --disk disk.raw --receipt recycled.kdl --esp-partuuid "$esp_uuid" \
+                    --output-disk recycled.raw --options "$options")
+                test "$result" = "Activated $recycled_id"
+            fi
             cmp -n 1048576 disk.raw recycled.raw
             cmp -i "$((trial_mib * 1024 * 1024))" disk.raw recycled.raw
             "$cps" boot-env list --disk recycled.raw --esp-partuuid "$esp_uuid" | tee recycled-trial.log

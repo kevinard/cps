@@ -508,7 +508,7 @@ enum BootCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Verify or write an unused GPT root partition and activate its staged trial
+    /// Verify or write an inactive GPT root partition and activate its staged trial
     ActivateDevice {
         #[arg(long)]
         root: PathBuf,
@@ -526,6 +526,9 @@ enum BootCommand {
         /// Write this export before activation. Without it, verify the existing bytes.
         #[arg(long)]
         root_image: Option<PathBuf>,
+        /// Retire this environment before writing its inactive root partition
+        #[arg(long, requires = "root_image")]
+        replace: Option<String>,
         #[arg(long, default_value = "boot/vmlinuz")]
         kernel: String,
         #[arg(long)]
@@ -1147,6 +1150,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 root_partuuid,
                 receipt,
                 root_image,
+                replace,
                 kernel,
                 initrd,
                 options,
@@ -1166,7 +1170,10 @@ fn run(command: Command) -> Result<ExitCode> {
                     &activation,
                     &device,
                     &receipt,
-                    root_image.as_deref(),
+                    root_image.as_deref().map(|image| RootDeployment {
+                        image,
+                        replace: replace.as_deref(),
+                    }),
                 )?;
                 println!("Activated {id}");
             }
