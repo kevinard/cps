@@ -10,10 +10,11 @@ sources=$(realpath -- "${CPS_SYSTEMD_SOURCE_DIR:?Set CPS_SYSTEMD_SOURCE_DIR to t
 runtime=$(realpath -- "${CPS_SYSTEMD_CPS_FIXTURE:?Set CPS_SYSTEMD_CPS_FIXTURE to the source-built CPS fixture}")
 util_linux=${CPS_SYSTEMD_UTIL_LINUX_FIXTURE:-}
 util_package=cps://canopa-util-linux/system/util-linux@2.42.4-0
+seccomp_package=cps://canopa/system/libseccomp@2.6.1-0
 systemd_version=262.1.0-0
 if [[ -n $util_linux ]]; then
     util_linux=$(realpath -- "$util_linux")
-    systemd_version=262.1.0-1
+    systemd_version=262.1.0-2
 fi
 CPS_SYSTEMD_TOOLS_ROOT=$(realpath -- "${CPS_SYSTEMD_TOOLS_ROOT:-/}")
 export CPS_SYSTEMD_TOOLS_ROOT
@@ -29,6 +30,23 @@ keypair() {
 }
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 
+toolchain_publisher() {
+    local name=$1 repository=$2 key=$3
+    local fingerprint
+    fingerprint=$(tail -c 32 -- "$key" | sha256sum | cut -d' ' -f1)
+    printf '        publisher "%s" catalog="%s" key-sha256="%s"\n' \
+        "$name" "$(cat "$repository/current")" "$fingerprint" >> "$work/toolchain-recipe"
+    printf 'publisher "%s" {\n    repository %s\n    trust-key %s\n}\n' \
+        "$name" "$(kdl_string "$repository")" "$(kdl_string "$key")" >> toolchain.kdl
+}
+
+kdl_string() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '"%s"' "$value"
+}
+
 keypair toolchain
 keypair builder
 keypair release
@@ -36,29 +54,52 @@ add_util_linux() {
     "$cps" publisher add --root "$1" --repo "$util_linux/repo" \
         --trust-key "$util_linux/release-public.der" canopa-util-linux
 }
-util_root=
+seed_args=()
+packaged_libs=0
 if [[ -n $util_linux ]]; then
     "$cps" repo attestation --repo "$util_linux/repo" --publisher canopa-util-linux \
         --trust-key "$util_linux/release-public.der" "$util_package" > util-linux-attestation.json
-    util_root="$work/util-linux"
-    "$cps" image-create --root "$util_root" --repo "$runtime/runtime-seed" \
-        --publisher canopa-runtime-seed --trust-key "$runtime/runtime-seed-public.der"
-    add_util_linux "$util_root"
-    "$cps" plan --root "$util_root" --output "$work/util-linux.json" install "$util_package"
-    "$cps" apply --root "$util_root" "$work/util-linux.json"
-    "$cps" verify --root "$util_root" --pristine
+    seed_args=(--uid "$(id -u)" --gid "$(id -g)")
+    packaged_libs=1
 else
     keypair runtime-seed
 fi
 "$cps" repo attestation --repo "$runtime/repo" --publisher canopa --trust-key "$runtime/release-public.der" \
-    cps://canopa/system/libseccomp@2.6.1-0 >/dev/null
-"$cps" verify --root "$runtime/image" --pristine
-CPS_SYSTEMD_UTIL_LINUX_ROOT="$util_root" bash "$project/tests/seed-native-c.sh" "$work/native-systemd" --systemd
-install -Dm755 "$runtime/image/usr/lib/libseccomp.so.2" "$work/native-systemd/usr/lib/libseccomp.so.2"
+    "$seccomp_package" > libseccomp-attestation.json
+CPS_SYSTEMD_PACKAGED_LIBS=$packaged_libs bash "$project/tests/seed-native-c.sh" "$work/native-systemd" --systemd
+if [[ -n $util_linux ]]; then
+    # These paths come from the pinned ELF runtime and library packages.
+    for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1,libseccomp.so.2,libblkid.so.1,libmount.so.1}; do
+        rm -f -- "$work/native-systemd/$path"
+    done
+else
+    "$cps" verify --root "$runtime/image" --pristine
+    install -Dm755 "$runtime/image/usr/lib/libseccomp.so.2" "$work/native-systemd/usr/lib/libseccomp.so.2"
+fi
 ln -s libseccomp.so.2 "$work/native-systemd/usr/lib/libseccomp.so"
 "$cps" manifest generate --proto "$work/native-systemd" --publisher seed --version 1.0.0-0 \
-    build/native-systemd > native-systemd.kdl
+    "${seed_args[@]}" build/native-systemd > native-systemd.kdl
 "$cps" publish --repo toolchain --proto "$work/native-systemd" --signing-key "$work/toolchain.der" native-systemd.kdl
+
+toolchain_input=(--repo toolchain --publisher seed --trust-key toolchain-public.der)
+if [[ -n $util_linux ]]; then
+    printf 'schema-version 1\n' > toolchain.kdl
+    printf '    toolchain solver="sat-v1" {\n' > "$work/toolchain-recipe"
+    toolchain_publisher seed toolchain toolchain-public.der
+    toolchain_publisher canopa-util-linux "$util_linux/repo" "$util_linux/release-public.der"
+    toolchain_publisher canopa "$runtime/repo" "$runtime/release-public.der"
+    toolchain_publisher canopa-runtime-seed "$runtime/runtime-seed" "$runtime/runtime-seed-public.der"
+    printf '        package "%s"\n' cps://seed/build/native-systemd@1.0.0-0 "$util_package" "$seccomp_package" \
+        >> "$work/toolchain-recipe"
+    printf '    }\n' >> "$work/toolchain-recipe"
+    toolchain_input=(--toolchain-config toolchain.kdl)
+else
+    cat > "$work/toolchain-recipe" <<TOOLCHAIN
+    toolchain "$(cat toolchain/current)" solver="sat-v1" {
+        package "build/native-systemd"
+    }
+TOOLCHAIN
+fi
 
 recipe="$project/packaging/systemd"
 sed -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
@@ -66,12 +107,15 @@ sed -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
 if [[ -n $util_linux ]]; then
     sed -i 's/require "system\/systemd-vm-libs"/require "system\/util-linux" version="=2.42.4-0"/' systemd.kdl
 fi
-sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
+sed -e "/^@TOOLCHAIN@\$/ {
+r $work/toolchain-recipe
+d
+}" \
     -e "s/@MANIFEST_SHA256@/$(sha systemd.kdl)/g" \
     -e "s/@PACKAGE_VERSION@/$systemd_version/g" \
     "$recipe/vm-build.kdl.in" > build.kdl
 "$cps" source import --from "$sources" --cache sources build.kdl
-"$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \
+"$cps" build "${toolchain_input[@]}" \
     --source-cache sources --output bundle --check-reproducible \
     --builder-signing-key "$work/builder.der" build.kdl
 
@@ -113,11 +157,6 @@ fi
 "$cps" verify --root image --pristine
 cmp bundle/proto/usr/lib/systemd/systemd image/usr/lib/systemd/systemd
 cmp bundle/proto/usr/lib/systemd/boot/efi/systemd-bootx64.efi image/usr/lib/systemd/boot/efi/systemd-bootx64.efi
-if [[ -n $util_linux ]]; then
-    for path in usr/bin/mount usr/lib/{libblkid,libmount}.so.1; do
-        cmp "$util_root/$path" "image/$path"
-    done
-fi
 loader=(env -i "$PWD/image/lib64/ld-linux-x86-64.so.2" --inhibit-cache --library-path "$PWD/image/usr/lib:$PWD/image/usr/lib/systemd")
 for program in usr/lib/systemd/systemd usr/lib/systemd/systemd-executor usr/lib/systemd/systemd-bless-boot usr/bin/systemctl; do
     links=$("${loader[@]}" --list "image/$program")
