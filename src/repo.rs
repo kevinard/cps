@@ -64,6 +64,8 @@ pub(crate) struct ReleaseProfile {
     pub architecture: String,
     pub facets: BTreeMap<String, bool>,
     pub companions: Vec<CatalogPin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elf_library_dirs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,6 +210,7 @@ impl Catalog {
             self.release_profiles.is_empty() || !next.release_profiles.is_empty(),
             "release drops signed composition profiles"
         );
+        self.check_elf_profiles(&next.release_profiles)?;
         for (id, record) in &self.withdrawals {
             ensure!(
                 next.withdrawals.get(id) == Some(record),
@@ -235,6 +238,20 @@ impl Catalog {
                 ensure!(
                     next_attestation == Some(attestation),
                     "release drops or changes the build attestation for {id}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_elf_profiles(&self, profiles: &BTreeMap<String, ReleaseProfile>) -> Result<()> {
+        for (name, profile) in &self.release_profiles {
+            if !profile.elf_library_dirs.is_empty() {
+                ensure!(
+                    profiles
+                        .get(name)
+                        .is_some_and(|next| !next.elf_library_dirs.is_empty()),
+                    "release drops ELF checking for signed profile {name}"
                 );
             }
         }
@@ -602,6 +619,9 @@ fn read_catalog_with_key(
     for (name, profile) in &catalog.release_profiles {
         validate_name(name).context("invalid signed profile name")?;
         validate_publisher(&profile.architecture).context("invalid signed profile architecture")?;
+        if !profile.elf_library_dirs.is_empty() {
+            publish_policy::validate_elf_dirs(&profile.architecture, &profile.elf_library_dirs)?;
+        }
         for facet in profile.facets.keys() {
             validate_publisher(facet).context("invalid signed profile facet")?;
         }
@@ -1323,7 +1343,7 @@ fn check_profiles(
             .map_or(key, |rotation| rotation.previous_key());
         profiles::check(repo, catalog, &policy.profiles, anchor)?;
         catalog.profiles_required = true;
-        catalog.release_profiles = policy
+        let release_profiles = policy
             .profiles
             .iter()
             .map(|(name, profile)| {
@@ -1341,10 +1361,13 @@ fn check_profiles(
                         architecture: profile.arch.clone(),
                         facets: profile.facets.clone(),
                         companions,
+                        elf_library_dirs: profile.elf_library_dirs.clone(),
                     },
                 )
             })
             .collect();
+        catalog.check_elf_profiles(&release_profiles)?;
+        catalog.release_profiles = release_profiles;
     }
     Ok(())
 }

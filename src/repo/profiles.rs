@@ -1,3 +1,6 @@
+mod elf;
+mod runtime;
+
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     path::Path,
@@ -71,8 +74,10 @@ pub(super) fn check(
             .map(|name| (name.clone(), catalog.publisher.as_str()))
             .collect::<BTreeMap<_, _>>();
         let current = candidates(catalog, &packages, &companions, false, sources.clone());
-        let (target, _) = compose(&current, profile, true)
+        let (target, paths) = compose(&current, profile, true)
             .with_context(|| format!("checking release profile {name}"))?;
+        runtime::check(repo, &catalog.publisher, profile, &target, &paths)
+            .with_context(|| format!("checking ELF closure for release profile {name}"))?;
         if let Some(hash) = profile.upgrade_from.as_deref() {
             let (baseline, baseline_packages) = match baselines.entry(hash) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -94,7 +99,8 @@ pub(super) fn check(
                     .map(|(name, pkg)| (name.clone(), pkg.published.manifest.publisher.as_str()))
                     .collect();
                 let current = candidates(catalog, &packages, &companions, false, sticky);
-                check_upgrade(&before, old_paths, &current, &target, profile)
+                let (after, paths) = check_upgrade(&before, old_paths, &current, &target, profile)?;
+                runtime::check(repo, &catalog.publisher, profile, &after, &paths)
             })()
             .with_context(|| format!("checking upgrade from {hash} for release profile {name}"))?;
         }
@@ -205,7 +211,7 @@ fn check_upgrade(
     catalogs: &CandidateSet<&Published>,
     target: &BTreeMap<String, Installed>,
     profile: &Profile,
-) -> Result<()> {
+) -> Result<Composition> {
     let (after, new_paths) = resolve_packages(
         before,
         Candidates {
@@ -251,5 +257,5 @@ fn check_upgrade(
             }
         }
     }
-    Ok(())
+    Ok((after, new_paths))
 }

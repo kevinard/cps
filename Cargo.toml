@@ -19,6 +19,7 @@ tempfile = "3"
 kdl = "6.5"
 libc = "0.2"
 libseccomp = "0.4"
+object = { version = "0.37.3", default-features = false, features = ["elf", "read_core", "std", "unaligned"] }
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 resolvo = "0.12"

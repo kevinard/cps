@@ -8,7 +8,9 @@ use kdl::{KdlDocument, KdlNode};
 
 use crate::{
     attestation::MAX_BUILDERS,
-    model::{PackageSpec, Version, validate_digest, validate_name, validate_publisher},
+    model::{
+        PackageSpec, Version, validate_digest, validate_name, validate_path, validate_publisher,
+    },
 };
 
 use super::{Fields, PublisherConfig, document, one, publisher_config, schema};
@@ -27,6 +29,27 @@ pub(crate) struct Profile {
     pub packages: BTreeMap<String, Option<Version>>,
     pub upgrade_from: Option<String>,
     pub companions: Vec<Companion>,
+    pub elf_library_dirs: Vec<String>,
+}
+
+pub(crate) fn validate_elf_dirs(arch: &str, dirs: &[String]) -> Result<()> {
+    ensure!(
+        matches!(arch, "x86_64" | "aarch64"),
+        "unsupported architecture for ELF checking {arch}"
+    );
+    ensure!(
+        (1..=32).contains(&dirs.len()),
+        "elf-check requires 1 to 32 library-dir entries"
+    );
+    let mut seen = BTreeSet::new();
+    for dir in dirs {
+        let relative = dir
+            .strip_prefix('/')
+            .context("library-dir must be absolute")?;
+        validate_path(relative)?;
+        ensure!(seen.insert(dir), "duplicate ELF library directory {dir}");
+    }
+    Ok(())
 }
 
 pub(crate) struct Companion {
@@ -48,6 +71,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     let mut packages = BTreeMap::new();
     let mut facets = BTreeMap::new();
     let mut companions = Vec::new();
+    let mut elf_library_dirs = Vec::new();
     let mut names = BTreeSet::from([publisher.to_owned()]);
     for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
         match child.name().value() {
@@ -101,6 +125,21 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
                     "duplicate profile facet {facet}"
                 );
             }
+            "elf-check" => {
+                ensure!(elf_library_dirs.is_empty(), "duplicate elf-check block");
+                Fields::read(child, 0, &[], true)?;
+                let directories = child
+                    .children()
+                    .context("elf-check requires a library-dir block")?;
+                for node in directories.nodes() {
+                    ensure!(
+                        node.name().value() == "library-dir",
+                        "expected library-dir under elf-check"
+                    );
+                    elf_library_dirs.push(Fields::read(node, 1, &[], false)?.string_arg(0)?);
+                }
+                validate_elf_dirs(&arch, &elf_library_dirs)?;
+            }
             kind => bail!("unknown profile node {kind}"),
         }
     }
@@ -116,6 +155,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             packages,
             upgrade_from,
             companions,
+            elf_library_dirs,
         },
     ))
 }

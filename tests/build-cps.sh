@@ -15,6 +15,7 @@ arch=$(uname -m)
 cps_version=0.1.0-2
 sqlite_version=3.54.1-1
 seccomp_version=2.6.1-1
+runtime_version=1.0.0-1
 [[ $arch == x86_64 ]] || { echo 'The ELF runtime seed requires an x86-64 worker' >&2; exit 1; }
 mkdir -m 700 -- "$output"
 work=$(mktemp -d "$output/.private.XXXXXXXX")
@@ -51,10 +52,13 @@ for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.
     install -Dm755 "$work/native-rust/$path" "$work/elf-runtime/$path"
     rm -- "$work/native-rust/$path"
 done
+# glibc's own executable entry point can name the canonical loader path.
+ln "$work/elf-runtime/lib64/ld-linux-x86-64.so.2" "$work/elf-runtime/usr/lib/ld-linux-x86-64.so.2"
+rm -f -- "$work/native-rust/usr/lib/ld-linux-x86-64.so.2"
 "$cps" manifest generate --proto "$work/native-rust" --publisher seed --version 1.0.0-0 \
     --uid "$(id -u)" --gid "$(id -g)" build/native-rust > native-rust.kdl
 "$cps" publish --repo toolchain --proto "$work/native-rust" --signing-key "$work/toolchain.der" native-rust.kdl
-"$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version 1.0.0-0 \
+"$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version "$runtime_version" \
     --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
 "$cps" publish --repo runtime-seed --proto "$work/elf-runtime" --signing-key "$work/runtime-seed.der" elf-runtime.kdl
 
@@ -69,7 +73,7 @@ write_toolchain_recipe() {
         cat "$pins"
         printf '        package "%s"\n' \
             cps://seed/build/native-rust@1.0.0-0 \
-            cps://canopa-runtime-seed/system/elf-runtime@1.0.0-0 "$@"
+            "cps://canopa-runtime-seed/system/elf-runtime@$runtime_version" "$@"
         printf '    }\n'
     } > "$toolchain_recipe"
 }
@@ -106,6 +110,10 @@ write_profile() {
     if [[ $name == cps-runtime ]]; then printf '        facet "devel" #false\n'; fi
     printf '        package "%s"\n' "$@"
     cat <<PROFILE
+        elf-check {
+            library-dir "/usr/lib"
+            library-dir "/lib64"
+        }
         publisher "canopa-runtime-seed" catalog="$(cat runtime-seed/current)" {
             repository "../runtime-seed"
             trust-key "../runtime-seed-public.der"
@@ -190,6 +198,7 @@ CONFIG
 "$cps" plan --root image --output install.json install "$cps_package"
 "$cps" apply --root image install.json
 cmp bundle/proto/usr/bin/cps image/usr/bin/cps
+test image/lib64/ld-linux-x86-64.so.2 -ef image/usr/lib/ld-linux-x86-64.so.2
 for path in usr/include/{sqlite3,sqlite3ext,seccomp,seccomp-syscalls}.h \
     usr/lib/pkgconfig/{sqlite3,libseccomp}.pc usr/lib/{libsqlite3,libseccomp}.so; do
     test ! -e "image/$path"

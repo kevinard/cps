@@ -16,7 +16,7 @@ original="$work/original"
 "$cps" image-create --root "$original" --repo "$runtime/runtime-seed" \
     --publisher canopa-runtime-seed --trust-key "$runtime/runtime-seed-public.der"
 "$cps" plan --root "$original" --output "$work/original.json" install \
-    cps://canopa-runtime-seed/system/elf-runtime@1.0.0-0
+    cps://canopa-runtime-seed/system/elf-runtime
 "$cps" apply --root "$original" "$work/original.json"
 "$cps" verify --root "$original" --pristine
 

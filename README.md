@@ -186,8 +186,10 @@ validates both packages with that facet enabled.
 
 The CPS recipe pins that library catalog, the Rust and C toolchain catalog,
 and the `runtime-seed` catalog with the worker's prebuilt ELF loader and C
-and GCC runtime libraries. After two matching builds, the release adds CPS
-to the catalog and validates the `cps-runtime` profile with `devel` disabled.
+and GCC runtime libraries. The seed provides both loader paths used by CPS
+and glibc as hard links to one inode. After two matching builds, the release
+adds CPS to the catalog and validates the `cps-runtime` profile with `devel`
+disabled.
 The fixture installs that profile and uses its own loader and libraries to
 run the installed CPS binary and verify the image.
 
@@ -388,6 +390,34 @@ only packages available in the candidate, and pass the planner's directory and
 kernel transition checks. This models the package-managed state of a clean
 image. Live filesystem changes and boot health are checked separately during
 staging and boot.
+
+For a native x86-64 or AArch64 profile, add `elf-check` with the image's
+ordered default library directories.
+
+```kdl
+profile "desktop" architecture="x86_64" {
+    package "desktop/base"
+    elf-check {
+        library-dir "/usr/lib"
+        library-dir "/lib64"
+    }
+}
+```
+
+CPS hashes the selected payloads and reads ELF program headers as data. It
+checks `PT_INTERP` and `DT_NEEDED` against the signed file map, including
+symlinks, hard links, and pinned companion packages. Each object can use its
+own `DT_RUNPATH` or `DT_RPATH`, with absolute paths and `$ORIGIN` supported.
+The check covers file availability and ELF class and machine compatibility.
+Symbol versions, libraries loaded with `dlopen`, inherited search paths, and
+loader state from the running system are outside its scope.
+
+The gate applies to the fresh composition and the result of a checked
+upgrade. The signed profile records its library directories, and later
+catalogs must keep the gate enabled for that profile. Use a CPS version that
+understands the ELF gate before consuming those catalogs. Run
+[`tests/elf-profile.sh`](tests/elf-profile.sh) to exercise the publication
+gate with a compiler-generated executable and shared library.
 
 List companion publishers inside a profile when dependencies are supplied by
 another repository.
