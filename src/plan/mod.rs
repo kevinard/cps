@@ -356,6 +356,7 @@ pub(crate) fn build(
                 )?
             };
             receipts = catalogs.verify_builds(image, &state, &installed)?;
+            state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
             state.settings.build_profile_catalog =
                 if catalogs.profile.as_ref().is_some_and(|profile| {
                     profile
@@ -664,9 +665,10 @@ pub(crate) fn build(
                 .context("payload byte count overflow")
         })?;
     state.settings.revision = revision;
-    if state.settings.bootstrap_catalog.take().is_some() {
-        state.settings.format = state.publishers.image_format(false);
-    }
+    state.settings.bootstrap_catalog = None;
+    state.settings.format = state
+        .publishers
+        .image_format(false, !state.settings.catalog_checkpoints.is_empty());
     state
         .settings
         .created_directories

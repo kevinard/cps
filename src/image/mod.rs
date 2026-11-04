@@ -22,13 +22,15 @@ use crate::{
     attestation::BuildTrust,
     kdl_format::{PublisherConfig, read_image_definition},
     model::{FORMAT, Node, validate_digest, validate_name, validate_publisher},
-    repo::{BuildReceipt, Published, canonical_repo, catalog_index, read_key},
+    repo::{BuildReceipt, CatalogCheckpoint, Published, canonical_repo, catalog_index, read_key},
 };
 
 // Earlier binaries must reject protected images instead of ignoring build trust.
 const BUILD_TRUST_IMAGE_FORMAT: u32 = 2;
 // Older binaries must reject an image before they can ignore its bootstrap pin.
 const BOOTSTRAP_IMAGE_FORMAT: u32 = 3;
+// Older writers would discard the catalog checkpoints.
+const CHECKPOINT_IMAGE_FORMAT: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
@@ -49,6 +51,8 @@ pub struct Settings {
     pub(crate) bootstrap_catalog: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) build_profile_catalog: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) catalog_checkpoints: BTreeMap<String, CatalogCheckpoint>,
     // Absent on images that predate tracking. Their proposals are discovered
     // from the saved vendor copies the first time they are reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +70,15 @@ pub struct BootParent {
 }
 
 impl Settings {
+    pub(crate) fn check_catalog(&self, publisher: &str, next: &CatalogCheckpoint) -> Result<()> {
+        if let Some(previous) = self.catalog_checkpoints.get(publisher) {
+            previous.check(next).with_context(|| {
+                format!("checking installed catalog checkpoint for {publisher}")
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn directory(&self) -> Node {
         Node::Dir {
             mode: 0o755,
@@ -134,9 +147,11 @@ impl Publishers {
             .find(|publisher| publisher.name == name)
     }
 
-    pub(crate) fn image_format(&self, bootstrapping: bool) -> u32 {
+    pub(crate) fn image_format(&self, bootstrapping: bool, checkpointed: bool) -> u32 {
         if bootstrapping {
             BOOTSTRAP_IMAGE_FORMAT
+        } else if checkpointed {
+            CHECKPOINT_IMAGE_FORMAT
         } else if self
             .as_slice()
             .iter()
@@ -297,6 +312,7 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
         &config.arch,
         &config.facets,
         config.bootstrap_catalog.as_deref(),
+        None,
     )?;
     if config.bootstrap_catalog.is_some() {
         ensure!(
@@ -344,7 +360,7 @@ fn initialize(
     }
     let id = image_id.map_or_else(new_identity, Ok)?;
     let settings = Settings {
-        format: publishers.image_format(bootstrap_catalog.is_some()),
+        format: publishers.image_format(bootstrap_catalog.is_some(), false),
         id: id.clone(),
         revision: 0,
         publisher_generation: 0,
@@ -356,6 +372,7 @@ fn initialize(
         boot_parent: None,
         bootstrap_catalog,
         build_profile_catalog: None,
+        catalog_checkpoints: BTreeMap::new(),
         config_updates: Some(BTreeMap::new()),
     };
     fs::create_dir_all(path)?;
@@ -493,7 +510,10 @@ impl Image {
         ensure!(
             matches!(
                 settings.format,
-                FORMAT | BUILD_TRUST_IMAGE_FORMAT | BOOTSTRAP_IMAGE_FORMAT
+                FORMAT
+                    | BUILD_TRUST_IMAGE_FORMAT
+                    | BOOTSTRAP_IMAGE_FORMAT
+                    | CHECKPOINT_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -504,10 +524,23 @@ impl Image {
         let settings = self.settings()?;
         let publishers = self.publishers()?;
         ensure!(
-            settings.format == publishers.image_format(settings.bootstrap_catalog.is_some())
-                && (settings.bootstrap_catalog.is_none() || publishers.release_profile().is_some()),
-            "image format does not match its build trust or bootstrap policy"
+            settings.format
+                == publishers.image_format(
+                    settings.bootstrap_catalog.is_some(),
+                    !settings.catalog_checkpoints.is_empty()
+                )
+                && (settings.bootstrap_catalog.is_none()
+                    || (publishers.release_profile().is_some()
+                        && settings.catalog_checkpoints.is_empty())),
+            "image format does not match its repository policy"
         );
+        for (publisher, checkpoint) in &settings.catalog_checkpoints {
+            ensure!(
+                publishers.get(publisher).is_some(),
+                "checkpoint for unconfigured publisher {publisher}"
+            );
+            validate_digest(&checkpoint.catalog).context("invalid catalog checkpoint digest")?;
+        }
         if let Some(hash) = &settings.build_profile_catalog {
             validate_digest(hash).context("invalid archived build profile catalog")?;
             ensure!(

@@ -230,7 +230,7 @@ impl Catalog {
         Ok(BuildEvidence {
             attestations: std::mem::take(&mut self.attestations),
             publisher_keys,
-            history: BuildHistory {
+            history: CatalogCheckpoint {
                 catalog: hash.to_owned(),
                 sequence: self.sequence,
                 rotations: std::mem::take(&mut self.key_rotations),
@@ -309,12 +309,7 @@ impl Catalog {
     }
 
     fn check_successor(&self, next: &Self, previous_hash: &str) -> Result<()> {
-        if let Some(previous) = self.sequence {
-            ensure!(
-                next.sequence.is_some_and(|sequence| sequence > previous),
-                "publisher catalog rollback or fork after sequence {previous}"
-            );
-        }
+        check_catalog_sequence(self.sequence, next.sequence)?;
         keys::check_successor(
             &self.key_rotations,
             self.sequence,
@@ -549,15 +544,41 @@ pub struct Snapshot {
 pub(crate) struct BuildEvidence {
     attestations: BTreeMap<String, String>,
     publisher_keys: Vec<[u8; 32]>,
-    history: BuildHistory,
+    pub(crate) history: CatalogCheckpoint,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct BuildHistory {
-    catalog: String,
+pub(crate) struct CatalogCheckpoint {
+    pub(crate) catalog: String,
     sequence: Option<NonZeroU64>,
     rotations: Vec<keys::Rotation>,
+}
+
+impl CatalogCheckpoint {
+    pub(crate) fn check(&self, next: &Self) -> Result<()> {
+        if self.catalog == next.catalog {
+            ensure!(self == next, "catalog checkpoint metadata mismatch");
+            return Ok(());
+        }
+        check_catalog_sequence(self.sequence, next.sequence)?;
+        keys::check_successor(
+            &self.rotations,
+            self.sequence,
+            &self.catalog,
+            &next.rotations,
+        )
+    }
+}
+
+fn check_catalog_sequence(previous: Option<NonZeroU64>, next: Option<NonZeroU64>) -> Result<()> {
+    if let Some(previous) = previous {
+        ensure!(
+            next.is_some_and(|sequence| sequence > previous),
+            "publisher catalog rollback or fork after sequence {previous}"
+        );
+    }
+    Ok(())
 }
 
 /// Local record of an authenticated catalog's admission of a manifest.
@@ -568,11 +589,11 @@ pub(crate) struct BuildReceipt {
     pub publisher: String,
     pub manifest: String,
     attestation: String,
-    history: BuildHistory,
+    history: CatalogCheckpoint,
 }
 
 impl BuildReceipt {
-    fn new(package: &Published, attestation: &str, history: &BuildHistory) -> Self {
+    fn new(package: &Published, attestation: &str, history: &CatalogCheckpoint) -> Self {
         Self {
             publisher: package.manifest.publisher.clone(),
             manifest: package.sha256.clone(),
@@ -703,6 +724,7 @@ pub(crate) fn audit_installed_builds<'a>(
     publisher: &str,
     key: &[u8],
     pin: Option<&CatalogPin>,
+    previous: Option<&CatalogCheckpoint>,
     trust: &BuildTrust,
     installed: impl IntoIterator<Item = &'a Published>,
 ) -> Result<BuildAudit> {
@@ -711,11 +733,14 @@ pub(crate) fn audit_installed_builds<'a>(
         trust.check_publisher_key(&key)?;
     }
     let mut audit = BuildAudit::default();
-    let history = BuildHistory {
+    let history = CatalogCheckpoint {
         catalog: hash,
         sequence: catalog.sequence,
         rotations: catalog.key_rotations.clone(),
     };
+    if let Some(previous) = previous {
+        previous.check(&history)?;
+    }
     for package in installed {
         let id = package.manifest.id();
         let installed_record = || {
@@ -993,6 +1018,7 @@ fn catalog_snapshot(
 pub(crate) struct CatalogIndex {
     pub entries: BTreeMap<String, String>,
     pub obsoletions: BTreeMap<String, Version>,
+    pub checkpoint: CatalogCheckpoint,
 }
 
 pub(crate) fn catalog_index(
@@ -1001,10 +1027,15 @@ pub(crate) fn catalog_index(
     key: &[u8],
     pin: Option<&CatalogPin>,
 ) -> Result<CatalogIndex> {
-    let (catalog, _) = read_selected_catalog(repo, publisher, key, pin)?;
+    let (catalog, hash) = read_selected_catalog(repo, publisher, key, pin)?;
     Ok(CatalogIndex {
         entries: catalog.entries,
         obsoletions: catalog.obsoletions,
+        checkpoint: CatalogCheckpoint {
+            catalog: hash,
+            sequence: catalog.sequence,
+            rotations: catalog.key_rotations,
+        },
     })
 }
 
@@ -1027,10 +1058,18 @@ pub(crate) fn release_profile(
     key: &[u8],
     pin: Option<&str>,
     name: &str,
-) -> Result<(String, ReleaseProfile)> {
+) -> Result<(CatalogCheckpoint, ReleaseProfile)> {
     let hash = pin.map_or_else(|| read_current(repo), |hash| Ok(hash.to_owned()))?;
-    let profile = take_profile(read_catalog(repo, &hash, publisher, key)?, &hash, name)?;
-    Ok((hash, profile))
+    let mut catalog = read_catalog(repo, &hash, publisher, key)?;
+    let profile = take_profile(&mut catalog, &hash, name)?;
+    Ok((
+        CatalogCheckpoint {
+            catalog: hash,
+            sequence: catalog.sequence,
+            rotations: catalog.key_rotations,
+        },
+        profile,
+    ))
 }
 
 pub(crate) fn archived_release_profile(
@@ -1045,13 +1084,13 @@ pub(crate) fn archived_release_profile(
         "archived profile catalog digest mismatch"
     );
     take_profile(
-        decode_catalog(bytes, hash, publisher, keys::Trust::Anchor(key))?,
+        &mut decode_catalog(bytes, hash, publisher, keys::Trust::Anchor(key))?,
         hash,
         name,
     )
 }
 
-fn take_profile(mut catalog: Catalog, hash: &str, name: &str) -> Result<ReleaseProfile> {
+fn take_profile(catalog: &mut Catalog, hash: &str, name: &str) -> Result<ReleaseProfile> {
     catalog.release_profiles.remove(name).with_context(|| {
         format!(
             "catalog {hash} for {} has no signed release profile {name}",

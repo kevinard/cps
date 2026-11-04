@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use crate::{
-    image::{Image, Installed, Publisher, Publishers},
+    image::{Image, Installed, Publisher, Publishers, Settings},
     kdl_format::manifest_text,
     model::{PackageSpec, Version, validate_digest},
     repo::{CatalogPin, catalog_index, read_package},
@@ -54,10 +54,12 @@ struct CatalogEntry {
 }
 
 fn available(
+    settings: &Settings,
     publisher: &Publisher,
     pin: Option<&CatalogPin>,
 ) -> Result<(Vec<CatalogEntry>, BTreeMap<String, Version>)> {
     let index = catalog_index(&publisher.repo, &publisher.name, &publisher.key, pin)?;
+    settings.check_catalog(&publisher.name, &index.checkpoint)?;
     let mut entries = Vec::new();
     for (id, sha256) in index.entries {
         let selector =
@@ -114,15 +116,12 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
             .collect());
     }
     let settings = image.settings()?;
-    let pins = publishers.release_pins(
-        &settings.arch,
-        &settings.facets,
-        settings.bootstrap_catalog.as_deref(),
-    )?;
+    let pins = publishers.release_pins(&settings)?;
     let mut entries = Vec::new();
     let mut blocked = BTreeSet::new();
     for publisher in publishers.as_slice() {
-        let (mut catalog, obsoletions) = available(publisher, pins.get(&publisher.name))?;
+        let (mut catalog, obsoletions) =
+            available(&settings, publisher, pins.get(&publisher.name))?;
         if scope == Scope::Available {
             let from_source = |name: &str| {
                 installed
@@ -173,11 +172,7 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
     let accepts = |version| selector.version.is_none_or(|wanted| wanted == version);
     let package = if from_catalog {
         let settings = image.settings()?;
-        let pins = publishers.release_pins(
-            &settings.arch,
-            &settings.facets,
-            settings.bootstrap_catalog.as_deref(),
-        )?;
+        let pins = publishers.release_pins(&settings)?;
         let source = selector.publisher.or_else(|| {
             installed
                 .as_ref()
@@ -187,7 +182,8 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
             if source.is_some_and(|name| publisher.name != name) {
                 continue;
             }
-            let (entries, obsoletions) = available(publisher, pins.get(&publisher.name))?;
+            let (entries, obsoletions) =
+                available(&settings, publisher, pins.get(&publisher.name))?;
             let mut named = entries
                 .into_iter()
                 .filter(|entry| entry.name == selector.name)

@@ -35,6 +35,25 @@ struct Pending {
     files_ready: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum PendingRecord<P> {
+    Checkpointed { checkpointed: P },
+    Legacy(P),
+}
+
+impl Pending {
+    fn record(&self) -> PendingRecord<&Self> {
+        if self.next.settings.catalog_checkpoints.is_empty() {
+            PendingRecord::Legacy(self)
+        } else {
+            // Older clients must fail before resuming a transaction that
+            // would commit an image with checkpoints they cannot preserve.
+            PendingRecord::Checkpointed { checkpointed: self }
+        }
+    }
+}
+
 type PublisherPayloads<'a> = (&'a Publisher, BTreeMap<&'a str, &'a Node>);
 
 pub fn apply(path: &Path, plan: &Plan) -> Result<u64> {
@@ -108,7 +127,11 @@ pub(crate) fn apply_with(
         "plan targets a different image"
     );
     let stage = image.stage()?;
-    let (mut pending, offline) = if let Some(pending) = image.pending::<Pending>()? {
+    let (mut pending, offline) = if let Some(record) = image.pending::<PendingRecord<Pending>>()? {
+        let pending = match record {
+            PendingRecord::Checkpointed { checkpointed } => checkpointed,
+            PendingRecord::Legacy(pending) => pending,
+        };
         ensure!(
             pending.id == id,
             "a different plan is pending; rerun apply with that plan"
@@ -137,7 +160,7 @@ pub(crate) fn apply_with(
             kernel_install: checked.kernel_install,
             files_ready: false,
         };
-        image.record_pending(&pending, &pending.next, &receipts, repo_backed)?;
+        image.record_pending(&pending.record(), &pending.next, &receipts, repo_backed)?;
         (pending, offline)
     };
 
@@ -151,7 +174,7 @@ pub(crate) fn apply_with(
         )?;
         if offline.is_some() {
             pending.files_ready = true;
-            image.update_pending(&pending)?;
+            image.update_pending(&pending.record())?;
         }
     }
     if let Some(path) = offline {

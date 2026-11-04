@@ -198,8 +198,8 @@ repository, protected package repository, and runtime seed repository. Set
 `CPS_VM_CPS_FIXTURE` to that output directory for a systemd VM boot test. The
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
-directory to also use that executable to assemble the guest. Set
-`CPS_VM_CPS_VERSION=0.1.0-1` when reusing the earlier runtime fixture.
+directory to also use that executable to assemble the guest. Use a
+`0.1.0-3` or later guest fixture with a checkpoint-aware host CPS.
 
 ### Preparing a source cache
 
@@ -509,6 +509,20 @@ in that profile. Upgrade clients before consuming profiles with this
 requirement.
 
 ## Signed releases and mirrors
+
+Each committed repository-backed transaction records the selected catalog
+digest, sequence, and publisher key history in the image. Subsequent plans,
+saved-plan checks, and available-package queries reject a lower sequence, a
+different catalog at the same sequence, or a signing history that drops a
+known rotation. The check works with a replacement cache that lacks the
+previous catalog. An unsequenced legacy catalog starts providing sequence
+protection when the image first applies a sequenced catalog.
+
+Each boot environment keeps its own checkpoints. An older release can still
+be installed into a new image using its signed bootstrap catalog or booted
+from its existing environment. Upgrade CPS in the target image before its
+first checkpointed transaction. Older CPS versions reject the new image
+state and cannot resume checkpointed transactions.
 
 Group related package changes and withdrawals in a KDL release file. Use the
 reviewed catalog digest from `repo/current` as `base`, or `base="empty"` when

@@ -12,7 +12,7 @@ epoch=$(git -C "$project" show -s --format=%ct "$revision")
 registry=$(realpath -- "${CARGO_HOME:-$HOME/.cargo}/registry")
 runtime_sources=$(realpath -- "${CPS_RUNTIME_SOURCE_DIR:?Set CPS_RUNTIME_SOURCE_DIR to the directory containing the pinned SQLite and libseccomp archives}")
 arch=$(uname -m)
-cps_version=0.1.0-2
+cps_version=0.1.0-3
 sqlite_version=3.54.1-1
 seccomp_version=2.6.1-1
 runtime_version=1.0.0-1

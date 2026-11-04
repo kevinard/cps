@@ -1565,6 +1565,80 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
 }
 
 #[test]
+fn image_rejects_catalog_replay_and_retired_signer_forks_without_cache_history() -> Result<()> {
+    let f = Fixture::new()?;
+    let rotated_key = Fixture::new()?;
+    let current = f.repo.join("current");
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "first", "0755", "")?,
+    )?;
+    let first = fs::read_to_string(&current)?;
+    f.create()?;
+    let request = Request::Install {
+        packages: vec!["desktop/compositor".into()],
+    };
+    let mut stale_plan = plan(&f.root, request.clone())?;
+
+    f.package("test/fork", "1.0.0-0", String::new())?;
+    let equal_fork = fs::read_to_string(&current)?;
+    f.package("test/fork", "2.0.0-0", String::new())?;
+    let higher_fork = fs::read_to_string(&current)?;
+    fs::write(&current, &first)?;
+    let rotated = rotate_publisher_key(
+        &f.repo,
+        "canopa",
+        first.trim(),
+        &f.private,
+        &rotated_key.private,
+    )?;
+
+    let install = plan(&f.root, request.clone())?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("checkpointed-install.json"),
+        &install,
+        COMPOSITOR,
+    )?;
+    fs::write(&current, &first)?;
+    let revision = apply(&f.root, &install)?;
+    stale_plan.base_revision = revision;
+    let error = apply(&f.root, &stale_plan).unwrap_err();
+    assert!(format!("{error:#}").contains("publisher catalog rollback or fork"));
+
+    for (rejected, reason) in [
+        (&first, "publisher catalog rollback or fork"),
+        (&equal_fork, "publisher catalog rollback or fork"),
+        (
+            &higher_fork,
+            "release drops or changes the publisher key history",
+        ),
+    ] {
+        fs::write(&current, rejected)?;
+        let error = plan(&f.root, request.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        let error = list_packages(&f.root, Scope::Available).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        assert_eq!(list_packages(&f.root, Scope::Installed)?.len(), 1);
+    }
+
+    fs::write(&current, format!("{rotated}\n"))?;
+    let update = f.file(COMPOSITOR, "next", "0755", "")?;
+    fs::write(
+        &f.recipe,
+        format!(
+            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"2.0.0-0\" {{\n{update}}}\n"
+        ),
+    )?;
+    publish(&f.repo, &f.proto, &f.recipe, &rotated_key.private)?;
+    fs::remove_file(f.repo.join("catalogs").join(&rotated))?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "next");
+    Ok(())
+}
+
+#[test]
 fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Result<()> {
     let f = Fixture::new()?;
     let second_key = Fixture::new()?;

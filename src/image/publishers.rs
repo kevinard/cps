@@ -6,14 +6,14 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Image, Publisher, Publishers, State, builds};
+use super::{Image, Publisher, Publishers, Settings, State, builds};
 use crate::{
     attestation::BuildTrust,
     kdl_format::read_build_trust,
     model::validate_publisher,
     repo::{
-        BuildAudit, BuildReceipt, CatalogPin, Published, ReleaseProfile, audit_installed_builds,
-        catalog_index, release_profile,
+        BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
+        audit_installed_builds, catalog_index, release_profile,
     },
 };
 
@@ -36,13 +36,15 @@ impl SelectedProfile {
 }
 
 impl Publishers {
-    pub(crate) fn release_pins(
-        &self,
-        arch: &str,
-        facets: &BTreeMap<String, bool>,
-        primary_pin: Option<&str>,
-    ) -> Result<BTreeMap<String, CatalogPin>> {
-        let Some(selected) = self.select_profile(arch, facets, primary_pin)? else {
+    pub(crate) fn release_pins(&self, settings: &Settings) -> Result<BTreeMap<String, CatalogPin>> {
+        let primary = &self.as_slice()[0];
+        let Some(selected) = self.select_profile(
+            &settings.arch,
+            &settings.facets,
+            settings.bootstrap_catalog.as_deref(),
+            settings.catalog_checkpoints.get(&primary.name),
+        )?
+        else {
             return Ok(BTreeMap::new());
         };
         Ok(iter::once(selected.primary)
@@ -56,6 +58,7 @@ impl Publishers {
         arch: &str,
         facets: &BTreeMap<String, bool>,
         primary_pin: Option<&str>,
+        previous: Option<&CatalogCheckpoint>,
     ) -> Result<Option<SelectedProfile>> {
         let Some(name) = self.release_profile() else {
             return Ok(None);
@@ -64,13 +67,18 @@ impl Publishers {
             .as_slice()
             .split_first()
             .context("missing primary publisher")?;
-        let (hash, profile) = release_profile(
+        let (checkpoint, profile) = release_profile(
             &primary.repo,
             &primary.name,
             &primary.key,
             primary_pin,
             name,
         )?;
+        if let Some(previous) = previous {
+            previous.check(&checkpoint).with_context(|| {
+                format!("checking installed catalog checkpoint for {}", primary.name)
+            })?;
+        }
         profile.check_image(
             name,
             arch,
@@ -78,7 +86,7 @@ impl Publishers {
             companions.iter().map(|publisher| publisher.name.as_str()),
         )?;
         Ok(Some(SelectedProfile {
-            primary: CatalogPin::primary(primary.name.clone(), hash),
+            primary: CatalogPin::primary(primary.name.clone(), checkpoint.catalog),
             record: profile,
         }))
     }
@@ -118,7 +126,15 @@ pub fn add_publisher_with_build_trust(
     let mut publisher = Publisher::from_config(name, repo, key)?;
     if let Some(path) = policy {
         let trust = read_build_trust(path)?.load(&publisher.key)?;
-        audit_installed_builds(&publisher.repo, name, &publisher.key, None, &trust, [])?;
+        audit_installed_builds(
+            &publisher.repo,
+            name,
+            &publisher.key,
+            None,
+            None,
+            &trust,
+            [],
+        )?;
         publisher.build_trust = Some(trust);
     } else {
         catalog_index(&publisher.repo, name, &publisher.key, None)
@@ -213,16 +229,13 @@ fn audit(
     let (mut audit, missing) = audit_archived(image, state, publisher, &[trust])?;
     if check_current || !missing.is_empty() {
         let repository_audit = || {
-            let pins = state.publishers.release_pins(
-                &state.settings.arch,
-                &state.settings.facets,
-                state.settings.bootstrap_catalog.as_deref(),
-            )?;
+            let pins = state.publishers.release_pins(&state.settings)?;
             audit_installed_builds(
                 &publisher.repo,
                 &publisher.name,
                 &publisher.key,
                 pins.get(&publisher.name),
+                state.settings.catalog_checkpoints.get(&publisher.name),
                 trust,
                 missing.iter().copied(),
             )
@@ -337,7 +350,13 @@ fn editable_publishers(image: &Image) -> Result<Publishers> {
 
 fn save(image: &mut Image, publishers: Publishers, receipts: &[BuildReceipt]) -> Result<()> {
     let mut settings = image.settings()?;
-    settings.format = publishers.image_format(settings.bootstrap_catalog.is_some());
+    settings
+        .catalog_checkpoints
+        .retain(|name, _| publishers.get(name).is_some());
+    settings.format = publishers.image_format(
+        settings.bootstrap_catalog.is_some(),
+        !settings.catalog_checkpoints.is_empty(),
+    );
     settings.publisher_generation = settings
         .publisher_generation
         .checked_add(1)

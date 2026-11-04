@@ -903,7 +903,8 @@ fn builder_policy_changes_are_atomic_and_wait_for_transaction_recovery() -> Resu
     assert_eq!(after.id, before.id);
     assert_eq!(after.revision, before.revision);
     assert_eq!(after.boot_parent, before.boot_parent);
-    assert_ne!(after.format, before.format);
+    assert_eq!(after.format, before.format);
+    assert_eq!(after.catalog_checkpoints, before.catalog_checkpoints);
     let error = apply(&f.root, &saved).unwrap_err();
     assert!(
         error

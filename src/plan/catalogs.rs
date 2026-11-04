@@ -7,7 +7,7 @@ use crate::{
     attestation::BuildTrust,
     image::{Image, Installed, Publisher, State},
     model::{PackageSpec, Version},
-    repo::{BuildEvidence, BuildReceipt, Published, ReleaseProfile, snapshot},
+    repo::{BuildEvidence, BuildReceipt, CatalogCheckpoint, Published, ReleaseProfile, snapshot},
 };
 
 #[derive(Default)]
@@ -16,6 +16,7 @@ pub(super) struct Catalogs {
     pub pins: BTreeMap<String, String>,
     pub candidates: CandidateSet<Published>,
     pub profile: Option<ReleaseProfile>,
+    pub checkpoints: BTreeMap<String, CatalogCheckpoint>,
     builds: BTreeMap<String, SelectedBuilds>,
 }
 
@@ -313,6 +314,7 @@ pub(super) fn load(
             .bootstrap_catalog
             .as_deref()
             .or(saved_pin(&publishers[0].name)?),
+        state.settings.catalog_checkpoints.get(&publishers[0].name),
     )?;
     let mut catalogs = Catalogs::default();
     for publisher in publishers {
@@ -331,6 +333,12 @@ pub(super) fn load(
             snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
         }
         .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
+        state
+            .settings
+            .check_catalog(&publisher.name, &snapshot.builds.history)?;
+        catalogs
+            .checkpoints
+            .insert(publisher.name.clone(), snapshot.builds.history.clone());
         catalogs
             .candidates
             .add_obsoletions(&mut sources, &publisher.name, &snapshot.obsoletions);
