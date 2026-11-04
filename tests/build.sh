@@ -169,6 +169,7 @@ cat > manifest.kdl <<MANIFEST
 schema-version 1
 package "demo/hello" publisher="canopa" version="1.0.0-0" {
     file "hello" mode="0644" uid=$uid gid=$gid
+    hardlink "hello-alias" target="hello"
 }
 MANIFEST
 sha() { sha256sum "$1" | cut -d' ' -f1; }
@@ -468,6 +469,7 @@ test ! -e targets/builder-public.der
 "$cps" image-create --root image --repo release --publisher canopa --trust-key public.der
 "$cps" plan --root image --output install.json install demo/hello
 "$cps" apply --root image install.json
-"$cps" verify --root image
-test "$(cat image/hello)" = 'hello from pinned input 1700000000'
+"$cps" verify --root image --pristine
+test image/hello -ef image/hello-alias
+test "$(cat image/hello-alias)" = 'hello from pinned input 1700000000'
 echo "Verified isolated build, reproducibility, signed provenance, and package installation"
