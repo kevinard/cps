@@ -293,7 +293,7 @@ pub(crate) fn build(
                 _ => BTreeMap::new(),
             };
             catalogs = catalogs::load(&state, &requested, saved)?;
-            resolve::resolve(
+            let (installed, paths) = resolve::resolve(
                 &state.installed,
                 Candidates {
                     packages: &catalogs.candidates.packages,
@@ -304,7 +304,9 @@ pub(crate) fn build(
                 matches!(request, Request::ExactInstall { .. }),
                 solver,
                 |installed| effective_paths(&state.settings, installed),
-            )?
+            )?;
+            catalogs.verify_builds(&state, &installed)?;
+            (installed, paths)
         }
     };
     // Resolving a vendor proposal changes local configuration, so a staged

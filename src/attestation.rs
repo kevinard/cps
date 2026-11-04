@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, ensure};
 use base64::{
@@ -15,9 +18,10 @@ use crate::{
         manifest_text, parse_manifest,
     },
     model::{
-        FileDigest, Manifest, Version, digest, validate_digest, validate_name, validate_publisher,
+        Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name,
+        validate_publisher,
     },
-    repo::{MANIFEST_LIMIT, read_limited},
+    repo::{MANIFEST_LIMIT, read_key, read_limited},
 };
 
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
@@ -28,6 +32,112 @@ const PINNED_PREDICATE: &str = "urn:canopa:cps:build-provenance:v2";
 const PUBLISHED_PREDICATE: &str = "urn:canopa:cps:build-provenance:v3";
 const PUBLISHED_MANIFEST: &str = "published-manifest.kdl";
 const MEDIA_TYPE: &str = "application/vnd.in-toto+json";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuildTrust {
+    minimum_builders: usize,
+    keys: BTreeSet<[u8; 32]>,
+}
+
+impl BuildTrust {
+    pub fn load(minimum_builders: usize, paths: &[PathBuf]) -> Result<Self> {
+        ensure!(
+            paths.len() <= MAX_BUILDERS,
+            "at most {MAX_BUILDERS} builder keys are supported"
+        );
+        let mut keys = BTreeSet::new();
+        for path in paths {
+            let key = read_key(path)?
+                .try_into()
+                .expect("read_key checks the key length");
+            ensure!(keys.insert(key), "duplicate builder key {}", path.display());
+        }
+        let trust = Self {
+            minimum_builders,
+            keys,
+        };
+        trust.validate()?;
+        Ok(trust)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.keys.len() <= MAX_BUILDERS
+                && (1..=self.keys.len()).contains(&self.minimum_builders),
+            "build trust requires between one and {MAX_BUILDERS} keys and a threshold within that range"
+        );
+        Ok(())
+    }
+
+    pub fn check_publisher_key(&self, key: &[u8]) -> Result<()> {
+        ensure!(
+            !self.keys.iter().any(|builder| builder.as_slice() == key),
+            "builder and publisher must use distinct keys"
+        );
+        Ok(())
+    }
+
+    pub fn verify(&self, bytes: &[u8], manifest: &Manifest, published: FileDigest) -> Result<()> {
+        let (payload, signatures) = decode_envelope(bytes)?;
+        let message = pae(&payload);
+        let mut valid = 0;
+        for key in &self.keys {
+            let key = UnparsedPublicKey::new(&ED25519, key);
+            if signatures
+                .iter()
+                .any(|sig| key.verify(&message, sig).is_ok())
+            {
+                valid += 1;
+                if valid == self.minimum_builders {
+                    break;
+                }
+            }
+        }
+        ensure!(
+            valid >= self.minimum_builders,
+            "build attestation requires {} trusted builder signatures, found {valid}",
+            self.minimum_builders
+        );
+        let statement = parse_statement(&payload)?;
+        ensure!(
+            statement.predicate_type == PUBLISHED_PREDICATE,
+            "build trust requires version 3 build evidence"
+        );
+        ensure!(
+            statement.predicate.package == manifest.id() && statement.predicate.identical_runs == 2,
+            "build attestation does not match the package or the reproducibility requirement"
+        );
+        validate_digest(&statement.predicate.recipe_sha256)?;
+        let mut subjects = subjects(statement.subject)?;
+        ensure!(
+            subjects.remove(PUBLISHED_MANIFEST) == Some(published),
+            "build attestation does not cover the exact published manifest"
+        );
+        ensure!(
+            subjects.remove("manifest.kdl").is_some()
+                && subjects.len() == manifest.payload_paths().len(),
+            "build attestation does not cover the declared package outputs"
+        );
+        for action in &manifest.action {
+            if let Action::File {
+                path,
+                sha256: Some(hash),
+                size: Some(size),
+                ..
+            } = action
+            {
+                ensure!(
+                    subjects
+                        .get(&format!("proto/{path}"))
+                        .is_some_and(|file| { &file.sha256 == hash && file.size == *size }),
+                    "build attestation does not cover published payload {path}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -336,7 +446,7 @@ fn published_manifest_digest(
     Ok(file_digest(bytes.as_bytes()))
 }
 
-fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+fn decode_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
     let signed: Envelope = serde_json::from_slice(bytes)?;
     ensure!(
         signed.payload_type == MEDIA_TYPE,
@@ -347,16 +457,23 @@ fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>
         "too many attestation signatures"
     );
     let payload = decode(&signed.payload)?;
+    let signatures = signed
+        .signatures
+        .into_iter()
+        // An Ed25519 signature is 64 bytes, at most 88 bytes in base64.
+        .filter(|entry| entry.sig.len() <= 88)
+        .filter_map(|entry| decode(&entry.sig).ok())
+        .collect();
+    Ok((payload, signatures))
+}
+
+fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (payload, signatures) = decode_envelope(bytes)?;
     let message = pae(&payload);
     let key = UnparsedPublicKey::new(&ED25519, builder_key);
-    let signature = signed
-        .signatures
-        .iter()
-        .find_map(|entry| {
-            let signature = decode(&entry.sig).ok()?;
-            key.verify(&message, &signature).ok()?;
-            Some(signature)
-        })
+    let signature = signatures
+        .into_iter()
+        .find(|signature| key.verify(&message, signature).is_ok())
         .context("invalid builder attestation signature")?;
     Ok((payload, signature))
 }

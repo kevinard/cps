@@ -632,10 +632,10 @@ pub fn export_with_retained(
         previous.check_successor(&catalog, pin).with_context(|| {
             format!("checking retained catalog {pin} against current {current}")
         })?;
-        let release = catalog_snapshot(repo, previous, (*pin).to_owned())?;
+        let release = catalog_snapshot(repo, previous, (*pin).to_owned(), &key)?;
         export_catalog(&root, stage.path(), &release)?;
     }
-    let release = catalog_snapshot(repo, catalog, current.clone())?;
+    let release = catalog_snapshot(repo, catalog, current.clone(), &key)?;
     export_catalog(&root, stage.path(), &release)?;
     if !retained.is_empty() {
         let mut document = String::new();
@@ -688,7 +688,7 @@ fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> 
     for (hash, length) in release_blobs(&release.packages)? {
         export_object(root, output, "blobs", hash, length, Some(length))?;
     }
-    for hash in release.attestations.values() {
+    for hash in release.builds.attestations.values() {
         export_object(root, output, "attestations", hash, ATTESTATION_LIMIT, None)?;
     }
     Ok(())

@@ -18,10 +18,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use self::root::Root;
 use crate::{
+    attestation::BuildTrust,
     kdl_format::{PublisherConfig, read_image_definition},
     model::{FORMAT, Node, validate_name, validate_publisher},
     repo::{Published, canonical_repo, catalog_index, read_key},
 };
+
+// Earlier binaries must reject protected images instead of ignoring build trust.
+const BUILD_TRUST_IMAGE_FORMAT: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
@@ -69,6 +73,8 @@ pub struct Publisher {
     pub name: String,
     pub repo: PathBuf,
     pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) build_trust: Option<BuildTrust>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -121,6 +127,18 @@ impl Publishers {
             .find(|publisher| publisher.name == name)
     }
 
+    fn image_format(&self) -> u32 {
+        if self
+            .as_slice()
+            .iter()
+            .any(|publisher| publisher.build_trust.is_some())
+        {
+            BUILD_TRUST_IMAGE_FORMAT
+        } else {
+            FORMAT
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.as_slice().is_empty(),
@@ -132,6 +150,10 @@ impl Publishers {
         let mut names = BTreeSet::new();
         for publisher in self.as_slice() {
             validate_publisher(&publisher.name)?;
+            if let Some(trust) = &publisher.build_trust {
+                trust.validate()?;
+                trust.check_publisher_key(&publisher.key)?;
+            }
             ensure!(
                 names.insert(&publisher.name),
                 "duplicate publisher {}",
@@ -149,6 +171,7 @@ impl Publisher {
             name: name.to_owned(),
             repo: canonical_repo(repo)?,
             key: read_key(key)?,
+            build_trust: None,
         })
     }
 }
@@ -241,7 +264,16 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
                  name,
                  repository,
                  trust_key,
-             }| { Publisher::from_config(name, repository, trust_key) },
+                 build_trust,
+             }| {
+                let mut publisher = Publisher::from_config(name, repository, trust_key)?;
+                publisher.build_trust = build_trust
+                    .as_ref()
+                    .map(|config| config.load(&publisher.key))
+                    .transpose()
+                    .with_context(|| format!("loading build trust for {name}"))?;
+                Ok(publisher)
+            },
         )
         .collect::<Result<Vec<_>>>()?;
     let publishers = Publishers::new(publishers, config.release_profile)?;
@@ -267,7 +299,7 @@ fn initialize(
     }
     let id = new_identity()?;
     let settings = Settings {
-        format: FORMAT,
+        format: publishers.image_format(),
         id: id.clone(),
         revision: 0,
         publisher_generation: 0,
@@ -398,14 +430,23 @@ impl Image {
 
     pub(crate) fn settings(&self) -> Result<Settings> {
         let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
-        ensure!(settings.format == FORMAT, "unsupported image format");
+        ensure!(
+            matches!(settings.format, FORMAT | BUILD_TRUST_IMAGE_FORMAT),
+            "unsupported image format"
+        );
         Ok(settings)
     }
 
     pub fn state(&self) -> Result<State> {
+        let settings = self.settings()?;
+        let publishers = self.publishers()?;
+        ensure!(
+            settings.format == publishers.image_format(),
+            "image format does not match its build trust policy"
+        );
         Ok(State {
-            settings: self.settings()?,
-            publishers: self.publishers()?,
+            settings,
+            publishers,
             installed: self.installed()?,
             paths: decode_rows(&self.db, "SELECT path, data FROM paths")?,
         })

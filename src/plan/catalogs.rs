@@ -4,9 +4,9 @@ use anyhow::{Context, Result, ensure};
 
 use super::Plan;
 use crate::{
-    image::State,
+    image::{Installed, State},
     model::{PackageSpec, Version},
-    repo::{Published, snapshot},
+    repo::{BuildEvidence, Published, snapshot},
 };
 
 #[derive(Default)]
@@ -14,6 +14,36 @@ pub(super) struct Catalogs {
     pub legacy: Option<String>,
     pub pins: BTreeMap<String, String>,
     pub candidates: CandidateSet<Published>,
+    builds: BTreeMap<String, BuildEvidence>,
+}
+
+impl Catalogs {
+    pub(super) fn verify_builds(
+        &self,
+        state: &State,
+        installed: &BTreeMap<String, Installed>,
+    ) -> Result<()> {
+        for (name, package) in installed {
+            if state
+                .installed
+                .get(name)
+                .is_some_and(|previous| previous.published.sha256 == package.published.sha256)
+            {
+                continue;
+            }
+            let publisher = state
+                .publishers
+                .get(&package.published.manifest.publisher)
+                .context("missing publisher for selected package")?;
+            if let Some(trust) = &publisher.build_trust {
+                self.builds
+                    .get(&publisher.name)
+                    .context("missing build evidence from selected catalog")?
+                    .verify(&publisher.repo, trust, &package.published)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct CandidateSet<P> {
@@ -175,6 +205,11 @@ pub(super) fn load(
         catalogs
             .candidates
             .add_packages(&mut sources, &publisher.name, snapshot.packages);
+        if publisher.build_trust.is_some() {
+            catalogs
+                .builds
+                .insert(publisher.name.clone(), snapshot.builds);
+        }
     }
     Ok(catalogs)
 }

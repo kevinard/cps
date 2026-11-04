@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
 use crate::{
+    attestation::BuildTrust,
     boot::kernel::Kernel,
     model::{
         Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_name, validate_publisher,
@@ -455,8 +456,8 @@ pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
         release_profile,
     } = read_image_definition(path)?;
     ensure!(
-        publishers.len() == 1 && release_profile.is_none(),
-        "use create_configured_image for multiple publishers or a release profile"
+        publishers.len() == 1 && release_profile.is_none() && publishers[0].build_trust.is_none(),
+        "use create_configured_image for multiple publishers, a release profile, or build trust"
     );
     let publisher = publishers.pop().expect("one publisher");
     Ok(ImageConfig {
@@ -472,6 +473,41 @@ pub(crate) struct PublisherConfig {
     pub name: String,
     pub repository: PathBuf,
     pub trust_key: PathBuf,
+    pub build_trust: Option<BuildTrustConfig>,
+}
+
+pub(crate) struct BuildTrustConfig {
+    minimum_builders: usize,
+    keys: Vec<PathBuf>,
+}
+
+impl BuildTrustConfig {
+    pub(crate) fn load(&self, publisher_key: &[u8]) -> Result<BuildTrust> {
+        let trust = BuildTrust::load(self.minimum_builders, &self.keys)?;
+        trust.check_publisher_key(publisher_key)?;
+        Ok(trust)
+    }
+}
+
+fn build_trust_config(node: &KdlNode, parent: &Path) -> Result<BuildTrustConfig> {
+    let fields = Fields::read(node, 0, &["minimum-builders"], true)?;
+    let keys = node
+        .children()
+        .context("build-trust requires a builder-key block")?
+        .nodes()
+        .iter()
+        .map(|entry| {
+            ensure!(
+                entry.name().value() == "builder-key",
+                "expected builder-key in build-trust"
+            );
+            Ok(parent.join(Fields::read(entry, 1, &[], false)?.string_arg(0)?))
+        })
+        .collect::<Result<_>>()?;
+    Ok(BuildTrustConfig {
+        minimum_builders: fields.integer("minimum-builders")?.unwrap_or(1),
+        keys,
+    })
 }
 
 fn publisher_config(node: &KdlNode, name: String, parent: &Path) -> Result<PublisherConfig> {
@@ -481,14 +517,21 @@ fn publisher_config(node: &KdlNode, name: String, parent: &Path) -> Result<Publi
         .context("publisher requires a configuration block")?;
     let repo = Fields::read(one(children, "repository")?, 1, &[], false)?.string_arg(0)?;
     let key = Fields::read(one(children, "trust-key")?, 1, &[], false)?.string_arg(0)?;
+    let build_trust = children
+        .nodes()
+        .iter()
+        .find(|entry| entry.name().value() == "build-trust")
+        .map(|node| build_trust_config(node, parent))
+        .transpose()?;
     ensure!(
-        children.nodes().len() == 2,
-        "expected repository and trust-key under publisher"
+        children.nodes().len() == 2 + usize::from(build_trust.is_some()),
+        "expected repository, trust-key, and optional build-trust under publisher"
     );
     Ok(PublisherConfig {
         name,
         repository: parent.join(repo),
         trust_key: parent.join(key),
+        build_trust,
     })
 }
 

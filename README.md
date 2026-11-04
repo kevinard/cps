@@ -281,7 +281,40 @@ cps publish-bundle --repo repo --signing-key private.der --builder-key worker-a-
     --witness worker-b-public.der=worker-b-build/attestation.json worker-a-build
 ```
 
-CPS counts distinct authorized keys whose signatures cover the same build statement, including the exact payload hashes and pinned inputs. The release stores those signatures together in the DSSE envelope. The threshold applies at publication. Administrators establish worker independence by assigning keys to separately operated workers.
+CPS counts distinct authorized keys whose signatures cover the same build statement, including the exact payload hashes and pinned inputs. The release stores those signatures together in the DSSE envelope. Administrators establish worker independence by assigning keys to separately operated workers.
+
+### Verifying builds on images and workers
+
+Add `build-trust` inside a `publisher` block in the image or toolchain
+configuration to require builder signatures independently of publication
+policy. Provision the worker keys separately from the repository.
+
+```kdl
+schema-version 1
+publisher "canopa" {
+    repository "/var/lib/cps/canopa"
+    trust-key "/etc/cps/keys/canopa.der"
+    build-trust minimum-builders=2 {
+        builder-key "/etc/cps/keys/worker-a.der"
+        builder-key "/etc/cps/keys/worker-b.der"
+    }
+}
+```
+
+The threshold defaults to one. CPS verifies evidence from the pinned catalog
+for each package entering or changing in an image. It repeats the check when
+applying a saved plan. With `--toolchain-config`, CPS checks selected inputs
+before materializing the toolchain. The signatures must be from distinct
+configured builders, separate from the publisher's current and retired keys.
+The evidence must be version 3 and cover the exact published manifest and
+payload digests. Cached evidence works offline.
+
+Use `image-create --config` to provision this policy on a new image. CPS
+stores the public keys in the image state. Older CPS binaries cannot apply
+plans to an image with build trust. Existing version 1 and 2 bundles remain
+publishable, and guarded consumers require packages built with version 3.
+
+### Checking release composition
 
 Add a `profile` inside the policy's `publisher` block to require a representative
 image composition before changing the catalog.

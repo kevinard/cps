@@ -295,6 +295,15 @@ if "$cps" build --toolchain-config wrong-key.kdl --source-cache cache \
 fi
 grep -F 'toolchain key digest mismatch for tools' rejected-multi.log
 test ! -e rejected-multi
+sed '/trust-key "other-public.der"/a\    build-trust { builder-key "builder-public.der"; }' \
+    toolchain.kdl > protected-toolchain.kdl
+if "$cps" build --toolchain-config protected-toolchain.kdl --source-cache cache \
+    --output rejected-multi multi-build.kdl > rejected-multi.log 2>&1; then
+    echo 'Accepted a toolchain package without required build evidence' >&2
+    exit 1
+fi
+grep -F 'no build attestation for cps://tools/build/probe@1.0.0-0' rejected-multi.log
+test ! -e rejected-multi
 
 cat > limits.kdl <<'KDL'
 schema-version 1
@@ -439,7 +448,7 @@ expect_failure() {
         echo "unexpected success: $*" >&2
         exit 1
     fi
-    grep -F "$expected" rejected.log
+    grep -F "$expected" rejected.log || { cat rejected.log >&2; return 1; }
 }
 write_policy "$reviewed"
 expect_failure 'publish policy requires an attested build bundle' "$cps" publish \
@@ -548,6 +557,88 @@ PYTHON
 test -f "targets/attestations-$(sha first/attestation.json)"
 test ! -e targets/publish-policy.kdl
 test ! -e targets/builder-public.der
+protected_image() {
+    local repo=$1 root=$2
+    cat > protected-image.kdl <<CONFIG
+schema-version 1
+publisher "canopa" {
+    repository "$repo"
+    trust-key "public.der"
+    build-trust minimum-builders=2 {
+        builder-key "builder-public.der"
+        builder-key "other-public.der"
+    }
+}
+CONFIG
+    "$cps" image-create --root "$root" --config protected-image.kdl
+}
+protected_image release single-signer-image
+expect_failure 'requires 2 trusted builder signatures, found 1' \
+    "$cps" plan --root single-signer-image --output rejected.json install demo/hello
+
+# Even a publisher with the signing key cannot change what the builders approved.
+python3 - <<'PYTHON'
+import hashlib
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+package = 'cps://canopa/demo/hello@1.0.0-0'
+
+def encode(value):
+    return json.dumps(value, separators=(',', ':')).encode()
+
+def store(directory, body):
+    digest = hashlib.sha256(body).hexdigest()
+    (directory / digest).write_bytes(body)
+    return digest
+
+def rewritten_repo(name, rewrite):
+    repo = Path(name)
+    shutil.copytree('witnessed', repo)
+    current = (repo / 'current').read_text().strip()
+    catalog = json.loads((repo / 'catalogs' / current).read_bytes())['catalog']
+    rewrite(repo, catalog)
+    Path('catalog-to-sign').write_bytes(encode(catalog))
+    signature = subprocess.check_output([
+        'openssl', 'pkeyutl', '-sign', '-rawin', '-keyform', 'DER', '-inkey',
+        'signing.der', '-in', 'catalog-to-sign',
+    ])
+    updated = store(repo / 'catalogs', encode({'catalog': catalog, 'signature': signature.hex()}))
+    (repo / 'current').write_text(updated + '\n')
+
+def change_mode(repo, catalog):
+    original = (repo / 'manifests' / catalog['entries'][package]).read_bytes()
+    changed = original.replace(b'mode="0644"', b'mode="0755"')
+    assert changed != original
+    catalog['entries'][package] = store(repo / 'manifests', changed)
+
+def repeat_signature(repo, catalog):
+    evidence = json.loads((repo / 'attestations' / catalog['attestations'][package]).read_bytes())
+    evidence['signatures'][1]['sig'] = evidence['signatures'][0]['sig']
+    catalog['attestations'][package] = store(repo / 'attestations', encode(evidence))
+
+rewritten_repo('changed-mode', change_mode)
+rewritten_repo('repeated-signature', repeat_signature)
+PYTHON
+protected_image changed-mode changed-mode-image
+expect_failure 'build attestation does not cover the exact published manifest' \
+    "$cps" plan --root changed-mode-image --output rejected.json install demo/hello
+protected_image repeated-signature repeated-signature-image
+expect_failure 'requires 2 trusted builder signatures, found 1' \
+    "$cps" plan --root repeated-signature-image --output rejected.json install demo/hello
+
+protected_image witnessed guarded
+"$cps" plan --root guarded --output guarded.json install demo/hello
+evidence=$(find witnessed/attestations -maxdepth 1 -type f)
+mv -- "$evidence" saved-evidence
+expect_failure 'reading build attestation for cps://canopa/demo/hello@1.0.0-0' \
+    "$cps" apply --root guarded guarded.json
+test ! -e guarded/hello
+mv -- saved-evidence "$evidence"
+"$cps" apply --root guarded guarded.json
+"$cps" verify --root guarded --pristine
 "$cps" image-create --root image --repo witnessed --publisher canopa --trust-key public.der
 "$cps" plan --root image --output install.json install demo/hello
 "$cps" apply --root image install.json
@@ -659,4 +750,10 @@ test "$(cat witnessed/current)" = "$wave_catalog"
 test "$(cat image/hello-alias)" = 'hello 2'
 test "$(cat image/platform)" = 'platform'
 test image/hello -ef image/hello-alias
+"$cps" plan --root guarded --output guarded-wave.json update
+"$cps" boot-env stage --source guarded --root guarded-staged guarded-wave.json
+"$cps" verify --root guarded-staged --pristine
+test "$(cat guarded-staged/hello-alias)" = 'hello 2'
+test "$(cat guarded-staged/platform)" = 'platform'
+test "$(cat guarded/hello-alias)" = 'hello from pinned input 1700000000'
 echo "Verified isolated build, reproducibility, signed provenance, and package installation"

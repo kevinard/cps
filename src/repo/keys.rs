@@ -61,6 +61,10 @@ impl Rotation {
     pub(super) fn previous_key(&self) -> &PublicKey {
         &self.transition.previous
     }
+
+    pub(super) fn next_key(&self) -> &PublicKey {
+        &self.transition.next
+    }
 }
 
 pub(super) enum Trust<'a> {

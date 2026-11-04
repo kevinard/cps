@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
-    attestation::{ATTESTATION_LIMIT, MAX_BUILDERS, VerifiedBuild, verify_bundle},
+    attestation::{ATTESTATION_LIMIT, BuildTrust, MAX_BUILDERS, VerifiedBuild, verify_bundle},
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
@@ -297,9 +297,48 @@ fn load_manifest(repo: &Path, sha256: String) -> Result<Published> {
 pub struct Snapshot {
     pub sha256: String,
     pub packages: Vec<Published>,
-    attestations: BTreeMap<String, String>,
+    pub(crate) builds: BuildEvidence,
     withdrawals: BTreeMap<String, Withdrawal>,
     pub(crate) obsoletions: BTreeMap<String, Version>,
+}
+
+pub(crate) struct BuildEvidence {
+    attestations: BTreeMap<String, String>,
+    publisher_keys: Vec<[u8; 32]>,
+}
+
+impl BuildEvidence {
+    pub(crate) fn verify(
+        &self,
+        repo: &Path,
+        trust: &BuildTrust,
+        package: &Published,
+    ) -> Result<()> {
+        for key in &self.publisher_keys {
+            trust.check_publisher_key(key)?;
+        }
+        let id = package.manifest.id();
+        let hash = self
+            .attestations
+            .get(&id)
+            .with_context(|| format!("no build attestation for {id}"))?;
+        let document = package
+            .document
+            .as_ref()
+            .context("build trust requires a published KDL manifest")?;
+        let bytes = read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
+            .with_context(|| format!("reading build attestation for {id}"))?;
+        trust
+            .verify(
+                &bytes,
+                &package.manifest,
+                FileDigest {
+                    sha256: package.sha256.clone(),
+                    size: document.len() as u64,
+                },
+            )
+            .with_context(|| format!("verifying build evidence for {id}"))
+    }
 }
 
 impl Snapshot {
@@ -499,10 +538,20 @@ pub fn snapshot(
         None => read_current(repo)?,
     };
     let catalog = read_catalog(repo, &hash, publisher, key)?;
-    catalog_snapshot(repo, catalog, hash)
+    catalog_snapshot(repo, catalog, hash, key)
 }
 
-fn catalog_snapshot(repo: &Path, catalog: Catalog, hash: String) -> Result<Snapshot> {
+fn catalog_snapshot(repo: &Path, catalog: Catalog, hash: String, key: &[u8]) -> Result<Snapshot> {
+    let mut publisher_keys = vec![
+        key.try_into()
+            .context("invalid Ed25519 public key length")?,
+    ];
+    publisher_keys.extend(
+        catalog
+            .key_rotations
+            .iter()
+            .map(|rotation| *rotation.next_key()),
+    );
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {
         packages.push(read_package(repo, &catalog.publisher, &id, sha256)?);
@@ -510,7 +559,10 @@ fn catalog_snapshot(repo: &Path, catalog: Catalog, hash: String) -> Result<Snaps
     Ok(Snapshot {
         sha256: hash,
         packages,
-        attestations: catalog.attestations,
+        builds: BuildEvidence {
+            attestations: catalog.attestations,
+            publisher_keys,
+        },
         withdrawals: catalog.withdrawals,
         obsoletions: catalog.obsoletions,
     })

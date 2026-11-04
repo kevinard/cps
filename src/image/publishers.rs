@@ -141,6 +141,7 @@ fn editable_publishers(image: &Image) -> Result<Publishers> {
 fn save(image: &mut Image, publishers: Vec<Publisher>) -> Result<()> {
     let publishers = Publishers::new(publishers, None)?;
     let mut settings = image.settings()?;
+    settings.format = publishers.image_format();
     settings.publisher_generation = settings
         .publisher_generation
         .checked_add(1)

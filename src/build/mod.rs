@@ -18,7 +18,7 @@ use rustix::{
 use tempfile::TempDir;
 
 use crate::{
-    attestation::{self, LegacyToolchain, PinnedPackage, PinnedToolchain, Toolchain},
+    attestation::{self, BuildTrust, LegacyToolchain, PinnedPackage, PinnedToolchain, Toolchain},
     image::root::Root,
     kdl_format::{
         build::{BuildRecipe, PublisherPin, ToolchainPins, read, read_toolchain_config},
@@ -361,6 +361,7 @@ struct ToolchainRepository {
     pin: PublisherPin,
     repository: PathBuf,
     key: Vec<u8>,
+    build_trust: Option<BuildTrust>,
 }
 
 fn toolchain_repositories(
@@ -385,6 +386,7 @@ fn toolchain_repositories(
                 },
                 repository: repo.to_owned(),
                 key,
+                build_trust: None,
             }])
         }
         (ToolchainPins::Publishers(pins), ToolchainLocation::Config(config)) => {
@@ -405,10 +407,17 @@ fn toolchain_repositories(
                         "toolchain key digest mismatch for {}",
                         pin.name
                     );
+                    let build_trust = entry
+                        .build_trust
+                        .as_ref()
+                        .map(|config| config.load(&key))
+                        .transpose()
+                        .with_context(|| format!("loading build trust for {}", pin.name))?;
                     Ok(ToolchainRepository {
                         pin: pin.clone(),
                         repository: entry.repository,
                         key,
+                        build_trust,
                     })
                 })
                 .collect()
@@ -438,6 +447,7 @@ fn prepare_toolchain(
         .collect();
     let mut candidates = CandidateSet::default();
     let mut paths_by_publisher = BTreeMap::new();
+    let mut builds = BTreeMap::new();
     for source in &repositories {
         let pin = &source.pin;
         let release = snapshot(
@@ -450,6 +460,12 @@ fn prepare_toolchain(
         candidates.add_obsoletions(&mut sources, &pin.name, &release.obsoletions);
         candidates.add_packages(&mut sources, &pin.name, release.packages);
         paths_by_publisher.insert(pin.name.as_str(), source.repository.as_path());
+        if let Some(trust) = &source.build_trust {
+            builds.insert(
+                pin.name.as_str(),
+                (&source.repository, trust, release.builds),
+            );
+        }
     }
     let (installed, paths) = resolve_packages(
         &BTreeMap::new(),
@@ -475,6 +491,14 @@ fn prepare_toolchain(
         },
     )
     .context("resolving build toolchain")?;
+    for package in installed.values() {
+        let published = &package.published;
+        if let Some((repository, trust, evidence)) =
+            builds.get(published.manifest.publisher.as_str())
+        {
+            evidence.verify(repository, trust, published)?;
+        }
+    }
     for (name, managed) in &paths {
         let (top, _) = name.split_once('/').unwrap_or((name, ""));
         if MOUNTS.contains(&top) {
