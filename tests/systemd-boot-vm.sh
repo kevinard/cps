@@ -44,7 +44,7 @@ code=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE to x86-64 OVMF_CODE}
 vars=${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS to the matching OVMF_VARS template}
 qemu_data=${CPS_VM_QEMU_DATA:-}
 
-for command in "$qemu" mkfs.fat mcopy mdir mkfs.ext4 sfdisk openssl timeout; do
+for command in "$qemu" mkfs.fat mcopy mdir mke2fs e2fsck sfdisk openssl timeout; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
 if [[ -n $busybox_repo || -n $busybox_key ]]; then
@@ -60,6 +60,7 @@ if [[ -n $busybox_repo || -n $busybox_key ]]; then
 else
     test -r "$busybox" || { echo "Missing input: $busybox" >&2; exit 1; }
 fi
+if [[ $mode == health-fail ]]; then command -v debugfs >/dev/null; fi
 for file in "$cps" "$efi" "$kernel" "$code" "$vars"; do
     test -r "$file" || { echo "Missing input: $file" >&2; exit 1; }
 done
@@ -496,6 +497,8 @@ if $profiled; then
         base/usr/bin/cps publisher list --root base >/dev/null
 fi
 
+"$cps" boot-env export --root base --output base.ext4 --size-mib "$root_mib"
+base_payload=$(sha256sum base.ext4)
 base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_uuid" --options "$options")
 base_id=${base_id#Activated }
@@ -568,6 +571,12 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
         cmp "staged/usr/lib/modules/$trial_release/initrd" "${prepared%/*}/initrd"
     fi
     printf 'corrupt prepared kernel' > "$prepared"
+    if "$cps" boot-env export --root staged --output rejected.ext4 --size-mib "$root_mib" 2> rejected.log; then
+        echo "Export accepted a corrupted prepared kernel" >&2
+        exit 1
+    fi
+    grep -q 'kernel artifact digest mismatch' rejected.log
+    test ! -e rejected.ext4
     if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
         --options "$options" 2> rejected.log; then
         echo "Activation accepted a corrupted prepared kernel" >&2
@@ -577,6 +586,10 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     cp "$trial_kernel" "$prepared"
     diff -r esp-before esp
 fi
+
+"$cps" boot-env export --root staged --output staged.ext4 --size-mib "$root_mib"
+test "$(sha256sum base.ext4)" = "$base_payload"
+diff -r esp-before esp
 
 mv "esp/EFI/cps/$base_id/vmlinuz.efi" saved-kernel
 if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
@@ -631,8 +644,10 @@ if [[ $mode == rollback ]]; then
 fi
 
 if [[ $mode == health-fail ]]; then
-    # The guest still identifies this as the trial, but the manifest hash fails.
-    printf 'trial\n\n' > staged/etc/cps-vm-state
+    # Simulate corruption after deployment while keeping the trial's data and
+    # hard-link identity readable by the guest.
+    debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
+    debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
 fi
 
 # Pack the two separate roots and the EFI directory into a GPT disk.
@@ -640,10 +655,6 @@ fi
 truncate -s 96M esp.fat
 mkfs.fat -F 32 esp.fat >/dev/null
 mcopy -s -i esp.fat esp/EFI esp/loader ::/
-for tree in base staged; do
-    truncate -s "${root_mib}M" "$tree.ext4"
-    mkfs.ext4 -q -F -d "$tree" "$tree.ext4"
-done
 base_mib=97
 trial_mib=$((base_mib + root_mib))
 truncate -s "$((trial_mib + root_mib + 1))M" disk.raw

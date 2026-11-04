@@ -624,16 +624,36 @@ Run `cargo build` followed by [`tests/systemd-actions.sh`](tests/systemd-actions
 Boot environments use separate Linux roots and a dedicated systemd-boot EFI System Partition (ESP). Start with an inactive, single-filesystem base root containing the kernel. GNU `cp` clones the image and uses a reflink where supported. The destination must be a new directory.
 
 ```sh
+cps boot-env export --root base --output base.ext4 --size-mib 2048
+# Place base.ext4 in the inactive partition identified by $base_partuuid.
 cps boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_partuuid" --initrd boot/initramfs.img
 cps plan --root base --output upgrade.json update
 cps boot-env stage --source base --root staged upgrade.json
-# Deploy the staged directory to its own GPT root partition before activation.
+cps boot-env export --root staged --output staged.ext4 --size-mib 2048
+# Place staged.ext4 in the inactive partition identified by $staged_partuuid.
 cps boot-env activate --root staged --esp esp \
     --root-partuuid "$staged_partuuid" --initrd boot/initramfs.img
 ```
 
-`stage` verifies the new root and gives it a fresh image identity. Activation copies boot files from the selected root and publishes its Boot Loader Specification entry last. Supply the **partition UUID** of each deployed root and the root-relative boot file paths. The kernel path defaults to `boot/vmlinuz`. Omit `--initrd` for a kernel that can mount the root on its own. Use `--options` for additional kernel arguments. Provisioning the partitions and installing systemd-boot on the dedicated ESP are external to these commands.
+`stage` verifies the new root and gives it a fresh image identity. Export
+checks the root and its prepared kernel, then writes a new regular file.
+Keep the source inactive and stable during export. CPS rejects nested
+mounts and special files. The export includes local state and CPS metadata
+alongside the package files. It uses `mke2fs` directory import to preserve
+ownership, modes, links, and extended attributes. It runs `e2fsck` read-only
+before publishing the image and refuses to replace an existing path. Use
+e2fsprogs with support for `root_perms`. Filesystem timestamps and formatter
+defaults affect the image bytes. [mke2fs manual](https://man7.org/linux/man-pages/man8/mke2fs.8.html)
+
+Deploy each payload to its own inactive partition before activating that
+root. The ext4 filesystem UUID identifies the CPS image. Supply the
+separate **GPT partition UUID** to `activate`. Activation copies boot files
+from the selected root and publishes its Boot Loader Specification entry
+last. The kernel path defaults to `boot/vmlinuz`. Omit `--initrd` for a kernel
+that can mount the root on its own. Use `--options` for additional kernel
+arguments. Provisioning the GPT partitions, placing the exported bytes, and
+installing systemd-boot on the dedicated ESP are external steps.
 
 `--known-good` bootstraps the first entry. Later activations require the previous environment's known-good entry and boot files. A trial gets two attempts by default. Install [the `system/cps` package](packaging/cps.kdl) in the base image to make its health check part of `boot-complete.target`. The package ships the CPS binary, [the health unit](packaging/systemd/cps-boot-health.service), and the required dependency link. The unit runs `cps verify --root /` after `multi-user.target`. Systemd blesses the entry when boot completion succeeds, removing the boot counter. If the attempts run out, systemd-boot selects the previous environment. The managed ESP uses its own loader configuration and assumes no EFI default override. [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
 
@@ -665,9 +685,24 @@ The list marks the default configured on the ESP and shows each registered root'
 
 ### VM boot tests
 
-The [VM test](tests/systemd-boot-vm.sh) builds a GPT disk with two separate ext4 roots and a FAT ESP, then boots it through OVMF and systemd-boot under QEMU. The `fallback` scenario checks that staging leaves the ESP alone and that the previous root boots after two failed attempts. The `bless` scenario runs systemd as PID 1, installs the health gate through the CPS package, and checks that systemd removes the counter and boots the blessed root again. The `health-fail` scenario corrupts a managed file and checks that the health gate blocks blessing through both attempts. The `kernel-upgrade` scenario checks the kernel and initrd on the ESP and reports `uname -r` from both roots.
+The [VM test](tests/systemd-boot-vm.sh) assembles a GPT disk from two CPS
+exports and a FAT ESP, then boots it through OVMF and systemd-boot under QEMU.
+The `fallback` scenario checks that staging leaves the ESP alone and that the
+previous root boots after two failed attempts. The `bless` scenario runs
+systemd as PID 1, installs the health gate through the CPS package, and checks
+that systemd removes the counter and boots the blessed root again. The
+`health-fail` scenario corrupts a managed file in the exported partition and
+checks that the health gate blocks blessing through both attempts. The
+`kernel-upgrade` scenario checks the kernel and initrd on the ESP and reports
+`uname -r` from both roots.
 
-Build with `cargo build`. The test needs `qemu-system-x86_64`, `mkfs.fat`, mtools, `mkfs.ext4`, `sfdisk`, OpenSSL, systemd-boot, and matching non-Secure-Boot x86-64 OVMF code and variables files. Supply an EFI-stub Linux kernel with built-in virtio block, GPT, ext4, and serial console support, plus a compatible BusyBox with `sh`, `cat`, `reboot`, and `poweroff`.
+Build with `cargo build`. Run [the export test](tests/boot-export.sh) with
+e2fsprogs, OpenSSL, and `setfattr` to check the payload and failure cleanup.
+The VM test additionally needs `qemu-system-x86_64`, `mkfs.fat`, mtools,
+`sfdisk`, systemd-boot, and matching non-Secure-Boot x86-64 OVMF code and
+variables files. Supply an EFI-stub Linux kernel with built-in virtio block,
+GPT, ext4, and serial console support, plus a compatible BusyBox with `sh`,
+`cat`, `reboot`, and `poweroff`.
 
 ```sh
 CPS_VM_OVMF_CODE=/path/to/OVMF_CODE.fd \
