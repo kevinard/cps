@@ -3602,6 +3602,7 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
         "desktop/compositor",
         "1.0.0-0",
         f.file(COMPOSITOR, "program", "0755", "")?
+            + &f.file(MANPAGE, "documentation", "0644", "facet=\"doc.man\"")?
             + &dependency("require", "library/libdisplay", "1.0.0-0"),
     )?;
     f.package(
@@ -3653,7 +3654,7 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
         "canopa",
         &f.public,
         "x86_64",
-        BTreeMap::new(),
+        BTreeMap::from([("doc.man".into(), false)]),
     )?;
     crate::add_publisher(&f.root, "extras", &extra_cache, &extras.public)?;
     let install = plan(
@@ -3715,5 +3716,20 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
     apply(&f.root, &repair)?;
     assert_eq!(fs::read(f.root.join(LIBRARY))?, b"library");
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+
+    fs::rename(&offline, &mirror)?;
+    let enable = plan(
+        &f.root,
+        Request::ChangeFacet {
+            facets: BTreeMap::from([("doc.man".into(), None)]),
+        },
+    )?;
+    assert!(!f.root.join(MANPAGE).exists());
+    assert!(!blob(b"documentation").exists());
+    assert_eq!(fetch_plan(&f.root, &enable)?, 1);
+    fs::rename(&mirror, &offline)?;
+    apply(&f.root, &enable)?;
+    assert_eq!(fs::read(f.root.join(MANPAGE))?, b"documentation");
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
     Ok(())
 }
