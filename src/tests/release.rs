@@ -17,7 +17,7 @@ use crate::{
     kdl_format::{build, parse_manifest},
     list_withdrawals,
     model::FileDigest,
-    publish_bundle, read_attestation, release as mirror_release,
+    publish_bundle, publish_release, read_attestation, release as mirror_release,
     repo::{read_key, read_signing_key, snapshot},
     withdraw_package,
 };
@@ -120,6 +120,52 @@ fn sign_root(path: &Path, private: &Path, predecessor: Option<&Path>) -> Result<
         });
     }
     fs::write(path, serde_json::to_vec(&root)?)?;
+    Ok(())
+}
+
+#[test]
+fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("test/one", "1.0.0-0", String::new())?;
+    f.package("test/two", "1.0.0-0", String::new())?;
+    let pointer = f.repo.join("current");
+    let base = fs::read_to_string(&pointer)?;
+    let release = f._dir.path().join("release.kdl");
+    let write = |second: &str| {
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} {{\n    withdraw \"cps://canopa/test/one@1.0.0-0\"\n    withdraw {second:?}\n}}\n",
+                base.trim(),
+            ),
+        )
+    };
+    write("cps://canopa/test/missing@1.0.0-0")?;
+    let error = publish_release(&f.repo, &f.private, &release).unwrap_err();
+    assert!(error.to_string().contains("no published package"));
+    assert_eq!(fs::read_to_string(&pointer)?, base);
+    assert!(list_withdrawals(&f.repo, "canopa", &f.public)?.is_empty());
+
+    write("cps://canopa/test/one@1.0.0-0")?;
+    let error = publish_release(&f.repo, &f.private, &release).unwrap_err();
+    assert!(format!("{error:#}").contains("duplicate release action"));
+
+    write("cps://canopa/test/two@1.0.0-0")?;
+    let committed = publish_release(&f.repo, &f.private, &release)?;
+    assert_eq!(fs::read_to_string(&pointer)?.trim(), committed);
+    assert_eq!(list_withdrawals(&f.repo, "canopa", &f.public)?.len(), 2);
+    let key = read_key(&f.public)?;
+    assert!(snapshot(&f.repo, "canopa", &key, None)?.packages.is_empty());
+    assert_eq!(
+        snapshot(&f.repo, "canopa", &key, Some(base.trim()))?
+            .packages
+            .len(),
+        2
+    );
+
+    let error = publish_release(&f.repo, &f.private, &release).unwrap_err();
+    assert!(error.to_string().contains("release base is stale"));
+    assert_eq!(fs::read_to_string(&pointer)?.trim(), committed);
     Ok(())
 }
 

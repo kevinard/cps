@@ -13,8 +13,8 @@ use cps::{
     Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
     add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_plan,
     fetch_sources, generate_manifest, import_sources, list_boot_environments, list_publishers,
-    list_withdrawals, plan, prefer_publisher, publish, publish_witnessed_bundle, read_attestation,
-    read_worker_config, release, remove_publisher, rollback_boot_environment,
+    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
+    read_attestation, read_worker_config, release, remove_publisher, rollback_boot_environment,
     stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
@@ -253,6 +253,14 @@ fn parse_witness(value: &str) -> std::result::Result<BuildWitness, String> {
 
 #[derive(Subcommand)]
 enum RepoCommand {
+    /// Commit a set of reviewed build bundles and withdrawals as one signed catalog
+    PublishRelease {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        signing_key: PathBuf,
+        release: PathBuf,
+    },
     /// Print the signed build evidence for a full package ID
     Attestation {
         #[arg(long)]
@@ -515,6 +523,16 @@ fn run(command: Command) -> Result<ExitCode> {
             );
         }
         Command::Repo { command } => match command {
+            RepoCommand::PublishRelease {
+                repo,
+                signing_key,
+                release,
+            } => {
+                println!(
+                    "Published catalog {}",
+                    publish_release(&repo, &signing_key, &release)?
+                );
+            }
             RepoCommand::Attestation {
                 repo,
                 publisher,

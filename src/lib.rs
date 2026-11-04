@@ -33,8 +33,8 @@ pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{Plan, Request, plan};
 pub use repo::{
-    BuildWitness, list_withdrawals, publish, publish_bundle, publish_witnessed_bundle,
-    read_attestation, release, withdraw_package,
+    BuildWitness, list_withdrawals, publish, publish_bundle, publish_release,
+    publish_witnessed_bundle, read_attestation, release, withdraw_package,
 };
 pub use verify::{Finding, verify, verify_pristine};
 

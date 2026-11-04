@@ -470,10 +470,82 @@ PYTHON
 test -f "targets/attestations-$(sha first/attestation.json)"
 test ! -e targets/publish-policy.kdl
 test ! -e targets/builder-public.der
-"$cps" image-create --root image --repo release --publisher canopa --trust-key public.der
+"$cps" image-create --root image --repo witnessed --publisher canopa --trust-key public.der
 "$cps" plan --root image --output install.json install demo/hello
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine
 test image/hello -ef image/hello-alias
 test "$(cat image/hello-alias)" = 'hello from pinned input 1700000000'
+
+# Build the two packages in a coordinated upgrade on both workers.
+printf 'hello from pinned input\n' > sources/input
+cat > manifest.kdl <<MANIFEST
+schema-version 1
+package "demo/hello" publisher="canopa" version="2.0.0-0" {
+    require "library/platform" version="=1.0.0-0"
+    file "hello" mode="0644" uid=$uid gid=$gid
+    hardlink "hello-alias" target="hello"
+}
+MANIFEST
+recipe '    printf "hello 2\n" > "$DESTDIR/hello"' > hello2.kdl
+build_package --sources sources --builder-signing-key builder.der --check-reproducible --output hello2-a hello2.kdl
+build_package --sources sources --builder-signing-key other.der --check-reproducible --output hello2-b hello2.kdl
+
+cat > manifest.kdl <<MANIFEST
+schema-version 1
+package "library/platform" publisher="canopa" version="1.0.0-0" {
+    file "platform" mode="0644" uid=$uid gid=$gid
+}
+MANIFEST
+recipe '    printf "platform\n" > "$DESTDIR/platform"' > platform.kdl
+build_package --sources sources --builder-signing-key builder.der --check-reproducible --output platform-a platform.kdl
+build_package --sources sources --builder-signing-key other.der --check-reproducible --output platform-b platform.kdl
+
+hello2_reviewed=$(sha hello2.kdl)
+platform_reviewed=$(sha platform.kdl)
+cat > witnessed/publish-policy.kdl <<POLICY
+schema-version 1
+publisher "canopa" minimum-builders=2 {
+    builder-key "builder-public.der"
+    builder-key "other-public.der"
+    approve "demo/hello" version="2.0.0-0" sha256="$hello2_reviewed"
+    approve "library/platform" version="1.0.0-0" sha256="$platform_reviewed"
+}
+POLICY
+cat > wave.kdl <<WAVE
+schema-version 1
+release "canopa" base="$witnessed_catalog" {
+    withdraw "cps://canopa/demo/hello@1.0.0-0"
+    bundle "cps://canopa/demo/hello@2.0.0-0" path="hello2-a" builder-key="builder-public.der" recipe-sha256="$hello2_reviewed" {
+        witness "hello2-b/attestation.json" key="other-public.der"
+    }
+    bundle "cps://canopa/library/platform@1.0.0-0" path="platform-a" builder-key="builder-public.der" recipe-sha256="$platform_reviewed" {
+        witness "platform-b/attestation.json" key="other-public.der"
+    }
+}
+WAVE
+publish_wave() {
+    "$cps" repo publish-release --repo witnessed --signing-key signing.der "$1"
+}
+sed '/witness "platform-b\/attestation.json"/d' wave.kdl > incomplete.kdl
+expect_failure 'requires 2 distinct build signers' publish_wave incomplete.kdl
+test "$(cat witnessed/current)" = "$witnessed_catalog"
+test -z "$("$cps" repo withdrawals --repo witnessed --publisher canopa --trust-key public.der)"
+
+cp -a witnessed repeat
+publish_wave wave.kdl
+wave_catalog=$(cat witnessed/current)
+test "$wave_catalog" != "$witnessed_catalog"
+expect_failure 'release base is stale' publish_wave wave.kdl
+"$cps" repo publish-release --repo repeat --signing-key signing.der wave.kdl
+test "$(cat repeat/current)" = "$wave_catalog"
+test "$(find witnessed/catalogs -type f | wc -l)" -eq 2
+"$cps" repo withdrawals --repo witnessed --publisher canopa --trust-key public.der \
+    | grep -F 'cps://canopa/demo/hello@1.0.0-0'
+"$cps" plan --root image --output wave.json update
+"$cps" apply --root image wave.json
+"$cps" verify --root image --pristine
+test "$(cat image/hello-alias)" = 'hello 2'
+test "$(cat image/platform)" = 'platform'
+test image/hello -ef image/hello-alias
 echo "Verified isolated build, reproducibility, signed provenance, and package installation"

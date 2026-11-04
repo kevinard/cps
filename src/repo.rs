@@ -15,7 +15,7 @@ use tempfile::NamedTempFile;
 use crate::{
     attestation::{ATTESTATION_LIMIT, MAX_BUILDERS, VerifiedBuild, verify_bundle},
     image::root::Root,
-    kdl_format::{manifest_text, parse_manifest, publish_policy},
+    kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
         Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, digest, digest_reader,
         validate_digest,
@@ -27,6 +27,7 @@ const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const TMPFILES_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY_LIMIT: u64 = 1024 * 1024;
+const PUBLISH_RELEASE_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
 pub mod release;
@@ -48,6 +49,37 @@ struct Catalog {
 }
 
 impl Catalog {
+    fn empty(publisher: &str) -> Self {
+        Self {
+            format: FORMAT,
+            publisher: publisher.to_owned(),
+            entries: BTreeMap::new(),
+            attestations: BTreeMap::new(),
+            attestations_required: false,
+            withdrawals: BTreeMap::new(),
+            sequence: None,
+        }
+    }
+
+    fn withdraw(&mut self, id: &str) -> Result<bool> {
+        if self.withdrawals.contains_key(id) {
+            return Ok(false);
+        }
+        let manifest = self
+            .entries
+            .remove(id)
+            .with_context(|| format!("no published package {id}"))?;
+        let attestation = self.attestations.remove(id);
+        self.withdrawals.insert(
+            id.to_owned(),
+            Withdrawal {
+                manifest,
+                attestation,
+            },
+        );
+        Ok(true)
+    }
+
     fn check_successor(&self, next: &Self) -> Result<()> {
         if let Some(previous) = self.sequence {
             ensure!(
@@ -435,22 +467,10 @@ pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
         publisher,
         key.public_key().as_ref(),
     )?;
-    if catalog.withdrawals.contains_key(id) {
-        return Ok(());
+    if catalog.withdraw(id)? {
+        write_catalog(repo, catalog, &key)?;
     }
-    let manifest = catalog
-        .entries
-        .remove(id)
-        .with_context(|| format!("no published package {id}"))?;
-    let attestation = catalog.attestations.remove(id);
-    catalog.withdrawals.insert(
-        id.to_owned(),
-        Withdrawal {
-            manifest,
-            attestation,
-        },
-    );
-    write_catalog(repo, catalog, &key)
+    Ok(())
 }
 
 pub fn list_withdrawals(
@@ -490,22 +510,39 @@ pub fn publish_witnessed_bundle(
     reviewed_recipe: &str,
     witnesses: &[BuildWitness],
 ) -> Result<String> {
+    let key = read_signing_key(key)?;
+    let (proto, manifest, verified) = verify_publication(
+        bundle,
+        builder_key,
+        reviewed_recipe,
+        witnesses,
+        key.public_key().as_ref(),
+    )?;
+    publish_manifest(repo, proto, manifest, &key, Some(verified))
+}
+
+fn verify_publication(
+    bundle: &Path,
+    builder_key: &Path,
+    reviewed_recipe: &str,
+    witnesses: &[BuildWitness],
+    publisher_key: &[u8],
+) -> Result<(Root, Manifest, VerifiedBuild)> {
     ensure!(
         witnesses.len() < MAX_BUILDERS,
         "at most {MAX_BUILDERS} build signers are supported"
     );
     let bundle = Root::open(bundle)?;
-    let key = read_signing_key(key)?;
     let builder = read_key(builder_key)?;
     ensure!(
-        builder.as_slice() != key.public_key().as_ref(),
+        builder.as_slice() != publisher_key,
         "builder and publisher must use distinct keys"
     );
     let (manifest, mut verified) = verify_bundle(&bundle, &builder, reviewed_recipe)?;
     for witness in witnesses {
         let builder = read_key(&witness.key)?;
         ensure!(
-            builder.as_slice() != key.public_key().as_ref(),
+            builder.as_slice() != publisher_key,
             "builder and publisher must use distinct keys"
         );
         let file = File::from(open(
@@ -522,52 +559,150 @@ pub fn publish_witnessed_bundle(
             .add_witness(&envelope, &builder)
             .with_context(|| format!("verifying witness {}", witness.attestation.display()))?;
     }
-    publish_manifest(
-        repo,
-        bundle.subdir("proto")?,
-        manifest,
-        &key,
-        Some(verified),
-    )
+    Ok((bundle.subdir("proto")?, manifest, verified))
+}
+
+pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<String> {
+    let bytes = read_limited(File::open(document)?, PUBLISH_RELEASE_LIMIT)?;
+    let release = publish_release::parse(std::str::from_utf8(&bytes)?)
+        .with_context(|| format!("reading release {}", document.display()))?;
+    let parent = document.parent().unwrap_or_else(|| Path::new("."));
+    let key = read_signing_key(key)?;
+    let _lock = lock_repo(repo)?;
+    let current = publication_base(repo)?;
+    ensure!(
+        release.base == current,
+        "release base is stale: expected {}, current is {}",
+        release.base.as_deref().unwrap_or("empty"),
+        current.as_deref().unwrap_or("empty"),
+    );
+    let mut catalog = publication_catalog(repo, &release.publisher, &key, current.as_deref())?;
+    let policy = if release
+        .changes
+        .iter()
+        .any(|change| matches!(change, publish_release::Change::Bundle { .. }))
+    {
+        prepare_objects(repo)?;
+        read_publish_policy(repo, &catalog)?
+    } else {
+        None
+    };
+    let mut changed = false;
+    for change in release.changes {
+        match change {
+            publish_release::Change::Bundle {
+                id,
+                path,
+                builder_key,
+                recipe,
+                mut witnesses,
+            } => {
+                for witness in &mut witnesses {
+                    witness.key = parent.join(&witness.key);
+                    witness.attestation = parent.join(&witness.attestation);
+                }
+                let (proto, manifest, verified) = verify_publication(
+                    &parent.join(path),
+                    &parent.join(builder_key),
+                    &recipe,
+                    &witnesses,
+                    key.public_key().as_ref(),
+                )
+                .with_context(|| format!("verifying bundle for {id}"))?;
+                ensure!(
+                    manifest.id() == id,
+                    "bundle contains {} instead of {id}",
+                    manifest.id()
+                );
+                changed |= stage_manifest(
+                    repo,
+                    &mut catalog,
+                    proto,
+                    manifest,
+                    Some(verified),
+                    policy.as_ref(),
+                )
+                .with_context(|| format!("staging {id}"))?;
+            }
+            publish_release::Change::Withdraw(id) => changed |= catalog.withdraw(&id)?,
+        }
+    }
+    if changed {
+        write_catalog(repo, catalog, &key)
+    } else {
+        current.context("empty release has no published catalog")
+    }
+}
+
+fn publication_base(repo: &Path) -> Result<Option<String>> {
+    ensure!(
+        !path_present(&repo.join(".tuf"))?,
+        "cannot publish to a TUF-managed repository cache"
+    );
+    path_present(&repo.join("current"))?
+        .then(|| read_current(repo))
+        .transpose()
+}
+
+fn publication_catalog(
+    repo: &Path,
+    publisher: &str,
+    key: &Ed25519KeyPair,
+    current: Option<&str>,
+) -> Result<Catalog> {
+    match current {
+        Some(hash) => read_catalog(repo, hash, publisher, key.public_key().as_ref()),
+        None => Ok(Catalog::empty(publisher)),
+    }
 }
 
 fn publish_manifest(
     repo: &Path,
     proto: Root,
-    mut manifest: Manifest,
+    manifest: Manifest,
     key: &Ed25519KeyPair,
     evidence: Option<VerifiedBuild>,
 ) -> Result<String> {
     let _lock = lock_repo(repo)?;
+    let current = publication_base(repo)?;
+    let mut catalog = publication_catalog(repo, &manifest.publisher, key, current.as_deref())?;
+    let id = manifest.id();
+    let policy = read_publish_policy(repo, &catalog)?;
+    prepare_objects(repo)?;
+    if stage_manifest(
+        repo,
+        &mut catalog,
+        proto,
+        manifest,
+        evidence,
+        policy.as_ref(),
+    )? {
+        write_catalog(repo, catalog, key)?;
+    }
+    Ok(id)
+}
+
+fn stage_manifest(
+    repo: &Path,
+    catalog: &mut Catalog,
+    proto: Root,
+    mut manifest: Manifest,
+    evidence: Option<VerifiedBuild>,
+    policy: Option<&PublicationPolicy>,
+) -> Result<bool> {
     ensure!(
-        !path_present(&repo.join(".tuf"))?,
-        "cannot publish to a TUF-managed repository cache"
+        manifest.publisher == catalog.publisher,
+        "bundle belongs to a different publisher"
     );
-    let mut catalog = if path_present(&repo.join("current"))? {
-        read_catalog(
-            repo,
-            &read_current(repo)?,
-            &manifest.publisher,
-            key.public_key().as_ref(),
-        )?
-    } else {
-        Catalog {
-            format: FORMAT,
-            publisher: manifest.publisher.clone(),
-            entries: BTreeMap::new(),
-            attestations: BTreeMap::new(),
-            attestations_required: false,
-            withdrawals: BTreeMap::new(),
-            sequence: None,
-        }
-    };
     let id = manifest.id();
     ensure!(
         !catalog.withdrawals.contains_key(&id),
         "{id} was withdrawn and cannot be republished"
     );
-    enforce_publish_policy(repo, &mut catalog, &id, evidence.as_ref())?;
-    prepare_objects(repo)?;
+    if let Some(policy) = policy {
+        policy.verify(&id, evidence.as_ref())?;
+        catalog.attestations_required = true;
+    }
     let tmpfiles: std::collections::BTreeSet<_> = manifest
         .systemd
         .iter()
@@ -627,18 +762,17 @@ fn publish_manifest(
                 "{id} already has a different build attestation"
             );
             read_object(repo, "attestations", previous, ATTESTATION_LIMIT)?;
-            return Ok(id);
+            return Ok(false);
         }
         let hash = store(repo, "attestations", &envelope)?;
         catalog.attestations.insert(id.clone(), hash);
     } else if unchanged_manifest {
-        return Ok(id);
+        return Ok(false);
     }
-    write_catalog(repo, catalog, key)?;
-    Ok(id)
+    Ok(true)
 }
 
-fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<()> {
+fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
     let sequence = catalog
         .sequence
         .map_or(0, NonZeroU64::get)
@@ -655,21 +789,45 @@ fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Res
     );
     let hash = store(repo, "catalogs", &signed)?;
     File::open(repo)?.sync_all()?;
-    write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)
+    write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)?;
+    Ok(hash)
 }
 
-fn enforce_publish_policy(
-    repo: &Path,
-    catalog: &mut Catalog,
-    id: &str,
-    evidence: Option<&VerifiedBuild>,
-) -> Result<()> {
+struct PublicationPolicy {
+    approved: BTreeSet<String>,
+    recipes: BTreeMap<String, String>,
+    minimum_builders: usize,
+}
+
+impl PublicationPolicy {
+    fn verify(&self, id: &str, evidence: Option<&VerifiedBuild>) -> Result<()> {
+        let build = evidence.context("publish policy requires an attested build bundle")?;
+        ensure!(
+            self.recipes.get(id) == Some(&build.recipe_sha256),
+            "build recipe is not approved for {id}"
+        );
+        ensure!(
+            build
+                .builders()
+                .all(|builder| self.approved.contains(builder)),
+            "build signer is not authorized by publish policy"
+        );
+        ensure!(
+            build.builders().len() >= self.minimum_builders,
+            "publish policy requires {} distinct build signers",
+            self.minimum_builders
+        );
+        Ok(())
+    }
+}
+
+fn read_publish_policy(repo: &Path, catalog: &Catalog) -> Result<Option<PublicationPolicy>> {
     if !path_present(&repo.join(PUBLISH_POLICY))? {
         ensure!(
             !catalog.attestations_required,
             "protected repository is missing {PUBLISH_POLICY}"
         );
-        return Ok(());
+        return Ok(None);
     }
     ensure!(
         catalog.attestations_required || catalog.entries.is_empty(),
@@ -685,31 +843,20 @@ fn enforce_publish_policy(
         policy.publisher == catalog.publisher,
         "publish policy names a different publisher"
     );
-    let build = evidence.context("publish policy requires an attested build bundle")?;
-    ensure!(
-        policy.recipes.get(id) == Some(&build.recipe_sha256),
-        "build recipe is not approved for {id}"
-    );
     let mut approved = BTreeSet::new();
     for path in policy.builder_keys {
         let key = read_key(&repo.join(path))?;
         approved.insert(digest(&key));
     }
     ensure!(
-        build.builders().all(|builder| approved.contains(builder)),
-        "build signer is not authorized by publish policy"
-    );
-    ensure!(
         approved.len() >= policy.minimum_builders,
         "publish policy has fewer distinct builder keys than its threshold"
     );
-    ensure!(
-        build.builders().len() >= policy.minimum_builders,
-        "publish policy requires {} distinct build signers",
-        policy.minimum_builders
-    );
-    catalog.attestations_required = true;
-    Ok(())
+    Ok(Some(PublicationPolicy {
+        approved,
+        recipes: policy.recipes,
+        minimum_builders: policy.minimum_builders,
+    }))
 }
 
 fn store_blob(

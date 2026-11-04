@@ -183,7 +183,7 @@ publisher "canopa" {
 }
 ```
 
-Protected repositories accept packages through `publish-bundle` only. CPS checks the verified worker key and recipe digest against the policy, independently of the command-line arguments. The publisher signs the protection flag into the catalog, and later publication fails if the policy file is missing. Keep bootstrap packages in a separate toolchain repository. Export carries package attestations and leaves the publisher's local policy and key files on the publishing machine.
+Protected repositories accept packages through `publish-bundle` and `repo publish-release`. CPS checks the verified worker key and recipe digest against the policy, independently of the command-line arguments. The publisher signs the protection flag into the catalog, and later publication fails if the policy file is missing. Keep bootstrap packages in a separate toolchain repository. Export carries package attestations and leaves the publisher's local policy and key files on the publishing machine.
 
 For independent rebuilds, set `minimum-builders=2` on the policy's `publisher` node and provision a `builder-key` for each worker. Run the same pinned recipe on each worker and pass the additional signed statements with `--witness`. The publishing policy defaults to one worker key.
 
@@ -196,6 +196,30 @@ cps publish-bundle --repo repo --signing-key private.der --builder-key worker-a-
 CPS counts distinct authorized keys whose signatures cover the same build statement, including the exact payload hashes and pinned inputs. The release stores those signatures together in the DSSE envelope. The threshold applies at publication. Administrators establish worker independence by assigning keys to separately operated workers.
 
 ## Signed releases and mirrors
+
+Group related package changes and withdrawals in a KDL release file. Use the
+reviewed catalog digest from `repo/current` as `base`, or `base="empty"` when
+initializing a repository. Bundle, builder key, and witness paths are relative
+to the release file's directory.
+
+```kdl
+schema-version 1
+release "canopa" base="<reviewed catalog SHA-256>" {
+    bundle "cps://canopa/demo/hello@2.0.0-0" path="hello-build" builder-key="worker-a-public.der" recipe-sha256="<reviewed recipe SHA-256>" {
+        witness "worker-b-build/attestation.json" key="worker-b-public.der"
+    }
+    withdraw "cps://canopa/demo/hello@1.0.0-0"
+}
+```
+
+```sh
+cps repo publish-release --repo repo --signing-key private.der release.kdl
+```
+
+CPS checks the base under the repository lock and uses one policy snapshot for
+all bundles. Readers see a single new signed catalog after every action succeeds.
+If verification fails, the current catalog stays unchanged. Content-addressed
+objects may remain on disk. Historical catalogs remain available for pinned plans.
 
 `publish` assembles the local CPS repository using a publisher signing key. Export a snapshot to a new directory before signing it with [The Update Framework](https://theupdateframework.github.io/specification/latest/).
 
