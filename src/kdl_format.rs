@@ -247,6 +247,7 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             "arch",
             "facet",
             "preserve",
+            "original-name",
             "sha256",
             "size",
             "capabilities",
@@ -283,6 +284,7 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
                 .map(|value| value.as_bool().context("preserve must be #true or #false"))
                 .transpose()?
                 .unwrap_or(false),
+            original_name: fields.string("original-name")?,
             sha256: fields.string("sha256")?,
             size: fields.integer("size")?,
             capabilities: fields
@@ -367,6 +369,7 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 gid,
                 mode,
                 preserve,
+                original_name,
                 sha256,
                 size,
                 capabilities,
@@ -375,6 +378,9 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 node.insert("mode", mode.as_str());
                 if *preserve {
                     node.insert("preserve", true);
+                }
+                if let Some(original_name) = original_name {
+                    node.insert("original-name", original_name.as_str());
                 }
                 if let Some(sha256) = sha256 {
                     node.insert("sha256", sha256.as_str());

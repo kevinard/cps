@@ -72,6 +72,7 @@ pub(super) fn writes(
                         after: Some(after),
                         detach: false,
                         local_config: true,
+                        config_move: None,
                     },
                 );
             }
@@ -100,6 +101,7 @@ pub(super) fn writes(
                 after: Some(managed.node.clone()),
                 detach: false,
                 local_config: false,
+                config_move: None,
             },
         );
     }

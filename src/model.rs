@@ -275,6 +275,8 @@ pub enum Action {
         size: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<FileCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_name: Option<String>,
     },
     Dir {
         path: String,
@@ -398,6 +400,13 @@ impl Action {
         matches!(self, Self::File { preserve: true, .. })
     }
 
+    pub(crate) fn original_name(&self) -> Option<&str> {
+        match self {
+            Self::File { original_name, .. } => original_name.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn node(&self) -> Result<Node> {
         Ok(match self {
             Self::File {
@@ -457,9 +466,22 @@ impl Action {
                 size,
                 preserve,
                 capabilities,
+                original_name,
                 ..
             } => {
                 let mode = parse_mode(mode)?;
+                if let Some(original) = original_name {
+                    ensure!(*preserve, "original-name requires preserve=#true");
+                    let (package, path) = original.split_once(':').context(
+                        "original-name must be a package name followed by ':' and a path",
+                    )?;
+                    validate_name(package)?;
+                    validate_path(path)?;
+                    ensure!(
+                        path.split('/').next() != Some(".cps"),
+                        "reserved image path {path}"
+                    );
+                }
                 if let Some(capabilities) = capabilities {
                     capabilities.validate_declaration()?;
                     ensure!(

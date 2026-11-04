@@ -12,9 +12,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use rustix::{
     fs::{
-        AtFlags, CWD, FileType, Mode, OFlags, ResolveFlags, Stat, XattrFlags, chownat, fchmod,
-        fchown, fgetxattr, flistxattr, fremovexattr, fsetxattr, fstat, linkat, listxattr, mkdirat,
-        open, openat2, readlinkat, renameat, statat, symlinkat, unlinkat,
+        AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, ResolveFlags, Stat, XattrFlags, chownat,
+        fchmod, fchown, fgetxattr, flistxattr, fremovexattr, fsetxattr, fstat, linkat, listxattr,
+        mkdirat, open, openat2, readlinkat, renameat, renameat_with, statat, symlinkat, unlinkat,
     },
     io::Errno,
     process::{Gid, Uid},
@@ -29,7 +29,7 @@ pub struct Root(File);
 
 pub(crate) enum ReplacementSource<'a> {
     Staged(File),
-    LocalConfig(&'a Node),
+    LocalConfig { path: &'a str, before: &'a Node },
 }
 
 impl Root {
@@ -259,6 +259,7 @@ impl Root {
         node: &Node,
         payload: Option<ReplacementSource<'_>>,
         staging: &File,
+        require_absent: bool,
     ) -> Result<()> {
         validate_path(path)?;
         let (parent, leaf) = self.parent(path)?;
@@ -292,7 +293,7 @@ impl Root {
                     ReplacementSource::Staged(mut file) => {
                         std::io::copy(&mut file, &mut temp)?;
                     }
-                    ReplacementSource::LocalConfig(before) => {
+                    ReplacementSource::LocalConfig { path, before } => {
                         self.copy_local_config(path, before, node, &mut temp)?;
                     }
                 }
@@ -342,7 +343,12 @@ impl Root {
             }
             Node::Special => anyhow::bail!("cannot materialize special file {path}"),
         }
-        renameat(staging, TEMP, &parent, leaf)?;
+        if require_absent {
+            renameat_with(staging, TEMP, &parent, leaf, RenameFlags::NOREPLACE)
+                .with_context(|| format!("publishing new path {path}"))?;
+        } else {
+            renameat(staging, TEMP, &parent, leaf)?;
+        }
         parent.sync_all()?;
         staging.sync_all()?;
         Ok(())

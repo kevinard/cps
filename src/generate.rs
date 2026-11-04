@@ -109,6 +109,7 @@ pub fn generate_manifest(
                     sha256: None,
                     size: None,
                     capabilities,
+                    original_name: None,
                 }
             }
             FileType::Symlink => {

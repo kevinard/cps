@@ -12,14 +12,19 @@ use crate::{
 
 #[derive(Debug)]
 pub(super) struct PathConflict {
-    pub path: String,
+    message: String,
     pub owners: [String; 2],
 }
 
 impl PathConflict {
     fn new(path: &str, first: &str, second: &str) -> Self {
+        let message = if first == second {
+            format!("{first} selects incompatible actions at {path}")
+        } else {
+            format!("path conflict for {path} between {first} and {second}")
+        };
         Self {
-            path: path.to_owned(),
+            message,
             owners: [first.to_owned(), second.to_owned()],
         }
     }
@@ -27,16 +32,7 @@ impl PathConflict {
 
 impl fmt::Display for PathConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [first, second] = &self.owners;
-        if first == second {
-            write!(f, "{first} selects incompatible actions at {}", self.path)
-        } else {
-            write!(
-                f,
-                "path conflict for {} between {first} and {second}",
-                self.path
-            )
-        }
+        f.write_str(&self.message)
     }
 }
 
@@ -91,7 +87,9 @@ pub(crate) fn select_paths(
 ) -> Result<BTreeMap<String, Managed>> {
     let mut paths: BTreeMap<String, Managed> = BTreeMap::new();
     let mut sizes = BTreeMap::new();
+    let mut config_names = BTreeMap::new();
     for (name, package) in installed {
+        let publisher = &package.published.manifest.publisher;
         let mut selected = BTreeSet::new();
         for action in &package.published.manifest.action {
             let (facet, action_arch) = action.selectors();
@@ -103,6 +101,21 @@ pub(crate) fn select_paths(
             let path = action.path();
             if !selected.insert(path) {
                 return Err(PathConflict::new(path, name, name).into());
+            }
+            let original_name = action.original_name();
+            if action.preserve() {
+                let identity = config_name(name, path, original_name);
+                if let Some((owner, previous)) =
+                    config_names.insert((publisher, identity.clone()), (name, path))
+                {
+                    return Err(PathConflict {
+                        message: format!(
+                            "configuration identity {publisher}/{identity} is selected at both {previous} and {path}"
+                        ),
+                        owners: [owner.clone(), name.clone()],
+                    }
+                    .into());
+                }
             }
             let node = action.node()?;
             if let Node::File { sha256, size, .. } = &node {
@@ -119,6 +132,7 @@ pub(crate) fn select_paths(
                         owners: BTreeSet::from([name.clone()]),
                         preserve: action.preserve(),
                         implicit: false,
+                        original_name: original_name.map(str::to_owned),
                     });
                 }
                 Entry::Occupied(mut entry) => {
@@ -148,6 +162,7 @@ pub(crate) fn select_paths(
                     owners: BTreeSet::new(),
                     preserve: false,
                     implicit: true,
+                    original_name: None,
                 });
             }
         }
@@ -158,4 +173,8 @@ pub(crate) fn select_paths(
         .collect();
     paths.extend(parents);
     Ok(paths)
+}
+
+pub(super) fn config_name(package: &str, path: &str, original: Option<&str>) -> String {
+    original.map_or_else(|| format!("{package}:{path}"), str::to_owned)
 }

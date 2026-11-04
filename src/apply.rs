@@ -251,17 +251,10 @@ fn write_files(
         match &write.after {
             Some(node) => {
                 let payload = match node {
-                    Node::File { .. } if write.local_config => {
-                        Some(ReplacementSource::LocalConfig(
-                            write
-                                .before
-                                .as_ref()
-                                .context("missing local configuration")?,
-                        ))
-                    }
-                    Node::File { .. } => {
-                        Some(ReplacementSource::Staged(checked_payload(root, node)?))
-                    }
+                    Node::File { .. } => Some(match write.local_config_source() {
+                        Some((path, before)) => ReplacementSource::LocalConfig { path, before },
+                        None => ReplacementSource::Staged(checked_payload(root, node)?),
+                    }),
                     Node::Hardlink { .. } => Some(ReplacementSource::Staged(
                         link_source
                             .context("missing hard link target")?
@@ -269,7 +262,13 @@ fn write_files(
                     )),
                     _ => None,
                 };
-                root.replace(&write.path, node, payload, stage)?;
+                root.replace(
+                    &write.path,
+                    node,
+                    payload,
+                    stage,
+                    write.config_move.is_some(),
+                )?;
             }
             None => root.remove_file(&write.path)?,
         }

@@ -55,6 +55,15 @@ pub(crate) struct Write {
     pub(crate) detach: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) local_config: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) config_move: Option<ConfigMove>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConfigMove {
+    pub(crate) from: String,
+    pub(crate) local: Option<Node>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,6 +140,11 @@ impl Plan {
         }
         for path in &self.preserved {
             lines.push(format!("Preserve local config {path}"));
+        }
+        for write in &self.writes {
+            if let Some(migration) = &write.config_move {
+                lines.push(format!("Move config {} to {}", migration.from, write.path));
+            }
         }
         for write in self
             .writes
@@ -374,12 +388,27 @@ pub(crate) fn build(
         }
         _ => BTreeMap::new(),
     };
+    let moves = config::moves(&state, &installed, &paths)?;
+    let retired: BTreeSet<_> = moves.values().map(String::as_str).collect();
+    for (to, from) in &moves {
+        config::plan_move(
+            root,
+            &mut state.settings,
+            revision,
+            (from, &state.paths[from]),
+            (to, &paths[to]),
+            &mut writes,
+        )?;
+    }
     for path in state
         .paths
         .keys()
         .chain(paths.keys())
         .collect::<BTreeSet<_>>()
     {
+        if moves.contains_key(path) || retired.contains(path.as_str()) {
+            continue;
+        }
         let before = state.paths.get(path);
         let after = paths.get(path);
         if before == after {
@@ -433,15 +462,12 @@ pub(crate) fn build(
                     if target.node != old.node {
                         stage_config(
                             root,
-                            &state.settings,
+                            &mut state.settings,
                             revision,
                             path,
                             &target.node,
                             &mut writes,
                         )?;
-                        if let Some(updates) = &mut state.settings.config_updates {
-                            updates.insert(path.clone(), revision);
-                        }
                     }
                     if config::file_metadata(&old.node) != config::file_metadata(&target.node)
                         && let Some(after) = observed
@@ -509,6 +535,7 @@ pub(crate) fn build(
                 after: destination,
                 detach,
                 local_config,
+                config_move: None,
             },
         );
     }
@@ -532,6 +559,7 @@ pub(crate) fn build(
                     after: Some(managed.node.clone()),
                     detach: false,
                     local_config: false,
+                    config_move: None,
                 },
             );
         }
@@ -549,7 +577,8 @@ pub(crate) fn build(
         }
     }
     plan.writes = writes.into_values().collect();
-    plan.writes.sort_by(|a, b| a.order().cmp(&b.order()));
+    plan.writes
+        .sort_by(|a, b| a.order(&retired).cmp(&b.order(&retired)));
     plan.payload_bytes = payloads(&plan.writes)
         .values()
         .try_fold(0_u64, |total, node| {
@@ -590,7 +619,20 @@ impl Write {
     }
 
     pub(crate) fn needs_blob(&self) -> bool {
-        self.replaces_file() && !self.local_config
+        self.replaces_file() && self.local_config_source().is_none()
+    }
+
+    pub(crate) fn local_config_source(&self) -> Option<(&str, &Node)> {
+        if let Some(migration) = &self.config_move {
+            return migration
+                .local
+                .as_ref()
+                .map(|node| (migration.from.as_str(), node));
+        }
+        if self.local_config {
+            return self.before.as_ref().map(|node| (self.path.as_str(), node));
+        }
+        None
     }
 
     pub(crate) fn hardlink_target(&self) -> Option<&str> {
@@ -600,10 +642,13 @@ impl Write {
         }
     }
 
-    fn order(&self) -> (u8, usize, &str) {
+    fn order(&self, retired: &BTreeSet<&str>) -> (u8, usize, &str) {
         let depth = self.path.bytes().filter(|b| *b == b'/').count();
         if self.removes_directory() {
-            (3, usize::MAX - depth, "")
+            (4, usize::MAX - depth, "")
+        } else if retired.contains(self.path.as_str()) {
+            // Publish both the new path and its vendor proposal before retiring the old path.
+            (3, depth, "")
         } else if let Some(target) = self.hardlink_target() {
             (2, 0, target)
         } else if self.after.as_ref().is_some_and(Node::is_dir) {
@@ -628,12 +673,15 @@ pub(crate) fn config_update_prefix(revision: u64) -> String {
 
 fn stage_config(
     root: &Root,
-    settings: &Settings,
+    settings: &mut Settings,
     revision: u64,
     path: &str,
     node: &Node,
     writes: &mut BTreeMap<String, Write>,
 ) -> Result<()> {
+    if let Some(updates) = &mut settings.config_updates {
+        updates.insert(path.to_owned(), revision);
+    }
     let path = format!("{}{path}", config_update_prefix(revision));
     for (index, _) in path.match_indices('/').skip(1) {
         let parent = &path[..index];
@@ -652,6 +700,7 @@ fn stage_config(
                     after: Some(after),
                     detach: false,
                     local_config: false,
+                    config_move: None,
                 },
             );
         }
@@ -668,6 +717,7 @@ fn stage_config(
             after: Some(node.clone()),
             detach: false,
             local_config: false,
+            config_move: None,
         },
     );
     Ok(())

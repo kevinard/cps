@@ -1660,6 +1660,209 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
 }
 
 #[test]
+fn relocates_preserved_configuration_across_releases_and_resumes_offline() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::{list_config_updates, stage_boot_environment};
+
+    const OLD: [&str; 3] = [CONFIG, "etc/canopa/optional", "etc/canopa/pristine"];
+    const MIDDLE: [&str; 3] = ["etc/mid/main", "etc/mid/optional", "etc/mid/pristine"];
+    const NEW: [&str; 3] = [
+        "etc/new/settings/main",
+        "etc/new/settings/optional",
+        "etc/new/settings/pristine",
+    ];
+    let f = Fixture::new()?;
+    let package = |name, version, paths: &[&str], defaults, mode, moved| -> Result<()> {
+        let mut actions = String::new();
+        for (path, original) in paths.iter().zip(OLD) {
+            let properties = if moved {
+                format!(r#"preserve=#true original-name="desktop/settings:{original}""#)
+            } else {
+                "preserve=#true".to_owned()
+            };
+            actions += &f.file(path, defaults, mode, &properties)?;
+        }
+        f.package(name, version, actions)
+    };
+
+    package("desktop/settings", "1.0.0-0", &OLD, "v1", "0644", false)?;
+    f.create()?;
+    let initial = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/settings".into()],
+        },
+    )?;
+    apply(&f.root, &initial)?;
+    fs::write(f.root.join(OLD[0]), "administrator settings")?;
+    fs::remove_file(f.root.join(OLD[1]))?;
+    let flags = rustix::fs::XattrFlags::empty();
+    rustix::fs::setxattr(f.root.join(OLD[0]), "user.cps-test", b"annotation", flags)?;
+
+    package("desktop/settings", "2.0.0-0", &OLD, "v2", "0644", false)?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert_eq!(list_config_updates(&f.root)?.len(), 2);
+    package("desktop/settings", "3.0.0-0", &MIDDLE, "v3", "0644", true)?;
+    let intermediate = f._dir.path().join("intermediate");
+    stage_boot_environment(&f.root, &intermediate, &plan(&f.root, Request::Update)?)?;
+
+    package("desktop/preferences", "4.0.0-0", &NEW, "v4", "0600", true)?;
+    let request = Request::ExactInstall {
+        packages: vec!["desktop/preferences".into()],
+    };
+    let check_result = |root: &Path| -> Result<()> {
+        assert!(
+            OLD.iter()
+                .chain(&MIDDLE)
+                .all(|path| !root.join(path).exists())
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(NEW[0]))?,
+            "administrator settings"
+        );
+        assert_eq!(
+            fs::metadata(root.join(NEW[0]))?.permissions().mode() & 0o777,
+            0o600
+        );
+        let mut attribute = [0; 16];
+        let len = rustix::fs::getxattr(root.join(NEW[0]), "user.cps-test", &mut attribute[..])?;
+        assert_eq!(&attribute[..len], b"annotation");
+        assert!(!root.join(NEW[1]).exists());
+        assert_eq!(fs::read_to_string(root.join(NEW[2]))?, "v4");
+        let proposals = list_config_updates(root)?;
+        assert_eq!(
+            proposals
+                .iter()
+                .map(|update| update.path.as_str())
+                .collect::<Vec<_>>(),
+            NEW[..2]
+        );
+        for update in proposals {
+            assert!(update.vendor_available);
+            assert_eq!(fs::read_to_string(root.join(update.vendor_copy))?, "v4");
+        }
+        assert!(verify(root)?.iter().all(|finding| !finding.is_error));
+        Ok(())
+    };
+
+    let moved_twice = f._dir.path().join("moved-twice");
+    stage_boot_environment(
+        &intermediate,
+        &moved_twice,
+        &plan(&intermediate, request.clone())?,
+    )?;
+    check_result(&moved_twice)?;
+    assert_eq!(
+        fs::read_to_string(intermediate.join(MIDDLE[0]))?,
+        "administrator settings"
+    );
+
+    fs::create_dir_all(f.root.join(NEW[0]).parent().unwrap())?;
+    fs::write(f.root.join(NEW[0]), "unmanaged settings")?;
+    assert!(
+        plan(&f.root, request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("unmanaged path")
+    );
+    fs::remove_file(f.root.join(NEW[0]))?;
+    let direct = plan(&f.root, request)?;
+    assert!(
+        direct
+            .summary()
+            .contains(&format!("Move config {} to {}", OLD[0], NEW[0]))
+    );
+    let staged = f._dir.path().join("skipped-version");
+    stage_boot_environment(&f.root, &staged, &direct)?;
+    check_result(&staged)?;
+    assert_eq!(
+        fs::read_to_string(f.root.join(OLD[0]))?,
+        "administrator settings"
+    );
+    assert_eq!(fs::read_to_string(f.root.join(OLD[2]))?, "v2");
+    assert_eq!(list_config_updates(&f.root)?[0].path, OLD[0]);
+
+    interrupt_apply_at(&f.root, &f._dir.path().join("move.json"), &direct, NEW[0])?;
+    assert_eq!(
+        fs::read_to_string(f.root.join(OLD[0]))?,
+        "administrator settings"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join(NEW[0]))?,
+        "administrator settings"
+    );
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert_eq!(apply(&f.root, &direct)?, 3);
+    assert_eq!(apply(&f.root, &direct)?, 3);
+    check_result(&f.root)?;
+    Ok(())
+}
+
+#[test]
+fn configuration_move_identities_are_unique_within_a_publisher() -> Result<()> {
+    const OTHER: &str = "etc/replacement/preferences.conf";
+    const MOVE: &str =
+        "preserve=#true original-name=\"desktop/settings:etc/canopa/compositor.conf\"";
+    let primary = Fixture::new()?;
+    let extra = Fixture::new()?;
+    primary.package(
+        "desktop/settings",
+        "1.0.0-0",
+        primary.file(CONFIG, "original defaults", "0644", "preserve=#true")?,
+    )?;
+    let other = primary.file(OTHER, "alternate defaults", "0644", MOVE)?;
+    primary.package("desktop/alternate", "1.0.0-0", other)?;
+    extra.package_as(
+        "extras",
+        "desktop/replacement",
+        "1.0.0-0",
+        extra.file(OTHER, "foreign defaults", "0644", MOVE)?,
+    )?;
+    let config = primary._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            "schema-version 1\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
+             publisher \"extras\" {{\n    repository {:?}\n    trust-key {:?}\n}}\n",
+            extra.repo, extra.public,
+        ),
+    )?;
+    crate::create_configured_image(&primary.root, &config)?;
+    let install = |name: &str| Request::Install {
+        packages: vec![name.into()],
+    };
+    apply(
+        &primary.root,
+        &plan(&primary.root, install("desktop/settings"))?,
+    )?;
+    fs::write(primary.root.join(CONFIG), "private administrator setting")?;
+
+    let error = plan(&primary.root, install("desktop/alternate")).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("configuration identity"),
+        "{error:#}"
+    );
+    let foreign = plan(
+        &primary.root,
+        Request::ExactInstall {
+            packages: vec!["desktop/replacement".into()],
+        },
+    )?;
+    assert!(!foreign.summary().contains("Move config"));
+    apply(&primary.root, &foreign)?;
+    assert_eq!(
+        fs::read_to_string(primary.root.join(OTHER))?,
+        "foreign defaults"
+    );
+    assert_eq!(
+        fs::read_to_string(primary.root.join(CONFIG))?,
+        "private administrator setting"
+    );
+    Ok(())
+}
+
+#[test]
 fn imports_legacy_config_proposals_without_reopening_dismissed_updates() -> Result<()> {
     use crate::{ConfigChoice, list_config_updates};
 

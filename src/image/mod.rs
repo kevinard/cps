@@ -176,6 +176,8 @@ pub struct Managed {
     pub owners: BTreeSet<String>,
     pub preserve: bool,
     pub implicit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) original_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

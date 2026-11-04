@@ -585,6 +585,23 @@ It copies extended attributes before applying permissions, so the POSIX
 ACL mask follows the new mode. Existing hard-link aliases retain their
 original inode. [Linux access control lists](https://man7.org/linux/man-pages/man5/acl.5.html)
 
+To move a preserved file, set `original-name` on the new file action.
+Use the original package name and root-relative path and keep that identity
+through later moves, including moves between packages of the same publisher.
+
+```kdl
+file "etc/canopa/session/preferences.conf" mode="0600" uid=0 gid=0 preserve=#true original-name="desktop/session:etc/canopa/preferences.conf"
+```
+
+The transaction must retire the old path and the new path must be unclaimed.
+CPS carries edited contents and extended attributes to the new path with
+the new package metadata. A locally deleted file stays absent at the new
+path. In both cases CPS stages the new defaults there for review. An
+untouched file takes the new defaults directly. In a staged upgrade the
+previous boot environment retains its configuration at the old path.
+Deploy a CPS version that understands `original-name` before using it in
+packages offered to existing images. [IPS configuration migration](https://docs.oracle.com/cd/E26502_01/html/E21383/glyuz.html)
+
 When an upgrade keeps an edited or locally removed file and stages new
 vendor defaults, `cps config list` shows the pending file and its vendor
 copy. Compare the two copies or merge changes by editing the local file.
