@@ -66,6 +66,8 @@ pub(crate) struct ReleaseProfile {
     pub companions: Vec<CatalogPin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elf_library_dirs: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub elf_symbol_versions: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -247,11 +249,15 @@ impl Catalog {
     fn check_elf_profiles(&self, profiles: &BTreeMap<String, ReleaseProfile>) -> Result<()> {
         for (name, profile) in &self.release_profiles {
             if !profile.elf_library_dirs.is_empty() {
+                let next = profiles
+                    .get(name)
+                    .filter(|next| !next.elf_library_dirs.is_empty())
+                    .with_context(|| {
+                        format!("release drops ELF checking for signed profile {name}")
+                    })?;
                 ensure!(
-                    profiles
-                        .get(name)
-                        .is_some_and(|next| !next.elf_library_dirs.is_empty()),
-                    "release drops ELF checking for signed profile {name}"
+                    !profile.elf_symbol_versions || next.elf_symbol_versions,
+                    "release drops ELF symbol version checking for signed profile {name}"
                 );
             }
         }
@@ -619,6 +625,10 @@ fn read_catalog_with_key(
     for (name, profile) in &catalog.release_profiles {
         validate_name(name).context("invalid signed profile name")?;
         validate_publisher(&profile.architecture).context("invalid signed profile architecture")?;
+        ensure!(
+            !profile.elf_symbol_versions || !profile.elf_library_dirs.is_empty(),
+            "ELF symbol version checking requires library directories"
+        );
         if !profile.elf_library_dirs.is_empty() {
             publish_policy::validate_elf_dirs(&profile.architecture, &profile.elf_library_dirs)?;
         }
@@ -1362,6 +1372,7 @@ fn check_profiles(
                         facets: profile.facets.clone(),
                         companions,
                         elf_library_dirs: profile.elf_library_dirs.clone(),
+                        elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
                     },
                 )
             })
@@ -1539,7 +1550,16 @@ mod tests {
             profiles_required: true,
             obsoletions: BTreeMap::from([("desktop/retired".to_owned(), "2.0.0-0".parse()?)]),
             key_rotations: Vec::new(),
-            release_profiles: BTreeMap::new(),
+            release_profiles: BTreeMap::from([(
+                "desktop".to_owned(),
+                ReleaseProfile {
+                    architecture: "x86_64".to_owned(),
+                    facets: BTreeMap::new(),
+                    companions: Vec::new(),
+                    elf_library_dirs: vec!["/usr/lib".to_owned()],
+                    elf_symbol_versions: true,
+                },
+            )]),
         };
         let mut next = previous.clone();
         next.sequence = NonZeroU64::new(3);
@@ -1552,6 +1572,21 @@ mod tests {
         next.profiles_required = false;
         assert!(previous.check_successor(&next, &base).is_err());
         next.profiles_required = true;
+        next.release_profiles
+            .get_mut("desktop")
+            .unwrap()
+            .elf_symbol_versions = false;
+        assert!(
+            previous
+                .check_successor(&next, &base)
+                .unwrap_err()
+                .to_string()
+                .contains("ELF symbol version checking")
+        );
+        next.release_profiles
+            .get_mut("desktop")
+            .unwrap()
+            .elf_symbol_versions = true;
         next.obsoletions.clear();
         assert!(previous.check_successor(&next, &base).is_err());
         next.obsoletions

@@ -408,16 +408,22 @@ CPS hashes the selected payloads and reads ELF program headers as data. It
 checks `PT_INTERP` and `DT_NEEDED` against the signed file map, including
 symlinks, hard links, and pinned companion packages. Each object can use its
 own `DT_RUNPATH` or `DT_RPATH`, with absolute paths and `$ORIGIN` supported.
-The check covers file availability and ELF class and machine compatibility.
-Symbol versions, libraries loaded with `dlopen`, inherited search paths, and
+The check covers file availability, ELF class and machine compatibility,
+and the GNU version nodes required by each direct dependency. It follows
+version-table pointers in the dynamic segment, so it works on objects with
+section headers removed. The selected library must define each non-weak
+required version with its recorded name and hash. Symbol-by-symbol
+relocation, libraries loaded with `dlopen`, inherited search paths, and
 loader state from the running system are outside its scope.
 
 The gate applies to the fresh composition and the result of a checked
-upgrade. The signed profile records its library directories, and later
-catalogs must keep the gate enabled for that profile. Use a CPS version that
-understands the ELF gate before consuming those catalogs. Run
+upgrade. The signed profile records its library directories and version
+checking requirement. Later catalogs must retain those checks for that
+profile. Upgrade clients before consuming catalogs that record version
+checking. Run
 [`tests/elf-profile.sh`](tests/elf-profile.sh) to exercise the publication
-gate with a compiler-generated executable and shared library.
+gate with a compiler-generated executable and shared library and GNU
+`objcopy` with `--strip-section-headers` support.
 
 List companion publishers inside a profile when dependencies are supplied by
 another repository.

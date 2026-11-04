@@ -116,11 +116,17 @@ pub(super) fn check(
                     found
                 };
                 let target = target.with_context(|| format!("missing ELF dependency {needed}"))?;
-                ensure!(
-                    elf_at(target)
-                        .is_some_and(|library| native(library, machine) && library.shared_object),
-                    "incompatible ELF dependency {needed} at {target}"
-                );
+                let library = elf_at(target)
+                    .filter(|library| native(library, machine) && library.shared_object)
+                    .with_context(|| format!("incompatible ELF dependency {needed} at {target}"))?;
+                if let Some(versions) = info.required_versions.get(needed) {
+                    for (version, hash) in versions {
+                        ensure!(
+                            library.defined_versions.get(version) == Some(hash),
+                            "ELF dependency {needed} at {target} does not provide required version {version}"
+                        );
+                    }
+                }
             }
             Ok(())
         };

@@ -17,11 +17,19 @@ done
 mkdir -p app/usr/bin runtime/usr/lib/demo
 printf 'int answer(void) { return 42; }\n' > library.c
 printf 'extern int answer(void); void _start(void) { answer(); }\n' > app.c
+cat > current.map <<'MAP'
+CPS_DEMO_1.0 {};
+CPS_DEMO_2.0 { global: answer; local: *; } CPS_DEMO_1.0;
+MAP
+printf 'CPS_DEMO_1.0 { global: answer; local: *; };\n' > old.map
 cc -shared -fPIC -nostdlib -Wl,-soname,libcps-demo.so.1 \
+    -Wl,--version-script,current.map \
     -o runtime/usr/lib/demo/libcps-demo.so.1.0 library.c
 cc -pie -nostdlib -Wl,-e,_start,--dynamic-linker,/lib64/cps-loader.so \
     -Wl,-rpath,'$ORIGIN/../lib/demo' -o app/usr/bin/demo app.c \
     runtime/usr/lib/demo/libcps-demo.so.1.0
+objcopy --strip-section-headers app/usr/bin/demo
+objcopy --strip-section-headers runtime/usr/lib/demo/libcps-demo.so.1.0
 cat > app.kdl <<MANIFEST
 schema-version 1
 package "demo/app" publisher="canopa" version="1.0.0-0" {
@@ -104,6 +112,15 @@ ln -s libcps-demo.so.1.0/ runtime/usr/lib/demo/libcps-demo.so.1
 publish_runtime 5.0.0-0
 write_policy
 reject_refresh 'missing ELF dependency libcps-demo.so.1'
+rm -- runtime/usr/lib/demo/libcps-demo.so.1
+ln -s libcps-demo.so.1.0 runtime/usr/lib/demo/libcps-demo.so.1
+cc -shared -fPIC -nostdlib -Wl,-soname,libcps-demo.so.1 \
+    -Wl,--version-script,old.map \
+    -o runtime/usr/lib/demo/libcps-demo.so.1.0 library.c
+objcopy --strip-section-headers runtime/usr/lib/demo/libcps-demo.so.1.0
+publish_runtime 6.0.0-0
+write_policy
+reject_refresh 'does not provide required version CPS_DEMO_2.0'
 sed -i '/elf-check {/,/        }/d' repo/publish-policy.kdl
 reject_refresh 'release drops ELF checking for signed profile desktop'
 

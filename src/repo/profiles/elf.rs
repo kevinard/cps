@@ -1,4 +1,7 @@
+mod versions;
+
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{Read, Seek},
     os::unix::fs::MetadataExt,
@@ -9,7 +12,7 @@ use object::{
     elf,
     endian::Endianness,
     read::{
-        ReadCache, ReadRef,
+        Bytes, ReadCache, ReadRef,
         elf::{Dyn, FileHeader, ProgramHeader},
     },
 };
@@ -29,6 +32,8 @@ pub(super) struct Elf {
     pub runpath: Option<String>,
     pub shared_object: bool,
     pub use_default_dirs: bool,
+    pub required_versions: BTreeMap<String, versions::Names>,
+    pub defined_versions: versions::Names,
 }
 
 pub(super) fn inspect(mut file: File, size: u64, hash: &str) -> Result<Option<Elf>> {
@@ -85,6 +90,8 @@ fn parse<'a, E: FileHeader>(data: impl ReadRef<'a>) -> Result<Option<Elf>> {
         runpath: None,
         shared_object: kind == elf::ET_DYN,
         use_default_dirs: true,
+        required_versions: BTreeMap::new(),
+        defined_versions: BTreeMap::new(),
     };
     let mut dynamic = None;
     for segment in segments {
@@ -113,7 +120,7 @@ fn parse<'a, E: FileHeader>(data: impl ReadRef<'a>) -> Result<Option<Elf>> {
     }
     if let Some(entries) = dynamic {
         let mut needed = Vec::new();
-        let (mut strtab, mut strsz, mut runpath, mut rpath) = (None, None, None, None);
+        let mut tags = BTreeMap::new();
         let mut terminated = false;
         for entry in entries {
             let value: u64 = entry.d_val(endian).into();
@@ -124,10 +131,21 @@ fn parse<'a, E: FileHeader>(data: impl ReadRef<'a>) -> Result<Option<Elf>> {
                     break;
                 }
                 Some(elf::DT_NEEDED) => needed.push(value),
-                Some(elf::DT_STRTAB) => set_once(&mut strtab, value, "DT_STRTAB")?,
-                Some(elf::DT_STRSZ) => set_once(&mut strsz, value, "DT_STRSZ")?,
-                Some(elf::DT_RUNPATH) => set_once(&mut runpath, value, "DT_RUNPATH")?,
-                Some(elf::DT_RPATH) => set_once(&mut rpath, value, "DT_RPATH")?,
+                Some(
+                    tag @ (elf::DT_STRTAB
+                    | elf::DT_STRSZ
+                    | elf::DT_RUNPATH
+                    | elf::DT_RPATH
+                    | elf::DT_VERNEED
+                    | elf::DT_VERNEEDNUM
+                    | elf::DT_VERDEF
+                    | elf::DT_VERDEFNUM),
+                ) => {
+                    ensure!(
+                        tags.insert(tag, value).is_none(),
+                        "duplicate ELF dynamic tag {tag:#x}"
+                    );
+                }
                 Some(elf::DT_FLAGS_1) => {
                     result.use_default_dirs &= value & u64::from(elf::DF_1_NODEFLIB) == 0;
                     result.shared_object &= value & u64::from(elf::DF_1_PIE) == 0;
@@ -136,26 +154,58 @@ fn parse<'a, E: FileHeader>(data: impl ReadRef<'a>) -> Result<Option<Elf>> {
             }
         }
         ensure!(terminated, "unterminated ELF dynamic segment");
-        let runpath = runpath.or(rpath);
-        if !needed.is_empty() || runpath.is_some() {
-            ensure!(needed.len() <= 4096, "too many ELF dependencies");
-            let address = strtab.context("missing ELF dynamic string table address")?;
-            let size = strsz.context("missing ELF dynamic string table size")?;
-            ensure!(
-                size <= STRINGS_LIMIT,
-                "ELF dynamic string table is too large"
-            );
-            let offset = segments
+        let runpath = tags
+            .get(&elf::DT_RUNPATH)
+            .or_else(|| tags.get(&elf::DT_RPATH));
+        let load = |address: u64, size: u64| {
+            segments
                 .iter()
                 .filter(|segment| segment.p_type(endian) == elf::PT_LOAD)
                 .find_map(|segment| {
                     let (offset, length) = segment.file_range(endian);
-                    let start: u64 = segment.p_vaddr(endian).into();
-                    let relative = address.checked_sub(start)?;
-                    (relative.checked_add(size)? <= length).then_some(())?;
-                    offset.checked_add(relative)
+                    let relative = address.checked_sub(segment.p_vaddr(endian).into())?;
+                    let available = length.checked_sub(relative)?;
+                    (available >= size).then_some(())?;
+                    Some((offset.checked_add(relative)?, available))
                 })
-                .context("ELF dynamic string table is outside file-backed segments")?;
+                .context("ELF dynamic data is outside file-backed segments")
+        };
+        let table = |address_tag, count_tag| -> Result<Option<versions::Table<'a>>> {
+            match (tags.get(&address_tag), tags.get(&count_tag)) {
+                (None, None) => Ok(None),
+                (Some(&address), Some(&count)) => {
+                    ensure!(
+                        (1..=u64::from(elf::VERSYM_VERSION)).contains(&count),
+                        "invalid ELF version record count"
+                    );
+                    let (offset, available) = load(address, 1)?;
+                    let bytes = data
+                        .read_bytes_at(offset, available.min(DYNAMIC_LIMIT))
+                        .ok()
+                        .context("reading ELF version records")?;
+                    Ok(Some(versions::Table {
+                        bytes: Bytes(bytes),
+                        count: count as usize,
+                    }))
+                }
+                _ => bail!("incomplete ELF version table tags"),
+            }
+        };
+        let required = table(elf::DT_VERNEED, elf::DT_VERNEEDNUM)?;
+        let defined = table(elf::DT_VERDEF, elf::DT_VERDEFNUM)?;
+        if !needed.is_empty() || runpath.is_some() || required.is_some() || defined.is_some() {
+            ensure!(needed.len() <= 4096, "too many ELF dependencies");
+            let address = *tags
+                .get(&elf::DT_STRTAB)
+                .context("missing ELF dynamic string table address")?;
+            let size = *tags
+                .get(&elf::DT_STRSZ)
+                .context("missing ELF dynamic string table size")?;
+            ensure!(
+                size <= STRINGS_LIMIT,
+                "ELF dynamic string table is too large"
+            );
+            let (offset, _) = load(address, size)?;
             let strings = data
                 .read_bytes_at(offset, size)
                 .ok()
@@ -172,13 +222,20 @@ fn parse<'a, E: FileHeader>(data: impl ReadRef<'a>) -> Result<Option<Elf>> {
                 Ok(std::str::from_utf8(&string[..end])?.to_owned())
             };
             result.needed = needed.into_iter().map(get).collect::<Result<_>>()?;
-            result.runpath = runpath.map(get).transpose()?;
+            result.runpath = runpath.copied().map(get).transpose()?;
+            if let Some(required) = required {
+                result.required_versions = versions::required(required, endian, get)?;
+                for library in result.required_versions.keys() {
+                    ensure!(
+                        result.needed.contains(library),
+                        "ELF version requirement names undeclared dependency {library}"
+                    );
+                }
+            }
+            if let Some(defined) = defined {
+                result.defined_versions = versions::defined(defined, endian, get)?;
+            }
         }
     }
     Ok(Some(result))
-}
-
-fn set_once(slot: &mut Option<u64>, value: u64, tag: &str) -> Result<()> {
-    ensure!(slot.replace(value).is_none(), "duplicate ELF {tag}");
-    Ok(())
 }
