@@ -1663,8 +1663,115 @@ fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Resul
         BTreeMap::from([("doc.man".into(), false)])
     );
     assert!(verify(&f.root)?.is_empty());
+    fs::write(f.root.join(CONFIG), "replacement file")?;
     let error = plan(&f.root, set(None)).unwrap_err();
-    assert!(error.to_string().contains("unmanaged path already exists"));
+    assert!(error.to_string().contains("disabled configuration changed"));
+    fs::write(f.root.join(CONFIG), "administrator settings")?;
+    let inode = fs::metadata(f.root.join(CONFIG))?.ino();
+    fs::rename(f.repo.with_extension("offline"), &f.repo)?;
+    apply(&f.root, &plan(&f.root, set(None))?)?;
+    assert_eq!(fs::metadata(f.root.join(CONFIG))?.ino(), inode);
+    assert_eq!(
+        fs::read_to_string(f.root.join(CONFIG))?,
+        "administrator settings"
+    );
+    let state = crate::image::Image::open_query(&f.root)?.state()?;
+    assert!(state.paths.contains_key(CONFIG));
+    assert!(state.settings.dormant_configs.is_empty());
+    assert_eq!(state.settings.format, before.settings.format);
+    Ok(())
+}
+
+#[test]
+fn restores_disabled_config_proposals_and_moves_local_edits_after_upgrade() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const NEW_PATH: &str = "etc/canopa/preferences.conf";
+    const ABSENT: &str = "etc/canopa/deleted.conf";
+    let f = Fixture::new()?;
+    let recipe = |path, contents, mode| -> Result<String> {
+        Ok(f.file(path, contents, mode, "preserve=#true facet=\"optional\" original-name=\"desktop/compositor:etc/canopa/compositor.conf\"")?
+            + &f.file(ABSENT, "deleted by administrator", "0644", "preserve=#true facet=\"optional\"")?)
+    };
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        recipe(CONFIG, "first default", "0644")?,
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    fs::write(f.root.join(CONFIG), "local preferences")?;
+    fs::remove_file(f.root.join(ABSENT))?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        recipe(CONFIG, "second default", "0644")?,
+    )?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    let previous = crate::list_config_updates(&f.root)?;
+    assert_eq!(previous.len(), 1);
+    let toggle = |value| Request::ChangeFacet {
+        facets: BTreeMap::from([("optional".into(), value)]),
+    };
+    apply(&f.root, &plan(&f.root, toggle(Some(false)))?)?;
+    assert!(crate::list_config_updates(&f.root)?.is_empty());
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    apply(&f.root, &plan(&f.root, toggle(None))?)?;
+    let restored = crate::list_config_updates(&f.root)?;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].revision, previous[0].revision);
+    assert!(restored[0].vendor_available);
+    assert!(!f.root.join(ABSENT).exists());
+    apply(&f.root, &plan(&f.root, toggle(Some(false)))?)?;
+    fs::rename(&offline, &f.repo)?;
+
+    f.package(
+        "desktop/compositor",
+        "3.0.0-0",
+        recipe(NEW_PATH, "third default", "0600")?,
+    )?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert!(f.root.join(CONFIG).is_file());
+    assert!(!f.root.join(NEW_PATH).exists());
+    let enable = plan(&f.root, toggle(None))?;
+    assert!(
+        enable
+            .summary()
+            .contains(&format!("Move config {CONFIG} to {NEW_PATH}"))
+    );
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("resume-config.json"),
+        &enable,
+        NEW_PATH,
+    )?;
+    fs::rename(&f.repo, &offline)?;
+    apply(&f.root, &enable)?;
+    assert!(!f.root.join(CONFIG).exists());
+    assert!(!f.root.join(ABSENT).exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join(NEW_PATH))?,
+        "local preferences"
+    );
+    assert_eq!(
+        fs::metadata(f.root.join(NEW_PATH))?.permissions().mode() & 0o777,
+        0o600
+    );
+    let proposals = crate::list_config_updates(&f.root)?;
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].path, NEW_PATH);
+    assert_eq!(
+        fs::read_to_string(f.root.join(&proposals[0].vendor_copy))?,
+        "third default"
+    );
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     Ok(())
 }
 

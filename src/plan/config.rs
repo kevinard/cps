@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -7,7 +11,7 @@ use super::{
     CONFIG_UPDATES_DIR, ConfigMove, Write, config_update_prefix, paths::config_name, stage_config,
 };
 use crate::{
-    image::{Image, Installed, Managed, Settings, State, root::Root},
+    image::{DormantConfig, Image, Installed, Managed, Settings, State, root::Root},
     model::{Node, validate_path},
     verify::manifest_paths,
 };
@@ -181,20 +185,178 @@ fn configuration_paths<'a>(
     paths
         .iter()
         .filter(|(_, file)| file.preserve)
-        .map(|(path, file)| {
-            let owner = file.owners.first().expect("preserved file has an owner");
-            let publisher = &installed[owner].published.manifest.publisher;
-            let name = config_name(owner, path, file.original_name.as_deref());
-            ((publisher.as_str(), name), path.as_str())
-        })
+        .map(|(path, file)| (identity(installed, path, file), path.as_str()))
         .collect()
+}
+
+fn identity<'a>(
+    installed: &'a BTreeMap<String, Installed>,
+    path: &str,
+    file: &Managed,
+) -> (&'a str, String) {
+    let owner = file.owners.first().expect("preserved file has an owner");
+    let publisher = &installed[owner].published.manifest.publisher;
+    (
+        publisher,
+        config_name(owner, path, file.original_name.as_deref()),
+    )
+}
+
+pub(super) fn remember_disabled(
+    installed: &BTreeMap<String, Installed>,
+    settings: &mut Settings,
+    path: &str,
+    old: &Managed,
+    local: Option<Node>,
+    pending_revision: Option<u64>,
+) -> Result<()> {
+    ensure!(
+        matches!(
+            local,
+            None | Some(Node::File {
+                capabilities: None,
+                ..
+            })
+        ),
+        "unexpected file type or capabilities on local configuration {path}"
+    );
+    let (publisher, identity) = identity(installed, path, old);
+    settings.dormant_configs.insert(
+        path.to_owned(),
+        DormantConfig {
+            publisher: publisher.to_owned(),
+            identity,
+            vendor: old.node.clone(),
+            local,
+            pending_revision,
+        },
+    );
+    Ok(())
+}
+
+pub(super) fn reclaim_disabled(
+    root: &Root,
+    state: &mut State,
+    revision: u64,
+    installed: &BTreeMap<String, Installed>,
+    paths: &BTreeMap<String, Managed>,
+    writes: &mut BTreeMap<String, Write>,
+) -> Result<BTreeMap<String, String>> {
+    let records = std::mem::take(&mut state.settings.dormant_configs);
+    let mut restored = BTreeMap::new();
+    if records.is_empty() {
+        return Ok(restored);
+    }
+    let targets = configuration_paths(installed, paths);
+    for (from, record) in records {
+        let Some(&to) = targets.get(&(record.publisher.as_str(), record.identity.clone())) else {
+            state.settings.dormant_configs.insert(from, record);
+            continue;
+        };
+        ensure!(
+            !state.paths.contains_key(to) && (from == to || !paths.contains_key(&from)),
+            "cannot reclaim disabled configuration from {from} at {to}: another action owns the path"
+        );
+        let observed = root.inspect(&from)?;
+        if observed.is_none() && record.local.is_some() {
+            // The administrator cleared the saved file. Install the newly
+            // selected vendor action through the ordinary path checks.
+            continue;
+        }
+        ensure!(
+            observed == record.local,
+            "disabled configuration changed at {from}"
+        );
+        let target = &paths[to];
+        if from != to {
+            plan_move(
+                root,
+                &mut state.settings,
+                revision,
+                (&from, &record.vendor),
+                (to, target),
+                writes,
+            )?;
+            ensure!(
+                writes[&from].before == record.local,
+                "disabled configuration changed at {from}"
+            );
+        } else {
+            if target.node != record.vendor {
+                stage_config(
+                    root,
+                    &mut state.settings,
+                    revision,
+                    to,
+                    &target.node,
+                    writes,
+                )?;
+            } else if let Some(revision) = record.pending_revision {
+                state
+                    .settings
+                    .config_updates
+                    .get_or_insert_default()
+                    .insert(to.to_owned(), revision);
+            }
+            let replacement = observed
+                .as_ref()
+                .and_then(|local| with_vendor_metadata(local, &target.node));
+            let local_config = replacement.is_some();
+            writes.insert(
+                to.to_owned(),
+                Write {
+                    path: to.to_owned(),
+                    before: observed.clone(),
+                    after: replacement.or(observed),
+                    detach: false,
+                    local_config,
+                    config_move: None,
+                },
+            );
+        }
+        restored.insert(to.to_owned(), from);
+    }
+    Ok(restored)
+}
+
+pub(super) fn retain_disabled(
+    settings: &mut Settings,
+    installed: &BTreeMap<String, Installed>,
+    paths: &BTreeMap<String, Managed>,
+) {
+    if settings.dormant_configs.is_empty() {
+        return;
+    }
+    let arch = settings.arch.as_str();
+    let identities = installed
+        .iter()
+        .flat_map(|(name, package)| {
+            let manifest = &package.published.manifest;
+            manifest
+                .action
+                .iter()
+                .filter(move |action| {
+                    action.preserve() && action.selectors().1.is_none_or(|target| target == arch)
+                })
+                .map(move |action| {
+                    (
+                        manifest.publisher.as_str(),
+                        config_name(name, action.path(), action.original_name()),
+                    )
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    settings.dormant_configs.retain(|path, record| {
+        !paths.contains_key(path)
+            && identities.contains(&(record.publisher.as_str(), record.identity.clone()))
+    });
 }
 
 pub(super) fn plan_move(
     root: &Root,
     settings: &mut Settings,
     revision: u64,
-    (from, old): (&str, &Managed),
+    (from, old): (&str, &Node),
     (to, target): (&str, &Managed),
     writes: &mut BTreeMap<String, Write>,
 ) -> Result<()> {
@@ -216,7 +378,7 @@ pub(super) fn plan_move(
     if let Some(updates) = &mut settings.config_updates {
         updates.remove(from);
     }
-    let (after, local) = if observed.as_ref() == Some(&old.node) {
+    let (after, local) = if observed.as_ref() == Some(old) {
         (Some(target.node.clone()), None)
     } else {
         stage_config(root, settings, revision, to, &target.node, writes)?;
@@ -253,7 +415,7 @@ pub(super) fn plan_move(
     Ok(())
 }
 
-fn updates(
+pub(super) fn updates(
     root: &Root,
     settings: &Settings,
     paths: &BTreeMap<String, Managed>,

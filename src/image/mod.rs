@@ -36,6 +36,18 @@ const CHECKPOINT_IMAGE_FORMAT: u32 = 4;
 const PROFILE_IMAGE_FORMAT: u32 = 5;
 // Older writers would advance checkpoints without keeping the catalogs.
 const CATALOG_ARCHIVE_IMAGE_FORMAT: u32 = 6;
+// Older writers would lose the history of locally preserved disabled facets.
+const DORMANT_CONFIG_IMAGE_FORMAT: u32 = 7;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DormantConfig {
+    pub publisher: String,
+    pub identity: String,
+    pub vendor: Node,
+    pub local: Option<Node>,
+    pub pending_revision: Option<u64>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
@@ -70,6 +82,8 @@ pub struct Settings {
     // from the saved vendor copies the first time they are reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) config_updates: Option<BTreeMap<String, u64>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) dormant_configs: BTreeMap<String, DormantConfig>,
 }
 
 pub(crate) fn publisher_generation_is_initial(generation: &u64) -> bool {
@@ -179,6 +193,8 @@ impl Publishers {
     pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
         if settings.bootstrap_catalog.is_some() {
             BOOTSTRAP_IMAGE_FORMAT
+        } else if !settings.dormant_configs.is_empty() {
+            DORMANT_CONFIG_IMAGE_FORMAT
         } else if settings.catalog_archives {
             CATALOG_ARCHIVE_IMAGE_FORMAT
         } else if !settings.profile_packages.is_empty() {
@@ -409,6 +425,7 @@ fn initialize(
         catalog_archives: false,
         profile_packages: BTreeMap::new(),
         config_updates: Some(BTreeMap::new()),
+        dormant_configs: BTreeMap::new(),
     };
     settings.format = publishers.image_format(&settings);
     fs::create_dir_all(path)?;
@@ -552,6 +569,7 @@ impl Image {
                     | CHECKPOINT_IMAGE_FORMAT
                     | PROFILE_IMAGE_FORMAT
                     | CATALOG_ARCHIVE_IMAGE_FORMAT
+                    | DORMANT_CONFIG_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -603,13 +621,42 @@ impl Image {
                 "archived profile differs from the installed primary catalog"
             );
         }
+        let paths = decode_rows(&self.db, "SELECT path, data FROM paths")?;
+        let mut dormant_identities = BTreeSet::new();
+        for (path, config) in &settings.dormant_configs {
+            crate::model::validate_path(path)?;
+            ensure!(
+                publishers.release_profile().is_none()
+                    && publishers.get(&config.publisher).is_some()
+                    && !paths.contains_key(path)
+                    && dormant_identities.insert((&config.publisher, &config.identity))
+                    && matches!(
+                        &config.vendor,
+                        Node::File {
+                            capabilities: None,
+                            ..
+                        }
+                    )
+                    && config.local.as_ref().is_none_or(|local| matches!(
+                        local,
+                        Node::File {
+                            capabilities: None,
+                            ..
+                        }
+                    ))
+                    && config
+                        .pending_revision
+                        .is_none_or(|revision| (1..=settings.revision).contains(&revision)),
+                "invalid disabled configuration record for {path}"
+            );
+        }
         let installed = self.installed()?;
         settings.check_profile_packages(&installed)?;
         Ok(State {
             settings,
             publishers,
             installed,
-            paths: decode_rows(&self.db, "SELECT path, data FROM paths")?,
+            paths,
         })
     }
 

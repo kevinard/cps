@@ -160,6 +160,9 @@ impl Plan {
                 });
             }
             for write in &self.writes {
+                if write.config_move.is_some() || write.path.starts_with(CONFIG_UPDATES_DIR) {
+                    continue;
+                }
                 match (&write.before, &write.after) {
                     (None, Some(Node::Dir { .. } | Node::Hardlink { .. })) => (),
                     (None, Some(_)) => lines.push(format!("Add {}", write.path)),
@@ -369,6 +372,10 @@ pub(crate) fn build(
                 "path ownership index differs from installed manifests"
             );
             image.verify_catalog_archives(&state)?;
+            if state.settings.config_updates.is_none() {
+                state.settings.config_updates =
+                    Some(config::updates(root, &state.settings, &state.paths)?);
+            }
             let mut settings = state.settings.facets.clone();
             for (name, value) in facets {
                 validate_publisher(name).with_context(|| format!("invalid facet {name:?}"))?;
@@ -607,24 +614,35 @@ pub(crate) fn build(
         _ => BTreeMap::new(),
     };
     let moves = config::moves(&state, &installed, &paths)?;
-    let retired: BTreeSet<_> = moves.values().map(String::as_str).collect();
     for (to, from) in &moves {
         config::plan_move(
             root,
             &mut state.settings,
             revision,
-            (from, &state.paths[from]),
+            (from, &state.paths[from].node),
             (to, &paths[to]),
             &mut writes,
         )?;
     }
+    let reclaimed =
+        config::reclaim_disabled(root, &mut state, revision, &installed, &paths, &mut writes)?;
+    plan.preserved.extend(reclaimed.keys().cloned());
+    let retired: BTreeSet<_> = moves
+        .iter()
+        .chain(&reclaimed)
+        .filter(|(to, from)| to != from)
+        .map(|(_, from)| from.as_str())
+        .collect();
     for path in state
         .paths
         .keys()
         .chain(paths.keys())
         .collect::<BTreeSet<_>>()
     {
-        if moves.contains_key(path) || retired.contains(path.as_str()) {
+        if moves.contains_key(path)
+            || reclaimed.contains_key(path)
+            || retired.contains(path.as_str())
+        {
             continue;
         }
         let before = state.paths.get(path);
@@ -632,11 +650,12 @@ pub(crate) fn build(
         if before == after {
             continue;
         }
+        let mut retired_update = None;
         if let Some(updates) = &mut state.settings.config_updates
             && (!after.is_some_and(|target| target.preserve)
                 || before.map(|old| &old.node) != after.map(|new| &new.node))
         {
-            updates.remove(path);
+            retired_update = updates.remove(path);
         }
         if let (Some(old), Some(new)) = (before, after) {
             check_path_type(path, old, new)?;
@@ -725,6 +744,16 @@ pub(crate) fn build(
                         "unexpected file capabilities on preserved config {path}"
                     );
                     plan.preserved.push(path.clone());
+                    if next_facets.is_some() {
+                        config::remember_disabled(
+                            &state.installed,
+                            &mut state.settings,
+                            path,
+                            old,
+                            observed.clone(),
+                            retired_update,
+                        )?;
+                    }
                     observed.clone()
                 } else {
                     None
@@ -812,6 +841,7 @@ pub(crate) fn build(
     if let Some(facets) = next_facets {
         state.settings.facets = facets;
     }
+    config::retain_disabled(&mut state.settings, &installed, &paths);
     state.settings.format = state.publishers.image_format(&state.settings);
     state
         .settings

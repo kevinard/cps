@@ -38,6 +38,7 @@ struct Pending {
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum PendingRecord<P> {
+    Dormant { dormant: P },
     Archived { archived: P },
     Profiled { profiled: P },
     Checkpointed { checkpointed: P },
@@ -46,7 +47,9 @@ enum PendingRecord<P> {
 
 impl Pending {
     fn record(&self) -> PendingRecord<&Self> {
-        if self.next.settings.catalog_archives {
+        if !self.next.settings.dormant_configs.is_empty() {
+            PendingRecord::Dormant { dormant: self }
+        } else if self.next.settings.catalog_archives {
             PendingRecord::Archived { archived: self }
         } else if !self.next.settings.profile_packages.is_empty() {
             PendingRecord::Profiled { profiled: self }
@@ -135,6 +138,7 @@ pub(crate) fn apply_with(
     let stage = image.stage()?;
     let (mut pending, offline) = if let Some(record) = image.pending::<PendingRecord<Pending>>()? {
         let pending = match record {
+            PendingRecord::Dormant { dormant } => dormant,
             PendingRecord::Archived { archived } => archived,
             PendingRecord::Profiled { profiled } => profiled,
             PendingRecord::Checkpointed { checkpointed } => checkpointed,

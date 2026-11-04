@@ -23,7 +23,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-11}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-12}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -104,7 +104,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[01]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-2]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -123,10 +123,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[01]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-2]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[01]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-2]) protected_profiles=true ;;
     esac
 fi
 if [[ -n $kernel_fixture ]]; then
@@ -214,6 +214,8 @@ publish_state() {
         mkdir -p proto/usr/share/man/man1
         printf 'trial\n' > proto/usr/share/man/man1/cps-vm.1
         facet_action="    file \"usr/share/man/man1/cps-vm.1\" mode=\"0644\" uid=$(id -u) gid=$(id -g) facet=\"doc.man\""
+        printf 'vendor settings\n' > proto/etc/cps-vm-optional.conf
+        facet_action+=$'\n'"    file \"etc/cps-vm-optional.conf\" mode=\"0644\" uid=$(id -u) gid=$(id -g) preserve=#true facet=\"optional\""
     fi
     if [[ $mode == rollback ]]; then
         case $state in
@@ -534,6 +536,7 @@ else
 fi
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
+if [[ $mode == facet-change ]]; then printf 'local settings\n' > base/etc/cps-vm-optional.conf; fi
 if [[ $reprovision == 1 ]]; then
     "$cps" image-create --root repro-base --config image.kdl
     "$cps" plan --root repro-base --output repro-install.json install-profile
@@ -678,7 +681,7 @@ if $profiled; then
     fi
 fi
 request=(update)
-if [[ $mode == facet-change ]]; then request=(change-facet doc.man=default); fi
+if [[ $mode == facet-change ]]; then request=(change-facet doc.man=default optional=false); fi
 "$cps" plan --root base --output update.json "${request[@]}" | tee update.log
 cp -a esp esp-before
 trial=$("$cps" boot-env stage --source base --root staged update.json)
@@ -692,12 +695,16 @@ if [[ $mode == facet-change ]]; then
     cmp base/etc/cps-vm-state staged/etc/cps-vm-state
     cmp <("$cps" list --root base) <("$cps" list --root staged)
     grep -Fq 'Add usr/share/man/man1/cps-vm.1' update.log
+    grep -Fq 'Preserve local config etc/cps-vm-optional.conf' update.log
+    cmp base/etc/cps-vm-optional.conf staged/etc/cps-vm-optional.conf
+    "$cps" verify --root base
+    "$cps" verify --root staged
 else
     test "$(cat staged/etc/cps-vm-state)" = trial
     grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
+    "$cps" verify --root base --pristine
+    "$cps" verify --root staged --pristine
 fi
-"$cps" verify --root base --pristine
-"$cps" verify --root staged --pristine
 check_runtime_packages staged
 
 if [[ $mode == rollback ]]; then

@@ -454,9 +454,10 @@ bb=/bin/busybox
 state=$("$bb" cat /etc/cps-vm-boot-state)
 if [ -f /etc/cps-vm-assert-facet ]; then
     facets=$(/usr/bin/cps facet --root /)
+    [ "$("$bb" cat /etc/cps-vm-optional.conf)" = 'local settings' ]
     if [ -f /usr/share/man/man1/cps-vm.1 ]; then
         state=$("$bb" cat /usr/share/man/man1/cps-vm.1)
-        [ "$facets" = "$(printf 'FACET\tVALUE\ndevel\tfalse')" ]
+        [ "$facets" = "$(printf 'FACET\tVALUE\ndevel\tfalse\noptional\tfalse')" ]
         printf 'CPS_VM_FACET: %s docs present\n' "$state"
     else
         [ "$state" = previous ]
