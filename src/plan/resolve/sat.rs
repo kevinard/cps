@@ -14,7 +14,7 @@ use resolvo::{
 };
 
 use crate::{
-    model::{DependencyKind, VersionConstraint},
+    model::{Dependency, DependencyTarget, Version, VersionConstraint},
     plan::paths::PathConflict,
     repo::Published,
 };
@@ -48,7 +48,10 @@ struct Universe<'a> {
 }
 
 impl<'a> Universe<'a> {
-    fn new(candidates: &BTreeMap<&str, Vec<&'a Published>>) -> Result<Self> {
+    fn new(
+        candidates: &BTreeMap<&str, Vec<&'a Published>>,
+        retained: &BTreeMap<&str, Version>,
+    ) -> Result<Self> {
         let mut universe = Self {
             pool: Pool::new(),
             candidates: BTreeMap::new(),
@@ -60,19 +63,19 @@ impl<'a> Universe<'a> {
             for &package in versions {
                 let mut dependencies = KnownDependencies::default();
                 for dependency in &package.manifest.dependency {
-                    let name = universe
-                        .pool
-                        .intern_package_name(dependency.package.as_str());
-                    let filter = Filter {
-                        expression: dependency.version.clone(),
-                        constraint: VersionConstraint::parse(dependency.version.as_deref())?,
-                        exclude: dependency.kind == DependencyKind::Exclude,
-                    };
-                    let set = universe.pool.intern_version_set(name, filter);
-                    match dependency.kind {
-                        DependencyKind::Require => dependencies.requirements.push(set.into()),
-                        DependencyKind::Incorporate | DependencyKind::Exclude => {
-                            dependencies.constrains.push(set);
+                    match dependency {
+                        Dependency::Require(target) => dependencies
+                            .requirements
+                            .push(universe.target(target, false)?.into()),
+                        Dependency::Incorporate(target) => dependencies
+                            .constrains
+                            .push(universe.target(target, false)?),
+                        Dependency::Exclude(target) => {
+                            dependencies.constrains.push(universe.target(target, true)?)
+                        }
+                        Dependency::RequireAny { alternatives } => {
+                            let union = universe.alternatives(alternatives, retained)?;
+                            dependencies.requirements.push(union.into());
                         }
                     }
                 }
@@ -93,6 +96,45 @@ impl<'a> Universe<'a> {
 
     fn package(&self, id: SolvableId) -> &'a Published {
         self.packages[self.pool.resolve_solvable(id).record].0
+    }
+
+    fn target(&self, target: &DependencyTarget, exclude: bool) -> Result<VersionSetId> {
+        let name = self.pool.intern_package_name(target.package.as_str());
+        let filter = Filter {
+            expression: target.version.clone(),
+            constraint: VersionConstraint::parse(target.version.as_deref())?,
+            exclude,
+        };
+        Ok(self.pool.intern_version_set(name, filter))
+    }
+
+    fn alternatives(
+        &self,
+        targets: &[DependencyTarget],
+        retained: &BTreeMap<&str, Version>,
+    ) -> Result<VersionSetUnionId> {
+        let mut choices = Vec::with_capacity(targets.len());
+        for target in targets {
+            let set = self.target(target, false)?;
+            let matches_installed = retained
+                .get(target.package.as_str())
+                .is_some_and(|&version| {
+                    self.pool
+                        .resolve_version_set(set)
+                        .constraint
+                        .matches(version)
+                });
+            choices.push((
+                !matches_installed,
+                target.package.as_str(),
+                target.version.as_deref(),
+                set,
+            ));
+        }
+        choices.sort_unstable();
+        let mut sets = choices.into_iter().map(|(_, _, _, set)| set);
+        let first = sets.next().context("require-any has no alternatives")?;
+        Ok(self.pool.intern_version_set_union(first, sets))
     }
 }
 
@@ -120,7 +162,12 @@ mod tests {
             .iter()
             .map(|package| (package.manifest.name.as_str(), vec![package]))
             .collect();
-        let selected = solve(&candidates, &BTreeSet::from(["system/chain-0000"]), Ok)?;
+        let selected = solve(
+            &candidates,
+            &BTreeSet::from(["system/chain-0000"]),
+            &BTreeMap::new(),
+            Ok,
+        )?;
         assert_eq!(selected.len(), COUNT);
         Ok(())
     }
@@ -271,10 +318,11 @@ impl DependencyProvider for Provider<'_, '_> {
 pub(super) fn solve<'a, T>(
     candidates: &BTreeMap<&str, Vec<&'a Published>>,
     wanted: &BTreeSet<&str>,
+    retained: &BTreeMap<&str, Version>,
     compose: impl Fn(BTreeMap<&'a str, &'a Published>) -> Result<T>,
 ) -> Result<T> {
     let deadline = Instant::now() + TIME_LIMIT;
-    let universe = Universe::new(candidates)?;
+    let universe = Universe::new(candidates, retained)?;
     let requirements: Vec<_> = wanted
         .iter()
         .map(|&name| {

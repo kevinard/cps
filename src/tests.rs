@@ -195,6 +195,90 @@ fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
 }
 
 #[test]
+fn requires_one_compatible_backend_and_checks_removal_offline() -> Result<()> {
+    let f = Fixture::new()?;
+    const ALPHA: &str = "usr/lib/cps/alpha";
+    const ZETA: &str = "usr/lib/cps/zeta";
+    f.package(
+        "backend/alpha",
+        "1.0.0-0",
+        f.file(ALPHA, "alpha v1", "0644", "")?,
+    )?;
+    f.package(
+        "backend/zeta",
+        "2.0.0-0",
+        f.file(ZETA, "zeta v2", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/app",
+        "1.0.0-0",
+        concat!(
+            "    require-any {\n",
+            "        package \"backend/alpha\" version=\">=2.0.0-0\"\n",
+            "        package \"backend/zeta\" version=\"=2.0.0-0\"\n",
+            "        package \"backend/missing\"\n",
+            "    }\n",
+        )
+        .into(),
+    )?;
+    f.package(
+        "policy/desktop",
+        "1.0.0-0",
+        "    exclude \"backend/alpha\"\n".into(),
+    )?;
+    f.create()?;
+    let install = |names: &[&str]| Request::Install {
+        packages: names.iter().map(|name| name.to_string()).collect(),
+    };
+    let remove_zeta = || Request::Remove {
+        packages: vec!["backend/zeta".into()],
+    };
+    apply(&f.root, &plan(&f.root, install(&["backend/zeta"]))?)?;
+    f.package(
+        "backend/alpha",
+        "2.0.0-0",
+        f.file(ALPHA, "alpha v2", "0644", "")?,
+    )?;
+    apply(&f.root, &plan(&f.root, install(&["desktop/app"]))?)?;
+    assert!(
+        !f.root.join(ALPHA).exists(),
+        "an installed backend already satisfies the dependency"
+    );
+
+    let fresh = f._dir.path().join("fresh");
+    create_image(
+        &fresh,
+        &f.repo,
+        "canopa",
+        &f.public,
+        "x86_64",
+        BTreeMap::new(),
+    )?;
+    apply(
+        &fresh,
+        &plan(&fresh, install(&["desktop/app", "policy/desktop"]))?,
+    )?;
+    assert!(fresh.join(ZETA).is_file());
+    assert!(!fresh.join(ALPHA).exists());
+
+    let offline = f._dir.path().join("offline-repo");
+    fs::rename(&f.repo, &offline)?;
+    let error = format!("{:#}", plan(&f.root, remove_zeta()).unwrap_err());
+    assert!(
+        error.contains("requires one of") && error.contains("backend/zeta"),
+        "{error}"
+    );
+    fs::rename(&offline, &f.repo)?;
+    apply(&f.root, &plan(&f.root, install(&["backend/alpha"]))?)?;
+    fs::rename(&f.repo, &offline)?;
+    apply(&f.root, &plan(&f.root, remove_zeta())?)?;
+    assert!(!f.root.join(ZETA).exists());
+    assert_eq!(fs::read_to_string(f.root.join(ALPHA))?, "alpha v2");
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
     let f = Fixture::new()?;
     let uid = geteuid().as_raw();

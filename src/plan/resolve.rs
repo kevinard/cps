@@ -2,10 +2,14 @@ mod sat;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use super::SolverRevision;
-use crate::{image::Installed, model::DependencyKind, repo::Published};
+use crate::{
+    image::Installed,
+    model::{Dependency, DependencyTarget},
+    repo::Published,
+};
 
 pub fn resolve<T>(
     installed: &BTreeMap<String, Installed>,
@@ -59,6 +63,12 @@ pub fn resolve<T>(
         .map(String::as_str)
         .collect();
     let materialize = |selected: BTreeMap<&str, &Published>| {
+        for name in &wanted {
+            ensure!(
+                selected.contains_key(name),
+                "resolver omitted required package {name}"
+            );
+        }
         let installed = selected
             .into_iter()
             .map(|(name, pkg)| {
@@ -73,15 +83,23 @@ pub fn resolve<T>(
                 )
             })
             .collect();
+        check(&installed).context("validating the resolved package set")?;
         let composed = compose(&installed)?;
         Ok((installed, composed))
     };
     match solver {
-        Some(SolverRevision::SatV1) => sat::solve(&candidates, &wanted, materialize),
+        Some(SolverRevision::SatV1) => {
+            let retained = installed
+                .iter()
+                .filter(|(name, _)| wanted.contains(name.as_str()))
+                .map(|(name, entry)| (name.as_str(), entry.published.manifest.version))
+                .collect();
+            sat::solve(&candidates, &wanted, &retained, materialize)
+        }
         None => {
             // Existing saved plans and pinned build recipes retain their original selection order.
             let mut selected = BTreeMap::new();
-            search(&candidates, wanted, &mut selected)
+            search(&candidates, wanted.clone(), &mut selected)
                 .context("cannot satisfy package constraints")?;
             materialize(selected)
         }
@@ -104,13 +122,25 @@ fn search<'a>(
         .with_context(|| format!("no candidate for {name}"))?;
     let mut failure = None;
     for package in versions {
+        if package
+            .manifest
+            .dependency
+            .iter()
+            .any(|dependency| matches!(dependency, Dependency::RequireAny { .. }))
+        {
+            failure = Some(anyhow::anyhow!(
+                "{} requires solver sat-v1 for require-any",
+                package.manifest.id()
+            ));
+            continue;
+        }
         selected.insert(name, package);
         let mut wanted = wanted.clone();
         for dependency in &package.manifest.dependency {
-            if dependency.kind == DependencyKind::Require
-                && !selected.contains_key(dependency.package.as_str())
+            if let Dependency::Require(target) = dependency
+                && !selected.contains_key(target.package.as_str())
             {
-                wanted.insert(dependency.package.as_str());
+                wanted.insert(target.package.as_str());
             }
         }
         let attempt = check_selected(selected).and_then(|()| search(candidates, wanted, selected));
@@ -126,30 +156,33 @@ fn search<'a>(
 fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {
     for package in selected.values() {
         for dependency in &package.manifest.dependency {
-            if let Some(target) = selected.get(dependency.package.as_str()) {
-                if dependency.kind == DependencyKind::Exclude
-                    && !dependency.matches(target.manifest.version)?
-                {
-                    bail!(
-                        "{} excludes {} {}, but selected {}",
-                        package.manifest.id(),
-                        dependency.package,
-                        dependency.version.as_deref().unwrap_or("at any version"),
-                        target.manifest.id()
-                    );
-                }
+            let (target, exclude) = match dependency {
+                Dependency::Require(target) | Dependency::Incorporate(target) => (target, false),
+                Dependency::Exclude(target) => (target, true),
+                Dependency::RequireAny { .. } => continue,
+            };
+            if let Some(selected_target) = selected.get(target.package.as_str()) {
+                let verb = if exclude { "excludes" } else { "requires" };
                 ensure!(
-                    dependency.matches(target.manifest.version)?,
-                    "{} requires {} {} when present, but selected {}",
+                    target.matches(selected_target.manifest.version)? != exclude,
+                    "{} {verb} {target}, but selected {}",
                     package.manifest.id(),
-                    dependency.package,
-                    dependency.version.as_deref().unwrap_or("at any version"),
-                    target.manifest.id()
+                    selected_target.manifest.id()
                 );
             }
         }
     }
     Ok(())
+}
+
+fn selected_matches(
+    selected: &BTreeMap<&str, &Published>,
+    target: &DependencyTarget,
+) -> Result<bool> {
+    match selected.get(target.package.as_str()) {
+        Some(package) => target.matches(package.manifest.version),
+        None => Ok(false),
+    }
 }
 
 pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
@@ -160,14 +193,33 @@ pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
     check_selected(&selected)?;
     for package in selected.values() {
         for dependency in &package.manifest.dependency {
-            if dependency.kind == DependencyKind::Require
-                && !selected.contains_key(dependency.package.as_str())
-            {
-                bail!(
+            match dependency {
+                Dependency::Require(target) => ensure!(
+                    selected.contains_key(target.package.as_str()),
                     "{} is missing required package {}",
                     package.manifest.id(),
-                    dependency.package
-                );
+                    target.package,
+                ),
+                Dependency::RequireAny { alternatives } => {
+                    let mut satisfied = false;
+                    for target in alternatives {
+                        if selected_matches(&selected, target)? {
+                            satisfied = true;
+                            break;
+                        }
+                    }
+                    ensure!(
+                        satisfied,
+                        "{} requires one of: {}",
+                        package.manifest.id(),
+                        alternatives
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                _ => {}
             }
         }
     }

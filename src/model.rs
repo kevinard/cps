@@ -104,28 +104,72 @@ impl<'de> Deserialize<'de> for Version {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DependencyKind {
-    Require,
-    Incorporate,
-    Exclude,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Dependency {
+    Require(DependencyTarget),
+    Incorporate(DependencyTarget),
+    Exclude(DependencyTarget),
+    RequireAny { alternatives: Vec<DependencyTarget> },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Dependency {
-    pub kind: DependencyKind,
+pub struct DependencyTarget {
     pub package: String,
     pub version: Option<String>,
 }
 
-impl Dependency {
+impl DependencyTarget {
     pub fn matches(&self, version: Version) -> Result<bool> {
-        Ok(
-            VersionConstraint::parse(self.version.as_deref())?.matches(version)
-                != (self.kind == DependencyKind::Exclude),
+        Ok(VersionConstraint::parse(self.version.as_deref())?.matches(version))
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_name(&self.package)?;
+        VersionConstraint::parse(self.version.as_deref())?;
+        Ok(())
+    }
+}
+
+impl fmt::Display for DependencyTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {}",
+            self.package,
+            self.version.as_deref().unwrap_or("at any version")
         )
+    }
+}
+
+impl Dependency {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Require(target) | Self::Exclude(target) => target.validate(),
+            Self::Incorporate(target) => {
+                ensure!(
+                    target.version.is_some(),
+                    "incorporate requires a version constraint"
+                );
+                target.validate()
+            }
+            Self::RequireAny { alternatives } => {
+                ensure!(
+                    alternatives.len() >= 2,
+                    "require-any needs at least two alternatives"
+                );
+                let mut seen = BTreeSet::new();
+                for target in alternatives {
+                    target.validate()?;
+                    ensure!(
+                        seen.insert((&target.package, &target.version)),
+                        "duplicate require-any alternative {target}"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -386,12 +430,7 @@ impl Manifest {
         validate_publisher(&self.publisher)?;
         validate_name(&self.name)?;
         for dependency in &self.dependency {
-            validate_name(&dependency.package)?;
-            ensure!(
-                dependency.kind != DependencyKind::Incorporate || dependency.version.is_some(),
-                "incorporate requires a version constraint"
-            );
-            dependency.matches(self.version)?;
+            dependency.validate()?;
         }
         let mut actions = BTreeSet::new();
         for action in &self.action {

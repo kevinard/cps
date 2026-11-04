@@ -609,7 +609,7 @@ mod tests {
     fn old_json_manifest_keeps_its_digest() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::create_dir(repo.path().join("manifests"))?;
-        let bytes = br#"{"format":1,"publisher":"canopa","name":"test/legacy","version":"1.0.0-0","dependency":[],"action":[]}"#;
+        let bytes = br#"{"format":1,"publisher":"canopa","name":"test/legacy","version":"1.0.0-0","dependency":[{"kind":"require","package":"library/one","version":null},{"kind":"incorporate","package":"library/two","version":"=1.0.0-0"}],"action":[]}"#;
         let hash = store(repo.path(), "manifests", bytes)?;
         let manifest = load_manifest(repo.path(), hash.clone())?;
         assert_eq!(manifest.sha256, hash);

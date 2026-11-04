@@ -9,7 +9,7 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 
 use crate::{
     boot::kernel::Kernel,
-    model::{Action, Dependency, DependencyKind, FORMAT, Manifest},
+    model::{Action, Dependency, DependencyTarget, FORMAT, Manifest},
     systemd::Action as SystemdAction,
 };
 
@@ -149,19 +149,9 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
         match name {
-            "require" | "incorporate" | "exclude" => {
-                let fields = Fields::read(node, 1, &["version"], false).context(name.to_owned())?;
-                let kind = match name {
-                    "require" => DependencyKind::Require,
-                    "incorporate" => DependencyKind::Incorporate,
-                    _ => DependencyKind::Exclude,
-                };
-                manifest.dependency.push(Dependency {
-                    kind,
-                    package: fields.string_arg(0)?,
-                    version: fields.string("version")?,
-                });
-            }
+            "require" | "incorporate" | "exclude" | "require-any" => manifest
+                .dependency
+                .push(parse_dependency(node).with_context(|| format!("{name} dependency"))?),
             "file" | "dir" | "symlink" => manifest
                 .action
                 .push(parse_action(node).with_context(|| format!("{name} action"))?),
@@ -192,6 +182,41 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         }
     }
     Ok(manifest)
+}
+
+fn parse_target(node: &KdlNode) -> Result<DependencyTarget> {
+    let fields = Fields::read(node, 1, &["version"], false)?;
+    Ok(DependencyTarget {
+        package: fields.string_arg(0)?,
+        version: fields.string("version")?,
+    })
+}
+
+fn parse_dependency(node: &KdlNode) -> Result<Dependency> {
+    let dependency = match node.name().value() {
+        "require" => Dependency::Require(parse_target(node)?),
+        "incorporate" => Dependency::Incorporate(parse_target(node)?),
+        "exclude" => Dependency::Exclude(parse_target(node)?),
+        "require-any" => {
+            Fields::read(node, 0, &[], true)?;
+            let alternatives = node
+                .children()
+                .context("require-any needs a child block")?
+                .nodes()
+                .iter()
+                .map(|child| {
+                    ensure!(
+                        child.name().value() == "package",
+                        "expected a package alternative"
+                    );
+                    parse_target(child)
+                })
+                .collect::<Result<_>>()?;
+            Dependency::RequireAny { alternatives }
+        }
+        name => bail!("unknown dependency {name}"),
+    };
+    Ok(dependency)
 }
 
 fn parse_action(node: &KdlNode) -> Result<Action> {
@@ -245,6 +270,15 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
     })
 }
 
+fn target_node(name: &str, target: &DependencyTarget) -> KdlNode {
+    let mut node = KdlNode::new(name);
+    node.push(target.package.as_str());
+    if let Some(version) = &target.version {
+        node.insert("version", version.as_str());
+    }
+    node
+}
+
 pub fn manifest_text(manifest: &Manifest) -> String {
     let mut doc = KdlDocument::new();
     let mut schema = KdlNode::new("schema-version");
@@ -256,16 +290,20 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     package.insert("version", manifest.version.to_string());
     let children = package.ensure_children().nodes_mut();
     for dependency in &manifest.dependency {
-        let mut node = KdlNode::new(match dependency.kind {
-            DependencyKind::Require => "require",
-            DependencyKind::Incorporate => "incorporate",
-            DependencyKind::Exclude => "exclude",
+        children.push(match dependency {
+            Dependency::Require(target) => target_node("require", target),
+            Dependency::Incorporate(target) => target_node("incorporate", target),
+            Dependency::Exclude(target) => target_node("exclude", target),
+            Dependency::RequireAny { alternatives } => {
+                let mut node = KdlNode::new("require-any");
+                node.ensure_children().nodes_mut().extend(
+                    alternatives
+                        .iter()
+                        .map(|target| target_node("package", target)),
+                );
+                node
+            }
         });
-        node.push(dependency.package.as_str());
-        if let Some(version) = &dependency.version {
-            node.insert("version", version.as_str());
-        }
-        children.push(node);
     }
     for action in &manifest.action {
         let mut node = KdlNode::new(match action {
