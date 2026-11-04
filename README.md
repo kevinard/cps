@@ -119,6 +119,33 @@ Use the digest of the selected repository catalog, such as the digest recorded i
 
 `solver="sat-v1"` pins the toolchain selection algorithm. Recipes written before this setting was introduced retain the original resolver when the setting is absent.
 
+### Building CPS itself
+
+On an x86-64 Arch Linux worker with Rust, the native GCC toolchain, SQLite and
+libseccomp development files, and Python 3.11 or newer, build the fixture in a
+new output directory. The worker needs a sparse crates.io cache populated for
+the selected revision's `Cargo.lock`.
+
+```sh
+cargo fetch --locked
+tests/build-cps.sh target/cps-fixture HEAD
+```
+
+The fixture archives the selected Git commit and checks each cached crate
+archive against `Cargo.lock` before vendoring from a fresh offline Cargo home.
+It pins both archives, the package manifest, and a signed catalog containing
+the worker's Rust and C toolchain. CPS builds the release binary twice in fresh
+network-isolated sandboxes, publishes `system/cps` with build evidence, and runs
+the installed binary to verify the image. The seed catalog captures prebuilt
+worker tools and libraries. The build uses those pinned inputs for both runs.
+The resulting executable uses the worker's shared SQLite, libseccomp, and C
+runtime libraries.
+
+The output includes `source-revision`, the recipe, source cache, toolchain
+repository, and protected package repository. To run the VM boot tests with
+the resulting binary, point `CPS_BIN` at `image/usr/bin/cps` inside the output
+directory.
+
 ### Preparing a source cache
 
 Add a `url="https://upstream.example.org/releases/hello.c"` property to a pinned `source` entry to fetch it. Use the final HTTPS URL. The fetcher checks the exact byte count and SHA-256 before publishing an object to the cache. It rejects redirects and rechecks existing objects before reuse. Recipes can share a cache by digest.

@@ -5,7 +5,14 @@ unset LD_LIBRARY_PATH LD_PRELOAD GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPAT
 export PATH=/usr/bin:/bin LC_ALL=C
 umask 022
 
-seed=${1:?usage: seed-native-c.sh PROTOTYPE}
+seed=${1:?usage: seed-native-c.sh PROTOTYPE [--rust]}
+rust_root=
+if [[ $# == 2 && $2 == --rust ]]; then
+    rust_root=$(rustc --print sysroot)
+elif [[ $# != 1 ]]; then
+    echo 'usage: seed-native-c.sh PROTOTYPE [--rust]' >&2
+    exit 2
+fi
 mkdir -- "$seed"
 
 copy_file() {
@@ -15,7 +22,7 @@ copy_file() {
 }
 
 copy_elf() {
-    local source=$1 path=$2 interpreter loader dependencies library
+    local source=$1 path=$2 interpreter loader dependencies library relative
     copy_file "$source" "$path"
     interpreter=$(readelf -l "$source" | sed -n 's/^.*Requesting program interpreter: \([^]]*\)].*$/\1/p')
     if [[ -n $interpreter ]]; then
@@ -28,7 +35,12 @@ copy_elf() {
             return 1
         fi
         while IFS= read -r library; do
-            copy_file "$library" "${library#/}"
+            library=$(realpath -ms -- "$library")
+            relative=${library#/}
+            if [[ -n $rust_root && $library == "$rust_root/"* ]]; then
+                relative="usr/${library#"$rust_root/"}"
+            fi
+            copy_file "$library" "$relative"
         done < <(awk '$2 == "=>" && $3 ~ /^\// { print $3 }' <<< "$dependencies")
     fi
 }
@@ -65,3 +77,21 @@ libc_files=$(pacman -Qlq glibc linux-api-headers)
 while IFS= read -r file; do
     copy_file "$file" "${file#/}"
 done < <(awk '/^\/usr\/include\/.*[^\/]$/ || /^\/usr\/lib\/[^/]+\.a$/' <<< "$libc_files")
+
+if [[ -n $rust_root ]]; then
+    rust_host=$(rustc -vV | sed -n 's/^host: //p')
+    test -n "$rust_host"
+    for tool in rustc cargo; do
+        copy_elf "$rust_root/bin/$tool" "usr/bin/$tool"
+    done
+    mkdir -p "$seed/usr/lib/rustlib"
+    cp -RL -- "$rust_root/lib/rustlib/$rust_host" "$seed/usr/lib/rustlib/"
+    ln -s gcc "$seed/usr/bin/cc"
+    for tool in gzip pkg-config; do
+        copy_elf "/usr/bin/$tool" "usr/bin/$tool"
+    done
+    for library in libseccomp.so libseccomp.so.2 libsqlite3.so libsqlite3.so.0; do
+        copy_elf "/usr/lib/$library" "usr/lib/$library"
+    done
+    copy_file /usr/lib/pkgconfig/sqlite3.pc usr/lib/pkgconfig/sqlite3.pc
+fi

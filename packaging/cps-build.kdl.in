@@ -1,0 +1,26 @@
+schema-version 1
+build architecture="@ARCH@" epoch=@EPOCH@ {
+    toolchain "@CATALOG_SHA256@" solver="sat-v1" {
+        package "build/native-rust"
+    }
+    manifest "cps.kdl" sha256="@MANIFEST_SHA256@"
+    source "cps.tar.gz" size=@SOURCE_SIZE@ sha256="@SOURCE_SHA256@"
+    source "vendor.tar.gz" size=@VENDOR_SIZE@ sha256="@VENDOR_SHA256@"
+    script """
+    tar -xzf "$CPS_SOURCES/cps.tar.gz"
+    tar -xzf "$CPS_SOURCES/vendor.tar.gz"
+    cd cps
+    export CARGO_HOME=/build/cargo-home CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_STRIP=symbols
+    export RUSTFLAGS=--remap-path-prefix=/build=/usr/src AWS_LC_SYS_CMAKE_BUILDER=0
+    mkdir -p "$CARGO_HOME"
+    cat > "$CARGO_HOME/config.toml" <<'CONFIG'
+    [source.crates-io]
+    replace-with = "vendor"
+    [source.vendor]
+    directory = "/build/vendor"
+    CONFIG
+    cargo build --frozen --release --jobs 2 --bin cps
+    install -Dm755 target/release/cps "$DESTDIR/usr/bin/cps"
+    install -Dm644 packaging/systemd/cps-boot-health.service "$DESTDIR/usr/lib/systemd/system/cps-boot-health.service"
+    """
+}
