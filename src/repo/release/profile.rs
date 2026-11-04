@@ -71,28 +71,53 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
         .split_first()
         .context("missing primary cache")?;
     let full = !index_only;
-    let primary_release = stage_release(primary_repo, primary, full, Some(&binding), None)
-        .with_context(|| format!("staging primary publisher {}", primary.publisher))?;
-    let (_, profile) = release_profile(
+    let bootstrap_pin = definition
+        .bootstrap_catalog
+        .as_ref()
+        .map(|hash| CatalogPin::primary(primary.publisher.to_owned(), hash.clone()));
+    let primary_release = stage_release(
         primary_repo,
-        primary.publisher,
-        &primary.key,
-        Some(&primary_release.current),
-        name,
-    )?;
-    profile.check_image(
-        name,
-        &definition.arch,
-        &definition.facets,
-        companions.iter().map(|source| source.publisher),
-    )?;
+        primary,
+        full,
+        Some(&binding),
+        bootstrap_pin.as_ref().as_slice(),
+    )
+    .with_context(|| format!("staging primary publisher {}", primary.publisher))?;
+    let current_pin = CatalogPin::primary(
+        primary.publisher.to_owned(),
+        primary_release.current.clone(),
+    );
+    let pins = iter::once(current_pin)
+        .chain(bootstrap_pin.filter(|pin| pin.sha256 != primary_release.current));
+    let mut profiles = Vec::new();
+    for pin in pins {
+        let (_, profile) = release_profile(
+            primary_repo,
+            primary.publisher,
+            &primary.key,
+            Some(&pin.sha256),
+            name,
+        )?;
+        profile.check_image(
+            name,
+            &definition.arch,
+            &definition.facets,
+            companions.iter().map(|source| source.publisher),
+        )?;
+        ensure!(
+            definition.bootstrap_catalog.as_ref() != Some(&pin.sha256)
+                || !profile.composition.is_empty(),
+            "bootstrap catalog has no recorded signed composition for profile {name}"
+        );
+        profiles.push((pin, profile));
+    }
     let mut staged = Vec::with_capacity(companions.len());
-    for ((source, repo), pin) in companions
-        .iter()
-        .zip(companion_repos)
-        .zip(&profile.companions)
-    {
-        let release = stage_release(repo, source, full, None, Some(pin)).with_context(|| {
+    for (index, (source, repo)) in companions.iter().zip(companion_repos).enumerate() {
+        let required = profiles
+            .iter()
+            .map(|(_, profile)| &profile.companions[index])
+            .collect::<Vec<_>>();
+        let release = stage_release(repo, source, full, None, &required).with_context(|| {
             format!(
                 "staging companion publisher {} for profile {name}",
                 source.publisher
@@ -100,19 +125,23 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
         })?;
         staged.push((source, repo, release));
     }
-    if !profile.composition.is_empty() {
-        let primary_pin = CatalogPin::primary(
-            primary.publisher.to_owned(),
-            primary_release.current.clone(),
-        );
+    for (pin, profile) in profiles
+        .iter()
+        .filter(|(_, profile)| !profile.composition.is_empty())
+    {
         check_composition(
-            &profile,
-            &primary_pin,
+            profile,
+            pin,
             &definition.publishers,
             &sources,
             &repositories,
         )
-        .with_context(|| format!("checking staged composition for release profile {name}"))?;
+        .with_context(|| {
+            format!(
+                "checking staged composition for release profile {name} at {}",
+                pin.sha256
+            )
+        })?;
     }
     // Profile readers use the primary pointer as the visibility boundary.
     // Earlier catalogs and objects remain addressable by their original digests.

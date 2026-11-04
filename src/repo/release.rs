@@ -257,7 +257,7 @@ fn synchronize(
 ) -> Result<String> {
     let source = SyncSource::new(trusted_root, mirror, publisher, trust_key)?;
     let _lock = lock_repo(repo)?;
-    let release = stage_release(repo, &source, full, None, None)?;
+    let release = stage_release(repo, &source, full, None, &[])?;
     source.promote(repo, &release, None)?;
     Ok(release.current)
 }
@@ -329,7 +329,7 @@ fn stage_release(
     source: &SyncSource<'_>,
     full: bool,
     binding: Option<&str>,
-    pin: Option<&CatalogPin>,
+    required: &[&CatalogPin],
 ) -> Result<StagedRelease> {
     let SyncSource {
         publisher,
@@ -385,7 +385,7 @@ fn stage_release(
         )
         .await?;
         prepare_objects(repo)?;
-        materialize(repo, &verified, publisher, key, full, pin).await
+        materialize(repo, &verified, publisher, key, full, required).await
     })
 }
 
@@ -479,7 +479,7 @@ async fn materialize(
     publisher: &str,
     key: &[u8],
     full: bool,
-    required: Option<&CatalogPin>,
+    required: &[&CatalogPin],
 ) -> Result<StagedRelease> {
     let pointer = download(verified, "current", repo, 65, None, None)
         .await?
@@ -503,8 +503,7 @@ async fn materialize(
         // Remember the signed catalog even when its payloads cannot be fetched.
         write_atomic(&checkpoint, format!("{hash}\n").as_bytes(), false)?;
     }
-    let mut required = required;
-    if let Some(pin) = required.take_if(|pin| pin.sha256 == hash) {
+    for pin in required.iter().filter(|pin| pin.sha256 == hash) {
         pin.check_lineage(&catalog, key)?;
     }
     let mut entries = BTreeMap::new();
@@ -527,16 +526,17 @@ async fn materialize(
             previous.check_successor(&catalog, pin).with_context(|| {
                 format!("checking retained catalog {pin} against current {hash}")
             })?;
-            if let Some(pin) = required.take_if(|required| required.sha256 == pin) {
-                pin.check_lineage(&previous, key)?;
+            for required in required.iter().filter(|required| required.sha256 == pin) {
+                required.check_lineage(&previous, key)?;
             }
             entries.extend(previous.entries);
             attestations.extend(previous.attestations.into_values());
             retained_hashes.push(pin.to_owned());
         }
     }
-    if let Some(pin) = required {
-        anyhow::bail!(
+    for pin in required {
+        ensure!(
+            pin.sha256 == hash || retained_hashes.contains(&pin.sha256),
             "mirror for {publisher} does not advertise required catalog {} as current or retained",
             pin.sha256
         );

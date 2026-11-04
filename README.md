@@ -812,8 +812,11 @@ release-profile "desktop" bootstrap-catalog="0123456789abcdef0123456789abcdef012
 ```
 
 Keep that catalog and its signed companion catalogs in the configured local
-repositories or retained mirror caches. CPS uses the pin when creating the
-image, looking up available packages, and planning `install-profile`. Cache
+repositories. With mirrors, `repo sync-profile --config image.kdl` requires
+both the current and bootstrap catalog sets to be advertised as current or
+retained TUF targets. It verifies both compositions before promoting the
+current release. CPS uses the bootstrap pin when creating the image,
+looking up available packages, and planning `install-profile`. Cache
 pruning with `--keep-image` retains the pinned catalogs' payloads. The first
 committed `install-profile` consumes the pin, and subsequent plans follow the
 current signed release.

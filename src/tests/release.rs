@@ -1248,6 +1248,15 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
             ),
         ),
     )?;
+    let error = mirror_release::sync_profile(&bootstrap_config, true).unwrap_err();
+    assert!(format!("{error:#}").contains(&format!(
+        "mirror for canopa does not advertise required catalog {}",
+        first.trim()
+    )));
+    assert_eq!(
+        fs::read_to_string(primary_cache.join("current"))?.trim(),
+        second
+    );
     let bootstrap_root = work.join("bootstrap-image");
     create_configured_image(&bootstrap_root, &bootstrap_config)?;
     let error = plan(&bootstrap_root, Request::Update).unwrap_err();
@@ -1284,6 +1293,95 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         fs::read_to_string(primary_cache.join("current"))?.trim(),
         second
     );
+
+    let archive_primary = work.join("archive-primary-mirror");
+    let archive_seed = work.join("archive-seed-mirror");
+    let archive = work.join("archive-primary-export");
+    mirror_release::export_with_retained(
+        &f.repo,
+        "canopa",
+        &f.public,
+        &archive,
+        &[first.trim().to_owned()],
+    )?;
+    sign_export(
+        &archive,
+        &archive_primary,
+        3,
+        fresh,
+        &primary_root,
+        &primary_key,
+    )?;
+    let archive = work.join("archive-seed-export");
+    mirror_release::export_with_retained(
+        &seed.repo,
+        "seed",
+        &seed.public,
+        &archive,
+        &[previous.trim().to_owned()],
+    )?;
+    sign_export(&archive, &archive_seed, 4, fresh, &anchor, &tuf_key)?;
+
+    let cold_primary = work.join("cold-primary-cache");
+    let cold_seed = work.join("cold-seed-cache");
+    let cold_config = work.join("cold-bootstrap.kdl");
+    let configure_cold = |primary: &Path, seed: &Path| -> Result<()> {
+        write_config(primary, seed)?;
+        fs::write(
+            &cold_config,
+            fs::read_to_string(&config)?
+                .replace(
+                    primary_cache.to_str().unwrap(),
+                    cold_primary.to_str().unwrap(),
+                )
+                .replace(seed_cache.to_str().unwrap(), cold_seed.to_str().unwrap())
+                .replace(
+                    "release-profile \"desktop\"",
+                    &format!(
+                        "release-profile \"desktop\" bootstrap-catalog={:?}",
+                        first.trim()
+                    ),
+                ),
+        )?;
+        Ok(())
+    };
+    for (primary, seed, missing, hash) in [
+        (
+            &next_primary_mirror,
+            &next_seed_mirror,
+            "canopa",
+            first.trim(),
+        ),
+        (&archive_primary, &next_seed_mirror, "seed", previous.trim()),
+    ] {
+        configure_cold(primary, seed)?;
+        let error = mirror_release::sync_profile(&cold_config, true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "mirror for {missing} does not advertise required catalog {hash}"
+            )),
+            "{error:#}"
+        );
+        assert!(!cold_primary.join("current").exists());
+        assert!(!cold_seed.join("current").exists());
+    }
+    configure_cold(&archive_primary, &archive_seed)?;
+    assert_eq!(mirror_release::sync_profile(&cold_config, true)?, second);
+    assert_eq!(
+        fs::read_to_string(cold_primary.join("current"))?.trim(),
+        second
+    );
+    assert_eq!(fs::read_to_string(cold_seed.join("current"))?, latest);
+    let cold_root = work.join("cold-bootstrap-image");
+    create_configured_image(&cold_root, &cold_config)?;
+    let cold_plan = plan(&cold_root, Request::InstallProfile)?;
+    assert_eq!(cold_plan.catalogs, saved.catalogs);
+    assert!(!cold_seed.join(&blob).exists());
+    fetch_plan(&cold_root, &cold_plan)?;
+    fs::rename(&archive_primary, work.join("offline-archive-primary"))?;
+    fs::rename(&archive_seed, work.join("offline-archive-seed"))?;
+    apply(&cold_root, &cold_plan)?;
+    assert_eq!(fs::read(cold_root.join(payload))?, b"old");
 
     let broken = crate::repo::sign_profile_with_missing_dependency(
         &f.repo,
