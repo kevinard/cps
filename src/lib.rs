@@ -9,6 +9,7 @@ mod plan;
 pub mod query;
 mod repo;
 mod systemd;
+mod transport;
 mod verify;
 
 pub use apply::apply;
@@ -16,7 +17,10 @@ pub use boot::{
     Activation, BootEnvironment, activate_boot_environment, list_boot_environments,
     rollback_boot_environment, stage_boot_environment,
 };
-pub use build::{BuildOptions, build, build_package};
+pub use build::{
+    BuildOptions, build, build_cached_package, build_package,
+    sources::{fetch_sources, import_sources},
+};
 pub use image::create_image;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{Plan, Request, plan};

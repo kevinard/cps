@@ -4,12 +4,11 @@ use std::{
     io::{Read, Seek, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt},
     path::Path,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use futures_util::{StreamExt, TryStreamExt, pin_mut, stream};
-use reqwest::{Client, StatusCode, redirect::Policy};
+use reqwest::{Client, StatusCode};
 use rustix::fs::{RenameFlags, renameat_with};
 use rustix::process::geteuid;
 use tempfile::{NamedTempFile, TempDir};
@@ -19,7 +18,10 @@ use tough::{
 };
 use url::Url;
 
-use crate::model::{Action, digest, digest_reader, validate_digest, validate_publisher};
+use crate::{
+    model::{Action, digest, digest_reader, validate_digest, validate_publisher},
+    transport::https_client,
+};
 
 use super::{
     CATALOG_LIMIT, MANIFEST_LIMIT, Published, Root, load_manifest, lock_repo, parse_current,
@@ -166,14 +168,7 @@ pub fn sync(
         .with_context(|| format!("reading trusted TUF root {}", trusted_root.display()))?;
     let transport = MirrorTransport(
         (metadata.scheme() == "https" || targets.scheme() == "https")
-            .then(|| {
-                Client::builder()
-                    .https_only(true)
-                    .redirect(Policy::none())
-                    .connect_timeout(Duration::from_secs(10))
-                    .read_timeout(Duration::from_secs(30))
-                    .build()
-            })
+            .then(|| https_client().build())
             .transpose()?,
     );
     let _lock = lock_repo(repo)?;

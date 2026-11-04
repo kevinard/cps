@@ -79,6 +79,20 @@ Use the digest of the selected repository catalog, such as the digest recorded i
 
 `solver="sat-v1"` pins the toolchain selection algorithm. Recipes written before this setting was introduced retain the original resolver when the setting is absent.
 
+### Preparing a source cache
+
+Add a `url="https://upstream.example.org/releases/hello.c"` property to a pinned `source` entry to fetch it. Use the final HTTPS URL. The fetcher checks the exact byte count and SHA-256 before publishing an object to the cache. It rejects redirects and rechecks existing objects before reuse. Recipes can share a cache by digest.
+
+```sh
+cps source fetch --cache source-cache hello.build.kdl
+cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
+    --source-cache source-cache --output hello-build --check-reproducible hello.build.kdl
+```
+
+For local sources, `cps source import --from sources --cache source-cache hello.build.kdl` fills the same cache offline. Builds read the cache offline and verify each input again before staging it under its recipe path. The existing `--sources` option accepts a directory laid out by recipe path.
+
+### Building and publishing with signed evidence
+
 ```sh
 cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
     --sources sources --output hello-build --check-reproducible \
@@ -93,7 +107,7 @@ The bundle contains the recipe, package manifest, and the declared regular file 
 
 The optional worker key signs an in-toto statement in a DSSE envelope after both runs match. The statement records the recipe and source digests, pinned toolchain catalog and resolved package manifests, and the output hashes and lengths. Provision the worker public key and the expected recipe digest on the publishing machine from independently reviewed inputs. Keep the publishing key separate from the worker key. `publish-bundle` verifies the statement and streams the exact attested payloads into the repository. [in-toto statement specification](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md) · [DSSE signature protocol](https://github.com/secure-systems-lab/dsse/blob/master/protocol.md)
 
-Run [`tests/build.sh`](tests/build.sh) on a worker with Bubblewrap, Bash, a C compiler with static libc, binutils, Python 3, and OpenSSL. It exercises isolation, reproducibility, signed provenance, and package installation.
+Run [`tests/build.sh`](tests/build.sh) on a worker with Bubblewrap, Bash, a C compiler with static libc, binutils, Python 3, and OpenSSL. It exercises isolation, reproducibility, signed provenance, and package installation. [`tests/sources.sh`](tests/sources.sh) uses a local TLS server to exercise source downloads and cache integrity.
 
 ### Publishing policy
 

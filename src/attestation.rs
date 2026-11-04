@@ -11,14 +11,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     image::root::Root,
     kdl_format::{
-        build::{BuildRecipe, parse},
+        build::{BuildRecipe, RECIPE_LIMIT, parse},
         parse_manifest,
     },
     model::{FileDigest, Manifest, digest, validate_digest, validate_name, validate_publisher},
     repo::{MANIFEST_LIMIT, read_limited},
 };
 
-pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
 const STATEMENT: &str = "https://in-toto.io/Statement/v1";
 const PREDICATE: &str = "urn:canopa:cps:build-provenance:v1";
@@ -138,7 +137,7 @@ pub(crate) fn sign(
             recipe_sha256: digest(recipe_bytes),
             architecture: recipe.arch.clone(),
             source_date_epoch: recipe.epoch,
-            sources: recipe.sources.clone(),
+            sources: recipe.source_digests(),
             toolchain,
             identical_runs: 2,
         },
@@ -236,7 +235,7 @@ pub(crate) fn verify_bundle(
         predicate.architecture == recipe.arch
             && predicate.source_date_epoch == recipe.epoch
             && predicate.toolchain.catalog_sha256 == recipe.catalog
-            && predicate.sources == recipe.sources
+            && predicate.sources == recipe.source_digests()
             && predicate.identical_runs == 2,
         "build attestation does not match the recipe or the reproducibility requirement"
     );

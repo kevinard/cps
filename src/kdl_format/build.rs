@@ -1,12 +1,25 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use kdl::KdlDocument;
+use url::Url;
 
 use crate::model::{FileDigest, validate_digest, validate_name, validate_path, validate_publisher};
 use crate::plan::SolverRevision;
+use crate::repo::read_limited;
 
 use super::{Fields, document, one, schema};
+
+pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
+
+pub(crate) struct Source {
+    pub pin: FileDigest,
+    pub url: Option<Url>,
+}
 
 pub(crate) struct BuildRecipe {
     pub solver: Option<SolverRevision>,
@@ -16,8 +29,24 @@ pub(crate) struct BuildRecipe {
     pub packages: BTreeSet<String>,
     pub manifest: String,
     pub manifest_digest: String,
-    pub sources: BTreeMap<String, FileDigest>,
+    pub sources: BTreeMap<String, Source>,
     pub script: String,
+}
+
+impl BuildRecipe {
+    pub(crate) fn source_digests(&self) -> BTreeMap<String, FileDigest> {
+        self.sources
+            .iter()
+            .map(|(path, source)| (path.clone(), source.pin.clone()))
+            .collect()
+    }
+}
+
+pub(crate) fn read(path: &Path) -> Result<(Vec<u8>, BuildRecipe)> {
+    let bytes = read_limited(File::open(path)?, RECIPE_LIMIT)?;
+    let recipe = parse(std::str::from_utf8(&bytes)?)
+        .with_context(|| format!("parsing build recipe {}", path.display()))?;
+    Ok((bytes, recipe))
 }
 
 pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
@@ -82,21 +111,47 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         match node.name().value() {
             "toolchain" | "manifest" | "script" => {}
             "source" => {
-                let fields = Fields::read(node, 1, &["sha256", "size"], false)?;
+                let fields = Fields::read(node, 1, &["sha256", "size", "url"], false)?;
                 let path = fields.string_arg(0)?;
                 validate_path(&path)?;
                 let sha256 = fields.required_string("sha256")?;
                 validate_digest(&sha256).with_context(|| format!("invalid digest for {path}"))?;
                 let size = fields.integer("size")?.context("missing source size")?;
+                let url = fields
+                    .string("url")?
+                    .map(|value| source_url(&value))
+                    .transpose()?;
                 ensure!(
                     sources
-                        .insert(path.clone(), FileDigest { sha256, size })
+                        .insert(
+                            path.clone(),
+                            Source {
+                                pin: FileDigest { sha256, size },
+                                url
+                            }
+                        )
                         .is_none(),
                     "duplicate source {path}"
                 );
             }
             name => bail!("unknown build node {name}"),
         }
+    }
+    let mut sizes = BTreeMap::new();
+    for (path, source) in &sources {
+        for (index, _) in path.match_indices('/') {
+            ensure!(
+                !sources.contains_key(&path[..index]),
+                "source paths overlap at {}",
+                &path[..index]
+            );
+        }
+        let size = sizes.entry(&source.pin.sha256).or_insert(source.pin.size);
+        ensure!(
+            *size == source.pin.size,
+            "conflicting source sizes for {}",
+            source.pin.sha256
+        );
     }
     Ok(BuildRecipe {
         solver,
@@ -109,4 +164,35 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         sources,
         script,
     })
+}
+
+fn source_url(value: &str) -> Result<Url> {
+    let url = Url::parse(value).context("invalid source URL")?;
+    ensure!(
+        url.scheme() == "https"
+            && url.has_host()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none(),
+        "source URL must use HTTPS without credentials or a fragment"
+    );
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_urls_require_https_without_credentials() {
+        assert!(source_url("https://example.org/source.tar.gz").is_ok());
+        for invalid in [
+            "http://example.org/source",
+            "file:///source",
+            "https://user@example.org/source",
+            "https://example.org/source#fragment",
+        ] {
+            assert!(source_url(invalid).is_err(), "accepted {invalid}");
+        }
+    }
 }

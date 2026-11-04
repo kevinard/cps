@@ -74,6 +74,21 @@ impl Root {
         Ok(Self(self.dir(path)?))
     }
 
+    pub(crate) fn ensure_dir(&self, path: &str) -> Result<Self> {
+        validate_path(path)?;
+        let (parent, name) = self.parent(path)?;
+        match mkdirat(&parent, name, Mode::RWXU) {
+            Ok(()) => parent.sync_all()?,
+            Err(Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.subdir(path)
+    }
+
+    pub(crate) fn as_file(&self) -> &File {
+        &self.0
+    }
+
     pub fn file(&self, path: &str) -> Result<File> {
         validate_path(path)?;
         let file = self.open_relative(path, OFlags::RDONLY | OFlags::NONBLOCK)?;

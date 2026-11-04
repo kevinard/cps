@@ -141,18 +141,20 @@ recipe '    probe
 
 export CPS_TEST_SECRET=should-be-cleared
 build_package() {
-    "$cps" build --repo repo --publisher canopa --trust-key public.der --sources sources "$@"
+    "$cps" build --repo repo --publisher canopa --trust-key public.der "$@"
 }
-build_package --builder-signing-key builder.der --check-reproducible --output first build.kdl
-(umask 077; build_package --builder-signing-key builder.der --check-reproducible --output second build.kdl)
+"$cps" source import --from sources --cache cache build.kdl
+"$cps" source fetch --cache cache build.kdl
+build_package --source-cache cache --builder-signing-key builder.der --check-reproducible --output first build.kdl
+(umask 077; build_package --sources sources --builder-signing-key builder.der --check-reproducible --output second build.kdl)
 diff -r first second
-build_package --builder-signing-key other.der --check-reproducible --output unapproved build.kdl
+build_package --sources sources --builder-signing-key other.der --check-reproducible --output unapproved build.kdl
 test ! -e first/proto/unlisted
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
 test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
 
 recipe '    probe unstable > "$DESTDIR/hello"' > unstable.kdl
-if build_package --check-reproducible --output unstable unstable.kdl 2> unstable.log; then
+if build_package --sources sources --check-reproducible --output unstable unstable.kdl 2> unstable.log; then
     echo "nondeterministic build unexpectedly succeeded" >&2
     exit 1
 fi
@@ -160,7 +162,7 @@ grep -F 'build is not reproducible for hello' unstable.log
 test ! -e unstable
 
 recipe '    probe symlink' > symlink.kdl
-if build_package --output symlink symlink.kdl 2> symlink.log; then
+if build_package --sources sources --output symlink symlink.kdl 2> symlink.log; then
     echo "symlink build output unexpectedly succeeded" >&2
     exit 1
 fi
@@ -169,12 +171,21 @@ test ! -e symlink
 
 # A same-length modification must fail digest verification before the sandbox starts.
 printf 'x' | dd of=sources/input bs=1 conv=notrunc status=none
-if build_package --output bad build.kdl 2> bad.log; then
+if build_package --sources sources --output bad build.kdl 2> bad.log; then
     echo "corrupt source unexpectedly succeeded" >&2
     exit 1
 fi
 grep -F 'source digest or length mismatch for input' bad.log
 test ! -e bad
+object=$(find cache/sha256 -type f)
+chmod u+w "$object"
+printf 'x' | dd of="$object" bs=1 conv=notrunc status=none
+if build_package --source-cache cache --output bad-cache build.kdl 2> bad-cache.log; then
+    echo 'corrupt cached source unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'source digest or length mismatch for input' bad-cache.log
+test ! -e bad-cache
 
 reviewed=$(sha build.kdl)
 mkdir release

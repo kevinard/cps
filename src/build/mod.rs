@@ -1,9 +1,10 @@
 mod sandbox;
+pub(crate) mod sources;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek},
+    io::{self, Seek},
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
 };
@@ -16,10 +17,10 @@ use rustix::{
 use tempfile::TempDir;
 
 use crate::{
-    attestation::{self, RECIPE_LIMIT, Toolchain},
+    attestation::{self, Toolchain},
     image::root::Root,
     kdl_format::{
-        build::{BuildRecipe, parse},
+        build::{BuildRecipe, read},
         parse_manifest,
     },
     model::{FileDigest, Node, digest, digest_reader},
@@ -66,6 +67,19 @@ pub fn build(
 }
 
 pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<String> {
+    build_with_sources(recipe_path, options, false)
+}
+
+/// Build offline using pinned objects from a source cache.
+pub fn build_cached_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<String> {
+    build_with_sources(recipe_path, options, true)
+}
+
+fn build_with_sources(
+    recipe_path: &Path,
+    options: BuildOptions<'_>,
+    cached: bool,
+) -> Result<String> {
     let BuildOptions {
         repo,
         publisher,
@@ -87,9 +101,7 @@ pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<St
         matches!(std::env::consts::ARCH, "x86_64" | "aarch64"),
         "the build sandbox supports x86_64 and aarch64"
     );
-    let recipe_bytes = read_limited(File::open(recipe_path)?, RECIPE_LIMIT)?;
-    let recipe = parse(std::str::from_utf8(&recipe_bytes)?)
-        .with_context(|| format!("parsing build recipe {}", recipe_path.display()))?;
+    let (recipe_bytes, recipe) = read(recipe_path)?;
     ensure!(
         recipe.arch == std::env::consts::ARCH,
         "toolchain architecture {} does not match this build worker",
@@ -118,7 +130,7 @@ pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<St
     let work = TempDir::new_in(&destination)?;
     let inputs = work.path().join("sources");
     fs::create_dir(&inputs)?;
-    stage_sources(sources, &inputs, &recipe)?;
+    stage_sources(sources, &inputs, &recipe, cached)?;
     let script = work.path().join("build.sh");
     fs::write(&script, &recipe.script)?;
     set_mode(&script, 0o444)?;
@@ -222,17 +234,19 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(fs::set_permissions(path, fs::Permissions::from_mode(mode))?)
 }
 
-fn stage_sources(root: &Path, input: &Path, recipe: &BuildRecipe) -> Result<()> {
+fn stage_sources(root: &Path, input: &Path, recipe: &BuildRecipe, cached: bool) -> Result<()> {
     let root = Root::open(root)?;
+    let root = if cached {
+        root.subdir(sources::OBJECTS)?
+    } else {
+        root
+    };
     let mut directories = BTreeSet::from([input.to_owned()]);
-    for (path, FileDigest { sha256, size }) in &recipe.sources {
-        let mut source = root
-            .file(path)
+    for (path, source) in &recipe.sources {
+        let pin = &source.pin;
+        let file = root
+            .file(if cached { &pin.sha256 } else { path })
             .with_context(|| format!("opening build source {path}"))?;
-        ensure!(
-            source.metadata()?.len() == *size,
-            "source length mismatch for {path}"
-        );
         let staged = input.join(path);
         fs::create_dir_all(parent(&staged))?;
         directories.extend(
@@ -242,17 +256,12 @@ fn stage_sources(root: &Path, input: &Path, recipe: &BuildRecipe) -> Result<()> 
                 .take_while(|dir| dir.starts_with(input))
                 .map(Path::to_owned),
         );
-        let mut file = OpenOptions::new()
+        let mut destination = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&staged)?;
-        let copied = io::copy(&mut source.by_ref().take(size.saturating_add(1)), &mut file)?;
-        file.rewind()?;
-        ensure!(
-            copied == *size && digest_reader(&mut file)? == *sha256,
-            "source digest or length mismatch for {path}"
-        );
+        sources::copy_verified(file, &mut destination, pin, path)?;
         set_mode(&staged, 0o444)?;
         normalize(&staged, recipe.epoch)?;
     }

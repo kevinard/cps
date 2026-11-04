@@ -11,9 +11,9 @@ use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, ImageConfig, Plan, Request, activate_boot_environment, apply,
-    build_package, create_image, list_boot_environments, plan, publish, publish_bundle,
-    read_attestation, read_image_config, release, rollback_boot_environment,
-    stage_boot_environment, verify,
+    build_cached_package, build_package, create_image, fetch_sources, import_sources,
+    list_boot_environments, plan, publish, publish_bundle, read_attestation, read_image_config,
+    release, rollback_boot_environment, stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -25,6 +25,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Prepare pinned package sources for offline builds
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
     /// Build a package with verified inputs in an offline sandbox
     Build {
         #[arg(long)]
@@ -33,8 +38,10 @@ enum Command {
         publisher: String,
         #[arg(long)]
         trust_key: PathBuf,
-        #[arg(long)]
-        sources: PathBuf,
+        #[arg(long, required_unless_present = "source_cache")]
+        sources: Option<PathBuf>,
+        #[arg(long, conflicts_with = "sources")]
+        source_cache: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -137,6 +144,24 @@ enum Command {
     BootEnv {
         #[command(subcommand)]
         command: BootCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCommand {
+    /// Download missing sources over HTTPS and verify their pins
+    Fetch {
+        #[arg(long)]
+        cache: PathBuf,
+        recipe: PathBuf,
+    },
+    /// Verify and cache sources from a local directory
+    Import {
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long)]
+        from: PathBuf,
+        recipe: PathBuf,
     },
 }
 
@@ -289,28 +314,45 @@ fn print_packages(rows: impl IntoIterator<Item = PackageRow>) -> Result<()> {
 
 fn run(command: Command) -> Result<ExitCode> {
     match command {
+        Command::Source { command } => {
+            let count = match command {
+                SourceCommand::Fetch { cache, recipe } => fetch_sources(&recipe, &cache)?,
+                SourceCommand::Import {
+                    cache,
+                    from,
+                    recipe,
+                } => import_sources(&recipe, &cache, &from)?,
+            };
+            println!("Verified {count} pinned source(s) in the cache");
+        }
         Command::Build {
             repo,
             publisher,
             trust_key,
             sources,
+            source_cache,
             output,
             check_reproducible,
             builder_signing_key,
             recipe,
         } => {
-            let id = build_package(
-                &recipe,
-                BuildOptions {
-                    repo: &repo,
-                    publisher: &publisher,
-                    trust_key: &trust_key,
-                    sources: &sources,
-                    output: &output,
-                    check_reproducible,
-                    builder_signing_key: builder_signing_key.as_deref(),
-                },
-            )?;
+            let options = BuildOptions {
+                repo: &repo,
+                publisher: &publisher,
+                trust_key: &trust_key,
+                sources: source_cache
+                    .as_deref()
+                    .or(sources.as_deref())
+                    .context("missing build sources")?,
+                output: &output,
+                check_reproducible,
+                builder_signing_key: builder_signing_key.as_deref(),
+            };
+            let id = if source_cache.is_some() {
+                build_cached_package(&recipe, options)?
+            } else {
+                build_package(&recipe, options)?
+            };
             println!("Built {id} at {}", output.display());
         }
         Command::Publish {
