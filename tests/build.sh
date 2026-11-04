@@ -523,7 +523,7 @@ test "$(cat witnessed/current)" = "$witnessed_catalog"
 cat > wave.kdl <<WAVE
 schema-version 1
 release "canopa" base="$witnessed_catalog" {
-    withdraw "cps://canopa/demo/hello@1.0.0-0"
+    obsolete "cps://canopa/demo/hello@1.1.0-0"
     bundle "cps://canopa/demo/hello@2.0.0-0" path="hello2-a" builder-key="builder-public.der" recipe-sha256="$hello2_reviewed" {
         witness "hello2-b/attestation.json" key="other-public.der"
     }
@@ -550,6 +550,8 @@ test "$(cat repeat/current)" = "$wave_catalog"
 test "$(find witnessed/catalogs -type f | wc -l)" -eq 2
 "$cps" repo withdrawals --repo witnessed --publisher canopa --trust-key public.der \
     | grep -F 'cps://canopa/demo/hello@1.0.0-0'
+test "$("$cps" repo obsoletions --repo witnessed --publisher canopa --trust-key public.der)" = \
+    'cps://canopa/demo/hello@1.1.0-0'
 expect_failure 'checking release profile base' "$cps" repo withdraw \
     --repo witnessed --signing-key signing.der cps://canopa/library/platform@1.0.0-0
 mv witnessed/publish-policy.kdl gate.saved

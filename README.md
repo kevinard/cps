@@ -325,6 +325,31 @@ payloads and build evidence for recovery and auditing. A fresh cache only fetche
 objects for active versions. Upgrade clients before distributing a catalog with
 withdrawals.
 
+To retire a package name as part of a rolling release, add an `obsolete` action
+to the KDL file for `repo publish-release`.
+
+```kdl
+schema-version 1
+release "canopa" base="<reviewed catalog SHA-256>" {
+    obsolete "cps://canopa/library/legacy@2.0.0-0"
+}
+```
+
+The cutoff must be newer than every previously published version of that
+package. CPS withdraws its active versions and signs the cutoff into the same
+catalog. New install and update plans cannot select versions through the cutoff.
+If a selected publisher has obsoleted an installed package and offers no newer
+version, resolving a transaction removes it when remaining dependencies allow
+that removal. Coordinate changes to dependents in the same release. Removal
+preserves locally edited configuration under the ordinary image rules.
+
+An obsoletion reserves the name at its publisher's position in the search order.
+A higher version can reintroduce the package, while the cutoff and earlier
+withdrawals remain in the signed history. Saved plans still use their pinned
+catalogs. Inspect the cutoffs with `cps repo obsoletions --repo repo --publisher
+canopa --trust-key public.der`. Clients need obsoletion support to read catalogs
+containing these records.
+
 ### Publisher order
 
 An image configuration can declare multiple publisher blocks in search order.

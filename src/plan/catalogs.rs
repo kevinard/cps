@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use super::Plan;
 use crate::{
     image::State,
-    model::PackageSpec,
+    model::{PackageSpec, Version},
     repo::{Published, snapshot},
 };
 
@@ -14,6 +14,7 @@ pub(super) struct Catalogs {
     pub legacy: Option<String>,
     pub pins: BTreeMap<String, String>,
     pub packages: Vec<Published>,
+    pub obsoletions: BTreeMap<String, Version>,
 }
 
 pub(super) fn requested<'a>(
@@ -92,9 +93,18 @@ pub(super) fn load(
         };
         let snapshot = snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
             .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
+        for (name, cutoff) in &snapshot.obsoletions {
+            if *sources.entry(name.clone()).or_insert(&publisher.name) == publisher.name {
+                catalogs.obsoletions.insert(name.clone(), *cutoff);
+            }
+        }
         for spec in requested.values() {
             if let Some(version) = spec.version
                 && sources.get(spec.name) == Some(&publisher.name.as_str())
+                && snapshot
+                    .obsoletions
+                    .get(spec.name)
+                    .is_none_or(|cutoff| version > *cutoff)
             {
                 let id = format!("cps://{}/{}@{version}", publisher.name, spec.name);
                 ensure!(!snapshot.is_withdrawn(&id), "{id} was withdrawn");

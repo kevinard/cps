@@ -15,7 +15,7 @@ use crate::{
     attestation::{self, Toolchain},
     fetch_plan,
     kdl_format::{build, parse_manifest},
-    list_withdrawals,
+    list_obsoletions, list_withdrawals,
     model::FileDigest,
     publish_bundle, publish_release, read_attestation, release as mirror_release,
     repo::{read_key, read_signing_key, snapshot},
@@ -282,6 +282,20 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
         "{message}"
     );
     assert_eq!(fs::read_to_string(f.repo.join("current"))?, old);
+    write_policy("desktop/compositor")?;
+    let release = f._dir.path().join("obsolete.kdl");
+    fs::write(
+        &release,
+        format!(
+            "schema-version 1\nrelease \"canopa\" base={:?} {{\n    obsolete \"cps://canopa/library/legacy@2.0.0-0\"\n}}\n",
+            old.trim(),
+        ),
+    )?;
+    publish_release(&f.repo, &f.private, &release)?;
+    assert_eq!(
+        list_obsoletions(&f.repo, "canopa", &f.public)?,
+        ["cps://canopa/library/legacy@2.0.0-0"]
+    );
     Ok(())
 }
 
@@ -336,6 +350,162 @@ fn sign_publisher_release(
                 .await?;
             Ok(())
         })
+}
+
+#[test]
+fn tuf_obsoletion_removes_only_when_dependencies_allow_and_preserves_history() -> Result<()> {
+    use crate::query::{Scope, list_packages, package_manifest};
+
+    const NAME: &str = "library/legacy";
+    const OLD: &str = "cps://canopa/library/legacy@1.0.0-0";
+    const CUTOFF: &str = "cps://canopa/library/legacy@2.0.0-0";
+    let f = Fixture::new()?;
+    let extras = Fixture::new()?;
+    let work = f._dir.path();
+    let cache = work.join("cache");
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let sync = |version| {
+        let mirror = work.join(format!("mirror-{version}"));
+        sign_release(&f, &mirror, version, fresh, &anchor, &tuf_key)?;
+        let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+        let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+        mirror_release::sync(
+            &cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    let create = |root: &Path| -> Result<()> {
+        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        crate::add_publisher(root, "extras", &extras.repo, &extras.public)
+    };
+    let install = |root: &Path, package: &str| {
+        plan(
+            root,
+            Request::Install {
+                packages: vec![package.to_owned()],
+            },
+        )
+    };
+    let config = f.file(CONFIG, "vendor", "0644", "preserve=#true")?;
+    f.package(
+        NAME,
+        "1.0.0-0",
+        f.file(LIBRARY, "legacy", "0644", "")? + &config,
+    )?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "original", "0755", "")? + &dependency("require", NAME, "1.0.0-0"),
+    )?;
+    extras.package_as("extras", NAME, "9.0.0-0", String::new())?;
+    let base = sync(1)?;
+    create(&f.root)?;
+    apply(&f.root, &install(&f.root, "desktop/compositor")?)?;
+    fs::write(f.root.join(CONFIG), "local settings")?;
+    let historical = work.join("historical");
+    create(&historical)?;
+    let saved = install(&historical, OLD)?;
+    let skipped = work.join("skipped");
+    create(&skipped)?;
+    apply(&skipped, &install(&skipped, OLD)?)?;
+
+    let release = work.join("retire.kdl");
+    let retire = |id: &str| {
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={base:?} {{\n    obsolete {id:?}\n}}\n"
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)
+    };
+    assert!(
+        retire(OLD)
+            .unwrap_err()
+            .to_string()
+            .contains("must be newer")
+    );
+    let retired = retire(CUTOFF)?;
+    assert_eq!(sync(2)?, retired);
+    assert_eq!(list_obsoletions(&cache, "canopa", &f.public)?, [CUTOFF]);
+    assert!(list_withdrawals(&cache, "canopa", &f.public)?.contains_key(OLD));
+    let error = plan(&f.root, Request::Update).unwrap_err();
+    assert!(format!("{error:#}").contains(NAME));
+    assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "legacy");
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "original");
+
+    let fresh_root = work.join("fresh");
+    create(&fresh_root)?;
+    let error = install(&fresh_root, NAME).unwrap_err();
+    assert!(error.to_string().contains("is obsolete through 2.0.0-0"));
+    assert!(
+        install(&fresh_root, OLD)
+            .unwrap_err()
+            .to_string()
+            .contains("is obsolete")
+    );
+    assert!(
+        package_manifest(&fresh_root, NAME, true)
+            .unwrap_err()
+            .to_string()
+            .contains("is obsolete")
+    );
+    assert!(
+        list_packages(&fresh_root, Scope::Available)?
+            .iter()
+            .all(|row| row.name != NAME)
+    );
+    let qualified = "cps://extras/library/legacy@9.0.0-0";
+    apply(&fresh_root, &install(&fresh_root, qualified)?)?;
+    apply(&fresh_root, &plan(&fresh_root, Request::Update)?)?;
+    assert!(
+        list_packages(&fresh_root, Scope::Installed)?
+            .iter()
+            .any(|row| row.id == qualified)
+    );
+
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "current", "0755", "")?,
+    )?;
+    sync(3)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(
+        update
+            .summary()
+            .contains("Remove cps://canopa/library/legacy")
+    );
+    apply(&f.root, &update)?;
+    assert!(!f.root.join(LIBRARY).exists());
+    assert_eq!(fs::read_to_string(f.root.join(CONFIG))?, "local settings");
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "current");
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+
+    apply(&historical, &saved)?;
+    assert_eq!(fs::read_to_string(historical.join(LIBRARY))?, "legacy");
+    apply(&historical, &plan(&historical, Request::Update)?)?;
+    assert!(list_packages(&historical, Scope::Installed)?.is_empty());
+    assert!(!historical.join(LIBRARY).exists());
+    assert!(
+        f.package(NAME, "2.0.0-0", String::new())
+            .unwrap_err()
+            .to_string()
+            .contains("obsolete")
+    );
+    f.package(NAME, "3.0.0-0", f.file(LIBRARY, "revived", "0644", "")?)?;
+    sync(4)?;
+    apply(&skipped, &plan(&skipped, Request::Update)?)?;
+    assert_eq!(fs::read_to_string(skipped.join(LIBRARY))?, "revived");
+    assert_eq!(list_obsoletions(&cache, "canopa", &f.public)?, [CUTOFF]);
+    Ok(())
 }
 
 #[test]

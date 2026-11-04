@@ -21,7 +21,7 @@ use crate::{
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
 };
-pub(crate) use resolve::{check as check_dependencies, resolve as resolve_packages};
+pub(crate) use resolve::{Candidates, check as check_dependencies, resolve as resolve_packages};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -231,7 +231,10 @@ pub(crate) fn build(
             catalogs = catalogs::load(&state, &requested, saved)?;
             resolve::resolve(
                 &state.installed,
-                &catalogs.packages,
+                Candidates {
+                    packages: &catalogs.packages,
+                    obsoletions: &catalogs.obsoletions,
+                },
                 &requested,
                 matches!(request, Request::Update),
                 matches!(request, Request::ExactInstall { .. }),

@@ -25,7 +25,7 @@ use crate::{
         parse_manifest,
     },
     model::{FileDigest, Node, PackageSpec, digest, digest_reader},
-    plan::{resolve_packages, select_paths},
+    plan::{Candidates, resolve_packages, select_paths},
     repo::{MANIFEST_LIMIT, read_key, read_limited, read_signing_key, snapshot, stage_blob},
 };
 
@@ -328,7 +328,10 @@ fn prepare_toolchain(
         .collect();
     let (installed, paths) = resolve_packages(
         &BTreeMap::new(),
-        &release.packages,
+        Candidates {
+            packages: &release.packages,
+            obsoletions: &release.obsoletions,
+        },
         &requested,
         false,
         true,

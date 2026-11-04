@@ -7,13 +7,18 @@ use anyhow::{Context, Result, ensure};
 use super::SolverRevision;
 use crate::{
     image::Installed,
-    model::{Dependency, DependencyTarget, PackageSpec},
+    model::{Dependency, DependencyTarget, PackageSpec, Version},
     repo::Published,
 };
 
+pub(crate) struct Candidates<'a> {
+    pub packages: &'a [Published],
+    pub obsoletions: &'a BTreeMap<String, Version>,
+}
+
 pub fn resolve<T>(
     installed: &BTreeMap<String, Installed>,
-    packages: &[Published],
+    available: Candidates<'_>,
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     update: bool,
     exact: bool,
@@ -21,10 +26,21 @@ pub fn resolve<T>(
     compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
 ) -> Result<(BTreeMap<String, Installed>, T)> {
     let mut candidates = BTreeMap::<_, Vec<_>>::new();
-    for package in packages
+    let obsolete = |package: &Published| {
+        let manifest = &package.manifest;
+        available
+            .obsoletions
+            .get(&manifest.name)
+            .is_some_and(|cutoff| manifest.version <= *cutoff)
+    };
+    for package in available
+        .packages
         .iter()
         .chain(installed.values().map(|pkg| &pkg.published))
     {
+        if obsolete(package) {
+            continue;
+        }
         let manifest = &package.manifest;
         let spec = requested.get(manifest.name.as_str());
         let pinned = spec.and_then(|spec| spec.version);
@@ -67,6 +83,16 @@ pub fn resolve<T>(
         versions.dedup_by(|a, b| a.sha256 == b.sha256);
     }
     for spec in requested.values() {
+        if let Some(cutoff) = available.obsoletions.get(spec.name) {
+            ensure!(
+                spec.version.map_or_else(
+                    || candidates.contains_key(spec.name),
+                    |version| version > *cutoff
+                ),
+                "{} is obsolete through {cutoff}",
+                spec.name
+            );
+        }
         if let Some(version) = spec.version {
             ensure!(
                 candidates.contains_key(spec.name),
@@ -77,9 +103,11 @@ pub fn resolve<T>(
     }
 
     let wanted: BTreeSet<_> = installed
-        .keys()
-        .filter(|_| !exact)
-        .map(String::as_str)
+        .iter()
+        .filter(|(name, package)| {
+            !exact && (!obsolete(&package.published) || candidates.contains_key(name.as_str()))
+        })
+        .map(|(name, _)| name.as_str())
         .chain(requested.keys().copied())
         .collect();
     let materialize = |selected: BTreeMap<&str, &Published>| {

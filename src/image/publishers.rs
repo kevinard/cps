@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 
 use super::{Image, Publisher, Publishers};
-use crate::{model::validate_publisher, repo::catalog_entries};
+use crate::{model::validate_publisher, repo::catalog_index};
 
 pub struct PublisherInfo {
     pub name: String,
@@ -33,7 +33,7 @@ pub fn add_publisher(root: &Path, name: &str, repo: &Path, key: &Path) -> Result
         "publisher {name} is already configured"
     );
     let publisher = Publisher::from_config(name, repo, key)?;
-    catalog_entries(&publisher.repo, name, &publisher.key)
+    catalog_index(&publisher.repo, name, &publisher.key)
         .with_context(|| format!("verifying signed catalog for {name}"))?;
     let mut publishers = configured.as_slice().to_vec();
     publishers.push(publisher);

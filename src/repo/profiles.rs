@@ -10,7 +10,10 @@ use crate::{
     image::{Installed, Managed},
     kdl_format::publish_policy::Profile,
     model::{Node, PackageSpec, Version},
-    plan::{SolverRevision, check_directory, check_path_type, resolve_packages, select_paths},
+    plan::{
+        Candidates, SolverRevision, check_directory, check_path_type, resolve_packages,
+        select_paths,
+    },
 };
 
 use super::{Catalog, Published, read_catalog, read_package};
@@ -94,7 +97,10 @@ fn compose(
     }
     resolve_packages(
         &BTreeMap::new(),
-        packages,
+        Candidates {
+            packages,
+            obsoletions: &BTreeMap::new(),
+        },
         &requested,
         false,
         true,
@@ -132,7 +138,10 @@ fn check_upgrade(
         .context("composing the baseline image")?;
     let (after, new_paths) = resolve_packages(
         &before,
-        packages,
+        Candidates {
+            packages,
+            obsoletions: &catalog.obsoletions,
+        },
         &BTreeMap::new(),
         true,
         false,

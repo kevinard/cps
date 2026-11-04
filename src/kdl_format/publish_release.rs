@@ -26,6 +26,7 @@ pub(crate) enum Change {
         witnesses: Vec<BuildWitness>,
     },
     Withdraw(String),
+    Obsolete(String),
 }
 
 fn path(value: String) -> Result<PathBuf> {
@@ -52,12 +53,13 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
         Some(base)
     };
     let mut ids = BTreeSet::new();
+    let mut obsoletions = BTreeSet::new();
     let mut changes = Vec::new();
     for node in release.children().into_iter().flat_map(KdlDocument::nodes) {
         let kind = node.name().value();
         let fields = match kind {
             "bundle" => Fields::read(node, 1, &["path", "builder-key", "recipe-sha256"], true)?,
-            "withdraw" => Fields::read(node, 1, &[], false)?,
+            "withdraw" | "obsolete" => Fields::read(node, 1, &[], false)?,
             _ => bail!("unknown release action {kind}"),
         };
         let id = fields.string_arg(0)?;
@@ -67,6 +69,15 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
             "release action requires a full package ID for {publisher}: {id}"
         );
         ensure!(ids.insert(id.clone()), "duplicate release action for {id}");
+        if kind == "obsolete" {
+            ensure!(
+                obsoletions.insert(spec.name.to_owned()),
+                "duplicate obsoletion for {}",
+                spec.name
+            );
+            changes.push(Change::Obsolete(id));
+            continue;
+        }
         if kind == "withdraw" {
             changes.push(Change::Withdraw(id));
             continue;

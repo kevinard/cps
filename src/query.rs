@@ -1,6 +1,10 @@
 //! Read-only queries of committed image state and the configured signed catalog.
 
-use std::{collections::BTreeMap, fmt, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
 
@@ -8,7 +12,7 @@ use crate::{
     image::{Image, Installed, Publisher, Publishers},
     kdl_format::manifest_text,
     model::{PackageSpec, Version, validate_digest},
-    repo::{catalog_entries, read_package},
+    repo::{catalog_index, read_package},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,9 +53,10 @@ struct CatalogEntry {
     sha256: String,
 }
 
-fn available(publisher: &Publisher) -> Result<Vec<CatalogEntry>> {
+fn available(publisher: &Publisher) -> Result<(Vec<CatalogEntry>, BTreeMap<String, Version>)> {
+    let index = catalog_index(&publisher.repo, &publisher.name, &publisher.key)?;
     let mut entries = Vec::new();
-    for (id, sha256) in catalog_entries(&publisher.repo, &publisher.name, &publisher.key)? {
+    for (id, sha256) in index.entries {
         let selector =
             PackageSpec::parse(&id).with_context(|| format!("invalid catalog ID {id}"))?;
         ensure!(
@@ -70,7 +75,7 @@ fn available(publisher: &Publisher) -> Result<Vec<CatalogEntry>> {
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| b.version.cmp(&a.version)));
-    Ok(entries)
+    Ok((entries, index.obsoletions))
 }
 
 fn installed(image: &Image, publishers: &Publishers) -> Result<BTreeMap<String, Installed>> {
@@ -106,14 +111,17 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
             .collect());
     }
     let mut entries = Vec::new();
+    let mut blocked = BTreeSet::new();
     for publisher in publishers.as_slice() {
-        let mut catalog = available(publisher)?;
+        let (mut catalog, obsoletions) = available(publisher)?;
         if scope == Scope::Available {
-            catalog.retain(|entry| {
+            let from_source = |name: &str| {
                 installed
-                    .get(&entry.name)
+                    .get(name)
                     .is_none_or(|pkg| pkg.published.manifest.publisher == publisher.name)
-            });
+            };
+            catalog.retain(|entry| from_source(&entry.name) && !blocked.contains(&entry.name));
+            blocked.extend(obsoletions.into_keys().filter(|name| from_source(name)));
         }
         entries.extend(catalog);
     }
@@ -164,12 +172,22 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
             if source.is_some_and(|name| publisher.name != name) {
                 continue;
             }
-            let entries = available(publisher)?;
+            let (entries, obsoletions) = available(publisher)?;
             let mut named = entries
                 .into_iter()
                 .filter(|entry| entry.name == selector.name)
                 .peekable();
-            if named.peek().is_some() {
+            if let Some(cutoff) = obsoletions.get(selector.name) {
+                ensure!(
+                    selector
+                        .version
+                        .map_or_else(|| named.peek().is_some(), |version| version > *cutoff),
+                    "{} is obsolete through {cutoff} for {}",
+                    selector.name,
+                    publisher.name,
+                );
+            }
+            if named.peek().is_some() || obsoletions.contains_key(selector.name) {
                 let entry = named
                     .find(|entry| accepts(entry.version))
                     .with_context(|| {

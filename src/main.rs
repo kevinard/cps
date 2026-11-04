@@ -12,10 +12,10 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
     add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_plan,
-    fetch_sources, generate_manifest, import_sources, list_boot_environments, list_publishers,
-    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
-    read_attestation, read_worker_config, release, remove_publisher, rollback_boot_environment,
-    stage_boot_environment, verify, verify_pristine, withdraw_package,
+    fetch_sources, generate_manifest, import_sources, list_boot_environments, list_obsoletions,
+    list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
+    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
+    rollback_boot_environment, stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -253,6 +253,15 @@ fn parse_witness(value: &str) -> std::result::Result<BuildWitness, String> {
 
 #[derive(Subcommand)]
 enum RepoCommand {
+    /// List signed package obsoletion cutoffs
+    Obsoletions {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+    },
     /// Commit a set of reviewed build bundles and withdrawals as one signed catalog
     PublishRelease {
         #[arg(long)]
@@ -523,6 +532,15 @@ fn run(command: Command) -> Result<ExitCode> {
             );
         }
         Command::Repo { command } => match command {
+            RepoCommand::Obsoletions {
+                repo,
+                publisher,
+                trust_key,
+            } => {
+                for id in list_obsoletions(&repo, &publisher, &trust_key)? {
+                    println!("{id}");
+                }
+            }
             RepoCommand::PublishRelease {
                 repo,
                 signing_key,

@@ -17,8 +17,8 @@ use crate::{
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
-        Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, digest, digest_reader,
-        validate_digest,
+        Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, digest, digest_reader,
+        validate_digest, validate_name,
     },
     systemd::{self, Action as SystemdAction},
 };
@@ -49,6 +49,8 @@ struct Catalog {
     sequence: Option<NonZeroU64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     profiles_required: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    obsoletions: BTreeMap<String, Version>,
 }
 
 impl Catalog {
@@ -62,6 +64,7 @@ impl Catalog {
             withdrawals: BTreeMap::new(),
             sequence: None,
             profiles_required: false,
+            obsoletions: BTreeMap::new(),
         }
     }
 
@@ -84,6 +87,57 @@ impl Catalog {
         Ok(true)
     }
 
+    fn obsolete(&mut self, id: &str) -> Result<bool> {
+        let spec = PackageSpec::parse(id)?;
+        ensure!(
+            spec.publisher == Some(&self.publisher),
+            "obsoletion belongs to a different publisher"
+        );
+        let cutoff = spec.version.context("obsoletion requires a version")?;
+        if let Some(previous) = self.obsoletions.get(spec.name) {
+            ensure!(
+                cutoff >= *previous,
+                "obsoletion must advance the cutoff for {}",
+                spec.name
+            );
+            if cutoff == *previous {
+                return Ok(false);
+            }
+        }
+        let prefix = format!("cps://{}/{}@", self.publisher, spec.name);
+        let active = self
+            .entries
+            .range(prefix.clone()..)
+            .map(|(id, _)| id)
+            .take_while(|id| id.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let retired = self
+            .withdrawals
+            .range(prefix.clone()..)
+            .map(|(id, _)| id)
+            .take_while(|id| id.starts_with(&prefix));
+        ensure!(
+            !active.is_empty() || retired.clone().next().is_some(),
+            "no published versions to obsolete for {}",
+            spec.name
+        );
+        for previous in active.iter().chain(retired) {
+            let version = PackageSpec::parse(previous)?
+                .version
+                .context("published package has no version")?;
+            ensure!(
+                cutoff > version,
+                "obsoletion {id} must be newer than {previous}"
+            );
+        }
+        for previous in active {
+            self.withdraw(&previous)?;
+        }
+        self.obsoletions.insert(spec.name.to_owned(), cutoff);
+        Ok(true)
+    }
+
     fn check_successor(&self, next: &Self) -> Result<()> {
         if let Some(previous) = self.sequence {
             ensure!(
@@ -103,6 +157,14 @@ impl Catalog {
             ensure!(
                 next.withdrawals.get(id) == Some(record),
                 "release drops or changes the withdrawal for {id}"
+            );
+        }
+        for (name, cutoff) in &self.obsoletions {
+            ensure!(
+                next.obsoletions
+                    .get(name)
+                    .is_some_and(|next| next >= cutoff),
+                "release drops or lowers the obsoletion for {name}"
             );
         }
         for (id, manifest) in &self.entries {
@@ -197,6 +259,7 @@ pub struct Snapshot {
     pub packages: Vec<Published>,
     attestations: BTreeMap<String, String>,
     withdrawals: BTreeMap<String, Withdrawal>,
+    pub(crate) obsoletions: BTreeMap<String, Version>,
 }
 
 impl Snapshot {
@@ -285,11 +348,31 @@ fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<
         )
         .map_err(|_| anyhow::anyhow!("invalid signature on catalog {hash}"))?;
     for (id, manifest) in &catalog.entries {
+        let spec = PackageSpec::parse(id)?;
+        let version = spec
+            .version
+            .with_context(|| format!("catalog entry {id} has no version"))?;
         ensure!(
-            exact_publisher(id)? == publisher,
+            spec.publisher == Some(publisher),
             "invalid catalog entry {id}"
         );
+        ensure!(
+            catalog
+                .obsoletions
+                .get(spec.name)
+                .is_none_or(|cutoff| version > *cutoff),
+            "catalog advertises obsolete package {id}"
+        );
         validate_digest(manifest)?;
+    }
+    for (name, cutoff) in &catalog.obsoletions {
+        validate_name(name)?;
+        ensure!(
+            !catalog
+                .withdrawals
+                .contains_key(&format!("cps://{publisher}/{name}@{cutoff}")),
+            "obsoletion for {name} reuses a published version"
+        );
     }
     let mut evidence = BTreeSet::new();
     for (id, digest) in &catalog.attestations {
@@ -354,15 +437,30 @@ pub fn snapshot(
         packages,
         attestations: catalog.attestations,
         withdrawals: catalog.withdrawals,
+        obsoletions: catalog.obsoletions,
     })
 }
 
-pub(crate) fn catalog_entries(
-    repo: &Path,
-    publisher: &str,
-    key: &[u8],
-) -> Result<BTreeMap<String, String>> {
-    Ok(read_catalog(repo, &read_current(repo)?, publisher, key)?.entries)
+pub(crate) struct CatalogIndex {
+    pub entries: BTreeMap<String, String>,
+    pub obsoletions: BTreeMap<String, Version>,
+}
+
+pub(crate) fn catalog_index(repo: &Path, publisher: &str, key: &[u8]) -> Result<CatalogIndex> {
+    let catalog = read_catalog(repo, &read_current(repo)?, publisher, key)?;
+    Ok(CatalogIndex {
+        entries: catalog.entries,
+        obsoletions: catalog.obsoletions,
+    })
+}
+
+pub fn list_obsoletions(repo: &Path, publisher: &str, key: &Path) -> Result<Vec<String>> {
+    let index = catalog_index(repo, publisher, &read_key(key)?)?;
+    Ok(index
+        .obsoletions
+        .into_iter()
+        .map(|(name, version)| format!("cps://{publisher}/{name}@{version}"))
+        .collect())
 }
 
 pub(crate) fn read_package(
@@ -638,6 +736,7 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
                 .with_context(|| format!("staging {id}"))?;
             }
             publish_release::Change::Withdraw(id) => changed |= catalog.withdraw(&id)?,
+            publish_release::Change::Obsolete(id) => changed |= catalog.obsolete(&id)?,
         }
     }
     if changed {
@@ -724,6 +823,12 @@ fn stage_manifest(
         !catalog.withdrawals.contains_key(&id),
         "{id} was withdrawn and cannot be republished"
     );
+    if let Some(cutoff) = catalog.obsoletions.get(&manifest.name) {
+        ensure!(
+            manifest.version > *cutoff,
+            "{id} is obsolete through {cutoff}"
+        );
+    }
     if let Some(policy) = policy {
         policy.verify(&id, evidence.as_ref())?;
         catalog.attestations_required = true;
@@ -1032,6 +1137,7 @@ mod tests {
             )]),
             sequence: NonZeroU64::new(1),
             profiles_required: true,
+            obsoletions: BTreeMap::from([("desktop/retired".to_owned(), "2.0.0-0".parse()?)]),
         };
         let mut next = previous.clone();
         next.sequence = NonZeroU64::new(3);
@@ -1044,6 +1150,14 @@ mod tests {
         next.profiles_required = false;
         assert!(previous.check_successor(&next).is_err());
         next.profiles_required = true;
+        next.obsoletions.clear();
+        assert!(previous.check_successor(&next).is_err());
+        next.obsoletions
+            .insert("desktop/retired".to_owned(), "1.0.0-0".parse()?);
+        assert!(previous.check_successor(&next).is_err());
+        next.obsoletions
+            .insert("desktop/retired".to_owned(), "3.0.0-0".parse()?);
+        previous.check_successor(&next)?;
 
         next.attestations.remove(&active);
         assert!(previous.check_successor(&next).is_err());
