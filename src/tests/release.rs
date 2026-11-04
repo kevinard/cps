@@ -439,11 +439,7 @@ fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()>
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "withdrawn");
 
     let error = refresh(&cache, &resurrected).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("drops or changes the withdrawal")
-    );
+    assert!(error.to_string().contains("catalog rollback or fork"));
     assert_eq!(
         fs::read_to_string(cache.join("current"))?.trim(),
         withdrawn_hash
@@ -460,5 +456,81 @@ fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()>
     apply(&f.root, &plan(&f.root, Request::Update)?)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "replacement");
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    Ok(())
+}
+
+#[test]
+fn tuf_cache_remembers_a_newer_publisher_catalog_after_a_failed_download() -> Result<()> {
+    let f = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let cache = work.join("cache");
+    let refresh = |name: &str| {
+        let mirror = work.join(name);
+        let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+        let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+        mirror_release::sync(
+            &cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    let sign =
+        |name: &str, version| sign_release(&f, &work.join(name), version, fresh, &anchor, &tuf_key);
+
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "old", "0755", "")?,
+    )?;
+    let current = f.repo.join("current");
+    let first = fs::read_to_string(&current)?;
+    sign("first", 1)?;
+    sign("replay", 3)?; // Fresh TUF metadata, original CPS publisher catalog.
+
+    f.package("test/fork", "1.0.0-0", String::new())?;
+    sign("fork", 4)?; // A different publisher-signed catalog at sequence 2.
+    fs::write(&current, &first)?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "new", "0755", "")?,
+    )?;
+    let second = fs::read_to_string(&current)?;
+    publish(&f.repo, &f.proto, &f.recipe, &f.private)?;
+    assert_eq!(fs::read_to_string(&current)?, second);
+    sign("second", 2)?;
+
+    assert_eq!(refresh("first")?, first.trim());
+    let checkpoint = cache.join(".tuf/catalog");
+    fs::remove_file(&checkpoint)?; // Upgrade an existing cache without a publisher checkpoint.
+    let blob = digest(b"new");
+    fs::write(
+        work.join("second/targets")
+            .join(format!("{blob}.blobs-{blob}")),
+        b"bad",
+    )?;
+    let corrupt = refresh("second").unwrap_err();
+    assert!(format!("{corrupt:#}").contains("Hash mismatch"));
+    assert_eq!(fs::read_to_string(&checkpoint)?, second);
+    assert_eq!(fs::read_to_string(cache.join("current"))?, first);
+
+    for rejected in ["replay", "fork"] {
+        let error = refresh(rejected).unwrap_err();
+        assert!(error.to_string().contains("catalog rollback or fork"));
+        assert_eq!(fs::read_to_string(&checkpoint)?, second);
+        assert_eq!(fs::read_to_string(cache.join("current"))?, first);
+    }
+
+    sign("restored", 5)?;
+    assert_eq!(refresh("restored")?, second.trim());
+    assert_eq!(refresh("restored")?, second.trim());
+    assert_eq!(fs::read_to_string(cache.join("current"))?, second);
     Ok(())
 }

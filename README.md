@@ -218,6 +218,17 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 
 Sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and the complete release. A failed download leaves the last complete release available. The cache retains previous content-addressed objects for saved plans. Planning and applying can use the last cached release offline. TUF freshness is checked at sync time.
 
+Each new publication or withdrawal advances a sequence signed by the CPS
+publisher. Sync remembers the newest authenticated catalog even if downloading
+its payloads fails. It rejects older publisher sequences and different catalogs
+with a sequence it has already seen, including when those catalogs arrive with
+newer TUF metadata. Sync can retry the same catalog and can skip sequences. A
+successor must preserve known package identities, build evidence, and
+withdrawals. Once a repository requires build evidence, sync also enforces that
+requirement on successors. Older catalogs remain readable, and the first change
+made to a legacy repository starts its sequence at one. Upgrade clients before
+publishing sequenced catalogs.
+
 The publisher signs the association between each package and its build evidence. Export and sync carry the evidence with the release. To retrieve it, use `cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-key public.der cps://canopa/demo/hello@1.0.0-0`. Clients need a CPS version that supports attestations before they can read catalogs containing that field.
 
 To withdraw an exact version, use the publisher signing key on the publishing

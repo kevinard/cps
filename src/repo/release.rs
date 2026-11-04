@@ -25,14 +25,15 @@ use crate::{
 
 use super::{
     CATALOG_LIMIT, MANIFEST_LIMIT, Published, Root, load_manifest, lock_repo, parse_current,
-    path_present, prepare_objects, read_catalog, read_current, read_key, read_limited, snapshot,
-    write_atomic,
+    path_present, prepare_objects, read_catalog, read_current, read_key, read_limited,
+    read_pointer, snapshot, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
 
 const ROOT_LIMIT: u64 = 1024 * 1024;
 const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
+const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
 const CHECKPOINT_FILES: [(&str, u64); 4] = [
     ("root.json", ROOT_LIMIT),
     ("timestamp.json", ROOT_LIMIT),
@@ -242,17 +243,21 @@ async fn materialize(
     let hash = parse_current(&String::from_utf8(read_limited(pointer.reopen()?, 65)?)?)?;
     fetch_object(verified, repo, "catalogs", &hash, CATALOG_LIMIT, None).await?;
     let catalog = read_catalog(repo, &hash, publisher, key)?;
-    if path_present(&repo.join("current"))? {
-        let previous = read_current(repo)?;
-        if previous != hash {
-            let previous = read_catalog(repo, &previous, publisher, key)?;
-            for (id, record) in previous.withdrawals {
-                ensure!(
-                    catalog.withdrawals.get(&id) == Some(&record),
-                    "release drops or changes the withdrawal for {id}"
-                );
-            }
+    let checkpoint = repo.join(PUBLISHER_CHECKPOINT);
+    let trusted = path_present(&checkpoint)?
+        .then(|| read_pointer(repo, PUBLISHER_CHECKPOINT))
+        .transpose()?;
+    if trusted.as_deref() != Some(&hash) {
+        let previous = match trusted {
+            Some(previous) => Some(previous),
+            None if path_present(&repo.join("current"))? => Some(read_current(repo)?),
+            None => None,
+        };
+        if let Some(previous) = previous.filter(|previous| previous != &hash) {
+            read_catalog(repo, &previous, publisher, key)?.check_successor(&catalog)?;
         }
+        // Remember the signed catalog even when its payloads cannot be fetched.
+        write_atomic(&checkpoint, format!("{hash}\n").as_bytes(), false)?;
     }
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, Write},
+    num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
@@ -42,6 +43,46 @@ struct Catalog {
     attestations_required: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     withdrawals: BTreeMap<String, Withdrawal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence: Option<NonZeroU64>,
+}
+
+impl Catalog {
+    fn check_successor(&self, next: &Self) -> Result<()> {
+        if let Some(previous) = self.sequence {
+            ensure!(
+                next.sequence.is_some_and(|sequence| sequence > previous),
+                "publisher catalog rollback or fork after sequence {previous}"
+            );
+        }
+        ensure!(
+            !self.attestations_required || next.attestations_required,
+            "release disables the publisher's build evidence requirement"
+        );
+        for (id, record) in &self.withdrawals {
+            ensure!(
+                next.withdrawals.get(id) == Some(record),
+                "release drops or changes the withdrawal for {id}"
+            );
+        }
+        for (id, manifest) in &self.entries {
+            let (next_manifest, next_attestation) = match next.withdrawals.get(id) {
+                Some(record) => (Some(&record.manifest), record.attestation.as_ref()),
+                None => (next.entries.get(id), next.attestations.get(id)),
+            };
+            ensure!(
+                next_manifest == Some(manifest),
+                "release drops or changes the published manifest for {id}"
+            );
+            if let Some(attestation) = self.attestations.get(id) {
+                ensure!(
+                    next_attestation == Some(attestation),
+                    "release drops or changes the build attestation for {id}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -144,9 +185,13 @@ pub(crate) fn read_signing_key(path: &Path) -> Result<Ed25519KeyPair> {
 }
 
 fn read_current(repo: &Path) -> Result<String> {
+    read_pointer(repo, "current")
+}
+
+fn read_pointer(repo: &Path, name: &str) -> Result<String> {
     let pointer = String::from_utf8(
-        read_limited(Root::open(repo)?.file("current")?, 65)
-            .context("reading repository current catalog")?,
+        read_limited(Root::open(repo)?.file(name)?, 65)
+            .with_context(|| format!("reading repository pointer {name}"))?,
     )?;
     parse_current(&pointer)
 }
@@ -199,6 +244,13 @@ fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<
             &hex::decode(signed.signature)?,
         )
         .map_err(|_| anyhow::anyhow!("invalid signature on catalog {hash}"))?;
+    for (id, manifest) in &catalog.entries {
+        ensure!(
+            exact_publisher(id)? == publisher,
+            "invalid catalog entry {id}"
+        );
+        validate_digest(manifest)?;
+    }
     let mut evidence = BTreeSet::new();
     for (id, digest) in &catalog.attestations {
         validate_digest(digest)?;
@@ -506,6 +558,7 @@ fn publish_manifest(
             attestations: BTreeMap::new(),
             attestations_required: false,
             withdrawals: BTreeMap::new(),
+            sequence: None,
         }
     };
     let id = manifest.id();
@@ -585,7 +638,14 @@ fn publish_manifest(
     Ok(id)
 }
 
-fn write_catalog(repo: &Path, catalog: Catalog, key: &Ed25519KeyPair) -> Result<()> {
+fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<()> {
+    let sequence = catalog
+        .sequence
+        .map_or(0, NonZeroU64::get)
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .context("publisher catalog sequence exhausted")?;
+    catalog.sequence = Some(sequence);
     let signature = hex::encode(key.sign(&serde_json::to_vec(&catalog)?).as_ref());
     let signed = SignedCatalog { catalog, signature };
     let signed = serde_json::to_vec(&signed)?;
@@ -727,6 +787,79 @@ pub fn canonical_repo(repo: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_catalog_signatures_and_first_sequence() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        prepare_objects(repo.path())?;
+        let key =
+            Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("generate key");
+        let key = Ed25519KeyPair::from_pkcs8(key.as_ref()).expect("read generated key");
+        let legacy = br#"{"format":1,"publisher":"canopa","entries":{}}"#;
+        let signed = format!(
+            r#"{{"catalog":{},"signature":"{}"}}"#,
+            std::str::from_utf8(legacy)?,
+            hex::encode(key.sign(legacy).as_ref())
+        );
+        let hash = store(repo.path(), "catalogs", signed.as_bytes())?;
+        let read =
+            |hash: &str| read_catalog(repo.path(), hash, "canopa", key.public_key().as_ref());
+        let previous = read(&hash)?;
+        assert!(previous.sequence.is_none());
+        write_catalog(repo.path(), previous.clone(), &key)?;
+        let next = read(&read_current(repo.path())?)?;
+        assert_eq!(next.sequence, NonZeroU64::new(1));
+        previous.check_successor(&next)?;
+        assert!(next.check_successor(&previous).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_successors_preserve_signed_publication_records() -> Result<()> {
+        let active = "cps://canopa/desktop@2.0.0-0".to_owned();
+        let withdrawn = "cps://canopa/desktop@1.0.0-0".to_owned();
+        let manifest = digest(b"active manifest");
+        let attestation = digest(b"build evidence");
+        let previous = Catalog {
+            format: FORMAT,
+            publisher: "canopa".to_owned(),
+            entries: BTreeMap::from([(active.clone(), manifest.clone())]),
+            attestations: BTreeMap::from([(active.clone(), attestation.clone())]),
+            attestations_required: true,
+            withdrawals: BTreeMap::from([(
+                withdrawn.clone(),
+                Withdrawal {
+                    manifest: digest(b"withdrawn manifest"),
+                    attestation: None,
+                },
+            )]),
+            sequence: NonZeroU64::new(1),
+        };
+        let mut next = previous.clone();
+        next.sequence = NonZeroU64::new(3);
+        previous.check_successor(&next)?;
+
+        next.attestations_required = false;
+        assert!(previous.check_successor(&next).is_err());
+        next.attestations_required = true;
+
+        next.attestations.remove(&active);
+        assert!(previous.check_successor(&next).is_err());
+        next.entries.remove(&active);
+        assert!(previous.check_successor(&next).is_err());
+        next.withdrawals.insert(
+            active,
+            Withdrawal {
+                manifest,
+                attestation: Some(attestation),
+            },
+        );
+        previous.check_successor(&next)?;
+
+        next.withdrawals.remove(&withdrawn);
+        assert!(previous.check_successor(&next).is_err());
+        Ok(())
+    }
 
     #[test]
     fn metadata_and_payload_reads_are_bounded() -> Result<()> {
