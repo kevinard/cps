@@ -121,18 +121,33 @@ pub(super) fn load(
         spec.publisher
             .map(|publisher| (spec.name.to_owned(), publisher))
     }));
+    let saved_pin = |publisher: &str| -> Result<Option<&str>> {
+        match saved {
+            None => Ok(None),
+            Some(plan) if single => Ok(plan.catalog.as_deref()),
+            Some(plan) => {
+                Ok(Some(plan.catalogs.get(publisher).with_context(|| {
+                    format!("saved plan has no catalog for {publisher}")
+                })?))
+            }
+        }
+    };
+    let release_pins = state.publishers.release_pins(
+        &state.settings.arch,
+        &state.settings.facets,
+        saved_pin(&publishers[0].name)?,
+    )?;
     let mut catalogs = Catalogs::default();
     for publisher in publishers {
-        let pin = match saved {
-            None => None,
-            Some(plan) if single => plan.catalog.as_deref(),
-            Some(plan) => Some(
-                plan.catalogs
-                    .get(&publisher.name)
-                    .with_context(|| format!("saved plan has no catalog for {}", publisher.name))?
-                    .as_str(),
-            ),
-        };
+        let mut pin = saved_pin(&publisher.name)?;
+        if let Some(required) = release_pins.get(&publisher.name) {
+            ensure!(
+                saved.is_none() || pin == Some(required),
+                "saved plan catalog for {} differs from the signed release profile",
+                publisher.name
+            );
+            pin = Some(required);
+        }
         let snapshot = snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
             .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
         catalogs

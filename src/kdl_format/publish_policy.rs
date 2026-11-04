@@ -40,7 +40,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     let name = fields.string_arg(0)?;
     validate_name(&name)?;
     let arch = fields.required_string("architecture")?;
-    validate_name(&arch).context("invalid profile architecture")?;
+    validate_publisher(&arch).context("invalid profile architecture")?;
     let upgrade_from = fields.string("upgrade-from")?;
     if let Some(hash) = &upgrade_from {
         validate_digest(hash).context("invalid profile upgrade catalog digest")?;
@@ -92,7 +92,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             "facet" => {
                 let fields = Fields::read(child, 2, &[], false)?;
                 let facet = fields.string_arg(0)?;
-                ensure!(!facet.is_empty(), "empty profile facet");
+                validate_publisher(&facet).context("invalid profile facet")?;
                 let enabled = fields.args[1]
                     .as_bool()
                     .context("facet must be #true or #false")?;

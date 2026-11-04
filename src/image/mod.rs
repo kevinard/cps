@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use self::root::Root;
 use crate::{
     kdl_format::{PublisherConfig, read_image_definition},
-    model::{FORMAT, Node, validate_publisher},
-    repo::{Published, canonical_repo, read_key},
+    model::{FORMAT, Node, validate_name, validate_publisher},
+    repo::{Published, canonical_repo, catalog_index, read_key},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,13 +72,23 @@ pub struct Publisher {
 pub(crate) enum Publishers {
     Single(Publisher),
     Ordered(Vec<Publisher>),
+    Profiled {
+        release_profile: String,
+        publishers: Vec<Publisher>,
+    },
 }
 
 impl Publishers {
-    fn new(publishers: Vec<Publisher>) -> Result<Self> {
-        let publishers = match <[Publisher; 1]>::try_from(publishers) {
-            Ok([publisher]) => Self::Single(publisher),
-            Err(publishers) => Self::Ordered(publishers),
+    fn new(publishers: Vec<Publisher>, profile: Option<String>) -> Result<Self> {
+        let publishers = match profile {
+            Some(release_profile) => Self::Profiled {
+                release_profile,
+                publishers,
+            },
+            None => match <[Publisher; 1]>::try_from(publishers) {
+                Ok([publisher]) => Self::Single(publisher),
+                Err(publishers) => Self::Ordered(publishers),
+            },
         };
         publishers.validate()?;
         Ok(publishers)
@@ -88,6 +98,16 @@ impl Publishers {
         match self {
             Self::Single(publisher) => std::slice::from_ref(publisher),
             Self::Ordered(publishers) => publishers,
+            Self::Profiled { publishers, .. } => publishers,
+        }
+    }
+
+    pub(crate) fn release_profile(&self) -> Option<&str> {
+        match self {
+            Self::Profiled {
+                release_profile, ..
+            } => Some(release_profile),
+            _ => None,
         }
     }
 
@@ -102,6 +122,9 @@ impl Publishers {
             !self.as_slice().is_empty(),
             "an image requires at least one publisher"
         );
+        if let Some(profile) = self.release_profile() {
+            validate_name(profile).context("invalid image release profile")?;
+        }
         let mut names = BTreeSet::new();
         for publisher in self.as_slice() {
             validate_publisher(&publisher.name)?;
@@ -215,12 +238,15 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
              }| { Publisher::from_config(name, repository, trust_key) },
         )
         .collect::<Result<Vec<_>>>()?;
-    initialize(
-        path,
-        Publishers::new(publishers)?,
-        &config.arch,
-        config.facets,
-    )
+    let publishers = Publishers::new(publishers, config.release_profile)?;
+    let pins = publishers.release_pins(&config.arch, &config.facets, None)?;
+    for publisher in publishers.as_slice() {
+        if let Some(pin) = pins.get(&publisher.name) {
+            catalog_index(&publisher.repo, &publisher.name, &publisher.key, Some(pin))
+                .with_context(|| format!("reading pinned catalog {pin} for {}", publisher.name))?;
+        }
+    }
+    initialize(path, publishers, &config.arch, config.facets)
 }
 
 fn initialize(

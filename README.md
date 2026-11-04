@@ -279,9 +279,9 @@ signer checks each pinned catalog against its configured trust key. It uses the
 release publisher first, then companions in declaration order. During an
 upgrade check, installed packages keep their original publishers. Set
 `upgrade-from` on a companion to pin a different baseline catalog for that
-publisher. Otherwise both compositions use its `catalog` pin. These pins are
-inputs to the publishing gate. An image still selects catalogs through its own
-publisher configuration.
+publisher. Otherwise both compositions use its `catalog` pin. The primary
+catalog signs the checked architecture, facets, and ordered companion catalog
+digests. A configured image can use those digests directly.
 
 ## Signed releases and mirrors
 
@@ -475,6 +475,21 @@ verifies the signed catalog before appending it. Use
 comes from that publisher and at least one publisher remains.
 These changes invalidate outstanding plans for the image and preserve its
 boot environment identity. They are local to the named image root.
+
+### Images that follow a signed release profile
+
+Add `release-profile "desktop"` to the image KDL to follow that profile in the
+first publisher's signed catalog. Configure the same architecture, facets, and
+publisher order as the profile. Each companion repository must have the signed
+catalog referenced by the profile. Publisher changes on a profiled image
+require a new image configuration.
+
+Available-package queries and new plans use the primary publisher's current
+catalog and the companion digests it signs. Saved plans use their original
+primary catalog and must match the companion digests signed in that catalog.
+Local history keeps those plans usable after a release advances. Offline
+installed-package queries, removal, and repair use committed image state.
+Upgrade CPS before using catalogs with signed release profile records.
 
 ## Manifest and image behavior
 

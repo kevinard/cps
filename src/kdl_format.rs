@@ -9,7 +9,9 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 
 use crate::{
     boot::kernel::Kernel,
-    model::{Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_publisher},
+    model::{
+        Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_name, validate_publisher,
+    },
     systemd::Action as SystemdAction,
 };
 
@@ -443,10 +445,11 @@ pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
         mut publishers,
         arch,
         facets,
+        release_profile,
     } = read_image_definition(path)?;
     ensure!(
-        publishers.len() == 1,
-        "use create_configured_image for multiple publishers"
+        publishers.len() == 1 && release_profile.is_none(),
+        "use create_configured_image for multiple publishers or a release profile"
     );
     let publisher = publishers.pop().expect("one publisher");
     Ok(ImageConfig {
@@ -486,6 +489,7 @@ pub(crate) struct ImageDefinition {
     pub publishers: Vec<PublisherConfig>,
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
+    pub release_profile: Option<String>,
 }
 
 pub(crate) fn read_image_definition(path: &Path) -> Result<ImageDefinition> {
@@ -504,6 +508,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         publishers: Vec::new(),
         arch: std::env::consts::ARCH.to_owned(),
         facets: BTreeMap::new(),
+        release_profile: None,
     };
     let mut architecture = false;
     let mut names = BTreeSet::new();
@@ -521,6 +526,15 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 ensure!(!architecture, "duplicate architecture node");
                 architecture = true;
                 config.arch = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+            }
+            "release-profile" => {
+                ensure!(
+                    config.release_profile.is_none(),
+                    "duplicate release-profile node"
+                );
+                let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                validate_name(&name).context("invalid release profile name")?;
+                config.release_profile = Some(name);
             }
             "facet" => {
                 let fields = Fields::read(node, 2, &[], false)?;

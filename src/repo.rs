@@ -54,6 +54,23 @@ struct Catalog {
     obsoletions: BTreeMap<String, Version>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     key_rotations: Vec<keys::Rotation>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    release_profiles: BTreeMap<String, ReleaseProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseProfile {
+    pub architecture: String,
+    pub facets: BTreeMap<String, bool>,
+    pub companions: Vec<CatalogPin>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogPin {
+    pub publisher: String,
+    pub sha256: String,
 }
 
 impl Catalog {
@@ -69,6 +86,7 @@ impl Catalog {
             profiles_required: false,
             obsoletions: BTreeMap::new(),
             key_rotations: Vec::new(),
+            release_profiles: BTreeMap::new(),
         }
     }
 
@@ -162,6 +180,10 @@ impl Catalog {
         ensure!(
             !self.profiles_required || next.profiles_required,
             "release disables the publisher's composition profile requirement"
+        );
+        ensure!(
+            self.release_profiles.is_empty() || !next.release_profiles.is_empty(),
+            "release drops signed composition profiles"
         );
         for (id, record) in &self.withdrawals {
             ensure!(
@@ -375,6 +397,27 @@ fn read_catalog_with_key(
             &hex::decode(signed.signature)?,
         )
         .map_err(|_| anyhow::anyhow!("invalid signature on catalog {hash}"))?;
+    ensure!(
+        catalog.release_profiles.is_empty() || catalog.profiles_required,
+        "signed composition profiles require the publishing gate"
+    );
+    for (name, profile) in &catalog.release_profiles {
+        validate_name(name).context("invalid signed profile name")?;
+        validate_publisher(&profile.architecture).context("invalid signed profile architecture")?;
+        for facet in profile.facets.keys() {
+            validate_publisher(facet).context("invalid signed profile facet")?;
+        }
+        let mut publishers = BTreeSet::from([publisher]);
+        for pin in &profile.companions {
+            validate_publisher(&pin.publisher)?;
+            validate_digest(&pin.sha256)?;
+            ensure!(
+                publishers.insert(pin.publisher.as_str()),
+                "duplicate publisher {} in signed profile {name}",
+                pin.publisher
+            );
+        }
+    }
     for (id, manifest) in &catalog.entries {
         let spec = PackageSpec::parse(id)?;
         let version = spec
@@ -474,16 +517,39 @@ pub(crate) struct CatalogIndex {
     pub obsoletions: BTreeMap<String, Version>,
 }
 
-pub(crate) fn catalog_index(repo: &Path, publisher: &str, key: &[u8]) -> Result<CatalogIndex> {
-    let catalog = read_catalog(repo, &read_current(repo)?, publisher, key)?;
+pub(crate) fn catalog_index(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    pin: Option<&str>,
+) -> Result<CatalogIndex> {
+    let hash = pin.map_or_else(|| read_current(repo), |hash| Ok(hash.to_owned()))?;
+    let catalog = read_catalog(repo, &hash, publisher, key)?;
     Ok(CatalogIndex {
         entries: catalog.entries,
         obsoletions: catalog.obsoletions,
     })
 }
 
+pub(crate) fn release_profile(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    pin: Option<&str>,
+    name: &str,
+) -> Result<(String, ReleaseProfile)> {
+    let hash = pin.map_or_else(|| read_current(repo), |hash| Ok(hash.to_owned()))?;
+    let profile = read_catalog(repo, &hash, publisher, key)?
+        .release_profiles
+        .remove(name)
+        .with_context(|| {
+            format!("catalog {hash} for {publisher} has no signed release profile {name}")
+        })?;
+    Ok((hash, profile))
+}
+
 pub fn list_obsoletions(repo: &Path, publisher: &str, key: &Path) -> Result<Vec<String>> {
-    let index = catalog_index(repo, publisher, &read_key(key)?)?;
+    let index = catalog_index(repo, publisher, &read_key(key)?, None)?;
     Ok(index
         .obsoletions
         .into_iter()
@@ -1037,6 +1103,28 @@ fn check_profiles(
             .map_or(key, |rotation| rotation.previous_key());
         profiles::check(repo, catalog, &policy.profiles, anchor)?;
         catalog.profiles_required = true;
+        catalog.release_profiles = policy
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                let companions = profile
+                    .companions
+                    .iter()
+                    .map(|companion| CatalogPin {
+                        publisher: companion.config.name.clone(),
+                        sha256: companion.catalog.clone(),
+                    })
+                    .collect();
+                (
+                    name.clone(),
+                    ReleaseProfile {
+                        architecture: profile.arch.clone(),
+                        facets: profile.facets.clone(),
+                        companions,
+                    },
+                )
+            })
+            .collect();
     }
     Ok(())
 }
@@ -1219,6 +1307,7 @@ mod tests {
             profiles_required: true,
             obsoletions: BTreeMap::from([("desktop/retired".to_owned(), "2.0.0-0".parse()?)]),
             key_rotations: Vec::new(),
+            release_profiles: BTreeMap::new(),
         };
         let mut next = previous.clone();
         next.sequence = NonZeroU64::new(3);

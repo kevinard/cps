@@ -13,11 +13,13 @@ use url::Url;
 use super::*;
 use crate::{
     attestation::{self, Toolchain},
-    fetch_plan,
+    create_configured_image, fetch_plan,
     kdl_format::{build, parse_manifest},
     list_obsoletions, list_withdrawals,
     model::FileDigest,
-    publish_bundle, publish_release, read_attestation, release as mirror_release,
+    publish_bundle, publish_release,
+    query::{Scope, list_packages, package_manifest},
+    read_attestation, release as mirror_release,
     repo::{read_key, read_signing_key, snapshot},
     rotate_publisher_key, withdraw_package,
 };
@@ -362,6 +364,118 @@ publisher "canopa" {{
     fs::remove_file(seed.repo.join("current"))?;
     withdraw_package(&f.repo, &f.private, id)?;
     assert!(list_withdrawals(&f.repo, "canopa", &f.public)?.contains_key(id));
+    Ok(())
+}
+
+#[test]
+fn profiled_image_follows_signed_catalog_set_and_recovers_saved_plans() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    let payload = "usr/lib/runtime.marker";
+    seed.package_as(
+        "seed",
+        "library/runtime",
+        "1.0.0-0",
+        seed.file(payload, "old", "0644", "")?,
+    )?;
+    let old_pin = fs::read_to_string(seed.repo.join("current"))?;
+    seed.package_as(
+        "seed",
+        "library/runtime",
+        "2.0.0-0",
+        seed.file(payload, "new", "0644", "")?,
+    )?;
+    let new_pin = fs::read_to_string(seed.repo.join("current"))?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        "    require \"library/runtime\"\n".to_owned(),
+    )?;
+    f.package("test/first", "1.0.0-0", String::new())?;
+    f.package("test/second", "1.0.0-0", String::new())?;
+    let config = f._dir.path().join("image.kdl");
+    let write_config = |arch: &str| {
+        fs::write(
+            &config,
+            format!(
+                r#"schema-version 1
+architecture {arch:?}
+release-profile "desktop"
+publisher "canopa" {{
+    repository {:?}
+    trust-key {:?}
+}}
+publisher "seed" {{
+    repository {:?}
+    trust-key {:?}
+}}
+"#,
+                f.repo, f.public, seed.repo, seed.public
+            ),
+        )
+    };
+    let release = |pin: &str, retired: &str| -> Result<()> {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "builder.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/compositor"
+        publisher "seed" catalog={:?} {{
+            repository {:?}
+            trust-key {:?}
+        }}
+    }}
+}}
+"#,
+                pin.trim(),
+                seed.repo,
+                seed.public
+            ),
+        )?;
+        withdraw_package(&f.repo, &f.private, retired)
+    };
+    release(&old_pin, "cps://canopa/test/first@1.0.0-0")?;
+    write_config("aarch64")?;
+    let error = create_configured_image(&f.root, &config).unwrap_err();
+    assert!(format!("{error:#}").contains("architecture or facets differ"));
+    assert!(!f.root.exists());
+    write_config("x86_64")?;
+    create_configured_image(&f.root, &config)?;
+    let error = crate::prefer_publisher(&f.root, "seed").unwrap_err();
+    assert!(format!("{error:#}").contains("fixes this image's publishers"));
+    let available = list_packages(&f.root, Scope::Available)?;
+    assert!(
+        available
+            .iter()
+            .any(|entry| entry.id == "cps://seed/library/runtime@1.0.0-0")
+    );
+    assert!(package_manifest(&f.root, "cps://seed/library/runtime@2.0.0-0", true).is_err());
+    let saved = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".to_owned()],
+        },
+    )?;
+    assert_eq!(saved.catalogs["seed"], old_pin.trim());
+    let mut altered = saved.clone();
+    altered
+        .catalogs
+        .insert("seed".to_owned(), new_pin.trim().to_owned());
+    let error = apply(&f.root, &altered).unwrap_err();
+    assert!(format!("{error:#}").contains("differs from the signed release profile"));
+    assert!(!f.root.join(payload).exists());
+
+    release(&new_pin, "cps://canopa/test/second@1.0.0-0")?;
+    fs::remove_file(seed.repo.join("current"))?;
+    apply(&f.root, &saved)?;
+    assert_eq!(fs::read_to_string(f.root.join(payload))?, "old");
+    let upgrade = plan(&f.root, Request::Update)?;
+    assert_eq!(upgrade.catalogs["seed"], new_pin.trim());
+    apply(&f.root, &upgrade)?;
+    assert_eq!(fs::read_to_string(f.root.join(payload))?, "new");
     Ok(())
 }
 

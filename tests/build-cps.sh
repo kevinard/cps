@@ -132,8 +132,19 @@ RELEASE
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
     cps://canopa/system/cps@0.1.0-1 > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa --trust-key release-public.der
-"$cps" publisher add --root image --repo runtime-seed --trust-key runtime-seed-public.der canopa-runtime-seed
+cat > image.kdl <<CONFIG
+schema-version 1
+release-profile "cps-runtime"
+publisher "canopa" {
+    repository "repo"
+    trust-key "release-public.der"
+}
+publisher "canopa-runtime-seed" {
+    repository "runtime-seed"
+    trust-key "runtime-seed-public.der"
+}
+CONFIG
+"$cps" image-create --root image --config image.kdl
 "$cps" plan --root image --output install.json install cps://canopa/system/cps@0.1.0-1
 "$cps" apply --root image install.json
 cmp bundle/proto/usr/bin/cps image/usr/bin/cps
