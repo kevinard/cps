@@ -12,12 +12,12 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, SourceLayout,
     activate_boot_environment, add_publisher, apply, build_with_toolchain_config,
-    build_with_worker, create_configured_image, create_image, fetch_plan, fetch_sources,
-    fetch_sources_with_local, generate_manifest, import_sources, list_boot_environments,
-    list_obsoletions, list_publishers, list_withdrawals, plan, prefer_publisher, publish,
-    publish_release, publish_witnessed_bundle, read_attestation, read_worker_config, release,
-    remove_publisher, rollback_boot_environment, rotate_publisher_key, stage_boot_environment,
-    verify, verify_pristine, withdraw_package,
+    build_with_worker, create_configured_image, create_image, export_boot_environment, fetch_plan,
+    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
+    list_boot_environments, list_obsoletions, list_publishers, list_withdrawals, plan,
+    prefer_publisher, publish, publish_release, publish_witnessed_bundle, read_attestation,
+    read_worker_config, release, remove_publisher, rollback_boot_environment, rotate_publisher_key,
+    stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -396,6 +396,15 @@ enum BootCommand {
         #[arg(long)]
         root: PathBuf,
         plan: PathBuf,
+    },
+    /// Export an inactive root to a new ext4 partition image
+    Export {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, value_name = "MIB")]
+        size_mib: u64,
     },
     /// Publish a systemd-boot entry for a verified environment
     Activate {
@@ -827,6 +836,14 @@ fn run(command: Command) -> Result<ExitCode> {
             BootCommand::Stage { source, root, plan } => {
                 let id = stage_boot_environment(&source, &root, &load_plan(&plan)?)?;
                 println!("Staged {id} at {}", root.display());
+            }
+            BootCommand::Export {
+                root,
+                output,
+                size_mib,
+            } => {
+                let id = export_boot_environment(&root, &output, size_mib)?;
+                println!("Exported {id} to {}", output.display());
             }
             BootCommand::Activate {
                 root,

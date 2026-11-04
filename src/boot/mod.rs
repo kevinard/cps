@@ -1,3 +1,4 @@
+mod export;
 pub(crate) mod kernel;
 mod systemd_boot;
 
@@ -17,6 +18,7 @@ use crate::{
     verify::verify_image,
 };
 
+pub use export::export_boot_environment;
 pub use systemd_boot::{
     Activation, BootEnvironment, activate_boot_environment, list_boot_environments,
     rollback_boot_environment,

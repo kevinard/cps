@@ -334,7 +334,7 @@ fn verify_fallback_artifacts(esp: &Path, id: &str, entry: &str) -> Result<()> {
     Ok(())
 }
 
-fn canonical_partuuid(value: &str) -> Result<String> {
+pub(super) fn canonical_partuuid(value: &str) -> Result<String> {
     ensure!(
         value.len() == 36
             && value.bytes().enumerate().all(|(i, c)| match i {
