@@ -1,0 +1,32 @@
+schema-version 1
+package "system/systemd-vm" publisher="canopa-systemd" version="262.1.0-0" {
+    require "system/elf-runtime"
+    require "system/libseccomp" version=">=2.6.1-0"
+    require "system/systemd-vm-libs"
+    file "usr/bin/kernel-install" mode="0755" uid=0 gid=0
+    file "usr/bin/systemctl" mode="0755" uid=0 gid=0
+    file "usr/bin/systemd-sysusers" mode="0755" uid=0 gid=0
+    file "usr/bin/systemd-tmpfiles" mode="0755" uid=0 gid=0
+    file "usr/lib/kernel/install.d/90-loaderentry.install" mode="0755" uid=0 gid=0
+    file "usr/lib/libsystemd.so.0" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/boot/efi/systemd-bootx64.efi" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/libsystemd-core-262.so" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/libsystemd-shared-262.so" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/systemd" mode="0755" uid=0 gid=0
+    file "usr/lib/systemd/systemd-executor" mode="0755" uid=0 gid=0
+    file "usr/lib/systemd/systemd-bless-boot" mode="0755" uid=0 gid=0
+    file "usr/lib/systemd/system-generators/systemd-bless-boot-generator" mode="0755" uid=0 gid=0
+    file "usr/lib/systemd/system/basic.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/boot-complete.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/local-fs.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/multi-user.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/paths.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/shutdown.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/slices.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/sockets.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/swap.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/sysinit.target" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/systemd-bless-boot.service" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/timers.target" mode="0644" uid=0 gid=0
+    file "usr/share/licenses/systemd-vm/LGPL-2.0-or-later.txt" mode="0644" uid=0 gid=0
+}

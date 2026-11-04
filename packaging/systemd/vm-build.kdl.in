@@ -1,0 +1,44 @@
+schema-version 1
+build architecture="x86_64" epoch=1792187472 {
+    toolchain "@CATALOG_SHA256@" solver="sat-v1" {
+        package "build/native-systemd"
+    }
+    manifest "systemd.kdl" sha256="@MANIFEST_SHA256@"
+    source "systemd-262.1.tar.gz" size=19088198 sha256="100fc873b848b9b0297d8a705e8e2ed326256c8483d9960ee1ffe264c8a5c3e3" url="https://codeload.github.com/systemd/systemd/tar.gz/refs/tags/v262.1"
+    script """
+    tar -xzf "$CPS_SOURCES/systemd-262.1.tar.gz"
+    cd systemd-262.1
+    export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1
+    meson setup out --prefix=/usr --libdir=lib --wrap-mode=nodownload --buildtype=release \\
+        -Dmode=release -Dvcs-tag=false -Dversion-tag=v262.1 -Dtests=false -Dauto_features=disabled \\
+        -Dblkid=enabled -Dlibmount=enabled -Dseccomp=enabled -Defi=true -Dbootloader=enabled -Dldconfig=false \\
+        -Dsbat-distro=canopa -Dsbat-distro-summary=Canopa -Dsbat-distro-pkgname=cps-systemd-vm \\
+        -Dsbat-distro-version=262.1.0-0 -Dsbat-distro-url=https://github.com/kevinard/cps
+    ninja -C out -j4 systemd systemd-executor systemctl systemd-bless-boot systemd-bless-boot-generator \\
+        systemd-sysusers systemd-tmpfiles kernel-install src/kernel-install/90-loaderentry.install \\
+        src/boot/systemd-bootx64.efi libsystemd.so.0.45.0 units/systemd-bless-boot.service
+
+    libexec="$DESTDIR/usr/lib/systemd"
+    install_elf() {
+        install -Dm"$3" "$1" "$2"
+        patchelf --set-rpath /usr/lib/systemd "$2"
+    }
+    for tool in kernel-install systemctl systemd-sysusers systemd-tmpfiles; do
+        install_elf "out/$tool" "$DESTDIR/usr/bin/$tool" 755
+    done
+    for program in systemd systemd-executor systemd-bless-boot; do
+        install_elf "out/$program" "$libexec/$program" 755
+    done
+    install_elf out/systemd-bless-boot-generator "$libexec/system-generators/systemd-bless-boot-generator" 755
+    install_elf out/src/core/libsystemd-core-262.so "$libexec/libsystemd-core-262.so" 644
+    install_elf out/src/shared/libsystemd-shared-262.so "$libexec/libsystemd-shared-262.so" 644
+    install -Dm644 out/libsystemd.so.0.45.0 "$DESTDIR/usr/lib/libsystemd.so.0"
+    install -Dm755 out/src/kernel-install/90-loaderentry.install "$DESTDIR/usr/lib/kernel/install.d/90-loaderentry.install"
+    install -Dm644 out/src/boot/systemd-bootx64.efi "$libexec/boot/efi/systemd-bootx64.efi"
+    for unit in basic boot-complete local-fs multi-user paths shutdown slices sockets swap sysinit timers; do
+        install -Dm644 "units/$unit.target" "$libexec/system/$unit.target"
+    done
+    install -Dm644 out/units/systemd-bless-boot.service "$libexec/system/systemd-bless-boot.service"
+    install -Dm644 LICENSES/LGPL-2.0-or-later.txt "$DESTDIR/usr/share/licenses/systemd-vm/LGPL-2.0-or-later.txt"
+    """
+}

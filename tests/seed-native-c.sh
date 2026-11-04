@@ -5,15 +5,18 @@ unset LD_LIBRARY_PATH LD_PRELOAD GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPAT
 export PATH=/usr/bin:/bin LC_ALL=C
 umask 022
 
-seed=${1:?usage: seed-native-c.sh PROTOTYPE [--rust|--kernel]}
+seed=${1:?usage: seed-native-c.sh PROTOTYPE [--rust|--kernel|--systemd]}
 rust_root=
 kernel=false
+systemd=false
 if [[ $# == 2 && $2 == --rust ]]; then
     rust_root=$(rustc --print sysroot)
 elif [[ $# == 2 && $2 == --kernel ]]; then
     kernel=true
+elif [[ $# == 2 && $2 == --systemd ]]; then
+    systemd=true
 elif [[ $# != 1 ]]; then
-    echo 'usage: seed-native-c.sh PROTOTYPE [--rust|--kernel]' >&2
+    echo 'usage: seed-native-c.sh PROTOTYPE [--rust|--kernel|--systemd]' >&2
     exit 2
 fi
 mkdir -- "$seed"
@@ -106,4 +109,35 @@ if $kernel; then
     ln -s libelf.so.1 "$seed/usr/lib/libelf.so"
     mkdir -p -- "$seed/usr/share"
     cp -RL -- /usr/share/bison "$seed/usr/share/"
+fi
+if $systemd; then
+    tools_root=${CPS_SYSTEMD_TOOLS_ROOT:-/}
+    tools_root=${tools_root%/}
+    for tool in env gzip id ls mount ninja pkg-config printf python python3 readelf realpath stat true; do
+        copy_elf "/usr/bin/$tool" "usr/bin/$tool"
+    done
+    ln -s gcc "$seed/usr/bin/cc"
+    copy_file /usr/bin/meson usr/bin/meson
+    for tool in gperf patchelf; do
+        copy_elf "$tools_root/usr/bin/$tool" "usr/bin/$tool"
+    done
+    python_lib=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
+    python_files=$(pacman -Qlq python)
+    while IFS= read -r path; do
+        copy_file "$path" "${path#/}"
+    done < <(awk -v dir="$python_lib/" 'index($0, dir) == 1 && !/\/$|__pycache__|\/site-packages\//' <<< "$python_files")
+    site="$python_lib/site-packages"
+    mkdir -p "$seed$site"
+    for module in mesonbuild packaging markupsafe; do
+        cp -RL -- "$site/$module" "$seed$site/"
+    done
+    for module in elftools jinja2; do
+        cp -RL -- "$tools_root$site/$module" "$seed$site/"
+    done
+    for path in usr/include/{blkid/blkid.h,libmount/libmount.h,seccomp.h,seccomp-syscalls.h} \
+        usr/lib/pkgconfig/{blkid,mount,libseccomp,libsystemd}.pc; do
+        copy_file "/$path" "$path"
+    done
+    ln -s libblkid.so.1 "$seed/usr/lib/libblkid.so"
+    ln -s libmount.so.1 "$seed/usr/lib/libmount.so"
 fi
