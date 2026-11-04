@@ -2522,6 +2522,49 @@ fn legacy_cache_relocation_requires_the_applied_catalog() -> Result<()> {
     db.execute("DROP TABLE catalog_archives", [])?;
 
     f.package("test/pkg", "2.0.0-0", String::new())?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let cache = work.join("guarded-cache");
+    let sync = |mirror: &Path| {
+        mirror_release::sync_with_options(
+            &cache,
+            &anchor,
+            Url::from_directory_path(mirror.join("metadata"))
+                .unwrap()
+                .as_str(),
+            Url::from_directory_path(mirror.join("targets"))
+                .unwrap()
+                .as_str(),
+            "canopa",
+            &f.public,
+            mirror_release::SyncOptions {
+                index_only: true,
+                image: Some(&f.root),
+            },
+        )
+    };
+    let mirror = work.join("without-predecessor");
+    sign_release(&f, &mirror, 1, fresh, &anchor, &tuf_key)?;
+    let error = sync(&mirror).unwrap_err();
+    assert!(format!("{error:#}").contains("fetching last applied catalog"));
+    assert!(!cache.join("current").exists());
+    assert!(!cache.join(".tuf/catalog").exists());
+    let export = work.join("export-with-predecessor");
+    let current = mirror_release::export_with_retained(
+        &f.repo,
+        "canopa",
+        &f.public,
+        &export,
+        &[applied.trim().to_owned()],
+    )?;
+    let mirror = work.join("with-predecessor");
+    sign_export(&export, &mirror, 2, fresh, &anchor, &tuf_key)?;
+    assert_eq!(sync(&mirror)?, current);
+    assert!(cache.join("catalogs").join(applied.trim()).is_file());
+
     let replacement = f.repo.with_extension("replacement");
     fs::rename(&f.repo, &replacement)?;
     let predecessor = replacement.join("catalogs").join(applied.trim());
