@@ -658,6 +658,29 @@ signed CPS and BusyBox fixtures. The test publishes the companion update,
 checks that the installed profile still selects the old kernel, and advances
 the profile before staging and booting the trial.
 
+#### Testing a source-built Linux kernel
+
+On the x86-64 Arch Linux build worker, provide GCC, binutils, libelf headers,
+`bc`, Bison, Flex, M4, XZ, and the usual native build tools. Verify the Linux 6.12.115
+release signature and place `linux-6.12.115.tar.xz` in a local source directory.
+[Linux release signatures](https://www.kernel.org/signature.html)
+
+```sh
+CPS_KERNEL_SOURCE_DIR=/path/to/verified-sources tests/build-kernel.sh target/kernel-fixture
+```
+
+The recipe pins the archive, VM configuration, and signed worker toolchain.
+CPS builds the EFI kernel twice in fresh offline sandboxes, verifies the matching
+outputs, and publishes `system/kernel-qemu` with signed build evidence. Set
+`CPS_KERNEL_BC` to an extracted trusted `bc` binary if the worker does not have
+it installed. The worker toolchain still comes from prebuilt Arch packages.
+
+For the signed-profile rollback test, also set `CPS_VM_KERNEL_FIXTURE` to the
+build output directory. The signed trial installs the kernel and its build
+configuration directly from the fixture repository. This kernel has built-in
+virtio, ext4, and VFAT support and boots the QEMU test root without an initrd.
+The previous root keeps its original kernel and initrd.
+
 #### Testing a source-built BusyBox
 
 On an x86-64 Arch Linux worker with a native GCC toolchain, run

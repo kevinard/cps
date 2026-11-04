@@ -13,6 +13,8 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
+kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
+kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
 profiled=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
@@ -63,10 +65,21 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
 fi
+if [[ -n $kernel_fixture ]]; then
+    $profiled || { echo 'CPS_VM_KERNEL_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
+    kernel_fixture=$(realpath -- "$kernel_fixture")
+    trial_release=$(cat "$kernel_fixture/kernel-release")
+    test "$trial_release" = 6.12.115-cps-vm
+    trial_kernel="$kernel_fixture/image/usr/lib/modules/$trial_release/vmlinuz"
+    "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
+        --trust-key "$kernel_fixture/release-public.der" "$kernel_package" >/dev/null
+fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
-    trial_kernel=${CPS_VM_TRIAL_KERNEL:?Set CPS_VM_TRIAL_KERNEL to the second kernel}
-    trial_release=${CPS_VM_TRIAL_KERNEL_RELEASE:?Set CPS_VM_TRIAL_KERNEL_RELEASE to its uname -r value}
+    if [[ -z $kernel_fixture ]]; then
+        trial_kernel=${CPS_VM_TRIAL_KERNEL:?Set CPS_VM_TRIAL_KERNEL to the second kernel}
+        trial_release=${CPS_VM_TRIAL_KERNEL_RELEASE:?Set CPS_VM_TRIAL_KERNEL_RELEASE to its uname -r value}
+    fi
     kernel=$(realpath -- "$kernel")
     trial_kernel=$(realpath -- "$trial_kernel")
     test "$base_release" != "$trial_release"
@@ -101,6 +114,12 @@ publish_state() {
         case $state in
             previous) dependency='    require "test/legacy-marker"' ;;
             trial) dependency='    require "test/extra-marker"' ;;
+        esac
+    fi
+    if [[ -n $kernel_fixture ]]; then
+        case $state in
+            previous) dependency+=$'\n    require "system/kernel"' ;;
+            trial) dependency+=$'\n    require "system/kernel-qemu"' ;;
         esac
     fi
     printf '%s\n' "$state" > proto/etc/cps-vm-state
@@ -150,6 +169,9 @@ profile_companions() {
     printf '%s\n' "$fixture_publisher repo public.der" 'canopa signed-cps cps-public.der' \
         'canopa-runtime-seed signed-seed seed-public.der' 'canopa-bootstrap signed-busybox busybox-public.der' \
         'extras extras extras-public.der'
+    if [[ -n $kernel_fixture ]]; then
+        printf '%s\n' 'canopa-kernel signed-kernel kernel-public.der'
+    fi
 }
 
 refresh_vm_profile() {
@@ -237,7 +259,11 @@ if $systemd_guest; then
         copy_runtime_deps runtime proto/usr/bin/cps
     fi
     if [[ $mode == rollback ]]; then
-        prepare_fat_modules runtime "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
+        if [[ -n $kernel_fixture ]]; then
+            CPS_VM_FAT_BUILTIN=1 prepare_fat_modules runtime "$trial_release" /
+        else
+            prepare_fat_modules runtime "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
+        fi
         touch runtime/etc/cps-vm-assert-extra-publisher
     fi
 else
@@ -271,14 +297,20 @@ if $profiled; then
     cp -- "$cps_fixture/release-public.der" cps-public.der
     cp -- "$cps_fixture/runtime-seed-public.der" seed-public.der
     cp -- "$busybox_key" busybox-public.der
+    boot_kernel_dependency='    require "system/kernel"'
+    if [[ -n $kernel_fixture ]]; then
+        cp -a -- "$kernel_fixture/repo" signed-kernel
+        cp -- "$kernel_fixture/release-public.der" kernel-public.der
+        boot_kernel_dependency=
+    fi
     openssl genpkey -algorithm ED25519 -outform DER -out profile-private.der
     openssl pkey -inform DER -in profile-private.der -pubout -outform DER -out profile-public.der
-    cat > boot-stack.kdl <<'MANIFEST'
+    cat > boot-stack.kdl <<MANIFEST
 schema-version 1
 package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
     require "test/boot-state"
     require "test/boot-runtime"
-    require "system/kernel"
+$boot_kernel_dependency
     require "system/cps"
     require "system/busybox"
 }
@@ -347,14 +379,19 @@ if [[ $mode == rollback ]]; then
 fi
 
 publish_state 2.0.0-0 trial
-if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
+if [[ -z $kernel_fixture && ( $mode == kernel-upgrade || $mode == rollback ) ]]; then
     publish_kernel 2.0.0-0 "$trial_release" "$trial_kernel"
 fi
 if [[ $mode == rollback ]]; then
+    retire_kernel=
+    if [[ -n $kernel_fixture ]]; then
+        retire_kernel="    obsolete \"cps://$fixture_publisher/system/kernel@2.0.0-0\""
+    fi
     cat > retirement.kdl <<RELEASE
 schema-version 1
 release "$fixture_publisher" base="$(cat repo/current)" {
     obsolete "cps://$fixture_publisher/test/legacy-marker@2.0.0-0"
+$retire_kernel
 }
 RELEASE
     "$cps" repo publish-release --repo repo --signing-key private.der retirement.kdl
@@ -362,7 +399,7 @@ fi
 if $profiled; then
     "$cps" plan --root base --output before-profile.json update > before-profile.log
     grep -Fq "\"$base_test_catalog\"" before-profile.json
-    if grep -q 'Update .*system/kernel' before-profile.log; then
+    if grep -Eq '(Update|Install|Remove) .*system/kernel' before-profile.log; then
         echo 'The companion update escaped its signed profile pin' >&2
         exit 1
     fi
@@ -391,7 +428,13 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
         if cmp -s "$file" "$trial_kernel"; then prepared=$file; break; fi
     done
     test -n "$prepared"
-    cmp "staged/usr/lib/modules/$trial_release/initrd" "${prepared%/*}/initrd"
+    if [[ -n $kernel_fixture ]]; then
+        grep -Fq 'Install cps://canopa-kernel/system/kernel-qemu 6.12.115-0' update.log
+        cmp "$kernel_fixture/image/usr/lib/modules/$trial_release/config" "staged/usr/lib/modules/$trial_release/config"
+        test ! -e "${prepared%/*}/initrd"
+    else
+        cmp "staged/usr/lib/modules/$trial_release/initrd" "${prepared%/*}/initrd"
+    fi
     printf 'corrupt prepared kernel' > "$prepared"
     if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
         --options "$options" 2> rejected.log; then
@@ -432,7 +475,11 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     cmp "$kernel" "esp/EFI/cps/$base_id/vmlinuz.efi"
     cmp "$trial_kernel" "esp/EFI/cps/$trial_id/vmlinuz.efi"
     cmp "base/usr/lib/modules/$base_release/initrd" "esp/EFI/cps/$base_id/initramfs.img"
-    cmp "staged/usr/lib/modules/$trial_release/initrd" "esp/EFI/cps/$trial_id/initramfs.img"
+    if [[ -n $kernel_fixture ]]; then
+        test ! -e "esp/EFI/cps/$trial_id/initramfs.img"
+    else
+        cmp "staged/usr/lib/modules/$trial_release/initrd" "esp/EFI/cps/$trial_id/initramfs.img"
+    fi
 fi
 
 if [[ $mode == rollback ]]; then
