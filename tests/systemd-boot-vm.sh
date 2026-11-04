@@ -21,7 +21,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-3}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-4}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -99,7 +99,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-2|0.1.0-3) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-2|0.1.0-3|0.1.0-4) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -130,10 +130,10 @@ fi
 if [[ -n $util_linux_fixture ]]; then
     [[ -n $usr_base_fixture ]] || { echo 'CPS_VM_UTIL_LINUX_FIXTURE requires the merged /usr fixture' >&2; exit 2; }
     util_linux_fixture=$(realpath -- "$util_linux_fixture")
-    if [[ $cps_version == 0.1.0-2 || $cps_version == 0.1.0-3 ]]; then
-        systemd_version=262.1.0-4
-    else
+    if [[ $cps_version == 0.1.0-1 ]]; then
         systemd_version=262.1.0-2
+    else
+        systemd_version=262.1.0-4
     fi
     "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
         --trust-key "$util_linux_fixture/release-public.der" "$util_linux_package" >/dev/null

@@ -4,7 +4,6 @@ export LC_ALL=C
 umask 022
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
-source "$project/tests/build-toolchain.sh"
 cps=$(realpath -- "${CPS_TEST_BINARY:-"$project/target/debug/cps"}")
 output=$(realpath -m -- "${1:?usage: build-cps.sh OUTPUT-DIRECTORY [GIT-REVISION]}")
 revision=$(git -C "$project" rev-parse --verify --end-of-options "${2:-HEAD}^{commit}")
@@ -12,10 +11,6 @@ epoch=$(git -C "$project" show -s --format=%ct "$revision")
 registry=$(realpath -- "${CARGO_HOME:-$HOME/.cargo}/registry")
 runtime_sources=$(realpath -- "${CPS_RUNTIME_SOURCE_DIR:?Set CPS_RUNTIME_SOURCE_DIR to the directory containing the pinned SQLite and libseccomp archives}")
 arch=$(uname -m)
-cps_version=0.1.0-3
-sqlite_version=3.54.1-1
-seccomp_version=2.6.1-1
-runtime_version=1.0.0-1
 [[ $arch == x86_64 ]] || { echo 'The ELF runtime seed requires an x86-64 worker' >&2; exit 1; }
 mkdir -m 700 -- "$output"
 work=$(mktemp -d "$output/.private.XXXXXXXX")
@@ -31,10 +26,33 @@ sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 mkdir "$work/sources"
 git -C "$project" archive --format=tar --prefix=cps/ "$revision" | gzip -n > "$work/sources/cps.tar.gz"
 tar -xzf "$work/sources/cps.tar.gz" -C "$work"
+source_tree="$work/cps"
+source "$source_tree/tests/build-toolchain.sh"
 printf '%s\n' "$revision" > source-revision
-python3 "$project/tests/seed-cargo-cache.py" "$work/cps/Cargo.lock" "$registry" "$work/cargo-home"
+manifest_version() {
+    local version
+    version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$1")
+    [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || {
+        echo "Could not determine the package version in $1" >&2
+        return 1
+    }
+    printf '%s\n' "$version"
+}
+cps_manifest="$source_tree/packaging/cps.kdl"
+cps_version=$(manifest_version "$cps_manifest")
+sqlite_version=$(manifest_version "$source_tree/packaging/runtime/sqlite.kdl")
+seccomp_version=$(manifest_version "$source_tree/packaging/runtime/libseccomp.kdl")
+seed_version=1.0.0-0
+runtime_version=1.0.0-1
+seed_arch=()
+if grep -q '^package .* architecture=' "$cps_manifest"; then
+    seed_version=1.0.0-1
+    runtime_version=1.0.0-2
+    seed_arch=(--architecture "$arch")
+fi
+python3 "$source_tree/tests/seed-cargo-cache.py" "$source_tree/Cargo.lock" "$registry" "$work/cargo-home"
 (
-    cd "$work/cps"
+    cd "$source_tree"
     CARGO_HOME="$work/cargo-home" CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
         cargo vendor --quiet --frozen --versioned-dirs "$work/vendor" > /dev/null
 )
@@ -45,7 +63,7 @@ keypair toolchain
 keypair builder
 keypair release
 keypair runtime-seed
-bash "$project/tests/seed-native-c.sh" "$work/native-rust" --rust
+bash "$source_tree/tests/seed-native-c.sh" "$work/native-rust" --rust
 # Preserve the worker's matched loader and C/GCC ABI as a separate signed
 # package that the sandbox and the installed CPS image both consume.
 for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1}; do
@@ -55,10 +73,10 @@ done
 # glibc's own executable entry point can name the canonical loader path.
 ln "$work/elf-runtime/lib64/ld-linux-x86-64.so.2" "$work/elf-runtime/usr/lib/ld-linux-x86-64.so.2"
 rm -f -- "$work/native-rust/usr/lib/ld-linux-x86-64.so.2"
-"$cps" manifest generate --proto "$work/native-rust" --publisher seed --version 1.0.0-0 \
+"$cps" manifest generate --proto "$work/native-rust" --publisher seed --version "$seed_version" "${seed_arch[@]}" \
     --uid "$(id -u)" --gid "$(id -g)" build/native-rust > native-rust.kdl
 "$cps" publish --repo toolchain --proto "$work/native-rust" --signing-key "$work/toolchain.der" native-rust.kdl
-"$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version "$runtime_version" \
+"$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version "$runtime_version" "${seed_arch[@]}" \
     --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
 "$cps" publish --repo runtime-seed --proto "$work/elf-runtime" --signing-key "$work/runtime-seed.der" elf-runtime.kdl
 
@@ -72,7 +90,7 @@ write_toolchain_recipe() {
         printf '    toolchain solver="sat-v1" {\n'
         cat "$pins"
         printf '        package "%s"\n' \
-            cps://seed/build/native-rust@1.0.0-0 \
+            "cps://seed/build/native-rust@$seed_version" \
             "cps://canopa-runtime-seed/system/elf-runtime@$runtime_version" "$@"
         printf '    }\n'
     } > "$toolchain_recipe"
@@ -87,7 +105,7 @@ build_bundle() {
         --check-reproducible --builder-signing-key "$work/builder.der" "$2"
 }
 for library in sqlite libseccomp; do
-    recipe="$project/packaging/runtime/$library"
+    recipe="$source_tree/packaging/runtime/$library"
     fixture_manifest "$recipe.kdl" > "$library.kdl"
     sed -e "s/@ARCH@/$arch/g" -e "/^@TOOLCHAIN@\$/ {
 r $toolchain_recipe
@@ -153,7 +171,7 @@ cp bootstrap-toolchain.kdl toolchain.kdl
 append_toolchain_publisher "$pins" toolchain.kdl canopa repo release-public.der
 write_toolchain_recipe "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"
 
-fixture_manifest "$project/packaging/cps.kdl" > cps.kdl
+fixture_manifest "$cps_manifest" > cps.kdl
 sed -e "s/@ARCH@/$arch/g" -e "s/@EPOCH@/$epoch/g" \
     -e "/^@TOOLCHAIN@\$/ {
 r $toolchain_recipe
@@ -164,7 +182,7 @@ d
     -e "s/@SOURCE_SHA256@/$(sha "$work/sources/cps.tar.gz")/g" \
     -e "s/@VENDOR_SIZE@/$(wc -c < "$work/sources/vendor.tar.gz")/g" \
     -e "s/@VENDOR_SHA256@/$(sha "$work/sources/vendor.tar.gz")/g" \
-    "$project/packaging/cps-build.kdl.in" > build.kdl
+    "$source_tree/packaging/cps-build.kdl.in" > build.kdl
 
 "$cps" source import --from "$work/sources" --cache sources build.kdl
 build_bundle toolchain.kdl build.kdl bundle

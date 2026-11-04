@@ -177,14 +177,16 @@ cargo fetch --locked
 CPS_RUNTIME_SOURCE_DIR=/path/to/runtime-sources tests/build-cps.sh target/cps-fixture HEAD
 ```
 
-The fixture archives the selected Git commit and checks each cached crate
+The fixture takes the package manifests, build recipes, and worker seed scripts
+from the selected Git commit. It checks each cached crate
 archive against `Cargo.lock` before vendoring from a fresh offline Cargo home.
 It builds SQLite and libseccomp twice offline and publishes both to an initial
 protected catalog. Their packages carry the headers, pkg-config files, and
 linker symlinks under the `devel` facet. The `cps-build-libs` profile
 validates both packages with that facet enabled.
 
-The CPS recipe pins that library catalog, the Rust and C toolchain catalog,
+The x86-64 CPS package declares its target in the signed manifest. Its
+recipe pins that library catalog, the Rust and C toolchain catalog,
 and the `runtime-seed` catalog with the worker's prebuilt ELF loader and C
 and GCC runtime libraries. The seed provides both loader paths used by CPS
 and glibc as hard links to one inode. After two matching builds, the release
@@ -198,8 +200,10 @@ repository, protected package repository, and runtime seed repository. Set
 `CPS_VM_CPS_FIXTURE` to that output directory for a systemd VM boot test. The
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
-directory to also use that executable to assemble the guest. Use a
-`0.1.0-3` or later guest fixture with a checkpoint-aware host CPS.
+directory to also use that executable to assemble the guest. The VM defaults
+to package revision `0.1.0-4`. Set `CPS_VM_CPS_VERSION=0.1.0-3` to reuse
+the previous guest fixture. Use an architecture-aware host CPS to assemble
+images containing the new package.
 
 ### Preparing a source cache
 
