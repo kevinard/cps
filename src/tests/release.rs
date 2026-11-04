@@ -3540,10 +3540,23 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
 
     fs::rename(&extra_offline, &extra_mirror)?;
-    fs::remove_file(extra_cache.join("blobs").join(digest(b"library")))?;
+    let replacement = work.join("extras-replacement");
+    mirror_release::sync_index(
+        &replacement,
+        &extra_anchor,
+        extra_metadata.as_str(),
+        extra_targets.as_str(),
+        "extras",
+        &extras.public,
+    )?;
+    fs::rename(&extra_cache, work.join("old-extras-cache"))?;
+    crate::set_publisher_repositories(&f.root, &[("extras".to_owned(), replacement.clone())])?;
+    let library = replacement.join("blobs").join(digest(b"library"));
+    assert!(!library.exists());
     fs::write(f.root.join(LIBRARY), b"damaged")?;
     let repair = plan(&f.root, Request::Repair { packages: vec![] })?;
     assert_eq!(fetch_plan(&f.root, &repair)?, 1);
+    assert_eq!(fs::read(library)?, b"library");
     fs::rename(&extra_mirror, &extra_offline)?;
     apply(&f.root, &repair)?;
     assert_eq!(fs::read(f.root.join(LIBRARY))?, b"library");
