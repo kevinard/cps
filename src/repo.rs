@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
-    attestation::{ATTESTATION_LIMIT, VerifiedBuild, verify_bundle},
+    attestation::{ATTESTATION_LIMIT, MAX_BUILDERS, VerifiedBuild, verify_bundle},
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest, publish_policy},
     model::{Action, FORMAT, FileDigest, Manifest, Node, digest, digest_reader, validate_digest},
@@ -332,6 +332,27 @@ pub fn publish_bundle(
     builder_key: &Path,
     reviewed_recipe: &str,
 ) -> Result<String> {
+    publish_witnessed_bundle(repo, bundle, key, builder_key, reviewed_recipe, &[])
+}
+
+#[derive(Clone)]
+pub struct BuildWitness {
+    pub key: PathBuf,
+    pub attestation: PathBuf,
+}
+
+pub fn publish_witnessed_bundle(
+    repo: &Path,
+    bundle: &Path,
+    key: &Path,
+    builder_key: &Path,
+    reviewed_recipe: &str,
+    witnesses: &[BuildWitness],
+) -> Result<String> {
+    ensure!(
+        witnesses.len() < MAX_BUILDERS,
+        "at most {MAX_BUILDERS} build signers are supported"
+    );
     let bundle = Root::open(bundle)?;
     let key = read_signing_key(key)?;
     let builder = read_key(builder_key)?;
@@ -339,7 +360,27 @@ pub fn publish_bundle(
         builder.as_slice() != key.public_key().as_ref(),
         "builder and publisher must use distinct keys"
     );
-    let (manifest, verified) = verify_bundle(&bundle, &builder, reviewed_recipe)?;
+    let (manifest, mut verified) = verify_bundle(&bundle, &builder, reviewed_recipe)?;
+    for witness in witnesses {
+        let builder = read_key(&witness.key)?;
+        ensure!(
+            builder.as_slice() != key.public_key().as_ref(),
+            "builder and publisher must use distinct keys"
+        );
+        let file = File::from(open(
+            &witness.attestation,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        ensure!(
+            file.metadata()?.is_file(),
+            "witness attestation must be a regular file"
+        );
+        let envelope = read_limited(file, ATTESTATION_LIMIT)?;
+        verified
+            .add_witness(&envelope, &builder)
+            .with_context(|| format!("verifying witness {}", witness.attestation.display()))?;
+    }
     publish_manifest(
         repo,
         bundle.subdir("proto")?,
@@ -431,7 +472,8 @@ fn publish_manifest(
         false
     };
     if let Some(evidence) = evidence {
-        let hash = digest(&evidence.envelope);
+        let envelope = evidence.envelope()?;
+        let hash = digest(&envelope);
         if let Some(previous) = catalog.attestations.get(&id) {
             ensure!(
                 previous == &hash,
@@ -440,7 +482,7 @@ fn publish_manifest(
             read_object(repo, "attestations", previous, ATTESTATION_LIMIT)?;
             return Ok(id);
         }
-        let hash = store(repo, "attestations", &evidence.envelope)?;
+        let hash = store(repo, "attestations", &envelope)?;
         catalog.attestations.insert(id.clone(), hash);
     } else if unchanged_manifest {
         return Ok(id);
@@ -490,12 +532,24 @@ fn enforce_publish_policy(
         policy.recipes.get(id) == Some(&build.recipe_sha256),
         "build recipe is not approved for {id}"
     );
-    let mut approved = false;
+    let mut approved = BTreeSet::new();
     for path in policy.builder_keys {
         let key = read_key(&repo.join(path))?;
-        approved |= digest(&key) == build.builder_sha256;
+        approved.insert(digest(&key));
     }
-    ensure!(approved, "build signer is not authorized by publish policy");
+    ensure!(
+        build.builders().all(|builder| approved.contains(builder)),
+        "build signer is not authorized by publish policy"
+    );
+    ensure!(
+        approved.len() >= policy.minimum_builders,
+        "publish policy has fewer distinct builder keys than its threshold"
+    );
+    ensure!(
+        build.builders().len() >= policy.minimum_builders,
+        "publish policy requires {} distinct build signers",
+        policy.minimum_builders
+    );
     catalog.attestations_required = true;
     Ok(())
 }

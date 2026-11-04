@@ -149,6 +149,9 @@ build_package --source-cache cache --builder-signing-key builder.der --check-rep
 (umask 077; build_package --sources sources --builder-signing-key builder.der --check-reproducible --output second build.kdl)
 diff -r first second
 build_package --sources sources --builder-signing-key other.der --check-reproducible --output unapproved build.kdl
+cp build.kdl other-recipe.kdl
+printf '\n// A different reviewed input\n' >> other-recipe.kdl
+build_package --sources sources --builder-signing-key other.der --check-reproducible --output mismatch other-recipe.kdl
 test ! -e first/proto/unlisted
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
 test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
@@ -260,6 +263,52 @@ Path('pae').write_bytes(b'DSSEv1 %d %s %d %s' % (len(kind), kind, len(payload), 
 Path('signature').write_bytes(base64.b64decode(envelope['signatures'][0]['sig'], validate=True))
 PYTHON
 openssl pkeyutl -verify -pubin -keyform DER -inkey builder-public.der -rawin -in pae -sigfile signature
+
+mkdir witnessed
+cp builder-public.der other-public.der witnessed/
+cat > witnessed/publish-policy.kdl <<POLICY
+schema-version 1
+publisher "canopa" minimum-builders=2 {
+    builder-key "builder-public.der"
+    builder-key "other-public.der"
+    approve "demo/hello" version="1.0.0-0" sha256="$reviewed"
+}
+POLICY
+publish_witnessed() {
+    "$cps" publish-bundle --repo witnessed --signing-key signing.der --recipe-sha256 "$reviewed" "$@"
+}
+expect_failure 'requires 2 distinct build signers' publish_witnessed --builder-key builder-public.der first
+expect_failure 'duplicate build signer' publish_witnessed --builder-key builder-public.der \
+    --witness builder-public.der=second/attestation.json first
+expect_failure 'invalid builder attestation signature' publish_witnessed --builder-key builder-public.der \
+    --witness other-public.der=second/attestation.json first
+expect_failure 'witness build statement differs' publish_witnessed --builder-key builder-public.der \
+    --witness other-public.der=mismatch/attestation.json first
+test ! -e witnessed/current
+publish_witnessed --builder-key builder-public.der --witness other-public.der=unapproved/attestation.json first
+witnessed_catalog=$(cat witnessed/current)
+publish_witnessed --builder-key other-public.der --witness builder-public.der=first/attestation.json unapproved
+test "$(cat witnessed/current)" = "$witnessed_catalog"
+"$cps" repo attestation --repo witnessed --publisher canopa --trust-key public.der \
+    cps://canopa/demo/hello@1.0.0-0 > witnessed.json
+python3 - <<'PYTHON'
+import base64
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+envelope = json.loads(Path('witnessed.json').read_bytes())
+assert envelope['payload'] == json.loads(Path('envelope.json').read_bytes())['payload']
+signatures = {entry['keyid']: entry['sig'] for entry in envelope['signatures']}
+assert len(envelope['signatures']) == len(signatures) == 2
+for path in ('builder-public.der', 'other-public.der'):
+    keyid = hashlib.sha256(Path(path).read_bytes()[-32:]).hexdigest()
+    Path('signature').write_bytes(base64.b64decode(signatures[keyid], validate=True))
+    subprocess.run(['openssl', 'pkeyutl', '-verify', '-pubin', '-keyform', 'DER',
+                    '-inkey', path, '-rawin', '-in', 'pae', '-sigfile', 'signature'], check=True)
+PYTHON
+
 "$cps" repo export --repo release --publisher canopa --trust-key public.der --output targets
 test -f "targets/attestations-$(sha first/attestation.json)"
 test ! -e targets/publish-policy.kdl

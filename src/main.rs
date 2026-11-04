@@ -10,10 +10,10 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
-    Activation, BuildOptions, ImageConfig, Plan, Request, activate_boot_environment, apply,
-    build_cached_package, build_package, create_image, fetch_sources, import_sources,
-    list_boot_environments, plan, publish, publish_bundle, read_attestation, read_image_config,
-    release, rollback_boot_environment, stage_boot_environment, verify,
+    Activation, BuildOptions, BuildWitness, ImageConfig, Plan, Request, activate_boot_environment,
+    apply, build_cached_package, build_package, create_image, fetch_sources, import_sources,
+    list_boot_environments, plan, publish, publish_witnessed_bundle, read_attestation,
+    read_image_config, release, rollback_boot_environment, stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -70,6 +70,8 @@ enum Command {
         builder_key: PathBuf,
         #[arg(long)]
         recipe_sha256: String,
+        #[arg(long, value_name = "KEY=ATTESTATION", value_parser = parse_witness)]
+        witness: Vec<BuildWitness>,
         bundle: PathBuf,
     },
     /// Export or synchronize a signed repository release
@@ -163,6 +165,17 @@ enum SourceCommand {
         from: PathBuf,
         recipe: PathBuf,
     },
+}
+
+fn parse_witness(value: &str) -> std::result::Result<BuildWitness, String> {
+    let (key, attestation) = value.split_once('=').ok_or("expected KEY=ATTESTATION")?;
+    if key.is_empty() || attestation.is_empty() {
+        return Err("witness key and attestation paths are required".to_owned());
+    }
+    Ok(BuildWitness {
+        key: key.into(),
+        attestation: attestation.into(),
+    })
 }
 
 #[derive(Subcommand)]
@@ -371,11 +384,19 @@ fn run(command: Command) -> Result<ExitCode> {
             signing_key,
             builder_key,
             recipe_sha256,
+            witness,
             bundle,
         } => {
             println!(
                 "Published {}",
-                publish_bundle(&repo, &bundle, &signing_key, &builder_key, &recipe_sha256)?
+                publish_witnessed_bundle(
+                    &repo,
+                    &bundle,
+                    &signing_key,
+                    &builder_key,
+                    &recipe_sha256,
+                    &witness
+                )?
             );
         }
         Command::Repo { command } => match command {

@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_BUILDERS: usize = 16;
 const STATEMENT: &str = "https://in-toto.io/Statement/v1";
 const PREDICATE: &str = "urn:canopa:cps:build-provenance:v1";
 const MEDIA_TYPE: &str = "application/vnd.in-toto+json";
@@ -104,10 +105,40 @@ pub(crate) struct Toolchain {
 }
 
 pub(crate) struct VerifiedBuild {
-    pub envelope: Vec<u8>,
+    payload: Vec<u8>,
+    signatures: BTreeMap<String, Vec<u8>>,
     pub artifacts: BTreeMap<String, FileDigest>,
-    pub builder_sha256: String,
     pub recipe_sha256: String,
+}
+
+impl VerifiedBuild {
+    pub fn add_witness(&mut self, bytes: &[u8], key: &[u8]) -> Result<()> {
+        let builder = digest(key);
+        ensure!(
+            !self.signatures.contains_key(&builder),
+            "duplicate build signer"
+        );
+        let (payload, signature) = verify_envelope(bytes, key)?;
+        ensure!(
+            payload == self.payload,
+            "witness build statement differs from the primary build"
+        );
+        self.signatures.insert(builder, signature);
+        Ok(())
+    }
+
+    pub fn builders(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.signatures.keys().map(String::as_str)
+    }
+
+    pub fn envelope(&self) -> Result<Vec<u8>> {
+        envelope(
+            &self.payload,
+            self.signatures
+                .iter()
+                .map(|(key, sig)| (key.as_str(), sig.as_slice())),
+        )
+    }
 }
 
 pub(crate) fn sign(
@@ -144,17 +175,24 @@ pub(crate) fn sign(
     };
     let payload = serde_json::to_vec(&statement)?;
     let signature = key.sign(&pae(&payload));
-    envelope(&payload, signature.as_ref(), key.public_key().as_ref())
+    let builder = digest(key.public_key().as_ref());
+    envelope(&payload, [(builder.as_str(), signature.as_ref())])
 }
 
-fn envelope(payload: &[u8], signature: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+fn envelope<'a>(
+    payload: &[u8],
+    signatures: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(&Envelope {
         payload_type: MEDIA_TYPE.to_owned(),
         payload: STANDARD.encode(payload),
-        signatures: vec![Signature {
-            keyid: digest(key),
-            sig: STANDARD.encode(signature),
-        }],
+        signatures: signatures
+            .into_iter()
+            .map(|(key, signature)| Signature {
+                keyid: key.to_owned(),
+                sig: STANDARD.encode(signature),
+            })
+            .collect(),
     })?;
     ensure!(
         bytes.len() as u64 <= ATTESTATION_LIMIT,
@@ -190,17 +228,15 @@ fn file_digest(bytes: &[u8]) -> FileDigest {
     }
 }
 
-pub(crate) fn verify_bundle(
-    bundle: &Root,
-    builder_key: &[u8],
-    reviewed_recipe: &str,
-) -> Result<(Manifest, VerifiedBuild)> {
-    validate_digest(reviewed_recipe).context("invalid reviewed recipe digest")?;
-    let bytes = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
-    let signed: Envelope = serde_json::from_slice(&bytes)?;
+fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let signed: Envelope = serde_json::from_slice(bytes)?;
     ensure!(
         signed.payload_type == MEDIA_TYPE,
         "unexpected attestation payload type"
+    );
+    ensure!(
+        signed.signatures.len() <= MAX_BUILDERS,
+        "too many attestation signatures"
     );
     let payload = decode(&signed.payload)?;
     let message = pae(&payload);
@@ -214,6 +250,17 @@ pub(crate) fn verify_bundle(
             Some(signature)
         })
         .context("invalid builder attestation signature")?;
+    Ok((payload, signature))
+}
+
+pub(crate) fn verify_bundle(
+    bundle: &Root,
+    builder_key: &[u8],
+    reviewed_recipe: &str,
+) -> Result<(Manifest, VerifiedBuild)> {
+    validate_digest(reviewed_recipe).context("invalid reviewed recipe digest")?;
+    let bytes = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
+    let (payload, signature) = verify_envelope(&bytes, builder_key)?;
     let statement: Statement = serde_json::from_slice(&payload)?;
     // CPS producers use one serialization. Reject ambiguous fields in externally signed statements.
     ensure!(
@@ -300,9 +347,9 @@ pub(crate) fn verify_bundle(
     Ok((
         manifest,
         VerifiedBuild {
-            envelope: envelope(&payload, &signature, builder_key)?,
+            payload,
+            signatures: BTreeMap::from([(digest(builder_key), signature)]),
             artifacts,
-            builder_sha256: digest(builder_key),
             recipe_sha256: reviewed_recipe.to_owned(),
         },
     ))

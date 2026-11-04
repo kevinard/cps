@@ -3,13 +3,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail, ensure};
 use kdl::KdlDocument;
 
-use crate::model::{Version, validate_digest, validate_name, validate_publisher};
+use crate::{
+    attestation::MAX_BUILDERS,
+    model::{Version, validate_digest, validate_name, validate_publisher},
+};
 
 use super::{Fields, document, one, schema};
 
 pub(crate) struct PublishPolicy {
     pub publisher: String,
     pub builder_keys: BTreeSet<String>,
+    pub minimum_builders: usize,
     pub recipes: BTreeMap<String, String>,
 }
 
@@ -21,7 +25,13 @@ pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
         "expected schema-version and publisher nodes"
     );
     let node = one(&doc, "publisher")?;
-    let publisher = Fields::read(node, 1, &[], true)?.string_arg(0)?;
+    let fields = Fields::read(node, 1, &["minimum-builders"], true)?;
+    let publisher = fields.string_arg(0)?;
+    let minimum_builders = fields.integer("minimum-builders")?.unwrap_or(1);
+    ensure!(
+        (1..=MAX_BUILDERS).contains(&minimum_builders),
+        "minimum-builders must be between 1 and {MAX_BUILDERS}"
+    );
     validate_publisher(&publisher)?;
     let mut builder_keys = BTreeSet::new();
     let mut recipes = BTreeMap::new();
@@ -58,6 +68,7 @@ pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
     Ok(PublishPolicy {
         publisher,
         builder_keys,
+        minimum_builders,
         recipes,
     })
 }

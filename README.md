@@ -123,6 +123,16 @@ publisher "canopa" {
 
 Protected repositories accept packages through `publish-bundle` only. CPS checks the verified worker key and recipe digest against the policy, independently of the command-line arguments. The publisher signs the protection flag into the catalog, and later publication fails if the policy file is missing. Keep bootstrap packages in a separate toolchain repository. Export carries package attestations and leaves the publisher's local policy and key files on the publishing machine.
 
+For independent rebuilds, set `minimum-builders=2` on the policy's `publisher` node and provision a `builder-key` for each worker. Run the same pinned recipe on each worker and pass the additional signed statements with `--witness`. The publishing policy defaults to one worker key.
+
+```sh
+cps publish-bundle --repo repo --signing-key private.der --builder-key worker-a-public.der \
+    --recipe-sha256 "$reviewed_recipe_sha256" \
+    --witness worker-b-public.der=worker-b-build/attestation.json worker-a-build
+```
+
+CPS counts distinct authorized keys whose signatures cover the same build statement, including the exact payload hashes and pinned inputs. The release stores those signatures together in the DSSE envelope. The threshold applies at publication. Administrators establish worker independence by assigning keys to separately operated workers.
+
 ## Signed releases and mirrors
 
 `publish` assembles the local CPS repository using a publisher signing key. Export a snapshot to a new directory before signing it with [The Update Framework](https://theupdateframework.github.io/specification/latest/).
