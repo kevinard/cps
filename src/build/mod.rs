@@ -496,7 +496,7 @@ fn prepare_toolchain(
         if let Some((repository, trust, evidence)) =
             builds.get(published.manifest.publisher.as_str())
         {
-            evidence.verify(repository, trust, published)?;
+            evidence.verify(repository, [*trust], published)?;
         }
     }
     for (name, managed) in &paths {

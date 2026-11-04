@@ -804,4 +804,109 @@ mv witnessed witnessed-offline
 "$cps" publisher audit-builds --root guarded-staged canopa | grep -F 'Verified build evidence for 2 installed package'
 expect_failure 'requires 2 trusted builder signatures, found 1' "$cps" publisher audit-builds --root guarded canopa
 mv witnessed-offline witnessed
+
+# A primary publisher checks both the clean and sticky upgrade composition.
+openssl genpkey -algorithm ED25519 -outform DER -out desktop.der
+openssl pkey -inform DER -in desktop.der -pubout -outform DER -out desktop-public.der
+cat > desktop.kdl <<'MANIFEST'
+schema-version 1
+package "desktop/base" publisher="desktop" version="1.0.0-0" {
+    require "demo/hello"
+}
+MANIFEST
+cat > unchecked.kdl <<'MANIFEST'
+schema-version 1
+package "demo/unchecked" publisher="canopa" version="1.0.0-0" {}
+MANIFEST
+"$cps" publish --repo desktop-repo --proto first/proto --signing-key desktop.der desktop.kdl
+"$cps" publish --repo profile-companion --proto first/proto --signing-key signing.der first/manifest.kdl
+"$cps" publish --repo profile-companion --proto first/proto --signing-key signing.der unchecked.kdl
+desktop_base=$(cat desktop-repo/current)
+desktop_baseline=$desktop_base
+unattested=$(cat profile-companion/current)
+profile_policy() {
+    local companion=$1 primary_baseline=${2:-} companion_baseline=${3:-}
+    cat > desktop-repo/publish-policy.kdl <<POLICY
+schema-version 1
+publisher "desktop" {
+    builder-key "../builder-public.der"
+    profile "desktop" architecture="$arch" $primary_baseline {
+        package "desktop/base"
+        publisher "canopa" catalog="$(cat "$companion/current")" $companion_baseline {
+            repository "../$companion"
+            trust-key "../public.der"
+            build-trust minimum-builders=2 {
+                builder-key "../builder-public.der"
+                builder-key "../other-public.der"
+            }
+        }
+    }
+}
+POLICY
+}
+refresh_desktop() {
+    printf 'schema-version 1\nrelease "desktop" base="%s" refresh-profiles=#true\n' \
+        "$desktop_base" > desktop-refresh.kdl
+    "$cps" repo publish-release --repo desktop-repo --signing-key desktop.der desktop-refresh.kdl
+}
+profile_policy profile-companion
+expect_failure 'no build attestation for cps://canopa/demo/hello@1.0.0-0' refresh_desktop
+profile_policy release
+expect_failure 'requires 2 trusted builder signatures, found 1' refresh_desktop
+test "$(cat desktop-repo/current)" = "$desktop_base"
+
+# The fresh composition now finds the primary package, but the upgrade keeps
+# the companion's copy because it was already installed from that publisher.
+rm -- desktop-repo/publish-policy.kdl
+sed 's/publisher="canopa"/publisher="desktop"/' first/manifest.kdl > desktop-hello.kdl
+"$cps" publish --repo desktop-repo --proto first/proto --signing-key desktop.der desktop-hello.kdl
+desktop_base=$(cat desktop-repo/current)
+profile_policy profile-companion "upgrade-from=\"$desktop_baseline\"" "upgrade-from=\"$unattested\""
+expect_failure 'checking upgrade from' refresh_desktop
+grep -F 'no build attestation for cps://canopa/demo/hello@1.0.0-0' rejected.log
+test "$(cat desktop-repo/current)" = "$desktop_base"
+
+"$cps" publish-bundle --repo profile-companion --signing-key signing.der \
+    --builder-key builder-public.der --recipe-sha256 "$reviewed" \
+    --witness other-public.der=unapproved/attestation.json first
+profile_policy profile-companion "upgrade-from=\"$desktop_baseline\"" "upgrade-from=\"$unattested\""
+refresh_desktop
+desktop_base=$(cat desktop-repo/current)
+expect_failure 'builder and publisher must use distinct keys' "$cps" repo rotate-key \
+    --repo desktop-repo --publisher desktop --base "$desktop_base" \
+    --signing-key desktop.der --new-signing-key builder.der
+sed -i '/build-trust minimum-builders=2 {/,/^            }/d' desktop-repo/publish-policy.kdl
+expect_failure 'release drops companion build trust for canopa' refresh_desktop
+test "$(cat desktop-repo/current)" = "$desktop_base"
+
+cat > desktop-image.kdl <<'CONFIG'
+schema-version 1
+release-profile "desktop"
+publisher "desktop" {
+    repository "desktop-repo"
+    trust-key "desktop-public.der"
+}
+publisher "canopa" {
+    repository "profile-companion"
+    trust-key "public.der"
+}
+CONFIG
+"$cps" image-create --root desktop-image --config desktop-image.kdl
+expect_failure 'no build attestation for cps://canopa/demo/unchecked@1.0.0-0' \
+    "$cps" plan --root desktop-image --output rejected.json install cps://canopa/demo/unchecked
+"$cps" plan --root desktop-image --output desktop.json install desktop/base cps://canopa/demo/hello
+evidence=$(find profile-companion/attestations -maxdepth 1 -type f)
+mv -- "$evidence" saved-companion-evidence
+expect_failure 'reading build attestation for cps://canopa/demo/hello@1.0.0-0' \
+    "$cps" apply --root desktop-image desktop.json
+test ! -e desktop-image/hello
+mv -- saved-companion-evidence "$evidence"
+"$cps" apply --root desktop-image desktop.json
+"$cps" verify --root desktop-image --pristine
+
+sed '/    trust-key "public.der"/a\    build-trust { builder-key "replacement-public.der"; }' \
+    desktop-image.kdl > independent-desktop.kdl
+"$cps" image-create --root independent-desktop --config independent-desktop.kdl
+expect_failure 'requires 1 trusted builder signatures, found 0' "$cps" plan \
+    --root independent-desktop --output rejected.json install desktop/base cps://canopa/demo/hello
 echo "Verified isolated build, reproducibility, signed provenance, and package installation"

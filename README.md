@@ -447,6 +447,29 @@ publisher. Otherwise both compositions use its `catalog` pin. The primary
 catalog signs the checked architecture, facets, and ordered companion catalog
 digests. A configured image can use those digests directly.
 
+Add a `build-trust` block inside a companion publisher to require version 3
+build evidence for the companion packages in the fresh composition and in
+the result of a checked upgrade. This includes packages the update solver
+retains from the baseline. Builder keys must be separate from the primary
+and companion publishers' current and retired signing keys.
+
+```kdl
+build-trust minimum-builders=2 {
+    builder-key "../keys/worker-a.der"
+    builder-key "../keys/worker-b.der"
+}
+```
+
+The primary signs the companion's builder keys and threshold with its
+catalog pin. Images following the profile verify that policy when planning
+and applying new or changed companion packages, including packages beyond
+the release's tested composition. Any independently configured image
+policy for that publisher must also pass. Use that local policy to audit
+archived evidence with `publisher audit-builds`. Later catalogs can rotate
+the signed policy and must retain a builder policy for the guarded
+companion in that profile. Upgrade clients before consuming profiles with
+this requirement.
+
 ## Signed releases and mirrors
 
 Group related package changes and withdrawals in a KDL release file. Use the

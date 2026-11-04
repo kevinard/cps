@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use crate::{
+    attestation::BuildTrust,
     boot::kernel,
     image::{Installed, Managed},
     kdl_format::publish_policy::{Companion, Profile},
@@ -19,27 +20,47 @@ use crate::{
     },
 };
 
-use super::{Catalog, Published, Snapshot, read_catalog, read_key, read_package, snapshot};
+use super::{
+    Catalog, CatalogPin, Published, ReleaseProfile, Snapshot, read_catalog, read_key, read_package,
+    snapshot,
+};
 
 type Composition = (BTreeMap<String, Installed>, BTreeMap<String, Managed>);
 
 struct CompanionCatalogs<'a> {
     name: &'a str,
+    repo: &'a Path,
+    trust: Option<BuildTrust>,
     current: Snapshot,
     baseline: Option<Snapshot>,
 }
 
 impl<'a> CompanionCatalogs<'a> {
-    fn load(companion: &'a Companion) -> Result<Self> {
+    fn load(companion: &'a Companion, primary_keys: &[[u8; 32]]) -> Result<Self> {
         let config = &companion.config;
         let key = read_key(&config.trust_key)?;
         let load = |hash: &str| {
             snapshot(&config.repository, &config.name, &key, Some(hash))
                 .with_context(|| format!("reading companion catalog {hash} for {}", config.name))
         };
+        let current = load(&companion.catalog)?;
+        let trust = config
+            .build_trust
+            .as_ref()
+            .map(|trust| trust.load(&key))
+            .transpose()
+            .with_context(|| format!("loading build trust for {}", config.name))?;
+        if let Some(trust) = &trust {
+            current.builds.check_keys(trust)?;
+            for key in primary_keys {
+                trust.check_publisher_key(key)?;
+            }
+        }
         Ok(Self {
             name: &config.name,
-            current: load(&companion.catalog)?,
+            repo: &config.repository,
+            trust,
+            current,
             baseline: companion
                 .upgrade_from
                 .as_deref()
@@ -55,17 +76,19 @@ pub(super) fn check(
     catalog: &Catalog,
     profiles: &BTreeMap<String, Profile>,
     key: &[u8],
-) -> Result<()> {
+) -> Result<BTreeMap<String, ReleaseProfile>> {
     if profiles.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     let packages = load_packages(repo, catalog)?;
+    let primary_keys = catalog.publisher_keys(key)?;
     let mut baselines = BTreeMap::new();
+    let mut checked = BTreeMap::new();
     for (name, profile) in profiles {
         let companions = profile
             .companions
             .iter()
-            .map(CompanionCatalogs::load)
+            .map(|companion| CompanionCatalogs::load(companion, &primary_keys))
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("loading companion publishers for release profile {name}"))?;
         let sources = profile
@@ -76,6 +99,8 @@ pub(super) fn check(
         let current = candidates(catalog, &packages, &companions, false, sources.clone());
         let (target, paths) = compose(&current, profile, true)
             .with_context(|| format!("checking release profile {name}"))?;
+        check_companion_builds(&companions, &target)
+            .with_context(|| format!("checking companion builds for release profile {name}"))?;
         runtime::check(repo, &catalog.publisher, profile, &target, &paths)
             .with_context(|| format!("checking ELF closure for release profile {name}"))?;
         if let Some(hash) = profile.upgrade_from.as_deref() {
@@ -100,9 +125,48 @@ pub(super) fn check(
                     .collect();
                 let current = candidates(catalog, &packages, &companions, false, sticky);
                 let (after, paths) = check_upgrade(&before, old_paths, &current, &target, profile)?;
+                check_companion_builds(&companions, &after)?;
                 runtime::check(repo, &catalog.publisher, profile, &after, &paths)
             })()
             .with_context(|| format!("checking upgrade from {hash} for release profile {name}"))?;
+        }
+        checked.insert(
+            name.clone(),
+            ReleaseProfile {
+                architecture: profile.arch.clone(),
+                facets: profile.facets.clone(),
+                companions: companions
+                    .into_iter()
+                    .map(|companion| CatalogPin {
+                        publisher: companion.name.to_owned(),
+                        sha256: companion.current.sha256,
+                        build_trust: companion.trust,
+                    })
+                    .collect(),
+                elf_library_dirs: profile.elf_library_dirs.clone(),
+                elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
+            },
+        );
+    }
+    Ok(checked)
+}
+
+fn check_companion_builds(
+    companions: &[CompanionCatalogs<'_>],
+    installed: &BTreeMap<String, Installed>,
+) -> Result<()> {
+    for companion in companions {
+        let Some(trust) = &companion.trust else {
+            continue;
+        };
+        for package in installed
+            .values()
+            .filter(|pkg| pkg.published.manifest.publisher == companion.name)
+        {
+            companion
+                .current
+                .builds
+                .verify(companion.repo, [trust], &package.published)?;
         }
     }
     Ok(())

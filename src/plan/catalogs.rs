@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 
 use super::Plan;
 use crate::{
+    attestation::BuildTrust,
     image::{Installed, State},
     model::{PackageSpec, Version},
     repo::{BuildEvidence, BuildReceipt, Published, snapshot},
@@ -14,7 +15,12 @@ pub(super) struct Catalogs {
     pub legacy: Option<String>,
     pub pins: BTreeMap<String, String>,
     pub candidates: CandidateSet<Published>,
-    builds: BTreeMap<String, BuildEvidence>,
+    builds: BTreeMap<String, SelectedBuilds>,
+}
+
+struct SelectedBuilds {
+    evidence: BuildEvidence,
+    profile_trust: Option<BuildTrust>,
 }
 
 impl Catalogs {
@@ -36,12 +42,17 @@ impl Catalogs {
                 .publishers
                 .get(&package.published.manifest.publisher)
                 .context("missing publisher for selected package")?;
-            if let Some(trust) = &publisher.build_trust {
-                let receipt = self
-                    .builds
-                    .get(&publisher.name)
-                    .context("missing build evidence from selected catalog")?
-                    .verify(&publisher.repo, trust, &package.published)?;
+            if let Some(builds) = self.builds.get(&publisher.name) {
+                let signed = builds.profile_trust.as_ref();
+                let local = publisher
+                    .build_trust
+                    .as_ref()
+                    .filter(|trust| Some(*trust) != signed);
+                let receipt = builds.evidence.verify(
+                    &publisher.repo,
+                    signed.into_iter().chain(local),
+                    &package.published,
+                )?;
                 receipts.push(receipt);
             }
         }
@@ -173,13 +184,14 @@ pub(super) fn load(
     let mut catalogs = Catalogs::default();
     for publisher in publishers {
         let mut pin = saved_pin(&publisher.name)?;
-        if let Some(required) = release_pins.get(&publisher.name) {
+        let signed = release_pins.get(&publisher.name);
+        if let Some(required) = signed {
             ensure!(
-                saved.is_none() || pin == Some(required),
+                saved.is_none() || pin == Some(required.sha256.as_str()),
                 "saved plan catalog for {} differs from the signed release profile",
                 publisher.name
             );
-            pin = Some(required);
+            pin = Some(&required.sha256);
         }
         let snapshot = snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
             .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
@@ -208,10 +220,15 @@ pub(super) fn load(
         catalogs
             .candidates
             .add_packages(&mut sources, &publisher.name, snapshot.packages);
-        if publisher.build_trust.is_some() {
-            catalogs
-                .builds
-                .insert(publisher.name.clone(), snapshot.builds);
+        let profile_trust = signed.and_then(|pin| pin.build_trust.clone());
+        if publisher.build_trust.is_some() || profile_trust.is_some() {
+            catalogs.builds.insert(
+                publisher.name.clone(),
+                SelectedBuilds {
+                    evidence: snapshot.builds,
+                    profile_trust,
+                },
+            );
         }
     }
     Ok(catalogs)

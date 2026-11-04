@@ -10,7 +10,10 @@ use crate::{
     attestation::BuildTrust,
     kdl_format::read_build_trust,
     model::validate_publisher,
-    repo::{BuildAudit, BuildReceipt, audit_installed_builds, catalog_index, release_profile},
+    repo::{
+        BuildAudit, BuildReceipt, CatalogPin, audit_installed_builds, catalog_index,
+        release_profile,
+    },
 };
 
 pub struct PublisherInfo {
@@ -24,7 +27,7 @@ impl Publishers {
         arch: &str,
         facets: &BTreeMap<String, bool>,
         primary_pin: Option<&str>,
-    ) -> Result<BTreeMap<String, String>> {
+    ) -> Result<BTreeMap<String, CatalogPin>> {
         let Some(name) = self.release_profile() else {
             return Ok(BTreeMap::new());
         };
@@ -50,12 +53,19 @@ impl Publishers {
                 .eq(profile.companions.iter().map(|pin| &pin.publisher)),
             "image publisher order differs from signed release profile {name}"
         );
-        let mut pins = BTreeMap::from([(primary.name.clone(), hash)]);
+        let mut pins = BTreeMap::from([(
+            primary.name.clone(),
+            CatalogPin {
+                publisher: primary.name.clone(),
+                sha256: hash,
+                build_trust: None,
+            },
+        )]);
         pins.extend(
             profile
                 .companions
                 .into_iter()
-                .map(|pin| (pin.publisher, pin.sha256)),
+                .map(|pin| (pin.publisher.clone(), pin)),
         );
         Ok(pins)
     }
@@ -151,10 +161,9 @@ pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
         .publishers
         .get(name)
         .with_context(|| format!("publisher {name} is not configured"))?;
-    let trust = publisher
-        .build_trust
-        .as_ref()
-        .with_context(|| format!("publisher {name} has no build trust policy"))?;
+    let trust = publisher.build_trust.as_ref().with_context(|| {
+        format!("publisher {name} has no locally configured build trust policy")
+    })?;
     audit(&image, &state, publisher, trust, false)
 }
 
@@ -205,7 +214,7 @@ fn audit(
                 &publisher.repo,
                 &publisher.name,
                 &publisher.key,
-                pins.get(&publisher.name).map(String::as_str),
+                pins.get(&publisher.name).map(|pin| pin.sha256.as_str()),
                 trust,
                 missing.iter().copied(),
             )

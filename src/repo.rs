@@ -75,6 +75,8 @@ pub(crate) struct ReleaseProfile {
 pub(crate) struct CatalogPin {
     pub publisher: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_trust: Option<BuildTrust>,
 }
 
 impl Catalog {
@@ -212,7 +214,7 @@ impl Catalog {
             self.release_profiles.is_empty() || !next.release_profiles.is_empty(),
             "release drops signed composition profiles"
         );
-        self.check_elf_profiles(&next.release_profiles)?;
+        self.check_profile_guards(&next.release_profiles)?;
         for (id, record) in &self.withdrawals {
             ensure!(
                 next.withdrawals.get(id) == Some(record),
@@ -246,11 +248,11 @@ impl Catalog {
         Ok(())
     }
 
-    fn check_elf_profiles(&self, profiles: &BTreeMap<String, ReleaseProfile>) -> Result<()> {
+    fn check_profile_guards(&self, profiles: &BTreeMap<String, ReleaseProfile>) -> Result<()> {
         for (name, profile) in &self.release_profiles {
+            let next = profiles.get(name);
             if !profile.elf_library_dirs.is_empty() {
-                let next = profiles
-                    .get(name)
+                let next = next
                     .filter(|next| !next.elf_library_dirs.is_empty())
                     .with_context(|| {
                         format!("release drops ELF checking for signed profile {name}")
@@ -259,6 +261,36 @@ impl Catalog {
                     !profile.elf_symbol_versions || next.elf_symbol_versions,
                     "release drops ELF symbol version checking for signed profile {name}"
                 );
+            }
+            for pin in profile
+                .companions
+                .iter()
+                .filter(|pin| pin.build_trust.is_some())
+            {
+                ensure!(
+                    next.is_some_and(|next| next.companions.iter().any(|candidate| {
+                        candidate.publisher == pin.publisher && candidate.build_trust.is_some()
+                    })),
+                    "release drops companion build trust for {} in signed profile {name}",
+                    pin.publisher
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_profile_build_trust(&self, signer: &[u8]) -> Result<()> {
+        for pin in self
+            .release_profiles
+            .values()
+            .flat_map(|profile| &profile.companions)
+        {
+            if let Some(trust) = &pin.build_trust {
+                trust.validate()?;
+                trust.check_publisher_key(signer)?;
+                for rotation in &self.key_rotations {
+                    trust.check_publisher_key(rotation.previous_key())?;
+                }
             }
         }
         Ok(())
@@ -419,21 +451,32 @@ impl BuildReceipt {
 }
 
 impl BuildEvidence {
-    pub(crate) fn verify(
-        &self,
-        repo: &Path,
-        trust: &BuildTrust,
-        package: &Published,
-    ) -> Result<BuildReceipt> {
+    pub(crate) fn check_keys(&self, trust: &BuildTrust) -> Result<()> {
         for key in &self.publisher_keys {
             trust.check_publisher_key(key)?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn verify<'a>(
+        &self,
+        repo: &Path,
+        policies: impl IntoIterator<Item = &'a BuildTrust>,
+        package: &Published,
+    ) -> Result<BuildReceipt> {
+        let mut policies = policies.into_iter().peekable();
+        ensure!(policies.peek().is_some(), "missing builder policy");
         let id = package.manifest.id();
         let hash = self
             .attestations
             .get(&id)
             .with_context(|| format!("no build attestation for {id}"))?;
-        verify_repository_attestation(repo, trust, package, hash)?;
+        let bytes = read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
+            .with_context(|| format!("reading build attestation for {id}"))?;
+        for trust in policies {
+            self.check_keys(trust)?;
+            verify_package_attestation(&bytes, trust, package)?;
+        }
         Ok(BuildReceipt::new(package, hash, &self.history))
     }
 }
@@ -622,6 +665,7 @@ fn read_catalog_with_key(
         catalog.release_profiles.is_empty() || catalog.profiles_required,
         "signed composition profiles require the publishing gate"
     );
+    catalog.validate_profile_build_trust(&signer)?;
     for (name, profile) in &catalog.release_profiles {
         validate_name(name).context("invalid signed profile name")?;
         validate_publisher(&profile.architecture).context("invalid signed profile architecture")?;
@@ -1292,12 +1336,13 @@ fn stage_manifest(
 
 fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
     catalog.sequence = Some(catalog.next_sequence()?);
-    keys::signer(
+    let signer = keys::signer(
         &catalog.publisher,
         catalog.sequence,
         &catalog.key_rotations,
         keys::Trust::Current(key.public_key().as_ref()),
     )?;
+    catalog.validate_profile_build_trust(&signer)?;
     let signature = hex::encode(key.sign(&serde_json::to_vec(&catalog)?).as_ref());
     let signed = SignedCatalog { catalog, signature };
     let signed = serde_json::to_vec(&signed)?;
@@ -1351,33 +1396,9 @@ fn check_profiles(
             .key_rotations
             .first()
             .map_or(key, |rotation| rotation.previous_key());
-        profiles::check(repo, catalog, &policy.profiles, anchor)?;
+        let release_profiles = profiles::check(repo, catalog, &policy.profiles, anchor)?;
+        catalog.check_profile_guards(&release_profiles)?;
         catalog.profiles_required = true;
-        let release_profiles = policy
-            .profiles
-            .iter()
-            .map(|(name, profile)| {
-                let companions = profile
-                    .companions
-                    .iter()
-                    .map(|companion| CatalogPin {
-                        publisher: companion.config.name.clone(),
-                        sha256: companion.catalog.clone(),
-                    })
-                    .collect();
-                (
-                    name.clone(),
-                    ReleaseProfile {
-                        architecture: profile.arch.clone(),
-                        facets: profile.facets.clone(),
-                        companions,
-                        elf_library_dirs: profile.elf_library_dirs.clone(),
-                        elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
-                    },
-                )
-            })
-            .collect();
-        catalog.check_elf_profiles(&release_profiles)?;
         catalog.release_profiles = release_profiles;
     }
     Ok(())

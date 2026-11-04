@@ -12,7 +12,7 @@ use crate::{
     image::{Image, Installed, Publisher, Publishers},
     kdl_format::manifest_text,
     model::{PackageSpec, Version, validate_digest},
-    repo::{catalog_index, read_package},
+    repo::{CatalogPin, catalog_index, read_package},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,13 +55,13 @@ struct CatalogEntry {
 
 fn available(
     publisher: &Publisher,
-    pin: Option<&String>,
+    pin: Option<&CatalogPin>,
 ) -> Result<(Vec<CatalogEntry>, BTreeMap<String, Version>)> {
     let index = catalog_index(
         &publisher.repo,
         &publisher.name,
         &publisher.key,
-        pin.map(String::as_str),
+        pin.map(|pin| pin.sha256.as_str()),
     )?;
     let mut entries = Vec::new();
     for (id, sha256) in index.entries {
