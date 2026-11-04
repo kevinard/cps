@@ -25,10 +25,10 @@ prepare_fat_modules() {
     mkdir -p "$dir"
     : > "$dir/load"
     if [[ ${CPS_VM_FAT_BUILTIN:-0} == 1 ]]; then return; fi
-    local dependencies command module name
+    local dependencies command module name kernel_name
     dependencies=$(
-        modprobe --show-depends --dirname "$source" --set-version "$release" vfat
-        modprobe --show-depends --dirname "$source" --set-version "$release" nls_iso8859-1
+        modprobe --config /dev/null --ignore-install --show-depends --dirname "$source" --set-version "$release" vfat &&
+        modprobe --config /dev/null --ignore-install --show-depends --dirname "$source" --set-version "$release" nls_iso8859-1
     )
     while read -r command module _; do
         [[ $command == insmod ]] || continue
@@ -40,7 +40,8 @@ prepare_fat_modules() {
             *.gz) zcat "$module" > "$dir/$name" ;;
             *) cp "$module" "$dir/$name" ;;
         esac
-        printf '/vm-modules/%s/%s\n' "$release" "$name" >> "$dir/load"
+        kernel_name=${name%.ko}
+        printf '/vm-modules/%s/%s %s\n' "$release" "$name" "${kernel_name//-/_}" >> "$dir/load"
     done <<< "$dependencies"
 }
 
@@ -94,10 +95,16 @@ MANIFEST
 
 setup_systemd_guest() {
     local root=$1 signed=${2:-} merged=${3:-} util_linux=${4:-}
+    local signed_insmod=${5:-false}
     local systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
     local binary unit command
     mkdir -p "$root"/{etc/systemd/system,usr/bin,usr/lib/systemd/{system,system-generators},usr/local/libexec,vm-modules}
-    local commands=(insmod)
+    local commands=()
+    if $signed_insmod; then
+        touch "$root/etc/cps-vm-assert-built-insmod"
+    else
+        commands+=(insmod)
+    fi
     if [[ -n $util_linux ]]; then
         touch "$root/etc/cps-vm-assert-built-util-linux"
     else
@@ -152,7 +159,17 @@ exec </dev/console >/dev/console 2>&1
 "$mount" -t efivarfs efivarfs /sys/firmware/efi/efivars
 "$mount" -t tmpfs tmpfs /run
 release=$(/bin/busybox uname -r)
-while read -r module; do /usr/bin/insmod "$module"; done < "/vm-modules/$release/load"
+insmod=/usr/bin/insmod
+if [ -f /etc/cps-vm-assert-built-insmod ]; then
+    [ /bin/insmod -ef "$bb" ]
+    insmod=/bin/insmod
+fi
+: > /run/cps-vm-loaded-modules
+while read -r module name; do
+    "$insmod" "$module"
+    [ -d "/sys/module/$name" ]
+    printf '%s\n' "$name" >> /run/cps-vm-loaded-modules
+done < "/vm-modules/$release/load"
 "$mount" -t vfat /dev/vda1 /efi
 for entry in /efi/loader/entries/cps-*+*.conf; do
     if [ -f "$entry" ]; then : > /run/cps-vm-counted; fi
@@ -213,6 +230,11 @@ if [ -f /etc/cps-vm-assert-built-busybox ]; then
         printf '%s' "$release"
     })
     printf 'CPS_VM_BUSYBOX: %s\n' "$version"
+fi
+if [ -f /etc/cps-vm-assert-built-insmod ]; then
+    printf 'CPS_VM_INSMOD: %s' "$state"
+    while read -r name; do printf ' %s' "$name"; done < /run/cps-vm-loaded-modules
+    printf '\n'
 fi
 if [ -f /etc/cps-vm-assert-kernel ]; then
     printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$("$bb" uname -r)"

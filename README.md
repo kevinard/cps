@@ -712,9 +712,9 @@ available there instead of on the worker.
 Set `CPS_VM_SYSTEMD_FIXTURE` to the build output for signed-profile rollback.
 The test installs systemd from the signed repository, copies the installed EFI
 loader to the ESP, and checks the packaged PID 1 on each boot. Combine this
-with `CPS_VM_KERNEL_FIXTURE` to test the source-built trial kernel. The default
-fixture uses host mount and module-loading commands in the guest. Offline
-staging uses the host's systemd helpers.
+with `CPS_VM_KERNEL_FIXTURE` to test the source-built trial kernel. The signed
+util-linux and BusyBox fixtures provide the guest's mount and module-loading
+commands. Offline staging uses the host's systemd helpers.
 
 #### Testing a merged `/usr` image
 
@@ -773,15 +773,24 @@ reboot, and rollback.
 On an x86-64 Arch Linux worker with a native GCC toolchain, run
 `tests/build-busybox.sh target/busybox-fixture` with a new output directory.
 It signs a seed catalog containing the worker's compiler and utilities, then
-pins that catalog and the upstream BusyBox archive in the recipe. CPS compiles
+pins that catalog, the upstream BusyBox 1.38.0 archive, and the two ash fixes
+for CVE-2026-38754 and CVE-2026-38755 in the recipe. CPS compiles
 the static binary twice in fresh sandboxes and publishes it to an
 attestation-required test repository. Set `CPS_BUSYBOX_SOURCE_DIR` to a
 directory containing the pinned archive to run without network access.
 The seed catalog identifies the prebuilt compiler used by this test.
-[BusyBox release archives](https://busybox.net/downloads/)
+[BusyBox release archives](https://busybox.net/downloads/) ·
+[IFS cleanup patch](https://lists.busybox.net/pipermail/busybox/2026-June/092360.html) ·
+[Function recursion patch](https://lists.busybox.net/pipermail/busybox/2026-June/092354.html)
 
 To use that package in the VM, set `CPS_VM_BUSYBOX_REPO` to
 `target/busybox-fixture/repo` and `CPS_VM_BUSYBOX_TRUST_KEY` to
 `target/busybox-fixture/release-public.der`. The fixture installs the exact
-package from that publisher and the systemd guest reports the BusyBox version
-on each boot.
+package from that publisher. The systemd guest loads its prepared modules
+with the packaged `insmod` applet, checks the loaded modules in sysfs, and
+reports the version and loaded module names on each boot. The host still prepares
+the module files for kernels with modular FAT support.
+
+To use an earlier fixture, set `CPS_VM_BUSYBOX_VERSION=1.37.0-0` for the
+split layout or `CPS_VM_BUSYBOX_VERSION=1.37.0-1` for merged `/usr`. These
+fixtures use the worker's `insmod` in the guest.

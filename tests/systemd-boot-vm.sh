@@ -32,10 +32,13 @@ kernel=${CPS_VM_KERNEL:-/boot/vmlinuz-linux}
 busybox=${CPS_VM_BUSYBOX:-/usr/lib/initcpio/busybox}
 busybox_repo=${CPS_VM_BUSYBOX_REPO:-}
 busybox_key=${CPS_VM_BUSYBOX_TRUST_KEY:-}
-busybox_package=cps://canopa-bootstrap/system/busybox@1.37.0-0
+busybox_revision=0
 if [[ -n $usr_base_fixture ]]; then
-    busybox_package=cps://canopa-bootstrap/system/busybox@1.37.0-1
+    busybox_revision=1
 fi
+busybox_version=${CPS_VM_BUSYBOX_VERSION:-1.38.0-$busybox_revision}
+busybox_package=cps://canopa-bootstrap/system/busybox@$busybox_version
+signed_insmod=false
 code=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE to x86-64 OVMF_CODE}
 vars=${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS to the matching OVMF_VARS template}
 qemu_data=${CPS_VM_QEMU_DATA:-}
@@ -46,6 +49,11 @@ done
 if [[ -n $busybox_repo || -n $busybox_key ]]; then
     busybox_repo=$(realpath -- "${busybox_repo:?Set CPS_VM_BUSYBOX_REPO}")
     busybox_key=$(realpath -- "${busybox_key:?Set CPS_VM_BUSYBOX_TRUST_KEY}")
+    case $busybox_version in
+        "1.38.0-$busybox_revision") signed_insmod=true ;;
+        "1.37.0-$busybox_revision") ;;
+        *) echo "Unsupported BusyBox version for this layout: $busybox_version" >&2; exit 2 ;;
+    esac
     "$cps" repo attestation --repo "$busybox_repo" --publisher canopa-bootstrap \
         --trust-key "$busybox_key" "$busybox_package" >/dev/null
 else
@@ -290,7 +298,7 @@ else
     copy_runtime_deps runtime "$busybox"
 fi
 if $systemd_guest; then
-    setup_systemd_guest runtime "$systemd_fixture" "$usr_base_fixture" "$util_linux_fixture"
+    setup_systemd_guest runtime "$systemd_fixture" "$usr_base_fixture" "$util_linux_fixture" "$signed_insmod"
     if [[ $mode == capabilities ]]; then
         setup_capability_guest runtime "$cps" "$project/tests/file-capabilities-guest.sh"
     fi
@@ -390,7 +398,7 @@ package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
 $boot_kernel_dependency
 $boot_systemd_dependency
     require "system/cps"
-    require "system/busybox"
+    require "system/busybox" version="=$busybox_version"
 }
 MANIFEST
     "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der boot-stack.kdl
@@ -647,14 +655,18 @@ run_vm() {
 check_busybox() {
     if [[ -n $busybox_repo ]] && $systemd_guest; then
         local log=$1
-        tr -d '\r' < "$log" | awk '
+        tr -d '\r' < "$log" | awk -v version="v${busybox_version%-*}" -v signed="$signed_insmod" '
             /^CPS_VM_BOOT: / { boots++ }
             /^CPS_VM_BUSYBOX: / {
                 print
-                if ($0 != "CPS_VM_BUSYBOX: v1.37.0") invalid = 1
+                if ($2 != version) invalid = 1
                 versions++
             }
-            END { exit (invalid || boots == 0 || boots != versions) }
+            /^CPS_VM_INSMOD: / { print; module_checks++ }
+            END {
+                exit (invalid || boots == 0 || boots != versions ||
+                      (signed == "true" && boots != module_checks))
+            }
         '
     fi
 }
@@ -720,6 +732,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$utilities" = $'CPS_VM_UTIL_LINUX: trial 2.42.4\nCPS_VM_UTIL_LINUX: trial 2.42.4'
             printf '%s\n' "$utilities"
         fi
+        if $signed_insmod; then
+            modules=$(awk '{printf " %s", $2}' "staged/vm-modules/$trial_release/load")
+            loaded=$(tr -d '\r' < serial.log | grep '^CPS_VM_INSMOD: ')
+            test "$loaded" = "$(printf 'CPS_VM_INSMOD: trial%s\nCPS_VM_INSMOD: trial%s' "$modules" "$modules")"
+        fi
         publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
@@ -766,6 +783,10 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         fi
         if [[ -n $util_linux_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_UTIL_LINUX: previous 2.42.4'
+        fi
+        if $signed_insmod; then
+            modules=$(awk '{printf " %s", $2}' "base/vm-modules/$base_release/load")
+            tr -d '\r' < rollback.log | grep -Fx "CPS_VM_INSMOD: previous$modules"
         fi
         printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
     fi
