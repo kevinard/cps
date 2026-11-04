@@ -229,6 +229,8 @@ test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
 # Resolve the probe from a separately signed publisher and its shell from the
 # primary catalog. Each repository retains a newer, unusable probe as well.
 install -m755 probe proto/usr/bin/probe
+# Give the companion ELF a distinct payload digest while keeping it executable.
+printf 'tools publisher\n' >> proto/usr/bin/probe
 sed 's/publisher="canopa"/publisher="tools"/' probe.kdl > tools-probe.kdl
 "$cps" publish --repo tools-repo --proto proto --signing-key other.der tools-probe.kdl
 tools_catalog=$(cat tools-repo/current)

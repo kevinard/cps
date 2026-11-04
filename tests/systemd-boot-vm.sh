@@ -99,12 +99,13 @@ fi
 if [[ -n $util_linux_fixture ]]; then
     [[ -n $usr_base_fixture ]] || { echo 'CPS_VM_UTIL_LINUX_FIXTURE requires the merged /usr fixture' >&2; exit 2; }
     util_linux_fixture=$(realpath -- "$util_linux_fixture")
-    systemd_version=262.1.0-1
+    systemd_version=262.1.0-2
     "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
         --trust-key "$util_linux_fixture/release-public.der" "$util_linux_package" >/dev/null
 fi
 if [[ -n $systemd_fixture ]]; then
     $profiled || { echo 'CPS_VM_SYSTEMD_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
+    systemd_version=${CPS_VM_SYSTEMD_VERSION:-$systemd_version}
     "$cps" repo attestation --repo "$systemd_fixture/repo" --publisher canopa-systemd \
         --trust-key "$systemd_fixture/release-public.der" "cps://canopa-systemd/system/systemd-vm@$systemd_version" >/dev/null
 fi
@@ -386,7 +387,7 @@ if $profiled; then
             cp -a -- "$systemd_fixture/runtime-seed" signed-systemd-seed
             cp -- "$systemd_fixture/runtime-seed-public.der" systemd-seed-public.der
         fi
-        boot_systemd_dependency='    require "system/systemd-vm"'
+        boot_systemd_dependency="    require \"system/systemd-vm\" version=\"=$systemd_version\""
     fi
     openssl genpkey -algorithm ED25519 -outform DER -out profile-private.der
     openssl pkey -inform DER -in profile-private.der -pubout -outform DER -out profile-public.der
