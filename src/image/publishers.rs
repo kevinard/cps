@@ -13,7 +13,7 @@ use crate::{
     model::validate_publisher,
     repo::{
         BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
-        audit_installed_builds, catalog_index, release_profile,
+        audit_installed_builds, catalog_index, check_profile_successor, release_profile,
     },
 };
 
@@ -35,16 +35,48 @@ impl SelectedProfile {
     }
 }
 
-impl Publishers {
-    pub(crate) fn release_pins(&self, settings: &Settings) -> Result<BTreeMap<String, CatalogPin>> {
-        let primary = &self.as_slice()[0];
-        let Some(selected) = self.select_profile(
+impl Image {
+    pub(crate) fn select_profile(
+        &self,
+        publishers: &Publishers,
+        settings: &Settings,
+        primary_pin: Option<&str>,
+    ) -> Result<Option<SelectedProfile>> {
+        let primary = &publishers.as_slice()[0];
+        let checkpoint = settings.catalog_checkpoints.get(&primary.name);
+        let selected = publishers.select_profile(
             &settings.arch,
             &settings.facets,
-            settings.bootstrap_catalog.as_deref(),
-            settings.catalog_checkpoints.get(&primary.name),
-        )?
-        else {
+            settings.bootstrap_catalog.as_deref().or(primary_pin),
+            checkpoint,
+        )?;
+        let archived_hash = settings.archived_profile_catalog.as_deref();
+        let previous = archived_hash.or(checkpoint.map(|point| point.catalog.as_str()));
+        if let (Some(selected), Some(previous)) = (&selected, previous)
+            && previous != selected.primary.sha256
+        {
+            let archived = archived_hash
+                .map(|_| builds::read_profile_catalog(&self.db))
+                .transpose()?;
+            check_profile_successor(
+                &primary.repo,
+                &primary.name,
+                &primary.key,
+                previous,
+                archived.as_deref(),
+                &selected.primary.sha256,
+            )
+            .with_context(|| format!("checking profile catalog successor for {}", primary.name))?;
+        }
+        Ok(selected)
+    }
+
+    pub(crate) fn release_pins(
+        &self,
+        publishers: &Publishers,
+        settings: &Settings,
+    ) -> Result<BTreeMap<String, CatalogPin>> {
+        let Some(selected) = self.select_profile(publishers, settings, None)? else {
             return Ok(BTreeMap::new());
         };
         Ok(iter::once(selected.primary)
@@ -52,7 +84,9 @@ impl Publishers {
             .map(|pin| (pin.publisher.clone(), pin))
             .collect())
     }
+}
 
+impl Publishers {
     pub(crate) fn select_profile(
         &self,
         arch: &str,
@@ -229,7 +263,7 @@ fn audit(
     let (mut audit, missing) = audit_archived(image, state, publisher, &[trust])?;
     if check_current || !missing.is_empty() {
         let repository_audit = || {
-            let pins = state.publishers.release_pins(&state.settings)?;
+            let pins = image.release_pins(&state.publishers, &state.settings)?;
             audit_installed_builds(
                 &publisher.repo,
                 &publisher.name,

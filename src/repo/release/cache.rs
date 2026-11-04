@@ -109,7 +109,7 @@ pub fn prune_payloads(
             "kept image {} does not use this cache for {publisher}",
             path.display()
         );
-        let pins = state.publishers.release_pins(&state.settings)?;
+        let pins = image.release_pins(&state.publishers, &state.settings)?;
         if let Some(pin) = pins.get(publisher) {
             pin.read(&repo, publisher, &key)?;
             catalogs.insert(pin.sha256.clone());

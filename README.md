@@ -521,6 +521,15 @@ known rotation. The check works with a replacement cache that lacks the
 previous catalog. An unsequenced legacy catalog starts providing sequence
 protection when the image first applies a sequenced catalog.
 
+When an image follows a signed release profile, CPS also archives the full
+primary catalog it applied. Before accepting a different primary catalog,
+CPS checks it against that signed archive. The new catalog must preserve
+published manifests, withdrawals, obsoletions, and profile safeguards even
+when the configured cache no longer has the earlier catalog. For an
+existing image with only the compact checkpoint, CPS checks the earlier
+catalog if it is still cached. The next repository-backed profile
+transaction creates the image archive.
+
 Each boot environment keeps its own checkpoints. An older release can still
 be installed into a new image using its signed bootstrap catalog or booted
 from its existing environment. Upgrade CPS in the target image before its

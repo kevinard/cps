@@ -1133,15 +1133,46 @@ pub(crate) fn archived_release_profile(
     key: &[u8],
     name: &str,
 ) -> Result<ReleaseProfile> {
+    take_profile(
+        &mut decode_archived_catalog(bytes, hash, publisher, key)?,
+        hash,
+        name,
+    )
+}
+
+fn decode_archived_catalog(
+    bytes: &[u8],
+    hash: &str,
+    publisher: &str,
+    key: &[u8],
+) -> Result<Catalog> {
     ensure!(
         digest(bytes) == hash,
         "archived profile catalog digest mismatch"
     );
-    take_profile(
-        &mut decode_catalog(bytes, hash, publisher, keys::Trust::Anchor(key))?,
-        hash,
-        name,
-    )
+    decode_catalog(bytes, hash, publisher, keys::Trust::Anchor(key))
+}
+
+pub(crate) fn check_profile_successor(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    previous_hash: &str,
+    archived: Option<&[u8]>,
+    next_hash: &str,
+) -> Result<()> {
+    let previous = if let Some(bytes) = archived {
+        decode_archived_catalog(bytes, previous_hash, publisher, key)?
+    } else {
+        validate_digest(previous_hash)?;
+        if !path_present(&repo.join("catalogs").join(previous_hash))? {
+            // Images created by older clients may only have a compact checkpoint.
+            return Ok(());
+        }
+        read_catalog(repo, previous_hash, publisher, key)?
+    };
+    let next = read_catalog(repo, next_hash, publisher, key)?;
+    previous.check_successor(&next, previous_hash)
 }
 
 fn take_profile(catalog: &mut Catalog, hash: &str, name: &str) -> Result<ReleaseProfile> {

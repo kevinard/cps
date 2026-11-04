@@ -269,6 +269,7 @@ pub(super) fn requested<'a>(
 }
 
 pub(super) fn load(
+    image: &Image,
     state: &State,
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     saved: Option<&Plan>,
@@ -308,15 +309,10 @@ pub(super) fn load(
             }
         }
     };
-    let profile = state.publishers.select_profile(
-        &state.settings.arch,
-        &state.settings.facets,
-        state
-            .settings
-            .bootstrap_catalog
-            .as_deref()
-            .or(saved_pin(&publishers[0].name)?),
-        state.settings.catalog_checkpoints.get(&publishers[0].name),
+    let profile = image.select_profile(
+        &state.publishers,
+        &state.settings,
+        saved_pin(&publishers[0].name)?,
     )?;
     let mut catalogs = Catalogs::default();
     for publisher in publishers {

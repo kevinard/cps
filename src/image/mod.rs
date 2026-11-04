@@ -51,8 +51,12 @@ pub struct Settings {
     pub boot_parent: Option<BootParent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bootstrap_catalog: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) build_profile_catalog: Option<String>,
+    #[serde(
+        default,
+        rename = "build_profile_catalog",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) archived_profile_catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalog_checkpoints: BTreeMap<String, CatalogCheckpoint>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -393,7 +397,7 @@ fn initialize(
         created_directories: BTreeSet::new(),
         boot_parent: None,
         bootstrap_catalog,
-        build_profile_catalog: None,
+        archived_profile_catalog: None,
         catalog_checkpoints: BTreeMap::new(),
         profile_packages: BTreeMap::new(),
         config_updates: Some(BTreeMap::new()),
@@ -569,11 +573,11 @@ impl Image {
             );
             validate_digest(&checkpoint.catalog).context("invalid catalog checkpoint digest")?;
         }
-        if let Some(hash) = &settings.build_profile_catalog {
-            validate_digest(hash).context("invalid archived build profile catalog")?;
+        if let Some(hash) = &settings.archived_profile_catalog {
+            validate_digest(hash).context("invalid archived profile catalog")?;
             ensure!(
                 publishers.release_profile().is_some() && settings.bootstrap_catalog.is_none(),
-                "archived build policy requires an installed release profile"
+                "archived catalog requires an installed release profile"
             );
             let primary = &publishers.as_slice()[0];
             ensure!(
@@ -581,7 +585,7 @@ impl Image {
                     .catalog_checkpoints
                     .get(&primary.name)
                     .is_none_or(|checkpoint| checkpoint.catalog == *hash),
-                "archived build policy differs from the installed primary catalog"
+                "archived profile differs from the installed primary catalog"
             );
         }
         let installed = self.installed()?;

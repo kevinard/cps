@@ -1974,6 +1974,136 @@ fn image_rejects_catalog_replay_and_retired_signer_forks_without_cache_history()
 }
 
 #[test]
+fn profiled_image_rejects_higher_sequence_forks_without_cache_history() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("desktop/base", "1.0.0-0", String::new())?;
+    for name in [
+        "initial",
+        "retired",
+        "successor",
+        "fork-one",
+        "fork-two",
+        "fork-three",
+    ] {
+        f.package(&format!("test/{name}"), "1.0.0-0", String::new())?;
+    }
+    let set_policy = |elf: &str| {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "unused.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/base"
+        {elf}
+    }}
+}}
+"#,
+            ),
+        )
+    };
+    let retire = |name| {
+        withdraw_package(
+            &f.repo,
+            &f.private,
+            &format!("cps://canopa/test/{name}@1.0.0-0"),
+        )
+    };
+    let current = f.repo.join("current");
+    set_policy("")?;
+    retire("initial")?;
+    let branch = fs::read_to_string(&current)?;
+    let elf = r#"elf-check { library-dir "/usr/lib"; }"#;
+    set_policy(elf)?;
+    retire("retired")?;
+    let applied = fs::read_to_string(&current)?;
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            f.repo, f.public,
+        ),
+    )?;
+    create_configured_image(&f.root, &config)?;
+    apply(&f.root, &plan(&f.root, Request::InstallProfile)?)?;
+
+    retire("successor")?;
+    let successor = fs::read_to_string(&current)?;
+    let good_plan = plan(&f.root, Request::Update)?;
+    fs::write(&current, branch)?;
+    set_policy("")?;
+    retire("fork-one")?;
+    retire("fork-two")?;
+    let weaker = fs::read_to_string(&current)?;
+    set_policy(elf)?;
+    retire("fork-three")?;
+    let resurrection = fs::read_to_string(&current)?;
+    {
+        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        db.execute(
+            "UPDATE image SET data=json_remove(data, '$.build_profile_catalog') WHERE id=1",
+            [],
+        )?;
+        let error = plan(&f.root, Request::Update).unwrap_err();
+        assert!(format!("{error:#}").contains("release drops or changes the withdrawal"));
+        db.execute(
+            "UPDATE image SET data=json_set(data, '$.build_profile_catalog', ?1) WHERE id=1",
+            [applied.trim()],
+        )?;
+    }
+    fs::remove_file(f.repo.join("catalogs").join(applied.trim()))?;
+
+    for (fork, reason) in [
+        (
+            &weaker,
+            "release drops ELF checking for signed profile desktop",
+        ),
+        (
+            &resurrection,
+            "release drops or changes the withdrawal for cps://canopa/test/retired",
+        ),
+    ] {
+        fs::write(&current, fork)?;
+        {
+            let image = crate::image::Image::open_query(&f.root)?;
+            let settings = image.settings()?;
+            let (checkpoint, _) = crate::repo::release_profile(
+                &f.repo,
+                "canopa",
+                &read_key(&f.public)?,
+                None,
+                "desktop",
+            )?;
+            settings.check_catalog("canopa", &checkpoint)?;
+        }
+        for error in [
+            plan(&f.root, Request::Update).unwrap_err(),
+            list_packages(&f.root, Scope::Available).unwrap_err(),
+            package_manifest(&f.root, "desktop/base", true).unwrap_err(),
+        ] {
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+        }
+        let mut changed = good_plan.clone();
+        changed.catalog = Some(fork.trim().to_owned());
+        let error = fetch_plan(&f.root, &changed).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        let error = apply(&f.root, &changed).unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+    }
+    fs::write(&current, successor)?;
+    assert_eq!(plan(&f.root, Request::Update)?, good_plan);
+    apply(&f.root, &good_plan)?;
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    Ok(())
+}
+
+#[test]
 fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Result<()> {
     let f = Fixture::new()?;
     let second_key = Fixture::new()?;
@@ -2471,7 +2601,7 @@ publisher "seed" {{
     };
     assert!(
         format!("{error:#}")
-            .contains("archived build policy differs from the installed primary catalog")
+            .contains("archived profile differs from the installed primary catalog")
     );
     Ok(())
 }

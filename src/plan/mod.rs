@@ -392,7 +392,7 @@ pub(crate) fn build(
                 }
                 _ => BTreeMap::new(),
             };
-            catalogs = catalogs::load(&state, &requested, saved)?;
+            catalogs = catalogs::load(image, &state, &requested, saved)?;
             update_profile |= saved.is_none()
                 && matches!(request, Request::Update)
                 && !state.installed.is_empty()
@@ -452,24 +452,18 @@ pub(crate) fn build(
                 state.settings.check_profile_packages(&installed)?;
             }
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
-            state.settings.build_profile_catalog =
-                if catalogs.profile.as_ref().is_some_and(|profile| {
-                    profile
-                        .companions
-                        .iter()
-                        .any(|pin| pin.build_trust.is_some())
-                }) {
-                    let primary = &state.publishers.as_slice()[0];
-                    Some(
-                        catalogs
-                            .pins
-                            .get(&primary.name)
-                            .context("missing primary catalog for signed build policy")?
-                            .clone(),
-                    )
-                } else {
-                    None
-                };
+            if catalogs.profile.is_some() {
+                let primary = &state.publishers.as_slice()[0];
+                state.settings.archived_profile_catalog = Some(
+                    state
+                        .settings
+                        .catalog_checkpoints
+                        .get(&primary.name)
+                        .context("missing primary catalog for signed profile")?
+                        .catalog
+                        .clone(),
+                );
+            }
             (installed, paths)
         }
     };

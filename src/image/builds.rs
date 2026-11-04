@@ -12,11 +12,12 @@ use crate::{
 const RECEIPT_LIMIT: u64 = 128 * 1024;
 
 pub(super) fn save_profile(tx: &Transaction<'_>, state: &State) -> Result<()> {
-    let Some(hash) = &state.settings.build_profile_catalog else {
+    let Some(hash) = &state.settings.archived_profile_catalog else {
         return Ok(());
     };
     let primary = &state.publishers.as_slice()[0];
-    let bytes = catalog_bytes(&primary.repo, hash).context("archiving the signed build policy")?;
+    let bytes =
+        catalog_bytes(&primary.repo, hash).context("archiving the signed profile catalog")?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS build_profile (
             id INTEGER PRIMARY KEY CHECK(id=1), catalog BLOB NOT NULL
@@ -30,8 +31,20 @@ pub(super) fn save_profile(tx: &Transaction<'_>, state: &State) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn read_profile_catalog(db: &Connection) -> Result<Vec<u8>> {
+    let bytes: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT CASE WHEN length(CAST(catalog AS BLOB)) <= ?1 THEN catalog END
+             FROM build_profile WHERE id=1",
+            [CATALOG_LIMIT],
+            |row| row.get(0),
+        )
+        .context("reading the archived profile catalog")?;
+    bytes.context("archived profile catalog exceeds size limit")
+}
+
 pub(super) fn read_profile(db: &Connection, state: &State) -> Result<Option<ReleaseProfile>> {
-    let Some(hash) = &state.settings.build_profile_catalog else {
+    let Some(hash) = &state.settings.archived_profile_catalog else {
         return Ok(None);
     };
     let name = state
@@ -43,15 +56,7 @@ pub(super) fn read_profile(db: &Connection, state: &State) -> Result<Option<Rele
         .as_slice()
         .split_first()
         .context("missing primary publisher")?;
-    let bytes: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT CASE WHEN length(CAST(catalog AS BLOB)) <= ?1 THEN catalog END
-             FROM build_profile WHERE id=1",
-            [CATALOG_LIMIT],
-            |row| row.get(0),
-        )
-        .context("reading the archived profile catalog")?;
-    let bytes = bytes.context("archived profile catalog exceeds size limit")?;
+    let bytes = read_profile_catalog(db)?;
     let profile = archived_release_profile(&bytes, hash, &primary.name, &primary.key, name)?;
     profile.check_image(
         name,
