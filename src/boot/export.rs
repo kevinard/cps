@@ -2,7 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -11,7 +11,9 @@ use rustix::{
     io::Errno,
 };
 
-use super::{check_image_integrity, entry_id, kernel, systemd_boot::canonical_partuuid};
+use super::{
+    artifact_helper, check_image_integrity, entry_id, kernel, systemd_boot::canonical_partuuid,
+};
 use crate::image::{Image, root::Root};
 
 const PAYLOAD: &str = "root.ext4";
@@ -99,7 +101,7 @@ pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Res
         source.gid(),
         source.mode() & 0o7777,
     );
-    let status = helper("mke2fs", &stage_path)
+    let status = artifact_helper("mke2fs", &stage_path)
         // Pin the source across exec and resolve it as a directory, even if
         // the caller renames the original source path.
         .stdin(Stdio::from(image.root.as_file().try_clone()?))
@@ -110,7 +112,7 @@ pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Res
         .status()
         .context("formatting the partition payload with mke2fs")?;
     ensure!(status.success(), "mke2fs failed with {status}");
-    let status = helper("e2fsck", &stage_path)
+    let status = artifact_helper("e2fsck", &stage_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .args(["-f", "-n", PAYLOAD])
@@ -135,14 +137,4 @@ pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Res
     .context("publishing the ext4 image")?;
     parent.as_file().sync_all()?;
     Ok(entry_id(&uuid, state.settings.revision))
-}
-
-fn helper(program: &str, directory: &Path) -> Command {
-    let mut command = Command::new(program);
-    command
-        .env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .current_dir(directory);
-    command
 }

@@ -12,12 +12,12 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, SourceLayout,
     activate_boot_environment, add_publisher, apply, build_with_toolchain_config,
-    build_with_worker, create_configured_image, create_image, export_boot_environment, fetch_plan,
-    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
-    list_boot_environments, list_obsoletions, list_publishers, list_withdrawals, plan,
-    prefer_publisher, publish, publish_release, publish_witnessed_bundle, read_attestation,
-    read_worker_config, release, remove_publisher, rollback_boot_environment, rotate_publisher_key,
-    stage_boot_environment, verify, verify_pristine, withdraw_package,
+    build_with_worker, create_configured_image, create_image, deploy_boot_environment,
+    export_boot_environment, fetch_plan, fetch_sources, fetch_sources_with_local,
+    generate_manifest, import_sources, list_boot_environments, list_obsoletions, list_publishers,
+    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
+    read_attestation, read_worker_config, release, remove_publisher, rollback_boot_environment,
+    rotate_publisher_key, stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -405,6 +405,17 @@ enum BootCommand {
         output: PathBuf,
         #[arg(long, value_name = "MIB")]
         size_mib: u64,
+    },
+    /// Deploy an exported root to a partition in a new offline GPT disk image
+    Deploy {
+        #[arg(long)]
+        disk: PathBuf,
+        #[arg(long)]
+        root_image: PathBuf,
+        #[arg(long)]
+        root_partuuid: String,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Publish a systemd-boot entry for a verified environment
     Activate {
@@ -844,6 +855,18 @@ fn run(command: Command) -> Result<ExitCode> {
             } => {
                 let id = export_boot_environment(&root, &output, size_mib)?;
                 println!("Exported {id} to {}", output.display());
+            }
+            BootCommand::Deploy {
+                disk,
+                root_image,
+                root_partuuid,
+                output,
+            } => {
+                let hash = deploy_boot_environment(&disk, &root_image, &root_partuuid, &output)?;
+                println!(
+                    "Deployed root to {root_partuuid} in {} (SHA-256 {hash})",
+                    output.display()
+                );
             }
             BootCommand::Activate {
                 root,

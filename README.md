@@ -625,13 +625,15 @@ Boot environments use separate Linux roots and a dedicated systemd-boot EFI Syst
 
 ```sh
 cps boot-env export --root base --output base.ext4 --size-mib 2048
-# Place base.ext4 in the inactive partition identified by $base_partuuid.
+cps boot-env deploy --disk template.raw --root-image base.ext4 \
+    --root-partuuid "$base_partuuid" --output base.raw
 cps boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_partuuid" --initrd boot/initramfs.img
 cps plan --root base --output upgrade.json update
 cps boot-env stage --source base --root staged upgrade.json
 cps boot-env export --root staged --output staged.ext4 --size-mib 2048
-# Place staged.ext4 in the inactive partition identified by $staged_partuuid.
+cps boot-env deploy --disk base.raw --root-image staged.ext4 \
+    --root-partuuid "$staged_partuuid" --output next.raw
 cps boot-env activate --root staged --esp esp \
     --root-partuuid "$staged_partuuid" --initrd boot/initramfs.img
 ```
@@ -646,14 +648,24 @@ before publishing the image and refuses to replace an existing path. Use
 e2fsprogs with support for `root_perms`. Filesystem timestamps and formatter
 defaults affect the image bytes. [mke2fs manual](https://man7.org/linux/man-pages/man8/mke2fs.8.html)
 
-Deploy each payload to its own inactive partition before activating that
-root. The ext4 filesystem UUID identifies the CPS image. Supply the
-separate **GPT partition UUID** to `activate`. Activation copies boot files
+For an offline VM or disk image, provision a raw GPT template with 512-byte
+sectors and one Linux filesystem partition per root. `deploy` uses GNU
+`cp`, util-linux `sfdisk`, and `e2fsck`. It clones the source disk, checks
+the GPT copies and partition ranges, and writes the payload to the selected
+partition. The payload must match the partition size exactly. CPS checks
+the deployed bytes by SHA-256 before publishing a new disk file. Keep the
+inputs offline during the operation. The source disk is read-only, and the
+new disk retains the previous contents outside the selected partition.
+[sfdisk manual](https://man7.org/linux/man-pages/man8/sfdisk.8.html)
+
+The ext4 filesystem UUID identifies the CPS image. Use the separate
+**GPT partition UUID** for both `deploy` and `activate`. Activation copies boot files
 from the selected root and publishes its Boot Loader Specification entry
 last. The kernel path defaults to `boot/vmlinuz`. Omit `--initrd` for a kernel
 that can mount the root on its own. Use `--options` for additional kernel
-arguments. Provisioning the GPT partitions, placing the exported bytes, and
-installing systemd-boot on the dedicated ESP are external steps.
+arguments. Provision the GPT partitions and install systemd-boot on the
+dedicated ESP separately. Apply the resulting ESP files to the disk before
+booting it.
 
 `--known-good` bootstraps the first entry. Later activations require the previous environment's known-good entry and boot files. A trial gets two attempts by default. Install [the `system/cps` package](packaging/cps.kdl) in the base image to make its health check part of `boot-complete.target`. The package ships the CPS binary, [the health unit](packaging/systemd/cps-boot-health.service), and the required dependency link. The unit runs `cps verify --root /` after `multi-user.target`. Systemd blesses the entry when boot completion succeeds, removing the boot counter. If the attempts run out, systemd-boot selects the previous environment. The managed ESP uses its own loader configuration and assumes no EFI default override. [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
 
@@ -685,8 +697,8 @@ The list marks the default configured on the ESP and shows each registered root'
 
 ### VM boot tests
 
-The [VM test](tests/systemd-boot-vm.sh) assembles a GPT disk from two CPS
-exports and a FAT ESP, then boots it through OVMF and systemd-boot under QEMU.
+The [VM test](tests/systemd-boot-vm.sh) deploys two CPS exports to a GPT disk
+and adds a FAT ESP, then boots through OVMF and systemd-boot under QEMU.
 The `fallback` scenario checks that staging leaves the ESP alone and that the
 previous root boots after two failed attempts. The `bless` scenario runs
 systemd as PID 1, installs the health gate through the CPS package, and checks
@@ -698,8 +710,10 @@ checks that the health gate blocks blessing through both attempts. The
 
 Build with `cargo build`. Run [the export test](tests/boot-export.sh) with
 e2fsprogs, OpenSSL, and `setfattr` to check the payload and failure cleanup.
+[The deployment test](tests/boot-deploy.sh) also uses `sfdisk` to check
+partition isolation and rejection of damaged or ambiguous GPT layouts.
 The VM test additionally needs `qemu-system-x86_64`, `mkfs.fat`, mtools,
-`sfdisk`, systemd-boot, and matching non-Secure-Boot x86-64 OVMF code and
+systemd-boot, and matching non-Secure-Boot x86-64 OVMF code and
 variables files. Supply an EFI-stub Linux kernel with built-in virtio block,
 GPT, ext4, and serial console support, plus a compatible BusyBox with `sh`,
 `cat`, `reboot`, and `poweroff`.

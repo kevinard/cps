@@ -155,6 +155,18 @@ if $systemd_guest; then
 elif [[ $mode == kernel-upgrade ]]; then
     root_mib=128
 fi
+# Use regular files so the fixture needs neither loop devices nor mounts.
+base_mib=97
+trial_mib=$((base_mib + root_mib))
+truncate -s "$((trial_mib + root_mib + 1))M" template.raw
+sfdisk --quiet template.raw <<PARTITIONS
+label: gpt
+unit: sectors
+
+start=2048, size=196608, type=uefi
+start=$((base_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$base_uuid
+start=$((trial_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$trial_uuid
+PARTITIONS
 mkdir -p esp/EFI/BOOT proto/etc
 if [[ -z $systemd_fixture ]]; then cp "$efi" esp/EFI/BOOT/BOOTX64.EFI; fi
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
@@ -499,6 +511,8 @@ fi
 
 "$cps" boot-env export --root base --output base.ext4 --size-mib "$root_mib"
 base_payload=$(sha256sum base.ext4)
+"$cps" boot-env deploy --disk template.raw --root-image base.ext4 \
+    --root-partuuid "$base_uuid" --output base.raw
 base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_uuid" --options "$options")
 base_id=${base_id#Activated }
@@ -590,6 +604,14 @@ fi
 "$cps" boot-env export --root staged --output staged.ext4 --size-mib "$root_mib"
 test "$(sha256sum base.ext4)" = "$base_payload"
 diff -r esp-before esp
+if [[ $mode == health-fail ]]; then
+    # Change a managed inode's mode while keeping ext4 structurally valid.
+    debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
+    debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
+fi
+"$cps" boot-env deploy --disk base.raw --root-image staged.ext4 \
+    --root-partuuid "$trial_uuid" --output disk.raw
+cmp -n "$((trial_mib * 1024 * 1024))" base.raw disk.raw
 
 mv "esp/EFI/cps/$base_id/vmlinuz.efi" saved-kernel
 if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
@@ -643,32 +665,11 @@ if [[ $mode == rollback ]]; then
     cmp config-before-rejected-rollback esp/loader/loader.conf
 fi
 
-if [[ $mode == health-fail ]]; then
-    # Simulate corruption after deployment while keeping the trial's data and
-    # hard-link identity readable by the guest.
-    debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
-    debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
-fi
-
-# Pack the two separate roots and the EFI directory into a GPT disk.
-# All construction uses regular files and works without loop devices.
+# Add the configured EFI directory after CPS has deployed both roots.
 truncate -s 96M esp.fat
 mkfs.fat -F 32 esp.fat >/dev/null
 mcopy -s -i esp.fat esp/EFI esp/loader ::/
-base_mib=97
-trial_mib=$((base_mib + root_mib))
-truncate -s "$((trial_mib + root_mib + 1))M" disk.raw
-sfdisk --quiet disk.raw <<PARTITIONS
-label: gpt
-unit: sectors
-
-start=2048, size=196608, type=uefi
-start=$((base_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$base_uuid
-start=$((trial_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$trial_uuid
-PARTITIONS
 dd if=esp.fat of=disk.raw bs=1M seek=1 conv=notrunc,sparse status=none
-dd if=base.ext4 of=disk.raw bs=1M seek="$base_mib" conv=notrunc,sparse status=none
-dd if=staged.ext4 of=disk.raw bs=1M seek="$trial_mib" conv=notrunc,sparse status=none
 cp "$vars" vars.fd
 
 args=()

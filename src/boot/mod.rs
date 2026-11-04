@@ -1,3 +1,4 @@
+mod deploy;
 mod export;
 pub(crate) mod kernel;
 mod systemd_boot;
@@ -18,6 +19,7 @@ use crate::{
     verify::verify_image,
 };
 
+pub use deploy::deploy_boot_environment;
 pub use export::export_boot_environment;
 pub use systemd_boot::{
     Activation, BootEnvironment, activate_boot_environment, list_boot_environments,
@@ -109,4 +111,14 @@ fn check_image_integrity(image: &Image) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn artifact_helper(program: &str, directory: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .current_dir(directory);
+    command
 }
