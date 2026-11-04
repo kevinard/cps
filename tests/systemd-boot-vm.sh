@@ -17,6 +17,9 @@ kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 kernel_package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
 systemd_fixture=${CPS_VM_SYSTEMD_FIXTURE:-}
 usr_base_fixture=${CPS_VM_USR_BASE_FIXTURE:-}
+util_linux_fixture=${CPS_VM_UTIL_LINUX_FIXTURE:-}
+systemd_version=262.1.0-0
+util_linux_package=cps://canopa-util-linux/system/util-linux@2.42.4-0
 systemd_efi=usr/lib/systemd/boot/efi/systemd-bootx64.efi
 profiled=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
@@ -85,10 +88,17 @@ if [[ -n $kernel_fixture ]]; then
     "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
         --trust-key "$kernel_fixture/release-public.der" "$kernel_package" >/dev/null
 fi
+if [[ -n $util_linux_fixture ]]; then
+    [[ -n $usr_base_fixture ]] || { echo 'CPS_VM_UTIL_LINUX_FIXTURE requires the merged /usr fixture' >&2; exit 2; }
+    util_linux_fixture=$(realpath -- "$util_linux_fixture")
+    systemd_version=262.1.0-1
+    "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
+        --trust-key "$util_linux_fixture/release-public.der" "$util_linux_package" >/dev/null
+fi
 if [[ -n $systemd_fixture ]]; then
     $profiled || { echo 'CPS_VM_SYSTEMD_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
     "$cps" repo attestation --repo "$systemd_fixture/repo" --publisher canopa-systemd \
-        --trust-key "$systemd_fixture/release-public.der" cps://canopa-systemd/system/systemd-vm@262.1.0-0 >/dev/null
+        --trust-key "$systemd_fixture/release-public.der" "cps://canopa-systemd/system/systemd-vm@$systemd_version" >/dev/null
 fi
 if [[ -n $usr_base_fixture ]]; then
     [[ -n $systemd_fixture ]] || { echo 'CPS_VM_USR_BASE_FIXTURE requires the signed systemd fixture' >&2; exit 2; }
@@ -200,8 +210,12 @@ profile_companions() {
         printf '%s\n' 'canopa-kernel signed-kernel kernel-public.der'
     fi
     if [[ -n $systemd_fixture ]]; then
-        printf '%s\n' 'canopa-systemd signed-systemd systemd-public.der' \
-            'canopa-systemd-seed signed-systemd-seed systemd-seed-public.der'
+        printf '%s\n' 'canopa-systemd signed-systemd systemd-public.der'
+        if [[ -n $util_linux_fixture ]]; then
+            printf '%s\n' 'canopa-util-linux signed-util-linux util-linux-public.der'
+        else
+            printf '%s\n' 'canopa-systemd-seed signed-systemd-seed systemd-seed-public.der'
+        fi
     fi
 }
 
@@ -212,6 +226,7 @@ refresh_vm_profile() {
     {
         printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
         printf '    profile "boot" architecture="%s"%s {\n        package "test/boot-stack"\n' "$(uname -m)" "$upgrade"
+        if [[ -n $util_linux_fixture ]]; then printf '        facet "devel" #false\n'; fi
         while read -r name repository key; do
             companion_upgrade=
             if [[ $repository == repo && -n $baseline_test ]]; then
@@ -275,7 +290,7 @@ else
     copy_runtime_deps runtime "$busybox"
 fi
 if $systemd_guest; then
-    setup_systemd_guest runtime "$systemd_fixture" "$usr_base_fixture"
+    setup_systemd_guest runtime "$systemd_fixture" "$usr_base_fixture" "$util_linux_fixture"
     if [[ $mode == capabilities ]]; then
         setup_capability_guest runtime "$cps" "$project/tests/file-capabilities-guest.sh"
     fi
@@ -291,10 +306,12 @@ if $systemd_guest; then
         copy_runtime_deps runtime proto/usr/bin/cps
     fi
     if [[ -n $systemd_fixture ]]; then
-        for library in libblkid.so.1 libmount.so.1; do
-            cmp "runtime/usr/lib/$library" "$systemd_fixture/image/usr/lib/$library"
-            rm -- "runtime/usr/lib/$library"
-        done
+        if [[ -z $util_linux_fixture ]]; then
+            for library in libblkid.so.1 libmount.so.1; do
+                cmp "runtime/usr/lib/$library" "$systemd_fixture/image/usr/lib/$library"
+                rm -- "runtime/usr/lib/$library"
+            done
+        fi
         rm -f -- runtime/usr/lib/libsystemd.so.0
     fi
     if [[ -n $usr_base_fixture ]]; then
@@ -353,9 +370,14 @@ if $profiled; then
     boot_systemd_dependency=
     if [[ -n $systemd_fixture ]]; then
         cp -a -- "$systemd_fixture/repo" signed-systemd
-        cp -a -- "$systemd_fixture/runtime-seed" signed-systemd-seed
         cp -- "$systemd_fixture/release-public.der" systemd-public.der
-        cp -- "$systemd_fixture/runtime-seed-public.der" systemd-seed-public.der
+        if [[ -n $util_linux_fixture ]]; then
+            cp -a -- "$util_linux_fixture/repo" signed-util-linux
+            cp -- "$util_linux_fixture/release-public.der" util-linux-public.der
+        else
+            cp -a -- "$systemd_fixture/runtime-seed" signed-systemd-seed
+            cp -- "$systemd_fixture/runtime-seed-public.der" systemd-seed-public.der
+        fi
         boot_systemd_dependency='    require "system/systemd-vm"'
     fi
     openssl genpkey -algorithm ED25519 -outform DER -out profile-private.der
@@ -384,6 +406,7 @@ publisher "vm-profile" {
     trust-key "profile-public.der"
 }
 CONFIG
+        if [[ -n $util_linux_fixture ]]; then printf 'facet "devel" #false\n'; fi
         while read -r name repository key; do
             printf 'publisher "%s" {\n    repository "%s"\n    trust-key "%s"\n}\n' "$name" "$repository" "$key"
         done < <(profile_companions)
@@ -411,6 +434,16 @@ fi
 "$cps" plan --root base --output install.json install "${packages[@]}"
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
+check_util_linux() {
+    local root=$1 path
+    if [[ -z $util_linux_fixture ]]; then return; fi
+    for path in usr/bin/{blkid,mount,umount} usr/lib/{libblkid,libmount}.so.1; do
+        cmp "$root/$path" "$util_linux_fixture/image/$path"
+    done
+    test ! -e "$root/usr/include/libmount/libmount.h"
+    test ! -L "$root/usr/lib/libmount.so"
+}
+check_util_linux base
 if [[ -n $usr_base_fixture ]]; then
     test "$(readlink base/bin)" = usr/bin
     test "$(readlink base/lib64)" = usr/lib
@@ -485,6 +518,7 @@ test "$(cat staged/etc/cps-vm-state)" = trial
 grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
 "$cps" verify --root base --pristine
 "$cps" verify --root staged --pristine
+check_util_linux staged
 
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     grep -Fq "Prepare Linux $trial_release with kernel-install" update.log
@@ -681,6 +715,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             if grep -F 'unmerged-usr' serial.log; then exit 1; fi
             printf '%s\n' "$layouts"
         fi
+        if [[ -n $util_linux_fixture ]]; then
+            utilities=$(tr -d '\r' < serial.log | grep '^CPS_VM_UTIL_LINUX: ' || :)
+            test "$utilities" = $'CPS_VM_UTIL_LINUX: trial 2.42.4\nCPS_VM_UTIL_LINUX: trial 2.42.4'
+            printf '%s\n' "$utilities"
+        fi
         publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
@@ -724,6 +763,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         if [[ -n $usr_base_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_USR: previous merged'
             if grep -F 'unmerged-usr' rollback.log; then exit 1; fi
+        fi
+        if [[ -n $util_linux_fixture ]]; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_UTIL_LINUX: previous 2.42.4'
         fi
         printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
     fi

@@ -93,11 +93,16 @@ MANIFEST
 }
 
 setup_systemd_guest() {
-    local root=$1 signed=${2:-} merged=${3:-}
+    local root=$1 signed=${2:-} merged=${3:-} util_linux=${4:-}
     local systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
     local binary unit command
     mkdir -p "$root"/{etc/systemd/system,usr/bin,usr/lib/systemd/{system,system-generators},usr/local/libexec,vm-modules}
-    local commands=(mount insmod)
+    local commands=(insmod)
+    if [[ -n $util_linux ]]; then
+        touch "$root/etc/cps-vm-assert-built-util-linux"
+    else
+        commands+=(mount)
+    fi
     if [[ -z $signed ]]; then
         local programs=(systemd systemd-bless-boot system-generators/systemd-bless-boot-generator)
         if [[ -x "$systemd/systemd-executor" ]]; then programs+=(systemd-executor); fi
@@ -191,6 +196,15 @@ if [ -f /etc/cps-vm-assert-built-systemd ]; then
     version=$(/usr/lib/systemd/systemd --version)
     case "$version" in 'systemd 262 (v262.1)'*) ;; *) exit 1 ;; esac
     printf 'CPS_VM_SYSTEMD: %s v262.1\n' "$state"
+fi
+if [ -f /etc/cps-vm-assert-built-util-linux ]; then
+    [ "$(/usr/bin/blkid -p -s TYPE -o value /dev/vda1)" = vfat ]
+    case "$(/usr/bin/mount --version)" in 'mount from util-linux 2.42.4'*) ;; *) exit 1 ;; esac
+    links=$(/lib64/ld-linux-x86-64.so.2 --inhibit-cache --list /usr/bin/mount)
+    for library in libmount.so.1 libblkid.so.1; do
+        case "$links" in *"$library => /usr/lib/$library ("*) ;; *) exit 1 ;; esac
+    done
+    printf 'CPS_VM_UTIL_LINUX: %s 2.42.4\n' "$state"
 fi
 if [ -f /etc/cps-vm-assert-built-busybox ]; then
     version=$("$bb" --help 2>&1 | {

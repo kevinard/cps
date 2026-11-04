@@ -704,9 +704,9 @@ available there instead of on the worker.
 Set `CPS_VM_SYSTEMD_FIXTURE` to the build output for signed-profile rollback.
 The test installs systemd from the signed repository, copies the installed EFI
 loader to the ESP, and checks the packaged PID 1 on each boot. Combine this
-with `CPS_VM_KERNEL_FIXTURE` to test the source-built trial kernel. The fixture
-still uses host mount and module-loading commands in the guest and the host's
-systemd helpers for offline staging.
+with `CPS_VM_KERNEL_FIXTURE` to test the source-built trial kernel. The default
+fixture uses host mount and module-loading commands in the guest. Offline
+staging uses the host's systemd helpers.
 
 #### Testing a merged `/usr` image
 
@@ -747,6 +747,18 @@ offline. It publishes the matching outputs with signed build evidence, then
 installs the package into the signed merged base and runs the tools with its
 loader. The package also delivers the headers and linker inputs under the
 `devel` facet.
+
+Set `CPS_SYSTEMD_UTIL_LINUX_FIXTURE=target/util-linux-fixture` when running
+`tests/build-systemd.sh`. The builder installs the signed package in a
+private root and uses its verified headers and libraries to build systemd
+package revision `262.1.0-1`.
+
+For signed-profile rollback, set `CPS_VM_UTIL_LINUX_FIXTURE` to the util-linux
+output, `CPS_VM_SYSTEMD_FIXTURE` to the matching systemd build, and
+`CPS_VM_USR_BASE_FIXTURE` to the merged base. The release profile pins the
+util-linux catalog with the `devel` facet disabled. The guest mounts the ESP
+with the packaged `mount` and probes it with `blkid` on the trial, default
+reboot, and rollback.
 
 #### Testing a source-built BusyBox
 
