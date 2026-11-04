@@ -14,7 +14,7 @@ use crate::{
     kdl_format::publish_policy::{Companion, Profile},
     model::{Node, PackageSpec, Version},
     plan::{
-        CandidateSet, Candidates, SolverRevision, check_directory, check_path_type,
+        CandidateSet, Candidates, Retention, SolverRevision, check_directory, check_path_type,
         resolve_packages, select_paths,
     },
 };
@@ -436,7 +436,7 @@ fn compose<'a>(
         },
         &requested,
         false,
-        true,
+        Retention::None,
         Some(SolverRevision::SatV1),
         |installed| profile_paths(&profile.arch, &profile.facets, installed),
     )
@@ -472,7 +472,7 @@ fn check_upgrade(
     let solver = Some(SolverRevision::SatV1);
     let compose = |installed: &_| profile_paths(&profile.architecture, &profile.facets, installed);
     let (after, new_paths) = if locked {
-        catalogs.update_profile(before, profile, solver, compose)?
+        catalogs.update_profile(before, profile, Some(&BTreeSet::new()), solver, compose)?
     } else {
         let result = resolve_packages(
             before,
@@ -482,7 +482,7 @@ fn check_upgrade(
             },
             &BTreeMap::new(),
             true,
-            false,
+            Retention::All,
             solver,
             compose,
         )?;

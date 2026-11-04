@@ -590,6 +590,23 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
 
     fs::rename(&offline, &f.repo)?;
     let upgrade = plan(&f.root, Request::Update)?;
+    // Replaying a saved update from before profile reconciliation must keep its
+    // original selection, including a dependency the new profile dropped.
+    let mut legacy = upgrade.clone();
+    legacy.track_profile_intent = false;
+    let image = crate::image::Image::open_query(&f.root)?;
+    let legacy = crate::plan::build(
+        &image,
+        image.state()?,
+        legacy.request.clone(),
+        Some(&legacy),
+        legacy.solver,
+    )?
+    .0;
+    drop(image);
+    let legacy_staged = f._dir.path().join("legacy-staged");
+    crate::stage_boot_environment(&f.root, &legacy_staged, &legacy)?;
+    package_manifest(&legacy_staged, "library/z", false)?;
     let staged = f._dir.path().join("staged");
     crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "next");
@@ -597,9 +614,160 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     fs::rename(&f.repo, &offline)?;
     assert!(plan(&f.root, remove("library/z")).is_err());
     assert!(plan(&staged, remove("library/a")).is_err());
-    apply(&staged, &plan(&staged, Request::Autoremove)?)?;
     assert!(package_manifest(&staged, "library/z", false).is_err());
     assert!(verify(&staged)?.iter().all(|finding| !finding.is_error));
+    Ok(())
+}
+
+#[test]
+fn profile_updates_reconcile_defaults_and_keep_operator_roots() -> Result<()> {
+    let f = Fixture::new()?;
+    let legacy = "usr/lib/desktop/legacy";
+    let default = "usr/share/desktop/default";
+    let shared = "library/shared";
+    let optional = "desktop/optional";
+    let addon = "desktop/addon";
+    f.package(
+        "library/legacy",
+        "1.0.0-0",
+        f.file(legacy, "legacy", "0644", "")?,
+    )?;
+    f.package(shared, "1.0.0-0", String::new())?;
+    f.package(optional, "1.0.0-0", String::new())?;
+    f.package(addon, "1.0.0-0", dependency("require", shared, "1.0.0-0"))?;
+    f.package(
+        "desktop/base",
+        "1.0.0-0",
+        dependency("require", "library/legacy", "1.0.0-0")
+            + &dependency("require", shared, "1.0.0-0"),
+    )?;
+    f.package(
+        "desktop/base",
+        "2.0.0-0",
+        dependency("exclude", "library/legacy", "1.0.0-0"),
+    )?;
+    f.package(
+        "desktop/old-default",
+        "1.0.0-0",
+        f.file(default, "old", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/new-default",
+        "1.0.0-0",
+        f.file(default, "new", "0644", "")?,
+    )?;
+    let publish_profile = |version, defaults: &str| -> Result<()> {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "unused.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/base@{version}"
+        {defaults}
+    }}
+}}
+"#,
+            ),
+        )?;
+        let release = f._dir.path().join("refresh.kdl");
+        let base = fs::read_to_string(f.repo.join("current"))?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                base.trim()
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)?;
+        Ok(())
+    };
+    publish_profile(
+        "1.0.0-0",
+        "package \"desktop/old-default\"; package \"desktop/optional\"",
+    )?;
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            f.repo, f.public,
+        ),
+    )?;
+    let exact_root = f._dir.path().join("exact-root");
+    for root in [&f.root, &exact_root] {
+        create_configured_image(root, &config)?;
+        apply(root, &plan(root, Request::InstallProfile)?)?;
+        apply(
+            root,
+            &plan(
+                root,
+                Request::Install {
+                    packages: vec![format!("cps://canopa/{optional}@1.0.0-0"), addon.into()],
+                },
+            )?,
+        )?;
+    }
+    apply(
+        &exact_root,
+        &plan(
+            &exact_root,
+            Request::ExactInstall {
+                packages: vec![addon.into()],
+            },
+        )?,
+    )?;
+    package_manifest(&exact_root, optional, false)?;
+
+    publish_profile("2.0.0-0", "package \"desktop/new-default\"")?;
+    let staged = f._dir.path().join("staged");
+    let upgrade = plan(&f.root, Request::Update)?;
+    assert!(upgrade.summary().contains("Remove library/legacy 1.0.0-0"));
+    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    assert_eq!(fs::read_to_string(f.root.join(default))?, "old");
+    assert!(f.root.join(legacy).is_file());
+    let interrupted = plan(&exact_root, Request::Update)?;
+    interrupt_apply_at(
+        &exact_root,
+        &f._dir.path().join("exact-update.json"),
+        &interrupted,
+        default,
+    )?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert_eq!(crate::resume_transaction(&exact_root)?, Some(4));
+    for (root, keeps_optional) in [(&staged, true), (&exact_root, false)] {
+        assert!(!root.join(legacy).exists());
+        assert_eq!(fs::read_to_string(root.join(default))?, "new");
+        let installed = list_packages(root, Scope::Installed)?;
+        assert!(
+            installed
+                .iter()
+                .all(|row| row.name != "desktop/old-default")
+        );
+        assert!(
+            installed
+                .iter()
+                .any(|row| row.name == addon && row.status == Status::Explicit)
+        );
+        assert!(
+            installed
+                .iter()
+                .any(|row| row.name == shared && row.status == Status::Dependency)
+        );
+        assert_eq!(
+            installed
+                .iter()
+                .find(|row| row.name == optional)
+                .map(|row| row.status),
+            keeps_optional.then_some(Status::Explicit),
+        );
+        assert!(verify(root)?.iter().all(|finding| !finding.is_error));
+    }
     Ok(())
 }
 
@@ -3207,7 +3375,7 @@ publisher "seed" {{
     assert!(format!("{error:#}").contains("archived catalog digest mismatch"));
     assert_eq!(
         db.execute(
-            "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'),
+            "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives', '$.profile_intent'),
              '$.build_profile_catalog', ?1, '$.format', 5) WHERE id=1",
             [first],
         )?,

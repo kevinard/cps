@@ -936,17 +936,25 @@ configuration, canonical repository paths, builder UID and GID, and
 `SOURCE_DATE_EPOCH`. Use the same GPT template for byte-identical disk
 images. A staged upgrade receives a fresh image identity.
 
-On a profiled image with installed packages, `plan update` uses the current
-profile's exact package set. It can add newly required packages and update
-compatible local additions. It preserves explicit install marks for local
-packages, and signed obsoletion rules still retire old packages. A profile
-update fails if reaching the signed set requires a downgrade or a publisher
-switch. Save and apply the plan normally, or stage it in a boot environment.
-Existing saved update plans retain the selection rules used to create them.
-For images created before composition protection, applying a signed profile
-update establishes the protected set. Upgrade the CPS binary in the target
-image before applying the first protected profile. Older clients reject the
-new image state and cannot resume the transaction that first writes it.
+On a profiled image with installed packages, `plan update` reconciles the
+image to the current signed composition plus the packages the operator
+explicitly requested and their dependencies. A previous profile default
+leaves the image if the new profile and local packages no longer require it.
+The package can remain published for manual installation. Use `plan install`
+to keep a default as a local choice, even when it is already installed.
+`plan exact-install` replaces the local choices while preserving the signed
+composition. Signed obsoletion rules still apply. A profile update fails if
+the signed set requires a downgrade or a publisher switch.
+
+Save and apply the plan normally, or stage it in a boot environment.
+Existing saved updates retain their original package selection rules.
+When an earlier image lacks separate local and profile marks, CPS uses
+the archived signed roots if they match its applied composition and
+otherwise keeps its existing explicit marks as local choices.
+Use a CPS release that supports reconciliation before publishing a profile
+that depends on it to remove old defaults. Images that need to record
+overlapping local and profile choices, or keep roots after the catalog
+has advanced, use image format 8.
 
 Available-package queries and new plans use the primary publisher's current
 catalog and the companion digests it signs. Saved plans use their original

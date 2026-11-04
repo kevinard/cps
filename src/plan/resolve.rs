@@ -16,12 +16,28 @@ pub(crate) struct Candidates<'a, P> {
     pub obsoletions: &'a BTreeMap<String, Version>,
 }
 
+pub(crate) enum Retention<'a> {
+    All,
+    None,
+    Names(&'a BTreeSet<String>),
+}
+
+impl Retention<'_> {
+    fn contains(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Names(names) => names.contains(name),
+        }
+    }
+}
+
 pub fn resolve<'a, T>(
     installed: &'a BTreeMap<String, Installed>,
     available: Candidates<'_, impl IntoIterator<Item = &'a Published>>,
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     update: bool,
-    exact: bool,
+    retention: Retention<'_>,
     solver: Option<SolverRevision>,
     compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
 ) -> Result<(BTreeMap<String, Installed>, T)> {
@@ -105,7 +121,8 @@ pub fn resolve<'a, T>(
     let wanted: BTreeSet<_> = installed
         .iter()
         .filter(|(name, package)| {
-            !exact && (!obsolete(&package.published) || candidates.contains_key(name.as_str()))
+            retention.contains(name)
+                && (!obsolete(&package.published) || candidates.contains_key(name.as_str()))
         })
         .map(|(name, _)| name.as_str())
         .chain(requested.keys().copied())
@@ -121,7 +138,8 @@ pub fn resolve<'a, T>(
             .into_iter()
             .map(|(name, pkg)| {
                 let explicit = requested.contains_key(name)
-                    || (!exact && installed.get(name).is_some_and(|old| old.explicit));
+                    || (retention.contains(name)
+                        && installed.get(name).is_some_and(|old| old.explicit));
                 (
                     name.to_owned(),
                     Installed {

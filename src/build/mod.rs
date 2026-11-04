@@ -476,7 +476,7 @@ fn prepare_toolchain(
         },
         &requested,
         false,
-        true,
+        crate::plan::Retention::None,
         recipe.solver,
         |installed| {
             select_paths(

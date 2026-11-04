@@ -39,6 +39,15 @@ const PROFILE_IMAGE_FORMAT: u32 = 5;
 const CATALOG_ARCHIVE_IMAGE_FORMAT: u32 = 6;
 // Older writers would lose the history of locally preserved disabled facets.
 const DORMANT_CONFIG_IMAGE_FORMAT: u32 = 7;
+// Older writers cannot preserve the distinction between profile and operator roots.
+const PROFILE_INTENT_IMAGE_FORMAT: u32 = 8;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileIntent {
+    pub(crate) roots: BTreeSet<String>,
+    pub(crate) local: BTreeSet<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +88,8 @@ pub struct Settings {
     pub(crate) catalog_archives: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) profile_packages: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_intent: Option<ProfileIntent>,
     // Absent on images that predate tracking. Their proposals are discovered
     // from the saved vendor copies the first time they are reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,6 +130,28 @@ impl Settings {
             previous.check(next).with_context(|| {
                 format!("checking installed catalog checkpoint for {publisher}")
             })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_profile_intent(
+        &self,
+        installed: &BTreeMap<String, Installed>,
+    ) -> Result<()> {
+        if let Some(intent) = &self.profile_intent {
+            ensure!(
+                !self.profile_packages.is_empty()
+                    && intent
+                        .roots
+                        .iter()
+                        .all(|name| self.profile_packages.contains_key(name))
+                    && intent.local.iter().all(|name| installed.contains_key(name))
+                    && installed.iter().all(|(name, package)| {
+                        package.explicit
+                            == (intent.roots.contains(name) || intent.local.contains(name))
+                    }),
+                "installed package marks differ from the recorded profile and local roots"
+            );
         }
         Ok(())
     }
@@ -194,6 +227,8 @@ impl Publishers {
     pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
         if settings.bootstrap_catalog.is_some() {
             BOOTSTRAP_IMAGE_FORMAT
+        } else if settings.profile_intent.is_some() {
+            PROFILE_INTENT_IMAGE_FORMAT
         } else if !settings.dormant_configs.is_empty() {
             DORMANT_CONFIG_IMAGE_FORMAT
         } else if settings.catalog_archives {
@@ -425,6 +460,7 @@ fn initialize(
         catalog_checkpoints: BTreeMap::new(),
         catalog_archives: false,
         profile_packages: BTreeMap::new(),
+        profile_intent: None,
         config_updates: Some(BTreeMap::new()),
         dormant_configs: BTreeMap::new(),
     };
@@ -571,6 +607,7 @@ impl Image {
                     | PROFILE_IMAGE_FORMAT
                     | CATALOG_ARCHIVE_IMAGE_FORMAT
                     | DORMANT_CONFIG_IMAGE_FORMAT
+                    | PROFILE_INTENT_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -653,6 +690,7 @@ impl Image {
         }
         let installed = self.installed()?;
         settings.check_profile_packages(&installed)?;
+        settings.check_profile_intent(&installed)?;
         Ok(State {
             settings,
             publishers,

@@ -123,10 +123,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-4]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-5]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-4]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-5]) protected_profiles=true ;;
     esac
 fi
 if [[ -n $kernel_fixture ]]; then
@@ -308,6 +308,7 @@ refresh_vm_profile() {
     {
         printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
         printf '    profile "boot" architecture="%s" {\n        package "test/boot-stack"\n' "$(uname -m)"
+        if [[ ${1:-} == base ]]; then printf '        package "test/previous-default"\n'; fi
         printf '        facet "devel" #false\n'
         while read -r name repository key; do
             printf '        publisher "%s" catalog="%s" {\n' "$name" "$(cat "$repository/current")"
@@ -411,6 +412,7 @@ if $systemd_guest; then
             prepare_fat_modules runtime "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
         fi
         touch runtime/etc/cps-vm-assert-extra-publisher
+        if $profiled; then touch runtime/etc/cps-vm-assert-profile-reconcile; fi
     fi
     if [[ $installed_stage == 1 ]]; then touch runtime/etc/cps-vm-assert-installed-stage; fi
 else
@@ -487,8 +489,16 @@ $boot_systemd_dependency
 }
 MANIFEST
     "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der boot-stack.kdl
+    printf 'previous default\n' > proto/etc/cps-vm-previous-default
+    cat > previous-default.kdl <<MANIFEST
+schema-version 1
+package "test/previous-default" publisher="vm-profile" version="1.0.0-0" {
+    file "etc/cps-vm-previous-default" mode="0644" uid=$(id -u) gid=$(id -g)
+}
+MANIFEST
+    "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der previous-default.kdl
     base_test_catalog=$(cat repo/current)
-    refresh_vm_profile
+    refresh_vm_profile base
     {
         cat <<'CONFIG'
 schema-version 1
@@ -707,6 +717,10 @@ else
 fi
 check_runtime_packages staged
 if $profiled; then
+    grep -Fq 'Remove cps://vm-profile/test/previous-default 1.0.0-0' update.log
+    test "$(cat base/etc/cps-vm-previous-default)" = 'previous default'
+    test ! -e staged/etc/cps-vm-previous-default
+    "$cps" info --root staged --available test/previous-default > /dev/null
     trial_plan=$("$cps" transaction history --root staged --limit 1 | awk -F '\t' '$1 == 2 && $3 == "update-profile" {print $2}')
     "$cps" transaction show --root staged "$trial_plan" > trial-history.json
     grep -Fq "\"kernel_release\": \"$trial_release\"" trial-history.json
@@ -985,6 +999,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
         test "$obsoletions" = $'CPS_VM_OBSOLETION: trial removed\nCPS_VM_OBSOLETION: trial removed'
+        if $profiled; then
+            reconciled=$(tr -d '\r' < serial.log | grep '^CPS_VM_PROFILE_RECONCILE: ')
+            test "$reconciled" = $'CPS_VM_PROFILE_RECONCILE: trial removed\nCPS_VM_PROFILE_RECONCILE: trial removed'
+            printf '%s\n' "$reconciled"
+        fi
         "$cps" boot-env list --disk disk.raw --esp-partuuid "$esp_uuid" | tee before-rollback.log
         assert_default() {
             awk -F '\t' -v id="$1" -v part="$2" -v release="$3" \
@@ -1019,6 +1038,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
         fi
         test "$rollback_publishers" = 'CPS_VM_PUBLISHER: previous absent'
         test "$rollback_obsoletions" = 'CPS_VM_OBSOLETION: previous retained'
+        if $profiled; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_PROFILE_RECONCILE: previous retained'
+        fi
         if [[ -n $cps_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_CPS_RUNTIME: previous verified'
         fi

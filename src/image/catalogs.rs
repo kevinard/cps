@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, Transaction};
 
-use super::{Image, Publisher, Publishers, Settings, State};
+use super::{Image, ProfileIntent, Publisher, Publishers, Settings, State};
 use crate::repo::{
     CATALOG_LIMIT, Catalog, CatalogCheckpoint, ReleaseProfile, catalog_bytes,
     check_catalog_successor, decode_archived_catalog, take_profile,
@@ -213,6 +215,32 @@ pub(super) fn retain(tx: &Transaction<'_>, settings: &Settings) -> Result<()> {
 }
 
 impl Image {
+    pub(crate) fn reconstruct_profile_intent(&self, state: &State) -> Result<ProfileIntent> {
+        // The archive can have advanced during a local install. Only use its
+        // roots to classify explicit marks if it describes the applied set.
+        let roots: BTreeSet<_> = if state.settings.profile_packages.is_empty() {
+            BTreeSet::new()
+        } else {
+            read_profile(&self.db, state)?
+                .filter(|profile| {
+                    profile.composition == state.settings.profile_packages
+                        && profile
+                            .roots
+                            .keys()
+                            .all(|name| state.installed[name].explicit)
+                })
+                .map(|profile| profile.roots.into_keys().collect())
+                .unwrap_or_default()
+        };
+        let local = state
+            .installed
+            .iter()
+            .filter(|(name, package)| package.explicit && !roots.contains(*name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        Ok(ProfileIntent { roots, local })
+    }
+
     pub(crate) fn check_repository_candidate(
         &self,
         state: &State,

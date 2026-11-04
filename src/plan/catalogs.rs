@@ -1,8 +1,11 @@
-use std::{borrow::Borrow, collections::BTreeMap};
+use std::{
+    borrow::Borrow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Plan, SolverRevision, resolve};
+use super::{Plan, Retention, SolverRevision, resolve};
 use crate::{
     attestation::BuildTrust,
     image::{Image, Installed, Publisher, State},
@@ -153,6 +156,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         &self,
         before: &BTreeMap<String, Installed>,
         profile: &ReleaseProfile,
+        local_roots: Option<&BTreeSet<String>>,
         solver: Option<SolverRevision>,
         compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
     ) -> Result<(BTreeMap<String, Installed>, T)> {
@@ -197,13 +201,16 @@ impl<P: Borrow<Published>> CandidateSet<P> {
             },
             &requested,
             true,
-            false,
+            local_roots.map_or(Retention::All, Retention::Names),
             solver,
             compose,
         )?;
         for (name, package) in &mut installed {
             package.explicit = profile.roots.contains_key(name)
-                || before.get(name).is_some_and(|old| old.explicit);
+                || local_roots.map_or_else(
+                    || before.get(name).is_some_and(|old| old.explicit),
+                    |roots| roots.contains(name),
+                );
         }
         Ok((installed, paths))
     }

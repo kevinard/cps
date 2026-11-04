@@ -554,6 +554,15 @@ if [ -f /etc/cps-vm-assert-extra-publisher ]; then
         printf 'CPS_VM_OBSOLETION: previous retained\n'
     fi
 fi
+if [ -f /etc/cps-vm-assert-profile-reconcile ]; then
+    if [ "$state" = previous ]; then
+        [ "$("$bb" cat /etc/cps-vm-previous-default)" = 'previous default' ]
+        printf 'CPS_VM_PROFILE_RECONCILE: previous retained\n'
+    else
+        [ ! -e /etc/cps-vm-previous-default ]
+        printf 'CPS_VM_PROFILE_RECONCILE: %s removed\n' "$state"
+    fi
+fi
 if [ "$state" = trial ] && [ -f /run/cps-vm-counted ] &&
     [ -f /usr/local/libexec/cps-vm-capabilities ]; then
     "$bb" sh /usr/local/libexec/cps-vm-capabilities

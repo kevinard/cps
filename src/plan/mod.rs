@@ -28,7 +28,9 @@ pub use config::{ConfigChoice, ConfigUpdate, list_config_updates};
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
 };
-pub(crate) use resolve::{Candidates, check as check_dependencies, resolve as resolve_packages};
+pub(crate) use resolve::{
+    Candidates, Retention, check as check_dependencies, resolve as resolve_packages,
+};
 
 const CONFIG_UPDATES_DIR: &str = ".cps/config-updates";
 
@@ -134,6 +136,8 @@ pub struct Plan {
     publisher_generation: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     prune_directories: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) track_profile_intent: bool,
     pub(crate) catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
@@ -340,6 +344,7 @@ impl Plan {
                     .map(|(name, pkg)| (name, pkg.published.sha256.as_str()))),
             "pending package selection differs from the verified plan"
         );
+        after.check_profile_intent(&next.installed)?;
         Ok(())
     }
 
@@ -414,7 +419,11 @@ fn resolve_local<'a>(
         available,
         &pinned,
         update,
-        exact,
+        if exact {
+            Retention::None
+        } else {
+            Retention::All
+        },
         solver,
         |installed| effective_paths(&state.settings, installed),
     )?;
@@ -444,7 +453,8 @@ pub(crate) fn build(
     let mut receipts = Vec::new();
     let mut next_facets = None;
     let mut update_profile = matches!(request, Request::UpdateProfile);
-    let (installed, paths) = match &request {
+    let mut track_profile_intent = false;
+    let (mut installed, paths) = match &request {
         Request::ChangeFacet { facets } => {
             ensure!(
                 state.publishers.release_profile().is_none(),
@@ -555,6 +565,14 @@ pub(crate) fn build(
                     .profile
                     .as_ref()
                     .is_some_and(|profile| !profile.composition.is_empty());
+            track_profile_intent = saved.map_or(
+                update_profile
+                    || (!requested.is_empty() && !state.settings.profile_packages.is_empty()),
+                |plan| plan.track_profile_intent,
+            );
+            if track_profile_intent && state.settings.profile_intent.is_none() {
+                state.settings.profile_intent = Some(image.reconstruct_profile_intent(&state)?);
+            }
             let (installed, paths) = if install_profile {
                 let profile = catalogs
                     .profile
@@ -579,6 +597,12 @@ pub(crate) fn build(
                 catalogs.candidates.update_profile(
                     &state.installed,
                     profile,
+                    state
+                        .settings
+                        .profile_intent
+                        .as_ref()
+                        .filter(|_| track_profile_intent)
+                        .map(|intent| &intent.local),
                     solver,
                     |installed| effective_paths(&state.settings, installed),
                 )?
@@ -597,14 +621,23 @@ pub(crate) fn build(
             };
             receipts = catalogs.verify_builds(image, &state, &installed)?;
             if install_profile || update_profile {
-                state.settings.profile_packages.clone_from(
-                    &catalogs
-                        .profile
-                        .as_ref()
-                        .expect("applied profile")
-                        .composition,
-                );
+                let profile = catalogs.profile.as_ref().expect("applied profile");
+                state
+                    .settings
+                    .profile_packages
+                    .clone_from(&profile.composition);
+                if let Some(intent) = &mut state.settings.profile_intent {
+                    intent.roots = profile.roots.keys().cloned().collect();
+                }
                 state.settings.check_profile_packages(&installed)?;
+            }
+            if let Some(intent) = &mut state.settings.profile_intent {
+                if matches!(request, Request::ExactInstall { .. }) {
+                    intent.local.clear();
+                }
+                intent
+                    .local
+                    .extend(requested.keys().map(|name| (*name).to_owned()));
             }
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
             state.settings.catalog_archives = true;
@@ -612,6 +645,23 @@ pub(crate) fn build(
             (installed, paths)
         }
     };
+    if let Some(intent) = &mut state.settings.profile_intent {
+        intent.local.retain(|name| installed.contains_key(name));
+        for (name, package) in &mut installed {
+            package.explicit = intent.roots.contains(name) || intent.local.contains(name);
+        }
+        // Preserve the old image format when the archived signed roots and
+        // explicit marks can reconstruct both sets on their own.
+        if track_profile_intent
+            && intent.roots.is_disjoint(&intent.local)
+            && catalogs.profile.as_ref().is_some_and(|profile| {
+                profile.composition == state.settings.profile_packages
+                    && profile.roots.keys().eq(&intent.roots)
+            })
+        {
+            state.settings.profile_intent = None;
+        }
+    }
     // Resolving a vendor proposal changes local configuration, so a staged
     // boot environment can still be activated at its original revision.
     let revision = if matches!(request, Request::ResolveConfig { .. }) {
@@ -634,6 +684,7 @@ pub(crate) fn build(
         base_revision: state.settings.revision,
         publisher_generation: state.settings.publisher_generation,
         prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
+        track_profile_intent,
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
         request: if update_profile {
