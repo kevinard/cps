@@ -138,6 +138,11 @@ impl Plan {
                     write.path
                 ));
             }
+            if write.replaces_file()
+                && let Some(caps) = write.after.as_ref().and_then(Node::capabilities)
+            {
+                lines.push(format!("Set file capabilities on {} to {caps}", write.path));
+            }
         }
         for effect in &self.systemd {
             lines.push(format!(
@@ -346,6 +351,10 @@ pub(crate) fn build(
                     && observed.as_ref() != Some(&old.node)
                 {
                     ensure!(
+                        observed.as_ref().and_then(Node::capabilities).is_none(),
+                        "unexpected file capabilities on preserved config {path}"
+                    );
+                    ensure!(
                         matches!(observed, None | Some(Node::File { .. })),
                         "config type changed at {path}"
                     );
@@ -388,6 +397,10 @@ pub(crate) fn build(
                     && old.preserve
                     && observed.as_ref() != Some(&old.node)
                 {
+                    ensure!(
+                        observed.as_ref().and_then(Node::capabilities).is_none(),
+                        "unexpected file capabilities on preserved config {path}"
+                    );
                     plan.preserved.push(path.clone());
                     observed.clone()
                 } else {
@@ -491,7 +504,7 @@ impl Write {
         self.after.is_none() && self.before.as_ref().is_some_and(Node::is_dir)
     }
 
-    fn replaces_file(&self) -> bool {
+    pub(crate) fn replaces_file(&self) -> bool {
         matches!(self.after, Some(Node::File { .. })) && (self.before != self.after || self.detach)
     }
 

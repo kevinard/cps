@@ -46,9 +46,9 @@ Run `cps verify --root image --pristine` to check a freshly assembled offline
 root. It checks all package paths, including preserved configuration and
 implicit directories, and reports unmanaged paths outside the reserved
 `.cps` state directory. It also rejects unexpected hard links to regular files
-and extended attributes on managed regular files and directories. Use regular
-`verify` after provisioning or booting, when the system can generate files
-outside package ownership.
+and undeclared extended attributes on managed regular files and directories.
+Use regular `verify` after provisioning or booting, when the system can
+generate files outside package ownership.
 
 Use `plan exact-install NAME ...` to reconcile an image to the named packages and their required dependencies. The plan previews packages that would be removed. Use `plan remove NAME ...` to remove selected packages from committed image state while offline. Removal fails if a package that remains still requires one of those packages. Both operations preserve locally edited files declared with `preserve=#true`. A saved install, exact-install, remove, or update plan can also be applied to a clone with `boot-env stage`.
 
@@ -77,11 +77,12 @@ deterministic order without following symlinks or crossing mounts. For each
 regular-file hard-link group it records one payload path and aliases within the
 prototype. Groups extending outside the prototype are rejected. Ownership
 defaults to UID and GID zero. Use `--uid` and `--gid` to set explicit owners.
-The generator rejects hard-linked symlinks, special modes and filesystem
-objects, and extended attributes on regular files or directories. Review the
-manifest and add dependency, configuration, and systemd declarations before
-publishing. Publication derives
-the payload hashes and lengths. [IPS prototype manifest generation](https://docs.oracle.com/cd/E88353_01/html/E37839/pkgsend-1.html)
+The generator captures Linux file capabilities from executable inodes. It
+rejects namespaced capability sets, hard-linked symlinks, special modes and
+filesystem objects, and other extended attributes on regular files or
+directories. Review the manifest and add dependency, configuration, and
+systemd declarations before publishing. Publication derives the payload
+hashes and lengths. [IPS prototype manifest generation](https://docs.oracle.com/cd/E88353_01/html/E37839/pkgsend-1.html)
 
 ## Finding and inspecting packages
 
@@ -274,6 +275,28 @@ boot environment identity. They are local to the named image root.
 - The image must be inactive and reside on one filesystem. Install and update require existing explicit directory metadata to match the selected action. Transitions between a directory and a file or symlink are rejected. When ownership ends, CPS prunes directories it recorded creating if they are empty and their metadata still matches. It keeps pre-existing directories and directories with local content or extended attributes.
 
 Run `cargo test` for the desktop upgrade and interruption test.
+
+### Linux file capabilities
+
+A signed file action can grant a Linux executable specific capabilities.
+
+```kdl
+file "usr/bin/ping" mode="0755" uid=0 gid=0 capabilities="cap_net_raw=ep"
+```
+
+Use comma-separated capability names followed by `=` and the permitted (`p`)
+or inheritable (`i`) flags. Separate clauses with spaces when the sets differ.
+The effective flag (`e`) applies to the entire file, so include it in every
+clause when needed. Use `capabilities="="` for an explicit empty set. The
+executable must be root-owned and nonwritable by its group and other users.
+Hard links to the file share its capability metadata. [Linux capabilities](https://man7.org/linux/man-pages/man7/capabilities.7.html)
+
+Reading or writing file capabilities requires an unmapped UID namespace.
+Apply also needs `CAP_SETFCAP` and checks support in the image's staging
+directory before recording the transaction. Verification checks the installed
+set, including unexpected capabilities on ordinary files. Build workers can
+attest manifests with capabilities, and they materialize their toolchains
+without those privileges.
 
 ## Offline systemd actions
 

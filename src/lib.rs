@@ -2,6 +2,7 @@ mod apply;
 mod attestation;
 mod boot;
 mod build;
+mod file_caps;
 mod generate;
 mod image;
 mod kdl_format;

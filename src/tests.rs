@@ -107,6 +107,29 @@ fn dependency(kind: &str, name: &str, version: &str) -> String {
 }
 
 #[test]
+fn manifest_capabilities_require_a_protected_executable() -> Result<()> {
+    use crate::kdl_format::{manifest_text, parse_manifest};
+    let package = |metadata| {
+        parse_manifest(&format!(
+            "schema-version 1\npackage \"test/caps\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n    file \"bin/probe\" capabilities=\"cap_net_raw=ep\" {metadata}\n}}\n"
+        ))
+    };
+    for metadata in [
+        "uid=1000 gid=0 mode=\"0755\"",
+        "uid=0 gid=0 mode=\"0644\"",
+        "uid=0 gid=0 mode=\"0775\"",
+        "uid=0 gid=0 mode=\"0757\"",
+        "uid=0 gid=0 mode=\"0755\" preserve=#true",
+    ] {
+        assert!(package(metadata)?.validate(false).is_err());
+    }
+    let manifest = package("uid=0 gid=0 mode=\"0755\"")?;
+    manifest.validate(false)?;
+    assert_eq!(parse_manifest(&manifest_text(&manifest))?, manifest);
+    Ok(())
+}
+
+#[test]
 fn hardlinks_follow_target_updates_and_resume_offline() -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 

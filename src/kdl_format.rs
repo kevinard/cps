@@ -237,7 +237,15 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
     let name = node.name().value();
     let props: &[&str] = match name {
         "file" => &[
-            "mode", "uid", "gid", "arch", "facet", "preserve", "sha256", "size",
+            "mode",
+            "uid",
+            "gid",
+            "arch",
+            "facet",
+            "preserve",
+            "sha256",
+            "size",
+            "capabilities",
         ],
         "dir" => &["mode", "uid", "gid", "arch", "facet"],
         "hardlink" => &["target", "arch", "facet"],
@@ -273,6 +281,11 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
                 .unwrap_or(false),
             sha256: fields.string("sha256")?,
             size: fields.integer("size")?,
+            capabilities: fields
+                .string("capabilities")?
+                .as_deref()
+                .map(crate::file_caps::FileCapabilities::parse)
+                .transpose()?,
         },
         "dir" => Action::Dir {
             path,
@@ -352,6 +365,7 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 preserve,
                 sha256,
                 size,
+                capabilities,
                 ..
             } => {
                 node.insert("mode", mode.as_str());
@@ -363,6 +377,9 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 }
                 if let Some(size) = size {
                     node.insert("size", i128::from(*size));
+                }
+                if let Some(capabilities) = capabilities {
+                    node.insert("capabilities", capabilities.to_string());
                 }
                 Some((*uid, *gid))
             }

@@ -238,6 +238,15 @@ fn prepare(stage: &File, writes: &[Write], state: &State) -> Result<()> {
             fs::remove_file(entry.path())?;
         }
     }
+    for write in writes.iter().filter(|write| write.replaces_file()) {
+        if let Some(node) = &write.after
+            && node.capabilities().is_some()
+        {
+            let probe = NamedTempFile::new_in(&dir)?;
+            Root::set_file_metadata(probe.as_file(), node)
+                .with_context(|| format!("checking file capability support for {}", write.path))?;
+        }
+    }
     let payloads = payloads(writes);
     let mut sources = std::collections::BTreeMap::new();
     for managed in state.paths.values() {

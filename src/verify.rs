@@ -98,16 +98,24 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
                 continue;
             }
             (
-                Node::File { mode, uid, gid, .. },
+                Node::File {
+                    mode,
+                    uid,
+                    gid,
+                    capabilities,
+                    ..
+                },
                 Some(Node::File {
                     mode: actual_mode,
                     uid: actual_uid,
                     gid: actual_gid,
+                    capabilities: actual_capabilities,
                     ..
                 }),
             ) if !pristine
                 && managed.preserve
-                && (mode, uid, gid) == (actual_mode, actual_uid, actual_gid) =>
+                && (mode, uid, gid, capabilities)
+                    == (actual_mode, actual_uid, actual_gid, actual_capabilities) =>
             {
                 findings.push(Finding {
                     is_error: false,
@@ -116,6 +124,11 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
                 continue;
             }
             (_, None) => "missing",
+            (file @ Node::File { .. }, Some(observed @ Node::File { .. }))
+                if file.capabilities() != observed.capabilities() =>
+            {
+                "file capabilities differ"
+            }
             _ => "content, type, or metadata differs",
         };
         findings.push(Finding {
@@ -134,6 +147,10 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
                 return Ok(false);
             };
             let kind = FileType::from_raw_mode(info.st_mode);
+            let file = match &managed.node {
+                Node::Hardlink { target } => expected.get(target).unwrap_or(managed),
+                _ => managed,
+            };
             let links = 1 + aliases.get(path).map_or(0, Vec::len);
             if kind == FileType::RegularFile
                 && !matches!(managed.node, Node::Hardlink { .. })
@@ -148,7 +165,7 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
                 });
             }
             if matches!(kind, FileType::RegularFile | FileType::Directory)
-                && Root::has_xattrs(entry)
+                && Root::has_xattrs(entry, file.node.capabilities().is_some())
                     .with_context(|| format!("listing attributes at {path:?}"))?
             {
                 findings.push(Finding {

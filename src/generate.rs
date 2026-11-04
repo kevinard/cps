@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{FileType, readlinkat};
 
 use crate::{
+    file_caps::FileCapabilities,
     image::root::Root,
     kdl_format::manifest_text,
     model::{Action, FORMAT, Manifest, validate_name, validate_publisher},
@@ -45,14 +46,14 @@ pub fn generate_manifest(
     let root = Root::open(proto)?;
     root.walk(None, |path, entry, info| {
         let kind = FileType::from_raw_mode(info.st_mode);
-        let mode = || {
+        let mode = |allow_capability| {
             let mode = info.st_mode & 0o7777;
             ensure!(
                 mode <= 0o777,
                 "unsupported special permission bits at {path:?}"
             );
             ensure!(
-                !Root::has_xattrs(entry)
+                !Root::has_xattrs(entry, allow_capability)
                     .with_context(|| format!("listing attributes at {path:?}"))?,
                 "unsupported extended attributes at {path:?}"
             );
@@ -61,7 +62,7 @@ pub fn generate_manifest(
         let action = match kind {
             FileType::Directory => Action::Dir {
                 path: path.to_owned(),
-                mode: mode()?,
+                mode: mode(false)?,
                 uid,
                 gid,
                 facet: None,
@@ -95,9 +96,11 @@ pub fn generate_manifest(
                         }
                     }
                 }
+                let capabilities = FileCapabilities::read(entry)
+                    .with_context(|| format!("reading file capabilities at {path:?}"))?;
                 Action::File {
                     path: path.to_owned(),
-                    mode: mode()?,
+                    mode: mode(capabilities.is_some())?,
                     uid,
                     gid,
                     preserve: false,
@@ -105,6 +108,7 @@ pub fn generate_manifest(
                     arch: None,
                     sha256: None,
                     size: None,
+                    capabilities,
                 }
             }
             FileType::Symlink => {

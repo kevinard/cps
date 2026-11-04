@@ -52,6 +52,10 @@ pub(super) fn writes(
         }
         if managed.preserve {
             ensure!(
+                before.as_ref().and_then(Node::capabilities).is_none(),
+                "unexpected file capabilities on preserved config {path}"
+            );
+            ensure!(
                 matches!(before, None | Some(Node::File { .. })),
                 "config type changed at {path}"
             );

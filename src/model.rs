@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::file_caps::FileCapabilities;
+
 pub const FORMAT: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -270,6 +272,8 @@ pub enum Action {
         sha256: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         size: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<FileCapabilities>,
     },
     Dir {
         path: String,
@@ -310,6 +314,8 @@ pub enum Node {
         mode: u32,
         uid: u32,
         gid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<FileCapabilities>,
     },
     Dir {
         mode: u32,
@@ -330,6 +336,13 @@ pub enum Node {
 impl Node {
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Dir { .. })
+    }
+
+    pub(crate) fn capabilities(&self) -> Option<&FileCapabilities> {
+        match self {
+            Self::File { capabilities, .. } => capabilities.as_ref(),
+            _ => None,
+        }
     }
 }
 
@@ -374,6 +387,7 @@ impl Action {
                 mode,
                 uid,
                 gid,
+                capabilities,
                 ..
             } => Node::File {
                 sha256: sha256.clone().context("missing file digest")?,
@@ -381,6 +395,7 @@ impl Action {
                 mode: parse_mode(mode)?,
                 uid: *uid,
                 gid: *gid,
+                capabilities: *capabilities,
             },
             Self::Dir { mode, uid, gid, .. } => Node::Dir {
                 mode: parse_mode(mode)?,
@@ -421,9 +436,18 @@ impl Action {
                 gid,
                 sha256,
                 size,
+                preserve,
+                capabilities,
                 ..
             } => {
-                parse_mode(mode)?;
+                let mode = parse_mode(mode)?;
+                if let Some(capabilities) = capabilities {
+                    capabilities.validate_declaration()?;
+                    ensure!(
+                        *uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0 && !preserve,
+                        "file capabilities require a root-owned executable with no group or other write access and preserve disabled"
+                    );
+                }
                 if published {
                     validate_digest(sha256.as_deref().context("missing file digest")?)?;
                     ensure!(size.is_some(), "missing file size");

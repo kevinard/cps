@@ -650,6 +650,7 @@ mod tests {
             mode: 0o644,
             uid: 0,
             gid: 0,
+            capabilities: None,
         };
         fs::write(&blob, b"abcd")?;
         let mut destination = tempfile::tempfile()?;

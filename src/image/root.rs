@@ -16,7 +16,10 @@ use rustix::{
     process::{Gid, Uid},
 };
 
-use crate::model::{Node, digest_reader, validate_path};
+use crate::{
+    file_caps::{ATTRIBUTE, FileCapabilities},
+    model::{Node, digest_reader, validate_path},
+};
 
 pub struct Root(File);
 
@@ -35,7 +38,18 @@ impl Root {
         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
     }
 
-    pub(crate) fn has_xattrs(entry: &File) -> Result<bool> {
+    pub(crate) fn has_xattrs(entry: &File, allow_capability: bool) -> Result<bool> {
+        if allow_capability {
+            let mut names = [0u8; ATTRIBUTE.len() + 1];
+            return match listxattr(Self::fd_path(entry), &mut names[..]) {
+                Ok(0) | Err(Errno::NOTSUP) => Ok(false),
+                Ok(len) => Ok(&names[..len] != b"security.capability\0"),
+                // The attribute name buffer can hold exactly the one
+                // declared attribute. A longer list contains other metadata.
+                Err(Errno::RANGE) => Ok(true),
+                Err(error) => Err(error.into()),
+            };
+        }
         // An empty buffer queries the size without allocating or reading values.
         let empty: &mut [u8] = &mut [];
         match listxattr(Self::fd_path(entry), empty) {
@@ -200,16 +214,8 @@ impl Root {
             .regular_entry(target)?
             .with_context(|| format!("hard link target {target} is not a regular file"))?;
         let file = File::open(Self::fd_path(&entry))?;
-        let metadata = file.metadata()?;
-        let observed = Node::File {
-            sha256: digest_reader(&file)?,
-            size: metadata.len(),
-            mode: metadata.mode() & 0o7777,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-        };
         ensure!(
-            observed == *expected,
+            file_node(&file)? == *expected,
             "hard link target {target} differs from its manifest"
         );
         Ok(file)
@@ -233,16 +239,7 @@ impl Root {
                 let target = readlinkat(&parent, leaf, Vec::new())?.into_string()?;
                 Node::Symlink { target, uid, gid }
             }
-            FileType::RegularFile => {
-                let file = self.file(path)?;
-                Node::File {
-                    sha256: digest_reader(file)?,
-                    size: info.st_size.try_into()?,
-                    uid,
-                    gid,
-                    mode,
-                }
-            }
+            FileType::RegularFile => file_node(&self.file(path)?)?,
             _ => Node::Special,
         }))
     }
@@ -273,7 +270,7 @@ impl Root {
             Err(err) => return Err(err.into()),
         }
         match node {
-            Node::File { mode, uid, gid, .. } => {
+            Node::File { .. } => {
                 let temp = openat2(
                     staging,
                     TEMP,
@@ -284,7 +281,8 @@ impl Root {
                 let mut temp = File::from(temp);
                 std::io::copy(&mut payload.context("missing staged payload")?, &mut temp)?;
                 temp.flush()?;
-                set_metadata(&temp, *mode, *uid, *gid)?;
+                Self::set_file_metadata(&temp, node)
+                    .with_context(|| format!("preparing file metadata for {path}"))?;
             }
             Node::Dir { mode, uid, gid } => {
                 mkdirat(staging, TEMP, Mode::RWXU)?;
@@ -295,7 +293,9 @@ impl Root {
                     Mode::empty(),
                     ResolveFlags::NO_SYMLINKS,
                 )?;
-                set_metadata(&File::from(temp), *mode, *uid, *gid)?;
+                let temp = File::from(temp);
+                set_metadata(&temp, *mode, *uid, *gid)?;
+                temp.sync_all()?;
             }
             Node::Symlink { target, uid, gid } => {
                 symlinkat(target.as_str(), staging, TEMP)?;
@@ -338,6 +338,27 @@ impl Root {
         Ok(())
     }
 
+    pub(crate) fn set_file_metadata(file: &File, node: &Node) -> Result<()> {
+        let Node::File {
+            mode,
+            uid,
+            gid,
+            capabilities,
+            ..
+        } = node
+        else {
+            anyhow::bail!("expected file metadata");
+        };
+        set_metadata(file, *mode, *uid, *gid)?;
+        // Writes and ownership changes may clear capabilities. Set them only
+        // on the finished inode, before syncing and publishing the path.
+        if let Some(capabilities) = capabilities {
+            capabilities.install(file)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
     pub fn remove_empty_dir(&self, path: &str) -> Result<bool> {
         validate_path(path)?;
         let entry = match self.open_relative(path, OFlags::PATH | OFlags::DIRECTORY) {
@@ -345,7 +366,7 @@ impl Root {
             Err(Errno::XDEV) => return Ok(false),
             Err(error) => return Err(error).with_context(|| format!("opening directory {path}")),
         };
-        if Self::has_xattrs(&entry)? {
+        if Self::has_xattrs(&entry, false)? {
             return Ok(false);
         }
         let (parent, leaf) = self.parent(path)?;
@@ -386,6 +407,7 @@ impl Root {
             "unexpected state at {path}; pending transaction retained"
         );
         set_metadata(&file, mode, uid, gid)?;
+        file.sync_all()?;
         ensure!(
             directory_metadata(&file)? == *after,
             "could not restore directory metadata at {path}; pending transaction retained"
@@ -430,13 +452,24 @@ fn directory_metadata(file: &File) -> Result<Node> {
     })
 }
 
+fn file_node(file: &File) -> Result<Node> {
+    let metadata = file.metadata()?;
+    Ok(Node::File {
+        sha256: digest_reader(file)?,
+        size: metadata.len(),
+        mode: metadata.mode() & 0o7777,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        capabilities: FileCapabilities::read(file)?,
+    })
+}
+
 fn set_metadata(file: &File, mode: u32, uid: u32, gid: u32) -> Result<()> {
     let info = fstat(file)?;
     if (info.st_uid, info.st_gid) != (uid, gid) {
         fchown(file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
     }
     fchmod(file, Mode::from_raw_mode(mode))?;
-    file.sync_all()?;
     Ok(())
 }
 
