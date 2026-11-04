@@ -13,7 +13,7 @@ build architecture="x86_64" epoch=1792187472 {
         -Dmode=release -Dvcs-tag=false -Dversion-tag=v262.1 -Dtests=false -Dauto_features=disabled \\
         -Dblkid=enabled -Dlibmount=enabled -Dseccomp=enabled -Defi=true -Dbootloader=enabled -Dldconfig=false \\
         -Dsbat-distro=canopa -Dsbat-distro-summary=Canopa -Dsbat-distro-pkgname=cps-systemd-vm \\
-        -Dsbat-distro-version=262.1.0-0 -Dsbat-distro-url=https://github.com/kevinard/cps
+        -Dsbat-distro-version=@PACKAGE_VERSION@ -Dsbat-distro-url=https://github.com/kevinard/cps
     ninja -C out -j4 systemd systemd-executor systemctl systemd-bless-boot systemd-bless-boot-generator \\
         systemd-sysusers systemd-tmpfiles kernel-install src/kernel-install/90-loaderentry.install \\
         src/boot/systemd-bootx64.efi libsystemd.so.0.45.0 units/systemd-bless-boot.service

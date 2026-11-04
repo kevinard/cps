@@ -123,7 +123,7 @@ fi
 if $systemd; then
     tools_root=${CPS_SYSTEMD_TOOLS_ROOT:-/}
     tools_root=${tools_root%/}
-    for tool in env gzip id ls mount ninja pkg-config printf python python3 readelf realpath stat true; do
+    for tool in env gzip id ls ninja pkg-config printf python python3 readelf realpath stat true; do
         copy_elf "/usr/bin/$tool" "usr/bin/$tool"
     done
     ln -s gcc "$seed/usr/bin/cc"
@@ -144,9 +144,18 @@ if $systemd; then
     for module in elftools jinja2; do
         cp -RL -- "$tools_root$site/$module" "$seed$site/"
     done
-    for path in usr/include/{blkid/blkid.h,libmount/libmount.h,seccomp.h,seccomp-syscalls.h} \
-        usr/lib/pkgconfig/{blkid,mount,libseccomp,libsystemd}.pc; do
+    for path in usr/include/{seccomp.h,seccomp-syscalls.h} usr/lib/pkgconfig/{libseccomp,libsystemd}.pc; do
         copy_file "/$path" "$path"
+    done
+    util_root=${CPS_SYSTEMD_UTIL_LINUX_ROOT:-}
+    if [[ -z $util_root ]]; then
+        copy_elf /usr/bin/mount usr/bin/mount
+    else
+        copy_file "$util_root/usr/bin/mount" usr/bin/mount
+    fi
+    for path in usr/include/{blkid/blkid.h,libmount/libmount.h} \
+        usr/lib/pkgconfig/{blkid,mount}.pc usr/lib/{libblkid.so.1,libmount.so.1}; do
+        copy_file "$util_root/$path" "$path"
     done
     ln -s libblkid.so.1 "$seed/usr/lib/libblkid.so"
     ln -s libmount.so.1 "$seed/usr/lib/libmount.so"
