@@ -11,13 +11,14 @@ use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, SourceLayout,
-    activate_boot_environment, add_publisher, apply, build_with_toolchain_config,
-    build_with_worker, create_configured_image, create_image, deploy_boot_environment,
-    export_boot_environment, fetch_plan, fetch_sources, fetch_sources_with_local,
-    generate_manifest, import_sources, list_boot_environments, list_obsoletions, list_publishers,
-    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
-    read_attestation, read_worker_config, release, remove_publisher, rollback_boot_environment,
-    rotate_publisher_key, stage_boot_environment, verify, verify_pristine, withdraw_package,
+    activate_boot_environment, activate_deployed_boot_environment, add_publisher, apply,
+    build_with_toolchain_config, build_with_worker, create_configured_image, create_image,
+    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
+    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
+    list_boot_environments, list_obsoletions, list_publishers, list_withdrawals, plan,
+    prefer_publisher, publish, publish_release, publish_witnessed_bundle, read_attestation,
+    read_worker_config, release, remove_publisher, rollback_boot_environment, rotate_publisher_key,
+    stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -405,6 +406,9 @@ enum BootCommand {
         output: PathBuf,
         #[arg(long, value_name = "MIB")]
         size_mib: u64,
+        /// Write the KDL export receipt to standard output
+        #[arg(long)]
+        receipt: bool,
     },
     /// Deploy an exported root to a partition in a new offline GPT disk image
     Deploy {
@@ -425,6 +429,12 @@ enum BootCommand {
         esp: PathBuf,
         #[arg(long)]
         root_partuuid: String,
+        /// Offline GPT disk holding the deployed root
+        #[arg(long, requires = "receipt")]
+        disk: Option<PathBuf>,
+        /// KDL receipt produced by boot-env export --receipt
+        #[arg(long, requires = "disk")]
+        receipt: Option<PathBuf>,
         #[arg(long, default_value = "boot/vmlinuz")]
         kernel: String,
         #[arg(long)]
@@ -852,9 +862,15 @@ fn run(command: Command) -> Result<ExitCode> {
                 root,
                 output,
                 size_mib,
+                receipt,
             } => {
-                let id = export_boot_environment(&root, &output, size_mib)?;
-                println!("Exported {id} to {}", output.display());
+                if receipt {
+                    let receipt = export_boot_environment_receipt(&root, &output, size_mib)?;
+                    std::io::stdout().lock().write_all(receipt.as_bytes())?;
+                } else {
+                    let id = export_boot_environment(&root, &output, size_mib)?;
+                    println!("Exported {id} to {}", output.display());
+                }
             }
             BootCommand::Deploy {
                 disk,
@@ -872,6 +888,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 root,
                 esp,
                 root_partuuid,
+                disk,
+                receipt,
                 kernel,
                 initrd,
                 options,
@@ -886,7 +904,13 @@ fn run(command: Command) -> Result<ExitCode> {
                     tries,
                     known_good,
                 };
-                let id = activate_boot_environment(&root, &esp, &activation)?;
+                let id = match (disk.as_deref(), receipt.as_deref()) {
+                    (Some(disk), Some(receipt)) => {
+                        activate_deployed_boot_environment(&root, &esp, &activation, disk, receipt)?
+                    }
+                    (None, None) => activate_boot_environment(&root, &esp, &activation)?,
+                    _ => anyhow::bail!("--disk and --receipt must be supplied together"),
+                };
                 println!("Activated {id}");
             }
         },

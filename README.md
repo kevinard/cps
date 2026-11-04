@@ -624,18 +624,18 @@ Run `cargo build` followed by [`tests/systemd-actions.sh`](tests/systemd-actions
 Boot environments use separate Linux roots and a dedicated systemd-boot EFI System Partition (ESP). Start with an inactive, single-filesystem base root containing the kernel. GNU `cp` clones the image and uses a reflink where supported. The destination must be a new directory.
 
 ```sh
-cps boot-env export --root base --output base.ext4 --size-mib 2048
+cps boot-env export --root base --output base.ext4 --size-mib 2048 --receipt > base.kdl
 cps boot-env deploy --disk template.raw --root-image base.ext4 \
     --root-partuuid "$base_partuuid" --output base.raw
 cps boot-env activate --known-good --root base --esp esp \
-    --root-partuuid "$base_partuuid" --initrd boot/initramfs.img
+    --root-partuuid "$base_partuuid" --disk base.raw --receipt base.kdl
 cps plan --root base --output upgrade.json update
 cps boot-env stage --source base --root staged upgrade.json
-cps boot-env export --root staged --output staged.ext4 --size-mib 2048
+cps boot-env export --root staged --output staged.ext4 --size-mib 2048 --receipt > staged.kdl
 cps boot-env deploy --disk base.raw --root-image staged.ext4 \
     --root-partuuid "$staged_partuuid" --output next.raw
 cps boot-env activate --root staged --esp esp \
-    --root-partuuid "$staged_partuuid" --initrd boot/initramfs.img
+    --root-partuuid "$staged_partuuid" --disk next.raw --receipt staged.kdl
 ```
 
 `stage` verifies the new root and gives it a fresh image identity. Export
@@ -658,13 +658,27 @@ inputs offline during the operation. The source disk is read-only, and the
 new disk retains the previous contents outside the selected partition.
 [sfdisk manual](https://man7.org/linux/man-pages/man8/sfdisk.8.html)
 
-The ext4 filesystem UUID identifies the CPS image. Use the separate
-**GPT partition UUID** for both `deploy` and `activate`. Activation copies boot files
-from the selected root and publishes its Boot Loader Specification entry
-last. The kernel path defaults to `boot/vmlinuz`. Omit `--initrd` for a kernel
-that can mount the root on its own. Use `--options` for additional kernel
-arguments. Provision the GPT partitions and install systemd-boot on the
-dedicated ESP separately. Apply the resulting ESP files to the disk before
+The ext4 filesystem UUID identifies the CPS image, and the label records
+its revision in hexadecimal. Use the separate
+**GPT partition UUID** for both `deploy` and `activate`. Keep the KDL export
+receipt on the trusted host, outside the image. With `--disk` and
+`--receipt`, activation checks the receipt against the root's identity,
+revision, and CPS state. It checks the bytes in the named GPT partition
+against the export's SHA-256 and uses `blkid` to confirm the ext4 UUID and
+revision label. For a trial, it checks those two identifiers on the
+registered fallback partition of the same disk. Keep the disk offline
+through activation. The receipt describes the freshly deployed root,
+whose bytes can change after boot.
+For separately provisioned roots, activation accepts the operator's
+partition mapping when both flags are omitted.
+[blkid manual](https://man7.org/linux/man-pages/man8/blkid.8.html)
+
+Activation copies boot files from the selected root and publishes its Boot
+Loader Specification entry last. With manually supplied boot files the
+kernel path defaults to `boot/vmlinuz`. Use `--initrd` if the kernel needs
+one to mount the root and `--options` for additional kernel arguments.
+Provision the GPT partitions and install systemd-boot on the dedicated
+ESP separately. Apply the resulting ESP files to the verified disk before
 booting it.
 
 `--known-good` bootstraps the first entry. Later activations require the previous environment's known-good entry and boot files. A trial gets two attempts by default. Install [the `system/cps` package](packaging/cps.kdl) in the base image to make its health check part of `boot-complete.target`. The package ships the CPS binary, [the health unit](packaging/systemd/cps-boot-health.service), and the required dependency link. The unit runs `cps verify --root /` after `multi-user.target`. Systemd blesses the entry when boot completion succeeds, removing the boot counter. If the attempts run out, systemd-boot selects the previous environment. The managed ESP uses its own loader configuration and assumes no EFI default override. [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
@@ -710,8 +724,9 @@ checks that the health gate blocks blessing through both attempts. The
 
 Build with `cargo build`. Run [the export test](tests/boot-export.sh) with
 e2fsprogs, OpenSSL, and `setfattr` to check the payload and failure cleanup.
-[The deployment test](tests/boot-deploy.sh) also uses `sfdisk` to check
-partition isolation and rejection of damaged or ambiguous GPT layouts.
+[The deployment test](tests/boot-deploy.sh) also uses `sfdisk` and `blkid`
+to check partition isolation and reject damaged or ambiguous layouts,
+stale receipts, modified payloads, and missing fallback roots.
 The VM test additionally needs `qemu-system-x86_64`, `mkfs.fat`, mtools,
 systemd-boot, and matching non-Secure-Boot x86-64 OVMF code and
 variables files. Supply an EFI-stub Linux kernel with built-in virtio block,

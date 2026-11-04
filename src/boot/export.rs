@@ -12,14 +12,39 @@ use rustix::{
 };
 
 use super::{
-    artifact_helper, check_image_integrity, entry_id, kernel, systemd_boot::canonical_partuuid,
+    artifact_helper, check_image_integrity, entry_id, kernel, root_label,
+    systemd_boot::canonical_partuuid,
 };
-use crate::image::{Image, root::Root};
+use crate::{
+    image::{Image, root::Root},
+    kdl_format::boot_export::ExportReceipt,
+    model::digest_reader,
+};
 
 const PAYLOAD: &str = "root.ext4";
 
 /// Export an inactive CPS root to a new, checked ext4 partition payload.
 pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Result<String> {
+    let (id, _) = export(root, output, size_mib, false)?;
+    Ok(id)
+}
+
+/// Export a root and return its KDL receipt for activation against a GPT disk.
+pub fn export_boot_environment_receipt(
+    root: &Path,
+    output: &Path,
+    size_mib: u64,
+) -> Result<String> {
+    let (_, receipt) = export(root, output, size_mib, true)?;
+    receipt.context("missing root export receipt")
+}
+
+fn export(
+    root: &Path,
+    output: &Path,
+    size_mib: u64,
+    emit_receipt: bool,
+) -> Result<(String, Option<String>)> {
     let bytes = size_mib
         .checked_mul(1024 * 1024)
         .filter(|bytes| *bytes <= i64::MAX as u64)
@@ -105,9 +130,11 @@ pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Res
         // Pin the source across exec and resolve it as a directory, even if
         // the caller renames the original source path.
         .stdin(Stdio::from(image.root.as_file().try_clone()?))
+        .stdout(Stdio::null())
         .args([
             "-q", "-t", "ext4", "-F", "-b", "4096", "-U", &uuid, "-E", &options,
         ])
+        .args(["-L", &root_label(state.settings.revision)])
         .args(["-d", "/proc/self/fd/0/.", PAYLOAD])
         .status()
         .context("formatting the partition payload with mke2fs")?;
@@ -127,6 +154,20 @@ pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Res
         "the checked ext4 image was replaced or resized"
     );
     checked.sync_all()?;
+    let receipt = if emit_receipt {
+        Some(
+            ExportReceipt {
+                image: uuid.clone(),
+                revision: state.settings.revision,
+                state_sha256: digest_reader(image.root.file(".cps/state.sqlite")?)?,
+                bytes,
+                sha256: digest_reader(checked)?,
+            }
+            .render(),
+        )
+    } else {
+        None
+    };
     renameat_with(
         stage.as_file(),
         PAYLOAD,
@@ -136,5 +177,5 @@ pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Res
     )
     .context("publishing the ext4 image")?;
     parent.as_file().sync_all()?;
-    Ok(entry_id(&uuid, state.settings.revision))
+    Ok((entry_id(&uuid, state.settings.revision), receipt))
 }

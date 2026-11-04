@@ -16,9 +16,9 @@ mod verify;
 
 pub use apply::{apply, fetch_plan};
 pub use boot::{
-    Activation, BootEnvironment, activate_boot_environment, deploy_boot_environment,
-    export_boot_environment, list_boot_environments, rollback_boot_environment,
-    stage_boot_environment,
+    Activation, BootEnvironment, activate_boot_environment, activate_deployed_boot_environment,
+    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt,
+    list_boot_environments, rollback_boot_environment, stage_boot_environment,
 };
 pub use build::{
     BuildOptions, BuildSettings, BuildWorker, SourceLayout, build, build_cached_package,

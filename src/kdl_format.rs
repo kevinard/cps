@@ -15,6 +15,7 @@ use crate::{
     systemd::Action as SystemdAction,
 };
 
+pub(crate) mod boot_export;
 pub(crate) mod build;
 pub(crate) mod publish_policy;
 pub(crate) mod publish_release;

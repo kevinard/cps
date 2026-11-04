@@ -10,9 +10,14 @@ use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{FlockOperation, flock};
 use tempfile::NamedTempFile;
 
-use super::{check_image_integrity, entry_id, kernel};
+use super::{
+    check_image_integrity,
+    deploy::{OfflineDisk, offline_file},
+    entry_id, kernel,
+};
 use crate::{
     image::{Image, root::Root},
+    kdl_format::boot_export::ExportReceipt,
     model::digest_reader,
 };
 
@@ -114,6 +119,26 @@ pub fn activate_boot_environment(
     esp: &Path,
     activation: &Activation,
 ) -> Result<String> {
+    activate(root, esp, activation, None)
+}
+
+/// Activate an environment after verifying its deployed root in an offline disk.
+pub fn activate_deployed_boot_environment(
+    root: &Path,
+    esp: &Path,
+    activation: &Activation,
+    disk: &Path,
+    receipt: &Path,
+) -> Result<String> {
+    activate(root, esp, activation, Some((disk, receipt)))
+}
+
+fn activate(
+    root: &Path,
+    esp: &Path,
+    activation: &Activation,
+    deployment: Option<(&Path, &Path)>,
+) -> Result<String> {
     let partuuid = canonical_partuuid(&activation.root_partuuid)?;
     validate_options(&activation.options)?;
     ensure!(
@@ -129,7 +154,8 @@ pub fn activate_boot_environment(
             && !root.starts_with(&esp),
         "use separate, inactive image and EFI directories"
     );
-    let image = Image::open(&root, false)?;
+    let image = Image::open_query(&root)?;
+    image.root.offline_path()?;
     check_image_integrity(&image)?;
     let state = image.state()?;
     let settings = &state.settings;
@@ -172,12 +198,26 @@ pub fn activate_boot_environment(
             .context("opening the environment initramfs")?;
         (kernel, initrd)
     };
+    let disk = deployment
+        .map(|(disk, receipt)| {
+            let receipt = read_export_receipt(receipt)?;
+            ensure!(
+                receipt.image == image_id && receipt.revision == settings.revision,
+                "root export receipt is for a different image or revision"
+            );
+            ensure!(
+                receipt.state_sha256 == digest_reader(image.root.file(".cps/state.sqlite")?)?,
+                "image state differs from the root export receipt"
+            );
+            let disk = OfflineDisk::open(disk)?;
+            disk.verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
+            disk.verify_filesystem(&partuuid, &image_id, settings.revision)?;
+            Ok::<_, anyhow::Error>(disk)
+        })
+        .transpose()?;
     let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
-    let loader = ensure_dir(&esp, "loader")?;
-    let entries = ensure_dir(&loader, "entries")?;
     let (policy, existing) = inventory(&esp)?;
     let existing_entry = existing.iter().find(|entry| entry.id == id);
-    let config_path = loader.join("loader.conf");
 
     let description = Entry {
         id: &id,
@@ -241,6 +281,18 @@ pub fn activate_boot_environment(
         );
     }
 
+    if let (Some(disk), Some(fallback), Some(parent)) = (&disk, &fallback, &settings.boot_parent) {
+        let base = find_known_good(&existing, fallback)?;
+        disk.verify_filesystem(
+            &base.partuuid,
+            &canonical_partuuid(&parent.id)?,
+            parent.revision,
+        )
+        .context("checking the known-good fallback partition")?;
+    }
+    let loader = ensure_dir(&esp, "loader")?;
+    let entries = ensure_dir(&loader, "entries")?;
+    let config_path = loader.join("loader.conf");
     let efi = ensure_dir(&esp, "EFI")?;
     let artifacts = ensure_dir(&ensure_dir(&efi, "cps")?, &id)?;
     install(&artifacts.join("vmlinuz.efi"), kernel)?;
@@ -269,6 +321,19 @@ pub fn activate_boot_environment(
     }
 
     Ok(id)
+}
+
+fn read_export_receipt(path: &Path) -> Result<ExportReceipt> {
+    const MAX_RECEIPT_BYTES: u64 = 4096;
+    let file = offline_file(path)?;
+    let mut text = String::new();
+    file.take(MAX_RECEIPT_BYTES + 1).read_to_string(&mut text)?;
+    ensure!(
+        text.len() as u64 <= MAX_RECEIPT_BYTES,
+        "root export receipt is too large"
+    );
+    ExportReceipt::parse(&text)
+        .with_context(|| format!("reading root export receipt {}", path.display()))
 }
 
 struct Entry<'a> {

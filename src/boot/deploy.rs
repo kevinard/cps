@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, btree_map::Entry},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
@@ -14,7 +14,7 @@ use rustix::{
 };
 use serde::Deserialize;
 
-use super::{artifact_helper, systemd_boot::canonical_partuuid};
+use super::{artifact_helper, root_label, systemd_boot::canonical_partuuid};
 use crate::{image::root::Root, model::digest_reader};
 
 const DISK: &str = "disk.raw";
@@ -76,7 +76,8 @@ pub fn deploy_boot_environment(
         "cloning the offline disk failed with {status}"
     );
 
-    let (offset, bytes) = partition_extent(&clone, &stage_path, &partuuid)?;
+    let layout = read_partitions(&clone)?;
+    let PartitionExtent { offset, bytes, .. } = *linux_partition(&layout, &partuuid)?;
     ensure!(
         payload.metadata()?.len() == bytes,
         "root payload size must match the target partition ({bytes} bytes)"
@@ -97,8 +98,7 @@ pub fn deploy_boot_environment(
         "root payload was truncated during deployment"
     );
     clone.sync_all()?;
-    clone.seek(SeekFrom::Start(offset))?;
-    let actual = digest_reader((&mut clone).take(bytes))?;
+    let actual = digest_extent(&clone, offset, bytes)?;
     ensure!(
         actual == expected && payload.metadata()?.len() == bytes,
         "deployed partition does not match the checked root payload"
@@ -122,7 +122,7 @@ pub fn deploy_boot_environment(
     Ok(actual)
 }
 
-fn offline_file(path: &Path) -> Result<File> {
+pub(super) fn offline_file(path: &Path) -> Result<File> {
     let pinned = File::from(
         open(
             path,
@@ -165,8 +165,95 @@ struct Partition {
     uuid: String,
 }
 
-fn partition_extent(disk: &File, directory: &Path, partuuid: &str) -> Result<(u64, u64)> {
-    let output = sfdisk(disk, directory, "--json")?;
+struct PartitionExtent {
+    offset: u64,
+    bytes: u64,
+    linux: bool,
+}
+
+fn linux_partition<'a>(
+    partitions: &'a BTreeMap<String, PartitionExtent>,
+    partuuid: &str,
+) -> Result<&'a PartitionExtent> {
+    let partition = partitions
+        .get(partuuid)
+        .with_context(|| format!("GPT partition {partuuid} was not found"))?;
+    ensure!(
+        partition.linux,
+        "target is not a GPT Linux filesystem partition"
+    );
+    Ok(partition)
+}
+
+pub(super) struct OfflineDisk {
+    file: File,
+    partitions: BTreeMap<String, PartitionExtent>,
+}
+
+impl OfflineDisk {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = offline_file(path)?;
+        let partitions = read_partitions(&file)?;
+        Ok(Self { file, partitions })
+    }
+
+    pub fn verify_payload(&self, partuuid: &str, bytes: u64, sha256: &str) -> Result<()> {
+        let partition = linux_partition(&self.partitions, partuuid)?;
+        ensure!(
+            partition.bytes == bytes
+                && digest_extent(&self.file, partition.offset, partition.bytes)? == sha256,
+            "deployed partition {partuuid} does not match the root export receipt"
+        );
+        Ok(())
+    }
+
+    pub fn verify_filesystem(&self, partuuid: &str, image: &str, revision: u64) -> Result<()> {
+        let partition = linux_partition(&self.partitions, partuuid)?;
+        let output = artifact_helper("blkid", Path::new("/"))
+            .env("BLKID_CONF", "/dev/null")
+            .stdin(Stdio::from(self.file.try_clone()?))
+            .args(["--probe", "--offset", &partition.offset.to_string()])
+            .args(["--size", &partition.bytes.to_string()])
+            .args([
+                "--output",
+                "export",
+                "--match-tag",
+                "UUID",
+                "--match-tag",
+                "TYPE",
+                "--match-tag",
+                "LABEL",
+            ])
+            .arg("/proc/self/fd/0")
+            .output()
+            .context("probing the deployed filesystem with blkid")?;
+        let tags = std::str::from_utf8(&output.stdout)?;
+        let uuid = format!("UUID={image}");
+        let label = format!("LABEL={}", root_label(revision));
+        ensure!(
+            output.status.success()
+                && tags.lines().any(|line| line == "TYPE=ext4")
+                && tags.lines().any(|line| line == uuid)
+                && tags.lines().any(|line| line == label),
+            "partition {partuuid} does not contain the expected ext4 filesystem {image} at revision {revision}"
+        );
+        Ok(())
+    }
+}
+
+fn digest_extent(mut disk: &File, offset: u64, bytes: u64) -> Result<String> {
+    disk.seek(SeekFrom::Start(offset))?;
+    let mut extent = disk.take(bytes);
+    let sha256 = digest_reader(&mut extent)?;
+    ensure!(
+        extent.limit() == 0,
+        "disk partition was truncated while reading"
+    );
+    Ok(sha256)
+}
+
+fn read_partitions(disk: &File) -> Result<BTreeMap<String, PartitionExtent>> {
+    let output = sfdisk(disk, "--json")?;
     let mut table = serde_json::from_slice::<DiskTable>(&output)
         .context("expected a GPT partition table from sfdisk")?
         .partitiontable;
@@ -182,18 +269,20 @@ fn partition_extent(disk: &File, directory: &Path, partuuid: &str) -> Result<(u6
             && table.lastlba < (disk_bytes / SECTOR_SIZE).saturating_sub(1),
         "invalid GPT usable sector range"
     );
-    sfdisk(disk, directory, "--verify")?;
+    sfdisk(disk, "--verify")?;
     check_gpt_copies(disk, disk_bytes / SECTOR_SIZE - 1, &table)?;
 
     table.partitions.sort_unstable_by_key(|part| part.start);
     let mut next = table.firstlba;
-    let mut seen = BTreeSet::new();
-    let mut target = None;
+    let mut partitions = BTreeMap::new();
     for part in table.partitions {
         let uuid = canonical_partuuid(&part.uuid)?;
+        let Entry::Vacant(entry) = partitions.entry(uuid) else {
+            anyhow::bail!("GPT contains a duplicate partition UUID");
+        };
         ensure!(
-            uuid != NIL_UUID && seen.insert(uuid.clone()),
-            "GPT contains a missing or duplicate partition UUID"
+            entry.key() != NIL_UUID,
+            "GPT contains a missing partition UUID"
         );
         let end = part
             .start
@@ -204,15 +293,13 @@ fn partition_extent(disk: &File, directory: &Path, partuuid: &str) -> Result<(u6
             "GPT contains overlapping or out-of-range partitions"
         );
         next = end;
-        if uuid == partuuid {
-            ensure!(
-                part.kind.eq_ignore_ascii_case(LINUX_FILESYSTEM),
-                "target is not a GPT Linux filesystem partition"
-            );
-            target = Some((part.start * SECTOR_SIZE, part.size * SECTOR_SIZE));
-        }
+        entry.insert(PartitionExtent {
+            offset: part.start * SECTOR_SIZE,
+            bytes: part.size * SECTOR_SIZE,
+            linux: part.kind.eq_ignore_ascii_case(LINUX_FILESYSTEM),
+        });
     }
-    target.with_context(|| format!("GPT partition {partuuid} was not found"))
+    Ok(partitions)
 }
 
 fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt) -> Result<()> {
@@ -265,8 +352,8 @@ fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt) -> Result<()>
     Ok(())
 }
 
-fn sfdisk(disk: &File, directory: &Path, action: &str) -> Result<Vec<u8>> {
-    let output = artifact_helper("sfdisk", directory)
+fn sfdisk(disk: &File, action: &str) -> Result<Vec<u8>> {
+    let output = artifact_helper("sfdisk", Path::new("/"))
         .stdin(Stdio::from(disk.try_clone()?))
         .args([action, "/proc/self/fd/0"])
         .output()

@@ -44,7 +44,7 @@ code=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE to x86-64 OVMF_CODE}
 vars=${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS to the matching OVMF_VARS template}
 qemu_data=${CPS_VM_QEMU_DATA:-}
 
-for command in "$qemu" mkfs.fat mcopy mdir mke2fs e2fsck sfdisk openssl timeout; do
+for command in "$qemu" mkfs.fat mcopy mdir mke2fs e2fsck sfdisk blkid openssl timeout; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
 if [[ -n $busybox_repo || -n $busybox_key ]]; then
@@ -509,11 +509,12 @@ if $profiled; then
         base/usr/bin/cps publisher list --root base >/dev/null
 fi
 
-"$cps" boot-env export --root base --output base.ext4 --size-mib "$root_mib"
+"$cps" boot-env export --receipt --root base --output base.ext4 --size-mib "$root_mib" > base.kdl
 base_payload=$(sha256sum base.ext4)
 "$cps" boot-env deploy --disk template.raw --root-image base.ext4 \
     --root-partuuid "$base_uuid" --output base.raw
 base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
+    --disk base.raw --receipt base.kdl \
     --root-partuuid "$base_uuid" --options "$options")
 base_id=${base_id#Activated }
 test -f "esp/loader/entries/$base_id.conf"
@@ -601,14 +602,9 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     diff -r esp-before esp
 fi
 
-"$cps" boot-env export --root staged --output staged.ext4 --size-mib "$root_mib"
+"$cps" boot-env export --receipt --root staged --output staged.ext4 --size-mib "$root_mib" > staged.kdl
 test "$(sha256sum base.ext4)" = "$base_payload"
 diff -r esp-before esp
-if [[ $mode == health-fail ]]; then
-    # Change a managed inode's mode while keeping ext4 structurally valid.
-    debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
-    debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
-fi
 "$cps" boot-env deploy --disk base.raw --root-image staged.ext4 \
     --root-partuuid "$trial_uuid" --output disk.raw
 cmp -n "$((trial_mib * 1024 * 1024))" base.raw disk.raw
@@ -631,6 +627,7 @@ grep -q 'distinct root PARTUUID' rejected.log
 diff -r esp-before esp
 
 "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
+    --disk disk.raw --receipt staged.kdl \
     --options "$options" --tries 2
 "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
     --options "$options" --tries 9
@@ -663,6 +660,13 @@ if [[ $mode == rollback ]]; then
     fi
     grep -q 'is not known-good' rejected.log
     cmp config-before-rejected-rollback esp/loader/loader.conf
+fi
+
+if [[ $mode == health-fail ]]; then
+    # Simulate an offline modification after checked activation.
+    debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
+    debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
+    dd if=staged.ext4 of=disk.raw bs=1M seek="$trial_mib" conv=notrunc status=none
 fi
 
 # Add the configured EFI directory after CPS has deployed both roots.

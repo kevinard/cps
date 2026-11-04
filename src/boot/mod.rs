@@ -20,10 +20,10 @@ use crate::{
 };
 
 pub use deploy::deploy_boot_environment;
-pub use export::export_boot_environment;
+pub use export::{export_boot_environment, export_boot_environment_receipt};
 pub use systemd_boot::{
-    Activation, BootEnvironment, activate_boot_environment, list_boot_environments,
-    rollback_boot_environment,
+    Activation, BootEnvironment, activate_boot_environment, activate_deployed_boot_environment,
+    list_boot_environments, rollback_boot_environment,
 };
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
@@ -100,6 +100,11 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
 
 fn entry_id(image: &str, revision: u64) -> String {
     format!("cps-{image}-{revision}")
+}
+
+fn root_label(revision: u64) -> String {
+    // A full revision fits in the 16 bytes available for an ext4 label.
+    format!("{revision:016x}")
 }
 
 fn check_image_integrity(image: &Image) -> Result<()> {

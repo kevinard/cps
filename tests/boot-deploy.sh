@@ -98,3 +98,100 @@ test ! -e missing
 test -z "$(find . -maxdepth 1 -name '.cps-deploy-*' -print)"
 
 echo 'Verified atomic GPT deployment and byte-for-byte preservation outside the target slot'
+
+mkdir -p proto/etc esp
+openssl genpkey -algorithm ED25519 -outform DER -out private.der
+openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+publish() {
+    local publisher=$1 repo=$2 version=$3
+    printf '%s\n' "$version" > proto/etc/version
+    "$cps" manifest generate --proto proto --publisher "$publisher" --version "$version" \
+        --uid "$(id -u)" --gid "$(id -g)" test/root > package.kdl
+    "$cps" publish --repo "$repo" --proto proto --signing-key private.der package.kdl
+}
+publish test repo 1.0.0-0
+"$cps" image-create --root base --repo repo --publisher test --trust-key public.der
+"$cps" plan --root base --output install.json install test/root
+"$cps" apply --root base install.json
+mkdir -p base/boot
+printf 'test kernel\n' > base/boot/vmlinuz
+
+export_with_receipt() {
+    "$cps" boot-env export --root "$1" --output "$1.ext4" --size-mib 16 --receipt > "$1.kdl"
+}
+activate_checked() {
+    local root=$1 disk=$2 partuuid=$3 receipt=$4
+    shift 4
+    "$cps" boot-env activate --root "$root" --esp esp --root-partuuid "$partuuid" \
+        --disk "$disk" --receipt "$receipt" "$@"
+}
+reject_activation() {
+    local message=$1
+    shift
+    if activate_checked "$@" > rejected.log 2>&1; then
+        echo 'Unexpected checked activation success' >&2
+        exit 1
+    fi
+    grep -F "$message" rejected.log
+}
+
+export_with_receipt base
+base_hash=$(sha256sum base.ext4)
+grep -F "bytes=16777216 sha256=\"${base_hash%% *}\"" base.kdl
+deploy template.raw base.ext4 "$base" base.raw
+reject_activation 'does not match the root export receipt' \
+    base template.raw "$base" base.kdl --known-good
+test -z "$(ls -A esp)"
+
+publish test repo 2.0.0-0
+"$cps" plan --root base --output update.json update
+cp -a base different-revision
+"$cps" apply --root different-revision update.json
+reject_activation 'different image or revision' \
+    different-revision base.raw "$base" base.kdl --known-good
+export_with_receipt different-revision
+deploy template.raw different-revision.ext4 "$base" different-revision.raw
+
+publish extra extras 1.0.0-0
+cp -a base different-state
+"$cps" publisher add --root different-state --repo extras --trust-key public.der extra
+reject_activation 'image state differs from the root export receipt' \
+    different-state base.raw "$base" base.kdl --known-good
+
+sed 's/ bytes=/ revision=1 bytes=/' base.kdl > duplicate.kdl
+reject_activation 'duplicate root-export property revision' \
+    base base.raw "$base" duplicate.kdl --known-good
+truncate -s 4097 oversized.kdl
+reject_activation 'root export receipt is too large' \
+    base base.raw "$base" oversized.kdl --known-good
+test -z "$(ls -A esp)"
+base_id=$(activate_checked base base.raw "$base" base.kdl --known-good)
+base_id=${base_id#Activated }
+test -f "esp/loader/entries/$base_id.conf"
+
+"$cps" boot-env stage --source base --root staged update.json
+export_with_receipt staged
+deploy base.raw staged.ext4 "$trial" staged.raw
+deploy template.raw staged.ext4 "$trial" without-base.raw
+deploy different-revision.raw staged.ext4 "$trial" wrong-base-revision.raw
+cp -a esp esp-before
+reject_activation 'checking the known-good fallback partition' \
+    staged without-base.raw "$trial" staged.kdl
+reject_activation 'at revision 1' \
+    staged wrong-base-revision.raw "$trial" staged.kdl
+reject_activation 'does not match the root export receipt' \
+    staged staged.raw "$base" staged.kdl
+cp staged.raw tampered.raw
+printf 'changed deployed bytes' | dd of=tampered.raw bs=1M seek=19 conv=notrunc status=none
+reject_activation 'does not match the root export receipt' \
+    staged tampered.raw "$trial" staged.kdl
+diff -r esp-before esp
+
+trial_id=$(activate_checked staged staged.raw "$trial" staged.kdl)
+trial_id=${trial_id#Activated }
+test -f "esp/loader/entries/$trial_id+2.conf"
+activate_checked staged staged.raw "$trial" staged.kdl --tries 9
+test ! -e "esp/loader/entries/$trial_id+9.conf"
+cmp "esp-before/loader/entries/$base_id.conf" "esp/loader/entries/$base_id.conf"
+
+echo 'Verified checked activation rejects stale exports, modified partitions, and missing fallbacks'
