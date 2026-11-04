@@ -519,7 +519,11 @@ if [ -f /etc/cps-vm-assert-profile-protection ]; then
         > /run/remove-profile.log 2>&1; then
         exit 1
     fi
-    "$bb" grep -Fq 'test/boot-stack is protected by the installed signed profile' /run/remove-profile.log
+    rejection=$("$bb" cat /run/remove-profile.log)
+    case "$rejection" in
+        *'test/boot-stack is protected by the installed signed profile'*) ;;
+        *) printf '%s\n' "$rejection" >&2; exit 1 ;;
+    esac
     [ ! -e /run/remove-profile.json ]
     printf 'CPS_VM_PROFILE_PROTECTION: %s verified\n' "$state"
 fi
