@@ -1,7 +1,8 @@
+mod paths;
 mod resolve;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet},
     path::Path,
 };
 
@@ -10,12 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     boot::kernel::{self, Artifacts},
-    image::{Image, Installed, Managed, Settings, State, root::Root},
+    image::{Image, Settings, State, root::Root},
     model::{FORMAT, Node, digest, validate_name},
     repo::snapshot,
     systemd::{self, Action as SystemdAction},
 };
 
+pub(crate) use paths::{effective_paths, select_paths};
 pub(crate) use resolve::{check as check_dependencies, resolve as resolve_packages};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -139,92 +141,6 @@ pub fn plan(path: &Path, request: Request) -> Result<Plan> {
     .0)
 }
 
-pub(crate) fn effective_paths(
-    settings: &Settings,
-    installed: &BTreeMap<String, Installed>,
-) -> Result<BTreeMap<String, Managed>> {
-    select_paths(
-        &settings.arch,
-        &settings.facets,
-        settings.directory(),
-        installed,
-    )
-}
-
-pub(crate) fn select_paths(
-    arch: &str,
-    facets: &BTreeMap<String, bool>,
-    implicit_directory: Node,
-    installed: &BTreeMap<String, Installed>,
-) -> Result<BTreeMap<String, Managed>> {
-    let mut paths: BTreeMap<String, Managed> = BTreeMap::new();
-    let mut sizes = BTreeMap::new();
-    for (name, package) in installed {
-        let mut selected = BTreeSet::new();
-        for action in &package.published.manifest.action {
-            let (facet, action_arch) = action.selectors();
-            if facet.is_some_and(|key| !facets.get(key).copied().unwrap_or(true))
-                || action_arch.is_some_and(|action_arch| action_arch != arch)
-            {
-                continue;
-            }
-            let path = action.path();
-            ensure!(
-                selected.insert(path),
-                "{} selects multiple actions for {path}",
-                package.published.manifest.id()
-            );
-            let node = action.node()?;
-            if let Node::File { sha256, size, .. } = &node {
-                let previous = sizes.entry(sha256.clone()).or_insert(*size);
-                ensure!(
-                    *previous == *size,
-                    "inconsistent payload sizes for {sha256}"
-                );
-            }
-            match paths.entry(path.to_owned()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(Managed {
-                        node,
-                        owners: BTreeSet::from([name.clone()]),
-                        preserve: action.preserve(),
-                        implicit: false,
-                    });
-                }
-                Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
-                    ensure!(
-                        node.is_dir() && existing.node == node,
-                        "path conflict for {path} between {:?} and {name}",
-                        existing.owners
-                    );
-                    existing.owners.insert(name.clone());
-                }
-            }
-        }
-    }
-    let parents: Vec<_> = paths
-        .keys()
-        .flat_map(|path| {
-            path.match_indices('/')
-                .map(|(index, _)| path[..index].to_owned())
-        })
-        .collect();
-    for parent in parents {
-        let entry = paths.entry(parent.clone()).or_insert_with(|| Managed {
-            node: implicit_directory.clone(),
-            owners: BTreeSet::new(),
-            preserve: false,
-            implicit: true,
-        });
-        ensure!(
-            entry.node.is_dir(),
-            "{parent} must be a directory to contain package paths"
-        );
-    }
-    Ok(paths)
-}
-
 pub(crate) fn build(
     root: &Root,
     mut state: State,
@@ -232,7 +148,7 @@ pub(crate) fn build(
     catalog: Option<&str>,
     solver: Option<SolverRevision>,
 ) -> Result<(Plan, State)> {
-    let (catalog, installed) = match &request {
+    let (catalog, installed, paths) = match &request {
         Request::Remove { packages } => {
             let names = requested_names(packages)?;
             let mut installed = state.installed.clone();
@@ -243,7 +159,8 @@ pub(crate) fn build(
                 );
             }
             resolve::check(&installed).context("removal would break installed dependencies")?;
-            (None, installed)
+            let paths = effective_paths(&state.settings, &installed)?;
+            (None, installed, paths)
         }
         _ => {
             let requested = match &request {
@@ -258,18 +175,18 @@ pub(crate) fn build(
                 &state.publisher.key,
                 catalog,
             )?;
-            let installed = resolve::resolve(
+            let (installed, paths) = resolve::resolve(
                 &state.installed,
                 &packages.packages,
                 &requested,
                 matches!(request, Request::Update),
                 matches!(request, Request::ExactInstall { .. }),
                 solver,
+                |installed| effective_paths(&state.settings, installed),
             )?;
-            (Some(packages.sha256), installed)
+            (Some(packages.sha256), installed, paths)
         }
     };
-    let paths = effective_paths(&state.settings, &installed)?;
     let revision = state
         .settings
         .revision

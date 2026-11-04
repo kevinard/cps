@@ -273,21 +273,27 @@ fn prepare_toolchain(
     let key = read_key(trust_key)?;
     let release = snapshot(repo, publisher, &key, Some(&recipe.catalog))
         .context("loading pinned toolchain catalog")?;
-    let installed = resolve_packages(
+    let (installed, paths) = resolve_packages(
         &BTreeMap::new(),
         &release.packages,
         &recipe.packages,
         false,
         true,
         recipe.solver,
+        |installed| {
+            select_paths(
+                &recipe.arch,
+                &BTreeMap::new(),
+                Node::Dir {
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                },
+                installed,
+            )
+        },
     )
     .context("resolving build toolchain")?;
-    let implicit = Node::Dir {
-        mode: 0o755,
-        uid: 0,
-        gid: 0,
-    };
-    let paths = select_paths(&recipe.arch, &BTreeMap::new(), implicit, &installed)?;
     for (name, managed) in &paths {
         let (top, _) = name.split_once('/').unwrap_or((name, ""));
         if MOUNTS.contains(&top) {

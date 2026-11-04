@@ -195,6 +195,98 @@ fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
 }
 
 #[test]
+fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
+    let f = Fixture::new()?;
+    let uid = geteuid().as_raw();
+    let gid = getegid().as_raw();
+    f.package(
+        "base/paths",
+        "1.0.0-0",
+        format!(
+            "{}    symlink \"opt/cps\" target=\"elsewhere\" uid={uid} gid={gid}\n",
+            f.file(LIBRARY, "owned by base", "0644", "")?,
+        ),
+    )?;
+    f.package(
+        "desktop/app",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "compatible", "0755", "")?,
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["base/paths".into(), "desktop/app".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+
+    f.package(
+        "desktop/app",
+        "2.0.0-0",
+        f.file(LIBRARY, "colliding leaf", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/app",
+        "3.0.0-0",
+        f.file("opt/cps/child", "under a symlink", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/app",
+        "4.0.0-0",
+        format!(
+            "{}{}",
+            f.file(COMPOSITOR, "overlapping actions", "0755", "")?,
+            f.file(COMPOSITOR, "overlapping actions", "0755", "arch=\"x86_64\"")?,
+        ),
+    )?;
+    let update = plan(&f.root, Request::Update)?;
+    apply(&f.root, &update)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compatible");
+    assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "owned by base");
+    assert_eq!(
+        fs::read_link(f.root.join("opt/cps"))?,
+        Path::new("elsewhere")
+    );
+
+    f.package(
+        "desktop/blocker",
+        "1.0.0-0",
+        f.file(LIBRARY, "blocked", "0644", "")?,
+    )?;
+    let error = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/blocker".into()],
+        },
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    for detail in [
+        "cannot satisfy package constraints",
+        LIBRARY,
+        "base/paths",
+        "desktop/blocker",
+    ] {
+        assert!(message.contains(detail), "missing {detail} in {message}");
+    }
+
+    f.package(
+        "desktop/app",
+        "5.0.0-0",
+        f.file(COMPOSITOR, "next compatible", "0755", "")?,
+    )?;
+    let update = plan(&f.root, Request::Update)?;
+    apply(&f.root, &update)?;
+    assert_eq!(
+        fs::read_to_string(f.root.join(COMPOSITOR))?,
+        "next compatible"
+    );
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn install_upgrade_and_resume_offline() -> Result<()> {
     if let (Some(root), Some(saved)) = (
         std::env::var_os("CPS_TEST_IMAGE"),

@@ -7,14 +7,15 @@ use anyhow::{Context, Result, bail, ensure};
 use super::SolverRevision;
 use crate::{image::Installed, model::DependencyKind, repo::Published};
 
-pub fn resolve(
+pub fn resolve<T>(
     installed: &BTreeMap<String, Installed>,
     packages: &[Published],
     requested: &BTreeSet<String>,
     update: bool,
     exact: bool,
     solver: Option<SolverRevision>,
-) -> Result<BTreeMap<String, Installed>> {
+    compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
+) -> Result<(BTreeMap<String, Installed>, T)> {
     let mut candidates = BTreeMap::<_, Vec<_>>::new();
     for package in packages
         .iter()
@@ -57,30 +58,34 @@ pub fn resolve(
         .chain(requested)
         .map(String::as_str)
         .collect();
-    let selected = match solver {
-        Some(SolverRevision::SatV1) => sat::solve(&candidates, &wanted)?,
+    let materialize = |selected: BTreeMap<&str, &Published>| {
+        let installed = selected
+            .into_iter()
+            .map(|(name, pkg)| {
+                let explicit = requested.contains(name)
+                    || (!exact && installed.get(name).is_some_and(|old| old.explicit));
+                (
+                    name.to_owned(),
+                    Installed {
+                        published: pkg.clone(),
+                        explicit,
+                    },
+                )
+            })
+            .collect();
+        let composed = compose(&installed)?;
+        Ok((installed, composed))
+    };
+    match solver {
+        Some(SolverRevision::SatV1) => sat::solve(&candidates, &wanted, materialize),
         None => {
             // Existing saved plans and pinned build recipes retain their original selection order.
             let mut selected = BTreeMap::new();
             search(&candidates, wanted, &mut selected)
                 .context("cannot satisfy package constraints")?;
-            selected
+            materialize(selected)
         }
-    };
-    Ok(selected
-        .into_iter()
-        .map(|(name, pkg)| {
-            let explicit = requested.contains(name)
-                || (!exact && installed.get(name).is_some_and(|old| old.explicit));
-            (
-                name.to_owned(),
-                Installed {
-                    published: pkg.clone(),
-                    explicit,
-                },
-            )
-        })
-        .collect())
+    }
 }
 
 fn search<'a>(
