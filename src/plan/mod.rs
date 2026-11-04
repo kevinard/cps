@@ -73,6 +73,8 @@ pub struct Plan {
     pub(crate) base_revision: u64,
     #[serde(default, skip_serializing_if = "publisher_generation_is_initial")]
     publisher_generation: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    prune_directories: bool,
     pub(crate) catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
@@ -120,6 +122,9 @@ impl Plan {
             for write in &self.writes {
                 lines.push(format!("Repair {}", write.path));
             }
+        }
+        for write in self.writes.iter().filter(|write| write.removes_directory()) {
+            lines.push(format!("Prune if empty {}", write.path));
         }
         for effect in &self.systemd {
             lines.push(format!(
@@ -233,6 +238,7 @@ pub(crate) fn build(
         image: state.settings.id.clone(),
         base_revision: state.settings.revision,
         publisher_generation: state.settings.publisher_generation,
+        prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
         request,
@@ -350,7 +356,16 @@ pub(crate) fn build(
                     Some(target.node.clone())
                 }
             }
-            None if before.is_some_and(|old| old.node.is_dir()) => observed.clone(),
+            None if before.is_some_and(|old| old.node.is_dir()) => {
+                if plan.prune_directories
+                    && state.settings.created_directories.contains(path)
+                    && observed.as_ref() == before.map(|old| &old.node)
+                {
+                    None
+                } else {
+                    observed.clone()
+                }
+            }
             None => {
                 ensure!(
                     !matches!(observed, Some(Node::Dir { .. } | Node::Special)),
@@ -389,14 +404,14 @@ pub(crate) fn build(
     }
     plan.writes = writes.into_values().collect();
     plan.writes.sort_by_key(|write| {
-        (
-            if write.after.as_ref().is_some_and(Node::is_dir) {
-                0
-            } else {
-                1
-            },
-            write.path.bytes().filter(|b| *b == b'/').count(),
-        )
+        let depth = write.path.bytes().filter(|b| *b == b'/').count();
+        if write.removes_directory() {
+            (2, usize::MAX - depth)
+        } else if write.after.as_ref().is_some_and(Node::is_dir) {
+            (0, depth)
+        } else {
+            (1, depth)
+        }
     });
     plan.payload_bytes = payloads(&plan.writes)
         .values()
@@ -409,9 +424,29 @@ pub(crate) fn build(
                 .context("payload byte count overflow")
         })?;
     state.settings.revision = revision;
+    state
+        .settings
+        .created_directories
+        .retain(|path| paths.contains_key(path));
+    state.settings.created_directories.extend(
+        plan.writes
+            .iter()
+            .filter(|write| {
+                write.before.is_none()
+                    && write.after.as_ref().is_some_and(Node::is_dir)
+                    && paths.contains_key(&write.path)
+            })
+            .map(|write| write.path.clone()),
+    );
     state.installed = installed;
     state.paths = paths;
     Ok((plan, state))
+}
+
+impl Write {
+    pub(crate) fn removes_directory(&self) -> bool {
+        self.after.is_none() && self.before.as_ref().is_some_and(Node::is_dir)
+    }
 }
 
 fn requested_names(packages: &[String]) -> Result<BTreeSet<String>> {

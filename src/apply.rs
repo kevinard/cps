@@ -160,6 +160,12 @@ fn write_files(
             "unexpected state at {}; pending transaction retained",
             write.path
         );
+        if write.removes_directory() {
+            if root.remove_empty_dir(&write.path)? {
+                after_write(write);
+            }
+            continue;
+        }
         match &write.after {
             Some(node) => {
                 let payload = if matches!(node, Node::File { .. }) {

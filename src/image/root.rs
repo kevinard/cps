@@ -264,6 +264,27 @@ impl Root {
         Ok(())
     }
 
+    pub fn remove_empty_dir(&self, path: &str) -> Result<bool> {
+        validate_path(path)?;
+        let entry = match self.open_relative(path, OFlags::PATH | OFlags::DIRECTORY) {
+            Ok(entry) => entry,
+            Err(Errno::XDEV) => return Ok(false),
+            Err(error) => return Err(error).with_context(|| format!("opening directory {path}")),
+        };
+        if Self::has_xattrs(&entry)? {
+            return Ok(false);
+        }
+        let (parent, leaf) = self.parent(path)?;
+        match unlinkat(&parent, leaf, AtFlags::REMOVEDIR) {
+            Ok(()) => {
+                parent.sync_all()?;
+                Ok(true)
+            }
+            Err(Errno::NOTEMPTY | Errno::EXIST | Errno::BUSY) => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("pruning directory {path}")),
+        }
+    }
+
     pub fn repair_directory(&self, path: &str, before: &Node, after: &Node) -> Result<bool> {
         let Node::Dir { mode: old_mode, .. } = *before else {
             anyhow::bail!("expected directory metadata at {path}");
@@ -298,9 +319,18 @@ impl Root {
         Ok(true)
     }
 
-    pub fn sync_parent(&self, path: &str) -> Result<()> {
-        self.parent(path)?.0.sync_all()?;
-        Ok(())
+    pub fn sync_parent(&self, mut path: &str) -> Result<()> {
+        loop {
+            match self.parent(path) {
+                Ok((parent, _)) => return Ok(parent.sync_all()?),
+                // During replay, deeper removals may already have completed
+                // along with their parent. Sync the nearest surviving ancestor.
+                Err(Errno::NOENT) => {
+                    path = path.rsplit_once('/').context("missing image parent")?.0
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 }
 

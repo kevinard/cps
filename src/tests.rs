@@ -13,11 +13,7 @@ use ring::{
 use rustix::process::{getegid, geteuid};
 
 use crate::{
-    Plan, Request, apply,
-    apply::apply_with,
-    create_image,
-    model::{Node, digest},
-    plan, publish, verify,
+    Plan, Request, apply, apply::apply_with, create_image, model::digest, plan, publish, verify,
 };
 
 const CONFIG: &str = "etc/canopa/compositor.conf";
@@ -1186,6 +1182,10 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
 }
 
 fn interrupt_apply(root: &Path, saved: &Path, plan: &Plan) -> Result<()> {
+    interrupt_apply_at(root, saved, plan, COMPOSITOR)
+}
+
+fn interrupt_apply_at(root: &Path, saved: &Path, plan: &Plan, path: &str) -> Result<()> {
     fs::write(saved, serde_json::to_vec(plan)?)?;
     let worker = Command::new(std::env::current_exe()?)
         .args([
@@ -1195,6 +1195,7 @@ fn interrupt_apply(root: &Path, saved: &Path, plan: &Plan) -> Result<()> {
         ])
         .env("CPS_TEST_IMAGE", root)
         .env("CPS_TEST_PLAN", saved)
+        .env("CPS_TEST_AFTER_PATH", path)
         .output()?;
     assert_eq!(
         worker.status.code(),
@@ -1207,12 +1208,85 @@ fn interrupt_apply(root: &Path, saved: &Path, plan: &Plan) -> Result<()> {
 
 fn interrupt_apply_worker(root: &Path, saved: &Path) -> Result<()> {
     let plan: Plan = serde_json::from_slice(&fs::read(saved)?)?;
+    let path = std::env::var("CPS_TEST_AFTER_PATH")?;
     apply_with(root, &plan, |write| {
-        if write.path == COMPOSITOR && matches!(write.before, Some(Node::File { .. })) {
+        if write.path == path {
             std::process::exit(INTERRUPTED);
         }
     })?;
-    panic!("fixture did not replace the compositor");
+    panic!("fixture did not write {path}");
+}
+
+#[test]
+fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new()?;
+    let uid = geteuid().as_raw();
+    let gid = getegid().as_raw();
+    let actions = f.file("opt/example/bin/tool", "tool", "0755", "")?
+        + &f.file("opt/shared/vendor-file", "vendor", "0644", "")?
+        + &f.file("var/example/cache/vendor-file", "vendor", "0644", "")?
+        + &format!(
+            "    dir \"opt/example\" mode=\"0755\" uid={uid} gid={gid}\n\
+             dir \"var/changed-mode\" mode=\"0755\" uid={uid} gid={gid}\n\
+             dir \"var/attributes\" mode=\"0755\" uid={uid} gid={gid}\n"
+        );
+    f.package("test/prune", "1.0.0-0", actions)?;
+    f.create()?;
+    fs::create_dir_all(f.root.join("opt/shared"))?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/prune".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    let changed_mode = f.root.join("var/changed-mode");
+    fs::set_permissions(&changed_mode, fs::Permissions::from_mode(0o700))?;
+    let attributes = f.root.join("var/attributes");
+    rustix::fs::setxattr(
+        &attributes,
+        "user.cps-test",
+        b"kept",
+        rustix::fs::XattrFlags::empty(),
+    )?;
+    let local = f.root.join("var/example/cache/local");
+    fs::write(&local, "local data")?;
+
+    let request = Request::Remove {
+        packages: vec!["test/prune".into()],
+    };
+    let legacy = {
+        let image = crate::image::Image::open(&f.root, false)?;
+        crate::plan::build(&image.root, image.state()?, request.clone(), None, None)?.0
+    };
+    assert!(!legacy.summary().contains("Prune if empty"));
+    let removal = plan(&f.root, request)?;
+    assert!(removal.summary().contains("Prune if empty opt/example"));
+    assert!(!removal.summary().contains("Prune if empty opt/shared"));
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("remove.json"),
+        &removal,
+        "opt/example",
+    )?;
+    assert!(!f.root.join("opt/example").exists());
+    assert!(verify(&f.root).is_err());
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert_eq!(apply(&f.root, &removal)?, 2);
+    assert_eq!(apply(&f.root, &removal)?, 2);
+    assert!(verify(&f.root)?.is_empty());
+    assert!(f.root.join("opt/shared").is_dir());
+    assert!(!f.root.join("opt/shared/vendor-file").exists());
+    assert_eq!(
+        fs::metadata(changed_mode)?.permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(attributes.is_dir());
+    assert_eq!(fs::read_to_string(local)?, "local data");
+    assert!(!f.root.join("var/example/cache/vendor-file").exists());
+    Ok(())
 }
 
 #[test]

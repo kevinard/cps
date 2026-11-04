@@ -34,6 +34,8 @@ pub struct Settings {
     pub facets: BTreeMap<String, bool>,
     pub uid: u32,
     pub gid: u32,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) created_directories: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_parent: Option<BootParent>,
 }
@@ -241,6 +243,7 @@ fn initialize(
         facets,
         uid: geteuid().as_raw(),
         gid: getegid().as_raw(),
+        created_directories: BTreeSet::new(),
         boot_parent: None,
     };
     fs::create_dir_all(path)?;
