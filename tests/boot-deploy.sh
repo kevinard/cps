@@ -205,7 +205,7 @@ printf 'systemd random seed\n' > seed/loader/random-seed
 truncate -s 2M seed.fat
 mkfs.fat -F 12 seed.fat >/dev/null
 mcopy -s -i seed.fat seed/EFI seed/loader ::/
-cp --sparse=always base.raw with-esp.raw
+cp --sparse=always template.raw with-esp.raw
 dd if=seed.fat of=with-esp.raw bs=1M seek=1 conv=notrunc status=none
 raw_activate() {
     local root=$1 disk=$2 partuuid=$3 output=$4
@@ -232,24 +232,32 @@ assert_default() {
     raw_list "$1" | awk -F '\t' -v id="$2" -v status="$3" \
         '$1 == "*" && $2 == status && $3 == id {found=1} END {exit !found}'
 }
+assert_retired() {
+    local listing
+    listing=$(raw_list "$1")
+    if grep -Fq "$2" <<< "$listing"; then
+        echo "Retired boot environment $2 is still registered" >&2
+        exit 1
+    fi
+}
 
 reject_raw 'not a GPT EFI System partition' "$cps" boot-env list --disk with-esp.raw --esp-partuuid "$base"
 reject_raw 'fsck.fat rejected the EFI partition' raw_activate base base.raw "$base" rejected.raw --known-good
 test ! -e rejected.raw
 test "$(raw_list with-esp.raw)" = 'No boot environments registered'
 original=$(sha256sum with-esp.raw)
-raw_activate base with-esp.raw "$base" bootable-base.raw --known-good
+raw_activate base with-esp.raw "$base" bootable-base.raw --known-good --root-image base.ext4
 test "$(sha256sum with-esp.raw)" = "$original"
 assert_default bootable-base.raw "$base_id" known-good
 
 deploy bootable-base.raw staged.ext4 "$trial" deployed-trial.raw
-cp --sparse=always deployed-trial.raw full-esp.raw
+cp --sparse=always bootable-base.raw full-esp.raw
 free=$(mdir -i full-esp.raw@@1048576 ::/ | awk '/bytes free/ {sub(/bytes free/, ""); gsub(/[^0-9]/, ""); print}')
 test -n "$free"
 truncate -s "$free" fill
 mcopy -i full-esp.raw@@1048576 fill ::/fill
 full_before=$(sha256sum full-esp.raw)
-reject_raw 'could not create EFI directory' raw_activate staged full-esp.raw "$trial" rejected.raw
+reject_raw 'could not create EFI directory' raw_activate staged full-esp.raw "$trial" rejected.raw --root-image staged.ext4
 test "$(sha256sum full-esp.raw)" = "$full_before"
 test ! -e rejected.raw
 raw_activate staged deployed-trial.raw "$trial" bootable-trial.raw
@@ -258,6 +266,22 @@ cmp -i "$((3 * 1024 * 1024))" deployed-trial.raw bootable-trial.raw
 assert_default bootable-trial.raw "$trial_id" 'trial (2 left)'
 raw_activate staged bootable-trial.raw "$trial" retry.raw --tries 9
 cmp bootable-trial.raw retry.raw
+
+# A pinned base can coexist with a live trial. Only its exhausted entry can
+# be recycled without blessing that trial.
+"$cps" boot-env stage --source base --root retry-root update.json
+export_with_receipt retry-root
+"$cps" boot-env rollback --disk bootable-trial.raw --esp-partuuid "$esp" \
+    --output-disk pinned-base.raw "$base_id"
+reject_raw 'while its trial has attempts left' \
+    raw_activate retry-root pinned-base.raw "$trial" rejected.raw --root-image retry-root.ext4 --replace "$trial_id"
+mren -i pinned-base.raw@@1048576 \
+    "::/loader/entries/$trial_id+2.conf" "::/loader/entries/$trial_id+0-2.conf"
+retry_id=$(raw_activate retry-root pinned-base.raw "$trial" retried.raw \
+    --root-image retry-root.ext4 --replace "$trial_id")
+retry_id=${retry_id#Activated }
+assert_default retried.raw "$retry_id" 'trial (2 left)'
+assert_retired retried.raw "$trial_id"
 
 # Simulate the guest blessing the counted entry on the source disk.
 mren -i bootable-trial.raw@@1048576 \
@@ -277,6 +301,46 @@ done
 deploy bootable-trial.raw different-revision.ext4 "$base" unusable-fallback.raw
 reject_raw 'checking the rollback root partition' raw_rollback unusable-fallback.raw rejected.raw
 reject_raw 'destination already exists' raw_rollback bootable-trial.raw rolled-back.raw
+test ! -e rejected.raw
+
+publish test repo 3.0.0-0
+"$cps" plan --root staged --output next.json update
+"$cps" boot-env stage --source staged --root recycled next.json
+export_with_receipt recycled
+before_recycle=$(sha256sum bootable-trial.raw)
+reject_raw 'distinct root PARTUUID' \
+    raw_activate recycled bootable-trial.raw "$base" rejected.raw --root-image recycled.ext4
+reject_raw 'cannot replace the known-good base' \
+    raw_activate recycled bootable-trial.raw "$trial" rejected.raw --root-image recycled.ext4 --replace "$trial_id"
+reject_raw 'unknown replacement boot environment' \
+    raw_activate recycled bootable-trial.raw "$base" rejected.raw --root-image recycled.ext4 --replace "$disk_id"
+reject_raw 'checking the occupied root partition' \
+    raw_activate recycled unusable-fallback.raw "$base" rejected.raw --root-image recycled.ext4 --replace "$base_id"
+reject_raw 'root payload does not match the root export receipt' \
+    raw_activate recycled bootable-trial.raw "$base" rejected.raw --root-image base.ext4 --replace "$base_id"
+test ! -e rejected.raw
+test "$(sha256sum bootable-trial.raw)" = "$before_recycle"
+
+printf 'foreign file in retired directory\n' > unrelated
+mcopy -i bootable-trial.raw@@1048576 unrelated "::/EFI/cps/$base_id/keep"
+before_recycle=$(sha256sum bootable-trial.raw)
+recycled_id=$(raw_activate recycled bootable-trial.raw "$base" recycled.raw \
+    --root-image recycled.ext4 --replace "$base_id")
+recycled_id=${recycled_id#Activated }
+test "$(sha256sum bootable-trial.raw)" = "$before_recycle"
+cmp -n 1048576 bootable-trial.raw recycled.raw
+cmp -i "$((3 * 1024 * 1024)):0" -n "$((16 * 1024 * 1024))" recycled.raw recycled.ext4
+cmp -i "$((19 * 1024 * 1024))" bootable-trial.raw recycled.raw
+mcopy -i recycled.raw@@1048576 "::/EFI/cps/$base_id/keep" - | cmp unrelated -
+if mdir -i recycled.raw@@1048576 "::/EFI/cps/$base_id/vmlinuz.efi" >/dev/null 2>&1; then
+    echo 'Retired kernel still exists on the ESP' >&2
+    exit 1
+fi
+assert_default recycled.raw "$recycled_id" 'trial (2 left)'
+assert_retired recycled.raw "$base_id"
+raw_rollback recycled.raw recycled-rollback.raw
+assert_default recycled-rollback.raw "$trial_id" known-good
+reject_raw 'the recorded parent is unavailable' raw_rollback recycled-rollback.raw rejected.raw
 test ! -e rejected.raw
 
 # Simulate the dirty flag left in the primary boot sector after guest shutdown.

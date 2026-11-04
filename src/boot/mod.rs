@@ -23,13 +23,13 @@ use crate::{
 
 pub use deploy::deploy_boot_environment;
 pub use esp::{
-    activate_boot_environment_on_disk, list_boot_environments_on_disk,
-    rollback_boot_environment_on_disk,
+    activate_boot_environment_on_disk, deploy_and_activate_boot_environment,
+    list_boot_environments_on_disk, rollback_boot_environment_on_disk,
 };
 pub use export::{export_boot_environment, export_boot_environment_receipt};
 pub use systemd_boot::{
-    Activation, BootEnvironment, activate_boot_environment, activate_deployed_boot_environment,
-    list_boot_environments, rollback_boot_environment,
+    Activation, BootEnvironment, RootDeployment, activate_boot_environment,
+    activate_deployed_boot_environment, list_boot_environments, rollback_boot_environment,
 };
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {

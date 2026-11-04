@@ -8,6 +8,11 @@ case $mode in
     fallback|bless|health-fail|kernel-upgrade|rollback|capabilities) ;;
     *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade|rollback|capabilities]" >&2; exit 2 ;;
 esac
+recycle=${CPS_VM_RECYCLE_SLOT:-0}
+if [[ $recycle == 1 && $mode != rollback ]]; then
+    echo 'CPS_VM_RECYCLE_SLOT requires the rollback scenario' >&2
+    exit 2
+fi
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
@@ -47,6 +52,9 @@ qemu_data=${CPS_VM_QEMU_DATA:-}
 for command in "$qemu" mkfs.fat fsck.fat mcopy mdir mmd mke2fs e2fsck sfdisk blkid openssl timeout; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
+if [[ $recycle == 1 ]]; then
+    for command in mdel mrd; do command -v "$command" >/dev/null; done
+fi
 if [[ -n $busybox_repo || -n $busybox_key ]]; then
     busybox_repo=$(realpath -- "${busybox_repo:?Set CPS_VM_BUSYBOX_REPO}")
     busybox_key=$(realpath -- "${busybox_key:?Set CPS_VM_BUSYBOX_TRUST_KEY}")
@@ -179,13 +187,13 @@ publish_state() {
     if [[ $mode == rollback ]]; then
         case $state in
             previous) dependency='    require "test/legacy-marker"' ;;
-            trial) dependency='    require "test/extra-marker"' ;;
+            trial|recycled) dependency='    require "test/extra-marker"' ;;
         esac
     fi
     if [[ -n $kernel_fixture ]]; then
         case $state in
             previous) dependency+=$'\n    require "system/kernel"' ;;
-            trial) dependency+=$'\n    require "system/kernel-qemu"' ;;
+            trial|recycled) dependency+=$'\n    require "system/kernel-qemu"' ;;
         esac
     fi
     printf '%s\n' "$state" > proto/etc/cps-vm-state
@@ -839,6 +847,52 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             tr -d '\r' < rollback.log | grep -Fx "CPS_VM_INSMOD: previous$modules"
         fi
         printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
+        if [[ $recycle == 1 ]]; then
+            # Start from the disk with the blessed upgrade, before rollback.
+            if $profiled; then
+                previous_profile=$(cat profile-repo/current)
+                previous_test=$(cat repo/current)
+            fi
+            publish_state 3.0.0-0 recycled
+            if $profiled; then refresh_vm_profile "$previous_profile" "$previous_test"; fi
+            "$cps" plan --root staged --output recycle.json update | tee recycle-plan.log
+            grep -Fq 'test/boot-state 2.0.0-0 -> 3.0.0-0' recycle-plan.log
+            result=$("$cps" boot-env stage --source staged --root recycled recycle.json)
+            recycled_id=${result#Staged }
+            recycled_id=${recycled_id%% at *}
+            "$cps" boot-env export --receipt --root recycled --output recycled.ext4 \
+                --size-mib "$root_mib" > recycled.kdl
+            result=$("$cps" boot-env activate --root recycled --root-image recycled.ext4 \
+                --root-partuuid "$base_uuid" --replace "$base_id" \
+                --disk disk.raw --receipt recycled.kdl --esp-partuuid "$esp_uuid" \
+                --output-disk recycled.raw --options "$options")
+            test "$result" = "Activated $recycled_id"
+            cmp -n 1048576 disk.raw recycled.raw
+            cmp -i "$((trial_mib * 1024 * 1024))" disk.raw recycled.raw
+            "$cps" boot-env list --disk recycled.raw --esp-partuuid "$esp_uuid" | tee recycled-trial.log
+            grep -Fq "$recycled_id" recycled-trial.log
+            if grep -Fq "$base_id" recycled-trial.log ||
+                mdir -i recycled.raw@@1048576 "::/EFI/cps/$base_id" >/dev/null 2>&1; then
+                echo 'Retired environment is still present in the recycled disk' >&2
+                exit 1
+            fi
+
+            cp "$vars" vars.fd
+            run_vm recycled-boot.log recycled.raw
+            check_busybox recycled-boot.log
+            recycled_boots=$(tr -d '\r' < recycled-boot.log | grep '^CPS_VM_BOOT: ')
+            test "$recycled_boots" = $'CPS_VM_BOOT: recycled blessed\nCPS_VM_BOOT: recycled default'
+            "$cps" boot-env list --disk recycled.raw --esp-partuuid "$esp_uuid" | tee recycled-blessed.log
+            assert_default "$recycled_id" "$base_uuid" "$trial_release" recycled-blessed.log
+            result=$("$cps" boot-env rollback --disk recycled.raw --esp-partuuid "$esp_uuid" \
+                --output-disk recycled-rollback.raw)
+            test "$result" = "Selected $trial_id for the next boot"
+            run_vm recycled-rollback.log recycled-rollback.raw
+            check_busybox recycled-rollback.log
+            test "$(tr -d '\r' < recycled-rollback.log | grep '^CPS_VM_BOOT: ')" = 'CPS_VM_BOOT: trial default'
+            tr -d '\r' < recycled-rollback.log | grep -Fx "CPS_VM_KERNEL: trial $trial_release"
+            printf '%s\nVerified the recycled slot and rolled back to the preceding root\n' "$recycled_boots"
+        fi
     fi
     exit 0
 fi

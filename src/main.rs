@@ -10,15 +10,15 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
-    Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, SourceLayout,
-    activate_boot_environment, activate_boot_environment_on_disk,
+    Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, RootDeployment,
+    SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
     activate_deployed_boot_environment, add_publisher, apply, build_with_toolchain_config,
-    build_with_worker, create_configured_image, create_image, deploy_boot_environment,
-    export_boot_environment, export_boot_environment_receipt, fetch_plan, fetch_sources,
-    fetch_sources_with_local, generate_manifest, import_sources, list_boot_environments,
-    list_boot_environments_on_disk, list_obsoletions, list_publishers, list_withdrawals, plan,
-    prefer_publisher, publish, publish_release, publish_witnessed_bundle, read_attestation,
-    read_worker_config, release, remove_publisher, rollback_boot_environment,
+    build_with_worker, create_configured_image, create_image, deploy_and_activate_boot_environment,
+    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
+    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
+    list_boot_environments, list_boot_environments_on_disk, list_obsoletions, list_publishers,
+    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
+    read_attestation, read_worker_config, release, remove_publisher, rollback_boot_environment,
     rollback_boot_environment_on_disk, rotate_publisher_key, stage_boot_environment, verify,
     verify_pristine, withdraw_package,
 };
@@ -458,6 +458,12 @@ enum BootCommand {
         /// Publish the activation in a new disk file
         #[arg(long, requires_all = ["disk", "receipt", "esp_partuuid"])]
         output_disk: Option<PathBuf>,
+        /// Deploy this root payload in the same transaction as activation
+        #[arg(long, requires = "output_disk")]
+        root_image: Option<PathBuf>,
+        /// Recycle the root slot of this inactive boot environment
+        #[arg(long, requires = "root_image")]
+        replace: Option<String>,
         #[arg(long, default_value = "boot/vmlinuz")]
         kernel: String,
         #[arg(long)]
@@ -943,6 +949,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 receipt,
                 esp_partuuid,
                 output_disk,
+                root_image,
+                replace,
                 kernel,
                 initrd,
                 options,
@@ -971,14 +979,29 @@ fn run(command: Command) -> Result<ExitCode> {
                         activate_boot_environment(&root, esp, &activation)?
                     }
                     (None, Some(disk), Some(receipt), Some(partuuid), Some(output)) => {
-                        activate_boot_environment_on_disk(
-                            &root,
-                            &activation,
-                            disk,
-                            partuuid,
-                            receipt,
-                            output,
-                        )?
+                        if let Some(image) = root_image.as_deref() {
+                            deploy_and_activate_boot_environment(
+                                &root,
+                                &activation,
+                                disk,
+                                partuuid,
+                                receipt,
+                                output,
+                                RootDeployment {
+                                    image,
+                                    replace: replace.as_deref(),
+                                },
+                            )?
+                        } else {
+                            activate_boot_environment_on_disk(
+                                &root,
+                                &activation,
+                                disk,
+                                partuuid,
+                                receipt,
+                                output,
+                            )?
+                        }
                     }
                     _ => anyhow::bail!("specify --esp or the offline disk and output options"),
                 };

@@ -171,8 +171,16 @@ while read -r module name; do
     printf '%s\n' "$name" >> /run/cps-vm-loaded-modules
 done < "/vm-modules/$release/load"
 "$mount" -t vfat /dev/vda1 /efi
+root_arg=
+for arg in $("$bb" cat /proc/cmdline); do
+    case "$arg" in root=PARTUUID=*) root_arg=$arg ;; esac
+done
+[ -n "$root_arg" ]
 for entry in /efi/loader/entries/cps-*+*.conf; do
-    if [ -f "$entry" ]; then : > /run/cps-vm-counted; fi
+    [ -f "$entry" ] || continue
+    while IFS= read -r line; do
+        case "$line" in "options $root_arg "*) : > /run/cps-vm-counted; break ;; esac
+    done < "$entry"
 done
 exec /usr/lib/systemd/systemd
 GUEST
@@ -255,9 +263,9 @@ if [ -f /etc/cps-vm-assert-extra-publisher ]; then
         publisher=$("$bb" cat /etc/cps-vm-extra-marker)
     fi
     printf 'CPS_VM_PUBLISHER: %s %s\n' "$state" "$publisher"
-    if [ "$state" = trial ]; then
+    if [ "$state" != previous ]; then
         [ ! -e /etc/cps-vm-legacy-marker ]
-        printf 'CPS_VM_OBSOLETION: trial removed\n'
+        printf 'CPS_VM_OBSOLETION: %s removed\n' "$state"
     else
         [ "$("$bb" cat /etc/cps-vm-legacy-marker)" = legacy ]
         printf 'CPS_VM_OBSOLETION: previous retained\n'
@@ -272,14 +280,14 @@ if [ "$state" = previous ]; then
 elif [ -f /run/cps-vm-counted ]; then
     if /usr/bin/systemctl is-active --quiet cps-boot-health.service &&
        /usr/bin/systemctl is-active --quiet systemd-bless-boot.service; then
-        printf 'CPS_VM_BOOT: trial blessed\n'
+        printf 'CPS_VM_BOOT: %s blessed\n' "$state"
     else
-        printf 'CPS_VM_BOOT: trial health-failed\n'
+        printf 'CPS_VM_BOOT: %s health-failed\n' "$state"
     fi
     "$bb" sync
     exec "$bb" reboot -f
 else
-    printf 'CPS_VM_BOOT: trial default\n'
+    printf 'CPS_VM_BOOT: %s default\n' "$state"
 fi
 "$bb" sync
 exec "$bb" poweroff -f

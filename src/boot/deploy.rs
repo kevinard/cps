@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tempfile::TempDir;
 
 use super::{artifact_helper, root_label, systemd_boot::canonical_partuuid};
-use crate::{image::root::Root, model::digest_reader};
+use crate::{image::root::Root, kdl_format::boot_export::ExportReceipt, model::digest_reader};
 
 const DISK: &str = "disk.raw";
 const SECTOR_SIZE: u64 = 512;
@@ -32,28 +32,8 @@ pub fn deploy_boot_environment(
     output: &Path,
 ) -> Result<String> {
     let partuuid = canonical_partuuid(root_partuuid)?;
-    let mut payload = offline_file(root_image)?;
     let stage = DiskStage::new(disk, output)?;
-    let partition = stage.disk.partition(&partuuid, LINUX_FILESYSTEM)?;
-    let bytes = partition.bytes;
-    ensure!(
-        payload.metadata()?.len() == bytes,
-        "root payload size must match the target partition ({bytes} bytes)"
-    );
-    let expected = digest_reader((&mut payload).take(bytes))?;
-    let status = artifact_helper("e2fsck", &stage.directory())
-        .stdin(Stdio::from(payload.try_clone()?))
-        .stdout(Stdio::null())
-        .args(["-f", "-n", "/proc/self/fd/0"])
-        .status()
-        .context("checking the root payload with e2fsck")?;
-    ensure!(status.success(), "e2fsck failed with {status}");
-    payload.rewind()?;
-    let actual = stage.disk.write_partition(partition, &mut payload)?;
-    ensure!(
-        actual == expected && payload.metadata()?.len() == bytes,
-        "deployed partition does not match the checked root payload"
-    );
+    let actual = stage.disk.write_root(&partuuid, root_image, None)?;
     stage.publish()?;
     Ok(actual)
 }
@@ -236,6 +216,42 @@ impl OfflineDisk {
 
     pub fn esp(&self, partuuid: &str) -> Result<&PartitionExtent> {
         self.partition(&canonical_partuuid(partuuid)?, EFI_SYSTEM)
+    }
+
+    pub fn write_root(
+        &self,
+        partuuid: &str,
+        root_image: &Path,
+        receipt: Option<&ExportReceipt>,
+    ) -> Result<String> {
+        let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
+        let bytes = partition.bytes;
+        let mut payload = offline_file(root_image)?;
+        ensure!(
+            payload.metadata()?.len() == bytes,
+            "root payload size must match the target partition ({bytes} bytes)"
+        );
+        let expected = digest_reader((&mut payload).take(bytes))?;
+        if let Some(receipt) = receipt {
+            ensure!(
+                receipt.bytes == bytes && receipt.sha256 == expected,
+                "root payload does not match the root export receipt"
+            );
+        }
+        let status = artifact_helper("e2fsck", Path::new("/"))
+            .stdin(Stdio::from(payload.try_clone()?))
+            .stdout(Stdio::null())
+            .args(["-f", "-n", "/proc/self/fd/0"])
+            .status()
+            .context("checking the root payload with e2fsck")?;
+        ensure!(status.success(), "e2fsck failed with {status}");
+        payload.rewind()?;
+        let actual = self.write_partition(partition, &mut payload)?;
+        ensure!(
+            actual == expected && payload.metadata()?.len() == bytes,
+            "deployed partition does not match the checked root payload"
+        );
+        Ok(actual)
     }
 
     pub fn read_partition(&self, part: &PartitionExtent, output: &mut File) -> Result<()> {

@@ -68,7 +68,7 @@ pub(super) fn rollback(esp: &Path, id: Option<&str>, disk: Option<&OfflineDisk>)
             .selected(&entries)
             .context("no configured default CPS boot environment")?;
         if let Some(parent) = &current.parent {
-            find_known_good(&entries, parent)?
+            find_known_good(&entries, parent).context("the recorded parent is unavailable")?
         } else {
             // Entries made before CPS recorded their parent were activated
             // from the newest known-good image at the time.
@@ -123,6 +123,20 @@ pub struct Activation {
     pub known_good: bool,
 }
 
+/// A root payload to deploy as part of an atomic offline activation.
+#[derive(Clone, Copy)]
+pub struct RootDeployment<'a> {
+    pub image: &'a Path,
+    pub replace: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Deployment<'a> {
+    pub disk: &'a OfflineDisk,
+    pub receipt: &'a Path,
+    pub root: Option<RootDeployment<'a>>,
+}
+
 pub fn activate_boot_environment(
     root: &Path,
     esp: &Path,
@@ -140,19 +154,30 @@ pub fn activate_deployed_boot_environment(
     receipt: &Path,
 ) -> Result<String> {
     let disk = OfflineDisk::open(disk)?;
-    Ok(activate(root, esp, activation, Some((&disk, receipt)))?.id)
+    let deployment = Deployment {
+        disk: &disk,
+        receipt,
+        root: None,
+    };
+    Ok(activate(root, esp, activation, Some(deployment))?.id)
 }
 
 pub(super) struct ActivationUpdate {
     pub id: String,
     pub files: Vec<String>,
+    pub retired: Option<RetiredEntry>,
+}
+
+pub(super) struct RetiredEntry {
+    pub id: String,
+    pub file: String,
 }
 
 pub(super) fn activate(
     root: &Path,
     esp: &Path,
     activation: &Activation,
-    deployment: Option<(&OfflineDisk, &Path)>,
+    deployment: Option<Deployment<'_>>,
 ) -> Result<ActivationUpdate> {
     let partuuid = canonical_partuuid(&activation.root_partuuid)?;
     validate_options(&activation.options)?;
@@ -213,8 +238,8 @@ pub(super) fn activate(
             .context("opening the environment initramfs")?;
         (kernel, initrd)
     };
-    if let Some((disk, receipt)) = deployment {
-        let receipt = read_export_receipt(receipt)?;
+    let receipt = if let Some(deployment) = deployment {
+        let receipt = read_export_receipt(deployment.receipt)?;
         ensure!(
             receipt.image == image_id && receipt.revision == settings.revision,
             "root export receipt is for a different image or revision"
@@ -223,9 +248,18 @@ pub(super) fn activate(
             receipt.state_sha256 == digest_reader(image.root.file(".cps/state.sqlite")?)?,
             "image state differs from the root export receipt"
         );
-        disk.verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
-        disk.verify_filesystem(&partuuid, &image_id, settings.revision)?;
-    }
+        if deployment.root.is_none() {
+            deployment
+                .disk
+                .verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
+            deployment
+                .disk
+                .verify_filesystem(&partuuid, &image_id, settings.revision)?;
+        }
+        Some(receipt)
+    } else {
+        None
+    };
     let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let (policy, existing) = inventory(&esp)?;
     let existing_entry = existing.iter().find(|entry| entry.id == id);
@@ -262,6 +296,19 @@ pub(super) fn activate(
             .as_ref()
             .and_then(|policy| policy.selected(&existing))
             .is_some_and(|entry| entry.id == id);
+    let root_deployment = deployment.and_then(|deployment| deployment.root);
+    if root_deployment.is_some() {
+        ensure!(
+            existing_entry.is_none(),
+            "the environment is already registered"
+        );
+    }
+    let replace = root_deployment.and_then(|root| root.replace);
+    ensure!(
+        replace.is_none() || select_trial,
+        "a slot replacement requires a new trial and a known-good base"
+    );
+    let mut retired = None;
     if let Some(fallback) = fallback.as_deref().filter(|_| select_trial) {
         let base = find_known_good(&existing, fallback)
             .context("the base must have a known-good boot entry")?;
@@ -273,10 +320,18 @@ pub(super) fn activate(
             "select the known-good base environment {fallback} before activating its upgrade"
         );
         verify_fallback_artifacts(&esp, fallback, &base.description)?;
+        if let Some(replace) = replace {
+            let disk = deployment
+                .context("slot replacement requires an offline disk")?
+                .disk;
+            retired = Some(check_replacement(
+                disk, &existing, replace, &partuuid, base,
+            )?);
+        }
         ensure!(
-            !existing
-                .iter()
-                .any(|entry| entry.id != id && entry.partuuid == partuuid),
+            !existing.iter().any(|entry| entry.id != id
+                && Some(entry.id.as_str()) != replace
+                && entry.partuuid == partuuid),
             "each environment requires a distinct root PARTUUID"
         );
     } else if existing_entry.is_none() {
@@ -292,16 +347,28 @@ pub(super) fn activate(
         );
     }
 
-    if let (Some((disk, _)), Some(fallback), Some(parent)) =
+    if let (Some(deployment), Some(fallback), Some(parent)) =
         (deployment, &fallback, &settings.boot_parent)
     {
         let base = find_known_good(&existing, fallback)?;
-        disk.verify_filesystem(
-            &base.partuuid,
-            &canonical_partuuid(&parent.id)?,
-            parent.revision,
-        )
-        .context("checking the known-good fallback partition")?;
+        deployment
+            .disk
+            .verify_filesystem(
+                &base.partuuid,
+                &canonical_partuuid(&parent.id)?,
+                parent.revision,
+            )
+            .context("checking the known-good fallback partition")?;
+    }
+    if let Some(root) = root_deployment {
+        let disk = deployment
+            .context("root deployment requires an offline disk")?
+            .disk;
+        let receipt = receipt
+            .as_ref()
+            .context("root deployment requires an export receipt")?;
+        disk.write_root(&partuuid, root.image, Some(receipt))?;
+        disk.verify_filesystem(&partuuid, &image_id, settings.revision)?;
     }
     let loader = ensure_dir(&esp, "loader")?;
     let entries = ensure_dir(&loader, "entries")?;
@@ -344,7 +411,44 @@ pub(super) fn activate(
         files.push("loader/loader.conf".into());
     }
 
-    Ok(ActivationUpdate { id, files })
+    Ok(ActivationUpdate { id, files, retired })
+}
+
+fn check_replacement(
+    disk: &OfflineDisk,
+    entries: &[BootEntry],
+    id: &str,
+    partuuid: &str,
+    base: &BootEntry,
+) -> Result<RetiredEntry> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .with_context(|| format!("unknown replacement boot environment {id}"))?;
+    ensure!(
+        entry.id != base.id && partuuid != base.partuuid,
+        "cannot replace the known-good base"
+    );
+    ensure!(
+        entry.partuuid == partuuid,
+        "replacement entry {id} belongs to a different root PARTUUID"
+    );
+    ensure!(
+        entry.tries.is_none_or(|left| left == 0),
+        "cannot replace boot environment {id} while its trial has attempts left"
+    );
+    let (image, revision) = policy::entry_identity(id)?;
+    disk.verify_filesystem(partuuid, image, revision)
+        .context("checking the occupied root partition before replacement")?;
+    let file = entry
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid boot entry filename")?;
+    Ok(RetiredEntry {
+        id: id.to_owned(),
+        file: file.to_owned(),
+    })
 }
 
 fn read_export_receipt(path: &Path) -> Result<ExportReceipt> {

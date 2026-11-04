@@ -12,7 +12,8 @@ use rustix::process::geteuid;
 use super::{
     Activation, BootEnvironment, artifact_helper,
     deploy::{DiskStage, OfflineDisk, PartitionExtent},
-    list_boot_environments, systemd_boot,
+    list_boot_environments,
+    systemd_boot::{self, Deployment, RetiredEntry, RootDeployment},
 };
 use crate::model::digest_reader;
 
@@ -42,11 +43,52 @@ pub fn activate_boot_environment_on_disk(
     receipt: &Path,
     output: &Path,
 ) -> Result<String> {
+    activate_disk(root, activation, disk, esp_partuuid, receipt, output, None)
+}
+
+/// Deploy and activate a root together, optionally recycling a registered slot.
+pub fn deploy_and_activate_boot_environment(
+    root: &Path,
+    activation: &Activation,
+    disk: &Path,
+    esp_partuuid: &str,
+    receipt: &Path,
+    output: &Path,
+    install: RootDeployment<'_>,
+) -> Result<String> {
+    activate_disk(
+        root,
+        activation,
+        disk,
+        esp_partuuid,
+        receipt,
+        output,
+        Some(install),
+    )
+}
+
+fn activate_disk(
+    root: &Path,
+    activation: &Activation,
+    disk: &Path,
+    esp_partuuid: &str,
+    receipt: &Path,
+    output: &Path,
+    install: Option<RootDeployment<'_>>,
+) -> Result<String> {
     let stage = DiskStage::new(disk, output)?;
     let partition = stage.disk.esp(esp_partuuid)?;
     let esp = Esp::read(&stage.disk, partition, &stage.directory())?;
     esp.read_boot_files()?;
-    let update = systemd_boot::activate(root, &esp.tree, activation, Some((&stage.disk, receipt)))?;
+    let deployment = Deployment {
+        disk: &stage.disk,
+        receipt,
+        root: install,
+    };
+    let update = systemd_boot::activate(root, &esp.tree, activation, Some(deployment))?;
+    if let Some(retired) = &update.retired {
+        esp.remove_entry(retired)?;
+    }
     esp.write(
         &stage.disk,
         partition,
@@ -358,6 +400,49 @@ impl Esp {
         ensure!(
             digest_reader(File::open(verify.path())?)? == digest_reader(File::open(source)?)?,
             "the written EFI file {path} differs from its staged contents"
+        );
+        Ok(())
+    }
+
+    fn remove_entry(&self, retired: &RetiredEntry) -> Result<()> {
+        self.delete_file("loader/entries", &retired.file)?;
+        if self.has_directory("EFI/cps", &retired.id)? {
+            let directory = format!("EFI/cps/{}", retired.id);
+            for artifact in ["vmlinuz.efi", "initramfs.img"] {
+                if self
+                    .children(&directory)?
+                    .iter()
+                    .any(|entry| entry.name.eq_ignore_ascii_case(artifact))
+                {
+                    self.delete_file(&directory, artifact)?;
+                }
+            }
+            if self.children(&directory)?.is_empty() {
+                let status = self
+                    .fat_command("mrd", &[])?
+                    .arg(format!("::/{directory}"))
+                    .status()?;
+                ensure!(
+                    status.success() && !self.has_directory("EFI/cps", &retired.id)?,
+                    "could not remove the retired EFI directory {directory}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_file(&self, directory: &str, name: &str) -> Result<()> {
+        let status = self
+            .fat_command("mdel", &[])?
+            .arg(format!("::/{directory}/{name}"))
+            .status()?;
+        ensure!(
+            status.success()
+                && !self
+                    .children(directory)?
+                    .iter()
+                    .any(|entry| entry.name.eq_ignore_ascii_case(name)),
+            "could not remove the retired EFI file {directory}/{name}"
         );
         Ok(())
     }

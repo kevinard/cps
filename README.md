@@ -734,6 +734,31 @@ match its registered entry before changing the default.
 
 The list marks the default configured on the ESP and shows each registered root's partition UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. Rollback selects the default environment's recorded parent unless an ID is supplied. Entries from earlier CPS versions use the previous known-good revision. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
+### Reusing a root slot
+
+After the trial becomes known-good, stage the next release from that
+environment. On a two-slot disk, use `boot-env list` to identify the older
+entry and its partition UUID. Deploy and activate in one command.
+
+```sh
+cps plan --root staged --output next-upgrade.json update
+cps boot-env stage --source staged --root next-staged next-upgrade.json
+cps boot-env export --root next-staged --output next-staged.ext4 \
+    --size-mib 2048 --receipt > next-staged.kdl
+cps boot-env activate --root next-staged --root-image next-staged.ext4 \
+    --disk bootable-next.raw --receipt next-staged.kdl \
+    --root-partuuid "$base_partuuid" --replace "$base_environment_id" \
+    --esp-partuuid "$esp_partuuid" --output-disk next-release.raw
+```
+
+CPS checks that the entry being replaced owns the slot and that the
+selected known-good environment is the staged root's parent. An inactive
+known-good entry or an exhausted trial can be replaced. CPS verifies the
+payload against its receipt, retires the old entry and its boot files,
+and publishes the new disk with the selected root as the trial's fallback.
+The source disk retains its original roots and entries. Omit `--replace`
+to use the same transaction for an unregistered slot.
+
 ### VM boot tests
 
 The [VM test](tests/systemd-boot-vm.sh) deploys two CPS exports to a GPT disk
@@ -791,12 +816,15 @@ and capability removal during an upgrade.
 The `rollback` scenario adds another signed publisher after activating the base
 environment. The upgrade installs a dependency from that publisher and removes
 an obsolete dependency. After systemd blesses the trial and reboots it as the
-default, the test runs `boot-env list` and `boot-env rollback` against the ESP.
-It boots the same VM disk again and checks that the previous kernel and retired
+default, the test runs `boot-env list` and `boot-env rollback` against the disk.
+It boots the resulting disk and checks that the previous kernel and retired
 dependency are present and that the added package is absent. Both kernels need
 VFAT support. To load modules from extracted kernel packages, set
 `CPS_VM_KERNEL_MODULES_ROOT` and `CPS_VM_TRIAL_MODULES_ROOT` to the roots
 containing their indexed `lib/modules` trees.
+
+Set `CPS_VM_RECYCLE_SLOT=1` with `rollback` to stage and bless a second
+upgrade on the original root slot, then roll it back to the first upgrade.
 
 Set `CPS_VM_RELEASE_PROFILE=1` in the rollback test to assemble the roots from
 a signed release profile. Use a current CPS build on the host and provide the
