@@ -225,6 +225,19 @@ impl Catalog {
         Ok(keys)
     }
 
+    fn take_build_evidence(&mut self, hash: &str, key: &[u8]) -> Result<BuildEvidence> {
+        let publisher_keys = self.publisher_keys(key)?;
+        Ok(BuildEvidence {
+            attestations: std::mem::take(&mut self.attestations),
+            publisher_keys,
+            history: BuildHistory {
+                catalog: hash.to_owned(),
+                sequence: self.sequence,
+                rotations: std::mem::take(&mut self.key_rotations),
+            },
+        })
+    }
+
     fn withdraw(&mut self, id: &str) -> Result<bool> {
         if self.withdrawals.contains_key(id) {
             return Ok(false);
@@ -604,6 +617,21 @@ impl BuildReceipt {
 }
 
 impl BuildEvidence {
+    pub(crate) fn verify_policies(
+        &self,
+        repo: &Path,
+        package: &Published,
+        signed: Option<&BuildTrust>,
+        local: Option<&BuildTrust>,
+    ) -> Result<Option<BuildReceipt>> {
+        let local = local.filter(|trust| Some(*trust) != signed);
+        if signed.is_none() && local.is_none() {
+            return Ok(None);
+        }
+        self.verify(repo, signed.into_iter().chain(local), package)
+            .map(Some)
+    }
+
     pub(crate) fn check_keys(&self, trust: &BuildTrust) -> Result<()> {
         for key in &self.publisher_keys {
             trust.check_publisher_key(key)?;
@@ -929,24 +957,21 @@ pub fn snapshot(
     catalog_snapshot(repo, catalog, hash, key)
 }
 
-fn catalog_snapshot(repo: &Path, catalog: Catalog, hash: String, key: &[u8]) -> Result<Snapshot> {
-    let publisher_keys = catalog.publisher_keys(key)?;
+fn catalog_snapshot(
+    repo: &Path,
+    mut catalog: Catalog,
+    hash: String,
+    key: &[u8],
+) -> Result<Snapshot> {
+    let builds = catalog.take_build_evidence(&hash, key)?;
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {
         packages.push(read_package(repo, &catalog.publisher, &id, sha256)?);
     }
     Ok(Snapshot {
-        sha256: hash.clone(),
+        sha256: hash,
         packages,
-        builds: BuildEvidence {
-            attestations: catalog.attestations,
-            publisher_keys,
-            history: BuildHistory {
-                catalog: hash,
-                sequence: catalog.sequence,
-                rotations: catalog.key_rotations,
-            },
-        },
+        builds,
         withdrawals: catalog.withdrawals,
         obsoletions: catalog.obsoletions,
     })
@@ -1688,8 +1713,30 @@ pub fn canonical_repo(repo: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::sign_profile_with_missing_dependency;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) fn sign_profile_with_missing_dependency(
+        repo: &Path,
+        publisher: &str,
+        key: &Path,
+        profile: &str,
+        dependency: &str,
+    ) -> Result<String> {
+        let signer = read_signing_key(key)?;
+        let current = read_current(repo)?;
+        let mut catalog = publication_catalog(repo, publisher, &signer, Some(&current))?;
+        let composition = &mut catalog
+            .release_profiles
+            .get_mut(profile)
+            .unwrap()
+            .composition;
+        *composition.get_mut(dependency).unwrap() = digest(b"missing signed profile dependency");
+        write_catalog(repo, catalog, &signer)
+    }
 
     #[test]
     fn companion_lineage_guards_primary_successors_and_matches_the_companion() -> Result<()> {

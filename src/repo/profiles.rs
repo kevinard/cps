@@ -334,7 +334,7 @@ fn baseline_image(
         let installed = baseline
             .replay(historical)
             .context("replaying the baseline image")?;
-        let paths = profile_paths(profile, &installed)?;
+        let paths = profile_paths(&profile.arch, &profile.facets, &installed)?;
         return Ok((installed, paths));
     }
     compose(&baseline, profile, roots).context("composing the baseline image")
@@ -429,17 +429,18 @@ fn compose<'a>(
         false,
         true,
         Some(SolverRevision::SatV1),
-        |installed| profile_paths(profile, installed),
+        |installed| profile_paths(&profile.arch, &profile.facets, installed),
     )
 }
 
-fn profile_paths(
-    profile: &Profile,
+pub(super) fn profile_paths(
+    arch: &str,
+    facets: &BTreeMap<String, bool>,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
     let paths = select_paths(
-        &profile.arch,
-        &profile.facets,
+        arch,
+        facets,
         Node::Dir {
             mode: 0o755,
             uid: 0,
@@ -468,7 +469,7 @@ fn check_upgrade(
         true,
         false,
         Some(SolverRevision::SatV1),
-        |installed| profile_paths(profile, installed),
+        |installed| profile_paths(&profile.arch, &profile.facets, installed),
     )?;
     for name in profile.packages.keys() {
         let expected = &target[name].published;

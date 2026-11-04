@@ -1,8 +1,17 @@
-use std::{fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs, iter,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{kdl_format::read_image_definition, repo::release_profile};
+use crate::{
+    kdl_format::{PublisherConfig, read_image_definition},
+    model::PackageSpec,
+    plan::{CandidateSet, claim_source},
+    repo::{CatalogPin, ReleaseProfile, profiles::profile_paths, read_package, release_profile},
+};
 
 use super::{Mirror, SyncSource, digest, lock_repo, stage_release};
 
@@ -91,6 +100,17 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
         })?;
         staged.push((source, repo, hash));
     }
+    if !profile.composition.is_empty() {
+        let primary_pin = CatalogPin::primary(primary.publisher.to_owned(), primary_hash.clone());
+        check_composition(
+            &profile,
+            &primary_pin,
+            &definition.publishers,
+            &sources,
+            &repositories,
+        )
+        .with_context(|| format!("checking staged composition for release profile {name}"))?;
+    }
     // Profile readers use the primary pointer as the visibility boundary.
     // Earlier catalogs and objects remain addressable by their original digests.
     for (source, repo, hash) in staged {
@@ -98,4 +118,47 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
     }
     primary.promote(primary_repo, &primary_hash, Some(&binding))?;
     Ok(primary_hash)
+}
+
+fn check_composition(
+    profile: &ReleaseProfile,
+    primary: &CatalogPin,
+    config: &[PublisherConfig],
+    sources: &[SyncSource<'_>],
+    repositories: &[PathBuf],
+) -> Result<()> {
+    let mut candidates = CandidateSet::default();
+    let mut origins = BTreeMap::new();
+    let pins = iter::once(primary).chain(&profile.companions);
+    for (((source, repo), config), pin) in sources.iter().zip(repositories).zip(config).zip(pins) {
+        let mut catalog = pin.read(repo, source.publisher, &source.key)?;
+        let local = config
+            .build_trust
+            .as_ref()
+            .map(|trust| trust.load(&source.key))
+            .transpose()
+            .with_context(|| format!("loading build trust for {}", source.publisher))?;
+        let signed = pin.build_trust.as_ref();
+        let evidence = (signed.is_some() || local.is_some())
+            .then(|| catalog.take_build_evidence(&pin.sha256, &source.key))
+            .transpose()?;
+        candidates.add_obsoletions(&mut origins, source.publisher, &catalog.obsoletions);
+        // A publisher claims a name even when its versions miss the locked digest.
+        for (id, hash) in catalog.entries {
+            let spec = PackageSpec::parse(&id)?;
+            let Some(expected) = profile.composition.get(spec.name) else {
+                continue;
+            };
+            if claim_source(&mut origins, source.publisher, spec.name) && &hash == expected {
+                let package = read_package(repo, source.publisher, &id, hash)?;
+                if let Some(evidence) = &evidence {
+                    evidence.verify_policies(repo, &package, signed, local.as_ref())?;
+                }
+                candidates.packages.push(package);
+            }
+        }
+    }
+    let installed = candidates.replay(profile)?;
+    profile_paths(&profile.architecture, &profile.facets, &installed)?;
+    Ok(())
 }

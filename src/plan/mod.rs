@@ -20,7 +20,7 @@ use crate::{
     systemd::{self, Action as SystemdAction},
 };
 
-pub(crate) use catalogs::CandidateSet;
+pub(crate) use catalogs::{CandidateSet, claim_source};
 pub use config::{ConfigChoice, ConfigUpdate, list_config_updates};
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,

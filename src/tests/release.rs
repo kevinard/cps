@@ -1079,6 +1079,27 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         format!("{error:#}")
             .contains("bound to a different release profile or companion cache set")
     );
+    let builder = Fixture::new()?;
+    let seed_key = format!("    trust-key {:?}", seed.public);
+    fs::write(
+        &config,
+        correct_config.replace(
+            &seed_key,
+            &format!(
+                "{seed_key}\n    build-trust {{ builder-key {:?}; }}",
+                builder.public
+            ),
+        ),
+    )?;
+    let error = mirror_release::sync_profile(&config, true).unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("no build attestation for cps://seed/library/runtime@3.0.0-0"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read_to_string(primary_cache.join("current"))?, first);
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, current);
+    assert_eq!(plan(&f.root, Request::InstallProfile)?, saved);
     fs::write(&config, correct_config)?;
     assert_eq!(mirror_release::sync_profile(&config, true)?, second);
     assert_eq!(
@@ -1091,12 +1112,38 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     let new_plan = plan(&fresh_root, Request::InstallProfile)?;
     assert_eq!(new_plan.catalogs["seed"], latest.trim());
     fetch_plan(&fresh_root, &new_plan)?;
+
+    let broken = crate::repo::sign_profile_with_missing_dependency(
+        &f.repo,
+        "canopa",
+        &f.private,
+        "desktop",
+        "library/runtime",
+    )?;
+    let broken_mirror = work.join("broken-primary-mirror");
+    sign_release(&f, &broken_mirror, 3, fresh, &primary_root, &primary_key)?;
+    write_config(&broken_mirror, &next_seed_mirror)?;
+    let error = mirror_release::sync_profile(&config, true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("signed profile package library/runtime with manifest"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(primary_cache.join("current"))?.trim(),
+        second
+    );
+    assert_eq!(
+        fs::read_to_string(primary_cache.join(".tuf/catalog"))?.trim(),
+        broken
+    );
+
     fs::rename(&mirror, work.join("offline-mirror"))?;
     fs::rename(&next_seed_mirror, work.join("offline-next-seed-mirror"))?;
     fs::rename(
         &next_primary_mirror,
         work.join("offline-next-primary-mirror"),
     )?;
+    fs::rename(&broken_mirror, work.join("offline-broken-primary-mirror"))?;
     apply(&f.root, &saved)?;
     assert_eq!(fs::read(f.root.join(payload))?, b"old");
     apply(&fresh_root, &new_plan)?;

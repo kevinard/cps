@@ -590,10 +590,16 @@ cps image-create --root image --config image.kdl
 
 CPS verifies the primary release and requires each companion mirror to
 advertise the exact signed pin as its current or retained catalog. It
-prepares all caches before advancing the primary pointer. If a companion
-mirror is behind, clients can still select the previous primary catalog
-and its cached objects. Replay checkpoints still remember newer verified
-metadata. Retry the same command when the mirror catches up.
+prepares all caches before advancing the primary pointer. If the profile
+records a package composition, CPS checks its exact manifests in publisher
+order, dependencies, selected paths, kernel actions, and builder trust from
+the signed profile and supplied KDL. These checks also run in index-only
+mode. Older profiles without a recorded composition can still synchronize
+their catalog pins.
+
+If a companion mirror is behind or the staged composition fails validation,
+clients can still select the previous primary catalog and its cached
+objects. Replay checkpoints still remember newer verified metadata.
 
 The first successful coordinated sync binds the primary cache to that
 profile and its ordered cache directories. Use `repo sync-profile` for

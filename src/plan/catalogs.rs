@@ -43,17 +43,14 @@ impl Catalogs {
                 .publishers
                 .get(&package.published.manifest.publisher)
                 .context("missing publisher for selected package")?;
-            if let Some(builds) = self.builds.get(&publisher.name) {
-                let signed = builds.profile_trust.as_ref();
-                let local = publisher
-                    .build_trust
-                    .as_ref()
-                    .filter(|trust| Some(*trust) != signed);
-                let receipt = builds.evidence.verify(
+            if let Some(builds) = self.builds.get(&publisher.name)
+                && let Some(receipt) = builds.evidence.verify_policies(
                     &publisher.repo,
-                    signed.into_iter().chain(local),
                     &package.published,
-                )?;
+                    builds.profile_trust.as_ref(),
+                    publisher.build_trust.as_ref(),
+                )?
+            {
                 receipts.push(receipt);
             }
         }
@@ -64,6 +61,14 @@ impl Catalogs {
 pub(crate) struct CandidateSet<P> {
     pub packages: Vec<P>,
     pub obsoletions: BTreeMap<String, Version>,
+}
+
+pub(crate) fn claim_source<'a>(
+    sources: &mut BTreeMap<String, &'a str>,
+    publisher: &'a str,
+    name: &str,
+) -> bool {
+    *sources.entry(name.to_owned()).or_insert(publisher) == publisher
 }
 
 impl<P> Default for CandidateSet<P> {
@@ -116,7 +121,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         obsoletions: &BTreeMap<String, Version>,
     ) {
         for (name, cutoff) in obsoletions {
-            if *sources.entry(name.clone()).or_insert(publisher) == publisher {
+            if claim_source(sources, publisher, name) {
                 self.obsoletions.insert(name.clone(), *cutoff);
             }
         }
@@ -128,12 +133,11 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         publisher: &'a str,
         packages: impl IntoIterator<Item = P>,
     ) {
-        self.packages.extend(packages.into_iter().filter(|pkg| {
-            *sources
-                .entry(pkg.borrow().manifest.name.clone())
-                .or_insert(publisher)
-                == publisher
-        }));
+        self.packages.extend(
+            packages
+                .into_iter()
+                .filter(|pkg| claim_source(sources, publisher, &pkg.borrow().manifest.name)),
+        );
     }
 }
 
