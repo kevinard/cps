@@ -19,7 +19,7 @@ use crate::{
     model::FileDigest,
     publish_bundle, publish_release, read_attestation, release as mirror_release,
     repo::{read_key, read_signing_key, snapshot},
-    withdraw_package,
+    rotate_publisher_key, withdraw_package,
 };
 
 fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)> {
@@ -350,6 +350,142 @@ fn sign_publisher_release(
                 .await?;
             Ok(())
         })
+}
+
+#[test]
+fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Result<()> {
+    let f = Fixture::new()?;
+    let second_key = Fixture::new()?;
+    let third_key = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_root(&anchor, &tuf_key, None)?;
+    let cache = work.join("cache");
+    let sign = |version| -> Result<PathBuf> {
+        let mirror = work.join(format!("mirror-{version}"));
+        sign_release(&f, &mirror, version, fresh, &anchor, &tuf_key)?;
+        Ok(mirror)
+    };
+    let refresh = |cache: &Path, mirror: &Path| {
+        let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+        let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+        mirror_release::sync(
+            cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    let create = |root: &Path| -> Result<()> {
+        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        Ok(())
+    };
+    let install = |root: &Path| {
+        plan(
+            root,
+            Request::Install {
+                packages: vec!["desktop/compositor".to_owned()],
+            },
+        )
+    };
+
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "old", "0755", "")?,
+    )?;
+    let initial = refresh(&cache, &sign(1)?)?;
+    create(&f.root)?;
+    apply(&f.root, &install(&f.root)?)?;
+    let historical = work.join("historical");
+    create(&historical)?;
+    let saved = install(&historical)?;
+
+    let rotated =
+        rotate_publisher_key(&f.repo, "canopa", &initial, &f.private, &second_key.private)?;
+    let current = f.repo.join("current");
+    assert_eq!(fs::read_to_string(&current)?.trim(), rotated);
+    let error = rotate_publisher_key(
+        &f.repo,
+        "canopa",
+        &initial,
+        &second_key.private,
+        &third_key.private,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("rotation base is stale"));
+    let error = publish(&f.repo, &f.proto, &f.recipe, &f.private).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("signing key is not the current publisher key")
+    );
+
+    let actions = f.file(COMPOSITOR, "new", "0755", "")?;
+    fs::write(
+        &f.recipe,
+        format!(
+            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"2.0.0-0\" {{\n{actions}}}\n"
+        ),
+    )?;
+    publish(&f.repo, &f.proto, &f.recipe, &second_key.private)?;
+    let second = fs::read_to_string(&current)?;
+    let mirror = sign(2)?;
+    let blob = digest(b"new");
+    fs::write(
+        mirror.join("targets").join(format!("{blob}.blobs-{blob}")),
+        b"bad",
+    )?;
+    let error = refresh(&cache, &mirror).unwrap_err();
+    assert!(format!("{error:#}").contains("Hash mismatch"));
+    assert_eq!(fs::read_to_string(cache.join("current"))?.trim(), initial);
+    assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, second);
+
+    // Simulate the retired signer creating a higher-sequence fork and getting
+    // it wrapped in fresh TUF metadata. The publisher checkpoint must win.
+    fs::write(&current, format!("{initial}\n"))?;
+    for version in ["1.0.0-0", "2.0.0-0", "3.0.0-0"] {
+        f.package("test/fork", version, String::new())?;
+    }
+    let fork = sign(3)?;
+    fs::write(&current, &second)?;
+    let error = refresh(&cache, &fork).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("drops or changes the publisher key history")
+    );
+    assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, second);
+
+    let latest = rotate_publisher_key(
+        &f.repo,
+        "canopa",
+        second.trim(),
+        &second_key.private,
+        &third_key.private,
+    )?;
+    let error = rotate_publisher_key(&f.repo, "canopa", &latest, &third_key.private, &f.private)
+        .unwrap_err();
+    assert!(error.to_string().contains("publisher key was already used"));
+    assert_eq!(fs::read_to_string(&current)?.trim(), latest);
+    let newest = sign(4)?;
+    assert_eq!(refresh(&cache, &newest)?, latest);
+    assert_eq!(refresh(&work.join("new-cache"), &newest)?, latest);
+    let old_id = "cps://canopa/desktop/compositor@1.0.0-0";
+    assert!(withdraw_package(&f.repo, &second_key.private, old_id).is_err());
+    withdraw_package(&f.repo, &third_key.private, old_id)?;
+    refresh(&cache, &sign(5)?)?;
+
+    apply(&historical, &saved)?;
+    assert_eq!(fs::read_to_string(historical.join(COMPOSITOR))?, "old");
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "new");
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    Ok(())
 }
 
 #[test]

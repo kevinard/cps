@@ -401,7 +401,7 @@ async fn materialize(
             None => None,
         };
         if let Some(previous) = previous.filter(|previous| previous != &hash) {
-            read_catalog(repo, &previous, publisher, key)?.check_successor(&catalog)?;
+            read_catalog(repo, &previous, publisher, key)?.check_successor(&catalog, &previous)?;
         }
         // Remember the signed catalog even when its payloads cannot be fetched.
         write_atomic(&checkpoint, format!("{hash}\n").as_bytes(), false)?;

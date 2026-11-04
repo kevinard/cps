@@ -18,7 +18,7 @@ use crate::{
     kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
         Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, digest, digest_reader,
-        validate_digest, validate_name,
+        validate_digest, validate_name, validate_publisher,
     },
     systemd::{self, Action as SystemdAction},
 };
@@ -30,6 +30,7 @@ const PUBLISH_POLICY_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_RELEASE_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
+mod keys;
 mod profiles;
 pub mod release;
 
@@ -51,6 +52,8 @@ struct Catalog {
     profiles_required: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     obsoletions: BTreeMap<String, Version>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    key_rotations: Vec<keys::Rotation>,
 }
 
 impl Catalog {
@@ -65,6 +68,7 @@ impl Catalog {
             sequence: None,
             profiles_required: false,
             obsoletions: BTreeMap::new(),
+            key_rotations: Vec::new(),
         }
     }
 
@@ -138,13 +142,19 @@ impl Catalog {
         Ok(true)
     }
 
-    fn check_successor(&self, next: &Self) -> Result<()> {
+    fn check_successor(&self, next: &Self, previous_hash: &str) -> Result<()> {
         if let Some(previous) = self.sequence {
             ensure!(
                 next.sequence.is_some_and(|sequence| sequence > previous),
                 "publisher catalog rollback or fork after sequence {previous}"
             );
         }
+        keys::check_successor(
+            &self.key_rotations,
+            self.sequence,
+            previous_hash,
+            &next.key_rotations,
+        )?;
         ensure!(
             !self.attestations_required || next.attestations_required,
             "release disables the publisher's build evidence requirement"
@@ -184,6 +194,14 @@ impl Catalog {
             }
         }
         Ok(())
+    }
+
+    fn next_sequence(&self) -> Result<NonZeroU64> {
+        self.sequence
+            .map_or(0, NonZeroU64::get)
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .context("publisher catalog sequence exhausted")
     }
 }
 
@@ -332,6 +350,15 @@ fn read_object(repo: &Path, kind: &str, hash: &str, limit: u64) -> Result<Vec<u8
 }
 
 fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<Catalog> {
+    read_catalog_with_key(repo, hash, publisher, keys::Trust::Anchor(key))
+}
+
+fn read_catalog_with_key(
+    repo: &Path,
+    hash: &str,
+    publisher: &str,
+    trust: keys::Trust<'_>,
+) -> Result<Catalog> {
     let signed: SignedCatalog =
         serde_json::from_slice(&read_object(repo, "catalogs", hash, CATALOG_LIMIT)?)?;
     let catalog = signed.catalog;
@@ -341,7 +368,8 @@ fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<
         "unexpected publisher {}",
         catalog.publisher
     );
-    UnparsedPublicKey::new(&ED25519, key)
+    let signer = keys::signer(publisher, catalog.sequence, &catalog.key_rotations, trust)?;
+    UnparsedPublicKey::new(&ED25519, signer)
         .verify(
             &serde_json::to_vec(&catalog)?,
             &hex::decode(signed.signature)?,
@@ -567,11 +595,11 @@ pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
         !path_present(&repo.join(".tuf"))?,
         "cannot withdraw from a TUF-managed repository cache"
     );
-    let mut catalog = read_catalog(
+    let mut catalog = read_catalog_with_key(
         repo,
         &read_current(repo)?,
         publisher,
-        key.public_key().as_ref(),
+        keys::Trust::Current(key.public_key().as_ref()),
     )?;
     if catalog.withdraw(id)? {
         let policy = read_publish_policy(repo, &catalog, false)?;
@@ -584,6 +612,36 @@ pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
         write_catalog(repo, catalog, &key)?;
     }
     Ok(())
+}
+
+pub fn rotate_publisher_key(
+    repo: &Path,
+    publisher: &str,
+    base: &str,
+    old_key: &Path,
+    new_key: &Path,
+) -> Result<String> {
+    validate_publisher(publisher)?;
+    validate_digest(base)?;
+    let old_key = read_signing_key(old_key)?;
+    let new_key = read_signing_key(new_key)?;
+    Root::open(repo)?;
+    let _lock = lock_repo(repo)?;
+    let current = publication_base(repo)?.context("repository has no catalog to rotate")?;
+    ensure!(
+        current == base,
+        "rotation base is stale: expected {base}, current is {current}"
+    );
+    let mut catalog = publication_catalog(repo, publisher, &old_key, Some(&current))?;
+    let rotation = keys::Rotation::new(
+        publisher,
+        &current,
+        catalog.next_sequence()?,
+        &old_key,
+        &new_key,
+    )?;
+    catalog.key_rotations.push(rotation);
+    write_catalog(repo, catalog, &new_key)
 }
 
 pub fn list_withdrawals(
@@ -769,7 +827,12 @@ fn publication_catalog(
     current: Option<&str>,
 ) -> Result<Catalog> {
     match current {
-        Some(hash) => read_catalog(repo, hash, publisher, key.public_key().as_ref()),
+        Some(hash) => read_catalog_with_key(
+            repo,
+            hash,
+            publisher,
+            keys::Trust::Current(key.public_key().as_ref()),
+        ),
         None => Ok(Catalog::empty(publisher)),
     }
 }
@@ -832,6 +895,15 @@ fn stage_manifest(
     if let Some(policy) = policy {
         policy.verify(&id, evidence.as_ref())?;
         catalog.attestations_required = true;
+    }
+    if let Some(evidence) = &evidence {
+        for rotation in &catalog.key_rotations {
+            let retired = digest(rotation.previous_key());
+            ensure!(
+                evidence.builders().all(|builder| builder != retired),
+                "a retired publisher key cannot sign builds"
+            );
+        }
     }
     let tmpfiles: std::collections::BTreeSet<_> = manifest
         .systemd
@@ -903,13 +975,13 @@ fn stage_manifest(
 }
 
 fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
-    let sequence = catalog
-        .sequence
-        .map_or(0, NonZeroU64::get)
-        .checked_add(1)
-        .and_then(NonZeroU64::new)
-        .context("publisher catalog sequence exhausted")?;
-    catalog.sequence = Some(sequence);
+    catalog.sequence = Some(catalog.next_sequence()?);
+    keys::signer(
+        &catalog.publisher,
+        catalog.sequence,
+        &catalog.key_rotations,
+        keys::Trust::Current(key.public_key().as_ref()),
+    )?;
     let signature = hex::encode(key.sign(&serde_json::to_vec(&catalog)?).as_ref());
     let signed = SignedCatalog { catalog, signature };
     let signed = serde_json::to_vec(&signed)?;
@@ -959,7 +1031,11 @@ fn check_profiles(
     key: &[u8],
 ) -> Result<()> {
     if let Some(policy) = policy.filter(|policy| !policy.profiles.is_empty()) {
-        profiles::check(repo, catalog, &policy.profiles, key)?;
+        let anchor = catalog
+            .key_rotations
+            .first()
+            .map_or(key, |rotation| rotation.previous_key());
+        profiles::check(repo, catalog, &policy.profiles, anchor)?;
         catalog.profiles_required = true;
     }
     Ok(())
@@ -1111,13 +1187,17 @@ mod tests {
         write_catalog(repo.path(), previous.clone(), &key)?;
         let next = read(&read_current(repo.path())?)?;
         assert_eq!(next.sequence, NonZeroU64::new(1));
-        previous.check_successor(&next)?;
-        assert!(next.check_successor(&previous).is_err());
+        previous.check_successor(&next, &hash)?;
+        assert!(
+            next.check_successor(&previous, &read_current(repo.path())?)
+                .is_err()
+        );
         Ok(())
     }
 
     #[test]
     fn catalog_successors_preserve_signed_publication_records() -> Result<()> {
+        let base = digest(b"base catalog");
         let active = "cps://canopa/desktop@2.0.0-0".to_owned();
         let withdrawn = "cps://canopa/desktop@1.0.0-0".to_owned();
         let manifest = digest(b"active manifest");
@@ -1138,31 +1218,32 @@ mod tests {
             sequence: NonZeroU64::new(1),
             profiles_required: true,
             obsoletions: BTreeMap::from([("desktop/retired".to_owned(), "2.0.0-0".parse()?)]),
+            key_rotations: Vec::new(),
         };
         let mut next = previous.clone();
         next.sequence = NonZeroU64::new(3);
-        previous.check_successor(&next)?;
+        previous.check_successor(&next, &base)?;
 
         next.attestations_required = false;
-        assert!(previous.check_successor(&next).is_err());
+        assert!(previous.check_successor(&next, &base).is_err());
         next.attestations_required = true;
 
         next.profiles_required = false;
-        assert!(previous.check_successor(&next).is_err());
+        assert!(previous.check_successor(&next, &base).is_err());
         next.profiles_required = true;
         next.obsoletions.clear();
-        assert!(previous.check_successor(&next).is_err());
+        assert!(previous.check_successor(&next, &base).is_err());
         next.obsoletions
             .insert("desktop/retired".to_owned(), "1.0.0-0".parse()?);
-        assert!(previous.check_successor(&next).is_err());
+        assert!(previous.check_successor(&next, &base).is_err());
         next.obsoletions
             .insert("desktop/retired".to_owned(), "3.0.0-0".parse()?);
-        previous.check_successor(&next)?;
+        previous.check_successor(&next, &base)?;
 
         next.attestations.remove(&active);
-        assert!(previous.check_successor(&next).is_err());
+        assert!(previous.check_successor(&next, &base).is_err());
         next.entries.remove(&active);
-        assert!(previous.check_successor(&next).is_err());
+        assert!(previous.check_successor(&next, &base).is_err());
         next.withdrawals.insert(
             active,
             Withdrawal {
@@ -1170,10 +1251,10 @@ mod tests {
                 attestation: Some(attestation),
             },
         );
-        previous.check_successor(&next)?;
+        previous.check_successor(&next, &base)?;
 
         next.withdrawals.remove(&withdrawn);
-        assert!(previous.check_successor(&next).is_err());
+        assert!(previous.check_successor(&next, &base).is_err());
         Ok(())
     }
 

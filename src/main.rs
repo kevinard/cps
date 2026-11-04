@@ -15,7 +15,8 @@ use cps::{
     fetch_sources, generate_manifest, import_sources, list_boot_environments, list_obsoletions,
     list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
     publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
-    rollback_boot_environment, stage_boot_environment, verify, verify_pristine, withdraw_package,
+    rollback_boot_environment, rotate_publisher_key, stage_boot_environment, verify,
+    verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -253,6 +254,19 @@ fn parse_witness(value: &str) -> std::result::Result<BuildWitness, String> {
 
 #[derive(Subcommand)]
 enum RepoCommand {
+    /// Authorize a new publisher signing key in a successor catalog
+    RotateKey {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        new_signing_key: PathBuf,
+    },
     /// List signed package obsoletion cutoffs
     Obsoletions {
         #[arg(long)]
@@ -532,6 +546,18 @@ fn run(command: Command) -> Result<ExitCode> {
             );
         }
         Command::Repo { command } => match command {
+            RepoCommand::RotateKey {
+                repo,
+                publisher,
+                base,
+                signing_key,
+                new_signing_key,
+            } => {
+                println!(
+                    "Published catalog {}",
+                    rotate_publisher_key(&repo, &publisher, &base, &signing_key, &new_signing_key)?
+                );
+            }
             RepoCommand::Obsoletions {
                 repo,
                 publisher,

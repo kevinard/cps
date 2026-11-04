@@ -307,6 +307,33 @@ publishing sequenced catalogs.
 
 The publisher signs the association between each package and its build evidence. Export and sync carry the evidence with the release. To retrieve it, use `cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-key public.der cps://canopa/demo/hello@1.0.0-0`. Clients need a CPS version that supports attestations before they can read catalogs containing that field.
 
+### Publisher signing key rotation
+
+Rotate a publisher's catalog signing key on the publishing repository with both
+private keys and the reviewed current catalog digest.
+
+```sh
+cps repo rotate-key --repo repo --publisher canopa --base "$reviewed_catalog_sha256" \
+    --signing-key old-private.der --new-signing-key new-private.der
+```
+
+Both keys sign the handoff, including the base catalog digest and the sequence
+where the new key takes effect. The new key signs the successor catalog and all
+subsequent publications and withdrawals. The catalog carries the handoff
+history, so clients can skip releases and still verify the current signing key.
+TUF sync remembers authenticated handoffs even if a payload download fails. It
+rejects releases that drop or rewrite known handoffs or backdate a new handoff
+into an already authenticated catalog sequence.
+
+Keep the original publisher public key as the trust anchor for export, sync,
+images, and pinned build toolchains. It verifies historical catalogs and anchors
+newer ones. Export and sign the rotated catalog with the repository's TUF roles
+as usual. The publisher and TUF roles have separate keys and rotation procedures.
+Upgrade clients before distributing the rotated catalog. If the current private
+key is lost, recovery requires a new trust bootstrap.
+
+### Withdrawing and obsoleting packages
+
 To withdraw an exact version, use the publisher signing key on the publishing
 repository, then export and sign a new TUF release.
 

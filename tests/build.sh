@@ -477,6 +477,11 @@ test ! -e targets/builder-public.der
 test image/hello -ef image/hello-alias
 test "$(cat image/hello-alias)" = 'hello from pinned input 1700000000'
 
+openssl genpkey -algorithm ED25519 -outform DER -out successor.der
+"$cps" repo rotate-key --repo witnessed --publisher canopa --base "$witnessed_catalog" \
+    --signing-key signing.der --new-signing-key successor.der
+rotated_catalog=$(cat witnessed/current)
+
 # Build the two packages in a coordinated upgrade on both workers.
 printf 'hello from pinned input\n' > sources/input
 cat > manifest.kdl <<MANIFEST
@@ -490,6 +495,7 @@ MANIFEST
 recipe '    printf "hello 2\n" > "$DESTDIR/hello"' > hello2.kdl
 build_package --sources sources --builder-signing-key builder.der --check-reproducible --output hello2-a hello2.kdl
 build_package --sources sources --builder-signing-key other.der --check-reproducible --output hello2-b hello2.kdl
+build_package --sources sources --builder-signing-key signing.der --check-reproducible --output hello2-retired hello2.kdl
 
 cat > manifest.kdl <<MANIFEST
 schema-version 1
@@ -503,11 +509,13 @@ build_package --sources sources --builder-signing-key other.der --check-reproduc
 
 hello2_reviewed=$(sha hello2.kdl)
 platform_reviewed=$(sha platform.kdl)
+cp public.der witnessed/retired-publisher.der
 cat > witnessed/publish-policy.kdl <<POLICY
 schema-version 1
 publisher "canopa" minimum-builders=2 {
     builder-key "builder-public.der"
     builder-key "other-public.der"
+    builder-key "retired-publisher.der"
     approve "demo/hello" version="2.0.0-0" sha256="$hello2_reviewed"
     approve "library/platform" version="1.0.0-0" sha256="$platform_reviewed"
     profile "base" architecture="$arch" upgrade-from="$witnessed_catalog" {
@@ -515,14 +523,17 @@ publisher "canopa" minimum-builders=2 {
     }
 }
 POLICY
+expect_failure 'a retired publisher key cannot sign builds' "$cps" publish-bundle \
+    --repo witnessed --signing-key successor.der --builder-key public.der \
+    --recipe-sha256 "$hello2_reviewed" --witness other-public.der=hello2-b/attestation.json hello2-retired
 expect_failure 'checking release profile base' "$cps" publish-bundle \
-    --repo witnessed --signing-key signing.der --builder-key builder-public.der \
+    --repo witnessed --signing-key successor.der --builder-key builder-public.der \
     --recipe-sha256 "$hello2_reviewed" --witness other-public.der=hello2-b/attestation.json hello2-a
-test "$(cat witnessed/current)" = "$witnessed_catalog"
+test "$(cat witnessed/current)" = "$rotated_catalog"
 
 cat > wave.kdl <<WAVE
 schema-version 1
-release "canopa" base="$witnessed_catalog" {
+release "canopa" base="$rotated_catalog" {
     obsolete "cps://canopa/demo/hello@1.1.0-0"
     bundle "cps://canopa/demo/hello@2.0.0-0" path="hello2-a" builder-key="builder-public.der" recipe-sha256="$hello2_reviewed" {
         witness "hello2-b/attestation.json" key="other-public.der"
@@ -533,33 +544,35 @@ release "canopa" base="$witnessed_catalog" {
 }
 WAVE
 publish_wave() {
-    "$cps" repo publish-release --repo witnessed --signing-key signing.der "$1"
+    "$cps" repo publish-release --repo witnessed --signing-key successor.der "$1"
 }
 sed '/witness "platform-b\/attestation.json"/d' wave.kdl > incomplete.kdl
 expect_failure 'requires 2 distinct build signers' publish_wave incomplete.kdl
-test "$(cat witnessed/current)" = "$witnessed_catalog"
+test "$(cat witnessed/current)" = "$rotated_catalog"
 test -z "$("$cps" repo withdrawals --repo witnessed --publisher canopa --trust-key public.der)"
 
 cp -a witnessed repeat
 publish_wave wave.kdl
 wave_catalog=$(cat witnessed/current)
-test "$wave_catalog" != "$witnessed_catalog"
+test "$wave_catalog" != "$rotated_catalog"
 expect_failure 'release base is stale' publish_wave wave.kdl
-"$cps" repo publish-release --repo repeat --signing-key signing.der wave.kdl
+"$cps" repo publish-release --repo repeat --signing-key successor.der wave.kdl
 test "$(cat repeat/current)" = "$wave_catalog"
-test "$(find witnessed/catalogs -type f | wc -l)" -eq 2
+test "$(find witnessed/catalogs -type f | wc -l)" -eq 3
 "$cps" repo withdrawals --repo witnessed --publisher canopa --trust-key public.der \
     | grep -F 'cps://canopa/demo/hello@1.0.0-0'
 test "$("$cps" repo obsoletions --repo witnessed --publisher canopa --trust-key public.der)" = \
     'cps://canopa/demo/hello@1.1.0-0'
+"$cps" repo attestation --repo witnessed --publisher canopa --trust-key public.der \
+    cps://canopa/demo/hello@1.0.0-0 | cmp - witnessed.json
 expect_failure 'checking release profile base' "$cps" repo withdraw \
-    --repo witnessed --signing-key signing.der cps://canopa/library/platform@1.0.0-0
+    --repo witnessed --signing-key successor.der cps://canopa/library/platform@1.0.0-0
 mv witnessed/publish-policy.kdl gate.saved
 expect_failure 'protected repository is missing publish-policy.kdl' "$cps" repo withdraw \
-    --repo witnessed --signing-key signing.der cps://canopa/library/platform@1.0.0-0
+    --repo witnessed --signing-key successor.der cps://canopa/library/platform@1.0.0-0
 sed '/profile "base"/,+2d' gate.saved > witnessed/publish-policy.kdl
 expect_failure 'requires release composition profiles' "$cps" repo withdraw \
-    --repo witnessed --signing-key signing.der cps://canopa/library/platform@1.0.0-0
+    --repo witnessed --signing-key successor.der cps://canopa/library/platform@1.0.0-0
 mv gate.saved witnessed/publish-policy.kdl
 test "$(cat witnessed/current)" = "$wave_catalog"
 "$cps" plan --root image --output wave.json update
