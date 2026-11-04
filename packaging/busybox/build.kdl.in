@@ -1,0 +1,39 @@
+schema-version 1
+build architecture="@ARCH@" epoch=1727395200 {
+    toolchain "@CATALOG_SHA256@" solver="sat-v1" {
+        package "build/native-c"
+    }
+    manifest "busybox.kdl" sha256="@MANIFEST_SHA256@"
+    source "busybox-1.37.0.tar.bz2" size=2565764 sha256="3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4" url="https://busybox.net/downloads/busybox-1.37.0.tar.bz2"
+    script """
+    tar -xjf "$CPS_SOURCES/busybox-1.37.0.tar.bz2"
+    cd busybox-1.37.0
+    cat > boot.config <<'CONFIG'
+    CONFIG_BUSYBOX=y
+    CONFIG_SHOW_USAGE=y
+    CONFIG_STATIC=y
+    CONFIG_SH_IS_ASH=y
+    CONFIG_ASH=y
+    CONFIG_ASH_PRINTF=y
+    CONFIG_ASH_TEST=y
+    CONFIG_CAT=y
+    CONFIG_MKDIR=y
+    CONFIG_POWEROFF=y
+    CONFIG_REBOOT=y
+    CONFIG_SYNC=y
+    CONFIG_UNAME=y
+    CONFIG
+    make -s allnoconfig >/dev/null
+    while IFS='=' read -r symbol value; do
+        sed -i "/^# $symbol is not set$/d; /^$symbol=/d" .config
+        printf '%s=%s\n' "$symbol" "$value" >> .config
+    done < boot.config
+    yes "" | make -s oldconfig >/dev/null
+    while IFS= read -r setting; do
+        grep -Fx "$setting" .config >/dev/null
+    done < boot.config
+    make -s -j2 busybox
+    install -Dm755 busybox "$DESTDIR/bin/busybox"
+    install -Dm644 LICENSE "$DESTDIR/usr/share/licenses/busybox/LICENSE"
+    """
+}
