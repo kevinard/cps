@@ -4,9 +4,11 @@ set -euo pipefail
 umask 022
 
 mode=${1:-fallback}
+health_failure=false
 case $mode in
-    fallback|bless|health-fail|kernel-upgrade|rollback|capabilities) ;;
-    *) echo "Usage: $0 [fallback|bless|health-fail|kernel-upgrade|rollback|capabilities]" >&2; exit 2 ;;
+    health-fail|catalog-health-fail) health_failure=true ;;
+    fallback|bless|kernel-upgrade|rollback|capabilities) ;;
+    *) echo "Usage: $0 [fallback|bless|health-fail|catalog-health-fail|kernel-upgrade|rollback|capabilities]" >&2; exit 2 ;;
 esac
 recycle=${CPS_VM_RECYCLE_SLOT:-0}
 device_activation=${CPS_VM_DEVICE_ACTIVATION:-0}
@@ -85,13 +87,14 @@ if [[ -n $busybox_repo || -n $busybox_key ]]; then
 else
     test -r "$busybox" || { echo "Missing input: $busybox" >&2; exit 1; }
 fi
-if [[ $mode == health-fail ]]; then command -v debugfs >/dev/null; fi
+if $health_failure; then command -v debugfs >/dev/null; fi
+if [[ $mode == catalog-health-fail ]]; then command -v sqlite3 >/dev/null; fi
 for file in "$cps" "$efi" "$kernel" "$code" "$vars"; do
     test -r "$file" || { echo "Missing input: $file" >&2; exit 1; }
 done
 
 systemd_guest=false
-if [[ $mode == bless || $mode == health-fail || $mode == rollback || $mode == capabilities ]]; then
+if $health_failure || [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
     systemd_guest=true
 fi
 fixture_publisher=canopa
@@ -789,10 +792,21 @@ if [[ $mode == rollback ]]; then
     cmp config-before-rejected-rollback esp/loader/loader.conf
 fi
 
-if [[ $mode == health-fail ]]; then
+if $health_failure; then
     # Simulate an offline modification after checked activation.
-    debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
-    debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
+    if [[ $mode == catalog-health-fail ]]; then
+        debugfs -R 'dump /.cps/state.sqlite trial.sqlite' staged.ext4 >/dev/null
+        changed=$(sqlite3 -batch -bail trial.sqlite \
+            "UPDATE catalog_archives SET catalog=x'00'; SELECT changes();")
+        test "$changed" -gt 0
+        printf '%s\n' 'rm /.cps/state.sqlite' 'write trial.sqlite /.cps/state.sqlite' > corrupt-debugfs
+        debugfs -w -f corrupt-debugfs staged.ext4 >/dev/null
+        debugfs -R 'dump /.cps/state.sqlite modified.sqlite' staged.ext4 >/dev/null
+        cmp trial.sqlite modified.sqlite
+    else
+        debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
+        debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
+    fi
     dd if=staged.ext4 of=disk.raw bs=1M seek="$trial_mib" conv=notrunc status=none
 fi
 
@@ -836,7 +850,7 @@ check_busybox serial.log
 
 case $mode in
     bless|rollback|capabilities) expected=$'CPS_VM_BOOT: trial blessed\nCPS_VM_BOOT: trial default' ;;
-    health-fail) expected=$'CPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: previous' ;;
+    health-fail|catalog-health-fail) expected=$'CPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: trial health-failed\nCPS_VM_BOOT: previous' ;;
     fallback|kernel-upgrade) expected=$'CPS_VM_BOOT: trial\nCPS_VM_BOOT: trial\nCPS_VM_BOOT: previous' ;;
 esac
 boots=$(tr -d '\r' < serial.log | grep '^CPS_VM_BOOT: ' || :)
@@ -1056,8 +1070,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
 fi
 
 mcopy -i disk.raw@@1048576 "::/loader/entries/$trial_id+0-2.conf" exhausted.conf
-if [[ $mode == health-fail ]]; then
-    grep -q 'etc/cps-vm-state: content, type, or metadata differs' serial.log
+if $health_failure; then
+    case $mode in
+        health-fail) grep -q 'etc/cps-vm-state: content, type, or metadata differs' serial.log ;;
+        catalog-health-fail) grep -q 'archived catalog digest mismatch' serial.log ;;
+    esac
     printf '%s\nVerified the health gate blocked blessing and systemd-boot fell back\n' "$boots"
     exit 0
 fi

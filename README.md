@@ -1265,7 +1265,10 @@ previous root boots after two failed attempts. The `bless` scenario runs
 systemd as PID 1, installs the health gate through the CPS package, and checks
 that systemd removes the counter and boots the blessed root again. The
 `health-fail` scenario corrupts a managed file in the exported partition and
-checks that the health gate blocks blessing through both attempts. The
+checks that the health gate blocks blessing through both attempts.
+`catalog-health-fail` uses `sqlite3` and `debugfs` to corrupt the archived
+catalog in the trial partition after activation. It checks for the catalog
+digest error and verifies that systemd-boot falls back after both attempts. The
 `kernel-upgrade` scenario checks the kernel and initrd on the ESP and reports
 `uname -r` from both roots.
 
