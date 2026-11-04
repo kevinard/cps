@@ -388,6 +388,27 @@ enum RepoCommand {
         #[arg(long)]
         index_only: bool,
     },
+    /// Preview or remove unused payload files from a TUF mirror cache
+    PruneCache {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+        /// Also retain payloads from this historical catalog
+        #[arg(long = "keep-catalog")]
+        catalogs: Vec<String>,
+        /// Keep payloads for this image's installed packages and current profile
+        #[arg(long = "keep-image")]
+        images: Vec<PathBuf>,
+        /// Keep payloads used by this saved plan
+        #[arg(long = "keep-plan")]
+        plans: Vec<PathBuf>,
+        /// Remove the listed files
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -796,6 +817,40 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!(
                     "Synchronized {}",
                     release::sync_profile(&config, index_only)?
+                );
+            }
+            RepoCommand::PruneCache {
+                repo,
+                publisher,
+                trust_key,
+                catalogs,
+                images,
+                plans,
+                apply,
+            } => {
+                let plans = plans
+                    .iter()
+                    .map(|path| load_plan(path))
+                    .collect::<Result<Vec<_>>>()?;
+                let report = release::prune_payloads(
+                    &repo,
+                    &publisher,
+                    &trust_key,
+                    release::CacheRetention {
+                        catalogs: &catalogs,
+                        images: &images,
+                        plans: &plans,
+                    },
+                    apply,
+                )?;
+                for (hash, length) in &report.blobs {
+                    println!("{hash}\t{length}");
+                }
+                let action = if apply { "Removed" } else { "Would remove" };
+                println!(
+                    "{action} {} payload file(s), {} bytes",
+                    report.blobs.len(),
+                    report.bytes
                 );
             }
         },

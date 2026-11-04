@@ -71,13 +71,13 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
         .split_first()
         .context("missing primary cache")?;
     let full = !index_only;
-    let primary_hash = stage_release(primary_repo, primary, full, Some(&binding), None)
+    let primary_release = stage_release(primary_repo, primary, full, Some(&binding), None)
         .with_context(|| format!("staging primary publisher {}", primary.publisher))?;
     let (_, profile) = release_profile(
         primary_repo,
         primary.publisher,
         &primary.key,
-        Some(&primary_hash),
+        Some(&primary_release.current),
         name,
     )?;
     profile.check_image(
@@ -92,16 +92,19 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
         .zip(companion_repos)
         .zip(&profile.companions)
     {
-        let hash = stage_release(repo, source, full, None, Some(pin)).with_context(|| {
+        let release = stage_release(repo, source, full, None, Some(pin)).with_context(|| {
             format!(
                 "staging companion publisher {} for profile {name}",
                 source.publisher
             )
         })?;
-        staged.push((source, repo, hash));
+        staged.push((source, repo, release));
     }
     if !profile.composition.is_empty() {
-        let primary_pin = CatalogPin::primary(primary.publisher.to_owned(), primary_hash.clone());
+        let primary_pin = CatalogPin::primary(
+            primary.publisher.to_owned(),
+            primary_release.current.clone(),
+        );
         check_composition(
             &profile,
             &primary_pin,
@@ -113,11 +116,11 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
     }
     // Profile readers use the primary pointer as the visibility boundary.
     // Earlier catalogs and objects remain addressable by their original digests.
-    for (source, repo, hash) in staged {
-        source.promote(repo, &hash, None)?;
+    for (source, repo, release) in staged {
+        source.promote(repo, &release, None)?;
     }
-    primary.promote(primary_repo, &primary_hash, Some(&binding))?;
-    Ok(primary_hash)
+    primary.promote(primary_repo, &primary_release, Some(&binding))?;
+    Ok(primary_release.current)
 }
 
 fn check_composition(

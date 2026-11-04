@@ -1064,6 +1064,20 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(saved.catalogs["seed"], previous.trim());
     fetch_plan(&f.root, &saved)?;
     assert_eq!(fs::read(seed_cache.join(&blob))?, b"old");
+    let prune_seed = |images: &[PathBuf]| {
+        mirror_release::prune_payloads(
+            &seed_cache,
+            "seed",
+            &seed.public,
+            mirror_release::CacheRetention {
+                catalogs: &[],
+                images,
+                plans: &[],
+            },
+            false,
+        )
+    };
+    assert!(prune_seed(&[])?.blobs.is_empty());
 
     let full = work.join("full-cache");
     mirror_release::sync(
@@ -1076,6 +1090,33 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     )?;
     assert_eq!(fs::read_to_string(full.join("current"))?, current);
     assert_eq!(fs::read(full.join(&blob))?, b"old");
+
+    // The mirror changes its retention list without a new current catalog.
+    // The empty profiled image still needs the original companion pin.
+    let unretained_mirror = work.join("unretained-mirror");
+    sign_publisher_release(
+        &seed,
+        &unretained_mirror,
+        2,
+        fresh,
+        &anchor,
+        &tuf_key,
+        "seed",
+    )?;
+    mirror_release::sync_index(
+        &seed_cache,
+        &anchor,
+        Url::from_directory_path(unretained_mirror.join("metadata"))
+            .unwrap()
+            .as_str(),
+        Url::from_directory_path(unretained_mirror.join("targets"))
+            .unwrap()
+            .as_str(),
+        "seed",
+        &seed.public,
+    )?;
+    assert_eq!(prune_seed(&[])?.blobs, [(digest(b"old"), 3)]);
+    assert!(prune_seed(std::slice::from_ref(&f.root))?.blobs.is_empty());
 
     seed.package_as(
         "seed",
@@ -1107,7 +1148,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         &primary_root,
         &primary_key,
     )?;
-    write_config(&next_primary_mirror, &mirror)?;
+    write_config(&next_primary_mirror, &unretained_mirror)?;
     let error = mirror_release::sync_profile(&config, true).unwrap_err();
     assert!(
         format!("{error:#}").contains(&format!(
@@ -1142,7 +1183,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     sign_publisher_release(
         &seed,
         &next_seed_mirror,
-        2,
+        3,
         fresh,
         &anchor,
         &tuf_key,
@@ -1221,6 +1262,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     );
 
     fs::rename(&mirror, work.join("offline-mirror"))?;
+    fs::rename(&unretained_mirror, work.join("offline-unretained-mirror"))?;
     fs::rename(&next_seed_mirror, work.join("offline-next-seed-mirror"))?;
     fs::rename(
         &next_primary_mirror,
@@ -1238,6 +1280,138 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     crate::stage_boot_environment(&f.root, &staged, &update)?;
     assert_eq!(fs::read(staged.join(payload))?, b"latest");
     assert_eq!(fs::read(f.root.join(payload))?, b"old");
+    Ok(())
+}
+
+#[test]
+fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()> {
+    let f = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let cache = work.join("cache");
+    let sync = |version| -> Result<PathBuf> {
+        let mirror = work.join(format!("mirror-{version}"));
+        sign_release(&f, &mirror, version, fresh, &anchor, &tuf_key)?;
+        mirror_release::sync(
+            &cache,
+            &anchor,
+            Url::from_directory_path(mirror.join("metadata"))
+                .unwrap()
+                .as_str(),
+            Url::from_directory_path(mirror.join("targets"))
+                .unwrap()
+                .as_str(),
+            "canopa",
+            &f.public,
+        )?;
+        Ok(mirror)
+    };
+    let prune = |catalogs: &[String], images: &[PathBuf], plans: &[Plan], apply| {
+        mirror_release::prune_payloads(
+            &cache,
+            "canopa",
+            &f.public,
+            mirror_release::CacheRetention {
+                catalogs,
+                images,
+                plans,
+            },
+            apply,
+        )
+    };
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "previous", "0644", "")?,
+    )?;
+    let first = sync(1)?;
+    let old_catalog = fs::read_to_string(cache.join("current"))?.trim().to_owned();
+    let installed = work.join("installed");
+    for root in [&installed, &f.root] {
+        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+    }
+    let request = Request::Install {
+        packages: vec!["desktop/compositor".to_owned()],
+    };
+    let saved = plan(&f.root, request.clone())?;
+    apply(&installed, &plan(&installed, request)?)?;
+
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "latest", "0644", "")?,
+    )?;
+    withdraw_package(
+        &f.repo,
+        &f.private,
+        "cps://canopa/desktop/compositor@1.0.0-0",
+    )?;
+    let second = sync(2)?;
+    let current = fs::read_to_string(cache.join("current"))?;
+    let old_blob = digest(b"previous");
+    let new_blob = digest(b"latest");
+    let orphan = digest(b"orphan");
+    let blob_dir = cache.join("blobs");
+    fs::write(blob_dir.join(&orphan), b"orphan")?;
+    fs::write(blob_dir.join("local-note"), b"leave this alone")?;
+    let unrelated = work.join("unrelated");
+    fs::write(&unrelated, b"outside the cache")?;
+    let symlink = blob_dir.join(digest(b"unexpected symlink"));
+    std::os::unix::fs::symlink(&unrelated, &symlink)?;
+
+    let inventory = cache.join(".tuf/retention").join(current.trim());
+    let saved_inventory = fs::read(&inventory)?;
+    fs::remove_file(&inventory)?;
+    let error =
+        prune(&[], &[], &[], true).expect_err("prune accepted a cache without an inventory");
+    assert!(format!("{error:#}").contains("cache has no retention inventory"));
+    assert!(blob_dir.join(&old_blob).exists() && blob_dir.join(&orphan).exists());
+    fs::write(inventory, saved_inventory)?;
+
+    let report = prune(&[], &[], &[], false)?;
+    assert_eq!(report.bytes, 14);
+    assert!(report.blobs.iter().any(|(hash, _)| hash == &old_blob));
+    assert!(blob_dir.join(&old_blob).exists() && blob_dir.join(&orphan).exists());
+    for report in [
+        prune(std::slice::from_ref(&old_catalog), &[], &[], false)?,
+        prune(&[], std::slice::from_ref(&installed), &[], false)?,
+        prune(&[], &[], std::slice::from_ref(&saved), true)?,
+    ] {
+        assert_eq!(report.blobs, [(orphan.clone(), 6)]);
+    }
+    assert!(!blob_dir.join(&orphan).exists());
+    assert!(blob_dir.join(&old_blob).exists() && blob_dir.join(&new_blob).exists());
+    assert!(symlink.symlink_metadata()?.file_type().is_symlink());
+    assert_eq!(fs::read(&unrelated)?, b"outside the cache");
+    assert!(blob_dir.join("local-note").exists());
+
+    fs::rename(first, work.join("offline-first"))?;
+    fs::rename(second, work.join("offline-second"))?;
+    apply(&f.root, &saved)?;
+    assert_eq!(fs::read(f.root.join(COMPOSITOR))?, b"previous");
+    fs::write(installed.join(COMPOSITOR), b"damaged")?;
+    let repair = plan(
+        &installed,
+        Request::Repair {
+            packages: Vec::new(),
+        },
+    )?;
+    apply(&installed, &repair)?;
+    assert_eq!(fs::read(installed.join(COMPOSITOR))?, b"previous");
+    assert_eq!(prune(&[], &[], &[], true)?.blobs, [(old_blob.clone(), 8)]);
+    assert!(!blob_dir.join(old_blob).exists());
+    assert!(blob_dir.join(new_blob).exists());
+    assert_eq!(fs::read_to_string(cache.join("current"))?, current);
+    assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, current);
+    assert_eq!(
+        snapshot(&cache, "canopa", &read_key(&f.public)?, Some(&old_catalog))?
+            .packages
+            .len(),
+        1
+    );
     Ok(())
 }
 

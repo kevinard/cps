@@ -123,7 +123,9 @@ fn endpoint(value: &str) -> Result<Url> {
     Ok(url)
 }
 
+mod cache;
 mod profile;
+pub use cache::{CacheRetention, PruneReport, prune_payloads};
 pub use profile::sync_profile;
 
 #[derive(Clone)]
@@ -255,9 +257,14 @@ fn synchronize(
 ) -> Result<String> {
     let source = SyncSource::new(trusted_root, mirror, publisher, trust_key)?;
     let _lock = lock_repo(repo)?;
-    let hash = stage_release(repo, &source, full, None, None)?;
-    source.promote(repo, &hash, None)?;
-    Ok(hash)
+    let release = stage_release(repo, &source, full, None, None)?;
+    source.promote(repo, &release, None)?;
+    Ok(release.current)
+}
+
+struct StagedRelease {
+    current: String,
+    retained: Vec<String>,
 }
 
 struct SyncSource<'a> {
@@ -290,8 +297,12 @@ impl<'a> SyncSource<'a> {
         })
     }
 
-    fn promote(&self, repo: &Path, hash: &str, binding: Option<&str>) -> Result<()> {
+    fn promote(&self, repo: &Path, release: &StagedRelease, binding: Option<&str>) -> Result<()> {
         let state = repo.join(".tuf");
+        let same_catalog = read_current(repo).is_ok_and(|hash| hash == release.current);
+        if !same_catalog {
+            cache::record_retention(&state, release)?;
+        }
         if let Some(binding) = binding {
             write_atomic(&state.join(PROFILE_BINDING), binding.as_bytes(), true)?;
         }
@@ -300,7 +311,15 @@ impl<'a> SyncSource<'a> {
             self.mirror.document().as_bytes(),
             false,
         )?;
-        write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)
+        write_atomic(
+            &repo.join("current"),
+            format!("{}\n", release.current).as_bytes(),
+            false,
+        )?;
+        if same_catalog {
+            cache::record_retention(&state, release)?;
+        }
+        Ok(())
     }
 }
 
@@ -311,7 +330,7 @@ fn stage_release(
     full: bool,
     binding: Option<&str>,
     pin: Option<&CatalogPin>,
-) -> Result<String> {
+) -> Result<StagedRelease> {
     let SyncSource {
         publisher,
         key,
@@ -424,15 +443,7 @@ pub(crate) fn fetch_payloads(publisher: &Publisher, blobs: BTreeMap<&str, u64>) 
     );
     let _lock = lock_repo(repo)?;
     let directory = open_state(repo)?;
-    let identity = format!("\n{}\n{}\n", publisher.name, hex::encode(&publisher.key));
-    let origin = String::from_utf8(read_limited(
-        directory.file("origin")?,
-        64 + identity.len() as u64,
-    )?)?;
-    let anchor = origin
-        .strip_suffix(&identity)
-        .context("TUF cache is configured for a different publisher or key")?;
-    validate_digest(anchor)?;
+    check_cache_origin(&directory, &publisher.name, &publisher.key)?;
     let mirror = Mirror::read(&directory)?;
     let scratch = TempDir::new_in(&state)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -450,6 +461,18 @@ pub(crate) fn fetch_payloads(publisher: &Publisher, blobs: BTreeMap<&str, u64>) 
     })
 }
 
+fn check_cache_origin(directory: &Root, publisher: &str, key: &[u8]) -> Result<()> {
+    let identity = format!("\n{publisher}\n{}\n", hex::encode(key));
+    let origin = String::from_utf8(read_limited(
+        directory.file("origin")?,
+        64 + identity.len() as u64,
+    )?)?;
+    let anchor = origin
+        .strip_suffix(&identity)
+        .context("TUF cache is configured for a different publisher or key")?;
+    validate_digest(anchor)
+}
+
 async fn materialize(
     repo: &Path,
     verified: &Repository,
@@ -457,7 +480,7 @@ async fn materialize(
     key: &[u8],
     full: bool,
     required: Option<&CatalogPin>,
-) -> Result<String> {
+) -> Result<StagedRelease> {
     let pointer = download(verified, "current", repo, 65, None, None)
         .await?
         .context("missing catalog pointer download")?;
@@ -486,6 +509,7 @@ async fn materialize(
     }
     let mut entries = BTreeMap::new();
     let mut attestations = BTreeSet::new();
+    let mut retained_hashes = Vec::new();
     if verified
         .targets()
         .signed
@@ -508,6 +532,7 @@ async fn materialize(
             }
             entries.extend(previous.entries);
             attestations.extend(previous.attestations.into_values());
+            retained_hashes.push(pin.to_owned());
         }
     }
     if let Some(pin) = required {
@@ -519,7 +544,10 @@ async fn materialize(
     entries.extend(catalog.entries);
     attestations.extend(catalog.attestations.into_values());
     cache_objects(verified, repo, publisher, entries, attestations, full).await?;
-    Ok(hash)
+    Ok(StagedRelease {
+        current: hash,
+        retained: retained_hashes,
+    })
 }
 
 fn retained_catalogs<'a>(
@@ -581,7 +609,9 @@ async fn cache_objects(
     Ok(())
 }
 
-fn release_blobs(packages: &[Published]) -> Result<BTreeMap<&str, u64>> {
+fn release_blobs<'a>(
+    packages: impl IntoIterator<Item = &'a Published>,
+) -> Result<BTreeMap<&'a str, u64>> {
     let mut blobs = BTreeMap::new();
     for package in packages {
         for action in &package.manifest.action {

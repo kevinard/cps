@@ -631,6 +631,29 @@ the local cache, which matters when an older plan references a withdrawn
 version. Use full `repo sync` when provisioning a toolchain cache for offline
 builds.
 
+### Reclaiming mirror cache space
+
+`repo prune-cache` lists unneeded payload files and their lengths. Run it
+once to review the list, then repeat with `--apply` to remove those files.
+It operates on TUF mirror caches. A cache created by an earlier CPS version
+needs a successful sync to record which historical catalogs its mirror
+retains.
+
+```sh
+cps repo prune-cache --repo /var/lib/cps/canopa --publisher canopa \
+    --trust-key public.der --keep-image current-root --keep-image fallback-root \
+    --keep-plan upgrade.json
+```
+
+CPS keeps payloads referenced by the current catalog and by catalogs retained
+when that release was synchronized. Repeat `--keep-image` for each root that
+needs offline repair, including fallback roots. An image following a signed
+profile also keeps the profile's current pin for that cache. Repeat
+`--keep-plan` for saved plans and `--keep-catalog SHA256` for other historical
+catalogs needed by builds or releases. Supply the references for each cache
+you prune. Catalogs, manifests, build evidence, and replay checkpoints stay
+available.
+
 Each new publication or withdrawal advances a sequence signed by the CPS
 publisher. Sync remembers the newest authenticated catalog even if downloading
 its payloads fails. It rejects older publisher sequences and different catalogs
