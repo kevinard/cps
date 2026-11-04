@@ -695,10 +695,11 @@ fn interrupt_apply_worker(root: &Path, saved: &Path) -> Result<()> {
 
 #[test]
 fn repair_installed_files_and_resume_offline() -> Result<()> {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     const REMOVED_CONFIG: &str = "etc/canopa/optional.conf";
     const LINK: &str = "usr/bin/compositor";
+    const DIR: &str = "usr/bin";
     let f = Fixture::new()?;
     let uid = geteuid().as_raw();
     let gid = getegid().as_raw();
@@ -707,6 +708,7 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     actions += &f.file(CONFIG, "vendor config", "0644", "preserve=#true")?;
     actions += &f.file(REMOVED_CONFIG, "optional", "0644", "preserve=#true")?;
     actions += &format!("    symlink {LINK:?} target=\"canopa-compositor\" uid={uid} gid={gid}\n");
+    actions += &format!("    dir {DIR:?} mode=\"0755\" uid={uid} gid={gid}\n");
     f.package("desktop/compositor", "1.0.0-0", actions)?;
     f.package(
         "library/libdisplay",
@@ -728,6 +730,10 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
         f.file(COMPOSITOR, "newer release", "0755", "")?,
     )?;
     fs::remove_file(f.repo.join("current"))?;
+    let dir = f.root.join(DIR);
+    let inode = fs::metadata(&dir)?.ino();
+    fs::write(dir.join("local"), "local tool")?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o770))?;
     fs::write(f.root.join(COMPOSITOR), "damaged")?;
     fs::set_permissions(f.root.join(COMPOSITOR), fs::Permissions::from_mode(0o600))?;
     fs::remove_dir_all(f.root.join("usr/lib/canopa"))?;
@@ -761,6 +767,7 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     );
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "damaged");
     assert!(!f.root.join("usr/lib/canopa").exists());
+    assert_eq!(fs::metadata(&dir)?.mode() & 0o777, 0o770);
     fs::write(&blob, "plugin 1")?;
     interrupt_apply(&f.root, &f._dir.path().join("repair.json"), &repair)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 1");
@@ -770,6 +777,10 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     fs::rename(&f.repo, &offline)?;
     assert_eq!(apply(&f.root, &repair)?, 2);
     assert_eq!(apply(&f.root, &repair)?, 2);
+    let metadata = fs::metadata(&dir)?;
+    assert_eq!(metadata.ino(), inode);
+    assert_eq!(metadata.mode() & 0o777, 0o755);
+    assert_eq!(fs::read_to_string(dir.join("local"))?, "local tool");
     assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "plugin 1");
     assert_eq!(
         fs::read_link(f.root.join(LINK))?,

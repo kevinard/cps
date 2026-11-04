@@ -48,11 +48,11 @@ Use `cps plan --root image --output repair.json repair [NAME ...]` to repair
 selected installed packages, or omit the names to check all installed packages.
 Apply the saved plan with `cps apply --root image repair.json`. CPS restores
 managed files, symlinks, and missing directories from the installed manifests.
+It restores ownership and permissions on explicit directories in place.
 File payloads come from the configured local repository or cache and are checked
 against the installed digests before any writes. Repair preserves edited or
-removed configuration files declared with `preserve=#true`. Resolve metadata
-conflicts on existing explicit directories and conflicts with special files or
-unexpected directories before retrying the plan.
+removed configuration files declared with `preserve=#true`. Resolve path type
+conflicts involving directories or special files before retrying the plan.
 
 ## Finding and inspecting packages
 
@@ -199,7 +199,7 @@ The publisher signs the association between each package and its build evidence.
 - New plans use Resolvo to resolve compatible versions and report incompatible requirements. When selected file actions collide, CPS excludes the conflicting version or pair of versions and retries. Directory sharing still requires identical metadata. SAT resolution has a 60-second time limit. Saved plans record their solver version so apply can verify the same selection against the pinned catalog. Plans created before solver versioning retain their original behavior. [Resolvo](https://github.com/prefix-dev/resolvo)
 - Actions support `file`, `dir`, and `symlink`. A symlink specifies `target` in place of `mode`. The optional `arch` and `facet` selectors match image policy. Facets default to enabled and can be set with `image-create --facet doc.man=false`.
 - Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. When the vendor file changes, find its new copy in `image/.cps/config-updates/<revision>/`.
-- The image must be inactive and reside on one filesystem. The prototype rejects directory metadata changes and transitions between a directory and a file or symlink. Directories left behind when their ownership ends are retained.
+- The image must be inactive and reside on one filesystem. Install and update require existing explicit directory metadata to match the selected action. Transitions between a directory and a file or symlink are rejected. Directories left behind when their ownership ends are retained.
 
 Run `cargo test` for the desktop upgrade and interruption test.
 

@@ -137,6 +137,15 @@ fn write_files(
         checked_payload(root, node)?;
     }
     for write in writes {
+        if let (Some(before @ Node::Dir { .. }), Some(after @ Node::Dir { .. })) =
+            (&write.before, &write.after)
+            && before != after
+        {
+            if root.repair_directory(&write.path, before, after)? {
+                after_write(write);
+            }
+            continue;
+        }
         let observed = root.inspect(&write.path)?;
         if observed == write.after {
             if write.before != write.after {

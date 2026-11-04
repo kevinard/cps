@@ -54,7 +54,14 @@ pub(super) fn writes(
             continue;
         }
         if managed.node.is_dir() {
-            ensure!(before.is_none(), "directory or metadata conflict at {path}");
+            ensure!(
+                before.as_ref().is_none_or(Node::is_dir),
+                "path type conflict at {path}"
+            );
+            if before.is_some() {
+                // Check the target can be opened without crossing a mount.
+                root.dir(path)?;
+            }
         } else {
             ensure!(
                 !matches!(before, Some(Node::Dir { .. } | Node::Special)),

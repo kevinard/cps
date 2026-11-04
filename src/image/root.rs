@@ -229,10 +229,53 @@ impl Root {
         Ok(())
     }
 
+    pub fn repair_directory(&self, path: &str, before: &Node, after: &Node) -> Result<bool> {
+        let Node::Dir { mode: old_mode, .. } = *before else {
+            anyhow::bail!("expected directory metadata at {path}");
+        };
+        let Node::Dir { uid, gid, mode } = *after else {
+            anyhow::bail!("expected directory metadata at {path}");
+        };
+        let file = self
+            .dir(path)
+            .with_context(|| format!("opening directory {path}"))?;
+        let observed = directory_metadata(&file)?;
+        if observed == *after {
+            file.sync_all()?;
+            return Ok(false);
+        }
+        // Linux chown preserves directory mode bits. A crash between chown
+        // and chmod can leave the new owner with the original permissions.
+        let intermediate = Node::Dir {
+            uid,
+            gid,
+            mode: old_mode,
+        };
+        ensure!(
+            observed == *before || observed == intermediate,
+            "unexpected state at {path}; pending transaction retained"
+        );
+        set_metadata(&file, mode, uid, gid)?;
+        ensure!(
+            directory_metadata(&file)? == *after,
+            "could not restore directory metadata at {path}; pending transaction retained"
+        );
+        Ok(true)
+    }
+
     pub fn sync_parent(&self, path: &str) -> Result<()> {
         self.parent(path)?.0.sync_all()?;
         Ok(())
     }
+}
+
+fn directory_metadata(file: &File) -> Result<Node> {
+    let info = fstat(file)?;
+    Ok(Node::Dir {
+        uid: info.st_uid,
+        gid: info.st_gid,
+        mode: info.st_mode & 0o7777,
+    })
 }
 
 fn set_metadata(file: &File, mode: u32, uid: u32, gid: u32) -> Result<()> {
@@ -243,4 +286,38 @@ fn set_metadata(file: &File, mode: u32, uid: u32, gid: u32) -> Result<()> {
     fchmod(file, Mode::from_raw_mode(mode))?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn resumes_directory_repair_after_ownership_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Root::open(temp.path())?;
+        let path = temp.path().join("dir");
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o770))?;
+        let metadata = fs::metadata(&path)?;
+        let (uid, gid) = (metadata.uid(), metadata.gid());
+        let before = Node::Dir {
+            uid: uid ^ 1,
+            gid,
+            mode: 0o700,
+        };
+        let after = Node::Dir {
+            uid,
+            gid,
+            mode: 0o755,
+        };
+        assert!(root.repair_directory("dir", &before, &after).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        assert!(root.repair_directory("dir", &before, &after)?);
+        assert_eq!(root.inspect("dir")?, Some(after.clone()));
+        assert!(!root.repair_directory("dir", &before, &after)?);
+        Ok(())
+    }
 }
