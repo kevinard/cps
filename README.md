@@ -562,6 +562,46 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 
 Full sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and downloads the complete release. A failed download leaves the previous cache available. Sync can repair a damaged cache object when the mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can work offline once the required metadata and payloads are cached.
 
+### Synchronizing a signed profile
+
+For a profile that spans mirrors, add one `mirror` entry per publisher to
+the same KDL file used by `image-create`. The `root` path names that mirror's
+provisioned TUF root. Relative paths resolve from the KDL file.
+
+```kdl
+schema-version 1
+release-profile "desktop"
+publisher "canopa" {
+    repository "/var/lib/cps/desktop"
+    trust-key "canopa.der"
+}
+publisher "runtime" {
+    repository "/var/lib/cps/runtime"
+    trust-key "runtime.der"
+}
+mirror "canopa" root="canopa-root.json" metadata="https://packages.example.org/canopa/metadata/" targets="https://packages.example.org/canopa/targets/"
+mirror "runtime" root="runtime-root.json" metadata="https://packages.example.org/runtime/metadata/" targets="https://packages.example.org/runtime/targets/"
+```
+
+```sh
+cps repo sync-profile --config image.kdl --index-only
+cps image-create --root image --config image.kdl
+```
+
+CPS verifies the primary release and requires each companion mirror to
+advertise the exact signed pin as its current or retained catalog. It
+prepares all caches before advancing the primary pointer. If a companion
+mirror is behind, clients can still select the previous primary catalog
+and its cached objects. Replay checkpoints still remember newer verified
+metadata. Retry the same command when the mirror catches up.
+
+The first successful coordinated sync binds the primary cache to that
+profile and its ordered cache directories. Use `repo sync-profile` for
+subsequent updates to that primary cache. Give each profile its own primary
+cache. Companion current pointers can advance independently, and profile
+clients continue to use the exact companion pins recorded by their primary
+catalog.
+
 For an image that uses a small part of a mirror, add `--index-only` to `repo sync`.
 This caches the catalog, manifests, and build evidence and verifies the signed
 TUF target entries for payloads. Fetch the files for the resulting plan before

@@ -25,9 +25,9 @@ use crate::{
 };
 
 use super::{
-    CATALOG_LIMIT, MANIFEST_LIMIT, Published, Root, Snapshot, catalog_snapshot, load_manifest,
-    lock_repo, parse_current, path_present, prepare_objects, read_catalog, read_current, read_key,
-    read_limited, read_pointer, write_atomic,
+    CATALOG_LIMIT, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot, catalog_snapshot,
+    load_manifest, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
+    read_current, read_key, read_limited, read_pointer, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -37,6 +37,7 @@ const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
 const ENDPOINTS_LIMIT: u64 = 8192;
 const PAYLOAD_DOWNLOADS: usize = 8;
 const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
+const PROFILE_BINDING: &str = "profile";
 const RETAINED: &str = "retained";
 const MAX_RETAINED: usize = 32;
 const RETAINED_LIMIT: u64 = (65 * MAX_RETAINED) as u64;
@@ -122,6 +123,10 @@ fn endpoint(value: &str) -> Result<Url> {
     Ok(url)
 }
 
+mod profile;
+pub use profile::sync_profile;
+
+#[derive(Clone)]
 struct Mirror {
     metadata: Url,
     targets: Url,
@@ -248,18 +253,73 @@ fn synchronize(
     trust_key: &Path,
     full: bool,
 ) -> Result<String> {
-    validate_publisher(publisher)?;
-    let key = read_key(trust_key)?;
-    let anchor = read_limited(File::open(trusted_root)?, ROOT_LIMIT)
-        .with_context(|| format!("reading trusted TUF root {}", trusted_root.display()))?;
-    let endpoints = mirror.document();
-    ensure!(
-        endpoints.len() as u64 <= ENDPOINTS_LIMIT,
-        "mirror endpoints exceed the size limit"
-    );
+    let source = SyncSource::new(trusted_root, mirror, publisher, trust_key)?;
     let _lock = lock_repo(repo)?;
+    let hash = stage_release(repo, &source, full, None, None)?;
+    source.promote(repo, &hash, None)?;
+    Ok(hash)
+}
+
+struct SyncSource<'a> {
+    publisher: &'a str,
+    key: Vec<u8>,
+    anchor: Vec<u8>,
+    mirror: Mirror,
+}
+
+impl<'a> SyncSource<'a> {
+    fn new(
+        trusted_root: &Path,
+        mirror: Mirror,
+        publisher: &'a str,
+        trust_key: &Path,
+    ) -> Result<Self> {
+        validate_publisher(publisher)?;
+        let key = read_key(trust_key)?;
+        let anchor = read_limited(File::open(trusted_root)?, ROOT_LIMIT)
+            .with_context(|| format!("reading trusted TUF root {}", trusted_root.display()))?;
+        ensure!(
+            mirror.document().len() as u64 <= ENDPOINTS_LIMIT,
+            "mirror endpoints exceed the size limit"
+        );
+        Ok(Self {
+            publisher,
+            key,
+            anchor,
+            mirror,
+        })
+    }
+
+    fn promote(&self, repo: &Path, hash: &str, binding: Option<&str>) -> Result<()> {
+        let state = repo.join(".tuf");
+        if let Some(binding) = binding {
+            write_atomic(&state.join(PROFILE_BINDING), binding.as_bytes(), true)?;
+        }
+        write_atomic(
+            &state.join("endpoints"),
+            self.mirror.document().as_bytes(),
+            false,
+        )?;
+        write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)
+    }
+}
+
+// The caller holds the cache lock until promotion or failure.
+fn stage_release(
+    repo: &Path,
+    source: &SyncSource<'_>,
+    full: bool,
+    binding: Option<&str>,
+    pin: Option<&CatalogPin>,
+) -> Result<String> {
+    let SyncSource {
+        publisher,
+        key,
+        anchor,
+        mirror,
+    } = source;
     let state = repo.join(".tuf");
-    let origin = format!("{}\n{publisher}\n{}\n", digest(&anchor), hex::encode(&key));
+    let origin = format!("{}\n{publisher}\n{}\n", digest(anchor), hex::encode(key));
     let published = path_present(&repo.join("current"))?;
     if !path_present(&state)? {
         ensure!(!published, "TUF sync requires a new repository cache");
@@ -267,6 +327,13 @@ fn synchronize(
         File::open(repo)?.sync_all()?;
     }
     let directory = open_state(repo)?;
+    if path_present(&state.join(PROFILE_BINDING))? {
+        let binding = binding.context("TUF cache is managed by repo sync-profile")?;
+        ensure!(
+            read_limited(directory.file(PROFILE_BINDING)?, 65)? == binding.as_bytes(),
+            "TUF cache is bound to a different release profile or companion cache set"
+        );
+    }
     let trusted_exists = path_present(&state.join("trusted"))?;
     if path_present(&state.join("origin"))? {
         ensure!(
@@ -289,15 +356,18 @@ fn synchronize(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let hash = runtime.block_on(async {
-        let verified =
-            load_mirror(&state, &directory, scratch.path(), mirror, Some(anchor)).await?;
+    runtime.block_on(async {
+        let verified = load_mirror(
+            &state,
+            &directory,
+            scratch.path(),
+            mirror.clone(),
+            Some(anchor.clone()),
+        )
+        .await?;
         prepare_objects(repo)?;
-        materialize(repo, &verified, publisher, &key, full).await
-    })?;
-    write_atomic(&state.join("endpoints"), endpoints.as_bytes(), false)?;
-    write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)?;
-    Ok(hash)
+        materialize(repo, &verified, publisher, key, full, pin).await
+    })
 }
 
 async fn load_mirror(
@@ -386,6 +456,7 @@ async fn materialize(
     publisher: &str,
     key: &[u8],
     full: bool,
+    required: Option<&CatalogPin>,
 ) -> Result<String> {
     let pointer = download(verified, "current", repo, 65, None, None)
         .await?
@@ -409,6 +480,10 @@ async fn materialize(
         // Remember the signed catalog even when its payloads cannot be fetched.
         write_atomic(&checkpoint, format!("{hash}\n").as_bytes(), false)?;
     }
+    let mut required = required;
+    if let Some(pin) = required.take_if(|pin| pin.sha256 == hash) {
+        pin.check_lineage(&catalog, key)?;
+    }
     let mut entries = BTreeMap::new();
     let mut attestations = BTreeSet::new();
     if verified
@@ -428,9 +503,18 @@ async fn materialize(
             previous.check_successor(&catalog, pin).with_context(|| {
                 format!("checking retained catalog {pin} against current {hash}")
             })?;
+            if let Some(pin) = required.take_if(|required| required.sha256 == pin) {
+                pin.check_lineage(&previous, key)?;
+            }
             entries.extend(previous.entries);
             attestations.extend(previous.attestations.into_values());
         }
+    }
+    if let Some(pin) = required {
+        anyhow::bail!(
+            "mirror for {publisher} does not advertise required catalog {} as current or retained",
+            pin.sha256
+        );
     }
     entries.extend(catalog.entries);
     attestations.extend(catalog.attestations.into_values());

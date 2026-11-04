@@ -455,6 +455,7 @@ pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
         arch,
         facets,
         release_profile,
+        ..
     } = read_image_definition(path)?;
     ensure!(
         publishers.len() == 1 && release_profile.is_none() && publishers[0].build_trust.is_none(),
@@ -558,6 +559,13 @@ pub(crate) struct ImageDefinition {
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
     pub release_profile: Option<String>,
+    pub mirrors: BTreeMap<String, MirrorConfig>,
+}
+
+pub(crate) struct MirrorConfig {
+    pub root: PathBuf,
+    pub metadata: String,
+    pub targets: String,
 }
 
 pub(crate) fn read_image_definition(path: &Path) -> Result<ImageDefinition> {
@@ -577,6 +585,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         arch: std::env::consts::ARCH.to_owned(),
         facets: BTreeMap::new(),
         release_profile: None,
+        mirrors: BTreeMap::new(),
     };
     let mut architecture = false;
     let mut names = BTreeSet::new();
@@ -589,6 +598,19 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 config
                     .publishers
                     .push(publisher_config(node, name, parent)?);
+            }
+            "mirror" => {
+                let fields = Fields::read(node, 1, &["root", "metadata", "targets"], false)?;
+                let name = fields.string_arg(0)?;
+                let mirror = MirrorConfig {
+                    root: parent.join(fields.required_string("root")?),
+                    metadata: fields.required_string("metadata")?,
+                    targets: fields.required_string("targets")?,
+                };
+                ensure!(
+                    config.mirrors.insert(name.clone(), mirror).is_none(),
+                    "duplicate mirror for publisher {name}"
+                );
             }
             "architecture" => {
                 ensure!(!architecture, "duplicate architecture node");
@@ -619,6 +641,12 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         }
     }
     ensure!(!config.publishers.is_empty(), "missing publisher node");
+    for publisher in config.mirrors.keys() {
+        ensure!(
+            names.contains(publisher),
+            "mirror has no configured publisher {publisher}"
+        );
+    }
     Ok(config)
 }
 

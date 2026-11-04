@@ -907,7 +907,7 @@ fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -
     f.package(
         "desktop/compositor",
         "1.0.0-0",
-        dependency("require", "library/runtime", "1.0.0-0"),
+        "    require \"library/runtime\"\n".to_owned(),
     )?;
     f.package("test/retire", "1.0.0-0", String::new())?;
     fs::write(
@@ -931,25 +931,51 @@ publisher "canopa" {{
         ),
     )?;
     withdraw_package(&f.repo, &f.private, "cps://canopa/test/retire@1.0.0-0")?;
+    let first = fs::read_to_string(f.repo.join("current"))?;
+    let primary_root = work.join("primary-root.json");
+    let primary_key = work.join("primary-tuf-key.der");
+    sign_root(&primary_root, &primary_key, None)?;
+    let primary_mirror = work.join("primary-mirror");
+    sign_release(&f, &primary_mirror, 1, fresh, &primary_root, &primary_key)?;
+    let primary_cache = work.join("primary-cache");
     let config = work.join("image.kdl");
-    fs::write(
-        &config,
-        format!(
-            r#"schema-version 1
+    let write_config = |primary: &Path, seed_mirror: &Path| -> Result<()> {
+        let endpoint = |mirror: &Path, directory| {
+            Url::from_directory_path(mirror.join(directory))
+                .unwrap()
+                .to_string()
+        };
+        fs::write(
+            &config,
+            format!(
+                r#"schema-version 1
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{
     repository {:?}
     trust-key {:?}
 }}
+mirror "canopa" root={primary_root:?} metadata={:?} targets={:?}
 publisher "seed" {{
     repository {:?}
     trust-key {:?}
 }}
+mirror "seed" root={anchor:?} metadata={:?} targets={:?}
 "#,
-            f.repo, f.public, seed_cache, seed.public
-        ),
-    )?;
+                primary_cache,
+                f.public,
+                endpoint(primary, "metadata"),
+                endpoint(primary, "targets"),
+                seed_cache,
+                seed.public,
+                endpoint(seed_mirror, "metadata"),
+                endpoint(seed_mirror, "targets"),
+            ),
+        )?;
+        Ok(())
+    };
+    write_config(&primary_mirror, &mirror)?;
+    assert_eq!(mirror_release::sync_profile(&config, true)?, first.trim());
     create_configured_image(&f.root, &config)?;
     let saved = plan(&f.root, Request::InstallProfile)?;
     assert_eq!(saved.catalogs["seed"], previous.trim());
@@ -967,10 +993,114 @@ publisher "seed" {{
     )?;
     assert_eq!(fs::read_to_string(full.join("current"))?, current);
     assert_eq!(fs::read(full.join(&blob))?, b"old");
+
+    seed.package_as(
+        "seed",
+        "library/runtime",
+        "3.0.0-0",
+        seed.file(payload, "latest", "0644", "")?,
+    )?;
+    let latest = fs::read_to_string(seed.repo.join("current"))?;
+    let policy = f.repo.join("publish-policy.kdl");
+    fs::write(
+        &policy,
+        fs::read_to_string(&policy)?.replace(previous.trim(), latest.trim()),
+    )?;
+    let refresh = work.join("refresh.kdl");
+    fs::write(
+        &refresh,
+        format!(
+            "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+            first.trim()
+        ),
+    )?;
+    let second = publish_release(&f.repo, &f.private, &refresh)?;
+    let next_primary_mirror = work.join("next-primary-mirror");
+    sign_release(
+        &f,
+        &next_primary_mirror,
+        2,
+        fresh,
+        &primary_root,
+        &primary_key,
+    )?;
+    write_config(&next_primary_mirror, &mirror)?;
+    let error = mirror_release::sync_profile(&config, true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!(
+            "mirror for seed does not advertise required catalog {}",
+            latest.trim()
+        )),
+        "{error:#}"
+    );
+    assert_eq!(fs::read_to_string(primary_cache.join("current"))?, first);
+    assert_eq!(
+        fs::read_to_string(primary_cache.join(".tuf/catalog"))?.trim(),
+        second
+    );
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, current);
+    assert_eq!(plan(&f.root, Request::InstallProfile)?, saved);
+    let error = mirror_release::sync_index(
+        &primary_cache,
+        &primary_root,
+        Url::from_directory_path(next_primary_mirror.join("metadata"))
+            .unwrap()
+            .as_str(),
+        Url::from_directory_path(next_primary_mirror.join("targets"))
+            .unwrap()
+            .as_str(),
+        "canopa",
+        &f.public,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("managed by repo sync-profile"));
+
+    let next_seed_mirror = work.join("next-seed-mirror");
+    sign_publisher_release(
+        &seed,
+        &next_seed_mirror,
+        2,
+        fresh,
+        &anchor,
+        &tuf_key,
+        "seed",
+    )?;
+    write_config(&next_primary_mirror, &next_seed_mirror)?;
+    let correct_config = fs::read_to_string(&config)?;
+    fs::write(
+        &config,
+        correct_config.replace(
+            seed_cache.to_str().unwrap(),
+            work.join("different-seed-cache").to_str().unwrap(),
+        ),
+    )?;
+    let error = mirror_release::sync_profile(&config, true).unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("bound to a different release profile or companion cache set")
+    );
+    fs::write(&config, correct_config)?;
+    assert_eq!(mirror_release::sync_profile(&config, true)?, second);
+    assert_eq!(
+        fs::read_to_string(primary_cache.join("current"))?.trim(),
+        second
+    );
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, latest);
+    let fresh_root = work.join("fresh-image");
+    create_configured_image(&fresh_root, &config)?;
+    let new_plan = plan(&fresh_root, Request::InstallProfile)?;
+    assert_eq!(new_plan.catalogs["seed"], latest.trim());
+    fetch_plan(&fresh_root, &new_plan)?;
     fs::rename(&mirror, work.join("offline-mirror"))?;
+    fs::rename(&next_seed_mirror, work.join("offline-next-seed-mirror"))?;
+    fs::rename(
+        &next_primary_mirror,
+        work.join("offline-next-primary-mirror"),
+    )?;
     apply(&f.root, &saved)?;
     assert_eq!(fs::read(f.root.join(payload))?, b"old");
-    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, current);
+    apply(&fresh_root, &new_plan)?;
+    assert_eq!(fs::read(fresh_root.join(payload))?, b"latest");
     Ok(())
 }
 

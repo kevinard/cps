@@ -379,6 +379,15 @@ enum RepoCommand {
         #[arg(long)]
         index_only: bool,
     },
+    /// Verify a signed release profile and its pinned companion catalogs from TUF mirrors
+    SyncProfile {
+        /// Image configuration with mirror settings for every publisher
+        #[arg(long)]
+        config: PathBuf,
+        /// Cache the catalogs, manifests, and build evidence without downloading payloads
+        #[arg(long)]
+        index_only: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -781,6 +790,12 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!(
                     "Synchronized {}",
                     sync(&repo, &root, &metadata, &targets, &publisher, &trust_key)?
+                );
+            }
+            RepoCommand::SyncProfile { config, index_only } => {
+                println!(
+                    "Synchronized {}",
+                    release::sync_profile(&config, index_only)?
                 );
             }
         },

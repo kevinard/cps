@@ -75,6 +75,27 @@ pub(crate) struct ReleaseProfile {
 }
 
 impl ReleaseProfile {
+    pub(crate) fn check_image<'a>(
+        &self,
+        name: &str,
+        arch: &str,
+        facets: &BTreeMap<String, bool>,
+        companions: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        ensure!(
+            self.architecture == arch && &self.facets == facets,
+            "image architecture or facets differ from signed release profile {name}"
+        );
+        ensure!(
+            self.companions
+                .iter()
+                .map(|pin| pin.publisher.as_str())
+                .eq(companions),
+            "image publisher order differs from signed release profile {name}"
+        );
+        Ok(())
+    }
+
     fn validate_composition(&self, name: &str, catalog: &Catalog) -> Result<()> {
         ensure!(
             self.composition.is_empty() || !self.roots.is_empty(),

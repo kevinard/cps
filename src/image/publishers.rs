@@ -71,17 +71,12 @@ impl Publishers {
             primary_pin,
             name,
         )?;
-        ensure!(
-            profile.architecture == arch && &profile.facets == facets,
-            "image architecture or facets differ from signed release profile {name}"
-        );
-        ensure!(
-            companions
-                .iter()
-                .map(|publisher| &publisher.name)
-                .eq(profile.companions.iter().map(|pin| &pin.publisher)),
-            "image publisher order differs from signed release profile {name}"
-        );
+        profile.check_image(
+            name,
+            arch,
+            facets,
+            companions.iter().map(|publisher| publisher.name.as_str()),
+        )?;
         Ok(Some(SelectedProfile {
             primary: CatalogPin::primary(primary.name.clone(), hash),
             record: profile,
