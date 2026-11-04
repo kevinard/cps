@@ -6,6 +6,15 @@ cps=$(realpath -- "${CPS_TEST_BINARY:-"$project/target/debug/cps"}")
 output=$(realpath -m -- "${1:?usage: build-busybox.sh OUTPUT-DIRECTORY}")
 source_dir=${CPS_BUSYBOX_SOURCE_DIR:-}
 if [[ -n $source_dir ]]; then source_dir=$(realpath -- "$source_dir"); fi
+manifest=busybox.kdl
+binary=bin/busybox
+version=1.37.0-0
+if [[ ${CPS_BUSYBOX_MERGED_USR:-0} == 1 ]]; then
+    manifest=busybox-usr.kdl
+    binary=usr/bin/busybox
+    version=1.37.0-1
+fi
+package="cps://canopa-bootstrap/system/busybox@$version"
 mkdir -m 700 -- "$output"
 work=$(mktemp -d "$output/.private.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
@@ -25,9 +34,10 @@ bash "$project/tests/seed-native-c.sh" "$work/native-c"
     build/native-c > native-c.kdl
 "$cps" publish --repo toolchain --proto "$work/native-c" --signing-key "$work/toolchain.der" native-c.kdl
 
-sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/busybox/busybox.kdl" > busybox.kdl
+sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/busybox/$manifest" > busybox.kdl
 sed -e "s/@ARCH@/$(uname -m)/g" -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha busybox.kdl)/g" \
+    -e "s|@BUSYBOX_PATH@|$binary|g" \
     "$project/packaging/busybox/build.kdl.in" > build.kdl
 
 if [[ -n $source_dir ]]; then
@@ -46,25 +56,29 @@ cat > repo/publish-policy.kdl <<POLICY
 schema-version 1
 publisher "canopa-bootstrap" {
     builder-key "builder-public.der"
-    approve "system/busybox" version="1.37.0-0" sha256="$recipe_sha256"
+    approve "system/busybox" version="$version" sha256="$recipe_sha256"
 }
 POLICY
 "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$recipe_sha256" bundle
 "$cps" repo attestation --repo repo --publisher canopa-bootstrap --trust-key release-public.der \
-    cps://canopa-bootstrap/system/busybox@1.37.0-0 > attestation.json
+    "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
 "$cps" image-create --root image --repo repo --publisher canopa-bootstrap --trust-key release-public.der
-"$cps" plan --root image --output install.json install cps://canopa-bootstrap/system/busybox@1.37.0-0
+"$cps" plan --root image --output install.json install "$package"
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine
-cmp bundle/proto/bin/busybox image/bin/busybox
-applets=$(image/bin/busybox --list)
+cmp "bundle/proto/$binary" "image/$binary"
+if [[ $version == 1.37.0-1 ]]; then
+    test "$(readlink image/usr/bin/sh)" = busybox
+    image/usr/bin/sh -ec 'test "$1" = merged' sh merged
+fi
+applets=$("image/$binary" --list)
 if [[ $applets != $'ash\ncat\nmkdir\npoweroff\nreboot\nsh\nsync\nuname' ]]; then
     printf 'Unexpected BusyBox applets\n%s\n' "$applets" >&2
     exit 1
 fi
-headers=$(readelf -l image/bin/busybox)
+headers=$(readelf -l "image/$binary")
 if [[ $headers == *INTERP* ]]; then
     echo 'Expected a static BusyBox executable' >&2
     exit 1

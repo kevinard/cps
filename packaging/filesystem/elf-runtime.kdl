@@ -1,0 +1,8 @@
+schema-version 1
+package "system/elf-runtime" publisher="canopa-usr-base" version="1.0.0-1" {
+    require "system/filesystem"
+    file "usr/lib/ld-linux-x86-64.so.2" mode="0755" uid=0 gid=0
+    file "usr/lib/libc.so.6" mode="0755" uid=0 gid=0
+    file "usr/lib/libm.so.6" mode="0755" uid=0 gid=0
+    file "usr/lib/libgcc_s.so.1" mode="0755" uid=0 gid=0
+}

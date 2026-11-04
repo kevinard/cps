@@ -1,0 +1,12 @@
+schema-version 1
+package "system/filesystem" publisher="canopa-usr-base" version="1.0.0-0" {
+    dir "usr" mode="0755" uid=0 gid=0
+    dir "usr/bin" mode="0755" uid=0 gid=0
+    dir "usr/lib" mode="0755" uid=0 gid=0
+    symlink "bin" target="usr/bin" uid=0 gid=0
+    symlink "sbin" target="usr/bin" uid=0 gid=0
+    symlink "lib" target="usr/lib" uid=0 gid=0
+    symlink "lib64" target="usr/lib" uid=0 gid=0 arch="x86_64"
+    symlink "usr/sbin" target="bin" uid=0 gid=0
+    symlink "usr/lib64" target="lib" uid=0 gid=0 arch="x86_64"
+}
