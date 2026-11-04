@@ -87,11 +87,7 @@ if [[ -n $rust_root ]]; then
     mkdir -p "$seed/usr/lib/rustlib"
     cp -RL -- "$rust_root/lib/rustlib/$rust_host" "$seed/usr/lib/rustlib/"
     ln -s gcc "$seed/usr/bin/cc"
-    for tool in gzip pkg-config; do
+    for tool in gzip ls pkg-config ranlib rmdir; do
         copy_elf "/usr/bin/$tool" "usr/bin/$tool"
     done
-    for library in libseccomp.so libseccomp.so.2 libsqlite3.so libsqlite3.so.0; do
-        copy_elf "/usr/lib/$library" "usr/lib/$library"
-    done
-    copy_file /usr/lib/pkgconfig/sqlite3.pc usr/lib/pkgconfig/sqlite3.pc
 fi

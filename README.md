@@ -121,30 +121,35 @@ Use the digest of the selected repository catalog, such as the digest recorded i
 
 ### Building CPS itself
 
-On an x86-64 Arch Linux worker with Rust, the native GCC toolchain, SQLite and
-libseccomp development files, and Python 3.11 or newer, build the fixture in a
-new output directory. The worker needs a sparse crates.io cache populated for
-the selected revision's `Cargo.lock`.
+On an x86-64 Arch Linux worker with Rust, the native GCC toolchain, and Python
+3.11 or newer, build the fixture in a new output directory. The worker needs a
+sparse crates.io cache populated for the selected revision's `Cargo.lock` and a
+directory with the SQLite 3.54.1 autoconf archive and the libseccomp 2.6.1 release
+archive. The recipes verify the archive lengths and digests on import.
+[SQLite downloads](https://www.sqlite.org/download.html) · [libseccomp release](https://github.com/seccomp/libseccomp/releases/tag/v2.6.1)
 
 ```sh
 cargo fetch --locked
-tests/build-cps.sh target/cps-fixture HEAD
+CPS_RUNTIME_SOURCE_DIR=/path/to/runtime-sources tests/build-cps.sh target/cps-fixture HEAD
 ```
 
 The fixture archives the selected Git commit and checks each cached crate
 archive against `Cargo.lock` before vendoring from a fresh offline Cargo home.
 It pins both archives, the package manifest, and a signed catalog containing
-the worker's Rust and C toolchain. CPS builds the release binary twice in fresh
-network-isolated sandboxes, publishes `system/cps` with build evidence, and runs
-the installed binary to verify the image. The seed catalog captures prebuilt
-worker tools and libraries. The build uses those pinned inputs for both runs.
-The resulting executable uses the worker's shared SQLite, libseccomp, and C
-runtime libraries.
+the worker's Rust and C toolchain. CPS builds SQLite and libseccomp twice from
+the pinned upstream archives, then links its own two builds against those exact
+libraries. All three packages carry signed build evidence. The solver installs
+the declared runtime dependencies, and the fixture uses the installed loader
+and libraries to run the installed CPS binary and verify the image. A separate
+signed `runtime-seed` repository contains the worker's prebuilt ELF loader and
+C and GCC runtime libraries.
 
-The output includes `source-revision`, the recipe, source cache, toolchain
-repository, and protected package repository. To run the VM boot tests with
-the resulting binary, point `CPS_BIN` at `image/usr/bin/cps` inside the output
-directory. The VM fixture copies the release executable byte for byte.
+The output includes `source-revision`, the recipes, source cache, toolchain
+repository, protected package repository, and runtime seed repository. Set
+`CPS_VM_CPS_FIXTURE` to that output directory for a systemd VM boot test. The
+VM fixture installs the exact protected CPS package and its dependencies from
+the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
+directory to also use that executable to assemble the guest.
 
 ### Preparing a source cache
 

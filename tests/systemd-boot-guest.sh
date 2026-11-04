@@ -177,6 +177,16 @@ fi
 if [ -f /etc/cps-vm-assert-kernel ]; then
     printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$("$bb" uname -r)"
 fi
+if [ -f /etc/cps-vm-assert-cps-runtime ]; then
+    links=$(/lib64/ld-linux-x86-64.so.2 --inhibit-cache --list /usr/bin/cps)
+    for library in libsqlite3.so.0 libseccomp.so.2 libc.so.6 libm.so.6 libgcc_s.so.1; do
+        case "$links" in
+            *"$library => /usr/lib/$library ("*) ;;
+            *) printf 'Unexpected CPS runtime link for %s\n%s\n' "$library" "$links" >&2; exit 1 ;;
+        esac
+    done
+    printf 'CPS_VM_CPS_RUNTIME: %s verified\n' "$state"
+fi
 if [ -f /etc/cps-vm-assert-extra-publisher ]; then
     publisher=absent
     if [ -f /etc/cps-vm-extra-marker ]; then

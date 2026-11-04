@@ -1,0 +1,17 @@
+schema-version 1
+build architecture="@ARCH@" epoch=1782864000 {
+    toolchain "@CATALOG_SHA256@" solver="sat-v1" {
+        package "build/native-rust"
+    }
+    manifest "libseccomp.kdl" sha256="@MANIFEST_SHA256@"
+    source "libseccomp-2.6.1.tar.gz" size=656231 sha256="501f66c667225d53791b97e1d7cf85ab764c297d04881f60f38f451c4b0ee1be"
+    script """
+    tar -xzf "$CPS_SOURCES/libseccomp-2.6.1.tar.gz"
+    cd libseccomp-2.6.1
+    test -s src/syscalls.perf.c
+    CFLAGS=-O2 GPERF=false ./configure --prefix=/usr --disable-static --disable-python
+    make -j2 -C src -o syscalls.perf -o syscalls.perf.c
+    install -Dm755 src/.libs/libseccomp.so.2 "$DESTDIR/usr/lib/libseccomp.so.2"
+    install -Dm644 LICENSE "$DESTDIR/usr/share/licenses/libseccomp/LICENSE"
+    """
+}

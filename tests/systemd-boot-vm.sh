@@ -12,6 +12,7 @@ esac
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
+cps_fixture=${CPS_VM_CPS_FIXTURE:-}
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
 kernel=${CPS_VM_KERNEL:-/boot/vmlinuz-linux}
@@ -41,6 +42,18 @@ done
 systemd_guest=false
 if [[ $mode == bless || $mode == health-fail || $mode == rollback || $mode == capabilities ]]; then
     systemd_guest=true
+fi
+fixture_publisher=canopa
+if [[ -n $cps_fixture ]]; then
+    $systemd_guest || { echo 'CPS_VM_CPS_FIXTURE requires a systemd guest' >&2; exit 2; }
+    cps_fixture=$(realpath -- "$cps_fixture")
+    fixture_publisher=vm-test
+    for package in system/cps@0.1.0-1 system/sqlite@3.54.1-0 system/libseccomp@2.6.1-0; do
+        "$cps" repo attestation --repo "$cps_fixture/repo" --publisher canopa \
+            --trust-key "$cps_fixture/release-public.der" "cps://canopa/$package" >/dev/null
+    done
+    elf_runtime_paths=(lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1})
+    cps_library_paths=(usr/lib/{libsqlite3.so.0,libseccomp.so.2})
 fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     base_release=${CPS_VM_KERNEL_RELEASE:-$(uname -r)}
@@ -85,7 +98,7 @@ publish_state() {
     printf '%s\n' "$state" > proto/etc/cps-vm-state
     cat > manifest.kdl <<MANIFEST
 schema-version 1
-package "test/boot-state" publisher="canopa" version="$version" {
+package "test/boot-state" publisher="$fixture_publisher" version="$version" {
     file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
     hardlink "etc/cps-vm-boot-state" target="etc/cps-vm-state"
 $dependency
@@ -103,7 +116,7 @@ publish_kernel() {
     (cd initrd-tree && printf 'cps-initrd-release\n' | cpio --quiet -o -H newc) > "proto/$modules/initrd"
     cat > kernel.kdl <<MANIFEST
 schema-version 1
-package "system/kernel" publisher="canopa" version="$version" {
+package "system/kernel" publisher="$fixture_publisher" version="$version" {
     file "$modules/vmlinuz" mode="0644" uid=$(id -u) gid=$(id -g)
     file "$modules/initrd" mode="0644" uid=$(id -u) gid=$(id -g)
     kernel-install "$release" initrd=#true
@@ -116,7 +129,7 @@ if [[ $mode == rollback ]]; then
     printf 'legacy\n' > proto/etc/cps-vm-legacy-marker
     cat > legacy-marker.kdl <<MANIFEST
 schema-version 1
-package "test/legacy-marker" publisher="canopa" version="1.0.0-0" {
+package "test/legacy-marker" publisher="$fixture_publisher" version="1.0.0-0" {
     file "etc/cps-vm-legacy-marker" mode="0644" uid=$(id -u) gid=$(id -g)
 }
 MANIFEST
@@ -128,7 +141,9 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     publish_kernel 1.0.0-0 "$base_release" "$kernel"
     packages+=(system/kernel)
 fi
-if $systemd_guest; then
+if [[ -n $cps_fixture ]]; then
+    packages+=(cps://canopa/system/cps@0.1.0-1)
+elif $systemd_guest; then
     mkdir -p proto/usr/{bin,lib/systemd/system}
     sections=$(readelf --wide --section-headers "$cps")
     if [[ $sections =~ [[:space:]]\.z?debug_ ]]; then
@@ -137,7 +152,8 @@ if $systemd_guest; then
         cp -- "$cps" proto/usr/bin/cps
     fi
     cp "$project/packaging/systemd/cps-boot-health.service" proto/usr/lib/systemd/system/
-    sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/cps.kdl" > cps.kdl
+    sed -e '/^    require /d' -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
+        "$project/packaging/cps.kdl" > cps.kdl
     "$cps" publish --repo repo --proto proto --signing-key private.der cps.kdl
     packages+=(system/cps)
 fi
@@ -157,9 +173,19 @@ else
 fi
 if $systemd_guest; then
     setup_systemd_guest runtime
-    copy_runtime_deps runtime proto/usr/bin/cps
     if [[ $mode == capabilities ]]; then
         setup_capability_guest runtime "$cps" "$project/tests/file-capabilities-guest.sh"
+    fi
+    if [[ -n $cps_fixture ]]; then
+        # Leave runtime ownership to the packages selected from the signed repositories.
+        for path in "${elf_runtime_paths[@]}"; do
+            if [[ -f runtime/$path ]]; then cmp "runtime/$path" "$cps_fixture/image/$path"; fi
+            rm -f -- "runtime/$path"
+        done
+        for path in "${cps_library_paths[@]}"; do rm -f -- "runtime/$path"; done
+        touch runtime/etc/cps-vm-assert-cps-runtime
+    else
+        copy_runtime_deps runtime proto/usr/bin/cps
     fi
     if [[ $mode == rollback ]]; then
         prepare_fat_modules runtime "$trial_release" "${CPS_VM_TRIAL_MODULES_ROOT:-/}"
@@ -184,24 +210,35 @@ fi
 GUEST
     chmod 0755 runtime/init
 fi
-"$cps" manifest generate --proto runtime --publisher canopa --version 1.0.0-0 \
+"$cps" manifest generate --proto runtime --publisher "$fixture_publisher" --version 1.0.0-0 \
     --uid "$(id -u)" --gid "$(id -g)" test/boot-runtime > runtime.kdl
 "$cps" publish --repo repo --proto runtime --signing-key private.der runtime.kdl
 packages+=(test/boot-runtime)
-cat > image.kdl <<'CONFIG'
+cat > image.kdl <<CONFIG
 schema-version 1
-publisher "canopa" {
+publisher "$fixture_publisher" {
     repository "repo"
     trust-key "public.der"
 }
 CONFIG
 "$cps" image-create --root base --config image.kdl
+if [[ -n $cps_fixture ]]; then
+    "$cps" publisher add --root base --repo "$cps_fixture/repo" \
+        --trust-key "$cps_fixture/release-public.der" canopa
+    "$cps" publisher add --root base --repo "$cps_fixture/runtime-seed" \
+        --trust-key "$cps_fixture/runtime-seed-public.der" canopa-runtime-seed
+fi
 if [[ -n $busybox_repo ]]; then
     "$cps" publisher add --root base --repo "$busybox_repo" --trust-key "$busybox_key" canopa-bootstrap
 fi
 "$cps" plan --root base --output install.json install "${packages[@]}"
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
+if [[ -n $cps_fixture ]]; then
+    for path in usr/bin/cps "${cps_library_paths[@]}" "${elf_runtime_paths[@]}"; do
+        cmp "base/$path" "$cps_fixture/image/$path"
+    done
+fi
 
 base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
     --root-partuuid "$base_uuid" --options "$options")
@@ -230,8 +267,8 @@ fi
 if [[ $mode == rollback ]]; then
     cat > retirement.kdl <<RELEASE
 schema-version 1
-release "canopa" base="$(cat repo/current)" {
-    obsolete "cps://canopa/test/legacy-marker@2.0.0-0"
+release "$fixture_publisher" base="$(cat repo/current)" {
+    obsolete "cps://$fixture_publisher/test/legacy-marker@2.0.0-0"
 }
 RELEASE
     "$cps" repo publish-release --repo repo --signing-key private.der retirement.kdl
@@ -304,7 +341,7 @@ fi
 
 if [[ $mode == rollback ]]; then
     grep -Fq 'Install cps://extras/test/extra-marker 1.0.0-0' update.log
-    grep -Fq 'Remove cps://canopa/test/legacy-marker 1.0.0-0' update.log
+    grep -Fq "Remove cps://$fixture_publisher/test/legacy-marker 1.0.0-0" update.log
     test ! -e base/etc/cps-vm-extra-marker
     test "$(cat staged/etc/cps-vm-extra-marker)" = extras
     test "$(cat base/etc/cps-vm-legacy-marker)" = legacy
@@ -417,6 +454,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         tr -d '\r' < serial.log | grep -Fx 'CPS_VM_CAPABILITIES: verified'
     fi
     if [[ $mode == rollback ]]; then
+        if [[ -n $cps_fixture ]]; then
+            runtimes=$(tr -d '\r' < serial.log | grep '^CPS_VM_CPS_RUNTIME: ' || :)
+            test "$runtimes" = $'CPS_VM_CPS_RUNTIME: trial verified\nCPS_VM_CPS_RUNTIME: trial verified'
+            printf '%s\n' "$runtimes"
+        fi
         publishers=$(tr -d '\r' < serial.log | grep '^CPS_VM_PUBLISHER: ' || :)
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
@@ -451,6 +493,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         fi
         test "$rollback_publishers" = 'CPS_VM_PUBLISHER: previous absent'
         test "$rollback_obsoletions" = 'CPS_VM_OBSOLETION: previous retained'
+        if [[ -n $cps_fixture ]]; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_CPS_RUNTIME: previous verified'
+        fi
         printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
     fi
     exit 0

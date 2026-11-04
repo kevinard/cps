@@ -2,6 +2,7 @@ schema-version 1
 build architecture="@ARCH@" epoch=@EPOCH@ {
     toolchain "@CATALOG_SHA256@" solver="sat-v1" {
         package "build/native-rust"
+        package "build/cps-libraries"
     }
     manifest "cps.kdl" sha256="@MANIFEST_SHA256@"
     source "cps.tar.gz" size=@SOURCE_SIZE@ sha256="@SOURCE_SHA256@"

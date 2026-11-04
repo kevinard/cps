@@ -1,0 +1,6 @@
+schema-version 1
+package "system/libseccomp" publisher="canopa" version="2.6.1-0" {
+    require "system/elf-runtime"
+    file "usr/lib/libseccomp.so.2" mode="0755" uid=0 gid=0
+    file "usr/share/licenses/libseccomp/LICENSE" mode="0644" uid=0 gid=0
+}
