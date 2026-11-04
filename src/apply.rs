@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::Seek,
     path::Path,
@@ -10,9 +11,9 @@ use tempfile::NamedTempFile;
 
 use crate::{
     boot::kernel::Artifacts,
-    image::{Image, State, root::Root},
+    image::{Image, Managed, State, root::Root},
     model::{Node, digest_reader},
-    plan::{Plan, Write, build, payloads},
+    plan::{Plan, Write, build, hardlink_groups, payloads},
     repo::stage_blob,
     systemd::{self, Action as SystemdAction},
     verify::verify_state,
@@ -98,7 +99,13 @@ pub(crate) fn apply_with(
     };
 
     if !pending.files_ready {
-        write_files(&image.root, &stage, &pending.writes, &mut after_write)?;
+        write_files(
+            &image.root,
+            &stage,
+            &pending.writes,
+            &pending.next.paths,
+            &mut after_write,
+        )?;
         if offline.is_some() {
             pending.files_ready = true;
             image.update_pending(&pending)?;
@@ -132,11 +139,18 @@ fn write_files(
     root: &Root,
     stage: &File,
     writes: &[Write],
+    paths: &BTreeMap<String, Managed>,
     after_write: &mut impl FnMut(&Write),
 ) -> Result<()> {
     for node in payloads(writes).into_values() {
         checked_payload(root, node)?;
     }
+    let mut checked_target: Option<(&str, File)> = None;
+    let groups = if writes.iter().any(|write| write.detach) {
+        hardlink_groups(paths)
+    } else {
+        BTreeMap::new()
+    };
     for write in writes {
         if let (Some(before @ Node::Dir { .. }), Some(after @ Node::Dir { .. })) =
             (&write.before, &write.after)
@@ -147,9 +161,37 @@ fn write_files(
             }
             continue;
         }
+        let link_source = if let Some(target) = write.hardlink_target() {
+            if checked_target
+                .as_ref()
+                .is_none_or(|(name, _)| *name != target)
+            {
+                let managed = paths
+                    .get(target)
+                    .with_context(|| format!("missing hard link target {target}"))?;
+                checked_target =
+                    Some((target, root.checked_hardlink_target(target, &managed.node)?));
+            }
+            checked_target.as_ref().map(|(_, file)| file)
+        } else {
+            None
+        };
+        if let Some(source) = link_source
+            && root.shares_inode(&write.path, source)?
+        {
+            root.sync_parent(&write.path)?;
+            stage.sync_all()?;
+            continue;
+        }
         let observed = root.inspect(&write.path)?;
-        if observed == write.after {
-            if write.before != write.after {
+        let detach = write.detach
+            && observed == write.after
+            && root.has_other_links(
+                &write.path,
+                groups.get(write.path.as_str()).map_or(&[], Vec::as_slice),
+            )?;
+        if observed == write.after && !detach {
+            if write.before != write.after || write.detach {
                 root.sync_parent(&write.path)?;
                 stage.sync_all()?;
             }
@@ -168,10 +210,14 @@ fn write_files(
         }
         match &write.after {
             Some(node) => {
-                let payload = if matches!(node, Node::File { .. }) {
-                    Some(checked_payload(root, node)?)
-                } else {
-                    None
+                let payload = match node {
+                    Node::File { .. } => Some(checked_payload(root, node)?),
+                    Node::Hardlink { .. } => Some(
+                        link_source
+                            .context("missing hard link target")?
+                            .try_clone()?,
+                    ),
+                    _ => None,
                 };
                 root.replace(&write.path, node, payload, stage)?;
             }

@@ -152,6 +152,7 @@ shell=$(command -v bash)
     printf 'schema-version 1\npackage "build/probe" publisher="canopa" version="1.0.0-0" {\n'
     printf '    require "build/shell" version="=1.0.0-0"\n'
     add_file probe usr/bin/probe
+    printf '    hardlink "usr/bin/probe-alias" target="usr/bin/probe"\n'
     printf '}\n'
 } > probe.kdl
 "$cps" publish --repo repo --proto proto --signing-key signing.der probe.kdl
@@ -187,7 +188,8 @@ $1
 RECIPE
 }
 
-recipe '    probe
+recipe '    test /usr/bin/probe -ef /usr/bin/probe-alias
+    probe-alias
     test "$PWD" = /build
     test "$HOME" = /build/home
     test "$LC_ALL" = C

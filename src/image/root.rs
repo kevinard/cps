@@ -8,8 +8,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use rustix::{
     fs::{
-        AtFlags, FileType, Mode, OFlags, ResolveFlags, Stat, chownat, fchmod, fchown, fstat,
-        listxattr, mkdirat, open, openat2, readlinkat, renameat, statat, symlinkat, unlinkat,
+        AtFlags, CWD, FileType, Mode, OFlags, ResolveFlags, Stat, chownat, fchmod, fchown, fstat,
+        linkat, listxattr, mkdirat, open, openat2, readlinkat, renameat, statat, symlinkat,
+        unlinkat,
     },
     io::Errno,
     process::{Gid, Uid},
@@ -153,6 +154,67 @@ impl Root {
             .with_context(|| format!("inspecting {path}"))
     }
 
+    fn regular_entry(&self, path: &str) -> Result<Option<File>> {
+        validate_path(path)?;
+        match self.open_relative(path, OFlags::PATH | OFlags::NOFOLLOW) {
+            Ok(file) if file.metadata()?.is_file() => Ok(Some(file)),
+            Ok(_) | Err(Errno::NOENT) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("opening hard link path {path}")),
+        }
+    }
+
+    pub(crate) fn hardlink_matches(&self, path: &str, target: &str) -> Result<bool> {
+        let Some(file) = self.regular_entry(target)? else {
+            return Ok(false);
+        };
+        self.shares_inode(path, &file)
+    }
+
+    pub(crate) fn shares_inode(&self, path: &str, target: &File) -> Result<bool> {
+        let Some(file) = self.regular_entry(path)? else {
+            return Ok(false);
+        };
+        let (observed, expected) = (file.metadata()?, target.metadata()?);
+        Ok((observed.dev(), observed.ino()) == (expected.dev(), expected.ino()))
+    }
+
+    pub(crate) fn has_other_links(&self, path: &str, aliases: &[&str]) -> Result<bool> {
+        let file = self
+            .regular_entry(path)?
+            .with_context(|| format!("expected a regular file at {path}"))?;
+        let links = file.metadata()?.nlink();
+        if links == 1 {
+            return Ok(false);
+        }
+        let mut declared = 1;
+        for alias in aliases {
+            if self.shares_inode(alias, &file)? {
+                declared += 1;
+            }
+        }
+        Ok(links != declared)
+    }
+
+    pub(crate) fn checked_hardlink_target(&self, target: &str, expected: &Node) -> Result<File> {
+        let entry = self
+            .regular_entry(target)?
+            .with_context(|| format!("hard link target {target} is not a regular file"))?;
+        let file = File::open(Self::fd_path(&entry))?;
+        let metadata = file.metadata()?;
+        let observed = Node::File {
+            sha256: digest_reader(&file)?,
+            size: metadata.len(),
+            mode: metadata.mode() & 0o7777,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        ensure!(
+            observed == *expected,
+            "hard link target {target} differs from its manifest"
+        );
+        Ok(file)
+    }
+
     fn inspect_inner(&self, path: &str) -> Result<Option<Node>> {
         let (parent, leaf) = match self.parent(path) {
             Ok(entry) => entry,
@@ -247,6 +309,18 @@ impl Root {
                         AtFlags::SYMLINK_NOFOLLOW,
                     )?;
                 }
+            }
+            Node::Hardlink { .. } => {
+                let source = payload.context("missing verified hard link target")?;
+                // Link the checked descriptor, so the target path cannot be
+                // substituted between verification and materialization.
+                linkat(
+                    CWD,
+                    Self::fd_path(&source),
+                    staging,
+                    TEMP,
+                    AtFlags::SYMLINK_FOLLOW,
+                )?;
             }
             Node::Special => anyhow::bail!("cannot materialize special file {path}"),
         }

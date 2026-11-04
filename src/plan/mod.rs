@@ -18,7 +18,7 @@ use crate::{
     systemd::{self, Action as SystemdAction},
 };
 
-pub(crate) use paths::{effective_paths, select_paths};
+pub(crate) use paths::{effective_paths, hardlink_groups, select_paths};
 pub(crate) use resolve::{check as check_dependencies, resolve as resolve_packages};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,6 +43,8 @@ pub(crate) struct Write {
     pub path: String,
     pub before: Option<Node>,
     pub after: Option<Node>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) detach: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -125,6 +127,17 @@ impl Plan {
         }
         for write in self.writes.iter().filter(|write| write.removes_directory()) {
             lines.push(format!("Prune if empty {}", write.path));
+        }
+        for write in &self.writes {
+            if let Some(target) = write.hardlink_target() {
+                lines.push(format!("Link {} to {target}", write.path));
+            }
+            if write.detach {
+                lines.push(format!(
+                    "Detach {} from its old hard link group",
+                    write.path
+                ));
+            }
         }
         for effect in &self.systemd {
             lines.push(format!(
@@ -393,26 +406,56 @@ pub(crate) fn build(
                 to: new.owners.clone(),
             });
         }
+        let detach = before.is_some_and(|old| matches!(old.node, Node::Hardlink { .. }))
+            && matches!(destination, Some(Node::File { .. }))
+            && observed == destination;
         writes.insert(
             path.clone(),
             Write {
                 path: path.clone(),
                 before: observed,
                 after: destination,
+                detach,
             },
         );
     }
-    plan.writes = writes.into_values().collect();
-    plan.writes.sort_by_key(|write| {
-        let depth = write.path.bytes().filter(|b| *b == b'/').count();
-        if write.removes_directory() {
-            (2, usize::MAX - depth)
-        } else if write.after.as_ref().is_some_and(Node::is_dir) {
-            (0, depth)
-        } else {
-            (1, depth)
+    // Replacing a regular file swaps its inode. Its aliases still refer to
+    // the old inode even when their actions have not changed.
+    for (path, managed) in &paths {
+        if let Node::Hardlink { target } = &managed.node
+            && writes.get(target).is_some_and(Write::replaces_file)
+            && !writes.contains_key(path)
+        {
+            let before = root.inspect(path)?;
+            ensure!(
+                !matches!(before, Some(Node::Dir { .. } | Node::Special)),
+                "path type conflict at {path}"
+            );
+            writes.insert(
+                path.clone(),
+                Write {
+                    path: path.clone(),
+                    before,
+                    after: Some(managed.node.clone()),
+                    detach: false,
+                },
+            );
         }
-    });
+    }
+    for target in writes
+        .values()
+        .filter_map(Write::hardlink_target)
+        .collect::<BTreeSet<_>>()
+    {
+        if !writes.get(target).is_some_and(Write::replaces_file) {
+            let file = paths
+                .get(target)
+                .with_context(|| format!("missing hard link target {target}"))?;
+            root.checked_hardlink_target(target, &file.node)?;
+        }
+    }
+    plan.writes = writes.into_values().collect();
+    plan.writes.sort_by(|a, b| a.order().cmp(&b.order()));
     plan.payload_bytes = payloads(&plan.writes)
         .values()
         .try_fold(0_u64, |total, node| {
@@ -446,6 +489,30 @@ pub(crate) fn build(
 impl Write {
     pub(crate) fn removes_directory(&self) -> bool {
         self.after.is_none() && self.before.as_ref().is_some_and(Node::is_dir)
+    }
+
+    fn replaces_file(&self) -> bool {
+        matches!(self.after, Some(Node::File { .. })) && (self.before != self.after || self.detach)
+    }
+
+    pub(crate) fn hardlink_target(&self) -> Option<&str> {
+        match &self.after {
+            Some(Node::Hardlink { target }) => Some(target),
+            _ => None,
+        }
+    }
+
+    fn order(&self) -> (u8, usize, &str) {
+        let depth = self.path.bytes().filter(|b| *b == b'/').count();
+        if self.removes_directory() {
+            (3, usize::MAX - depth, "")
+        } else if let Some(target) = self.hardlink_target() {
+            (2, 0, target)
+        } else if self.after.as_ref().is_some_and(Node::is_dir) {
+            (0, depth, "")
+        } else {
+            (1, depth, "")
+        }
     }
 }
 
@@ -481,6 +548,7 @@ fn stage_config(
                     path: parent.to_owned(),
                     before,
                     after: Some(after),
+                    detach: false,
                 },
             );
         }
@@ -495,6 +563,7 @@ fn stage_config(
             path,
             before: None,
             after: Some(node.clone()),
+            detach: false,
         },
     );
     Ok(())
@@ -504,7 +573,7 @@ pub(crate) fn payloads(writes: &[Write]) -> BTreeMap<&str, &Node> {
     writes
         .iter()
         .filter_map(|write| match &write.after {
-            Some(node @ Node::File { sha256, .. }) if write.before != write.after => {
+            Some(node @ Node::File { sha256, .. }) if write.replaces_file() => {
                 Some((sha256.as_str(), node))
             }
             _ => None,

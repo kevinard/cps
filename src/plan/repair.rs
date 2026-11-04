@@ -39,6 +39,11 @@ pub(super) fn writes(
     let mut writes = BTreeMap::new();
     for path in paths {
         let managed = &state.paths[path];
+        if let Node::Hardlink { target } = &managed.node
+            && root.hardlink_matches(path, target)?
+        {
+            continue;
+        }
         let before = root.inspect(path)?;
         if before.as_ref() == Some(&managed.node)
             || (managed.implicit && before.as_ref().is_some_and(Node::is_dir))
@@ -74,6 +79,7 @@ pub(super) fn writes(
                 path: path.to_owned(),
                 before,
                 after: Some(managed.node.clone()),
+                detach: false,
             },
         );
     }

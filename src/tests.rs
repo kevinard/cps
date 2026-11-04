@@ -107,6 +107,201 @@ fn dependency(kind: &str, name: &str, version: &str) -> String {
 }
 
 #[test]
+fn hardlinks_follow_target_updates_and_resume_offline() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    const ALIAS: &str = "bin/compositor";
+    const OTHER: &str = "usr/bin/compositor";
+    let f = Fixture::new()?;
+    let package = |version, bytes| {
+        f.package(
+            "desktop/compositor",
+            version,
+            f.file(COMPOSITOR, bytes, "0755", "")?
+                + &format!(
+                    "    hardlink {ALIAS:?} target={COMPOSITOR:?}\n    hardlink {OTHER:?} target={COMPOSITOR:?}\n"
+                ),
+        )
+    };
+    let check_links = |root: &Path, bytes: &str| -> Result<u64> {
+        let canonical = fs::metadata(root.join(COMPOSITOR))?;
+        assert_eq!(canonical.nlink(), 3);
+        for path in [ALIAS, OTHER] {
+            let alias = fs::metadata(root.join(path))?;
+            assert_eq!(
+                (alias.dev(), alias.ino()),
+                (canonical.dev(), canonical.ino())
+            );
+            assert_eq!(fs::read_to_string(root.join(path))?, bytes);
+        }
+        assert!(crate::verify_pristine(root)?.is_empty());
+        Ok(canonical.ino())
+    };
+    package("1.0.0-0", "version one")?;
+    f.create()?;
+    let plan_for = |request| plan(&f.root, request);
+    let install = plan_for(Request::Install {
+        packages: vec!["desktop/compositor".into()],
+    })?;
+    assert!(install.summary().contains("11 payload bytes required"));
+    assert_eq!(apply(&f.root, &install)?, 1);
+    let old_inode = check_links(&f.root, "version one")?;
+    let copy = f.root.with_extension("clone");
+    crate::stage_boot_environment(&f.root, &copy, &plan_for(Request::Update)?)?;
+    assert_ne!(old_inode, check_links(&copy, "version one")?);
+
+    let unowned = f.root.with_extension("unowned");
+    fs::hard_link(f.root.join(COMPOSITOR), &unowned)?;
+    assert!(verify(&f.root)?.is_empty());
+    assert!(
+        crate::verify_pristine(&f.root)?.iter().any(|finding| {
+            finding.is_error && finding.message.contains("unexpected hard link")
+        })
+    );
+    fs::remove_file(unowned)?;
+
+    package("2.0.0-0", "version two")?;
+    let upgrade = plan_for(Request::Update)?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("upgrade.json"),
+        &upgrade,
+        ALIAS,
+    )?;
+    assert_eq!(fs::read_to_string(f.root.join(ALIAS))?, "version two");
+    assert_eq!(fs::read_to_string(f.root.join(OTHER))?, "version one");
+    assert!(verify(&f.root).is_err());
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    assert_eq!(apply(&f.root, &upgrade)?, 2);
+    assert_ne!(old_inode, check_links(&f.root, "version two")?);
+
+    fs::remove_file(f.root.join(ALIAS))?;
+    fs::copy(f.root.join(COMPOSITOR), f.root.join(ALIAS))?;
+    assert!(
+        verify(&f.root)?.iter().any(|finding| {
+            finding.is_error && finding.message.contains("expected a hard link")
+        })
+    );
+    let repair = || {
+        plan_for(Request::Repair {
+            packages: vec!["desktop/compositor".into()],
+        })
+    };
+    let fix = repair()?;
+    assert!(fix.summary().contains("0 payload bytes required"));
+    assert_eq!(apply(&f.root, &fix)?, 3);
+    check_links(&f.root, "version two")?;
+
+    fs::write(f.root.join(COMPOSITOR), "corrupt")?;
+    let fix = repair()?;
+    fs::rename(&offline, &f.repo)?;
+    assert_eq!(apply(&f.root, &fix)?, 4);
+    check_links(&f.root, "version two")?;
+
+    // Splitting a group requires fresh inodes even when all payload bytes and
+    // metadata stay the same. Replay after the new alias is already linked.
+    const NEW: &str = "bin/new-compositor";
+    f.package(
+        "desktop/compositor",
+        "3.0.0-0",
+        f.file(COMPOSITOR, "version two", "0755", "")?
+            + &f.file(ALIAS, "version two", "0755", "")?
+            + &f.file(OTHER, "version two", "0755", "")?
+            + &format!("    hardlink {NEW:?} target={ALIAS:?}\n"),
+    )?;
+    let split = plan_for(Request::Update)?;
+    assert!(split.summary().contains(&format!("Detach {ALIAS}")));
+    interrupt_apply_at(&f.root, &f._dir.path().join("split.json"), &split, NEW)?;
+    let after = fs::metadata(f.root.join(ALIAS))?.ino();
+    assert_eq!(apply(&f.root, &split)?, 5);
+    assert_eq!(after, fs::metadata(f.root.join(ALIAS))?.ino());
+    assert_eq!(after, fs::metadata(f.root.join(NEW))?.ino());
+    let canonical = fs::metadata(f.root.join(COMPOSITOR))?;
+    let other = fs::metadata(f.root.join(OTHER))?;
+    assert_ne!(canonical.ino(), other.ino());
+    assert_ne!(canonical.ino(), after);
+    assert_ne!(other.ino(), after);
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
+
+    let remove = plan_for(Request::Remove {
+        packages: vec!["desktop/compositor".into()],
+    })?;
+    assert_eq!(apply(&f.root, &remove)?, 6);
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn hardlink_targets_must_be_immutable_files_owned_by_the_same_package() -> Result<()> {
+    use crate::kdl_format::parse_manifest;
+
+    let parse = |actions: &str| {
+        parse_manifest(&format!(
+            "schema-version 1\npackage \"test/hardlinks\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}\n}}\n"
+        ))
+    };
+    let file = "file \"usr/bin/tool\" mode=\"0755\" uid=0 gid=0";
+    let link = "hardlink \"bin/tool\" target=\"usr/bin/tool\"";
+    for actions in [
+        link.to_owned(),
+        format!("{file} preserve=#true\n{link}"),
+        format!("{file} facet=\"doc.man\"\n{link}"),
+        format!("{file} arch=\"aarch64\"\n{link} arch=\"x86_64\""),
+        format!("symlink \"usr/bin/tool\" target=\"external\" uid=0 gid=0\n{link}"),
+        format!("hardlink \"usr/bin/tool\" target=\"bin/tool\"\n{link}"),
+        "hardlink \"bin/tool\" target=\"../tool\"".to_owned(),
+        "hardlink \"bin/tool\" target=\"bin/tool\"".to_owned(),
+    ] {
+        assert!(parse(&actions)?.validate(false).is_err(), "{actions}");
+    }
+    assert!(parse(&format!("{file}\n{link} uid=0")).is_err());
+    parse(&format!("{file}\n{link} arch=\"x86_64\""))?.validate(false)?;
+    parse(&format!(
+        "{file} facet=\"doc.man\"\n{link} facet=\"doc.man\""
+    ))?
+    .validate(false)?;
+    Ok(())
+}
+
+#[test]
+fn adding_a_hardlink_checks_the_unchanged_target_before_writing() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new()?;
+    let canonical = f.file("usr/bin/tool", "tool", "0755", "")?;
+    f.package("test/tool", "1.0.0-0", canonical.clone())?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/tool".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    f.package(
+        "test/tool",
+        "2.0.0-0",
+        canonical + "    hardlink \"bin/tool\" target=\"usr/bin/tool\"\n",
+    )?;
+    let upgrade = plan(&f.root, Request::Update)?;
+    let outside = f.root.with_extension("external");
+    fs::write(&outside, "outside")?;
+    fs::remove_file(f.root.join("usr/bin/tool"))?;
+    symlink(&outside, f.root.join("usr/bin/tool"))?;
+    let error = apply(&f.root, &upgrade).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("hard link target usr/bin/tool is not a regular file")
+    );
+    assert!(!f.root.join("bin/tool").exists());
+    assert_eq!(fs::read_to_string(outside)?, "outside");
+    assert!(verify(&f.root)?.iter().any(|finding| finding.is_error));
+    Ok(())
+}
+
+#[test]
 fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()> {
     use std::os::unix::fs::{PermissionsExt, symlink};
 

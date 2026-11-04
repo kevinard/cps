@@ -153,7 +153,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             "require" | "incorporate" | "exclude" | "require-any" | "conditional" => manifest
                 .dependency
                 .push(parse_dependency(node).with_context(|| format!("{name} dependency"))?),
-            "file" | "dir" | "symlink" => manifest
+            "file" | "dir" | "symlink" | "hardlink" => manifest
                 .action
                 .push(parse_action(node).with_context(|| format!("{name} action"))?),
             "sysusers" | "tmpfiles" | "preset" => {
@@ -240,14 +240,23 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             "mode", "uid", "gid", "arch", "facet", "preserve", "sha256", "size",
         ],
         "dir" => &["mode", "uid", "gid", "arch", "facet"],
+        "hardlink" => &["target", "arch", "facet"],
         _ => &["target", "uid", "gid", "arch", "facet"],
     };
     let fields = Fields::read(node, 1, props, false)?;
     let path = fields.string_arg(0)?;
-    let uid = fields.owner("uid")?;
-    let gid = fields.owner("gid")?;
     let arch = fields.string("arch")?;
     let facet = fields.string("facet")?;
+    if name == "hardlink" {
+        return Ok(Action::Hardlink {
+            path,
+            target: fields.required_string("target")?,
+            arch,
+            facet,
+        });
+    }
+    let uid = fields.owner("uid")?;
+    let gid = fields.owner("gid")?;
     Ok(match name {
         "file" => Action::File {
             path,
@@ -332,9 +341,10 @@ pub fn manifest_text(manifest: &Manifest) -> String {
             Action::File { .. } => "file",
             Action::Dir { .. } => "dir",
             Action::Symlink { .. } => "symlink",
+            Action::Hardlink { .. } => "hardlink",
         });
         node.push(action.path());
-        let (uid, gid) = match action {
+        let owner = match action {
             Action::File {
                 uid,
                 gid,
@@ -354,21 +364,27 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 if let Some(size) = size {
                     node.insert("size", i128::from(*size));
                 }
-                (*uid, *gid)
+                Some((*uid, *gid))
             }
             Action::Dir { uid, gid, mode, .. } => {
                 node.insert("mode", mode.as_str());
-                (*uid, *gid)
+                Some((*uid, *gid))
             }
             Action::Symlink {
                 uid, gid, target, ..
             } => {
                 node.insert("target", target.as_str());
-                (*uid, *gid)
+                Some((*uid, *gid))
+            }
+            Action::Hardlink { target, .. } => {
+                node.insert("target", target.as_str());
+                None
             }
         };
-        node.insert("uid", i128::from(uid));
-        node.insert("gid", i128::from(gid));
+        if let Some((uid, gid)) = owner {
+            node.insert("uid", i128::from(uid));
+            node.insert("gid", i128::from(gid));
+        }
         let (facet, arch) = action.selectors();
         if let Some(facet) = facet {
             node.insert("facet", facet);

@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, fmt, io::Read, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    io::Read,
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -286,6 +291,14 @@ pub enum Action {
         #[serde(skip_serializing_if = "Option::is_none")]
         arch: Option<String>,
     },
+    Hardlink {
+        path: String,
+        target: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        facet: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arch: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -307,6 +320,9 @@ pub enum Node {
         target: String,
         uid: u32,
         gid: u32,
+    },
+    Hardlink {
+        target: String,
     },
     Special,
 }
@@ -330,7 +346,10 @@ fn parse_mode(mode: &str) -> Result<u32> {
 impl Action {
     pub fn path(&self) -> &str {
         match self {
-            Self::File { path, .. } | Self::Dir { path, .. } | Self::Symlink { path, .. } => path,
+            Self::File { path, .. }
+            | Self::Dir { path, .. }
+            | Self::Symlink { path, .. }
+            | Self::Hardlink { path, .. } => path,
         }
     }
 
@@ -338,7 +357,8 @@ impl Action {
         match self {
             Self::File { facet, arch, .. }
             | Self::Dir { facet, arch, .. }
-            | Self::Symlink { facet, arch, .. } => (facet.as_deref(), arch.as_deref()),
+            | Self::Symlink { facet, arch, .. }
+            | Self::Hardlink { facet, arch, .. } => (facet.as_deref(), arch.as_deref()),
         }
     }
 
@@ -373,6 +393,9 @@ impl Action {
                 target: target.clone(),
                 uid: *uid,
                 gid: *gid,
+            },
+            Self::Hardlink { target, .. } => Node::Hardlink {
+                target: target.clone(),
             },
         })
     }
@@ -425,6 +448,11 @@ impl Action {
                 );
                 (*uid, *gid)
             }
+            Self::Hardlink { target, .. } => {
+                validate_path(target)?;
+                ensure!(target != path, "hard link points to itself");
+                return Ok(());
+            }
         };
         ensure!(uid != u32::MAX && gid != u32::MAX, "invalid owner");
         Ok(())
@@ -474,13 +502,33 @@ impl Manifest {
         for dependency in &self.dependency {
             dependency.validate()?;
         }
-        let mut actions = BTreeSet::new();
+        let mut actions = BTreeMap::new();
         for action in &self.action {
             action
                 .validate(published)
                 .with_context(|| format!("action {}", action.path()))?;
-            if !actions.insert((action.path(), action.selectors())) {
+            if actions
+                .insert((action.path(), action.selectors()), action)
+                .is_some()
+            {
                 bail!("duplicate action for {}", action.path());
+            }
+        }
+        for action in &self.action {
+            if let Action::Hardlink { path, target, .. } = action {
+                let (facet, arch) = action.selectors();
+                ensure!(
+                    [None, facet]
+                        .into_iter()
+                        .any(|facet| [None, arch].into_iter().any(|arch| matches!(
+                            actions.get(&(target.as_str(), (facet, arch))),
+                            Some(Action::File {
+                                preserve: false,
+                                ..
+                            })
+                        ))),
+                    "hard link {path} requires an immutable file action for {target} in the same package with compatible selectors"
+                );
             }
         }
         let mut systemd = BTreeSet::new();

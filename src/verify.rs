@@ -6,7 +6,7 @@ use rustix::fs::FileType;
 use crate::{
     image::{Image, Managed, State, root::Root},
     model::{Node, validate_path},
-    plan::{check_dependencies, effective_paths},
+    plan::{check_dependencies, effective_paths, hardlink_groups},
 };
 
 #[derive(Debug)]
@@ -62,6 +62,18 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
     }
     for (path, managed) in &expected {
         validate_path(path)?;
+        if let Node::Hardlink { target } = &managed.node {
+            let message = match root.hardlink_matches(path, target) {
+                Ok(true) => continue,
+                Ok(false) => format!("{path}: expected a hard link to {target}"),
+                Err(error) => format!("{path}: {error:#}"),
+            };
+            findings.push(Finding {
+                is_error: true,
+                message,
+            });
+            continue;
+        }
         let observed = match root.inspect(path) {
             Ok(node) => node,
             Err(error) => {
@@ -112,19 +124,27 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
         });
     }
     if pristine {
+        let aliases = hardlink_groups(&expected);
         root.walk(Some(".cps"), |path, entry, info| {
-            if !expected.contains_key(path) {
+            let Some(managed) = expected.get(path) else {
                 findings.push(Finding {
                     is_error: true,
                     message: format!("unmanaged path {path:?}"),
                 });
                 return Ok(false);
-            }
+            };
             let kind = FileType::from_raw_mode(info.st_mode);
-            if kind == FileType::RegularFile && info.st_nlink != 1 {
+            let links = 1 + aliases.get(path).map_or(0, Vec::len) as u64;
+            if kind == FileType::RegularFile
+                && !matches!(managed.node, Node::Hardlink { .. })
+                && info.st_nlink != links
+            {
                 findings.push(Finding {
                     is_error: true,
-                    message: format!("unexpected hard link at {path:?}"),
+                    message: format!(
+                        "unexpected hard link count at {path:?}: expected {links}, found {}",
+                        info.st_nlink
+                    ),
                 });
             }
             if matches!(kind, FileType::RegularFile | FileType::Directory)

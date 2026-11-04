@@ -363,6 +363,7 @@ fn prepare_toolchain(
                 set_mode(&file, 0o755)?;
             }
             Node::Symlink { target, .. } => symlink(target, &file)?,
+            Node::Hardlink { .. } => {}
             Node::File { mode, .. } => {
                 let mut destination = OpenOptions::new()
                     .read(true)
@@ -375,6 +376,12 @@ fn prepare_toolchain(
                 destination.set_permissions(fs::Permissions::from_mode(mode))?;
             }
             Node::Special => bail!("unexpected special file in toolchain"),
+        }
+    }
+    for (name, managed) in &paths {
+        if let Node::Hardlink { target } = &managed.node {
+            fs::hard_link(path.join(target), path.join(name))
+                .with_context(|| format!("linking toolchain file {name} to {target}"))?;
         }
     }
     for mount in MOUNTS {

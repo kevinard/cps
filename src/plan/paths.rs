@@ -54,6 +54,19 @@ pub(crate) fn effective_paths(
     )
 }
 
+pub(crate) fn hardlink_groups(paths: &BTreeMap<String, Managed>) -> BTreeMap<&str, Vec<&str>> {
+    let mut groups = BTreeMap::<_, Vec<_>>::new();
+    for (path, managed) in paths {
+        if let Node::Hardlink { target } = &managed.node {
+            groups
+                .entry(target.as_str())
+                .or_default()
+                .push(path.as_str());
+        }
+    }
+    groups
+}
+
 pub(crate) fn select_paths(
     arch: &str,
     facets: &BTreeMap<String, bool>,
