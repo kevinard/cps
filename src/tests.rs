@@ -930,6 +930,117 @@ fn builder_policy_changes_are_atomic_and_wait_for_transaction_recovery() -> Resu
 }
 
 #[test]
+fn build_receipts_survive_offline_transaction_recovery_and_follow_installed_packages() -> Result<()>
+{
+    use crate::{
+        attestation::{LegacyToolchain, Toolchain, sign},
+        audit_publisher_builds,
+        kdl_format::{build, parse_manifest},
+        model::FileDigest,
+        publish_bundle,
+        repo::read_signing_key,
+        set_publisher_build_trust,
+    };
+
+    let f = Fixture::new()?;
+    let worker = Fixture::new()?;
+    let bundle = f._dir.path();
+    let bytes = "guarded executable";
+    let action = f.file(COMPOSITOR, bytes, "0755", "")?;
+    let manifest = format!(
+        "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{action}}}\n"
+    );
+    fs::write(&f.recipe, &manifest)?;
+    let pin = digest(b"test toolchain catalog");
+    let recipe = format!(
+        r#"schema-version 1
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain "{pin}" {{ package "build/shell"; }}
+    manifest "manifest.kdl" sha256="{}"
+    script "true"
+}}
+"#,
+        digest(manifest.as_bytes())
+    );
+    fs::write(bundle.join("build.kdl"), &recipe)?;
+    let toolchain = Toolchain::Legacy(LegacyToolchain {
+        publisher: "seed".into(),
+        key_sha256: digest(b"test toolchain key"),
+        catalog_sha256: pin,
+        package_manifests: BTreeMap::from([("build/shell".into(), digest(b"test shell"))]),
+    });
+    let evidence = sign(
+        &read_signing_key(&worker.private)?,
+        &parse_manifest(&manifest)?,
+        manifest.as_bytes(),
+        &build::parse(&recipe)?,
+        recipe.as_bytes(),
+        toolchain,
+        &BTreeMap::from([(
+            COMPOSITOR.into(),
+            FileDigest {
+                sha256: digest(bytes.as_bytes()),
+                size: bytes.len() as u64,
+            },
+        )]),
+    )?;
+    fs::write(bundle.join("attestation.json"), evidence)?;
+    publish_bundle(
+        &f.repo,
+        bundle,
+        &f.private,
+        &worker.public,
+        &digest(recipe.as_bytes()),
+    )?;
+
+    f.create()?;
+    let policy = bundle.join("trust.kdl");
+    fs::write(
+        &policy,
+        format!(
+            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            worker.public
+        ),
+    )?;
+    set_publisher_build_trust(&f.root, "canopa", &policy, false)?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    interrupt_apply_at(&f.root, &bundle.join("pending.json"), &install, COMPOSITOR)?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert_eq!(apply(&f.root, &install)?, 1);
+    let audit = audit_publisher_builds(&f.root, "canopa")?;
+    assert_eq!(audit.verified, 1);
+    assert!(audit.failures.is_empty());
+
+    {
+        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        assert_eq!(
+            db.execute("UPDATE build_receipts SET envelope=x'00'", [])?,
+            1
+        );
+    }
+    let audit = audit_publisher_builds(&f.root, "canopa")?;
+    assert_eq!(audit.verified, 0);
+    assert_eq!(audit.failures.len(), 1);
+    assert!(audit.failures[0].contains("archived build attestation digest mismatch"));
+    let remove = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    assert_eq!(apply(&f.root, &remove)?, 2);
+    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let count: u32 = db.query_row("SELECT count(*) FROM build_receipts", [], |row| row.get(0))?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[test]
 fn solver_honors_exclusions_and_explains_impossible_requests() -> Result<()> {
     let f = Fixture::new()?;
     f.package(

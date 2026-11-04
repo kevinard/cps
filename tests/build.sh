@@ -655,6 +655,10 @@ build-trust minimum-builders=2 {
 POLICY
 "$cps" publisher set-build-trust --root image --policy trust.kdl canopa
 "$cps" publisher audit-builds --root image canopa | grep -F 'Verified build evidence for 1 installed package'
+mv witnessed witnessed-offline
+"$cps" publisher audit-builds --root image canopa | grep -F 'Verified build evidence for 1 installed package'
+"$cps" publisher audit-builds --root guarded canopa | grep -F 'Verified build evidence for 1 installed package'
+mv witnessed-offline witnessed
 "$cps" image-create --root added --repo repo --publisher canopa --trust-key public.der
 expect_failure 'builder and publisher must use distinct keys' "$cps" publisher add \
     --root added --repo tools-repo --trust-key other-public.der --build-trust trust.kdl tools
@@ -796,4 +800,8 @@ sed '/^schema-version 1/a release-profile "base"' protected-image.kdl > profiled
 "$cps" publisher set-build-trust --root profiled --policy rotated-trust.kdl canopa
 expect_failure 'signed release profile fixes this image' "$cps" publisher prefer --root profiled canopa
 "$cps" plan --root profiled --output profiled.json install demo/hello
+mv witnessed witnessed-offline
+"$cps" publisher audit-builds --root guarded-staged canopa | grep -F 'Verified build evidence for 2 installed package'
+expect_failure 'requires 2 trusted builder signatures, found 1' "$cps" publisher audit-builds --root guarded canopa
+mv witnessed-offline witnessed
 echo "Verified isolated build, reproducibility, signed provenance, and package installation"

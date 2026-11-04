@@ -16,6 +16,7 @@ use crate::{
     boot::kernel::{self, Artifacts},
     image::{Image, Settings, State, publisher_generation_is_initial, root::Root},
     model::{FORMAT, Node, digest, validate_name},
+    repo::BuildReceipt,
     systemd::{self, Action as SystemdAction},
 };
 
@@ -261,8 +262,9 @@ pub(crate) fn build(
     request: Request,
     saved: Option<&Plan>,
     solver: Option<SolverRevision>,
-) -> Result<(Plan, State)> {
+) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let mut catalogs = catalogs::Catalogs::default();
+    let mut receipts = Vec::new();
     let (installed, paths) = match &request {
         Request::Repair { .. } | Request::ResolveConfig { .. } => {
             let paths = crate::verify::manifest_paths(&state)?;
@@ -305,7 +307,7 @@ pub(crate) fn build(
                 solver,
                 |installed| effective_paths(&state.settings, installed),
             )?;
-            catalogs.verify_builds(&state, &installed)?;
+            receipts = catalogs.verify_builds(&state, &installed)?;
             (installed, paths)
         }
     };
@@ -608,7 +610,7 @@ pub(crate) fn build(
     );
     state.installed = installed;
     state.paths = paths;
-    Ok((plan, state))
+    Ok((plan, state, receipts))
 }
 
 impl Write {

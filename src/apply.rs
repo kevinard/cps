@@ -17,7 +17,7 @@ use crate::{
     },
     model::{Node, copy_payload, digest_reader},
     plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads},
-    repo::{release::fetch_payloads, stage_blob},
+    repo::{BuildReceipt, release::fetch_payloads, stage_blob},
     systemd::{self, Action as SystemdAction},
     verify::verify_state,
 };
@@ -52,7 +52,7 @@ pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     if image.applied(&plan.id()?)?.is_some() {
         return Ok(0);
     }
-    let (checked, next) = check_plan(&image.root, state, plan)?;
+    let (checked, next, _) = check_plan(&image.root, state, plan)?;
     if checked.config_update_revision.is_some() {
         return Ok(0);
     }
@@ -74,7 +74,7 @@ pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     Ok(count)
 }
 
-fn check_plan(root: &Root, state: State, plan: &Plan) -> Result<(Plan, State)> {
+fn check_plan(root: &Root, state: State, plan: &Plan) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     ensure!(
         plan.base_revision == state.settings.revision,
         "stale plan for revision {}; image is at revision {}",
@@ -82,12 +82,13 @@ fn check_plan(root: &Root, state: State, plan: &Plan) -> Result<(Plan, State)> {
         state.settings.revision
     );
     plan.check_publisher_generation(&state.settings)?;
-    let (checked, next) = build(root, state, plan.request.clone(), Some(plan), plan.solver)?;
+    let (checked, next, receipts) =
+        build(root, state, plan.request.clone(), Some(plan), plan.solver)?;
     ensure!(
         &checked == plan,
         "saved plan differs from the verified plan; generate a new plan"
     );
-    Ok((checked, next))
+    Ok((checked, next, receipts))
 }
 
 pub(crate) fn apply_with(
@@ -120,7 +121,7 @@ pub(crate) fn apply_with(
         if let Some(revision) = image.applied(&id)? {
             return Ok(revision);
         }
-        let (checked, next) = check_plan(&image.root, state, plan)?;
+        let (checked, next, receipts) = check_plan(&image.root, state, plan)?;
         let offline = offline_target(
             &image.root,
             !checked.systemd.is_empty() || checked.kernel_install.is_some(),
@@ -134,7 +135,7 @@ pub(crate) fn apply_with(
             kernel_install: checked.kernel_install,
             files_ready: false,
         };
-        image.record_pending(&pending)?;
+        image.record_pending(&pending, &pending.next.publishers, &receipts)?;
         (pending, offline)
     };
 

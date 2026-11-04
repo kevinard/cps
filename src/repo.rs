@@ -328,6 +328,71 @@ pub struct Snapshot {
 pub(crate) struct BuildEvidence {
     attestations: BTreeMap<String, String>,
     publisher_keys: Vec<[u8; 32]>,
+    history: BuildHistory,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BuildHistory {
+    catalog: String,
+    sequence: Option<NonZeroU64>,
+    rotations: Vec<keys::Rotation>,
+}
+
+/// Local record of an authenticated catalog's admission of a manifest.
+/// The envelope and publisher key transitions are independently verifiable.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuildReceipt {
+    pub publisher: String,
+    pub manifest: String,
+    attestation: String,
+    history: BuildHistory,
+}
+
+impl BuildReceipt {
+    fn new(package: &Published, attestation: &str, history: &BuildHistory) -> Self {
+        Self {
+            publisher: package.manifest.publisher.clone(),
+            manifest: package.sha256.clone(),
+            attestation: attestation.to_owned(),
+            history: history.clone(),
+        }
+    }
+
+    pub(crate) fn read_attestation(&self, repo: &Path) -> Result<Vec<u8>> {
+        read_object(repo, "attestations", &self.attestation, ATTESTATION_LIMIT)
+    }
+
+    pub(crate) fn verify(
+        &self,
+        bytes: &[u8],
+        package: &Published,
+        anchor: &[u8],
+        trust: &BuildTrust,
+    ) -> Result<()> {
+        validate_digest(&self.history.catalog)?;
+        ensure!(
+            self.manifest == package.sha256 && self.publisher == package.manifest.publisher,
+            "archived build receipt belongs to a different package"
+        );
+        ensure!(
+            digest(bytes) == self.attestation,
+            "archived build attestation digest mismatch"
+        );
+        let signer = keys::signer(
+            &self.publisher,
+            self.history.sequence,
+            &self.history.rotations,
+            keys::Trust::Anchor(anchor),
+        )?;
+        for rotation in &self.history.rotations {
+            trust.check_publisher_key(rotation.previous_key())?;
+        }
+        trust.check_publisher_key(&signer)?;
+        package.verify()?;
+        verify_package_attestation(bytes, trust, package)
+    }
 }
 
 impl BuildEvidence {
@@ -336,50 +401,54 @@ impl BuildEvidence {
         repo: &Path,
         trust: &BuildTrust,
         package: &Published,
-    ) -> Result<()> {
+    ) -> Result<BuildReceipt> {
         for key in &self.publisher_keys {
             trust.check_publisher_key(key)?;
         }
         let id = package.manifest.id();
-        verify_package_attestation(
-            repo,
-            trust,
-            package,
-            self.attestations.get(&id).map(String::as_str),
-        )
+        let hash = self
+            .attestations
+            .get(&id)
+            .with_context(|| format!("no build attestation for {id}"))?;
+        verify_repository_attestation(repo, trust, package, hash)?;
+        Ok(BuildReceipt::new(package, hash, &self.history))
     }
 }
 
-fn verify_package_attestation(
+fn verify_repository_attestation(
     repo: &Path,
     trust: &BuildTrust,
     package: &Published,
-    hash: Option<&str>,
+    hash: &str,
 ) -> Result<()> {
     let id = package.manifest.id();
-    let hash = hash.with_context(|| format!("no build attestation for {id}"))?;
+    let bytes = read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
+        .with_context(|| format!("reading build attestation for {id}"))?;
+    verify_package_attestation(&bytes, trust, package)
+}
+
+fn verify_package_attestation(bytes: &[u8], trust: &BuildTrust, package: &Published) -> Result<()> {
     let document = package
         .document
         .as_ref()
         .context("build trust requires a published KDL manifest")?;
-    let bytes = read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
-        .with_context(|| format!("reading build attestation for {id}"))?;
     trust
         .verify(
-            &bytes,
+            bytes,
             &package.manifest,
             FileDigest {
                 sha256: package.sha256.clone(),
                 size: document.len() as u64,
             },
         )
-        .with_context(|| format!("verifying build evidence for {id}"))
+        .with_context(|| format!("verifying build evidence for {}", package.manifest.id()))
 }
 
 #[derive(Default)]
 pub struct BuildAudit {
     pub verified: usize,
     pub failures: Vec<String>,
+    pub(crate) receipts: Vec<BuildReceipt>,
 }
 
 pub(crate) fn audit_installed_builds<'a>(
@@ -396,6 +465,11 @@ pub(crate) fn audit_installed_builds<'a>(
         trust.check_publisher_key(&key)?;
     }
     let mut audit = BuildAudit::default();
+    let history = BuildHistory {
+        catalog: hash,
+        sequence: catalog.sequence,
+        rotations: catalog.key_rotations.clone(),
+    };
     for package in installed {
         let id = package.manifest.id();
         let installed_record = || {
@@ -407,13 +481,19 @@ pub(crate) fn audit_installed_builds<'a>(
                 manifest == package.sha256,
                 "installed manifest digest differs from the signed catalog"
             );
-            Ok(attestation)
+            attestation.with_context(|| format!("no build attestation for {id}"))
         };
         let result = installed_record()
             .with_context(|| format!("checking installed manifest for {id}"))
-            .and_then(|attestation| verify_package_attestation(repo, trust, package, attestation));
+            .and_then(|attestation| {
+                verify_repository_attestation(repo, trust, package, attestation)?;
+                Ok(BuildReceipt::new(package, attestation, &history))
+            });
         match result {
-            Ok(()) => audit.verified += 1,
+            Ok(receipt) => {
+                audit.verified += 1;
+                audit.receipts.push(receipt);
+            }
             Err(error) => audit.failures.push(format!("{error:#}")),
         }
     }
@@ -626,11 +706,16 @@ fn catalog_snapshot(repo: &Path, catalog: Catalog, hash: String, key: &[u8]) -> 
         packages.push(read_package(repo, &catalog.publisher, &id, sha256)?);
     }
     Ok(Snapshot {
-        sha256: hash,
+        sha256: hash.clone(),
         packages,
         builds: BuildEvidence {
             attestations: catalog.attestations,
             publisher_keys,
+            history: BuildHistory {
+                catalog: hash,
+                sequence: catalog.sequence,
+                rotations: catalog.key_rotations,
+            },
         },
         withdrawals: catalog.withdrawals,
         obsoletions: catalog.obsoletions,

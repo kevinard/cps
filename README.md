@@ -330,10 +330,21 @@ cps publisher set-build-trust --root image --policy builders.kdl canopa
 cps publisher audit-builds --root image canopa
 ```
 
-By default, CPS checks every installed package from that publisher before
-saving the policy. The audit matches the installed manifest against the
-signed current catalog or the catalog pinned by the image's release profile.
-It can check withdrawn packages when their evidence is still cached.
+Applying a guarded plan archives each admitted package's signed attestation,
+catalog digest, and publisher key history in the image database. The archive
+follows the installed versions in each boot environment. `audit-builds`
+rechecks those signatures against the installed manifest, the recorded
+publisher key history, and the image's current builder policy, even without
+the repository.
+
+By default, CPS checks the current or profile-pinned catalog's publisher key
+history and audits every installed package before saving the policy. For a
+package without an archived receipt, it checks the installed manifest
+against the signed catalog and reads the referenced evidence from the
+repository cache. This covers withdrawn packages whose evidence is still
+cached. Run `set-build-trust` with the same policy to archive that evidence
+for future offline audits.
+
 For immediate key revocation, use `set-build-trust --future-only` to change
 admission policy even with the repository offline. Use `audit-builds` to
 identify installed packages whose evidence fails the new policy.

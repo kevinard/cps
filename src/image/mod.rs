@@ -1,3 +1,4 @@
+mod builds;
 pub(crate) mod publishers;
 pub(crate) mod root;
 
@@ -21,7 +22,7 @@ use crate::{
     attestation::BuildTrust,
     kdl_format::{PublisherConfig, read_image_definition},
     model::{FORMAT, Node, validate_name, validate_publisher},
-    repo::{Published, canonical_repo, catalog_index, read_key},
+    repo::{BuildReceipt, Published, canonical_repo, catalog_index, read_key},
 };
 
 // Earlier binaries must reject protected images instead of ignoring build trust.
@@ -495,12 +496,19 @@ impl Image {
         Ok(())
     }
 
-    pub fn record_pending(&self, data: &impl Serialize) -> Result<()> {
-        self.db.execute(
+    pub fn record_pending(
+        &mut self,
+        data: &impl Serialize,
+        publishers: &Publishers,
+        receipts: &[BuildReceipt],
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        builds::save(&tx, publishers, receipts)?;
+        tx.execute(
             "INSERT INTO pending VALUES (1, ?1)",
             [serde_json::to_string(data)?],
         )?;
-        Ok(())
+        Ok(tx.commit()?)
     }
 
     pub fn update_pending(&self, data: &impl Serialize) -> Result<()> {
@@ -536,6 +544,7 @@ impl Image {
                 params![name, serde_json::to_string(package)?],
             )?;
         }
+        builds::prune(&tx, state)?;
         tx.execute("DELETE FROM paths", [])?;
         for (path, managed) in &state.paths {
             tx.execute(

@@ -6,7 +6,7 @@ use super::Plan;
 use crate::{
     image::{Installed, State},
     model::{PackageSpec, Version},
-    repo::{BuildEvidence, Published, snapshot},
+    repo::{BuildEvidence, BuildReceipt, Published, snapshot},
 };
 
 #[derive(Default)]
@@ -22,7 +22,8 @@ impl Catalogs {
         &self,
         state: &State,
         installed: &BTreeMap<String, Installed>,
-    ) -> Result<()> {
+    ) -> Result<Vec<BuildReceipt>> {
+        let mut receipts = Vec::new();
         for (name, package) in installed {
             if state
                 .installed
@@ -36,13 +37,15 @@ impl Catalogs {
                 .get(&package.published.manifest.publisher)
                 .context("missing publisher for selected package")?;
             if let Some(trust) = &publisher.build_trust {
-                self.builds
+                let receipt = self
+                    .builds
                     .get(&publisher.name)
                     .context("missing build evidence from selected catalog")?
                     .verify(&publisher.repo, trust, &package.published)?;
+                receipts.push(receipt);
             }
         }
-        Ok(())
+        Ok(receipts)
     }
 }
 

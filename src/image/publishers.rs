@@ -5,12 +5,12 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Image, Publisher, Publishers, State};
+use super::{Image, Publisher, Publishers, State, builds};
 use crate::{
     attestation::BuildTrust,
     kdl_format::read_build_trust,
     model::validate_publisher,
-    repo::{BuildAudit, audit_installed_builds, catalog_index, release_profile},
+    repo::{BuildAudit, BuildReceipt, audit_installed_builds, catalog_index, release_profile},
 };
 
 pub struct PublisherInfo {
@@ -103,7 +103,7 @@ pub fn add_publisher_with_build_trust(
     }
     let mut publishers = configured.as_slice().to_vec();
     publishers.push(publisher);
-    save(&mut image, Publishers::new(publishers, None)?)
+    save(&mut image, Publishers::new(publishers, None)?, &[])
 }
 
 /// Replace the locally provisioned builder policy. Audit installed packages
@@ -120,18 +120,25 @@ pub fn set_publisher_build_trust(
     let mut publishers = state.publishers.as_slice().to_vec();
     let publisher = &mut publishers[position(state.publishers.as_slice(), name)?];
     let trust = read_build_trust(policy)?.load(&publisher.key)?;
-    if !future_only {
-        let audit = audit(&state, publisher, &trust)?;
+    let receipts = if future_only {
+        Vec::new()
+    } else {
+        let audit = audit(&image, &state, publisher, &trust, true)?;
         ensure!(
             audit.failures.is_empty(),
             "installed build audit failed for {name}\n{}",
             audit.failures.join("\n")
         );
-    }
+        audit.receipts
+    };
     if publisher.build_trust.as_ref() != Some(&trust) {
         publisher.build_trust = Some(trust);
         let profile = state.publishers.release_profile().map(str::to_owned);
-        save(&mut image, Publishers::new(publishers, profile)?)?;
+        save(&mut image, Publishers::new(publishers, profile)?, &receipts)?;
+    } else if !receipts.is_empty() {
+        let tx = image.db.transaction()?;
+        builds::save(&tx, &state.publishers, &receipts)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -148,26 +155,77 @@ pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
         .build_trust
         .as_ref()
         .with_context(|| format!("publisher {name} has no build trust policy"))?;
-    audit(&state, publisher, trust)
+    audit(&image, &state, publisher, trust, false)
 }
 
-fn audit(state: &State, publisher: &Publisher, trust: &BuildTrust) -> Result<BuildAudit> {
-    let pins = state
-        .publishers
-        .release_pins(&state.settings.arch, &state.settings.facets, None)?;
+fn audit(
+    image: &Image,
+    state: &State,
+    publisher: &Publisher,
+    trust: &BuildTrust,
+    check_current: bool,
+) -> Result<BuildAudit> {
+    let mut audit = BuildAudit::default();
+    let archive = builds::exists(&image.db)?;
     let installed = state
         .installed
         .values()
         .map(|package| &package.published)
         .filter(|package| package.manifest.publisher == publisher.name);
-    audit_installed_builds(
-        &publisher.repo,
-        &publisher.name,
-        &publisher.key,
-        pins.get(&publisher.name).map(String::as_str),
-        trust,
-        installed,
-    )
+    let mut missing = Vec::new();
+    for package in installed {
+        if !archive {
+            missing.push(package);
+            continue;
+        }
+        let result = match builds::read(&image.db, &package.sha256) {
+            Ok(None) => {
+                missing.push(package);
+                continue;
+            }
+            Ok(Some((receipt, bytes))) => receipt.verify(&bytes, package, &publisher.key, trust),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => audit.verified += 1,
+            Err(error) => audit.failures.push(format!(
+                "checking archived build evidence for {}: {error:#}",
+                package.manifest.id()
+            )),
+        }
+    }
+    if check_current || !missing.is_empty() {
+        let repository_audit = || {
+            let pins = state.publishers.release_pins(
+                &state.settings.arch,
+                &state.settings.facets,
+                None,
+            )?;
+            audit_installed_builds(
+                &publisher.repo,
+                &publisher.name,
+                &publisher.key,
+                pins.get(&publisher.name).map(String::as_str),
+                trust,
+                missing.iter().copied(),
+            )
+        };
+        match repository_audit() {
+            Ok(found) => {
+                audit.verified += found.verified;
+                audit.failures.extend(found.failures);
+                audit.receipts = found.receipts;
+            }
+            Err(error) if check_current => return Err(error),
+            Err(error) => audit.failures.extend(missing.iter().map(|package| {
+                format!(
+                    "checking repository build evidence for {}: {error:#}",
+                    package.manifest.id()
+                )
+            })),
+        }
+    }
+    Ok(audit)
 }
 
 pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
@@ -179,7 +237,7 @@ pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     publishers[..=position].rotate_right(1);
-    save(&mut image, Publishers::new(publishers, None)?)
+    save(&mut image, Publishers::new(publishers, None)?, &[])
 }
 
 pub fn remove_publisher(root: &Path, name: &str) -> Result<()> {
@@ -199,7 +257,7 @@ pub fn remove_publisher(root: &Path, name: &str) -> Result<()> {
         );
     }
     publishers.remove(position);
-    save(&mut image, Publishers::new(publishers, None)?)
+    save(&mut image, Publishers::new(publishers, None)?, &[])
 }
 
 fn position(publishers: &[Publisher], name: &str) -> Result<usize> {
@@ -220,7 +278,7 @@ fn editable_publishers(image: &Image) -> Result<Publishers> {
     Ok(publishers)
 }
 
-fn save(image: &mut Image, publishers: Publishers) -> Result<()> {
+fn save(image: &mut Image, publishers: Publishers, receipts: &[BuildReceipt]) -> Result<()> {
     let mut settings = image.settings()?;
     settings.format = publishers.image_format();
     settings.publisher_generation = settings
@@ -228,6 +286,7 @@ fn save(image: &mut Image, publishers: Publishers) -> Result<()> {
         .checked_add(1)
         .context("publisher generation exhausted")?;
     let tx = image.db.transaction()?;
+    builds::save(&tx, &publishers, receipts)?;
     tx.execute(
         "UPDATE publishers SET data=?1 WHERE id=1",
         [serde_json::to_string(&publishers)?],
