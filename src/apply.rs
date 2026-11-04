@@ -13,8 +13,8 @@ use crate::{
     boot::kernel::Artifacts,
     image::{Image, Managed, Publisher, State, root::Root},
     model::{Node, digest_reader},
-    plan::{Plan, Write, build, config_update_prefix, hardlink_groups, payloads},
-    repo::{release::fetch_payloads, stage_blob},
+    plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads},
+    repo::{copy_payload, release::fetch_payloads, stage_blob},
     systemd::{self, Action as SystemdAction},
     verify::verify_state,
 };
@@ -50,6 +50,9 @@ pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
         return Ok(0);
     }
     let (checked, next) = check_plan(&image.root, state, plan)?;
+    if checked.config_update_revision.is_some() {
+        return Ok(0);
+    }
     let mut count = 0;
     for (publisher, blobs) in payload_sources(&checked.writes, &next)? {
         let blobs = blobs
@@ -96,6 +99,9 @@ pub(crate) fn apply_with(
         plan.image == state.settings.id,
         "plan targets a different image"
     );
+    if matches!(plan.request, Request::ResolveConfig { .. }) {
+        image.root.offline_path()?;
+    }
     let stage = image.stage()?;
     let (mut pending, offline) = if let Some(pending) = image.pending::<Pending>()? {
         ensure!(
@@ -116,7 +122,7 @@ pub(crate) fn apply_with(
             &image.root,
             !checked.systemd.is_empty() || checked.kernel_install.is_some(),
         )?;
-        prepare(&stage, &checked.writes, &next)?;
+        prepare(&image.root, &stage, &checked, &next)?;
         let pending = Pending {
             id,
             writes: checked.writes,
@@ -259,7 +265,8 @@ fn write_files(
     Ok(())
 }
 
-fn prepare(stage: &File, writes: &[Write], state: &State) -> Result<()> {
+fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> {
+    let writes = &plan.writes;
     let dir = Root::fd_path(stage);
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
@@ -278,12 +285,20 @@ fn prepare(stage: &File, writes: &[Write], state: &State) -> Result<()> {
                 .with_context(|| format!("checking file capability support for {}", write.path))?;
         }
     }
-    for (publisher, blobs) in payload_sources(writes, state)? {
-        for (hash, node) in blobs {
-            let mut file = NamedTempFile::new_in(&dir)?;
-            stage_blob(&publisher.repo, node, file.as_file_mut())?;
-            file.as_file().sync_all()?;
-            file.persist_noclobber(dir.join(hash))?;
+    if let Some((path, node @ Node::File { sha256, .. })) = plan.config_payload() {
+        let mut file = NamedTempFile::new_in(&dir)?;
+        copy_payload(root.file(&path)?, node, file.as_file_mut())
+            .with_context(|| format!("staging vendor configuration {path}"))?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(dir.join(sha256))?;
+    } else {
+        for (publisher, blobs) in payload_sources(writes, state)? {
+            for (hash, node) in blobs {
+                let mut file = NamedTempFile::new_in(&dir)?;
+                stage_blob(&publisher.repo, node, file.as_file_mut())?;
+                file.as_file().sync_all()?;
+                file.persist_noclobber(dir.join(hash))?;
+            }
         }
     }
     stage.sync_all()?;

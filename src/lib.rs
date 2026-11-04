@@ -34,7 +34,7 @@ pub use image::publishers::{
 pub use image::{create_configured_image, create_image};
 pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
-pub use plan::{Plan, Request, plan};
+pub use plan::{ConfigChoice, ConfigUpdate, Plan, Request, list_config_updates, plan};
 pub use repo::{
     BuildWitness, list_obsoletions, list_withdrawals, publish, publish_bundle, publish_release,
     publish_witnessed_bundle, read_attestation, release, rotate_publisher_key, withdraw_package,

@@ -1419,6 +1419,201 @@ fn interrupt_apply(root: &Path, saved: &Path, plan: &Plan) -> Result<()> {
     interrupt_apply_at(root, saved, plan, COMPOSITOR)
 }
 
+#[test]
+fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
+    use crate::{ConfigChoice, fetch_plan, list_config_updates, stage_boot_environment};
+
+    const OPTIONAL: &str = "etc/canopa/optional.conf";
+    const RESTORE: &str = "etc/canopa/restore.conf";
+    let f = Fixture::new()?;
+    let package = |version: &str, defaults: &str| {
+        let mut actions = String::new();
+        for path in [CONFIG, OPTIONAL, RESTORE] {
+            actions += &f.file(path, defaults, "0644", "preserve=#true")?;
+        }
+        f.package("desktop/settings", version, actions)
+    };
+    let review = |path: &str, take| Request::ResolveConfig {
+        path: path.to_owned(),
+        take,
+    };
+    package("1.0.0-0", "vendor version one")?;
+    f.create()?;
+    let initial = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/settings".into()],
+        },
+    )?;
+    apply(&f.root, &initial)?;
+    fs::write(f.root.join(CONFIG), "administrator edit")?;
+    fs::remove_file(f.root.join(OPTIONAL))?;
+    fs::remove_file(f.root.join(RESTORE))?;
+    package("2.0.0-0", "vendor version two")?;
+    let staged = f._dir.path().join("staged");
+    let upgrade = plan(&f.root, Request::Update)?;
+    stage_boot_environment(&f.root, &staged, &upgrade)?;
+    let proposals = list_config_updates(&staged)?;
+    assert_eq!(proposals.len(), 3);
+    assert!(
+        proposals
+            .iter()
+            .all(|update| update.revision == 2 && update.vendor_available)
+    );
+    assert!(list_config_updates(&f.root)?.is_empty());
+    let original = crate::image::Image::open_query(&staged)?.settings()?;
+    let vendor_copy = staged.join(&proposals[0].vendor_copy);
+    assert_eq!(proposals[0].path, CONFIG);
+
+    let accept = plan(&staged, review(CONFIG, ConfigChoice::Vendor))?;
+    fs::write(&vendor_copy, "tampered")?;
+    assert!(!list_config_updates(&staged)?[0].vendor_available);
+    assert!(
+        apply(&staged, &accept)
+            .unwrap_err()
+            .to_string()
+            .contains("differs from its installed manifest")
+    );
+    fs::write(&vendor_copy, "vendor version two")?;
+    fs::write(staged.join(CONFIG), "edited after review")?;
+    assert!(
+        apply(&staged, &accept)
+            .unwrap_err()
+            .to_string()
+            .contains("saved plan differs")
+    );
+    fs::write(staged.join(CONFIG), "administrator edit")?;
+
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    assert_eq!(fetch_plan(&staged, &accept)?, 0);
+    interrupt_apply_at(&staged, &f._dir.path().join("accept.json"), &accept, CONFIG)?;
+    assert!(
+        list_config_updates(&staged)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete transaction")
+    );
+    fs::remove_file(vendor_copy)?;
+    assert_eq!(apply(&staged, &accept)?, 2);
+    assert_eq!(apply(&staged, &accept)?, 2);
+    assert_eq!(
+        fs::read_to_string(staged.join(CONFIG))?,
+        "vendor version two"
+    );
+
+    let proposals = list_config_updates(&staged)?;
+    assert_eq!(proposals.len(), 2);
+    assert_eq!(proposals[0].path, OPTIONAL);
+    fs::remove_file(staged.join(&proposals[0].vendor_copy))?;
+    let keep = plan(&staged, review(OPTIONAL, ConfigChoice::Local))?;
+    assert_eq!(apply(&staged, &keep)?, 2);
+    assert!(!staged.join(OPTIONAL).exists());
+    let restore = plan(&staged, review(RESTORE, ConfigChoice::Vendor))?;
+    assert_eq!(apply(&staged, &restore)?, 2);
+    assert_eq!(
+        fs::read_to_string(staged.join(RESTORE))?,
+        "vendor version two"
+    );
+    assert!(list_config_updates(&staged)?.is_empty());
+    let resolved = crate::image::Image::open_query(&staged)?.settings()?;
+    assert_eq!(
+        (resolved.id, resolved.revision, resolved.boot_parent),
+        (original.id, original.revision, original.boot_parent)
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join(CONFIG))?,
+        "administrator edit"
+    );
+    assert!(!f.root.join(RESTORE).exists());
+
+    fs::rename(offline, &f.repo)?;
+    package("3.0.0-0", "vendor version three")?;
+    let next = plan(&staged, Request::Update)?;
+    apply(&staged, &next)?;
+    let updates = list_config_updates(&staged)?;
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].path, OPTIONAL);
+    assert_eq!(updates[0].revision, 3);
+    assert_eq!(
+        fs::read_to_string(staged.join(CONFIG))?,
+        "vendor version three"
+    );
+    assert_eq!(apply(&staged, &keep)?, 2);
+    assert_eq!(list_config_updates(&staged)?[0].revision, 3);
+    let remove = plan(
+        &staged,
+        Request::Remove {
+            packages: vec!["desktop/settings".into()],
+        },
+    )?;
+    apply(&staged, &remove)?;
+    assert!(list_config_updates(&staged)?.is_empty());
+    assert!(staged.join(&updates[0].vendor_copy).is_file());
+    Ok(())
+}
+
+#[test]
+fn imports_legacy_config_proposals_without_reopening_dismissed_updates() -> Result<()> {
+    use crate::{ConfigChoice, list_config_updates};
+
+    let f = Fixture::new()?;
+    let package = |version: &str, defaults: &str| {
+        f.package(
+            "desktop/settings",
+            version,
+            f.file(CONFIG, defaults, "0644", "preserve=#true")?,
+        )
+    };
+    package("1.0.0-0", "vendor version one")?;
+    f.create()?;
+    let initial = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/settings".into()],
+        },
+    )?;
+    apply(&f.root, &initial)?;
+    fs::write(f.root.join(CONFIG), "administrator edit")?;
+    for (version, defaults) in [("2.0.0-0", "vendor two"), ("3.0.0-0", "vendor three")] {
+        package(version, defaults)?;
+        apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    }
+    {
+        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        let text = db.query_row("SELECT data FROM image WHERE id=1", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut settings: serde_json::Value = serde_json::from_str(&text)?;
+        settings.as_object_mut().unwrap().remove("config_updates");
+        db.execute(
+            "UPDATE image SET data=?1 WHERE id=1",
+            [settings.to_string()],
+        )?;
+    }
+    let updates = list_config_updates(&f.root)?;
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].revision, 3);
+    let keep = plan(
+        &f.root,
+        Request::ResolveConfig {
+            path: CONFIG.into(),
+            take: ConfigChoice::Local,
+        },
+    )?;
+    assert_eq!(apply(&f.root, &keep)?, 3);
+    assert!(list_config_updates(&f.root)?.is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join(CONFIG))?,
+        "administrator edit"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join(&updates[0].vendor_copy))?,
+        "vendor three"
+    );
+    Ok(())
+}
+
 fn interrupt_apply_at(root: &Path, saved: &Path, plan: &Plan, path: &str) -> Result<()> {
     fs::write(saved, serde_json::to_vec(plan)?)?;
     let worker = Command::new(std::env::current_exe()?)

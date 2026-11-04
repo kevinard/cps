@@ -10,17 +10,17 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
-    Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, RootDeployment,
-    SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
+    Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, Plan, Request,
+    RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
     activate_deployed_boot_environment, add_publisher, apply, build_with_toolchain_config,
     build_with_worker, create_configured_image, create_image, deploy_and_activate_boot_environment,
     deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
     fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
-    list_boot_environments, list_boot_environments_on_disk, list_obsoletions, list_publishers,
-    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
-    read_attestation, read_worker_config, release, remove_publisher, rollback_boot_environment,
-    rollback_boot_environment_on_disk, rotate_publisher_key, stage_boot_environment, verify,
-    verify_pristine, withdraw_package,
+    list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
+    list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
+    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
+    rollback_boot_environment, rollback_boot_environment_on_disk, rotate_publisher_key,
+    stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -117,6 +117,11 @@ enum Command {
     Publisher {
         #[command(subcommand)]
         command: PublisherCommand,
+    },
+    /// Review pending changes to preserved configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
     /// List installed packages or versions in the configured signed catalogs
     List {
@@ -356,6 +361,15 @@ enum RepoCommand {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// List pending vendor configuration copies
+    List {
+        #[arg(long)]
+        root: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum PlanCommand {
     /// Install one or more packages, optionally specifying publisher and version
     Install {
@@ -374,6 +388,13 @@ enum PlanCommand {
     },
     /// Restore damaged paths from the installed package versions
     Repair { packages: Vec<String> },
+    /// Review a pending configuration update
+    ResolveConfig {
+        /// Path relative to the image root
+        path: String,
+        #[arg(long, value_enum)]
+        take: ConfigChoice,
+    },
     /// Update the installed package set
     Update,
 }
@@ -815,6 +836,27 @@ fn run(command: Command) -> Result<ExitCode> {
             let manifest = package_manifest(&root, &package, available)?;
             std::io::stdout().lock().write_all(manifest.as_bytes())?;
         }
+        Command::Config {
+            command: ConfigCommand::List { root },
+        } => {
+            let updates = list_config_updates(&root)?;
+            if updates.is_empty() {
+                println!("No pending configuration updates");
+            } else {
+                println!("STATUS\tREVISION\tPATH\tVENDOR COPY");
+                for update in updates {
+                    let status = if update.vendor_available {
+                        "pending"
+                    } else {
+                        "vendor copy unavailable"
+                    };
+                    println!(
+                        "{status}\t{}\t{:?}\t{:?}",
+                        update.revision, update.path, update.vendor_copy
+                    );
+                }
+            }
+        }
         Command::Plan {
             root,
             output,
@@ -825,6 +867,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
                 PlanCommand::Remove { packages } => Request::Remove { packages },
                 PlanCommand::Repair { packages } => Request::Repair { packages },
+                PlanCommand::ResolveConfig { path, take } => Request::ResolveConfig { path, take },
                 PlanCommand::Update => Request::Update,
             };
             let plan = plan(&root, request)?;

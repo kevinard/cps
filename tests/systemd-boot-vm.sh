@@ -183,12 +183,16 @@ openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 
 publish_state() {
     local version=$1 state=$2
-    local dependency=
+    local dependency= config_action=
     if [[ $mode == rollback ]]; then
         case $state in
             previous) dependency='    require "test/legacy-marker"' ;;
             trial|recycled) dependency='    require "test/extra-marker"' ;;
         esac
+    fi
+    if [[ $recycle == 1 ]]; then
+        printf 'vendor-%s\n' "$version" > proto/etc/cps-vm.conf
+        config_action="    file \"etc/cps-vm.conf\" mode=\"0644\" uid=$(id -u) gid=$(id -g) preserve=#true"
     fi
     if [[ -n $kernel_fixture ]]; then
         case $state in
@@ -202,6 +206,7 @@ schema-version 1
 package "test/boot-state" publisher="$fixture_publisher" version="$version" {
     file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
     hardlink "etc/cps-vm-boot-state" target="etc/cps-vm-state"
+$config_action
 $dependency
 }
 MANIFEST
@@ -620,6 +625,9 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     diff -r esp-before esp
 fi
 
+if [[ $recycle == 1 ]]; then
+    printf 'administrator-setting\n' > staged/etc/cps-vm.conf
+fi
 "$cps" boot-env export --receipt --root staged --output staged.ext4 --size-mib "$root_mib" > staged.kdl
 test "$(sha256sum base.ext4)" = "$base_payload"
 diff -r esp-before esp
@@ -849,6 +857,8 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         printf '%s\n' "$obsoletions" "$rollback_boots" "$rollback_kernels" "$rollback_publishers" "$rollback_obsoletions"
         if [[ $recycle == 1 ]]; then
             # Start from the disk with the blessed upgrade, before rollback.
+            configs=$(tr -d '\r' < serial.log | grep '^CPS_VM_CONFIG: ')
+            test "$configs" = $'CPS_VM_CONFIG: trial administrator-setting\nCPS_VM_CONFIG: trial administrator-setting'
             if $profiled; then
                 previous_profile=$(cat profile-repo/current)
                 previous_test=$(cat repo/current)
@@ -860,6 +870,13 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             result=$("$cps" boot-env stage --source staged --root recycled recycle.json)
             recycled_id=${result#Staged }
             recycled_id=${recycled_id%% at *}
+            test "$(cat recycled/etc/cps-vm.conf)" = administrator-setting
+            "$cps" config list --root recycled | tee config-review.log
+            grep -Fq '"etc/cps-vm.conf"' config-review.log
+            "$cps" plan --root recycled --output config-review.json \
+                resolve-config etc/cps-vm.conf --take vendor
+            "$cps" apply --root recycled config-review.json
+            test "$("$cps" config list --root recycled)" = 'No pending configuration updates'
             "$cps" boot-env export --receipt --root recycled --output recycled.ext4 \
                 --size-mib "$root_mib" > recycled.kdl
             result=$("$cps" boot-env activate --root recycled --root-image recycled.ext4 \
@@ -882,6 +899,8 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             check_busybox recycled-boot.log
             recycled_boots=$(tr -d '\r' < recycled-boot.log | grep '^CPS_VM_BOOT: ')
             test "$recycled_boots" = $'CPS_VM_BOOT: recycled blessed\nCPS_VM_BOOT: recycled default'
+            configs=$(tr -d '\r' < recycled-boot.log | grep '^CPS_VM_CONFIG: ')
+            test "$configs" = $'CPS_VM_CONFIG: recycled vendor-3.0.0-0\nCPS_VM_CONFIG: recycled vendor-3.0.0-0'
             "$cps" boot-env list --disk recycled.raw --esp-partuuid "$esp_uuid" | tee recycled-blessed.log
             assert_default "$recycled_id" "$base_uuid" "$trial_release" recycled-blessed.log
             result=$("$cps" boot-env rollback --disk recycled.raw --esp-partuuid "$esp_uuid" \
@@ -891,6 +910,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             check_busybox recycled-rollback.log
             test "$(tr -d '\r' < recycled-rollback.log | grep '^CPS_VM_BOOT: ')" = 'CPS_VM_BOOT: trial default'
             tr -d '\r' < recycled-rollback.log | grep -Fx "CPS_VM_KERNEL: trial $trial_release"
+            tr -d '\r' < recycled-rollback.log | grep -Fx 'CPS_VM_CONFIG: trial administrator-setting'
             printf '%s\nVerified the recycled slot and rolled back to the preceding root\n' "$recycled_boots"
         fi
     fi

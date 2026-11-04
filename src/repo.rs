@@ -1238,13 +1238,20 @@ fn store_blob(
 }
 
 pub fn stage_blob(repo: &Path, node: &Node, destination: &mut File) -> Result<()> {
-    let Node::File { sha256, size, .. } = node else {
+    let Node::File { sha256, .. } = node else {
         anyhow::bail!("expected a file payload");
     };
     validate_digest(sha256)?;
     let source = Root::open(repo)?
         .file(&format!("blobs/{sha256}"))
         .with_context(|| format!("opening repository payload {sha256}"))?;
+    copy_payload(source, node, destination)
+}
+
+pub(crate) fn copy_payload(source: File, node: &Node, destination: &mut File) -> Result<()> {
+    let Node::File { sha256, size, .. } = node else {
+        anyhow::bail!("expected a file payload");
+    };
     ensure!(
         source.metadata()?.len() == *size,
         "payload length mismatch for {sha256}"

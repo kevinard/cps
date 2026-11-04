@@ -17,7 +17,7 @@ use rustix::fs::{RenameFlags, renameat_with, syncfs};
 use crate::{
     apply::apply,
     image::{BootParent, Image},
-    plan::Plan,
+    plan::{Plan, Request},
     verify::verify_image,
 };
 
@@ -33,6 +33,10 @@ pub use systemd_boot::{
 };
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
+    ensure!(
+        !matches!(plan.request, Request::ResolveConfig { .. }),
+        "apply configuration review directly to an inactive root"
+    );
     let source = fs::canonicalize(source).context("opening the base image directory")?;
     ensure!(
         source != Path::new("/"),

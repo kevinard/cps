@@ -38,6 +38,10 @@ pub struct Settings {
     pub(crate) created_directories: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_parent: Option<BootParent>,
+    // Absent on images that predate tracking. Their proposals are discovered
+    // from the saved vendor copies the first time they are reviewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) config_updates: Option<BTreeMap<String, u64>>,
 }
 
 pub(crate) fn publisher_generation_is_initial(generation: &u64) -> bool {
@@ -271,6 +275,7 @@ fn initialize(
         gid: getegid().as_raw(),
         created_directories: BTreeSet::new(),
         boot_parent: None,
+        config_updates: Some(BTreeMap::new()),
     };
     fs::create_dir_all(path)?;
     Root::open(path)?;

@@ -575,6 +575,31 @@ Upgrade CPS before using catalogs with signed release profile records.
 
 Run `cargo test` for the desktop upgrade and interruption test.
 
+### Reviewing configuration updates
+
+When an upgrade keeps an edited or locally removed file and stages new
+vendor defaults, `cps config list` shows the pending file and its vendor
+copy. Compare the two copies or merge changes by editing the local file.
+Then save and apply a review plan on the inactive root.
+
+```sh
+cps config list --root staged
+cps plan --root staged --output config-review.json \
+    resolve-config etc/canopa/compositor.conf --take vendor
+cps apply --root staged config-review.json
+```
+
+`--take vendor` replaces the local file with the staged defaults and
+restores a file that was locally removed. CPS checks the copy against the
+installed manifest and uses it directly, so review works with the
+repository offline. Use `--take local` to keep an edit, a merged file, or
+a local deletion and dismiss that proposal. A newer vendor change can
+queue another proposal. Older vendor copies stay in the archive.
+
+On images made before review tracking, CPS finds vendor copies that match
+the current installed defaults. Review can run on a staged boot environment
+before export and keeps its package revision and boot lineage.
+
 ### Linux file capabilities
 
 A signed file action can grant a Linux executable specific capabilities.
@@ -825,6 +850,8 @@ containing their indexed `lib/modules` trees.
 
 Set `CPS_VM_RECYCLE_SLOT=1` with `rollback` to stage and bless a second
 upgrade on the original root slot, then roll it back to the first upgrade.
+The scenario keeps an administrator edit while staging, accepts the vendor
+copy before activation, and checks both settings in the guest across rollback.
 
 Set `CPS_VM_RELEASE_PROFILE=1` in the rollback test to assemble the roots from
 a signed release profile. Use a current CPS build on the host and provide the

@@ -1,4 +1,5 @@
 mod catalogs;
+mod config;
 mod paths;
 mod repair;
 mod resolve;
@@ -19,10 +20,13 @@ use crate::{
 };
 
 pub(crate) use catalogs::CandidateSet;
+pub use config::{ConfigChoice, ConfigUpdate, list_config_updates};
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
 };
 pub(crate) use resolve::{Candidates, check as check_dependencies, resolve as resolve_packages};
+
+const CONFIG_UPDATES_DIR: &str = ".cps/config-updates";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -37,6 +41,7 @@ pub enum Request {
     ExactInstall { packages: Vec<String> },
     Remove { packages: Vec<String> },
     Repair { packages: Vec<String> },
+    ResolveConfig { path: String, take: ConfigChoice },
     Update,
 }
 
@@ -88,6 +93,8 @@ pub struct Plan {
     package_changes: Vec<PackageChange>,
     transfers: Vec<Transfer>,
     preserved: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) config_update_revision: Option<u64>,
     pub(crate) writes: Vec<Write>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) systemd: Vec<SystemdAction>,
@@ -122,6 +129,24 @@ impl Plan {
         }
         for path in &self.preserved {
             lines.push(format!("Preserve local config {path}"));
+        }
+        for write in self
+            .writes
+            .iter()
+            .filter(|write| write.path.starts_with(CONFIG_UPDATES_DIR) && write.replaces_file())
+        {
+            lines.push(format!("Stage vendor config {:?}", write.path));
+        }
+        if let (Request::ResolveConfig { path, take }, Some(revision)) =
+            (&self.request, self.config_update_revision)
+        {
+            match take {
+                ConfigChoice::Local => lines.push(format!("Keep local config {path}")),
+                ConfigChoice::Vendor => lines.push(format!(
+                    "Install vendor config {path} from {}",
+                    config::vendor_copy(revision, path)
+                )),
+            }
         }
         if matches!(self.request, Request::Repair { .. }) {
             for write in &self.writes {
@@ -176,6 +201,22 @@ impl Plan {
         );
         Ok(())
     }
+
+    pub(crate) fn config_payload(&self) -> Option<(String, &Node)> {
+        let Request::ResolveConfig {
+            path,
+            take: ConfigChoice::Vendor,
+        } = &self.request
+        else {
+            return None;
+        };
+        let revision = self.config_update_revision?;
+        let write = self
+            .writes
+            .iter()
+            .find(|write| write.path == *path && write.replaces_file())?;
+        Some((config::vendor_copy(revision, path), write.after.as_ref()?))
+    }
 }
 
 pub fn plan(path: &Path, request: Request) -> Result<Plan> {
@@ -201,7 +242,7 @@ pub(crate) fn build(
 ) -> Result<(Plan, State)> {
     let mut catalogs = catalogs::Catalogs::default();
     let (installed, paths) = match &request {
-        Request::Repair { .. } => {
+        Request::Repair { .. } | Request::ResolveConfig { .. } => {
             let paths = crate::verify::manifest_paths(&state)?;
             ensure!(
                 paths == state.paths,
@@ -244,11 +285,17 @@ pub(crate) fn build(
             )?
         }
     };
-    let revision = state
-        .settings
-        .revision
-        .checked_add(1)
-        .context("image revision exhausted")?;
+    // Resolving a vendor proposal changes local configuration, so a staged
+    // boot environment can still be activated at its original revision.
+    let revision = if matches!(request, Request::ResolveConfig { .. }) {
+        state.settings.revision
+    } else {
+        state
+            .settings
+            .revision
+            .checked_add(1)
+            .context("image revision exhausted")?
+    };
     let kernel_install = kernel::transition(
         kernel::selected(&state.installed, &state.paths)?,
         kernel::selected(&installed, &paths)?,
@@ -270,6 +317,7 @@ pub(crate) fn build(
         package_changes: Vec::new(),
         transfers: Vec::new(),
         preserved: Vec::new(),
+        config_update_revision: None,
         writes: Vec::new(),
         systemd: systemd::plan_actions(&state, &installed, &paths),
         kernel_install,
@@ -310,6 +358,12 @@ pub(crate) fn build(
         Request::Repair { packages } => {
             repair::writes(root, &state, packages, &mut plan.preserved)?
         }
+        Request::ResolveConfig { path, take } => {
+            let (revision, write) =
+                config::resolve(root, &mut state.settings, &paths, path, *take)?;
+            plan.config_update_revision = Some(revision);
+            BTreeMap::from([(path.clone(), write)])
+        }
         _ => BTreeMap::new(),
     };
     for path in state
@@ -322,6 +376,12 @@ pub(crate) fn build(
         let after = paths.get(path);
         if before == after {
             continue;
+        }
+        if let Some(updates) = &mut state.settings.config_updates
+            && (!after.is_some_and(|target| target.preserve)
+                || before.map(|old| &old.node) != after.map(|new| &new.node))
+        {
+            updates.remove(path);
         }
         if let (Some(old), Some(new)) = (before, after) {
             check_path_type(path, old, new)?;
@@ -370,6 +430,9 @@ pub(crate) fn build(
                             &target.node,
                             &mut writes,
                         )?;
+                        if let Some(updates) = &mut state.settings.config_updates {
+                            updates.insert(path.clone(), revision);
+                        }
                     }
                     observed.clone()
                 } else {
@@ -536,7 +599,7 @@ fn requested_names(packages: &[String]) -> Result<BTreeSet<String>> {
 }
 
 pub(crate) fn config_update_prefix(revision: u64) -> String {
-    format!(".cps/config-updates/{revision}/")
+    format!("{CONFIG_UPDATES_DIR}/{revision}/")
 }
 
 fn stage_config(
