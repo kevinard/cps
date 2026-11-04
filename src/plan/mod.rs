@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     boot::kernel::{self, Artifacts},
     image::{Image, Settings, State, publisher_generation_is_initial, root::Root},
-    model::{FORMAT, Node, digest, validate_name},
+    model::{FORMAT, Node, PackageSpec, digest, validate_name},
     repo::BuildReceipt,
     systemd::{self, Action as SystemdAction},
 };
@@ -42,6 +42,7 @@ pub enum Request {
     ExactInstall { packages: Vec<String> },
     InstallProfile,
     Remove { packages: Vec<String> },
+    Autoremove,
     Repair { packages: Vec<String> },
     ResolveConfig { path: String, take: ConfigChoice },
     Update,
@@ -287,6 +288,36 @@ pub(crate) fn build(
             resolve::check(&installed).context("removal would break installed dependencies")?;
             let paths = effective_paths(&state.settings, &installed)?;
             (installed, paths)
+        }
+        Request::Autoremove => {
+            let requested = state
+                .installed
+                .iter()
+                .filter(|(_, package)| package.explicit)
+                .map(|(name, package)| {
+                    let manifest = &package.published.manifest;
+                    (
+                        name.as_str(),
+                        PackageSpec {
+                            publisher: Some(&manifest.publisher),
+                            name,
+                            version: Some(manifest.version),
+                        },
+                    )
+                })
+                .collect();
+            resolve::resolve(
+                &state.installed,
+                Candidates {
+                    packages: std::iter::empty(),
+                    obsoletions: &BTreeMap::new(),
+                },
+                &requested,
+                false,
+                true,
+                solver,
+                |installed| effective_paths(&state.settings, installed),
+            )?
         }
         _ => {
             let install_profile = matches!(request, Request::InstallProfile);

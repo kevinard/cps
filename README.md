@@ -886,6 +886,14 @@ Upgrade CPS before using catalogs with signed release profile records.
 - Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. When the vendor file changes, find its new copy in `image/.cps/config-updates/<revision>/`.
 - The image must be inactive and reside on one filesystem. Install and update require existing explicit directory metadata to match the selected action. Transitions between a directory and a file or symlink are rejected. When ownership ends, CPS prunes directories it recorded creating if they are empty and their metadata still matches. It keeps pre-existing directories and directories with local content or extended attributes.
 
+Use `cps plan --root image --output cleanup.json autoremove` to preview
+removing unused dependencies. CPS solves from the explicitly installed
+packages using their installed versions and the installed dependency
+candidates. It keeps the dependencies needed by that solution, including a
+compatible alternative and any conditional dependencies that apply. The
+plan and apply work offline. To keep a dependency explicitly, request it
+with `plan install` and its exact installed version before planning cleanup.
+
 Run `cargo test` for the desktop upgrade and interruption test.
 
 ### Reviewing configuration updates

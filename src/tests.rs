@@ -1136,6 +1136,123 @@ fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
 }
 
 #[test]
+fn autoremove_preserves_installed_roots_and_resumes_offline() -> Result<()> {
+    use crate::query::{Scope, Status, list_packages};
+
+    let f = Fixture::new()?;
+    for name in [
+        "library/backup",
+        "library/primary",
+        "desktop/theme",
+        "desktop/optional-plugin",
+    ] {
+        f.package(name, "1.0.0-0", String::new())?;
+    }
+    f.package(
+        "desktop/plugin",
+        "1.0.0-0",
+        f.file(PLUGIN, "active plugin", "0644", "")?,
+    )?;
+    f.package(
+        "library/left",
+        "1.0.0-0",
+        f.file(LIBRARY, "unused library", "0644", "")? + "    require \"library/right\"\n",
+    )?;
+    f.package(
+        "library/right",
+        "1.0.0-0",
+        "    require \"library/left\"\n".into(),
+    )?;
+    f.package(
+        "desktop/setup-primary",
+        "1.0.0-0",
+        "    require \"library/primary\"\n    require \"library/left\"\n".into(),
+    )?;
+    f.package(
+        "desktop/setup-backup",
+        "1.0.0-0",
+        "    require \"library/backup\"\n".into(),
+    )?;
+    f.package(
+        "desktop/session",
+        "1.0.0-0",
+        r#"    require-any {
+        package "library/primary"
+        package "library/backup"
+    }
+    conditional "desktop/plugin" when="library/backup"
+    conditional "desktop/optional-plugin" when="library/primary"
+"#
+        .into(),
+    )?;
+    f.create()?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Install {
+                packages: [
+                    "desktop/session",
+                    "desktop/setup-primary",
+                    "desktop/setup-backup",
+                    "desktop/theme",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            },
+        )?,
+    )?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Remove {
+                packages: vec![
+                    "desktop/setup-primary".into(),
+                    "desktop/setup-backup".into(),
+                ],
+            },
+        )?,
+    )?;
+    assert_eq!(list_packages(&f.root, Scope::Installed)?.len(), 8);
+    let cleanup = plan(&f.root, Request::Autoremove)?;
+    assert!(cleanup.summary().contains("Remove library/left"));
+    assert!(cleanup.summary().contains("Remove library/right"));
+    assert!(cleanup.summary().contains("Remove library/primary"));
+    assert!(cleanup.summary().contains("Remove desktop/optional-plugin"));
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("cleanup.json"),
+        &cleanup,
+        LIBRARY,
+    )?;
+    apply(&f.root, &cleanup)?;
+    assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "active plugin");
+    assert!(!f.root.join(LIBRARY).exists());
+    let installed: Vec<_> = list_packages(&f.root, Scope::Installed)?
+        .into_iter()
+        .map(|row| (row.name, row.status))
+        .collect();
+    assert_eq!(
+        installed,
+        [
+            ("desktop/plugin".to_owned(), Status::Dependency),
+            ("desktop/session".to_owned(), Status::Explicit),
+            ("desktop/theme".to_owned(), Status::Explicit),
+            ("library/backup".to_owned(), Status::Dependency),
+        ]
+    );
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    assert!(
+        !plan(&f.root, Request::Autoremove)?
+            .summary()
+            .contains("Remove ")
+    );
+    Ok(())
+}
+
+#[test]
 fn requires_one_compatible_backend_and_checks_removal_offline() -> Result<()> {
     let f = Fixture::new()?;
     const ALPHA: &str = "usr/lib/cps/alpha";

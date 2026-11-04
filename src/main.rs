@@ -429,6 +429,8 @@ enum PlanCommand {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+    /// Remove dependencies no longer needed by explicitly installed packages
+    Autoremove,
     /// Reconcile an image to the requested packages and their dependencies
     ExactInstall {
         #[arg(required = true)]
@@ -1039,6 +1041,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
                 PlanCommand::InstallProfile => Request::InstallProfile,
                 PlanCommand::Remove { packages } => Request::Remove { packages },
+                PlanCommand::Autoremove => Request::Autoremove,
                 PlanCommand::Repair { packages } => Request::Repair { packages },
                 PlanCommand::ResolveConfig { path, take } => Request::ResolveConfig { path, take },
                 PlanCommand::Update => Request::Update,
