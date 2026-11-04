@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, path::PathBuf};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use kdl::KdlDocument;
 
 use crate::{
@@ -14,6 +14,7 @@ use super::{Fields, document, one, schema};
 pub(crate) struct Release {
     pub publisher: String,
     pub base: Option<String>,
+    pub refresh_profiles: bool,
     pub changes: Vec<Change>,
 }
 
@@ -42,7 +43,7 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
         "expected schema-version and release nodes"
     );
     let release = one(&doc, "release")?;
-    let fields = Fields::read(release, 1, &["base"], true)?;
+    let fields = Fields::read(release, 1, &["base", "refresh-profiles"], true)?;
     let publisher = fields.string_arg(0)?;
     validate_publisher(&publisher)?;
     let base = fields.required_string("base")?;
@@ -52,6 +53,16 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
         validate_digest(&base)?;
         Some(base)
     };
+    let refresh_profiles = fields
+        .properties
+        .get("refresh-profiles")
+        .map(|value| {
+            value
+                .as_bool()
+                .context("refresh-profiles must be #true or #false")
+        })
+        .transpose()?
+        .unwrap_or(false);
     let mut ids = BTreeSet::new();
     let mut obsoletions = BTreeSet::new();
     let mut changes = Vec::new();
@@ -108,10 +119,18 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
             witnesses,
         });
     }
-    ensure!(!changes.is_empty(), "release has no changes");
+    ensure!(
+        refresh_profiles || !changes.is_empty(),
+        "release has no changes"
+    );
+    ensure!(
+        base.is_some() || !changes.is_empty(),
+        "cannot refresh profiles before the first publication"
+    );
     Ok(Release {
         publisher,
         base,
+        refresh_profiles,
         changes,
     })
 }

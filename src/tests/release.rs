@@ -391,8 +391,24 @@ fn profiled_image_follows_signed_catalog_set_and_recovers_saved_plans() -> Resul
         "1.0.0-0",
         "    require \"library/runtime\"\n".to_owned(),
     )?;
-    f.package("test/first", "1.0.0-0", String::new())?;
-    f.package("test/second", "1.0.0-0", String::new())?;
+    let pointer = f.repo.join("current");
+    let base = fs::read_to_string(&pointer)?;
+    let refresh = |base: &str| -> Result<String> {
+        let path = f._dir.path().join("refresh.kdl");
+        fs::write(
+            &path,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                base.trim()
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &path)
+    };
+    let error = refresh(&base).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("refresh-profiles requires release composition profiles")
+    );
+    assert_eq!(fs::read_to_string(&pointer)?, base);
     let config = f._dir.path().join("image.kdl");
     let write_config = |arch: &str| {
         fs::write(
@@ -414,7 +430,7 @@ publisher "seed" {{
             ),
         )
     };
-    let release = |pin: &str, retired: &str| -> Result<()> {
+    let write_policy = |pin: &str| {
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
@@ -434,10 +450,11 @@ publisher "canopa" {{
                 seed.repo,
                 seed.public
             ),
-        )?;
-        withdraw_package(&f.repo, &f.private, retired)
+        )
     };
-    release(&old_pin, "cps://canopa/test/first@1.0.0-0")?;
+    write_policy(&old_pin)?;
+    let first = refresh(&base)?;
+    assert_eq!(refresh(&first)?, first);
     write_config("aarch64")?;
     let error = create_configured_image(&f.root, &config).unwrap_err();
     assert!(format!("{error:#}").contains("architecture or facets differ"));
@@ -468,14 +485,24 @@ publisher "canopa" {{
     assert!(format!("{error:#}").contains("differs from the signed release profile"));
     assert!(!f.root.join(payload).exists());
 
-    release(&new_pin, "cps://canopa/test/second@1.0.0-0")?;
+    write_policy(&digest(b"missing companion"))?;
+    let error = refresh(&first).unwrap_err();
+    assert!(format!("{error:#}").contains("reading companion catalog"));
+    assert_eq!(fs::read_to_string(&pointer)?.trim(), first);
+    write_policy(&new_pin)?;
+    let error = refresh(&base).unwrap_err();
+    assert!(format!("{error:#}").contains("release base is stale"));
+    let second = refresh(&first)?;
+    assert_ne!(first, second);
     fs::remove_file(seed.repo.join("current"))?;
     apply(&f.root, &saved)?;
     assert_eq!(fs::read_to_string(f.root.join(payload))?, "old");
     let upgrade = plan(&f.root, Request::Update)?;
     assert_eq!(upgrade.catalogs["seed"], new_pin.trim());
-    apply(&f.root, &upgrade)?;
-    assert_eq!(fs::read_to_string(f.root.join(payload))?, "new");
+    let staged = f._dir.path().join("staged");
+    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    assert_eq!(fs::read_to_string(staged.join(payload))?, "new");
+    assert_eq!(fs::read_to_string(f.root.join(payload))?, "old");
     Ok(())
 }
 

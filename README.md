@@ -309,6 +309,12 @@ all bundles. Readers see a single new signed catalog after every action succeeds
 If verification fails, the current catalog stays unchanged. Content-addressed
 objects may remain on disk. Historical catalogs remain available for pinned plans.
 
+When only the release profiles change, update the publish policy and publish a
+release with `refresh-profiles=#true` and the current `base` digest. The signer
+reruns the profile checks and publishes a new catalog if the signed profile
+records changed. This lets a primary publisher advance a companion pin without
+rebuilding its own packages.
+
 `publish` assembles the local CPS repository using a publisher signing key. Export a snapshot to a new directory before signing it with [The Update Framework](https://theupdateframework.github.io/specification/latest/).
 
 ```sh

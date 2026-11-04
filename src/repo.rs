@@ -823,6 +823,13 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
         .iter()
         .any(|change| matches!(change, publish_release::Change::Bundle { .. }));
     let policy = read_publish_policy(repo, &catalog, publishes_bundles)?;
+    ensure!(
+        !release.refresh_profiles
+            || policy
+                .as_ref()
+                .is_some_and(|policy| !policy.profiles.is_empty()),
+        "refresh-profiles requires release composition profiles in the publish policy"
+    );
     if publishes_bundles {
         prepare_objects(repo)?;
     }
@@ -867,17 +874,19 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
             publish_release::Change::Obsolete(id) => changed |= catalog.obsolete(&id)?,
         }
     }
-    if changed {
+    if changed || release.refresh_profiles {
+        let previous = (!changed).then(|| catalog.release_profiles.clone());
         check_profiles(
             repo,
             &mut catalog,
             policy.as_ref(),
             key.public_key().as_ref(),
         )?;
-        write_catalog(repo, catalog, &key)
-    } else {
-        current.context("empty release has no published catalog")
+        if previous.is_none_or(|profiles| profiles != catalog.release_profiles) {
+            return write_catalog(repo, catalog, &key);
+        }
     }
+    current.context("empty release has no published catalog")
 }
 
 fn publication_base(repo: &Path) -> Result<Option<String>> {
