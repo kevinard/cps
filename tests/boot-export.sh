@@ -48,6 +48,30 @@ test "$(inode tool)" = "$(inode alias)"
 dumpe2fs -h root.ext4 2>/dev/null | grep -E "^Filesystem UUID: +$id$"
 test "$(sha256sum image/.cps/state.sqlite)" = "$source_state"
 
+epoch=1735689600
+printf 'invalid mke2fs config\n' > caller-mke2fs.conf
+repro_export() {
+    SOURCE_DATE_EPOCH="$1" MKE2FS_CONFIG="$work/caller-mke2fs.conf" \
+        "$cps" boot-env export --root image --output "$2" --size-mib 64 --receipt
+}
+repro_export "$epoch" repro-first.ext4 > repro-first.kdl
+sleep 1
+repro_export "0$epoch" repro-second.ext4 > repro-second.kdl
+cmp repro-first.ext4 repro-second.ext4
+cmp repro-first.kdl repro-second.kdl
+TZ=UTC dumpe2fs -h repro-first.ext4 2>/dev/null | grep -E 'Filesystem created: +Wed Jan  1 00:00:00 2025$'
+debugfs -R 'ea_list /' repro-first.ext4 2>/dev/null | grep -F 'user.cps-root (9) = "root-data"'
+debugfs -R 'ea_list /local-state' repro-first.ext4 2>/dev/null | grep -F 'user.cps (8) = "exported"'
+test "$(sha256sum image/.cps/state.sqlite)" = "$source_state"
+for invalid in '' '2025-01-01' -1 4294967296; do
+    if repro_export "$invalid" invalid-epoch.ext4 > rejected.log 2>&1; then
+        echo 'Export accepted an invalid SOURCE_DATE_EPOCH' >&2
+        exit 1
+    fi
+    grep -F 'SOURCE_DATE_EPOCH must be a decimal timestamp' rejected.log
+    test ! -e invalid-epoch.ext4
+done
+
 reject() {
     local message=$1 output=$2 size=${3:-64}
     if export_root "$output" "$size" > rejected.log 2>&1; then
@@ -94,4 +118,4 @@ reject 'image verification failed' corrupt.ext4
 test ! -e corrupt.ext4
 test -z "$(find . -maxdepth 1 -name '.cps-export-*' -print)"
 
-echo 'Verified atomic ext4 export, metadata preservation, and failure cleanup'
+echo 'Verified atomic and reproducible ext4 export, metadata preservation, and failure cleanup'

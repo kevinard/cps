@@ -1,6 +1,7 @@
 use std::{
+    env::{self, VarError},
     fs::{self, OpenOptions},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::Path,
     process::Stdio,
 };
@@ -22,6 +23,7 @@ use crate::{
 };
 
 const PAYLOAD: &str = "root.ext4";
+const FORMATTER_CONFIG: &str = "mke2fs.conf";
 
 /// Export an inactive CPS root to a new, checked ext4 partition payload.
 pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Result<String> {
@@ -50,6 +52,7 @@ fn export(
         .filter(|bytes| *bytes <= i64::MAX as u64)
         .context("ext4 image size is out of range")?;
     ensure!(size_mib >= 16, "an ext4 image requires at least 16 MiB");
+    let epoch = source_date_epoch()?;
 
     let root = fs::canonicalize(root).context("opening the image to export")?;
     ensure!(
@@ -120,13 +123,25 @@ fn export(
         .mode(0o600)
         .open(stage_path.join(PAYLOAD))?;
     file.set_len(bytes)?;
-    let options = format!(
+    let mut options = format!(
         "root_owner={}:{},root_perms={:04o},lazy_itable_init=0,lazy_journal_init=0",
         source.uid(),
         source.gid(),
         source.mode() & 0o7777,
     );
-    let status = artifact_helper("mke2fs", &stage_path)
+    let mut formatter = artifact_helper("mke2fs", &stage_path);
+    if let Some(epoch) = epoch {
+        fs::write(
+            stage_path.join(FORMATTER_CONFIG),
+            include_str!("mke2fs.conf"),
+        )?;
+        formatter
+            .env("MKE2FS_CONFIG", FORMATTER_CONFIG)
+            .env("SOURCE_DATE_EPOCH", epoch.to_string())
+            .args(["-T", "ext4"]);
+        options.push_str(&format!(",hash_seed={uuid}"));
+    }
+    let status = formatter
         // Pin the source across exec and resolve it as a directory, even if
         // the caller renames the original source path.
         .stdin(Stdio::from(image.root.as_file().try_clone()?))
@@ -153,6 +168,15 @@ fn export(
         (before.dev(), before.ino(), bytes) == (after.dev(), after.ino(), after.len()),
         "the checked ext4 image was replaced or resized"
     );
+    if let Some(epoch) = epoch {
+        // s_mkfs_time starts at offset 0x108 of the ext4 primary superblock.
+        let mut created = [0; 4];
+        checked.read_exact_at(&mut created, 1024 + 0x108)?;
+        ensure!(
+            u32::from_le_bytes(created) == epoch,
+            "mke2fs did not honor SOURCE_DATE_EPOCH. Use e2fsprogs with reproducible timestamp support"
+        );
+    }
     checked.sync_all()?;
     let receipt = if emit_receipt {
         Some(
@@ -178,4 +202,16 @@ fn export(
     .context("publishing the ext4 image")?;
     parent.as_file().sync_all()?;
     Ok((entry_id(&uuid, state.settings.revision), receipt))
+}
+
+fn source_date_epoch() -> Result<Option<u32>> {
+    match env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => {
+            let message = "SOURCE_DATE_EPOCH must be a decimal timestamp from 0 to 4294967295";
+            ensure!(value.bytes().all(|byte| byte.is_ascii_digit()), "{message}");
+            Ok(Some(value.parse().context(message)?))
+        }
+        Err(VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).context("reading SOURCE_DATE_EPOCH"),
+    }
 }

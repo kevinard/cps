@@ -955,6 +955,16 @@ before publishing the image and refuses to replace an existing path. Use
 e2fsprogs with support for `root_perms`. Filesystem timestamps and formatter
 defaults affect the image bytes. [mke2fs manual](https://man7.org/linux/man-pages/man8/mke2fs.8.html)
 
+Set `SOURCE_DATE_EPOCH` to export a byte-identical ext4 payload and receipt
+from the same stable source tree, partition size, and e2fsprogs build. CPS
+uses its own formatter profile and the image UUID as the directory hash
+seed. The formatter clamps imported timestamps to the epoch and uses it
+for filesystem creation. Keep source contents and metadata stable between
+exports, including access times older than the epoch. A read-only source
+mount preserves those access times. Use a decimal epoch from 0 to
+4294967295 and e2fsprogs with `root_perms` and `SOURCE_DATE_EPOCH` support.
+[e2fsprogs release notes](https://github.com/tytso/e2fsprogs/blob/v1.47.1/doc/RelNotes/v1.47.1.txt)
+
 For an offline VM or disk image, provision a raw GPT template with 512-byte
 sectors, one Linux filesystem partition per root, and a FAT EFI System
 Partition containing systemd-boot. `deploy` uses GNU
