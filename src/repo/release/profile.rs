@@ -13,10 +13,24 @@ use crate::{
     repo::{CatalogPin, ReleaseProfile, profiles::profile_paths, read_package, release_profile},
 };
 
-use super::{Mirror, SyncSource, digest, lock_repo, stage_release};
+use super::{
+    ImageGuard, Mirror, SyncSource, digest, lock_repo, record_catalog_checkpoint, stage_release,
+};
 
 /// Materialize a signed profile's catalog set before advancing its primary pointer.
 pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
+    synchronize_profile(config, index_only, None)
+}
+
+pub fn sync_profile_for_image(config: &Path, index_only: bool, root: &Path) -> Result<String> {
+    synchronize_profile(config, index_only, Some(ImageGuard::open(root)?))
+}
+
+fn synchronize_profile(
+    config: &Path,
+    index_only: bool,
+    guard: Option<ImageGuard>,
+) -> Result<String> {
     let definition = read_image_definition(config)?;
     let name = definition
         .release_profile
@@ -38,6 +52,32 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(guard) = &guard {
+        let state = &guard.state;
+        ensure!(
+            state.publishers.release_profile() == Some(name)
+                && state.settings.arch == definition.arch
+                && state.settings.facets == definition.facets
+                && state
+                    .publishers
+                    .as_slice()
+                    .iter()
+                    .map(|publisher| publisher.name.as_str())
+                    .eq(sources.iter().map(|source| source.publisher)),
+            "sync configuration differs from the installed image profile or publisher order"
+        );
+        ensure!(
+            state
+                .settings
+                .bootstrap_catalog
+                .as_ref()
+                .is_none_or(|hash| definition.bootstrap_catalog.as_ref() == Some(hash)),
+            "sync configuration differs from the image's pinned bootstrap catalog"
+        );
+        for source in &sources {
+            guard.check_source(source)?;
+        }
+    }
     let repositories = definition
         .publishers
         .iter()
@@ -81,6 +121,8 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
         full,
         Some(&binding),
         bootstrap_pin.as_ref().as_slice(),
+        guard.as_ref(),
+        guard.is_some(),
     )
     .with_context(|| format!("staging primary publisher {}", primary.publisher))?;
     let current_pin = CatalogPin::primary(
@@ -117,12 +159,30 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
             .iter()
             .map(|(_, profile)| &profile.companions[index])
             .collect::<Vec<_>>();
-        let release = stage_release(repo, source, full, None, &required).with_context(|| {
+        let release = stage_release(
+            repo,
+            source,
+            full,
+            None,
+            &required,
+            guard.as_ref(),
+            guard.is_some(),
+        )
+        .with_context(|| {
             format!(
                 "staging companion publisher {} for profile {name}",
                 source.publisher
             )
         })?;
+        if let Some(guard) = &guard {
+            // The first profile is the staged primary's current profile. A
+            // separately retained bootstrap profile may deliberately be older.
+            let pin = required[0];
+            if pin.sha256 != release.current {
+                let catalog = pin.read(repo, source.publisher, &source.key)?;
+                guard.check(repo, source, &pin.sha256, &catalog)?;
+            }
+        }
         staged.push((source, repo, release));
     }
     for (pin, profile) in profiles
@@ -145,6 +205,14 @@ pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
     }
     // Profile readers use the primary pointer as the visibility boundary.
     // Earlier catalogs and objects remain addressable by their original digests.
+    if guard.is_some() {
+        // A primary that pins an invalid companion must not become a replay
+        // checkpoint merely because its own signed catalog was fetched first.
+        for (_, repo, release) in &staged {
+            record_catalog_checkpoint(repo, &release.current)?;
+        }
+        record_catalog_checkpoint(primary_repo, &primary_release.current)?;
+    }
     for (source, repo, release) in staged {
         source.promote(repo, &release, None)?;
     }

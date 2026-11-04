@@ -201,7 +201,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-9`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-10`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -608,6 +608,15 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 
 Full sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and downloads the complete release. A failed download leaves the previous cache available. Sync can repair a damaged cache object when the mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can work offline once the required metadata and payloads are cached.
 
+When preparing a cache for an existing image, add `--image /path/to/image`
+to `repo sync`. CPS verifies the candidate against the installed publisher
+key, checkpoint, and signed catalog archive before advancing the cache's CPS
+checkpoint. This works with an empty cache. If the image has only a compact
+checkpoint, CPS needs the last applied catalog in the cache or as a signed
+target in the mirror. TUF metadata still records authenticated progress when
+a candidate fails the CPS check. The image is opened read-only and keeps
+its existing repository paths until an explicit relocation.
+
 ### Synchronizing a signed profile
 
 For a profile that spans mirrors, add one `mirror` entry per publisher to
@@ -646,6 +655,13 @@ their catalog pins.
 If a companion mirror is behind or the staged composition fails validation,
 clients can still select the previous primary catalog and its cached
 objects. Replay checkpoints still remember newer verified metadata.
+
+Use `repo sync-profile --config image.kdl --image /path/to/image` to guard
+the whole profile with an existing image. The supplied configuration must
+match the installed profile, architecture, facets, publisher order, and
+publisher keys. CPS checks the current catalog from each mirror and the
+exact companion catalogs pinned by the new primary profile. It advances
+the CPS checkpoints only after the guarded profile passes validation.
 
 The first successful coordinated sync binds the primary cache to that
 profile and its ordered cache directories. Use `repo sync-profile` for

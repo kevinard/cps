@@ -2353,6 +2353,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     }
     let error = apply(&f.root, &fork).unwrap_err();
     assert!(format!("{error:#}").contains(reason), "{error:#}");
+    check_guarded_sync(&f, &seed, &plain, [&good_primary, &good_seed], reason)?;
 
     for (source, (_, replacement)) in [&f.repo, &seed.repo].into_iter().zip(&replacements) {
         fs::rename(source, replacement)?;
@@ -2402,6 +2403,104 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     Ok(())
 }
 
+fn check_guarded_sync(
+    primary: &Fixture,
+    seed: &Fixture,
+    plain: &Path,
+    good: [&str; 2],
+    reason: &str,
+) -> Result<()> {
+    let work = primary._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let primary_pointer = primary.repo.join("current");
+    let seed_pointer = seed.repo.join("current");
+    let primary_fork = fs::read_to_string(&primary_pointer)?;
+    let seed_fork = fs::read_to_string(&seed_pointer)?;
+    let endpoint = |mirror: &Path, role| Url::from_directory_path(mirror.join(role)).unwrap();
+    let plain_cache = work.join("guarded-standalone");
+    let sync_plain = |mirror: &Path| {
+        mirror_release::sync_with_options(
+            &plain_cache,
+            &anchor,
+            endpoint(mirror, "metadata").as_str(),
+            endpoint(mirror, "targets").as_str(),
+            "seed",
+            &seed.public,
+            mirror_release::SyncOptions {
+                index_only: true,
+                image: Some(plain),
+            },
+        )
+    };
+    let fork_mirror = work.join("fork-seed-mirror");
+    sign_publisher_release(seed, &fork_mirror, 1, fresh, &anchor, &tuf_key, "seed")?;
+    let error = sync_plain(&fork_mirror).unwrap_err();
+    assert!(format!("{error:#}").contains(reason), "{error:#}");
+    assert!(!plain_cache.join("current").exists());
+    assert!(!plain_cache.join(".tuf/catalog").exists());
+
+    let primary_cache = work.join("guarded-primary");
+    let seed_cache = work.join("guarded-companion");
+    let config = work.join("guarded-sync.kdl");
+    let sync_profile = |primary_mirror: &Path, seed_mirror: &Path| -> Result<String> {
+        let mut document =
+            "schema-version 1\narchitecture \"x86_64\"\nrelease-profile \"desktop\"\n".to_owned();
+        for (name, repo, key, mirror) in [
+            ("canopa", &primary_cache, &primary.public, primary_mirror),
+            ("seed", &seed_cache, &seed.public, seed_mirror),
+        ] {
+            document.push_str(&format!(
+                "publisher {name:?} {{ repository {repo:?}; trust-key {key:?}; }}\n"
+            ));
+            document.push_str(&format!(
+                "mirror {name:?} root={anchor:?} metadata={:?} targets={:?}\n",
+                endpoint(mirror, "metadata").as_str(),
+                endpoint(mirror, "targets").as_str()
+            ));
+        }
+        fs::write(&config, document)?;
+        mirror_release::sync_profile_for_image(&config, true, &primary.root)
+    };
+    let fork_primary_mirror = work.join("fork-primary-mirror");
+    sign_release(primary, &fork_primary_mirror, 1, fresh, &anchor, &tuf_key)?;
+    // The companion's current catalog preserves the applied withdrawal. The
+    // higher-sequence fork pinned by the primary is still retained and invalid.
+    withdraw_package(&seed.repo, &seed.private, "cps://seed/test/retired@1.0.0-0")?;
+    let export = work.join("seed-with-fork");
+    mirror_release::export_with_retained(
+        &seed.repo,
+        "seed",
+        &seed.public,
+        &export,
+        &[seed_fork.trim().to_owned()],
+    )?;
+    let retained_fork = work.join("retained-fork-mirror");
+    sign_export(&export, &retained_fork, 1, fresh, &anchor, &tuf_key)?;
+    let error = sync_profile(&fork_primary_mirror, &retained_fork).unwrap_err();
+    assert!(format!("{error:#}").contains(reason), "{error:#}");
+    for repo in [&primary_cache, &seed_cache] {
+        assert!(!repo.join("current").exists());
+        assert!(!repo.join(".tuf/catalog").exists());
+    }
+
+    fs::write(&primary_pointer, good[0])?;
+    fs::write(&seed_pointer, good[1])?;
+    let good_primary = work.join("good-primary-mirror");
+    let good_seed = work.join("good-seed-mirror");
+    sign_release(primary, &good_primary, 2, fresh, &anchor, &tuf_key)?;
+    sign_publisher_release(seed, &good_seed, 2, fresh, &anchor, &tuf_key, "seed")?;
+    assert_eq!(sync_plain(&good_seed)?, good[1].trim());
+    assert_eq!(sync_profile(&good_primary, &good_seed)?, good[0].trim());
+    assert_eq!(fs::read_to_string(primary_cache.join("current"))?, good[0]);
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, good[1]);
+    fs::write(primary_pointer, primary_fork)?;
+    fs::write(seed_pointer, seed_fork)?;
+    Ok(())
+}
+
 #[test]
 fn legacy_cache_relocation_requires_the_applied_catalog() -> Result<()> {
     let f = Fixture::new()?;
@@ -2430,7 +2529,7 @@ fn legacy_cache_relocation_requires_the_applied_catalog() -> Result<()> {
     fs::remove_file(&predecessor)?;
     let locations = [("canopa".into(), replacement)];
     let error = crate::set_publisher_repositories(&f.root, &locations).unwrap_err();
-    assert!(format!("{error:#}").contains("relocation requires the last applied catalog"));
+    assert!(format!("{error:#}").contains("replacement cache requires the last applied catalog"));
     assert_eq!(crate::list_publishers(&f.root)?[0].repository, f.repo);
     fs::write(predecessor, bytes)?;
     crate::set_publisher_repositories(&f.root, &locations)?;

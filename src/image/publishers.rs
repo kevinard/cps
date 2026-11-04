@@ -216,7 +216,12 @@ pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)
         let check = || {
             let (catalog, hash) =
                 read_selected_catalog(&publisher.repo, &publisher.name, &publisher.key, pin)?;
-            image.check_relocation(&state, publisher, &catalog, &catalog.checkpoint(hash))?;
+            image.check_repository_candidate(
+                &state,
+                publisher,
+                &catalog,
+                &catalog.checkpoint(hash),
+            )?;
             let policies = publisher
                 .build_trust
                 .iter()

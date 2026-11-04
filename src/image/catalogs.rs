@@ -213,7 +213,7 @@ pub(super) fn retain(tx: &Transaction<'_>, settings: &Settings) -> Result<()> {
 }
 
 impl Image {
-    pub(super) fn check_relocation(
+    pub(crate) fn check_repository_candidate(
         &self,
         state: &State,
         publisher: &Publisher,
@@ -241,7 +241,7 @@ impl Image {
         } else {
             let bytes = catalog_bytes(&publisher.repo, previous_hash).with_context(|| {
                 format!(
-                    "relocation requires the last applied catalog {previous_hash} for {}",
+                    "replacement cache requires the last applied catalog {previous_hash} for {}",
                     publisher.name
                 )
             })?;

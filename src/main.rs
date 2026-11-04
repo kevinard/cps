@@ -393,6 +393,9 @@ enum RepoCommand {
         publisher: String,
         #[arg(long)]
         trust_key: PathBuf,
+        /// Check the signed catalog against this installed image before promotion
+        #[arg(long)]
+        image: Option<PathBuf>,
         /// Cache the catalog, manifests, and build evidence without downloading payloads
         #[arg(long)]
         index_only: bool,
@@ -402,6 +405,9 @@ enum RepoCommand {
         /// Image configuration with mirror settings for every publisher
         #[arg(long)]
         config: PathBuf,
+        /// Check the signed catalogs against this installed image before promotion
+        #[arg(long)]
+        image: Option<PathBuf>,
         /// Cache the catalogs, manifests, and build evidence without downloading payloads
         #[arg(long)]
         index_only: bool,
@@ -864,22 +870,34 @@ fn run(command: Command) -> Result<ExitCode> {
                 publisher,
                 trust_key,
                 index_only,
+                image,
             } => {
-                let sync = if index_only {
-                    release::sync_index
-                } else {
-                    release::sync
-                };
                 println!(
                     "Synchronized {}",
-                    sync(&repo, &root, &metadata, &targets, &publisher, &trust_key)?
+                    release::sync_with_options(
+                        &repo,
+                        &root,
+                        &metadata,
+                        &targets,
+                        &publisher,
+                        &trust_key,
+                        release::SyncOptions {
+                            index_only,
+                            image: image.as_deref()
+                        }
+                    )?
                 );
             }
-            RepoCommand::SyncProfile { config, index_only } => {
-                println!(
-                    "Synchronized {}",
-                    release::sync_profile(&config, index_only)?
-                );
+            RepoCommand::SyncProfile {
+                config,
+                index_only,
+                image,
+            } => {
+                let synchronized = match image {
+                    Some(image) => release::sync_profile_for_image(&config, index_only, &image)?,
+                    None => release::sync_profile(&config, index_only)?,
+                };
+                println!("Synchronized {}", synchronized);
             }
             RepoCommand::PruneCache {
                 repo,

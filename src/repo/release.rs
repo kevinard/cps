@@ -19,13 +19,13 @@ use tough::{
 use url::Url;
 
 use crate::{
-    image::Publisher,
+    image::{Image, Publisher, State},
     model::{Action, digest, digest_reader, validate_digest, validate_publisher},
     transport::https_client,
 };
 
 use super::{
-    CATALOG_LIMIT, CatalogEntry, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot,
+    CATALOG_LIMIT, Catalog, CatalogEntry, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot,
     catalog_snapshot, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
     read_current, read_key, read_limited, read_package, read_pointer, write_atomic,
 };
@@ -126,7 +126,7 @@ fn endpoint(value: &str) -> Result<Url> {
 mod cache;
 mod profile;
 pub use cache::{CacheRetention, PruneReport, prune_payloads};
-pub use profile::sync_profile;
+pub use profile::{sync_profile, sync_profile_for_image};
 
 #[derive(Clone)]
 struct Mirror {
@@ -218,13 +218,14 @@ pub fn sync(
     publisher: &str,
     trust_key: &Path,
 ) -> Result<String> {
-    synchronize(
+    sync_with_options(
         repo,
         trusted_root,
-        Mirror::new(metadata_url, targets_url)?,
+        metadata_url,
+        targets_url,
         publisher,
         trust_key,
-        true,
+        SyncOptions::default(),
     )
 }
 
@@ -237,29 +238,129 @@ pub fn sync_index(
     publisher: &str,
     trust_key: &Path,
 ) -> Result<String> {
-    synchronize(
+    sync_with_options(
         repo,
+        trusted_root,
+        metadata_url,
+        targets_url,
+        publisher,
+        trust_key,
+        SyncOptions {
+            index_only: true,
+            image: None,
+        },
+    )
+}
+
+#[derive(Default)]
+pub struct SyncOptions<'a> {
+    pub index_only: bool,
+    pub image: Option<&'a Path>,
+}
+
+pub fn sync_with_options(
+    repo: &Path,
+    trusted_root: &Path,
+    metadata_url: &str,
+    targets_url: &str,
+    publisher: &str,
+    trust_key: &Path,
+    options: SyncOptions<'_>,
+) -> Result<String> {
+    let source = SyncSource::new(
         trusted_root,
         Mirror::new(metadata_url, targets_url)?,
         publisher,
         trust_key,
-        false,
-    )
-}
-
-fn synchronize(
-    repo: &Path,
-    trusted_root: &Path,
-    mirror: Mirror,
-    publisher: &str,
-    trust_key: &Path,
-    full: bool,
-) -> Result<String> {
-    let source = SyncSource::new(trusted_root, mirror, publisher, trust_key)?;
+    )?;
+    let guard = options.image.map(ImageGuard::open).transpose()?;
+    if let Some(guard) = &guard {
+        ensure!(
+            guard.state.publishers.release_profile().is_none(),
+            "use repo sync-profile --image for an image that follows a signed profile"
+        );
+        guard.check_source(&source)?;
+    }
     let _lock = lock_repo(repo)?;
-    let release = stage_release(repo, &source, full, None, &[])?;
+    let release = stage_release(
+        repo,
+        &source,
+        !options.index_only,
+        None,
+        &[],
+        guard.as_ref(),
+        false,
+    )?;
     source.promote(repo, &release, None)?;
     Ok(release.current)
+}
+
+struct ImageGuard {
+    image: Image,
+    state: State,
+}
+
+impl ImageGuard {
+    fn open(root: &Path) -> Result<Self> {
+        let image =
+            Image::open_query(root).context("opening the image used to guard mirror sync")?;
+        image.require_clean()?;
+        let state = image.state()?;
+        Ok(Self { image, state })
+    }
+
+    fn check_source(&self, source: &SyncSource<'_>) -> Result<&Publisher> {
+        let publisher = self
+            .state
+            .publishers
+            .get(source.publisher)
+            .with_context(|| format!("image has no publisher {}", source.publisher))?;
+        ensure!(
+            publisher.key == source.key,
+            "mirror trust key differs from the image trust key for {}",
+            source.publisher
+        );
+        Ok(publisher)
+    }
+
+    fn legacy_predecessor(&self, publisher: &str, candidate: &str) -> Option<&str> {
+        let settings = &self.state.settings;
+        if settings.catalog_archives
+            || (settings.archived_profile_catalog.is_some()
+                && self.state.publishers.as_slice()[0].name == publisher)
+        {
+            return None;
+        }
+        settings
+            .catalog_checkpoints
+            .get(publisher)
+            .map(|point| point.catalog.as_str())
+            .filter(|hash| *hash != candidate)
+    }
+
+    fn check(
+        &self,
+        repo: &Path,
+        source: &SyncSource<'_>,
+        hash: &str,
+        catalog: &Catalog,
+    ) -> Result<()> {
+        let mut publisher = self.check_source(source)?.clone();
+        publisher.repo = repo.to_owned();
+        self.image
+            .check_repository_candidate(
+                &self.state,
+                &publisher,
+                catalog,
+                &catalog.checkpoint(hash.to_owned()),
+            )
+            .with_context(|| {
+                format!(
+                    "checking mirror catalog against the installed image for {}",
+                    source.publisher
+                )
+            })
+    }
 }
 
 struct StagedRelease {
@@ -330,6 +431,8 @@ fn stage_release(
     full: bool,
     binding: Option<&str>,
     required: &[&CatalogPin],
+    guard: Option<&ImageGuard>,
+    defer_checkpoint: bool,
 ) -> Result<StagedRelease> {
     let SyncSource {
         publisher,
@@ -385,7 +488,16 @@ fn stage_release(
         )
         .await?;
         prepare_objects(repo)?;
-        materialize(repo, &verified, publisher, key, full, required).await
+        materialize(
+            repo,
+            &verified,
+            source,
+            full,
+            required,
+            guard,
+            defer_checkpoint,
+        )
+        .await
     })
 }
 
@@ -476,17 +588,32 @@ fn check_cache_origin(directory: &Root, publisher: &str, key: &[u8]) -> Result<(
 async fn materialize(
     repo: &Path,
     verified: &Repository,
-    publisher: &str,
-    key: &[u8],
+    source: &SyncSource<'_>,
     full: bool,
     required: &[&CatalogPin],
+    guard: Option<&ImageGuard>,
+    defer_checkpoint: bool,
 ) -> Result<StagedRelease> {
+    let publisher = source.publisher;
+    let key = &source.key;
     let pointer = download(verified, "current", repo, 65, None, None)
         .await?
         .context("missing catalog pointer download")?;
     let hash = parse_current(&String::from_utf8(read_limited(pointer.reopen()?, 65)?)?)?;
     fetch_object(verified, repo, "catalogs", &hash, CATALOG_LIMIT, None).await?;
     let catalog = read_catalog(repo, &hash, publisher, key)?;
+    if let Some(guard) = guard {
+        if let Some(previous) = guard.legacy_predecessor(publisher, &hash)
+            && !path_present(&repo.join("catalogs").join(previous))?
+        {
+            fetch_object(verified, repo, "catalogs", previous, CATALOG_LIMIT, None)
+                .await
+                .with_context(|| {
+                    format!("fetching last applied catalog {previous} for {publisher}")
+                })?;
+        }
+        guard.check(repo, source, &hash, &catalog)?;
+    }
     let checkpoint = repo.join(PUBLISHER_CHECKPOINT);
     let trusted = path_present(&checkpoint)?
         .then(|| read_pointer(repo, PUBLISHER_CHECKPOINT))
@@ -501,7 +628,9 @@ async fn materialize(
             read_catalog(repo, &previous, publisher, key)?.check_successor(&catalog, &previous)?;
         }
         // Remember the signed catalog even when its payloads cannot be fetched.
-        write_atomic(&checkpoint, format!("{hash}\n").as_bytes(), false)?;
+        if !defer_checkpoint {
+            record_catalog_checkpoint(repo, &hash)?;
+        }
     }
     for pin in required.iter().filter(|pin| pin.sha256 == hash) {
         pin.check_lineage(&catalog, key)?;
@@ -548,6 +677,14 @@ async fn materialize(
         current: hash,
         retained: retained_hashes,
     })
+}
+
+fn record_catalog_checkpoint(repo: &Path, hash: &str) -> Result<()> {
+    write_atomic(
+        &repo.join(PUBLISHER_CHECKPOINT),
+        format!("{hash}\n").as_bytes(),
+        false,
+    )
 }
 
 fn retained_catalogs<'a>(
