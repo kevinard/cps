@@ -853,6 +853,83 @@ fn publisher_changes_invalidate_plans_without_changing_boot_lineage() -> Result<
 }
 
 #[test]
+fn builder_policy_changes_are_atomic_and_wait_for_transaction_recovery() -> Result<()> {
+    use crate::{audit_publisher_builds, image::Image, set_publisher_build_trust};
+
+    let f = Fixture::new()?;
+    let worker = Fixture::new()?;
+    let policy = f._dir.path().join("trust.kdl");
+    fs::write(
+        &policy,
+        format!(
+            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            worker.public
+        ),
+    )?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "original", "0755", "")?,
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("install.json"),
+        &install,
+        COMPOSITOR,
+    )?;
+    let error = set_publisher_build_trust(&f.root, "canopa", &policy, true).unwrap_err();
+    assert!(error.to_string().contains("incomplete transaction"));
+    apply(&f.root, &install)?;
+
+    let settings = || Image::open(&f.root, false)?.settings();
+    let before = settings()?;
+    let saved = plan(&f.root, Request::Update)?;
+    let error = set_publisher_build_trust(&f.root, "canopa", &policy, false).unwrap_err();
+    assert!(error.to_string().contains("no build attestation"));
+    assert_eq!(settings()?, before);
+
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    set_publisher_build_trust(&f.root, "canopa", &policy, true)?;
+    let after = settings()?;
+    assert_eq!(after.publisher_generation, before.publisher_generation + 1);
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.boot_parent, before.boot_parent);
+    assert_ne!(after.format, before.format);
+    let error = apply(&f.root, &saved).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("publisher configuration changed")
+    );
+    set_publisher_build_trust(&f.root, "canopa", &policy, true)?;
+    assert_eq!(settings()?, after);
+
+    fs::rename(&offline, &f.repo)?;
+    let audit = audit_publisher_builds(&f.root, "canopa")?;
+    assert_eq!(audit.verified, 0);
+    assert_eq!(audit.failures.len(), 1);
+    assert!(audit.failures[0].contains("no build attestation"));
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "unsigned by builders", "0755", "")?,
+    )?;
+    let error = plan(&f.root, Request::Update).unwrap_err();
+    assert!(error.to_string().contains("no build attestation"));
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "original");
+    Ok(())
+}
+
+#[test]
 fn solver_honors_exclusions_and_explains_impossible_requests() -> Result<()> {
     let f = Fixture::new()?;
     f.package(

@@ -646,12 +646,39 @@ mv -- saved-evidence "$evidence"
 test image/hello -ef image/hello-alias
 test "$(cat image/hello-alias)" = 'hello from pinned input 1700000000'
 
+cat > trust.kdl <<'POLICY'
+schema-version 1
+build-trust minimum-builders=2 {
+    builder-key "builder-public.der"
+    builder-key "other-public.der"
+}
+POLICY
+"$cps" publisher set-build-trust --root image --policy trust.kdl canopa
+"$cps" publisher audit-builds --root image canopa | grep -F 'Verified build evidence for 1 installed package'
+"$cps" image-create --root added --repo repo --publisher canopa --trust-key public.der
+expect_failure 'builder and publisher must use distinct keys' "$cps" publisher add \
+    --root added --repo tools-repo --trust-key other-public.der --build-trust trust.kdl tools
+sed -e 's/ minimum-builders=2//' -e '/"other-public.der"/d' trust.kdl > single-builder.kdl
+"$cps" publisher add --root added --repo tools-repo --trust-key other-public.der \
+    --build-trust single-builder.kdl tools
+expect_failure 'no build attestation for cps://tools/build/probe@2.0.0-0' \
+    "$cps" plan --root added --output rejected.json install cps://tools/build/probe
+openssl genpkey -algorithm ED25519 -outform DER -out replacement-builder.der
+openssl pkey -inform DER -in replacement-builder.der -pubout -outform DER -out replacement-public.der
+sed 's/"builder-public.der"/"replacement-public.der"/' trust.kdl > rotated-trust.kdl
+"$cps" plan --root guarded --output before-revocation.json update
+expect_failure 'installed build audit failed' \
+    "$cps" publisher set-build-trust --root guarded --policy rotated-trust.kdl canopa
+"$cps" publisher set-build-trust --root guarded --policy rotated-trust.kdl --future-only canopa
+expect_failure 'publisher configuration changed' "$cps" apply --root guarded before-revocation.json
+expect_failure 'requires 2 trusted builder signatures, found 1' "$cps" publisher audit-builds --root guarded canopa
+
 openssl genpkey -algorithm ED25519 -outform DER -out successor.der
 "$cps" repo rotate-key --repo witnessed --publisher canopa --base "$witnessed_catalog" \
     --signing-key signing.der --new-signing-key successor.der
 rotated_catalog=$(cat witnessed/current)
 
-# Build the two packages in a coordinated upgrade on both workers.
+# Build the coordinated upgrade with signatures for both trust policies.
 printf 'hello from pinned input\n' > sources/input
 cat > manifest.kdl <<MANIFEST
 schema-version 1
@@ -664,6 +691,7 @@ MANIFEST
 recipe '    printf "hello 2\n" > "$DESTDIR/hello"' > hello2.kdl
 build_package --sources sources --builder-signing-key builder.der --check-reproducible --output hello2-a hello2.kdl
 build_package --sources sources --builder-signing-key other.der --check-reproducible --output hello2-b hello2.kdl
+build_package --sources sources --builder-signing-key replacement-builder.der --check-reproducible --output hello2-c hello2.kdl
 build_package --sources sources --builder-signing-key signing.der --check-reproducible --output hello2-retired hello2.kdl
 
 cat > manifest.kdl <<MANIFEST
@@ -675,15 +703,18 @@ MANIFEST
 recipe '    printf "platform\n" > "$DESTDIR/platform"' > platform.kdl
 build_package --sources sources --builder-signing-key builder.der --check-reproducible --output platform-a platform.kdl
 build_package --sources sources --builder-signing-key other.der --check-reproducible --output platform-b platform.kdl
+build_package --sources sources --builder-signing-key replacement-builder.der --check-reproducible --output platform-c platform.kdl
 
 hello2_reviewed=$(sha hello2.kdl)
 platform_reviewed=$(sha platform.kdl)
 cp public.der witnessed/retired-publisher.der
+cp replacement-public.der witnessed/
 cat > witnessed/publish-policy.kdl <<POLICY
 schema-version 1
 publisher "canopa" minimum-builders=2 {
     builder-key "builder-public.der"
     builder-key "other-public.der"
+    builder-key "replacement-public.der"
     builder-key "retired-publisher.der"
     approve "demo/hello" version="2.0.0-0" sha256="$hello2_reviewed"
     approve "library/platform" version="1.0.0-0" sha256="$platform_reviewed"
@@ -706,16 +737,18 @@ release "canopa" base="$rotated_catalog" {
     obsolete "cps://canopa/demo/hello@1.1.0-0"
     bundle "cps://canopa/demo/hello@2.0.0-0" path="hello2-a" builder-key="builder-public.der" recipe-sha256="$hello2_reviewed" {
         witness "hello2-b/attestation.json" key="other-public.der"
+        witness "hello2-c/attestation.json" key="replacement-public.der"
     }
     bundle "cps://canopa/library/platform@1.0.0-0" path="platform-a" builder-key="builder-public.der" recipe-sha256="$platform_reviewed" {
         witness "platform-b/attestation.json" key="other-public.der"
+        witness "platform-c/attestation.json" key="replacement-public.der"
     }
 }
 WAVE
 publish_wave() {
     "$cps" repo publish-release --repo witnessed --signing-key successor.der "$1"
 }
-sed '/witness "platform-b\/attestation.json"/d' wave.kdl > incomplete.kdl
+sed '/witness "platform-[bc]\/attestation.json"/d' wave.kdl > incomplete.kdl
 expect_failure 'requires 2 distinct build signers' publish_wave incomplete.kdl
 test "$(cat witnessed/current)" = "$rotated_catalog"
 test -z "$("$cps" repo withdrawals --repo witnessed --publisher canopa --trust-key public.der)"
@@ -734,6 +767,7 @@ test "$("$cps" repo obsoletions --repo witnessed --publisher canopa --trust-key 
     'cps://canopa/demo/hello@1.1.0-0'
 "$cps" repo attestation --repo witnessed --publisher canopa --trust-key public.der \
     cps://canopa/demo/hello@1.0.0-0 | cmp - witnessed.json
+"$cps" publisher audit-builds --root image canopa | grep -F 'Verified build evidence for 1 installed package'
 expect_failure 'checking release profile base' "$cps" repo withdraw \
     --repo witnessed --signing-key successor.der cps://canopa/library/platform@1.0.0-0
 mv witnessed/publish-policy.kdl gate.saved
@@ -753,7 +787,13 @@ test image/hello -ef image/hello-alias
 "$cps" plan --root guarded --output guarded-wave.json update
 "$cps" boot-env stage --source guarded --root guarded-staged guarded-wave.json
 "$cps" verify --root guarded-staged --pristine
+"$cps" publisher audit-builds --root guarded-staged canopa | grep -F 'Verified build evidence for 2 installed package'
 test "$(cat guarded-staged/hello-alias)" = 'hello 2'
 test "$(cat guarded-staged/platform)" = 'platform'
 test "$(cat guarded/hello-alias)" = 'hello from pinned input 1700000000'
+sed '/^schema-version 1/a release-profile "base"' protected-image.kdl > profiled-image.kdl
+"$cps" image-create --root profiled --config profiled-image.kdl
+"$cps" publisher set-build-trust --root profiled --policy rotated-trust.kdl canopa
+expect_failure 'signed release profile fixes this image' "$cps" publisher prefer --root profiled canopa
+"$cps" plan --root profiled --output profiled.json install demo/hello
 echo "Verified isolated build, reproducibility, signed provenance, and package installation"

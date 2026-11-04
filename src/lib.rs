@@ -29,15 +29,17 @@ pub use build::{
 };
 pub use generate::generate_manifest;
 pub use image::publishers::{
-    PublisherInfo, add_publisher, list_publishers, prefer_publisher, remove_publisher,
+    PublisherInfo, add_publisher, add_publisher_with_build_trust, audit_publisher_builds,
+    list_publishers, prefer_publisher, remove_publisher, set_publisher_build_trust,
 };
 pub use image::{create_configured_image, create_image};
 pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{ConfigChoice, ConfigUpdate, Plan, Request, list_config_updates, plan};
 pub use repo::{
-    BuildWitness, list_obsoletions, list_withdrawals, publish, publish_bundle, publish_release,
-    publish_witnessed_bundle, read_attestation, release, rotate_publisher_key, withdraw_package,
+    BuildAudit, BuildWitness, list_obsoletions, list_withdrawals, publish, publish_bundle,
+    publish_release, publish_witnessed_bundle, read_attestation, release, rotate_publisher_key,
+    withdraw_package,
 };
 pub use verify::{Finding, verify, verify_pristine};
 

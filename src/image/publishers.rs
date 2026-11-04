@@ -5,10 +5,12 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Image, Publisher, Publishers};
+use super::{Image, Publisher, Publishers, State};
 use crate::{
+    attestation::BuildTrust,
+    kdl_format::read_build_trust,
     model::validate_publisher,
-    repo::{catalog_index, release_profile},
+    repo::{BuildAudit, audit_installed_builds, catalog_index, release_profile},
 };
 
 pub struct PublisherInfo {
@@ -74,18 +76,98 @@ pub fn list_publishers(root: &Path) -> Result<Vec<PublisherInfo>> {
 }
 
 pub fn add_publisher(root: &Path, name: &str, repo: &Path, key: &Path) -> Result<()> {
+    add_publisher_with_build_trust(root, name, repo, key, None)
+}
+
+pub fn add_publisher_with_build_trust(
+    root: &Path,
+    name: &str,
+    repo: &Path,
+    key: &Path,
+    policy: Option<&Path>,
+) -> Result<()> {
     let mut image = Image::open(root, true)?;
     let configured = editable_publishers(&image)?;
     ensure!(
         configured.get(name).is_none(),
         "publisher {name} is already configured"
     );
-    let publisher = Publisher::from_config(name, repo, key)?;
-    catalog_index(&publisher.repo, name, &publisher.key, None)
-        .with_context(|| format!("verifying signed catalog for {name}"))?;
+    let mut publisher = Publisher::from_config(name, repo, key)?;
+    if let Some(path) = policy {
+        let trust = read_build_trust(path)?.load(&publisher.key)?;
+        audit_installed_builds(&publisher.repo, name, &publisher.key, None, &trust, [])?;
+        publisher.build_trust = Some(trust);
+    } else {
+        catalog_index(&publisher.repo, name, &publisher.key, None)
+            .with_context(|| format!("verifying signed catalog for {name}"))?;
+    }
     let mut publishers = configured.as_slice().to_vec();
     publishers.push(publisher);
-    save(&mut image, publishers)
+    save(&mut image, Publishers::new(publishers, None)?)
+}
+
+/// Replace the locally provisioned builder policy. Audit installed packages
+/// first unless the administrator explicitly scopes the change to future plans.
+pub fn set_publisher_build_trust(
+    root: &Path,
+    name: &str,
+    policy: &Path,
+    future_only: bool,
+) -> Result<()> {
+    let mut image = Image::open(root, true)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    let mut publishers = state.publishers.as_slice().to_vec();
+    let publisher = &mut publishers[position(state.publishers.as_slice(), name)?];
+    let trust = read_build_trust(policy)?.load(&publisher.key)?;
+    if !future_only {
+        let audit = audit(&state, publisher, &trust)?;
+        ensure!(
+            audit.failures.is_empty(),
+            "installed build audit failed for {name}\n{}",
+            audit.failures.join("\n")
+        );
+    }
+    if publisher.build_trust.as_ref() != Some(&trust) {
+        publisher.build_trust = Some(trust);
+        let profile = state.publishers.release_profile().map(str::to_owned);
+        save(&mut image, Publishers::new(publishers, profile)?)?;
+    }
+    Ok(())
+}
+
+pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    let publisher = state
+        .publishers
+        .get(name)
+        .with_context(|| format!("publisher {name} is not configured"))?;
+    let trust = publisher
+        .build_trust
+        .as_ref()
+        .with_context(|| format!("publisher {name} has no build trust policy"))?;
+    audit(&state, publisher, trust)
+}
+
+fn audit(state: &State, publisher: &Publisher, trust: &BuildTrust) -> Result<BuildAudit> {
+    let pins = state
+        .publishers
+        .release_pins(&state.settings.arch, &state.settings.facets, None)?;
+    let installed = state
+        .installed
+        .values()
+        .map(|package| &package.published)
+        .filter(|package| package.manifest.publisher == publisher.name);
+    audit_installed_builds(
+        &publisher.repo,
+        &publisher.name,
+        &publisher.key,
+        pins.get(&publisher.name).map(String::as_str),
+        trust,
+        installed,
+    )
 }
 
 pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
@@ -97,7 +179,7 @@ pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     publishers[..=position].rotate_right(1);
-    save(&mut image, publishers)
+    save(&mut image, Publishers::new(publishers, None)?)
 }
 
 pub fn remove_publisher(root: &Path, name: &str) -> Result<()> {
@@ -117,7 +199,7 @@ pub fn remove_publisher(root: &Path, name: &str) -> Result<()> {
         );
     }
     publishers.remove(position);
-    save(&mut image, publishers)
+    save(&mut image, Publishers::new(publishers, None)?)
 }
 
 fn position(publishers: &[Publisher], name: &str) -> Result<usize> {
@@ -138,8 +220,7 @@ fn editable_publishers(image: &Image) -> Result<Publishers> {
     Ok(publishers)
 }
 
-fn save(image: &mut Image, publishers: Vec<Publisher>) -> Result<()> {
-    let publishers = Publishers::new(publishers, None)?;
+fn save(image: &mut Image, publishers: Publishers) -> Result<()> {
     let mut settings = image.settings()?;
     settings.format = publishers.image_format();
     settings.publisher_generation = settings

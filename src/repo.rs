@@ -90,6 +90,29 @@ impl Catalog {
         }
     }
 
+    fn package_record(&self, id: &str) -> Option<(&str, Option<&str>)> {
+        if let Some(hash) = self.entries.get(id) {
+            Some((hash, self.attestations.get(id).map(String::as_str)))
+        } else {
+            let withdrawn = self.withdrawals.get(id)?;
+            Some((&withdrawn.manifest, withdrawn.attestation.as_deref()))
+        }
+    }
+
+    fn publisher_keys(&self, anchor: &[u8]) -> Result<Vec<[u8; 32]>> {
+        let mut keys = vec![
+            anchor
+                .try_into()
+                .context("invalid Ed25519 public key length")?,
+        ];
+        keys.extend(
+            self.key_rotations
+                .iter()
+                .map(|rotation| *rotation.next_key()),
+        );
+        Ok(keys)
+    }
+
     fn withdraw(&mut self, id: &str) -> Result<bool> {
         if self.withdrawals.contains_key(id) {
             return Ok(false);
@@ -318,27 +341,83 @@ impl BuildEvidence {
             trust.check_publisher_key(key)?;
         }
         let id = package.manifest.id();
-        let hash = self
-            .attestations
-            .get(&id)
-            .with_context(|| format!("no build attestation for {id}"))?;
-        let document = package
-            .document
-            .as_ref()
-            .context("build trust requires a published KDL manifest")?;
-        let bytes = read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
-            .with_context(|| format!("reading build attestation for {id}"))?;
-        trust
-            .verify(
-                &bytes,
-                &package.manifest,
-                FileDigest {
-                    sha256: package.sha256.clone(),
-                    size: document.len() as u64,
-                },
-            )
-            .with_context(|| format!("verifying build evidence for {id}"))
+        verify_package_attestation(
+            repo,
+            trust,
+            package,
+            self.attestations.get(&id).map(String::as_str),
+        )
     }
+}
+
+fn verify_package_attestation(
+    repo: &Path,
+    trust: &BuildTrust,
+    package: &Published,
+    hash: Option<&str>,
+) -> Result<()> {
+    let id = package.manifest.id();
+    let hash = hash.with_context(|| format!("no build attestation for {id}"))?;
+    let document = package
+        .document
+        .as_ref()
+        .context("build trust requires a published KDL manifest")?;
+    let bytes = read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
+        .with_context(|| format!("reading build attestation for {id}"))?;
+    trust
+        .verify(
+            &bytes,
+            &package.manifest,
+            FileDigest {
+                sha256: package.sha256.clone(),
+                size: document.len() as u64,
+            },
+        )
+        .with_context(|| format!("verifying build evidence for {id}"))
+}
+
+#[derive(Default)]
+pub struct BuildAudit {
+    pub verified: usize,
+    pub failures: Vec<String>,
+}
+
+pub(crate) fn audit_installed_builds<'a>(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    pinned: Option<&str>,
+    trust: &BuildTrust,
+    installed: impl IntoIterator<Item = &'a Published>,
+) -> Result<BuildAudit> {
+    let hash = pinned.map_or_else(|| read_current(repo), |hash| Ok(hash.to_owned()))?;
+    let catalog = read_catalog(repo, &hash, publisher, key)?;
+    for key in catalog.publisher_keys(key)? {
+        trust.check_publisher_key(&key)?;
+    }
+    let mut audit = BuildAudit::default();
+    for package in installed {
+        let id = package.manifest.id();
+        let installed_record = || {
+            package.verify()?;
+            let (manifest, attestation) = catalog
+                .package_record(&id)
+                .context("package is absent from the signed catalog")?;
+            ensure!(
+                manifest == package.sha256,
+                "installed manifest digest differs from the signed catalog"
+            );
+            Ok(attestation)
+        };
+        let result = installed_record()
+            .with_context(|| format!("checking installed manifest for {id}"))
+            .and_then(|attestation| verify_package_attestation(repo, trust, package, attestation));
+        match result {
+            Ok(()) => audit.verified += 1,
+            Err(error) => audit.failures.push(format!("{error:#}")),
+        }
+    }
+    Ok(audit)
 }
 
 impl Snapshot {
@@ -520,9 +599,8 @@ fn read_catalog_with_key(
 pub fn read_attestation(repo: &Path, publisher: &str, key: &Path, id: &str) -> Result<Vec<u8>> {
     let catalog = read_catalog(repo, &read_current(repo)?, publisher, &read_key(key)?)?;
     let hash = catalog
-        .attestations
-        .get(id)
-        .or_else(|| catalog.withdrawals.get(id)?.attestation.as_ref())
+        .package_record(id)
+        .and_then(|(_, attestation)| attestation)
         .with_context(|| format!("no build attestation for {id}"))?;
     read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
 }
@@ -542,16 +620,7 @@ pub fn snapshot(
 }
 
 fn catalog_snapshot(repo: &Path, catalog: Catalog, hash: String, key: &[u8]) -> Result<Snapshot> {
-    let mut publisher_keys = vec![
-        key.try_into()
-            .context("invalid Ed25519 public key length")?,
-    ];
-    publisher_keys.extend(
-        catalog
-            .key_rotations
-            .iter()
-            .map(|rotation| *rotation.next_key()),
-    );
+    let publisher_keys = catalog.publisher_keys(key)?;
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {
         packages.push(read_package(repo, &catalog.publisher, &id, sha256)?);

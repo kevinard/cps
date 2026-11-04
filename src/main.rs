@@ -12,15 +12,16 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
-    activate_deployed_boot_environment, add_publisher, apply, build_with_toolchain_config,
-    build_with_worker, create_configured_image, create_image, deploy_and_activate_boot_environment,
+    activate_deployed_boot_environment, add_publisher_with_build_trust, apply,
+    audit_publisher_builds, build_with_toolchain_config, build_with_worker,
+    create_configured_image, create_image, deploy_and_activate_boot_environment,
     deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
     fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
     list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
     list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
     publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
     rollback_boot_environment, rollback_boot_environment_on_disk, rotate_publisher_key,
-    stage_boot_environment, verify, verify_pristine, withdraw_package,
+    set_publisher_build_trust, stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -240,6 +241,26 @@ enum PublisherCommand {
         repo: PathBuf,
         #[arg(long)]
         trust_key: PathBuf,
+        /// Require builder signatures from this KDL policy
+        #[arg(long)]
+        build_trust: Option<PathBuf>,
+        name: String,
+    },
+    /// Replace a publisher's locally configured builder keys and threshold
+    SetBuildTrust {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        /// Change admission policy without auditing existing packages
+        #[arg(long)]
+        future_only: bool,
+        name: String,
+    },
+    /// Check installed packages against the configured builder policy
+    AuditBuilds {
+        #[arg(long)]
+        root: PathBuf,
         name: String,
     },
     /// Search this publisher first when selecting new packages
@@ -794,9 +815,44 @@ fn run(command: Command) -> Result<ExitCode> {
                 root,
                 repo,
                 trust_key,
+                build_trust,
                 name,
             } => {
-                add_publisher(&root, &name, &repo, &trust_key)?;
+                add_publisher_with_build_trust(
+                    &root,
+                    &name,
+                    &repo,
+                    &trust_key,
+                    build_trust.as_deref(),
+                )?;
+            }
+            PublisherCommand::SetBuildTrust {
+                root,
+                policy,
+                future_only,
+                name,
+            } => {
+                set_publisher_build_trust(&root, &name, &policy, future_only)?;
+                if future_only {
+                    println!("Configured build trust for future packages from {name}");
+                } else {
+                    println!("Configured build trust for {name}");
+                }
+            }
+            PublisherCommand::AuditBuilds { root, name } => {
+                let audit = audit_publisher_builds(&root, &name)?;
+                for finding in &audit.failures {
+                    eprintln!("{finding}");
+                }
+                println!(
+                    "Verified build evidence for {} installed package(s) from {name}",
+                    audit.verified
+                );
+                ensure!(
+                    audit.failures.is_empty(),
+                    "{} installed package(s) failed build audit",
+                    audit.failures.len()
+                );
             }
             PublisherCommand::Prefer { root, name } => prefer_publisher(&root, &name)?,
             PublisherCommand::Remove { root, name } => remove_publisher(&root, &name)?,

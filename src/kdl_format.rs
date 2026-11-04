@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
 };
 
@@ -13,6 +13,7 @@ use crate::{
     model::{
         Action, Dependency, DependencyTarget, FORMAT, Manifest, validate_name, validate_publisher,
     },
+    repo::read_limited,
     systemd::Action as SystemdAction,
 };
 
@@ -487,6 +488,23 @@ impl BuildTrustConfig {
         trust.check_publisher_key(publisher_key)?;
         Ok(trust)
     }
+}
+
+pub(crate) fn read_build_trust(path: &Path) -> Result<BuildTrustConfig> {
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("opening build trust policy {}", path.display()))?;
+    let parent = path
+        .parent()
+        .context("missing build trust policy directory")?;
+    let bytes = read_limited(File::open(&path)?, 1024 * 1024)?;
+    let doc = document(std::str::from_utf8(&bytes)?)?;
+    schema(&doc)?;
+    ensure!(
+        doc.nodes().len() == 2,
+        "expected only schema-version and build-trust"
+    );
+    build_trust_config(one(&doc, "build-trust")?, parent)
+        .with_context(|| format!("parsing build trust policy {}", path.display()))
 }
 
 fn build_trust_config(node: &KdlNode, parent: &Path) -> Result<BuildTrustConfig> {

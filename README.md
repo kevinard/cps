@@ -314,6 +314,36 @@ stores the public keys in the image state. Older CPS binaries cannot apply
 plans to an image with build trust. Existing version 1 and 2 bundles remain
 publishable, and guarded consumers require packages built with version 3.
 
+To enable or replace build trust on an existing image, put the policy in
+its own KDL file. Relative key paths resolve from the file's directory.
+
+```kdl
+schema-version 1
+build-trust minimum-builders=2 {
+    builder-key "worker-a.der"
+    builder-key "worker-b.der"
+}
+```
+
+```sh
+cps publisher set-build-trust --root image --policy builders.kdl canopa
+cps publisher audit-builds --root image canopa
+```
+
+By default, CPS checks every installed package from that publisher before
+saving the policy. The audit matches the installed manifest against the
+signed current catalog or the catalog pinned by the image's release profile.
+It can check withdrawn packages when their evidence is still cached.
+For immediate key revocation, use `set-build-trust --future-only` to change
+admission policy even with the repository offline. Use `audit-builds` to
+identify installed packages whose evidence fails the new policy.
+CPS requires a clean transaction state before changing the policy. A change
+invalidates unapplied saved plans and preserves the image's boot identity.
+It applies to the named root.
+
+Use `publisher add --build-trust builders.kdl` to set build trust as part of
+adding a publisher.
+
 ### Checking release composition
 
 Add a `profile` inside the policy's `publisher` block to require a representative
