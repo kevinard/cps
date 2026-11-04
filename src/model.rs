@@ -542,6 +542,26 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub(crate) fn with_payloads(
+        mut self,
+        artifacts: &BTreeMap<String, FileDigest>,
+    ) -> Result<Self> {
+        for action in &mut self.action {
+            if let Action::File {
+                path, sha256, size, ..
+            } = action
+            {
+                let file = artifacts
+                    .get(path)
+                    .with_context(|| format!("missing package payload {path}"))?;
+                *sha256 = Some(file.sha256.clone());
+                *size = Some(file.size);
+            }
+        }
+        self.validate(true)?;
+        Ok(self)
+    }
+
     pub(crate) fn payload_paths(&self) -> BTreeSet<&str> {
         self.action
             .iter()

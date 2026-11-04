@@ -12,7 +12,7 @@ use crate::{
     image::root::Root,
     kdl_format::{
         build::{BuildRecipe, PublisherPin, RECIPE_LIMIT, ToolchainPins, parse},
-        parse_manifest,
+        manifest_text, parse_manifest,
     },
     model::{
         FileDigest, Manifest, Version, digest, validate_digest, validate_name, validate_publisher,
@@ -25,6 +25,8 @@ pub(crate) const MAX_BUILDERS: usize = 16;
 const STATEMENT: &str = "https://in-toto.io/Statement/v1";
 const LEGACY_PREDICATE: &str = "urn:canopa:cps:build-provenance:v1";
 const PINNED_PREDICATE: &str = "urn:canopa:cps:build-provenance:v2";
+const PUBLISHED_PREDICATE: &str = "urn:canopa:cps:build-provenance:v3";
+const PUBLISHED_MANIFEST: &str = "published-manifest.kdl";
 const MEDIA_TYPE: &str = "application/vnd.in-toto+json";
 
 #[derive(Serialize, Deserialize)]
@@ -198,6 +200,7 @@ pub(crate) struct VerifiedBuild {
     signatures: BTreeMap<String, Vec<u8>>,
     pub artifacts: BTreeMap<String, FileDigest>,
     pub recipe_sha256: String,
+    pub published_manifest: Option<FileDigest>,
 }
 
 impl VerifiedBuild {
@@ -239,10 +242,13 @@ pub(crate) fn sign(
     toolchain: Toolchain,
     artifacts: &BTreeMap<String, FileDigest>,
 ) -> Result<Vec<u8>> {
-    let mut subject = vec![Subject::new(
-        "manifest.kdl".to_owned(),
-        &file_digest(manifest_bytes),
-    )];
+    let mut subject = vec![
+        Subject::new("manifest.kdl".to_owned(), &file_digest(manifest_bytes)),
+        Subject::new(
+            PUBLISHED_MANIFEST.to_owned(),
+            &published_manifest_digest(manifest, artifacts)?,
+        ),
+    ];
     subject.extend(
         artifacts
             .iter()
@@ -251,7 +257,7 @@ pub(crate) fn sign(
     let statement = Statement {
         statement_type: STATEMENT.to_owned(),
         subject,
-        predicate_type: toolchain.predicate_type().to_owned(),
+        predicate_type: PUBLISHED_PREDICATE.to_owned(),
         predicate: Predicate {
             package: manifest.id(),
             recipe_sha256: digest(recipe_bytes),
@@ -317,6 +323,19 @@ fn file_digest(bytes: &[u8]) -> FileDigest {
     }
 }
 
+fn published_manifest_digest(
+    manifest: &Manifest,
+    artifacts: &BTreeMap<String, FileDigest>,
+) -> Result<FileDigest> {
+    let published = manifest.clone().with_payloads(artifacts)?;
+    let bytes = manifest_text(&published);
+    ensure!(
+        bytes.len() as u64 <= MANIFEST_LIMIT,
+        "manifest exceeds {MANIFEST_LIMIT} bytes"
+    );
+    Ok(file_digest(bytes.as_bytes()))
+}
+
 fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let signed: Envelope = serde_json::from_slice(bytes)?;
     ensure!(
@@ -350,17 +369,8 @@ pub(crate) fn verify_bundle(
     validate_digest(reviewed_recipe).context("invalid reviewed recipe digest")?;
     let bytes = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
     let (payload, signature) = verify_envelope(&bytes, builder_key)?;
-    let statement: Statement = serde_json::from_slice(&payload)?;
-    // CPS producers use one serialization. Reject ambiguous fields in externally signed statements.
-    ensure!(
-        serde_json::to_vec(&statement)? == payload,
-        "noncanonical CPS build statement"
-    );
-    ensure!(
-        statement.statement_type == STATEMENT
-            && statement.predicate_type == statement.predicate.toolchain.predicate_type(),
-        "unexpected build attestation statement type"
-    );
+    let statement = parse_statement(&payload)?;
+    let covers_published = statement.predicate_type == PUBLISHED_PREDICATE;
     let predicate = statement.predicate;
     let recipe_bytes = read_limited(bundle.file("build.kdl")?, RECIPE_LIMIT)?;
     ensure!(
@@ -390,8 +400,63 @@ pub(crate) fn verify_bundle(
         "build attestation names a different package"
     );
 
+    let mut subjects = subjects(statement.subject)?;
+    ensure!(
+        subjects.remove("manifest.kdl") == Some(manifest_digest),
+        "build attestation does not cover the bundle manifest"
+    );
+    let mut artifacts = BTreeMap::new();
+    for path in manifest.payload_paths() {
+        let file = subjects
+            .remove(&format!("proto/{path}"))
+            .with_context(|| format!("build attestation omits output {path}"))?;
+        artifacts.insert(path.to_owned(), file);
+    }
+    let published_manifest = if covers_published {
+        let expected = published_manifest_digest(&manifest, &artifacts)?;
+        ensure!(
+            subjects.remove(PUBLISHED_MANIFEST).as_ref() == Some(&expected),
+            "build attestation does not cover the exact published manifest"
+        );
+        Some(expected)
+    } else {
+        None
+    };
+    ensure!(
+        subjects.is_empty(),
+        "build attestation contains undeclared outputs"
+    );
+    Ok((
+        manifest,
+        VerifiedBuild {
+            payload,
+            signatures: BTreeMap::from([(digest(builder_key), signature)]),
+            artifacts,
+            recipe_sha256: reviewed_recipe.to_owned(),
+            published_manifest,
+        },
+    ))
+}
+
+fn parse_statement(payload: &[u8]) -> Result<Statement> {
+    let statement: Statement = serde_json::from_slice(payload)?;
+    // CPS producers use one serialization. Reject ambiguous fields in externally signed statements.
+    ensure!(
+        serde_json::to_vec(&statement)? == payload,
+        "noncanonical CPS build statement"
+    );
+    ensure!(
+        statement.statement_type == STATEMENT
+            && (statement.predicate_type == PUBLISHED_PREDICATE
+                || statement.predicate_type == statement.predicate.toolchain.predicate_type()),
+        "unexpected build attestation statement type"
+    );
+    Ok(statement)
+}
+
+fn subjects(input: Vec<Subject>) -> Result<BTreeMap<String, FileDigest>> {
     let mut subjects = BTreeMap::new();
-    for subject in statement.subject {
+    for subject in input {
         validate_digest(&subject.digest.sha256)?;
         ensure!(
             subjects
@@ -406,30 +471,7 @@ pub(crate) fn verify_bundle(
             "duplicate build attestation subject"
         );
     }
-    ensure!(
-        subjects.remove("manifest.kdl") == Some(manifest_digest),
-        "build attestation does not cover the bundle manifest"
-    );
-    let mut artifacts = BTreeMap::new();
-    for path in manifest.payload_paths() {
-        let file = subjects
-            .remove(&format!("proto/{path}"))
-            .with_context(|| format!("build attestation omits output {path}"))?;
-        artifacts.insert(path.to_owned(), file);
-    }
-    ensure!(
-        subjects.is_empty(),
-        "build attestation contains undeclared outputs"
-    );
-    Ok((
-        manifest,
-        VerifiedBuild {
-            payload,
-            signatures: BTreeMap::from([(digest(builder_key), signature)]),
-            artifacts,
-            recipe_sha256: reviewed_recipe.to_owned(),
-        },
-    ))
+    Ok(subjects)
 }
 
 #[cfg(test)]

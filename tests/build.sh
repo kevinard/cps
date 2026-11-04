@@ -278,7 +278,7 @@ import sys
 
 with open("multi-evidence.json") as f:
     evidence = json.loads(base64.b64decode(json.load(f)["payload"]))
-assert evidence["predicateType"] == "urn:canopa:cps:build-provenance:v2"
+assert evidence["predicateType"] == "urn:canopa:cps:build-provenance:v3"
 toolchain = evidence["predicate"]["toolchain"]
 assert [(p["name"], p["catalog_sha256"]) for p in toolchain["publishers"]] == [
     ("canopa", sys.argv[1]), ("tools", sys.argv[2])
@@ -474,6 +474,7 @@ test "$(cat release/current)" = "$first_catalog"
     cps://canopa/demo/hello@1.0.0-0 > envelope.json
 python3 - <<'PYTHON'
 import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -485,7 +486,14 @@ statement = json.loads(payload)
 assert statement['_type'] == 'https://in-toto.io/Statement/v1'
 assert statement['predicate']['identical_runs'] == 2
 assert set(statement['predicate']['toolchain']['package_manifests']) == {'build/shell', 'build/probe'}
-assert {subject['name'] for subject in statement['subject']} == {'manifest.kdl', 'proto/hello'}
+subjects = {subject['name']: subject for subject in statement['subject']}
+assert set(subjects) == {'manifest.kdl', 'published-manifest.kdl', 'proto/hello'}
+catalog = json.loads((Path('release/catalogs') / Path('release/current').read_text().strip()).read_bytes())
+manifest_hash = catalog['catalog']['entries']['cps://canopa/demo/hello@1.0.0-0']
+manifest = (Path('release/manifests') / manifest_hash).read_bytes()
+published = subjects['published-manifest.kdl']
+assert published['digest']['sha256'] == manifest_hash == hashlib.sha256(manifest).hexdigest()
+assert published['annotations']['cps:size'] == len(manifest)
 Path('pae').write_bytes(b'DSSEv1 %d %s %d %s' % (len(kind), kind, len(payload), payload))
 Path('signature').write_bytes(base64.b64decode(envelope['signatures'][0]['sig'], validate=True))
 PYTHON

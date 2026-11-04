@@ -17,7 +17,7 @@ use crate::{
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
-        Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, copy_payload, digest,
+        FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, copy_payload, digest,
         digest_reader, validate_digest, validate_name, validate_publisher,
     },
     systemd::{self, Action as SystemdAction},
@@ -952,7 +952,7 @@ fn stage_manifest(
     repo: &Path,
     catalog: &mut Catalog,
     proto: Root,
-    mut manifest: Manifest,
+    manifest: Manifest,
     evidence: Option<VerifiedBuild>,
     policy: Option<&PublicationPolicy>,
 ) -> Result<bool> {
@@ -990,11 +990,10 @@ fn stage_manifest(
         .filter(|effect| matches!(effect, SystemdAction::Tmpfiles(_)))
         .map(SystemdAction::path)
         .collect();
-    for action in &mut manifest.action {
-        if let Action::File {
-            path, sha256, size, ..
-        } = action
-        {
+    let artifacts = manifest
+        .payload_paths()
+        .into_iter()
+        .map(|path| {
             let input = proto
                 .file(path)
                 .with_context(|| format!("reading build output {path}"))?;
@@ -1007,16 +1006,12 @@ fn stage_manifest(
                         .context("missing verified build output")
                 })
                 .transpose()?;
-            let FileDigest {
-                sha256: hash,
-                size: length,
-            } = store_blob(repo, input, tmpfiles.contains(path), expected)
+            let file = store_blob(repo, input, tmpfiles.contains(path), expected)
                 .with_context(|| format!("publishing {path}"))?;
-            *sha256 = Some(hash);
-            *size = Some(length);
-        }
-    }
-    manifest.validate(true)?;
+            Ok((path.to_owned(), file))
+        })
+        .collect::<Result<_>>()?;
+    let manifest = manifest.with_payloads(&artifacts)?;
     let unchanged_manifest = if let Some(existing) = catalog.entries.get(&id) {
         let previous = load_manifest(repo, existing.clone())?;
         ensure!(
@@ -1035,6 +1030,12 @@ fn stage_manifest(
         false
     };
     if let Some(evidence) = evidence {
+        if let Some(manifest) = &evidence.published_manifest {
+            ensure!(
+                catalog.entries[&id] == manifest.sha256,
+                "build attestation names a different published manifest for {id}"
+            );
+        }
         let envelope = evidence.envelope()?;
         let hash = digest(&envelope);
         if let Some(previous) = catalog.attestations.get(&id) {
