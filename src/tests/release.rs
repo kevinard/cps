@@ -14,9 +14,11 @@ use super::*;
 use crate::{
     attestation::{self, Toolchain},
     kdl_format::{build, parse_manifest},
+    list_withdrawals,
     model::FileDigest,
     publish_bundle, read_attestation, release as mirror_release,
     repo::{read_key, read_signing_key, snapshot},
+    withdraw_package,
 };
 
 fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)> {
@@ -298,5 +300,165 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
 
     fs::remove_file(cache.join(".tuf/origin"))?;
     assert!(refresh(&rotated).is_err());
+    Ok(())
+}
+
+#[test]
+fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()> {
+    use crate::query::{Scope, list_packages, package_manifest};
+
+    let f = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let cache = work.join("cache");
+    let refresh = |cache: &Path, mirror: &Path| {
+        let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+        let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+        mirror_release::sync(
+            cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    let create = |root: &Path, cache: &Path| {
+        create_image(root, cache, "canopa", &f.public, "x86_64", BTreeMap::new())
+    };
+    let install = |root: &Path, package: &str| {
+        plan(
+            root,
+            Request::Install {
+                packages: vec![package.to_owned()],
+            },
+        )
+    };
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "previous", "0755", "")?,
+    )?;
+    let previous = fs::read_to_string(f.repo.join("current"))?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "withdrawn", "0755", "")?,
+    )?;
+    let (id, envelope) = attach_evidence(&f, previous.trim())?;
+    let original = work.join("original");
+    let resurrected = work.join("resurrected");
+    sign_release(&f, &original, 1, fresh, &anchor, &tuf_key)?;
+    sign_release(&f, &resurrected, 3, fresh, &anchor, &tuf_key)?;
+    let original_hash = refresh(&cache, &original)?;
+    let key = read_key(&f.public)?;
+    let published = snapshot(&cache, "canopa", &key, Some(&original_hash))?;
+    let retired = published
+        .packages
+        .iter()
+        .find(|pkg| pkg.manifest.id() == id)
+        .unwrap();
+    create(&f.root, &cache)?;
+    let saved = install(&f.root, &id)?;
+
+    for invalid in [
+        "desktop/compositor@2.0.0-0",
+        "cps://extras/desktop/compositor@2.0.0-0",
+        "cps://canopa/desktop/compositor@3.0.0-0",
+    ] {
+        assert!(withdraw_package(&f.repo, &f.private, invalid).is_err());
+    }
+    assert!(withdraw_package(&f.repo, &Fixture::new()?.private, &id).is_err());
+    assert!(withdraw_package(&cache, &f.private, &id).is_err());
+    assert_eq!(
+        fs::read_to_string(f.repo.join("current"))?.trim(),
+        original_hash
+    );
+
+    withdraw_package(&f.repo, &f.private, &id)?;
+    let withdrawn_pointer = fs::read_to_string(f.repo.join("current"))?;
+    withdraw_package(&f.repo, &f.private, &id)?;
+    let error = publish(&f.repo, &f.proto, &f.recipe, &f.private).unwrap_err();
+    assert!(error.to_string().contains("was withdrawn"));
+    assert_eq!(
+        fs::read_to_string(f.repo.join("current"))?,
+        withdrawn_pointer
+    );
+    assert_eq!(
+        read_attestation(&f.repo, "canopa", &f.public, &id)?,
+        envelope
+    );
+
+    let withdrawn = work.join("withdrawn");
+    sign_release(&f, &withdrawn, 2, fresh, &anchor, &tuf_key)?;
+    let withdrawn_hash = refresh(&cache, &withdrawn)?;
+    assert_eq!(withdrawn_hash, withdrawn_pointer.trim());
+    assert_eq!(refresh(&cache, &withdrawn)?, withdrawn_hash);
+    assert_eq!(
+        list_withdrawals(&cache, "canopa", &f.public)?,
+        BTreeMap::from([(id.clone(), retired.sha256.clone())])
+    );
+    assert_eq!(
+        read_attestation(&cache, "canopa", &f.public, &id)?,
+        envelope
+    );
+
+    let new_cache = work.join("new-cache");
+    assert_eq!(refresh(&new_cache, &withdrawn)?, withdrawn_hash);
+    assert!(!new_cache.join("manifests").join(&retired.sha256).exists());
+    assert!(!new_cache.join("blobs").join(digest(b"withdrawn")).exists());
+    assert!(
+        !new_cache
+            .join("attestations")
+            .join(digest(&envelope))
+            .exists()
+    );
+    let new_root = work.join("new-root");
+    create(&new_root, &new_cache)?;
+    assert_eq!(
+        list_packages(&new_root, Scope::Available)?[0].id,
+        "cps://canopa/desktop/compositor@1.0.0-0"
+    );
+    assert!(package_manifest(&new_root, &id, true).is_err());
+    let error = install(&new_root, &id).unwrap_err();
+    assert!(error.to_string().contains("was withdrawn"));
+    apply(&new_root, &install(&new_root, "desktop/compositor")?)?;
+    assert_eq!(fs::read_to_string(new_root.join(COMPOSITOR))?, "previous");
+
+    apply(&f.root, &saved)?;
+    let error = install(&f.root, "desktop/compositor@2.0.0-0").unwrap_err();
+    assert!(error.to_string().contains("was withdrawn"));
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "withdrawn");
+    fs::write(f.root.join(COMPOSITOR), "damaged")?;
+    let repair = plan(&f.root, Request::Repair { packages: vec![] })?;
+    apply(&f.root, &repair)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "withdrawn");
+
+    let error = refresh(&cache, &resurrected).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("drops or changes the withdrawal")
+    );
+    assert_eq!(
+        fs::read_to_string(cache.join("current"))?.trim(),
+        withdrawn_hash
+    );
+
+    f.package(
+        "desktop/compositor",
+        "3.0.0-0",
+        f.file(COMPOSITOR, "replacement", "0755", "")?,
+    )?;
+    let replacement = work.join("replacement");
+    sign_release(&f, &replacement, 4, fresh, &anchor, &tuf_key)?;
+    refresh(&cache, &replacement)?;
+    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "replacement");
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     Ok(())
 }

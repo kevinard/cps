@@ -15,7 +15,10 @@ use crate::{
     attestation::{ATTESTATION_LIMIT, MAX_BUILDERS, VerifiedBuild, verify_bundle},
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest, publish_policy},
-    model::{Action, FORMAT, FileDigest, Manifest, Node, digest, digest_reader, validate_digest},
+    model::{
+        Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, digest, digest_reader,
+        validate_digest,
+    },
     systemd::{self, Action as SystemdAction},
 };
 
@@ -37,6 +40,16 @@ struct Catalog {
     attestations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     attestations_required: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    withdrawals: BTreeMap<String, Withdrawal>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Withdrawal {
+    manifest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attestation: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -102,6 +115,13 @@ pub struct Snapshot {
     pub sha256: String,
     pub packages: Vec<Published>,
     attestations: BTreeMap<String, String>,
+    withdrawals: BTreeMap<String, Withdrawal>,
+}
+
+impl Snapshot {
+    pub(crate) fn is_withdrawn(&self, id: &str) -> bool {
+        self.withdrawals.contains_key(id)
+    }
 }
 
 pub fn read_key(path: &Path) -> Result<Vec<u8>> {
@@ -195,6 +215,20 @@ fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<
         !catalog.attestations_required || catalog.attestations.len() == catalog.entries.len(),
         "protected catalog contains a package without build evidence"
     );
+    for (id, withdrawal) in &catalog.withdrawals {
+        ensure!(
+            exact_publisher(id)? == publisher && !catalog.entries.contains_key(id),
+            "invalid withdrawal for {id}"
+        );
+        validate_digest(&withdrawal.manifest)?;
+        if let Some(digest) = &withdrawal.attestation {
+            validate_digest(digest)?;
+            ensure!(
+                evidence.insert(digest),
+                "duplicate package attestation {digest}"
+            );
+        }
+    }
     Ok(catalog)
 }
 
@@ -203,6 +237,7 @@ pub fn read_attestation(repo: &Path, publisher: &str, key: &Path, id: &str) -> R
     let hash = catalog
         .attestations
         .get(id)
+        .or_else(|| catalog.withdrawals.get(id)?.attestation.as_ref())
         .with_context(|| format!("no build attestation for {id}"))?;
     read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
 }
@@ -226,6 +261,7 @@ pub fn snapshot(
         sha256: hash,
         packages,
         attestations: catalog.attestations,
+        withdrawals: catalog.withdrawals,
     })
 }
 
@@ -325,6 +361,59 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
     publish_manifest(repo, Root::open(proto)?, manifest, &key, None)
 }
 
+fn exact_publisher(id: &str) -> Result<&str> {
+    let spec = PackageSpec::parse(id)?;
+    spec.publisher
+        .filter(|_| spec.version.is_some())
+        .context("expected a full package ID with publisher and version")
+}
+
+pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
+    let publisher = exact_publisher(id)?;
+    let key = read_signing_key(key)?;
+    Root::open(repo)?;
+    let _lock = lock_repo(repo)?;
+    ensure!(
+        !path_present(&repo.join(".tuf"))?,
+        "cannot withdraw from a TUF-managed repository cache"
+    );
+    let mut catalog = read_catalog(
+        repo,
+        &read_current(repo)?,
+        publisher,
+        key.public_key().as_ref(),
+    )?;
+    if catalog.withdrawals.contains_key(id) {
+        return Ok(());
+    }
+    let manifest = catalog
+        .entries
+        .remove(id)
+        .with_context(|| format!("no published package {id}"))?;
+    let attestation = catalog.attestations.remove(id);
+    catalog.withdrawals.insert(
+        id.to_owned(),
+        Withdrawal {
+            manifest,
+            attestation,
+        },
+    );
+    write_catalog(repo, catalog, &key)
+}
+
+pub fn list_withdrawals(
+    repo: &Path,
+    publisher: &str,
+    key: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let catalog = read_catalog(repo, &read_current(repo)?, publisher, &read_key(key)?)?;
+    Ok(catalog
+        .withdrawals
+        .into_iter()
+        .map(|(id, withdrawal)| (id, withdrawal.manifest))
+        .collect())
+}
+
 pub fn publish_bundle(
     repo: &Path,
     bundle: &Path,
@@ -416,9 +505,14 @@ fn publish_manifest(
             entries: BTreeMap::new(),
             attestations: BTreeMap::new(),
             attestations_required: false,
+            withdrawals: BTreeMap::new(),
         }
     };
     let id = manifest.id();
+    ensure!(
+        !catalog.withdrawals.contains_key(&id),
+        "{id} was withdrawn and cannot be republished"
+    );
     enforce_publish_policy(repo, &mut catalog, &id, evidence.as_ref())?;
     prepare_objects(repo)?;
     let tmpfiles: std::collections::BTreeSet<_> = manifest
@@ -487,6 +581,11 @@ fn publish_manifest(
     } else if unchanged_manifest {
         return Ok(id);
     }
+    write_catalog(repo, catalog, key)?;
+    Ok(id)
+}
+
+fn write_catalog(repo: &Path, catalog: Catalog, key: &Ed25519KeyPair) -> Result<()> {
     let signature = hex::encode(key.sign(&serde_json::to_vec(&catalog)?).as_ref());
     let signed = SignedCatalog { catalog, signature };
     let signed = serde_json::to_vec(&signed)?;
@@ -496,8 +595,7 @@ fn publish_manifest(
     );
     let hash = store(repo, "catalogs", &signed)?;
     File::open(repo)?.sync_all()?;
-    write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)?;
-    Ok(id)
+    write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)
 }
 
 fn enforce_publish_policy(

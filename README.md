@@ -203,7 +203,7 @@ CPS counts distinct authorized keys whose signatures cover the same build statem
 cps repo export --repo repo --publisher canopa --trust-key public.der --output release-targets
 ```
 
-The export includes the catalog pointer, signed catalog, and all referenced manifests and payloads. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
+The export includes the catalog pointer, signed catalog, and the manifests and payloads for active packages. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
 
 Provision the initial TUF root and the CPS publisher public key through a trusted channel. Sync into a new cache on a Linux filesystem that supports atomic directory exchange.
 
@@ -219,6 +219,24 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 Sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and the complete release. A failed download leaves the last complete release available. The cache retains previous content-addressed objects for saved plans. Planning and applying can use the last cached release offline. TUF freshness is checked at sync time.
 
 The publisher signs the association between each package and its build evidence. Export and sync carry the evidence with the release. To retrieve it, use `cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-key public.der cps://canopa/demo/hello@1.0.0-0`. Clients need a CPS version that supports attestations before they can read catalogs containing that field.
+
+To withdraw an exact version, use the publisher signing key on the publishing
+repository, then export and sign a new TUF release.
+
+```sh
+cps repo withdraw --repo repo --signing-key private.der cps://canopa/demo/hello@1.0.0-0
+cps repo withdrawals --repo repo --publisher canopa --trust-key public.der
+```
+
+The signed withdrawal records the original manifest digest and prevents reuse of
+that package ID. A cache that has accepted the withdrawal rejects later releases
+that omit or change the record. New installs use the remaining available versions.
+An installed withdrawn version remains eligible for ordinary retention until it
+can be upgraded or is explicitly removed. Saved plans still use their pinned
+catalogs. The publishing repository and existing caches retain previously fetched
+payloads and build evidence for recovery and auditing. A fresh cache only fetches
+objects for active versions. Upgrade clients before distributing a catalog with
+withdrawals.
 
 ### Publisher order
 

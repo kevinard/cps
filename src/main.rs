@@ -12,10 +12,10 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
     add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_sources,
-    generate_manifest, import_sources, list_boot_environments, list_publishers, plan,
-    prefer_publisher, publish, publish_witnessed_bundle, read_attestation, read_worker_config,
-    release, remove_publisher, rollback_boot_environment, stage_boot_environment, verify,
-    verify_pristine,
+    generate_manifest, import_sources, list_boot_environments, list_publishers, list_withdrawals,
+    plan, prefer_publisher, publish, publish_witnessed_bundle, read_attestation,
+    read_worker_config, release, remove_publisher, rollback_boot_environment,
+    stage_boot_environment, verify, verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -246,7 +246,7 @@ fn parse_witness(value: &str) -> std::result::Result<BuildWitness, String> {
 
 #[derive(Subcommand)]
 enum RepoCommand {
-    /// Print the signed build evidence for a full package ID in the current catalog
+    /// Print the signed build evidence for a full package ID
     Attestation {
         #[arg(long)]
         repo: PathBuf,
@@ -255,6 +255,23 @@ enum RepoCommand {
         #[arg(long)]
         trust_key: PathBuf,
         package_id: String,
+    },
+    /// Withdraw an exact published version from future package selections
+    Withdraw {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        signing_key: PathBuf,
+        package_id: String,
+    },
+    /// List withdrawn package IDs and their original manifest digests
+    Withdrawals {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
     },
     /// Export the current catalog and its objects for TUF signing
     Export {
@@ -498,6 +515,23 @@ fn run(command: Command) -> Result<ExitCode> {
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(&bytes)?;
                 writeln!(stdout)?;
+            }
+            RepoCommand::Withdraw {
+                repo,
+                signing_key,
+                package_id,
+            } => {
+                withdraw_package(&repo, &signing_key, &package_id)?;
+                println!("Withdrawn {package_id}");
+            }
+            RepoCommand::Withdrawals {
+                repo,
+                publisher,
+                trust_key,
+            } => {
+                for (id, hash) in list_withdrawals(&repo, &publisher, &trust_key)? {
+                    println!("{id}\t{hash}");
+                }
             }
             RepoCommand::Export {
                 repo,

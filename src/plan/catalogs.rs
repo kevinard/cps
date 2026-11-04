@@ -92,6 +92,14 @@ pub(super) fn load(
         };
         let snapshot = snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
             .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
+        for spec in requested.values() {
+            if let Some(version) = spec.version
+                && sources.get(spec.name) == Some(&publisher.name.as_str())
+            {
+                let id = format!("cps://{}/{}@{version}", publisher.name, spec.name);
+                ensure!(!snapshot.is_withdrawn(&id), "{id} was withdrawn");
+            }
+        }
         if single {
             catalogs.legacy = Some(snapshot.sha256);
         } else {

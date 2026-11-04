@@ -25,7 +25,8 @@ use crate::{
 
 use super::{
     CATALOG_LIMIT, MANIFEST_LIMIT, Published, Root, load_manifest, lock_repo, parse_current,
-    path_present, prepare_objects, read_catalog, read_key, read_limited, snapshot, write_atomic,
+    path_present, prepare_objects, read_catalog, read_current, read_key, read_limited, snapshot,
+    write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -241,6 +242,18 @@ async fn materialize(
     let hash = parse_current(&String::from_utf8(read_limited(pointer.reopen()?, 65)?)?)?;
     fetch_object(verified, repo, "catalogs", &hash, CATALOG_LIMIT, None).await?;
     let catalog = read_catalog(repo, &hash, publisher, key)?;
+    if path_present(&repo.join("current"))? {
+        let previous = read_current(repo)?;
+        if previous != hash {
+            let previous = read_catalog(repo, &previous, publisher, key)?;
+            for (id, record) in previous.withdrawals {
+                ensure!(
+                    catalog.withdrawals.get(&id) == Some(&record),
+                    "release drops or changes the withdrawal for {id}"
+                );
+            }
+        }
+    }
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, sha256) in catalog.entries {
         fetch_object(verified, repo, "manifests", &sha256, MANIFEST_LIMIT, None).await?;
