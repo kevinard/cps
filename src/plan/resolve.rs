@@ -11,14 +11,14 @@ use crate::{
     repo::Published,
 };
 
-pub(crate) struct Candidates<'a> {
-    pub packages: &'a [Published],
+pub(crate) struct Candidates<'a, P> {
+    pub packages: P,
     pub obsoletions: &'a BTreeMap<String, Version>,
 }
 
-pub fn resolve<T>(
-    installed: &BTreeMap<String, Installed>,
-    available: Candidates<'_>,
+pub fn resolve<'a, T>(
+    installed: &'a BTreeMap<String, Installed>,
+    available: Candidates<'_, impl IntoIterator<Item = &'a Published>>,
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     update: bool,
     exact: bool,
@@ -35,7 +35,7 @@ pub fn resolve<T>(
     };
     for package in available
         .packages
-        .iter()
+        .into_iter()
         .chain(installed.values().map(|pkg| &pkg.published))
     {
         if obsolete(package) {

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use kdl::{KdlDocument, KdlNode};
@@ -8,7 +11,7 @@ use crate::{
     model::{PackageSpec, Version, validate_digest, validate_name, validate_publisher},
 };
 
-use super::{Fields, document, one, schema};
+use super::{Fields, PublisherConfig, document, one, publisher_config, schema};
 
 pub(crate) struct PublishPolicy {
     pub publisher: String,
@@ -23,9 +26,16 @@ pub(crate) struct Profile {
     pub facets: BTreeMap<String, bool>,
     pub packages: BTreeMap<String, Option<Version>>,
     pub upgrade_from: Option<String>,
+    pub companions: Vec<Companion>,
 }
 
-fn profile(node: &KdlNode, publisher: &str) -> Result<(String, Profile)> {
+pub(crate) struct Companion {
+    pub config: PublisherConfig,
+    pub catalog: String,
+    pub upgrade_from: Option<String>,
+}
+
+fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Profile)> {
     let fields = Fields::read(node, 1, &["architecture", "upgrade-from"], true)?;
     let name = fields.string_arg(0)?;
     validate_name(&name)?;
@@ -37,8 +47,33 @@ fn profile(node: &KdlNode, publisher: &str) -> Result<(String, Profile)> {
     }
     let mut packages = BTreeMap::new();
     let mut facets = BTreeMap::new();
+    let mut companions = Vec::new();
+    let mut names = BTreeSet::from([publisher.to_owned()]);
     for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
         match child.name().value() {
+            "publisher" => {
+                let fields = Fields::read(child, 1, &["catalog", "upgrade-from"], true)?;
+                let name = fields.string_arg(0)?;
+                ensure!(
+                    names.insert(name.clone()),
+                    "duplicate profile publisher {name}"
+                );
+                let catalog = fields.required_string("catalog")?;
+                validate_digest(&catalog).context("invalid companion catalog digest")?;
+                let baseline = fields.string("upgrade-from")?;
+                if let Some(hash) = &baseline {
+                    ensure!(
+                        upgrade_from.is_some(),
+                        "companion upgrade-from requires a profile upgrade-from"
+                    );
+                    validate_digest(hash).context("invalid companion upgrade catalog digest")?;
+                }
+                companions.push(Companion {
+                    config: publisher_config(child, name, parent)?,
+                    catalog,
+                    upgrade_from: baseline,
+                });
+            }
             "package" => {
                 let selector = Fields::read(child, 1, &[], false)?.string_arg(0)?;
                 let spec = PackageSpec::parse(&selector)?;
@@ -80,11 +115,12 @@ fn profile(node: &KdlNode, publisher: &str) -> Result<(String, Profile)> {
             facets,
             packages,
             upgrade_from,
+            companions,
         },
     ))
 }
 
-pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
+pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
     let doc = document(text)?;
     schema(&doc)?;
     ensure!(
@@ -127,7 +163,7 @@ pub(crate) fn parse(text: &str) -> Result<PublishPolicy> {
                 );
             }
             "profile" => {
-                let (name, profile) = profile(node, &publisher)?;
+                let (name, profile) = profile(node, &publisher, parent)?;
                 ensure!(
                     profiles.insert(name.clone(), profile).is_none(),
                     "duplicate profile {name}"

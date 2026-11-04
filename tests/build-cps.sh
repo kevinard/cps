@@ -102,21 +102,33 @@ done
 mkdir repo
 cp builder-public.der repo/
 reviewed=$(sha build.kdl)
+sqlite_recipe=$(sha sqlite.build.kdl)
+seccomp_recipe=$(sha libseccomp.build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
 schema-version 1
 publisher "canopa" {
     builder-key "builder-public.der"
     approve "system/cps" version="0.1.0-1" sha256="$reviewed"
-    approve "system/sqlite" version="3.54.1-0" sha256="$(sha sqlite.build.kdl)"
-    approve "system/libseccomp" version="2.6.1-0" sha256="$(sha libseccomp.build.kdl)"
+    approve "system/sqlite" version="3.54.1-0" sha256="$sqlite_recipe"
+    approve "system/libseccomp" version="2.6.1-0" sha256="$seccomp_recipe"
+    profile "cps-runtime" architecture="$arch" {
+        package "system/cps@0.1.0-1"
+        publisher "canopa-runtime-seed" catalog="$(cat runtime-seed/current)" {
+            repository "../runtime-seed"
+            trust-key "../runtime-seed-public.der"
+        }
+    }
 }
 POLICY
-for library in sqlite libseccomp; do
-    "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
-        --recipe-sha256 "$(sha "$library.build.kdl")" "$library.bundle"
-done
-"$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
-    --recipe-sha256 "$reviewed" bundle
+cat > release.kdl <<RELEASE
+schema-version 1
+release "canopa" base="empty" {
+    bundle "cps://canopa/system/sqlite@3.54.1-0" path="sqlite.bundle" builder-key="builder-public.der" recipe-sha256="$sqlite_recipe"
+    bundle "cps://canopa/system/libseccomp@2.6.1-0" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
+    bundle "cps://canopa/system/cps@0.1.0-1" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
+}
+RELEASE
+"$cps" repo publish-release --repo repo --signing-key "$work/release.der" release.kdl
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
     cps://canopa/system/cps@0.1.0-1 > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json

@@ -18,6 +18,7 @@ use crate::{
     systemd::{self, Action as SystemdAction},
 };
 
+pub(crate) use catalogs::CandidateSet;
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
 };
@@ -232,8 +233,8 @@ pub(crate) fn build(
             resolve::resolve(
                 &state.installed,
                 Candidates {
-                    packages: &catalogs.packages,
-                    obsoletions: &catalogs.obsoletions,
+                    packages: &catalogs.candidates.packages,
+                    obsoletions: &catalogs.candidates.obsoletions,
                 },
                 &requested,
                 matches!(request, Request::Update),

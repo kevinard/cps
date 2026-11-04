@@ -1061,7 +1061,7 @@ fn read_publish_policy(
         Root::open(repo)?.file(PUBLISH_POLICY)?,
         PUBLISH_POLICY_LIMIT,
     )?;
-    let policy = publish_policy::parse(std::str::from_utf8(&bytes)?)
+    let policy = publish_policy::parse(std::str::from_utf8(&bytes)?, repo)
         .with_context(|| format!("reading {PUBLISH_POLICY}"))?;
     ensure!(
         policy.publisher == catalog.publisher,

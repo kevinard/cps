@@ -299,6 +299,72 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
     Ok(())
 }
 
+#[test]
+fn release_profiles_pin_and_authenticate_sticky_companion_publishers() -> Result<()> {
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    seed.package_as("seed", "library/runtime", "1.0.0-0", String::new())?;
+    let seed_baseline = fs::read_to_string(seed.repo.join("current"))?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        dependency("require", "library/runtime", "1.0.0-0"),
+    )?;
+    let baseline = fs::read_to_string(f.repo.join("current"))?;
+    seed.package_as("seed", "library/runtime", "2.0.0-0", String::new())?;
+    let seed_current = fs::read_to_string(seed.repo.join("current"))?;
+    f.package("library/runtime", "2.0.0-0", String::new())?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        dependency("require", "library/runtime", "2.0.0-0"),
+    )?;
+    f.package("test/retire", "1.0.0-0", String::new())?;
+    let pointer = f.repo.join("current");
+    let old = fs::read_to_string(&pointer)?;
+    let id = "cps://canopa/test/retire@1.0.0-0";
+    let write_policy = |pin: &str, key: &Path| {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "builder.der"
+    profile "desktop" architecture="x86_64" upgrade-from={:?} {{
+        package "desktop/compositor"
+        publisher "seed" catalog={:?} upgrade-from={:?} {{
+            repository {:?}
+            trust-key {key:?}
+        }}
+    }}
+}}
+"#,
+                baseline.trim(),
+                pin.trim(),
+                seed_baseline.trim(),
+                seed.repo,
+            ),
+        )
+    };
+
+    write_policy(&seed_current, &f.public)?;
+    let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
+    assert!(format!("{error:#}").contains("invalid signature on catalog"));
+    assert_eq!(fs::read_to_string(&pointer)?, old);
+
+    write_policy(&seed_baseline, &seed.public)?;
+    let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("update selects cps://canopa/desktop/compositor@1.0.0-0 instead of cps://canopa/desktop/compositor@2.0.0-0"), "{message}");
+    assert_eq!(fs::read_to_string(&pointer)?, old);
+
+    write_policy(&seed_current, &seed.public)?;
+    fs::remove_file(seed.repo.join("current"))?;
+    withdraw_package(&f.repo, &f.private, id)?;
+    assert!(list_withdrawals(&f.repo, "canopa", &f.public)?.contains_key(id));
+    Ok(())
+}
+
 fn sign_release(
     fixture: &Fixture,
     mirror: &Path,

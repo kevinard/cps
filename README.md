@@ -142,7 +142,9 @@ libraries. All three packages carry signed build evidence. The solver installs
 the declared runtime dependencies, and the fixture uses the installed loader
 and libraries to run the installed CPS binary and verify the image. A separate
 signed `runtime-seed` repository contains the worker's prebuilt ELF loader and
-C and GCC runtime libraries.
+C and GCC runtime libraries. A release profile pins the signed seed catalog
+and checks the complete CPS dependency set before publishing the three builds
+in one catalog.
 
 The output includes `source-revision`, the recipes, source cache, toolchain
 repository, protected package repository, and runtime seed repository. Set
@@ -245,9 +247,9 @@ version. The check covers dependencies, file ownership, and the consistency of
 selected kernel actions. Publish coordinated changes in one batch when the
 individual changes would break a profile. The first catalog that passes these
 checks records the requirement in its signature. Subsequent publications and
-withdrawals require a policy with at least one profile. Profiles check fresh
-image composition for the release's own publisher. Clients need support for
-profile enforcement to read catalogs that record this requirement.
+withdrawals require a policy with at least one profile. Profile roots come from
+the release's publisher. Clients need support for profile enforcement to read
+catalogs that record this requirement.
 
 Set `upgrade-from="<signed catalog SHA-256>"` on a profile to also test a rolling
 upgrade from that historical catalog. CPS composes the baseline with the same
@@ -258,6 +260,28 @@ only packages available in the candidate, and pass the planner's directory and
 kernel transition checks. This models the package-managed state of a clean
 image. Live filesystem changes and boot health are checked separately during
 staging and boot.
+
+List companion publishers inside a profile when dependencies are supplied by
+another repository.
+
+```kdl
+profile "cps-runtime" architecture="x86_64" {
+    package "system/cps"
+    publisher "canopa-runtime-seed" catalog="<signed seed catalog SHA-256>" {
+        repository "../runtime-seed"
+        trust-key "../runtime-seed-public.der"
+    }
+}
+```
+
+Paths resolve relative to the directory containing `publish-policy.kdl`. The
+signer checks each pinned catalog against its configured trust key. It uses the
+release publisher first, then companions in declaration order. During an
+upgrade check, installed packages keep their original publishers. Set
+`upgrade-from` on a companion to pin a different baseline catalog for that
+publisher. Otherwise both compositions use its `catalog` pin. These pins are
+inputs to the publishing gate. An image still selects catalogs through its own
+publisher configuration.
 
 ## Signed releases and mirrors
 

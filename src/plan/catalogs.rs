@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{borrow::Borrow, collections::BTreeMap};
 
 use anyhow::{Context, Result, ensure};
 
@@ -13,8 +13,50 @@ use crate::{
 pub(super) struct Catalogs {
     pub legacy: Option<String>,
     pub pins: BTreeMap<String, String>,
-    pub packages: Vec<Published>,
+    pub candidates: CandidateSet<Published>,
+}
+
+pub(crate) struct CandidateSet<P> {
+    pub packages: Vec<P>,
     pub obsoletions: BTreeMap<String, Version>,
+}
+
+impl<P> Default for CandidateSet<P> {
+    fn default() -> Self {
+        Self {
+            packages: Vec::new(),
+            obsoletions: BTreeMap::new(),
+        }
+    }
+}
+
+impl<P: Borrow<Published>> CandidateSet<P> {
+    pub(crate) fn add_obsoletions<'a>(
+        &mut self,
+        sources: &mut BTreeMap<String, &'a str>,
+        publisher: &'a str,
+        obsoletions: &BTreeMap<String, Version>,
+    ) {
+        for (name, cutoff) in obsoletions {
+            if *sources.entry(name.clone()).or_insert(publisher) == publisher {
+                self.obsoletions.insert(name.clone(), *cutoff);
+            }
+        }
+    }
+
+    pub(crate) fn add_packages<'a>(
+        &mut self,
+        sources: &mut BTreeMap<String, &'a str>,
+        publisher: &'a str,
+        packages: impl IntoIterator<Item = P>,
+    ) {
+        self.packages.extend(packages.into_iter().filter(|pkg| {
+            *sources
+                .entry(pkg.borrow().manifest.name.clone())
+                .or_insert(publisher)
+                == publisher
+        }));
+    }
 }
 
 pub(super) fn requested<'a>(
@@ -93,11 +135,9 @@ pub(super) fn load(
         };
         let snapshot = snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
             .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
-        for (name, cutoff) in &snapshot.obsoletions {
-            if *sources.entry(name.clone()).or_insert(&publisher.name) == publisher.name {
-                catalogs.obsoletions.insert(name.clone(), *cutoff);
-            }
-        }
+        catalogs
+            .candidates
+            .add_obsoletions(&mut sources, &publisher.name, &snapshot.obsoletions);
         for spec in requested.values() {
             if let Some(version) = spec.version
                 && sources.get(spec.name) == Some(&publisher.name.as_str())
@@ -118,13 +158,8 @@ pub(super) fn load(
                 .insert(publisher.name.clone(), snapshot.sha256);
         }
         catalogs
-            .packages
-            .extend(snapshot.packages.into_iter().filter(|pkg| {
-                *sources
-                    .entry(pkg.manifest.name.clone())
-                    .or_insert(&publisher.name)
-                    == publisher.name
-            }));
+            .candidates
+            .add_packages(&mut sources, &publisher.name, snapshot.packages);
     }
     Ok(catalogs)
 }

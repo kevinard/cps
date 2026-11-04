@@ -464,6 +464,24 @@ pub(crate) struct PublisherConfig {
     pub trust_key: PathBuf,
 }
 
+fn publisher_config(node: &KdlNode, name: String, parent: &Path) -> Result<PublisherConfig> {
+    validate_publisher(&name)?;
+    let children = node
+        .children()
+        .context("publisher requires a configuration block")?;
+    let repo = Fields::read(one(children, "repository")?, 1, &[], false)?.string_arg(0)?;
+    let key = Fields::read(one(children, "trust-key")?, 1, &[], false)?.string_arg(0)?;
+    ensure!(
+        children.nodes().len() == 2,
+        "expected repository and trust-key under publisher"
+    );
+    Ok(PublisherConfig {
+        name,
+        repository: parent.join(repo),
+        trust_key: parent.join(key),
+    })
+}
+
 pub(crate) struct ImageDefinition {
     pub publishers: Vec<PublisherConfig>,
     pub arch: String,
@@ -494,24 +512,10 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
             "schema-version" => {}
             "publisher" => {
                 let name = Fields::read(node, 1, &[], true)?.string_arg(0)?;
-                validate_publisher(&name)?;
                 ensure!(names.insert(name.clone()), "duplicate publisher {name}");
-                let children = node
-                    .children()
-                    .context("publisher requires a configuration block")?;
-                let repo =
-                    Fields::read(one(children, "repository")?, 1, &[], false)?.string_arg(0)?;
-                let key =
-                    Fields::read(one(children, "trust-key")?, 1, &[], false)?.string_arg(0)?;
-                ensure!(
-                    children.nodes().len() == 2,
-                    "expected repository and trust-key under publisher"
-                );
-                config.publishers.push(PublisherConfig {
-                    name,
-                    repository: parent.join(repo),
-                    trust_key: parent.join(key),
-                });
+                config
+                    .publishers
+                    .push(publisher_config(node, name, parent)?);
             }
             "architecture" => {
                 ensure!(!architecture, "duplicate architecture node");
