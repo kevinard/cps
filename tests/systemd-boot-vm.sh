@@ -43,6 +43,7 @@ systemd_version=262.1.0-3
 util_linux_package=cps://canopa-util-linux/system/util-linux@2.42.4-0
 systemd_efi=usr/lib/systemd/boot/efi/systemd-bootx64.efi
 profiled=false
+signed_cps_builds=false
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
 if [[ -n $systemd_fixture ]]; then
@@ -117,6 +118,9 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
         exit 2
     }
     profiled=true
+    case $cps_version in
+        0.1.0-3|0.1.0-4) signed_cps_builds=true ;;
+    esac
 fi
 if [[ -n $kernel_fixture ]]; then
     $profiled || { echo 'CPS_VM_KERNEL_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
@@ -292,7 +296,11 @@ refresh_vm_profile() {
         printf '        facet "devel" #false\n'
         while read -r name repository key; do
             printf '        publisher "%s" catalog="%s" {\n' "$name" "$(cat "$repository/current")"
-            printf '            repository "../%s"\n            trust-key "../%s"\n        }\n' "$repository" "$key"
+            printf '            repository "../%s"\n            trust-key "../%s"\n' "$repository" "$key"
+            if [[ $name == canopa ]] && $signed_cps_builds; then
+                printf '            build-trust { builder-key "../cps-builder-public.der"; }\n'
+            fi
+            printf '        }\n'
         done < <(profile_companions)
         printf '    }\n}\n'
     } > profile-repo/publish-policy.kdl
@@ -361,6 +369,7 @@ if $systemd_guest; then
         done
         for path in "${cps_library_paths[@]}"; do rm -f -- "runtime/$path"; done
         touch runtime/etc/cps-vm-assert-cps-runtime
+        if $signed_cps_builds; then touch runtime/etc/cps-vm-assert-cps-builds; fi
     else
         copy_runtime_deps runtime proto/usr/bin/cps
     fi
@@ -413,6 +422,9 @@ if $profiled; then
     cp -a -- "$cps_fixture/repo" signed-cps
     cp -a -- "$busybox_repo" signed-busybox
     cp -- "$cps_fixture/release-public.der" cps-public.der
+    if $signed_cps_builds; then
+        cp -- "$cps_fixture/builder-public.der" cps-builder-public.der
+    fi
     if [[ -n $usr_base_fixture ]]; then
         cp -a -- "$usr_base_fixture/repo" signed-seed
         cp -- "$usr_base_fixture/release-public.der" seed-public.der
@@ -858,6 +870,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$runtimes" = $'CPS_VM_CPS_RUNTIME: trial verified\nCPS_VM_CPS_RUNTIME: trial verified'
             printf '%s\n' "$runtimes"
         fi
+        if $signed_cps_builds; then
+            audits=$(tr -d '\r' < serial.log | grep '^CPS_VM_CPS_BUILDS: ')
+            test "$audits" = $'CPS_VM_CPS_BUILDS: trial verified\nCPS_VM_CPS_BUILDS: trial verified'
+            printf '%s\n' "$audits"
+        fi
         if [[ -n $systemd_fixture ]]; then
             managers=$(tr -d '\r' < serial.log | grep '^CPS_VM_SYSTEMD: ' || :)
             test "$managers" = $'CPS_VM_SYSTEMD: trial v262.1\nCPS_VM_SYSTEMD: trial v262.1'
@@ -919,6 +936,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         test "$rollback_obsoletions" = 'CPS_VM_OBSOLETION: previous retained'
         if [[ -n $cps_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_CPS_RUNTIME: previous verified'
+        fi
+        if $signed_cps_builds; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_CPS_BUILDS: previous verified'
         fi
         if [[ -n $systemd_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_SYSTEMD: previous v262.1'

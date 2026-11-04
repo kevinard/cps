@@ -509,6 +509,11 @@ if [ -f /etc/cps-vm-assert-cps-runtime ]; then
     done
     printf 'CPS_VM_CPS_RUNTIME: %s verified\n' "$state"
 fi
+if [ -f /etc/cps-vm-assert-cps-builds ]; then
+    audit=$(/usr/bin/cps publisher audit-builds --root / canopa)
+    [ "$audit" = 'Verified build evidence for 3 installed package(s) from canopa' ]
+    printf 'CPS_VM_CPS_BUILDS: %s verified\n' "$state"
+fi
 if [ -f /etc/cps-vm-assert-extra-publisher ]; then
     publisher=absent
     if [ -f /etc/cps-vm-extra-marker ]; then
