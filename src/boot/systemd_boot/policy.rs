@@ -119,11 +119,11 @@ fn selector(line: &str, prefix: &str) -> Result<String> {
         .strip_prefix(prefix)
         .and_then(|line| line.strip_suffix(".conf"))
         .context("invalid CPS boot entry selector")?;
-    revision(id)?;
+    entry_identity(id)?;
     Ok(id.to_owned())
 }
 
-fn revision(id: &str) -> Result<u64> {
+pub(super) fn entry_identity(id: &str) -> Result<(&str, u64)> {
     let (image, revision) = id
         .strip_prefix("cps-")
         .and_then(|id| id.rsplit_once('-'))
@@ -137,7 +137,7 @@ fn revision(id: &str) -> Result<u64> {
         revision == number.to_string(),
         "noncanonical CPS entry revision"
     );
-    Ok(number)
+    Ok((image, number))
 }
 
 pub(super) struct BootEntry {
@@ -179,7 +179,7 @@ pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
                 )
             }
         };
-        let revision = revision(id)?;
+        let (_, revision) = entry_identity(id)?;
         ensure!(
             !entries.iter().any(|entry: &BootEntry| entry.id == id),
             "duplicate CPS entry {id}"
@@ -211,7 +211,7 @@ pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
         let parent = field(&description, "# cps-parent ")?;
         if let Some(parent) = parent {
             ensure!(
-                self::revision(parent)?.checked_add(1) == Some(revision),
+                entry_identity(parent)?.1.checked_add(1) == Some(revision),
                 "invalid parent for {id}"
             );
         }

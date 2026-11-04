@@ -1,9 +1,11 @@
 mod deploy;
+mod esp;
 mod export;
 pub(crate) mod kernel;
 mod systemd_boot;
 
 use std::{
+    ffi::OsStr,
     fs::{self, File},
     path::Path,
     process::Command,
@@ -20,6 +22,10 @@ use crate::{
 };
 
 pub use deploy::deploy_boot_environment;
+pub use esp::{
+    activate_boot_environment_on_disk, list_boot_environments_on_disk,
+    rollback_boot_environment_on_disk,
+};
 pub use export::{export_boot_environment, export_boot_environment_receipt};
 pub use systemd_boot::{
     Activation, BootEnvironment, activate_boot_environment, activate_deployed_boot_environment,
@@ -118,7 +124,7 @@ fn check_image_integrity(image: &Image) -> Result<()> {
     Ok(())
 }
 
-fn artifact_helper(program: &str, directory: &Path) -> Command {
+fn artifact_helper(program: impl AsRef<OsStr>, directory: &Path) -> Command {
     let mut command = Command::new(program);
     command
         .env_clear()

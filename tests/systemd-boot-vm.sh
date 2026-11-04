@@ -44,7 +44,7 @@ code=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE to x86-64 OVMF_CODE}
 vars=${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS to the matching OVMF_VARS template}
 qemu_data=${CPS_VM_QEMU_DATA:-}
 
-for command in "$qemu" mkfs.fat mcopy mdir mke2fs e2fsck sfdisk blkid openssl timeout; do
+for command in "$qemu" mkfs.fat fsck.fat mcopy mdir mmd mke2fs e2fsck sfdisk blkid openssl timeout; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
 if [[ -n $busybox_repo || -n $busybox_key ]]; then
@@ -147,6 +147,7 @@ cd -- "$work"
 
 base_uuid=7adff456-af50-498f-b39a-dcf87cb4a7c1
 trial_uuid=b52060cf-81ab-4b8a-ad84-3aa69000ed49
+esp_uuid=9a138d0b-f9aa-4a2a-b527-93392ad7e812
 options='ro console=ttyS0 loglevel=3 init=/init'
 root_mib=64
 if $systemd_guest; then
@@ -163,7 +164,7 @@ sfdisk --quiet template.raw <<PARTITIONS
 label: gpt
 unit: sectors
 
-start=2048, size=196608, type=uefi
+start=2048, size=196608, type=uefi, uuid=$esp_uuid
 start=$((base_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$base_uuid
 start=$((trial_mib * 2048)), size=$((root_mib * 2048)), type=linux, uuid=$trial_uuid
 PARTITIONS
@@ -511,21 +512,30 @@ fi
 
 "$cps" boot-env export --receipt --root base --output base.ext4 --size-mib "$root_mib" > base.kdl
 base_payload=$(sha256sum base.ext4)
+truncate -s 96M esp.fat
+mkfs.fat -F 32 esp.fat >/dev/null
+mcopy -s -i esp.fat esp/EFI ::/
+dd if=esp.fat of=template.raw bs=1M seek=1 conv=notrunc,sparse status=none
 "$cps" boot-env deploy --disk template.raw --root-image base.ext4 \
     --root-partuuid "$base_uuid" --output base.raw
-base_id=$("$cps" boot-env activate --known-good --root base --esp esp \
-    --disk base.raw --receipt base.kdl \
+base_id=$("$cps" boot-env activate --known-good --root base \
+    --disk base.raw --receipt base.kdl --esp-partuuid "$esp_uuid" --output-disk bootable-base.raw \
     --root-partuuid "$base_uuid" --options "$options")
 base_id=${base_id#Activated }
-test -f "esp/loader/entries/$base_id.conf"
+base_disk=bootable-base.raw
 if [[ $mode == rollback ]]; then
     # A new upgrade should still be testable from an explicitly selected base.
-    "$cps" boot-env rollback --esp esp "$base_id"
+    "$cps" boot-env rollback --disk "$base_disk" --esp-partuuid "$esp_uuid" \
+        --output-disk pinned-base.raw "$base_id"
+    base_disk=pinned-base.raw
     if ! $profiled; then
         publish_extra_marker
         "$cps" publisher add --root base --repo extras --trust-key extras-public.der extras
     fi
 fi
+mcopy -s -i "$base_disk@@1048576" ::/loader esp/
+mcopy -s -i "$base_disk@@1048576" ::/EFI/cps esp/EFI/
+test -f "esp/loader/entries/$base_id.conf"
 
 publish_state 2.0.0-0 trial
 if [[ -z $kernel_fixture && ( $mode == kernel-upgrade || $mode == rollback ) ]]; then
@@ -605,9 +615,9 @@ fi
 "$cps" boot-env export --receipt --root staged --output staged.ext4 --size-mib "$root_mib" > staged.kdl
 test "$(sha256sum base.ext4)" = "$base_payload"
 diff -r esp-before esp
-"$cps" boot-env deploy --disk base.raw --root-image staged.ext4 \
-    --root-partuuid "$trial_uuid" --output disk.raw
-cmp -n "$((trial_mib * 1024 * 1024))" base.raw disk.raw
+"$cps" boot-env deploy --disk "$base_disk" --root-image staged.ext4 \
+    --root-partuuid "$trial_uuid" --output deployed.raw
+cmp -n "$((trial_mib * 1024 * 1024))" "$base_disk" deployed.raw
 
 mv "esp/EFI/cps/$base_id/vmlinuz.efi" saved-kernel
 if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
@@ -626,9 +636,16 @@ fi
 grep -q 'distinct root PARTUUID' rejected.log
 diff -r esp-before esp
 
-"$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
-    --disk disk.raw --receipt staged.kdl \
+"$cps" boot-env activate --root staged --root-partuuid "$trial_uuid" \
+    --disk deployed.raw --receipt staged.kdl --esp-partuuid "$esp_uuid" --output-disk disk.raw \
     --options "$options" --tries 2
+cmp -n 1048576 deployed.raw disk.raw
+cmp -i "$((base_mib * 1024 * 1024))" deployed.raw disk.raw
+mkdir esp-activated
+mcopy -s -i disk.raw@@1048576 ::/EFI ::/loader esp-activated/
+diff -r esp-before/EFI/BOOT esp-activated/EFI/BOOT
+mv esp esp-detached
+mv esp-activated esp
 "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
     --options "$options" --tries 9
 test -f "esp/loader/entries/$trial_id+2.conf"
@@ -669,23 +686,19 @@ if [[ $mode == health-fail ]]; then
     dd if=staged.ext4 of=disk.raw bs=1M seek="$trial_mib" conv=notrunc status=none
 fi
 
-# Add the configured EFI directory after CPS has deployed both roots.
-truncate -s 96M esp.fat
-mkfs.fat -F 32 esp.fat >/dev/null
-mcopy -s -i esp.fat esp/EFI esp/loader ::/
-dd if=esp.fat of=disk.raw bs=1M seek=1 conv=notrunc,sparse status=none
 cp "$vars" vars.fd
 
 args=()
 if [[ -n $qemu_data ]]; then args+=(-L "$qemu_data"); fi
 run_vm() {
     local log=$1
+    local disk=${2:-disk.raw}
     if ! timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${args[@]}" \
         -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
         -serial "file:$log" \
         -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
         -drive if=pflash,format=raw,unit=1,file=vars.fd \
-        -drive if=virtio,format=raw,file=disk.raw; then
+        -drive "if=virtio,format=raw,file=$disk"; then
         test ! -f "$log" || tail -80 "$log" >&2
         return 1
     fi
@@ -779,24 +792,23 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
         test "$publishers" = $'CPS_VM_PUBLISHER: trial extras\nCPS_VM_PUBLISHER: trial extras'
         obsoletions=$(tr -d '\r' < serial.log | grep '^CPS_VM_OBSOLETION: ' || :)
         test "$obsoletions" = $'CPS_VM_OBSOLETION: trial removed\nCPS_VM_OBSOLETION: trial removed'
-        # Bring the VM's blessed entry back into the offline ESP directory.
-        rm "esp/loader/entries/$trial_id+2.conf"
-        cp blessed.conf "esp/loader/entries/$trial_id.conf"
-        "$cps" boot-env list --esp esp | tee before-rollback.log
+        "$cps" boot-env list --disk disk.raw --esp-partuuid "$esp_uuid" | tee before-rollback.log
         assert_default() {
             awk -F '\t' -v id="$1" -v part="$2" -v release="$3" \
                 '$1 == "*" && $2 == "known-good" && $3 == id && $4 == part && index($5, release) {found=1} END {exit !found}' "$4"
         }
         assert_default "$trial_id" "$trial_uuid" "$trial_release" before-rollback.log
-        result=$("$cps" boot-env rollback --esp esp)
+        result=$("$cps" boot-env rollback --disk disk.raw --esp-partuuid "$esp_uuid" --output-disk rollback.raw)
         test "$result" = "Selected $base_id for the next boot"
-        "$cps" boot-env list --esp esp | tee after-rollback.log
+        "$cps" boot-env list --disk rollback.raw --esp-partuuid "$esp_uuid" | tee after-rollback.log
         assert_default "$base_id" "$base_uuid" "$base_release" after-rollback.log
         grep -Fq "$trial_id" after-rollback.log
-        cmp blessed.conf "esp/loader/entries/$trial_id.conf"
-        cmp previous.conf "esp/loader/entries/$base_id.conf"
-        mcopy -o -i disk.raw@@1048576 esp/loader/loader.conf ::/loader/loader.conf
-        run_vm rollback.log
+        mcopy -i rollback.raw@@1048576 "::/loader/entries/$trial_id.conf" rollback-trial.conf
+        mcopy -i rollback.raw@@1048576 "::/loader/entries/$base_id.conf" rollback-base.conf
+        cmp blessed.conf rollback-trial.conf
+        cmp previous.conf rollback-base.conf
+        cmp -i "$((base_mib * 1024 * 1024))" disk.raw rollback.raw
+        run_vm rollback.log rollback.raw
         check_busybox rollback.log
         rollback_boots=$(tr -d '\r' < rollback.log | grep '^CPS_VM_BOOT: ' || :)
         rollback_kernels=$(tr -d '\r' < rollback.log | grep '^CPS_VM_KERNEL: ' || :)

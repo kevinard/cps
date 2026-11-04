@@ -11,14 +11,16 @@ use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, Plan, Request, SourceLayout,
-    activate_boot_environment, activate_deployed_boot_environment, add_publisher, apply,
-    build_with_toolchain_config, build_with_worker, create_configured_image, create_image,
-    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
-    fetch_sources, fetch_sources_with_local, generate_manifest, import_sources,
-    list_boot_environments, list_obsoletions, list_publishers, list_withdrawals, plan,
+    activate_boot_environment, activate_boot_environment_on_disk,
+    activate_deployed_boot_environment, add_publisher, apply, build_with_toolchain_config,
+    build_with_worker, create_configured_image, create_image, deploy_boot_environment,
+    export_boot_environment, export_boot_environment_receipt, fetch_plan, fetch_sources,
+    fetch_sources_with_local, generate_manifest, import_sources, list_boot_environments,
+    list_boot_environments_on_disk, list_obsoletions, list_publishers, list_withdrawals, plan,
     prefer_publisher, publish, publish_release, publish_witnessed_bundle, read_attestation,
-    read_worker_config, release, remove_publisher, rollback_boot_environment, rotate_publisher_key,
-    stage_boot_environment, verify, verify_pristine, withdraw_package,
+    read_worker_config, release, remove_publisher, rollback_boot_environment,
+    rollback_boot_environment_on_disk, rotate_publisher_key, stage_boot_environment, verify,
+    verify_pristine, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -380,13 +382,24 @@ enum PlanCommand {
 enum BootCommand {
     /// List registered boot environments and the configured default
     List {
-        #[arg(long)]
-        esp: PathBuf,
+        #[arg(long, required_unless_present = "disk", conflicts_with = "disk")]
+        esp: Option<PathBuf>,
+        #[arg(long, requires = "esp_partuuid")]
+        disk: Option<PathBuf>,
+        #[arg(long, requires = "disk")]
+        esp_partuuid: Option<String>,
     },
     /// Select a known-good environment for the next boot
     Rollback {
-        #[arg(long)]
-        esp: PathBuf,
+        #[arg(long, required_unless_present = "disk", conflicts_with = "disk")]
+        esp: Option<PathBuf>,
+        #[arg(long, requires_all = ["esp_partuuid", "output_disk"])]
+        disk: Option<PathBuf>,
+        #[arg(long, requires = "disk")]
+        esp_partuuid: Option<String>,
+        /// Publish the rollback in a new disk file
+        #[arg(long, requires = "disk")]
+        output_disk: Option<PathBuf>,
         /// Environment ID. Defaults to the previous known-good environment.
         id: Option<String>,
     },
@@ -425,8 +438,12 @@ enum BootCommand {
     Activate {
         #[arg(long)]
         root: PathBuf,
-        #[arg(long)]
-        esp: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "output_disk",
+            conflicts_with = "output_disk"
+        )]
+        esp: Option<PathBuf>,
         #[arg(long)]
         root_partuuid: String,
         /// Offline GPT disk holding the deployed root
@@ -435,6 +452,12 @@ enum BootCommand {
         /// KDL receipt produced by boot-env export --receipt
         #[arg(long, requires = "disk")]
         receipt: Option<PathBuf>,
+        /// GPT PARTUUID of the EFI System Partition on the disk
+        #[arg(long, requires = "output_disk")]
+        esp_partuuid: Option<String>,
+        /// Publish the activation in a new disk file
+        #[arg(long, requires_all = ["disk", "receipt", "esp_partuuid"])]
+        output_disk: Option<PathBuf>,
         #[arg(long, default_value = "boot/vmlinuz")]
         kernel: String,
         #[arg(long)]
@@ -830,8 +853,19 @@ fn run(command: Command) -> Result<ExitCode> {
             println!("Image verified");
         }
         Command::BootEnv { command } => match command {
-            BootCommand::List { esp } => {
-                let environments = list_boot_environments(&esp)?;
+            BootCommand::List {
+                esp,
+                disk,
+                esp_partuuid,
+            } => {
+                let environments = match (esp.as_deref(), disk.as_deref(), esp_partuuid.as_deref())
+                {
+                    (Some(esp), None, None) => list_boot_environments(esp)?,
+                    (None, Some(disk), Some(partuuid)) => {
+                        list_boot_environments_on_disk(disk, partuuid)?
+                    }
+                    _ => anyhow::bail!("specify --esp or both --disk and --esp-partuuid"),
+                };
                 if environments.is_empty() {
                     println!("No boot environments registered");
                 } else {
@@ -850,8 +884,25 @@ fn run(command: Command) -> Result<ExitCode> {
                     }
                 }
             }
-            BootCommand::Rollback { esp, id } => {
-                let id = rollback_boot_environment(&esp, id.as_deref())?;
+            BootCommand::Rollback {
+                esp,
+                disk,
+                esp_partuuid,
+                output_disk,
+                id,
+            } => {
+                let id = match (
+                    esp.as_deref(),
+                    disk.as_deref(),
+                    esp_partuuid.as_deref(),
+                    output_disk.as_deref(),
+                ) {
+                    (Some(esp), None, None, None) => rollback_boot_environment(esp, id.as_deref())?,
+                    (None, Some(disk), Some(partuuid), Some(output)) => {
+                        rollback_boot_environment_on_disk(disk, partuuid, id.as_deref(), output)?
+                    }
+                    _ => anyhow::bail!("specify --esp or the offline disk and output options"),
+                };
                 println!("Selected {id} for the next boot");
             }
             BootCommand::Stage { source, root, plan } => {
@@ -890,6 +941,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 root_partuuid,
                 disk,
                 receipt,
+                esp_partuuid,
+                output_disk,
                 kernel,
                 initrd,
                 options,
@@ -904,12 +957,30 @@ fn run(command: Command) -> Result<ExitCode> {
                     tries,
                     known_good,
                 };
-                let id = match (disk.as_deref(), receipt.as_deref()) {
-                    (Some(disk), Some(receipt)) => {
-                        activate_deployed_boot_environment(&root, &esp, &activation, disk, receipt)?
+                let id = match (
+                    esp.as_deref(),
+                    disk.as_deref(),
+                    receipt.as_deref(),
+                    esp_partuuid.as_deref(),
+                    output_disk.as_deref(),
+                ) {
+                    (Some(esp), Some(disk), Some(receipt), None, None) => {
+                        activate_deployed_boot_environment(&root, esp, &activation, disk, receipt)?
                     }
-                    (None, None) => activate_boot_environment(&root, &esp, &activation)?,
-                    _ => anyhow::bail!("--disk and --receipt must be supplied together"),
+                    (Some(esp), None, None, None, None) => {
+                        activate_boot_environment(&root, esp, &activation)?
+                    }
+                    (None, Some(disk), Some(receipt), Some(partuuid), Some(output)) => {
+                        activate_boot_environment_on_disk(
+                            &root,
+                            &activation,
+                            disk,
+                            partuuid,
+                            receipt,
+                            output,
+                        )?
+                    }
+                    _ => anyhow::bail!("specify --esp or the offline disk and output options"),
                 };
                 println!("Activated {id}");
             }

@@ -627,15 +627,17 @@ Boot environments use separate Linux roots and a dedicated systemd-boot EFI Syst
 cps boot-env export --root base --output base.ext4 --size-mib 2048 --receipt > base.kdl
 cps boot-env deploy --disk template.raw --root-image base.ext4 \
     --root-partuuid "$base_partuuid" --output base.raw
-cps boot-env activate --known-good --root base --esp esp \
-    --root-partuuid "$base_partuuid" --disk base.raw --receipt base.kdl
+cps boot-env activate --known-good --root base --root-partuuid "$base_partuuid" \
+    --disk base.raw --receipt base.kdl --esp-partuuid "$esp_partuuid" \
+    --output-disk bootable-base.raw
 cps plan --root base --output upgrade.json update
 cps boot-env stage --source base --root staged upgrade.json
 cps boot-env export --root staged --output staged.ext4 --size-mib 2048 --receipt > staged.kdl
-cps boot-env deploy --disk base.raw --root-image staged.ext4 \
+cps boot-env deploy --disk bootable-base.raw --root-image staged.ext4 \
     --root-partuuid "$staged_partuuid" --output next.raw
-cps boot-env activate --root staged --esp esp \
-    --root-partuuid "$staged_partuuid" --disk next.raw --receipt staged.kdl
+cps boot-env activate --root staged --root-partuuid "$staged_partuuid" \
+    --disk next.raw --receipt staged.kdl --esp-partuuid "$esp_partuuid" \
+    --output-disk bootable-next.raw
 ```
 
 `stage` verifies the new root and gives it a fresh image identity. Export
@@ -649,7 +651,8 @@ e2fsprogs with support for `root_perms`. Filesystem timestamps and formatter
 defaults affect the image bytes. [mke2fs manual](https://man7.org/linux/man-pages/man8/mke2fs.8.html)
 
 For an offline VM or disk image, provision a raw GPT template with 512-byte
-sectors and one Linux filesystem partition per root. `deploy` uses GNU
+sectors, one Linux filesystem partition per root, and a FAT EFI System
+Partition containing systemd-boot. `deploy` uses GNU
 `cp`, util-linux `sfdisk`, and `e2fsck`. It clones the source disk, checks
 the GPT copies and partition ranges, and writes the payload to the selected
 partition. The payload must match the partition size exactly. CPS checks
@@ -677,9 +680,19 @@ Activation copies boot files from the selected root and publishes its Boot
 Loader Specification entry last. With manually supplied boot files the
 kernel path defaults to `boot/vmlinuz`. Use `--initrd` if the kernel needs
 one to mount the root and `--options` for additional kernel arguments.
-Provision the GPT partitions and install systemd-boot on the dedicated
-ESP separately. Apply the resulting ESP files to the verified disk before
-booting it.
+
+With `--esp-partuuid` and `--output-disk`, CPS edits a private copy of the
+selected EFI partition on the same verified disk. It checks the FAT
+filesystem, verifies the written files, and publishes a new disk image
+with the remaining partitions intact. Boot the output disk. This mode
+uses mtools and dosfstools and supports ESPs up to 1 GiB. An unprivileged
+caller can set `CPS_ESP_TOOLS_DIR` to the absolute path of a trusted tool
+directory. For a mounted or detached ESP, use `--esp` to operate on its
+directory. [fsck.fat manual](https://man7.org/linux/man-pages/man8/fsck.fat.8.html)
+
+For FAT32, CPS can clear a leftover dirty flag in its private copy
+when the primary and backup boot sectors otherwise agree. The copy still
+has to pass the read-only FAT check.
 
 `--known-good` bootstraps the first entry. Later activations require the previous environment's known-good entry and boot files. A trial gets two attempts by default. Install [the `system/cps` package](packaging/cps.kdl) in the base image to make its health check part of `boot-complete.target`. The package ships the CPS binary, [the health unit](packaging/systemd/cps-boot-health.service), and the required dependency link. The unit runs `cps verify --root /` after `multi-user.target`. Systemd blesses the entry when boot completion succeeds, removing the boot counter. If the attempts run out, systemd-boot selects the previous environment. The managed ESP uses its own loader configuration and assumes no EFI default override. [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
 
@@ -707,12 +720,25 @@ cps boot-env rollback --esp esp
 cps boot-env rollback --esp esp "$environment_id"
 ```
 
+For an offline disk, list the entries that systemd-boot actually sees and
+publish rollback to a new disk file.
+
+```sh
+cps boot-env list --disk bootable-next.raw --esp-partuuid "$esp_partuuid"
+cps boot-env rollback --disk bootable-next.raw --esp-partuuid "$esp_partuuid" \
+    --output-disk rolled-back.raw
+```
+
+Disk rollback checks that the selected root's filesystem UUID and revision
+match its registered entry before changing the default.
+
 The list marks the default configured on the ESP and shows each registered root's partition UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. Rollback selects the default environment's recorded parent unless an ID is supplied. Entries from earlier CPS versions use the previous known-good revision. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
 ### VM boot tests
 
 The [VM test](tests/systemd-boot-vm.sh) deploys two CPS exports to a GPT disk
-and adds a FAT ESP, then boots through OVMF and systemd-boot under QEMU.
+and activates them in its FAT ESP, then boots through OVMF and systemd-boot
+under QEMU.
 The `fallback` scenario checks that staging leaves the ESP alone and that the
 previous root boots after two failed attempts. The `bless` scenario runs
 systemd as PID 1, installs the health gate through the CPS package, and checks
@@ -727,6 +753,8 @@ e2fsprogs, OpenSSL, and `setfattr` to check the payload and failure cleanup.
 [The deployment test](tests/boot-deploy.sh) also uses `sfdisk` and `blkid`
 to check partition isolation and reject damaged or ambiguous layouts,
 stale receipts, modified payloads, and missing fallback roots.
+Run it with `--esp` and mtools and dosfstools installed to exercise raw-disk
+activation and rollback, including preservation of unrelated EFI files.
 The VM test additionally needs `qemu-system-x86_64`, `mkfs.fat`, mtools,
 systemd-boot, and matching non-Secure-Boot x86-64 OVMF code and
 variables files. Supply an EFI-stub Linux kernel with built-in virtio block,

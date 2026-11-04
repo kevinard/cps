@@ -195,3 +195,102 @@ test ! -e "esp/loader/entries/$trial_id+9.conf"
 cmp "esp-before/loader/entries/$base_id.conf" "esp/loader/entries/$base_id.conf"
 
 echo 'Verified checked activation rejects stale exports, modified partitions, and missing fallbacks'
+
+if [[ ${1:-} != --esp ]]; then exit 0; fi
+
+mkdir -p seed/EFI/{BOOT,vendor} seed/loader
+printf 'firmware entry\n' > seed/EFI/BOOT/BOOTX64.EFI
+printf 'vendor data\n' > seed/EFI/vendor/keep.efi
+printf 'systemd random seed\n' > seed/loader/random-seed
+truncate -s 2M seed.fat
+mkfs.fat -F 12 seed.fat >/dev/null
+mcopy -s -i seed.fat seed/EFI seed/loader ::/
+cp --sparse=always base.raw with-esp.raw
+dd if=seed.fat of=with-esp.raw bs=1M seek=1 conv=notrunc status=none
+raw_activate() {
+    local root=$1 disk=$2 partuuid=$3 output=$4
+    shift 4
+    "$cps" boot-env activate --root "$root" --root-partuuid "$partuuid" \
+        --receipt "$root.kdl" --disk "$disk" --esp-partuuid "$esp" --output-disk "$output" "$@"
+}
+raw_list() {
+    "$cps" boot-env list --disk "$1" --esp-partuuid "$esp"
+}
+raw_rollback() {
+    "$cps" boot-env rollback --disk "$1" --esp-partuuid "$esp" --output-disk "$2"
+}
+reject_raw() {
+    local message=$1
+    shift
+    if "$@" > rejected.log 2>&1; then
+        echo 'Unexpected success using the offline EFI partition' >&2
+        exit 1
+    fi
+    grep -F "$message" rejected.log
+}
+assert_default() {
+    raw_list "$1" | awk -F '\t' -v id="$2" -v status="$3" \
+        '$1 == "*" && $2 == status && $3 == id {found=1} END {exit !found}'
+}
+
+reject_raw 'not a GPT EFI System partition' "$cps" boot-env list --disk with-esp.raw --esp-partuuid "$base"
+reject_raw 'fsck.fat rejected the EFI partition' raw_activate base base.raw "$base" rejected.raw --known-good
+test ! -e rejected.raw
+test "$(raw_list with-esp.raw)" = 'No boot environments registered'
+original=$(sha256sum with-esp.raw)
+raw_activate base with-esp.raw "$base" bootable-base.raw --known-good
+test "$(sha256sum with-esp.raw)" = "$original"
+assert_default bootable-base.raw "$base_id" known-good
+
+deploy bootable-base.raw staged.ext4 "$trial" deployed-trial.raw
+cp --sparse=always deployed-trial.raw full-esp.raw
+free=$(mdir -i full-esp.raw@@1048576 ::/ | awk '/bytes free/ {sub(/bytes free/, ""); gsub(/[^0-9]/, ""); print}')
+test -n "$free"
+truncate -s "$free" fill
+mcopy -i full-esp.raw@@1048576 fill ::/fill
+full_before=$(sha256sum full-esp.raw)
+reject_raw 'could not create EFI directory' raw_activate staged full-esp.raw "$trial" rejected.raw
+test "$(sha256sum full-esp.raw)" = "$full_before"
+test ! -e rejected.raw
+raw_activate staged deployed-trial.raw "$trial" bootable-trial.raw
+cmp -n 1048576 deployed-trial.raw bootable-trial.raw
+cmp -i "$((3 * 1024 * 1024))" deployed-trial.raw bootable-trial.raw
+assert_default bootable-trial.raw "$trial_id" 'trial (2 left)'
+raw_activate staged bootable-trial.raw "$trial" retry.raw --tries 9
+cmp bootable-trial.raw retry.raw
+
+# Simulate the guest blessing the counted entry on the source disk.
+mren -i bootable-trial.raw@@1048576 \
+    "::/loader/entries/$trial_id+2.conf" "::/loader/entries/$trial_id.conf"
+assert_default bootable-trial.raw "$trial_id" known-good
+before_rollback=$(sha256sum bootable-trial.raw)
+raw_rollback bootable-trial.raw rolled-back.raw
+test "$(sha256sum bootable-trial.raw)" = "$before_rollback"
+assert_default rolled-back.raw "$base_id" known-good
+raw_list rolled-back.raw | grep -F "$trial_id"
+cmp -n 1048576 bootable-trial.raw rolled-back.raw
+cmp -i "$((3 * 1024 * 1024))" bootable-trial.raw rolled-back.raw
+for path in EFI/BOOT/BOOTX64.EFI EFI/vendor/keep.efi loader/random-seed; do
+    mcopy -i rolled-back.raw@@1048576 "::/$path" - | cmp "seed/$path" -
+done
+
+deploy bootable-trial.raw different-revision.ext4 "$base" unusable-fallback.raw
+reject_raw 'checking the rollback root partition' raw_rollback unusable-fallback.raw rejected.raw
+reject_raw 'destination already exists' raw_rollback bootable-trial.raw rolled-back.raw
+test ! -e rejected.raw
+
+# Simulate the dirty flag left in the primary boot sector after guest shutdown.
+truncate -s 66M dirty.raw
+printf 'label: gpt\nstart=2048,size=131072,type=uefi,uuid=%s\n' "$esp" | sfdisk --quiet dirty.raw
+truncate -s 64M fat32
+mkfs.fat -F 32 -b 6 fat32 >/dev/null
+printf '\001' | dd of=fat32 bs=1 seek=65 conv=notrunc status=none
+dd if=fat32 of=dirty.raw bs=1M seek=1 conv=notrunc,sparse status=none
+dirty_hash=$(sha256sum dirty.raw)
+test "$(raw_list dirty.raw)" = 'No boot environments registered'
+test "$(sha256sum dirty.raw)" = "$dirty_hash"
+printf 'X' | dd of=dirty.raw bs=1 seek="$((1048576 + 6 * 512 + 3))" conv=notrunc status=none
+reject_raw 'fsck.fat rejected the EFI partition' raw_list dirty.raw
+
+test -z "$(find . -maxdepth 1 -name '.cps-deploy-*' -print)"
+echo 'Verified activation and rollback update the same disk and preserve unrelated EFI files'

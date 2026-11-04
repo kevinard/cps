@@ -53,6 +53,10 @@ pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
 }
 
 pub fn rollback_boot_environment(esp: &Path, id: Option<&str>) -> Result<String> {
+    rollback(esp, id, None)
+}
+
+pub(super) fn rollback(esp: &Path, id: Option<&str>, disk: Option<&OfflineDisk>) -> Result<String> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let (policy, entries) = inventory(&esp)?;
@@ -75,6 +79,11 @@ pub fn rollback_boot_environment(esp: &Path, id: Option<&str>) -> Result<String>
         }
     };
     verify_fallback_artifacts(&esp, &target.id, &target.description)?;
+    if let Some(disk) = disk {
+        let (image, revision) = policy::entry_identity(&target.id)?;
+        disk.verify_filesystem(&target.partuuid, image, revision)
+            .context("checking the rollback root partition")?;
+    }
     LoaderPolicy::pinned(&target.id).write(&esp.join("loader/loader.conf"))?;
     Ok(target.id.clone())
 }
@@ -119,7 +128,7 @@ pub fn activate_boot_environment(
     esp: &Path,
     activation: &Activation,
 ) -> Result<String> {
-    activate(root, esp, activation, None)
+    Ok(activate(root, esp, activation, None)?.id)
 }
 
 /// Activate an environment after verifying its deployed root in an offline disk.
@@ -130,15 +139,21 @@ pub fn activate_deployed_boot_environment(
     disk: &Path,
     receipt: &Path,
 ) -> Result<String> {
-    activate(root, esp, activation, Some((disk, receipt)))
+    let disk = OfflineDisk::open(disk)?;
+    Ok(activate(root, esp, activation, Some((&disk, receipt)))?.id)
 }
 
-fn activate(
+pub(super) struct ActivationUpdate {
+    pub id: String,
+    pub files: Vec<String>,
+}
+
+pub(super) fn activate(
     root: &Path,
     esp: &Path,
     activation: &Activation,
-    deployment: Option<(&Path, &Path)>,
-) -> Result<String> {
+    deployment: Option<(&OfflineDisk, &Path)>,
+) -> Result<ActivationUpdate> {
     let partuuid = canonical_partuuid(&activation.root_partuuid)?;
     validate_options(&activation.options)?;
     ensure!(
@@ -198,23 +213,19 @@ fn activate(
             .context("opening the environment initramfs")?;
         (kernel, initrd)
     };
-    let disk = deployment
-        .map(|(disk, receipt)| {
-            let receipt = read_export_receipt(receipt)?;
-            ensure!(
-                receipt.image == image_id && receipt.revision == settings.revision,
-                "root export receipt is for a different image or revision"
-            );
-            ensure!(
-                receipt.state_sha256 == digest_reader(image.root.file(".cps/state.sqlite")?)?,
-                "image state differs from the root export receipt"
-            );
-            let disk = OfflineDisk::open(disk)?;
-            disk.verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
-            disk.verify_filesystem(&partuuid, &image_id, settings.revision)?;
-            Ok::<_, anyhow::Error>(disk)
-        })
-        .transpose()?;
+    if let Some((disk, receipt)) = deployment {
+        let receipt = read_export_receipt(receipt)?;
+        ensure!(
+            receipt.image == image_id && receipt.revision == settings.revision,
+            "root export receipt is for a different image or revision"
+        );
+        ensure!(
+            receipt.state_sha256 == digest_reader(image.root.file(".cps/state.sqlite")?)?,
+            "image state differs from the root export receipt"
+        );
+        disk.verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
+        disk.verify_filesystem(&partuuid, &image_id, settings.revision)?;
+    }
     let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let (policy, existing) = inventory(&esp)?;
     let existing_entry = existing.iter().find(|entry| entry.id == id);
@@ -281,7 +292,9 @@ fn activate(
         );
     }
 
-    if let (Some(disk), Some(fallback), Some(parent)) = (&disk, &fallback, &settings.boot_parent) {
+    if let (Some((disk, _)), Some(fallback), Some(parent)) =
+        (deployment, &fallback, &settings.boot_parent)
+    {
         let base = find_known_good(&existing, fallback)?;
         disk.verify_filesystem(
             &base.partuuid,
@@ -295,9 +308,14 @@ fn activate(
     let config_path = loader.join("loader.conf");
     let efi = ensure_dir(&esp, "EFI")?;
     let artifacts = ensure_dir(&ensure_dir(&efi, "cps")?, &id)?;
-    install(&artifacts.join("vmlinuz.efi"), kernel)?;
-    if let Some(initrd) = initrd {
-        install(&artifacts.join("initramfs.img"), initrd)?;
+    let mut files = Vec::new();
+    if install(&artifacts.join("vmlinuz.efi"), kernel)? {
+        files.push(format!("EFI/cps/{id}/vmlinuz.efi"));
+    }
+    if let Some(initrd) = initrd
+        && install(&artifacts.join("initramfs.img"), initrd)?
+    {
+        files.push(format!("EFI/cps/{id}/initramfs.img"));
     }
     if let Some(entry) = existing_entry {
         File::open(&entry.path)?.sync_all()?;
@@ -305,12 +323,17 @@ fn activate(
     } else {
         if fallback.is_none() {
             LoaderPolicy::Automatic.write(&config_path)?;
+            files.push("loader/loader.conf".into());
         }
         let file = match fallback {
             None => format!("{id}.conf"),
             Some(_) => format!("{id}+{}.conf", activation.tries),
         };
-        install(&entries.join(file), io::Cursor::new(description.as_bytes()))?;
+        install(
+            &entries.join(&file),
+            io::Cursor::new(description.as_bytes()),
+        )?;
+        files.push(format!("loader/entries/{file}"));
     }
     if let Some(fallback) = fallback
         .as_deref()
@@ -318,9 +341,10 @@ fn activate(
     {
         // The counted entry and its files are durable before selection.
         LoaderPolicy::trial(fallback, &id).write(&config_path)?;
+        files.push("loader/loader.conf".into());
     }
 
-    Ok(id)
+    Ok(ActivationUpdate { id, files })
 }
 
 fn read_export_receipt(path: &Path) -> Result<ExportReceipt> {
@@ -456,7 +480,7 @@ fn read_regular(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn install(path: &Path, mut bytes: impl Read) -> Result<()> {
+fn install(path: &Path, mut bytes: impl Read) -> Result<bool> {
     let parent = path.parent().context("missing EFI destination directory")?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -473,7 +497,7 @@ fn install(path: &Path, mut bytes: impl Read) -> Result<()> {
             );
             current.sync_all()?;
             File::open(parent)?.sync_all()?;
-            return Ok(());
+            return Ok(false);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -483,5 +507,5 @@ fn install(path: &Path, mut bytes: impl Read) -> Result<()> {
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)?;
     File::open(parent)?.sync_all()?;
-    Ok(())
+    Ok(true)
 }

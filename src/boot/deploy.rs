@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
 };
 
@@ -13,6 +13,7 @@ use rustix::{
     io::Errno,
 };
 use serde::Deserialize;
+use tempfile::TempDir;
 
 use super::{artifact_helper, root_label, systemd_boot::canonical_partuuid};
 use crate::{image::root::Root, model::digest_reader};
@@ -20,6 +21,7 @@ use crate::{image::root::Root, model::digest_reader};
 const DISK: &str = "disk.raw";
 const SECTOR_SIZE: u64 = 512;
 const LINUX_FILESYSTEM: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
+const EFI_SYSTEM: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Deploy an exported root to one partition in a new offline GPT disk image.
@@ -30,60 +32,16 @@ pub fn deploy_boot_environment(
     output: &Path,
 ) -> Result<String> {
     let partuuid = canonical_partuuid(root_partuuid)?;
-    let name = output
-        .file_name()
-        .context("expected a new disk file name")?;
-    let parent_path = fs::canonicalize(
-        output
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )
-    .context("opening the deployment destination directory")?;
-    let parent = Root::open(&parent_path)?;
-    match statat(parent.as_file(), name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => anyhow::bail!("the deployment destination already exists"),
-        Err(Errno::NOENT) => {}
-        Err(error) => return Err(error).context("checking the deployment destination"),
-    }
-
-    let source = offline_file(disk)?;
     let mut payload = offline_file(root_image)?;
-    let temp = tempfile::Builder::new()
-        .prefix(".cps-deploy-")
-        .tempdir_in(Root::fd_path(parent.as_file()))?;
-    let stage = Root::open(temp.path())?;
-    let stage_path = Root::fd_path(stage.as_file());
-    let mut clone = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(stage_path.join(DISK))?;
-    let status = artifact_helper("cp", &stage_path)
-        .stdin(Stdio::from(source.try_clone()?))
-        .args([
-            "--reflink=auto",
-            "--sparse=always",
-            "--",
-            "/proc/self/fd/0",
-            DISK,
-        ])
-        .status()
-        .context("cloning the offline disk with GNU cp")?;
-    ensure!(
-        status.success(),
-        "cloning the offline disk failed with {status}"
-    );
-
-    let layout = read_partitions(&clone)?;
-    let PartitionExtent { offset, bytes, .. } = *linux_partition(&layout, &partuuid)?;
+    let stage = DiskStage::new(disk, output)?;
+    let partition = stage.disk.partition(&partuuid, LINUX_FILESYSTEM)?;
+    let bytes = partition.bytes;
     ensure!(
         payload.metadata()?.len() == bytes,
         "root payload size must match the target partition ({bytes} bytes)"
     );
     let expected = digest_reader((&mut payload).take(bytes))?;
-    let status = artifact_helper("e2fsck", &stage_path)
+    let status = artifact_helper("e2fsck", &stage.directory())
         .stdin(Stdio::from(payload.try_clone()?))
         .stdout(Stdio::null())
         .args(["-f", "-n", "/proc/self/fd/0"])
@@ -91,35 +49,108 @@ pub fn deploy_boot_environment(
         .context("checking the root payload with e2fsck")?;
     ensure!(status.success(), "e2fsck failed with {status}");
     payload.rewind()?;
-    clone.seek(SeekFrom::Start(offset))?;
-    let written = io::copy(&mut (&mut payload).take(bytes), &mut clone)?;
-    ensure!(
-        written == bytes,
-        "root payload was truncated during deployment"
-    );
-    clone.sync_all()?;
-    let actual = digest_extent(&clone, offset, bytes)?;
+    let actual = stage.disk.write_partition(partition, &mut payload)?;
     ensure!(
         actual == expected && payload.metadata()?.len() == bytes,
         "deployed partition does not match the checked root payload"
     );
-    let checked = clone.metadata()?;
-    let published = stage.file(DISK)?.metadata()?;
-    ensure!(
-        (checked.dev(), checked.ino(), checked.len())
-            == (published.dev(), published.ino(), published.len()),
-        "the verified disk image was replaced or resized"
-    );
-    renameat_with(
-        stage.as_file(),
-        DISK,
-        parent.as_file(),
-        name,
-        RenameFlags::NOREPLACE,
-    )
-    .context("publishing the deployed disk image")?;
-    parent.as_file().sync_all()?;
+    stage.publish()?;
     Ok(actual)
+}
+
+pub(super) struct DiskStage<'a> {
+    pub disk: OfflineDisk,
+    stage: Root,
+    _temp: TempDir,
+    parent: Root,
+    name: &'a std::ffi::OsStr,
+    bytes: u64,
+}
+
+impl<'a> DiskStage<'a> {
+    pub fn new(source: &Path, output: &'a Path) -> Result<Self> {
+        let name = output
+            .file_name()
+            .context("expected a new disk file name")?;
+        let parent_path = fs::canonicalize(
+            output
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+        .context("opening the deployment destination directory")?;
+        let parent = Root::open(&parent_path)?;
+        match statat(parent.as_file(), name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => anyhow::bail!("the deployment destination already exists"),
+            Err(Errno::NOENT) => {}
+            Err(error) => return Err(error).context("checking the deployment destination"),
+        }
+        let source = offline_file(source)?;
+        let temp = tempfile::Builder::new()
+            .prefix(".cps-deploy-")
+            .tempdir_in(Root::fd_path(parent.as_file()))?;
+        let stage = Root::open(temp.path())?;
+        let directory = Root::fd_path(stage.as_file());
+        let clone = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(DISK))?;
+        let status = artifact_helper("cp", &directory)
+            .stdin(Stdio::from(source.try_clone()?))
+            .args([
+                "--reflink=auto",
+                "--sparse=always",
+                "--",
+                "/proc/self/fd/0",
+                DISK,
+            ])
+            .status()
+            .context("cloning the offline disk with GNU cp")?;
+        ensure!(
+            status.success(),
+            "cloning the offline disk failed with {status}"
+        );
+        let bytes = source.metadata()?.len();
+        ensure!(
+            clone.metadata()?.len() == bytes,
+            "offline disk size changed during cloning"
+        );
+        Ok(Self {
+            disk: OfflineDisk::from_file(clone)?,
+            stage,
+            _temp: temp,
+            parent,
+            name,
+            bytes,
+        })
+    }
+
+    pub fn directory(&self) -> PathBuf {
+        Root::fd_path(self.stage.as_file())
+    }
+
+    pub fn publish(self) -> Result<()> {
+        let checked = self.disk.file.metadata()?;
+        let published = self.stage.file(DISK)?.metadata()?;
+        ensure!(
+            (checked.dev(), checked.ino(), self.bytes)
+                == (published.dev(), published.ino(), published.len()),
+            "the verified disk image was replaced or resized"
+        );
+        self.disk.file.sync_all()?;
+        renameat_with(
+            self.stage.as_file(),
+            DISK,
+            self.parent.as_file(),
+            self.name,
+            RenameFlags::NOREPLACE,
+        )
+        .context("publishing the deployed disk image")?;
+        self.parent.as_file().sync_all()?;
+        Ok(())
+    }
 }
 
 pub(super) fn offline_file(path: &Path) -> Result<File> {
@@ -165,24 +196,10 @@ struct Partition {
     uuid: String,
 }
 
-struct PartitionExtent {
+pub(super) struct PartitionExtent {
     offset: u64,
-    bytes: u64,
-    linux: bool,
-}
-
-fn linux_partition<'a>(
-    partitions: &'a BTreeMap<String, PartitionExtent>,
-    partuuid: &str,
-) -> Result<&'a PartitionExtent> {
-    let partition = partitions
-        .get(partuuid)
-        .with_context(|| format!("GPT partition {partuuid} was not found"))?;
-    ensure!(
-        partition.linux,
-        "target is not a GPT Linux filesystem partition"
-    );
-    Ok(partition)
+    pub bytes: u64,
+    kind: String,
 }
 
 pub(super) struct OfflineDisk {
@@ -192,13 +209,60 @@ pub(super) struct OfflineDisk {
 
 impl OfflineDisk {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = offline_file(path)?;
+        Self::from_file(offline_file(path)?)
+    }
+
+    fn from_file(file: File) -> Result<Self> {
         let partitions = read_partitions(&file)?;
         Ok(Self { file, partitions })
     }
 
+    fn partition(&self, partuuid: &str, kind: &str) -> Result<&PartitionExtent> {
+        let partition = self
+            .partitions
+            .get(partuuid)
+            .with_context(|| format!("GPT partition {partuuid} was not found"))?;
+        ensure!(
+            partition.kind.eq_ignore_ascii_case(kind),
+            "target is not a GPT {} partition",
+            if kind == EFI_SYSTEM {
+                "EFI System"
+            } else {
+                "Linux filesystem"
+            }
+        );
+        Ok(partition)
+    }
+
+    pub fn esp(&self, partuuid: &str) -> Result<&PartitionExtent> {
+        self.partition(&canonical_partuuid(partuuid)?, EFI_SYSTEM)
+    }
+
+    pub fn read_partition(&self, part: &PartitionExtent, output: &mut File) -> Result<()> {
+        let mut disk = &self.file;
+        disk.seek(SeekFrom::Start(part.offset))?;
+        let read = io::copy(&mut disk.take(part.bytes), output)?;
+        ensure!(
+            read == part.bytes,
+            "disk partition was truncated while reading"
+        );
+        Ok(())
+    }
+
+    pub fn write_partition(&self, part: &PartitionExtent, payload: &mut File) -> Result<String> {
+        let mut disk = &self.file;
+        disk.seek(SeekFrom::Start(part.offset))?;
+        let written = io::copy(&mut payload.take(part.bytes), &mut disk)?;
+        ensure!(
+            written == part.bytes,
+            "partition payload was truncated during deployment"
+        );
+        disk.sync_all()?;
+        digest_extent(disk, part.offset, part.bytes)
+    }
+
     pub fn verify_payload(&self, partuuid: &str, bytes: u64, sha256: &str) -> Result<()> {
-        let partition = linux_partition(&self.partitions, partuuid)?;
+        let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
         ensure!(
             partition.bytes == bytes
                 && digest_extent(&self.file, partition.offset, partition.bytes)? == sha256,
@@ -208,7 +272,7 @@ impl OfflineDisk {
     }
 
     pub fn verify_filesystem(&self, partuuid: &str, image: &str, revision: u64) -> Result<()> {
-        let partition = linux_partition(&self.partitions, partuuid)?;
+        let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
         let output = artifact_helper("blkid", Path::new("/"))
             .env("BLKID_CONF", "/dev/null")
             .stdin(Stdio::from(self.file.try_clone()?))
@@ -296,7 +360,7 @@ fn read_partitions(disk: &File) -> Result<BTreeMap<String, PartitionExtent>> {
         entry.insert(PartitionExtent {
             offset: part.start * SECTOR_SIZE,
             bytes: part.size * SECTOR_SIZE,
-            linux: part.kind.eq_ignore_ascii_case(LINUX_FILESYSTEM),
+            kind: part.kind,
         });
     }
     Ok(partitions)
