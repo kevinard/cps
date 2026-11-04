@@ -199,11 +199,11 @@ pub(crate) fn build(
         _ => {
             let requested = match &request {
                 Request::Install { packages } | Request::ExactInstall { packages } => {
-                    requested_names(packages)?
+                    catalogs::requested(&state, packages)?
                 }
-                _ => BTreeSet::new(),
+                _ => BTreeMap::new(),
             };
-            catalogs = catalogs::load(&state, saved)?;
+            catalogs = catalogs::load(&state, &requested, saved)?;
             resolve::resolve(
                 &state.installed,
                 &catalogs.packages,

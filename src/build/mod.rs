@@ -24,7 +24,7 @@ use crate::{
         build::{BuildRecipe, read},
         parse_manifest,
     },
-    model::{FileDigest, Node, digest, digest_reader},
+    model::{FileDigest, Node, PackageSpec, digest, digest_reader},
     plan::{resolve_packages, select_paths},
     repo::{MANIFEST_LIMIT, read_key, read_limited, read_signing_key, snapshot, stage_blob},
 };
@@ -312,10 +312,24 @@ fn prepare_toolchain(
     let key = read_key(trust_key)?;
     let release = snapshot(repo, publisher, &key, Some(&recipe.catalog))
         .context("loading pinned toolchain catalog")?;
+    let requested = recipe
+        .packages
+        .iter()
+        .map(|name| {
+            (
+                name.as_str(),
+                PackageSpec {
+                    name,
+                    publisher: None,
+                    version: None,
+                },
+            )
+        })
+        .collect();
     let (installed, paths) = resolve_packages(
         &BTreeMap::new(),
         &release.packages,
-        &recipe.packages,
+        &requested,
         false,
         true,
         recipe.solver,

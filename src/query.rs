@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use crate::{
     image::{Image, Installed, Publisher, Publishers},
     kdl_format::manifest_text,
-    model::{Version, validate_digest, validate_name, validate_publisher},
+    model::{PackageSpec, Version, validate_digest},
     repo::{catalog_entries, read_package},
 };
 
@@ -42,35 +42,6 @@ pub struct PackageRow {
     pub status: Status,
 }
 
-struct Selector<'a> {
-    publisher: Option<&'a str>,
-    name: &'a str,
-    version: Option<Version>,
-}
-
-impl<'a> Selector<'a> {
-    fn parse(text: &'a str) -> Result<Self> {
-        let (publisher, spec) = if let Some(spec) = text.strip_prefix("cps://") {
-            let (publisher, spec) = spec.split_once('/').context("package ID has no name")?;
-            validate_publisher(publisher)?;
-            (Some(publisher), spec)
-        } else {
-            (None, text)
-        };
-        let (name, version) = if let Some((name, version)) = spec.split_once('@') {
-            (name, Some(version.parse()?))
-        } else {
-            (spec, None)
-        };
-        validate_name(name)?;
-        Ok(Self {
-            publisher,
-            name,
-            version,
-        })
-    }
-}
-
 struct CatalogEntry {
     id: String,
     name: String,
@@ -81,7 +52,8 @@ struct CatalogEntry {
 fn available(publisher: &Publisher) -> Result<Vec<CatalogEntry>> {
     let mut entries = Vec::new();
     for (id, sha256) in catalog_entries(&publisher.repo, &publisher.name, &publisher.key)? {
-        let selector = Selector::parse(&id).with_context(|| format!("invalid catalog ID {id}"))?;
+        let selector =
+            PackageSpec::parse(&id).with_context(|| format!("invalid catalog ID {id}"))?;
         ensure!(
             selector.publisher == Some(publisher.name.as_str()),
             "catalog entry {id} has a different publisher"
@@ -167,7 +139,7 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
 
 /// Return the verified manifest for a package in KDL.
 pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<String> {
-    let selector = Selector::parse(spec)?;
+    let selector = PackageSpec::parse(spec)?;
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let publishers = image.publishers()?;
@@ -193,10 +165,19 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
                 continue;
             }
             let entries = available(publisher)?;
-            if let Some(entry) = entries
+            let mut named = entries
                 .into_iter()
-                .find(|entry| entry.name == selector.name && accepts(entry.version))
-            {
+                .filter(|entry| entry.name == selector.name)
+                .peekable();
+            if named.peek().is_some() {
+                let entry = named
+                    .find(|entry| accepts(entry.version))
+                    .with_context(|| {
+                        format!(
+                            "package is absent from the signed catalog for {}: {spec}",
+                            publisher.name
+                        )
+                    })?;
                 let package =
                     read_package(&publisher.repo, &publisher.name, &entry.id, entry.sha256)?;
                 return Ok(manifest_text(&package.manifest));

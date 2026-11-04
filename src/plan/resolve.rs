@@ -7,14 +7,14 @@ use anyhow::{Context, Result, ensure};
 use super::SolverRevision;
 use crate::{
     image::Installed,
-    model::{Dependency, DependencyTarget},
+    model::{Dependency, DependencyTarget, PackageSpec},
     repo::Published,
 };
 
 pub fn resolve<T>(
     installed: &BTreeMap<String, Installed>,
     packages: &[Published],
-    requested: &BTreeSet<String>,
+    requested: &BTreeMap<&str, PackageSpec<'_>>,
     update: bool,
     exact: bool,
     solver: Option<SolverRevision>,
@@ -26,10 +26,14 @@ pub fn resolve<T>(
         .chain(installed.values().map(|pkg| &pkg.published))
     {
         let manifest = &package.manifest;
+        let spec = requested.get(manifest.name.as_str());
+        let pinned = spec.and_then(|spec| spec.version);
         let previous = installed.get(&manifest.name);
         if let Some(previous) = previous {
             let old = &previous.published.manifest;
-            if old.publisher != manifest.publisher || old.version > manifest.version {
+            if old.publisher != manifest.publisher
+                || (old.version > manifest.version && pinned != Some(manifest.version))
+            {
                 continue;
             }
             ensure!(
@@ -38,13 +42,20 @@ pub fn resolve<T>(
                 manifest.id()
             );
         }
+        if spec.is_some_and(|spec| {
+            spec.publisher
+                .is_some_and(|publisher| publisher != manifest.publisher)
+                || pinned.is_some_and(|version| version != manifest.version)
+        }) {
+            continue;
+        }
         candidates
             .entry(manifest.name.as_str())
             .or_default()
             .push(package);
     }
     for (name, versions) in &mut candidates {
-        let prefer_current = !update && !requested.contains(*name);
+        let prefer_current = !update && !requested.contains_key(*name);
         let current = installed.get(*name).map(|pkg| &pkg.published.sha256);
         versions.sort_by_key(|pkg| {
             (
@@ -55,12 +66,21 @@ pub fn resolve<T>(
         versions.reverse();
         versions.dedup_by(|a, b| a.sha256 == b.sha256);
     }
+    for spec in requested.values() {
+        if let Some(version) = spec.version {
+            ensure!(
+                candidates.contains_key(spec.name),
+                "no eligible version for {}@{version}",
+                spec.name
+            );
+        }
+    }
 
     let wanted: BTreeSet<_> = installed
         .keys()
         .filter(|_| !exact)
-        .chain(requested)
         .map(String::as_str)
+        .chain(requested.keys().copied())
         .collect();
     let materialize = |selected: BTreeMap<&str, &Published>| {
         for name in &wanted {
@@ -72,7 +92,7 @@ pub fn resolve<T>(
         let installed = selected
             .into_iter()
             .map(|(name, pkg)| {
-                let explicit = requested.contains(name)
+                let explicit = requested.contains_key(name)
                     || (!exact && installed.get(name).is_some_and(|old| old.explicit));
                 (
                     name.to_owned(),

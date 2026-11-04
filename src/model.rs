@@ -62,6 +62,36 @@ pub fn validate_publisher(publisher: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackageSpec<'a> {
+    pub publisher: Option<&'a str>,
+    pub name: &'a str,
+    pub version: Option<Version>,
+}
+
+impl<'a> PackageSpec<'a> {
+    pub fn parse(text: &'a str) -> Result<Self> {
+        let (publisher, spec) = if let Some(spec) = text.strip_prefix("cps://") {
+            let (publisher, spec) = spec.split_once('/').context("package ID has no name")?;
+            validate_publisher(publisher)?;
+            (Some(publisher), spec)
+        } else {
+            (None, text)
+        };
+        let (name, version) = if let Some((name, version)) = spec.split_once('@') {
+            (name, Some(version.parse()?))
+        } else {
+            (spec, None)
+        };
+        validate_name(name)?;
+        Ok(Self {
+            publisher,
+            name,
+            version,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Version([u32; 4]);
 

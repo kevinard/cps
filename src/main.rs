@@ -259,12 +259,12 @@ enum RepoCommand {
 
 #[derive(Subcommand)]
 enum PlanCommand {
-    /// Install one or more packages
+    /// Install one or more packages, optionally specifying publisher and version
     Install {
         #[arg(required = true)]
         packages: Vec<String>,
     },
-    /// Reconcile an image to the named packages and their dependencies
+    /// Reconcile an image to the requested packages and their dependencies
     ExactInstall {
         #[arg(required = true)]
         packages: Vec<String>,

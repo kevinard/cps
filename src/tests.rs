@@ -164,6 +164,28 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
     fs::write(&config, definition(&extra.public))?;
     crate::create_configured_image(&primary.root, &config)?;
     let plan_for = |request| plan(&primary.root, request);
+    let qualified_root = primary.root.with_extension("qualified");
+    crate::create_configured_image(&qualified_root, &config)?;
+    let install_qualified = plan(
+        &qualified_root,
+        Request::ExactInstall {
+            packages: vec![
+                "cps://extras/desktop/compositor@9.0.0-0".into(),
+                "desktop/strict".into(),
+            ],
+        },
+    )?;
+    apply(&qualified_root, &install_qualified)?;
+    assert_eq!(
+        fs::read_to_string(qualified_root.join(COMPOSITOR))?,
+        "extra compositor"
+    );
+    assert!(
+        plan_for(install("desktop/compositor@9.0.0-0"))
+            .unwrap_err()
+            .to_string()
+            .contains("no eligible version")
+    );
     let error = format!("{:#}", plan_for(install("desktop/strict")).unwrap_err());
     assert!(error.contains("cannot satisfy package constraints"));
     let all = list_packages(&primary.root, Scope::AllAvailableVersions)?;
@@ -236,6 +258,12 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
     );
     assert!(!primary.root.join(COMPOSITOR).exists());
     assert_eq!(apply(&primary.root, &saved)?, 1);
+    assert!(
+        plan_for(install("cps://extras/desktop/compositor"))
+            .unwrap_err()
+            .to_string()
+            .contains("sticky publisher canopa")
+    );
     assert_eq!(
         fs::read_to_string(primary.root.join(COMPOSITOR))?,
         "base compositor 1"
@@ -298,6 +326,51 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
         "extra plugin 2"
     );
     assert!(verify(&primary.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn exact_version_requests_respect_dependencies_and_allow_deliberate_downgrades() -> Result<()> {
+    let f = Fixture::new()?;
+    for (version, bytes) in [("1.0.0-0", "old"), ("2.0.0-0", "new")] {
+        f.package(
+            "desktop/compositor",
+            version,
+            f.file(COMPOSITOR, bytes, "0755", "")?,
+        )?;
+    }
+    f.package(
+        "desktop/plugin",
+        "1.0.0-0",
+        dependency("require", "desktop/compositor", "2.0.0-0"),
+    )?;
+    f.create()?;
+    let install = |name: &str| Request::Install {
+        packages: vec![name.into()],
+    };
+    let old = install("desktop/compositor@1.0.0-0");
+    let plan_for = |request| plan(&f.root, request);
+    apply(&f.root, &plan_for(old.clone())?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
+    apply(&f.root, &plan_for(install("desktop/plugin"))?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "new");
+    let error = format!("{:#}", plan_for(old.clone()).unwrap_err());
+    assert!(error.contains("cannot satisfy package constraints"));
+    let conflicting = plan_for(Request::Install {
+        packages: vec![
+            "desktop/compositor@1.0.0-0".into(),
+            "desktop/compositor@2.0.0-0".into(),
+        ],
+    })
+    .unwrap_err();
+    assert!(conflicting.to_string().contains("conflicting selectors"));
+    let remove = plan_for(Request::Remove {
+        packages: vec!["desktop/plugin".into()],
+    })?;
+    apply(&f.root, &remove)?;
+    apply(&f.root, &plan_for(old)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
+    assert!(verify(&f.root)?.is_empty());
     Ok(())
 }
 

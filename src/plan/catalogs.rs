@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use super::Plan;
 use crate::{
     image::State,
+    model::PackageSpec,
     repo::{Published, snapshot},
 };
 
@@ -15,7 +16,44 @@ pub(super) struct Catalogs {
     pub packages: Vec<Published>,
 }
 
-pub(super) fn load(state: &State, saved: Option<&Plan>) -> Result<Catalogs> {
+pub(super) fn requested<'a>(
+    state: &State,
+    packages: &'a [String],
+) -> Result<BTreeMap<&'a str, PackageSpec<'a>>> {
+    ensure!(!packages.is_empty(), "request requires a package name");
+    let mut requested = BTreeMap::new();
+    for package in packages {
+        let spec = PackageSpec::parse(package)
+            .with_context(|| format!("invalid requested package {package:?}"))?;
+        if let Some(publisher) = spec.publisher {
+            ensure!(
+                state.publishers.get(publisher).is_some(),
+                "publisher {publisher} is not configured in this image"
+            );
+            if let Some(installed) = state.installed.get(spec.name) {
+                let current = &installed.published.manifest.publisher;
+                ensure!(
+                    current == publisher,
+                    "{} is installed from sticky publisher {current}; remove it before selecting {publisher}",
+                    spec.name
+                );
+            }
+        }
+        let previous = requested.insert(spec.name, spec);
+        ensure!(
+            previous.is_none_or(|previous| previous == spec),
+            "conflicting selectors for {}",
+            spec.name
+        );
+    }
+    Ok(requested)
+}
+
+pub(super) fn load(
+    state: &State,
+    requested: &BTreeMap<&str, PackageSpec<'_>>,
+    saved: Option<&Plan>,
+) -> Result<Catalogs> {
     let publishers = state.publishers.as_slice();
     let single = publishers.len() == 1;
     if let Some(saved) = saved {
@@ -36,6 +74,10 @@ pub(super) fn load(state: &State, saved: Option<&Plan>) -> Result<Catalogs> {
         .iter()
         .map(|(name, pkg)| (name.clone(), pkg.published.manifest.publisher.as_str()))
         .collect();
+    sources.extend(requested.values().filter_map(|spec| {
+        spec.publisher
+            .map(|publisher| (spec.name.to_owned(), publisher))
+    }));
     let mut catalogs = Catalogs::default();
     for publisher in publishers {
         let pin = match saved {

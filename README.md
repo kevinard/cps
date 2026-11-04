@@ -217,6 +217,13 @@ changing the image. [IPS publisher search order and stickiness](https://docs.ora
 name. Use `list --available --all-versions` to see every publisher's catalog
 entries, or a full package ID with `info --available` to inspect a particular one.
 
+`plan install` and `plan exact-install` accept names, `NAME@VERSION`,
+`cps://PUBLISHER/NAME`, and full package IDs. A publisher-qualified request can
+select a lower-priority publisher for a new package. To change the publisher of
+an installed package, remove the package first. An exact version can select an
+older version from the package's own publisher when the resulting image
+satisfies all dependencies. A version on its own keeps normal publisher order.
+
 On an existing image, use `publisher list` to inspect search order.
 `publisher add --root image --repo /var/lib/cps/extras --trust-key extras.der extras`
 verifies the signed catalog before appending it. Use
