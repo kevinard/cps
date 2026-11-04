@@ -53,6 +53,8 @@ pub(crate) struct Write {
     pub after: Option<Node>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) detach: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) local_config: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -157,6 +159,12 @@ impl Plan {
             lines.push(format!("Prune if empty {}", write.path));
         }
         for write in &self.writes {
+            if write.local_config {
+                lines.push(format!(
+                    "Set package metadata on local config {}",
+                    write.path
+                ));
+            }
             if let Some(target) = write.hardlink_target() {
                 lines.push(format!("Link {} to {target}", write.path));
             }
@@ -387,6 +395,7 @@ pub(crate) fn build(
             check_path_type(path, old, new)?;
         }
         let observed = root.inspect(path)?;
+        let mut local_config = false;
         let destination = match after {
             Some(target) if target.node.is_dir() => match &observed {
                 None => Some(target.node.clone()),
@@ -434,7 +443,16 @@ pub(crate) fn build(
                             updates.insert(path.clone(), revision);
                         }
                     }
-                    observed.clone()
+                    if config::file_metadata(&old.node) != config::file_metadata(&target.node)
+                        && let Some(after) = observed
+                            .as_ref()
+                            .and_then(|local| config::with_vendor_metadata(local, &target.node))
+                    {
+                        local_config = true;
+                        Some(after)
+                    } else {
+                        observed.clone()
+                    }
                 } else {
                     Some(target.node.clone())
                 }
@@ -490,6 +508,7 @@ pub(crate) fn build(
                 before: observed,
                 after: destination,
                 detach,
+                local_config,
             },
         );
     }
@@ -512,6 +531,7 @@ pub(crate) fn build(
                     before,
                     after: Some(managed.node.clone()),
                     detach: false,
+                    local_config: false,
                 },
             );
         }
@@ -567,6 +587,10 @@ impl Write {
 
     pub(crate) fn replaces_file(&self) -> bool {
         matches!(self.after, Some(Node::File { .. })) && (self.before != self.after || self.detach)
+    }
+
+    pub(crate) fn needs_blob(&self) -> bool {
+        self.replaces_file() && !self.local_config
     }
 
     pub(crate) fn hardlink_target(&self) -> Option<&str> {
@@ -627,6 +651,7 @@ fn stage_config(
                     before,
                     after: Some(after),
                     detach: false,
+                    local_config: false,
                 },
             );
         }
@@ -642,6 +667,7 @@ fn stage_config(
             before: None,
             after: Some(node.clone()),
             detach: false,
+            local_config: false,
         },
     );
     Ok(())
@@ -651,7 +677,7 @@ pub(crate) fn payloads(writes: &[Write]) -> BTreeMap<&str, &Node> {
     writes
         .iter()
         .filter_map(|write| match &write.after {
-            Some(node @ Node::File { sha256, .. }) if write.replaces_file() => {
+            Some(node @ Node::File { sha256, .. }) if write.needs_blob() => {
                 Some((sha256.as_str(), node))
             }
             _ => None,

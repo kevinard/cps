@@ -1420,6 +1420,112 @@ fn interrupt_apply(root: &Path, saved: &Path, plan: &Plan) -> Result<()> {
 }
 
 #[test]
+fn reconciles_preserved_config_metadata_atomically() -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use crate::{fetch_plan, list_config_updates};
+
+    const LOCAL: &str = "administrator setting";
+    const ATTRIBUTE: &str = "user.cps-test";
+    let f = Fixture::new()?;
+    let package = |version: &str, mode: &str| {
+        f.package(
+            "desktop/settings",
+            version,
+            f.file(CONFIG, "vendor setting", mode, "preserve=#true")?,
+        )
+    };
+    package("1.0.0-0", "0644")?;
+    f.create()?;
+    let initial = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/settings".into()],
+        },
+    )?;
+    apply(&f.root, &initial)?;
+    let config = f.root.join(CONFIG);
+    fs::write(&config, LOCAL)?;
+    rustix::fs::setxattr(
+        &config,
+        ATTRIBUTE,
+        b"local annotation",
+        rustix::fs::XattrFlags::empty(),
+    )?;
+    let alias = f._dir.path().join("outside-image");
+    fs::hard_link(&config, &alias)?;
+    let mode =
+        |path: &Path| -> Result<u32> { Ok(fs::metadata(path)?.permissions().mode() & 0o777) };
+    let check_local_config = || -> Result<()> {
+        assert_eq!(mode(&config)?, 0o600);
+        assert_eq!(fs::read_to_string(&config)?, LOCAL);
+        let mut attribute = [0; 32];
+        let len = rustix::fs::getxattr(&config, ATTRIBUTE, &mut attribute[..])?;
+        assert_eq!(&attribute[..len], b"local annotation");
+        Ok(())
+    };
+
+    package("2.0.0-0", "0600")?;
+    let upgrade = plan(&f.root, Request::Update)?;
+    assert!(
+        upgrade
+            .summary()
+            .contains(&format!("Set package metadata on local config {CONFIG}"))
+    );
+    assert_eq!(fetch_plan(&f.root, &upgrade)?, 1);
+    fs::write(&config, "changed after planning")?;
+    assert!(
+        apply(&f.root, &upgrade)
+            .unwrap_err()
+            .to_string()
+            .contains("saved plan differs")
+    );
+    assert_eq!(mode(&alias)?, 0o644);
+    fs::write(&config, LOCAL)?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("upgrade.json"),
+        &upgrade,
+        CONFIG,
+    )?;
+    check_local_config()?;
+    assert_ne!(fs::metadata(&config)?.ino(), fs::metadata(&alias)?.ino());
+    assert_eq!(mode(&alias)?, 0o644);
+    assert_eq!(fs::read_to_string(&alias)?, LOCAL);
+    assert!(
+        !f.root
+            .join(".cps/stage")
+            .join(digest(LOCAL.as_bytes()))
+            .exists()
+    );
+
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert_eq!(apply(&f.root, &upgrade)?, 2);
+    assert_eq!(apply(&f.root, &upgrade)?, 2);
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    let updates = list_config_updates(&f.root)?;
+    assert_eq!(updates.len(), 1);
+    assert!(updates[0].vendor_available);
+    assert_eq!(mode(&f.root.join(&updates[0].vendor_copy))?, 0o600);
+
+    // Images upgraded before this fix can restore the installed mode offline.
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o640))?;
+    assert!(verify(&f.root)?.iter().any(|finding| finding.is_error));
+    let repair = plan(
+        &f.root,
+        Request::Repair {
+            packages: vec!["desktop/settings".into()],
+        },
+    )?;
+    assert_eq!(fetch_plan(&f.root, &repair)?, 0);
+    assert_eq!(apply(&f.root, &repair)?, 3);
+    check_local_config()?;
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+    assert!(list_config_updates(&f.root)?[0].vendor_available);
+    Ok(())
+}
+
+#[test]
 fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
     use crate::{ConfigChoice, fetch_plan, list_config_updates, stage_boot_environment};
 

@@ -17,8 +17,8 @@ use crate::{
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
-        Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, digest, digest_reader,
-        validate_digest, validate_name, validate_publisher,
+        Action, FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, copy_payload, digest,
+        digest_reader, validate_digest, validate_name, validate_publisher,
     },
     systemd::{self, Action as SystemdAction},
 };
@@ -1245,25 +1245,7 @@ pub fn stage_blob(repo: &Path, node: &Node, destination: &mut File) -> Result<()
     let source = Root::open(repo)?
         .file(&format!("blobs/{sha256}"))
         .with_context(|| format!("opening repository payload {sha256}"))?;
-    copy_payload(source, node, destination)
-}
-
-pub(crate) fn copy_payload(source: File, node: &Node, destination: &mut File) -> Result<()> {
-    let Node::File { sha256, size, .. } = node else {
-        anyhow::bail!("expected a file payload");
-    };
-    ensure!(
-        source.metadata()?.len() == *size,
-        "payload length mismatch for {sha256}"
-    );
-    let copied = io::copy(&mut source.take(size.saturating_add(1)), destination)?;
-    ensure!(copied == *size, "payload length mismatch for {sha256}");
-    destination.rewind()?;
-    ensure!(
-        digest_reader(destination)? == *sha256,
-        "payload digest mismatch for {sha256}"
-    );
-    Ok(())
+    copy_payload(&source, node, destination)
 }
 
 pub fn canonical_repo(repo: &Path) -> Result<PathBuf> {

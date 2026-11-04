@@ -212,6 +212,9 @@ state=$("$bb" cat /etc/cps-vm-boot-state)
 if [ -f /etc/cps-vm.conf ]; then
     printf 'CPS_VM_CONFIG: %s %s\n' "$state" "$("$bb" cat /etc/cps-vm.conf)"
 fi
+if [ -f /etc/cps-vm-policy.conf ]; then
+    printf 'CPS_VM_POLICY: %s %s\n' "$state" "$("$bb" cat /etc/cps-vm-policy.conf)"
+fi
 if [ -f /etc/cps-vm-assert-merged-usr ]; then
     for path in /bin /sbin /lib /lib64 /usr/sbin /usr/lib64; do [ -L "$path" ]; done
     [ /bin/busybox -ef /usr/bin/busybox ]

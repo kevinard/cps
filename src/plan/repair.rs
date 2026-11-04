@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, ensure};
 
-use super::{Write, requested_names};
+use super::{Write, config::with_vendor_metadata, requested_names};
 use crate::{
     image::{State, root::Root},
     model::Node,
@@ -60,6 +60,21 @@ pub(super) fn writes(
                 "config type changed at {path}"
             );
             preserved.push(path.to_owned());
+            if let Some(after) = before
+                .as_ref()
+                .and_then(|local| with_vendor_metadata(local, &managed.node))
+            {
+                writes.insert(
+                    path.to_owned(),
+                    Write {
+                        path: path.to_owned(),
+                        before,
+                        after: Some(after),
+                        detach: false,
+                        local_config: true,
+                    },
+                );
+            }
             continue;
         }
         if managed.node.is_dir() {
@@ -84,6 +99,7 @@ pub(super) fn writes(
                 before,
                 after: Some(managed.node.clone()),
                 detach: false,
+                local_config: false,
             },
         );
     }

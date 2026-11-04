@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    io::Read,
+    fs::File,
+    io::{self, Read, Seek},
     str::FromStr,
 };
 
@@ -344,6 +345,24 @@ impl Node {
             _ => None,
         }
     }
+}
+
+pub(crate) fn copy_payload(source: &File, node: &Node, destination: &mut File) -> Result<()> {
+    let Node::File { sha256, size, .. } = node else {
+        bail!("expected a file payload");
+    };
+    ensure!(
+        source.metadata()?.len() == *size,
+        "payload length mismatch for {sha256}"
+    );
+    let copied = io::copy(&mut source.take(size.saturating_add(1)), destination)?;
+    ensure!(copied == *size, "payload length mismatch for {sha256}");
+    destination.rewind()?;
+    ensure!(
+        digest_reader(destination)? == *sha256,
+        "payload digest mismatch for {sha256}"
+    );
+    Ok(())
 }
 
 fn parse_mode(mode: &str) -> Result<u32> {

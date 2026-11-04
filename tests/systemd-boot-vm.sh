@@ -183,7 +183,7 @@ openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 
 publish_state() {
     local version=$1 state=$2
-    local dependency= config_action=
+    local dependency= config_action= policy_mode=0644
     if [[ $mode == rollback ]]; then
         case $state in
             previous) dependency='    require "test/legacy-marker"' ;;
@@ -193,6 +193,9 @@ publish_state() {
     if [[ $recycle == 1 ]]; then
         printf 'vendor-%s\n' "$version" > proto/etc/cps-vm.conf
         config_action="    file \"etc/cps-vm.conf\" mode=\"0644\" uid=$(id -u) gid=$(id -g) preserve=#true"
+        printf 'vendor-policy\n' > proto/etc/cps-vm-policy.conf
+        if [[ $state == recycled ]]; then policy_mode=0600; fi
+        config_action+=$'\n'"    file \"etc/cps-vm-policy.conf\" mode=\"$policy_mode\" uid=$(id -u) gid=$(id -g) preserve=#true"
     fi
     if [[ -n $kernel_fixture ]]; then
         case $state in
@@ -627,6 +630,7 @@ fi
 
 if [[ $recycle == 1 ]]; then
     printf 'administrator-setting\n' > staged/etc/cps-vm.conf
+    printf 'administrator-policy\n' > staged/etc/cps-vm-policy.conf
 fi
 "$cps" boot-env export --receipt --root staged --output staged.ext4 --size-mib "$root_mib" > staged.kdl
 test "$(sha256sum base.ext4)" = "$base_payload"
@@ -871,11 +875,17 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             recycled_id=${result#Staged }
             recycled_id=${recycled_id%% at *}
             test "$(cat recycled/etc/cps-vm.conf)" = administrator-setting
+            test "$(cat recycled/etc/cps-vm-policy.conf)" = administrator-policy
+            test "$(stat -c %a staged/etc/cps-vm-policy.conf)" = 644
+            test "$(stat -c %a recycled/etc/cps-vm-policy.conf)" = 600
             "$cps" config list --root recycled | tee config-review.log
             grep -Fq '"etc/cps-vm.conf"' config-review.log
             "$cps" plan --root recycled --output config-review.json \
                 resolve-config etc/cps-vm.conf --take vendor
             "$cps" apply --root recycled config-review.json
+            "$cps" plan --root recycled --output policy-review.json \
+                resolve-config etc/cps-vm-policy.conf --take local
+            "$cps" apply --root recycled policy-review.json
             test "$("$cps" config list --root recycled)" = 'No pending configuration updates'
             "$cps" boot-env export --receipt --root recycled --output recycled.ext4 \
                 --size-mib "$root_mib" > recycled.kdl
@@ -901,6 +911,8 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$recycled_boots" = $'CPS_VM_BOOT: recycled blessed\nCPS_VM_BOOT: recycled default'
             configs=$(tr -d '\r' < recycled-boot.log | grep '^CPS_VM_CONFIG: ')
             test "$configs" = $'CPS_VM_CONFIG: recycled vendor-3.0.0-0\nCPS_VM_CONFIG: recycled vendor-3.0.0-0'
+            policies=$(tr -d '\r' < recycled-boot.log | grep '^CPS_VM_POLICY: ')
+            test "$policies" = $'CPS_VM_POLICY: recycled administrator-policy\nCPS_VM_POLICY: recycled administrator-policy'
             "$cps" boot-env list --disk recycled.raw --esp-partuuid "$esp_uuid" | tee recycled-blessed.log
             assert_default "$recycled_id" "$base_uuid" "$trial_release" recycled-blessed.log
             result=$("$cps" boot-env rollback --disk recycled.raw --esp-partuuid "$esp_uuid" \
@@ -911,6 +923,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities ]]; then
             test "$(tr -d '\r' < recycled-rollback.log | grep '^CPS_VM_BOOT: ')" = 'CPS_VM_BOOT: trial default'
             tr -d '\r' < recycled-rollback.log | grep -Fx "CPS_VM_KERNEL: trial $trial_release"
             tr -d '\r' < recycled-rollback.log | grep -Fx 'CPS_VM_CONFIG: trial administrator-setting'
+            tr -d '\r' < recycled-rollback.log | grep -Fx 'CPS_VM_POLICY: trial administrator-policy'
             printf '%s\nVerified the recycled slot and rolled back to the preceding root\n' "$recycled_boots"
         fi
     fi

@@ -57,10 +57,12 @@ selected installed packages, or omit the names to check all installed packages.
 Apply the saved plan with `cps apply --root image repair.json`. CPS restores
 managed files, symlinks, and missing directories from the installed manifests.
 It restores ownership and permissions on explicit directories in place.
-File payloads come from the configured local repository or cache and are checked
-against the installed digests before any writes. Repair preserves edited or
-removed configuration files declared with `preserve=#true`. Resolve path type
-conflicts involving directories or special files before retrying the plan.
+Package payloads come from the configured local repository or cache and are
+checked against the installed digests before any writes. Repair keeps local
+edits and deletions on files declared with `preserve=#true` and restores the
+installed permissions and ownership of files that are present. A repair that
+only fixes preserved configuration metadata works offline. Resolve path
+type conflicts involving directories or special files before retrying the plan.
 
 ## Generating a manifest from a prototype
 
@@ -577,6 +579,12 @@ Run `cargo test` for the desktop upgrade and interruption test.
 
 ### Reviewing configuration updates
 
+When package permissions or ownership change on an edited file, CPS
+publishes a new inode with the local contents and the package metadata.
+It copies extended attributes before applying permissions, so the POSIX
+ACL mask follows the new mode. Existing hard-link aliases retain their
+original inode. [Linux access control lists](https://man7.org/linux/man-pages/man5/acl.5.html)
+
 When an upgrade keeps an edited or locally removed file and stages new
 vendor defaults, `cps config list` shows the pending file and its vendor
 copy. Compare the two copies or merge changes by editing the local file.
@@ -850,8 +858,9 @@ containing their indexed `lib/modules` trees.
 
 Set `CPS_VM_RECYCLE_SLOT=1` with `rollback` to stage and bless a second
 upgrade on the original root slot, then roll it back to the first upgrade.
-The scenario keeps an administrator edit while staging, accepts the vendor
-copy before activation, and checks both settings in the guest across rollback.
+The scenario accepts a vendor copy for one setting and keeps another
+administrator edit with tighter permissions. It checks both settings in
+the guest across rollback.
 
 Set `CPS_VM_RELEASE_PROFILE=1` in the rollback test to assemble the roots from
 a signed release profile. Use a current CPS build on the host and provide the

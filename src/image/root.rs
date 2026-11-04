@@ -1,16 +1,20 @@
 use std::{
+    ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{Read, Write},
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    io::{Read, Seek, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
+    },
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
 use rustix::{
     fs::{
-        AtFlags, CWD, FileType, Mode, OFlags, ResolveFlags, Stat, chownat, fchmod, fchown, fstat,
-        linkat, listxattr, mkdirat, open, openat2, readlinkat, renameat, statat, symlinkat,
-        unlinkat,
+        AtFlags, CWD, FileType, Mode, OFlags, ResolveFlags, Stat, XattrFlags, chownat, fchmod,
+        fchown, fgetxattr, flistxattr, fremovexattr, fsetxattr, fstat, linkat, listxattr, mkdirat,
+        open, openat2, readlinkat, renameat, statat, symlinkat, unlinkat,
     },
     io::Errno,
     process::{Gid, Uid},
@@ -18,10 +22,15 @@ use rustix::{
 
 use crate::{
     file_caps::{ATTRIBUTE, FileCapabilities},
-    model::{Node, digest_reader, validate_path},
+    model::{Node, copy_payload, digest_reader, validate_path},
 };
 
 pub struct Root(File);
+
+pub(crate) enum ReplacementSource<'a> {
+    Staged(File),
+    LocalConfig(&'a Node),
+}
 
 impl Root {
     pub fn open(path: &Path) -> Result<Self> {
@@ -248,7 +257,7 @@ impl Root {
         &self,
         path: &str,
         node: &Node,
-        payload: Option<File>,
+        payload: Option<ReplacementSource<'_>>,
         staging: &File,
     ) -> Result<()> {
         validate_path(path)?;
@@ -274,12 +283,19 @@ impl Root {
                 let temp = openat2(
                     staging,
                     TEMP,
-                    OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+                    OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
                     Mode::RUSR | Mode::WUSR,
                     ResolveFlags::NO_SYMLINKS,
                 )?;
                 let mut temp = File::from(temp);
-                std::io::copy(&mut payload.context("missing staged payload")?, &mut temp)?;
+                match payload.context("missing file payload")? {
+                    ReplacementSource::Staged(mut file) => {
+                        std::io::copy(&mut file, &mut temp)?;
+                    }
+                    ReplacementSource::LocalConfig(before) => {
+                        self.copy_local_config(path, before, node, &mut temp)?;
+                    }
+                }
                 temp.flush()?;
                 Self::set_file_metadata(&temp, node)
                     .with_context(|| format!("preparing file metadata for {path}"))?;
@@ -311,7 +327,9 @@ impl Root {
                 }
             }
             Node::Hardlink { .. } => {
-                let source = payload.context("missing verified hard link target")?;
+                let Some(ReplacementSource::Staged(source)) = payload else {
+                    anyhow::bail!("missing verified hard link target");
+                };
                 // Link the checked descriptor, so the target path cannot be
                 // substituted between verification and materialization.
                 linkat(
@@ -327,6 +345,39 @@ impl Root {
         renameat(staging, TEMP, &parent, leaf)?;
         parent.sync_all()?;
         staging.sync_all()?;
+        Ok(())
+    }
+
+    fn copy_local_config(
+        &self,
+        path: &str,
+        before: &Node,
+        after: &Node,
+        temp: &mut File,
+    ) -> Result<()> {
+        let mut source = self.file(path)?;
+        let original = source.metadata()?;
+        ensure!(
+            before.capabilities().is_none() && after.capabilities().is_none(),
+            "unexpected file capabilities on preserved config {path}"
+        );
+        ensure!(
+            file_node(&source)? == *before,
+            "local configuration changed at {path}; pending transaction retained"
+        );
+        source.rewind()?;
+        copy_payload(&source, after, temp)
+            .with_context(|| format!("copying the local configuration at {path}"))?;
+        copy_config_xattrs(&source, temp)
+            .with_context(|| format!("preserving extended attributes at {path}"))?;
+        let current = source.metadata()?;
+        ensure!(
+            (original.ctime(), original.ctime_nsec()) == (current.ctime(), current.ctime_nsec())
+                && self.shares_inode(path, &source)?,
+            "local configuration changed at {path}; pending transaction retained"
+        );
+        // The caller sets the final mode after copying the ACL, so Linux
+        // adjusts the ACL mask to match the package's permissions.
         Ok(())
     }
 
@@ -462,6 +513,50 @@ fn file_node(file: &File) -> Result<Node> {
         gid: metadata.gid(),
         capabilities: FileCapabilities::read(file)?,
     })
+}
+
+fn xattr_names(file: &File) -> Result<Vec<OsString>> {
+    let mut names = vec![0; XATTR_LIMIT];
+    let len = match flistxattr(file, &mut names[..]) {
+        Ok(len) => len,
+        Err(Errno::NOTSUP) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(names[..len]
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| OsStr::from_bytes(name).to_owned())
+        .collect())
+}
+
+// Linux limits both xattr lists and individual values to 64 KiB.
+const XATTR_LIMIT: usize = 64 * 1024;
+
+fn copy_config_xattrs(source: &File, destination: &File) -> Result<()> {
+    let names = xattr_names(source)?;
+    ensure!(
+        !names.iter().any(|name| name == ATTRIBUTE),
+        "unexpected file capabilities on preserved configuration"
+    );
+    for name in xattr_names(destination)? {
+        if !names.contains(&name) {
+            fremovexattr(destination, &name)?;
+        }
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut value = vec![0; XATTR_LIMIT];
+    let mut inherited = vec![0; XATTR_LIMIT];
+    for name in names {
+        let len = fgetxattr(source, &name, &mut value[..])?;
+        let equal = fgetxattr(destination, &name, &mut inherited[..])
+            .is_ok_and(|existing| existing == len && inherited[..existing] == value[..len]);
+        if !equal {
+            fsetxattr(destination, &name, &value[..len], XattrFlags::empty())?;
+        }
+    }
+    Ok(())
 }
 
 fn set_metadata(file: &File, mode: u32, uid: u32, gid: u32) -> Result<()> {

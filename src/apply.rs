@@ -11,10 +11,13 @@ use tempfile::NamedTempFile;
 
 use crate::{
     boot::kernel::Artifacts,
-    image::{Image, Managed, Publisher, State, root::Root},
-    model::{Node, digest_reader},
+    image::{
+        Image, Managed, Publisher, State,
+        root::{ReplacementSource, Root},
+    },
+    model::{Node, copy_payload, digest_reader},
     plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads},
-    repo::{copy_payload, release::fetch_payloads, stage_blob},
+    repo::{release::fetch_payloads, stage_blob},
     systemd::{self, Action as SystemdAction},
     verify::verify_state,
 };
@@ -248,12 +251,22 @@ fn write_files(
         match &write.after {
             Some(node) => {
                 let payload = match node {
-                    Node::File { .. } => Some(checked_payload(root, node)?),
-                    Node::Hardlink { .. } => Some(
+                    Node::File { .. } if write.local_config => {
+                        Some(ReplacementSource::LocalConfig(
+                            write
+                                .before
+                                .as_ref()
+                                .context("missing local configuration")?,
+                        ))
+                    }
+                    Node::File { .. } => {
+                        Some(ReplacementSource::Staged(checked_payload(root, node)?))
+                    }
+                    Node::Hardlink { .. } => Some(ReplacementSource::Staged(
                         link_source
                             .context("missing hard link target")?
                             .try_clone()?,
-                    ),
+                    )),
                     _ => None,
                 };
                 root.replace(&write.path, node, payload, stage)?;
@@ -287,7 +300,7 @@ fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> 
     }
     if let Some((path, node @ Node::File { sha256, .. })) = plan.config_payload() {
         let mut file = NamedTempFile::new_in(&dir)?;
-        copy_payload(root.file(&path)?, node, file.as_file_mut())
+        copy_payload(&root.file(&path)?, node, file.as_file_mut())
             .with_context(|| format!("staging vendor configuration {path}"))?;
         file.as_file().sync_all()?;
         file.persist_noclobber(dir.join(sha256))?;
@@ -312,7 +325,7 @@ fn payload_sources<'a>(
     let mut seen = std::collections::BTreeSet::new();
     let mut by_publisher = BTreeMap::<_, BTreeMap<_, _>>::new();
     let config_updates = config_update_prefix(state.settings.revision);
-    for write in writes.iter().filter(|write| write.replaces_file()) {
+    for write in writes.iter().filter(|write| write.needs_blob()) {
         let Some(node @ Node::File { sha256, .. }) = &write.after else {
             unreachable!("only file replacements require a payload");
         };

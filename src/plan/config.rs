@@ -99,8 +99,37 @@ pub(super) fn resolve(
             before,
             after,
             detach: false,
+            local_config: false,
         },
     ))
+}
+
+pub(super) fn file_metadata(node: &Node) -> Option<(u32, u32, u32)> {
+    match node {
+        Node::File { mode, uid, gid, .. } => Some((*mode, *uid, *gid)),
+        _ => None,
+    }
+}
+
+pub(super) fn with_vendor_metadata(local: &Node, vendor: &Node) -> Option<Node> {
+    let Node::File {
+        sha256,
+        size,
+        capabilities: None,
+        ..
+    } = local
+    else {
+        return None;
+    };
+    let (mode, uid, gid) = file_metadata(vendor)?;
+    (file_metadata(local) != Some((mode, uid, gid))).then(|| Node::File {
+        sha256: sha256.clone(),
+        size: *size,
+        mode,
+        uid,
+        gid,
+        capabilities: None,
+    })
 }
 
 fn updates(
