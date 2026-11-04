@@ -1,3 +1,4 @@
+pub(crate) mod publishers;
 pub(crate) mod root;
 
 use std::{
@@ -27,12 +28,18 @@ pub struct Settings {
     pub format: u32,
     pub id: String,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "publisher_generation_is_initial")]
+    pub publisher_generation: u64,
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
     pub uid: u32,
     pub gid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_parent: Option<BootParent>,
+}
+
+pub(crate) fn publisher_generation_is_initial(generation: &u64) -> bool {
+    *generation == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -229,6 +236,7 @@ fn initialize(
         format: FORMAT,
         id: id.clone(),
         revision: 0,
+        publisher_generation: 0,
         arch: arch.to_owned(),
         facets,
         uid: geteuid().as_raw(),
@@ -352,11 +360,15 @@ impl Image {
             .transpose()
     }
 
-    pub fn state(&self) -> Result<State> {
+    pub(crate) fn settings(&self) -> Result<Settings> {
         let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
         ensure!(settings.format == FORMAT, "unsupported image format");
+        Ok(settings)
+    }
+
+    pub fn state(&self) -> Result<State> {
         Ok(State {
-            settings,
+            settings: self.settings()?,
             publishers: self.publishers()?,
             installed: self.installed()?,
             paths: decode_rows(&self.db, "SELECT path, data FROM paths")?,
@@ -365,7 +377,7 @@ impl Image {
 
     pub fn fork_for_boot(&self, parent: BootParent) -> Result<Settings> {
         self.require_clean()?;
-        let mut settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
+        let mut settings = self.settings()?;
         ensure!(
             settings.id == parent.id && parent.revision.checked_add(1) == Some(settings.revision),
             "staged image does not descend from the requested base"

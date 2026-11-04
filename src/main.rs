@@ -11,9 +11,10 @@ use clap::{Parser, Subcommand};
 use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
-    apply, build_with_worker, create_configured_image, create_image, fetch_sources, import_sources,
-    list_boot_environments, plan, publish, publish_witnessed_bundle, read_attestation,
-    read_worker_config, release, rollback_boot_environment, stage_boot_environment, verify,
+    add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_sources,
+    import_sources, list_boot_environments, list_publishers, plan, prefer_publisher, publish,
+    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
+    rollback_boot_environment, stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -98,7 +99,12 @@ enum Command {
         #[arg(long, value_name = "NAME=BOOL")]
         facet: Vec<String>,
     },
-    /// List installed packages or versions in the configured signed catalog
+    /// Manage an image's ordered set of trusted publishers
+    Publisher {
+        #[command(subcommand)]
+        command: PublisherCommand,
+    },
+    /// List installed packages or versions in the configured signed catalogs
     List {
         #[arg(long)]
         root: PathBuf,
@@ -166,6 +172,37 @@ enum SourceCommand {
         #[arg(long)]
         from: PathBuf,
         recipe: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PublisherCommand {
+    /// Show configured publishers in search order
+    List {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Verify and append a publisher to the image's search order
+    Add {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        trust_key: PathBuf,
+        name: String,
+    },
+    /// Search this publisher first when selecting new packages
+    Prefer {
+        #[arg(long)]
+        root: PathBuf,
+        name: String,
+    },
+    /// Remove a publisher that has no installed packages
+    Remove {
+        #[arg(long)]
+        root: PathBuf,
+        name: String,
     },
 }
 
@@ -469,6 +506,24 @@ fn run(command: Command) -> Result<ExitCode> {
             };
             println!("Created image {id} at {}", root.display());
         }
+        Command::Publisher { command } => match command {
+            PublisherCommand::List { root } => {
+                println!("PUBLISHER\tREPOSITORY");
+                for publisher in list_publishers(&root)? {
+                    println!("{}\t{}", publisher.name, publisher.repository.display());
+                }
+            }
+            PublisherCommand::Add {
+                root,
+                repo,
+                trust_key,
+                name,
+            } => {
+                add_publisher(&root, &name, &repo, &trust_key)?;
+            }
+            PublisherCommand::Prefer { root, name } => prefer_publisher(&root, &name)?,
+            PublisherCommand::Remove { root, name } => remove_publisher(&root, &name)?,
+        },
         Command::List {
             root,
             available,

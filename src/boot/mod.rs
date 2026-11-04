@@ -47,11 +47,12 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
 
     let base = Image::open(&source, false)?;
     base.require_clean()?;
-    let settings = base.state()?.settings;
+    let settings = base.settings()?;
     ensure!(
         settings.id == plan.image && settings.revision == plan.base_revision,
         "plan does not match the base image and revision"
     );
+    plan.check_publisher_generation(&settings)?;
     let previous = BootParent {
         id: settings.id,
         revision: settings.revision,

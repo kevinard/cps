@@ -68,6 +68,7 @@ pub(crate) fn apply_with(
             plan.base_revision,
             state.settings.revision
         );
+        plan.check_publisher_generation(&state.settings)?;
         let (checked, next) = build(
             &image.root,
             state,

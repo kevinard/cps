@@ -217,6 +217,15 @@ changing the image. [IPS publisher search order and stickiness](https://docs.ora
 name. Use `list --available --all-versions` to see every publisher's catalog
 entries, or a full package ID with `info --available` to inspect a particular one.
 
+On an existing image, use `publisher list` to inspect search order.
+`publisher add --root image --repo /var/lib/cps/extras --trust-key extras.der extras`
+verifies the signed catalog before appending it. Use
+`publisher prefer --root image extras` to move it to the front.
+`publisher remove --root image extras` requires that no installed package
+comes from that publisher and at least one publisher remains.
+These changes invalidate outstanding plans for the image and preserve its
+boot environment identity. They are local to the named image root.
+
 ## Manifest and image behavior
 
 - Manifests and image configuration use KDL 2 and begin with `schema-version 1`. Paths in image configuration resolve relative to the configuration file. It also accepts `architecture "x86_64"` and `facet "doc.man" #false`. Convert old TOML recipes before publishing new versions. Existing JSON manifest objects stay readable under their original digests.

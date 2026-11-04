@@ -264,6 +264,12 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
         &primary._dir.path().join("update.json"),
         &update,
     )?;
+    assert!(
+        crate::prefer_publisher(&primary.root, "extras")
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete transaction")
+    );
     let base_offline = primary.repo.with_extension("offline");
     let extra_offline = extra.repo.with_extension("offline");
     fs::rename(&primary.repo, &base_offline)?;
@@ -292,6 +298,98 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
         "extra plugin 2"
     );
     assert!(verify(&primary.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn publisher_changes_invalidate_plans_without_changing_boot_lineage() -> Result<()> {
+    use crate::{add_publisher, image::Image, list_publishers, prefer_publisher, remove_publisher};
+
+    let base = Fixture::new()?;
+    let extra = Fixture::new()?;
+    base.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        base.file(COMPOSITOR, "base", "0755", "")?,
+    )?;
+    extra.package_as(
+        "extras",
+        "desktop/plugin",
+        "1.0.0-0",
+        extra.file(PLUGIN, "extra", "0644", "")?,
+    )?;
+    base.create()?;
+    let plan_for = |request| plan(&base.root, request);
+    let install = |name: &str| Request::Install {
+        packages: vec![name.to_owned()],
+    };
+    apply(&base.root, &plan_for(install("desktop/compositor"))?)?;
+    let settings = |root| Image::open(root, false)?.settings();
+    let before = settings(&base.root)?;
+    let stale = plan_for(Request::Update)?;
+    assert!(add_publisher(&base.root, "extras", &extra.repo, &base.public).is_err());
+    assert_eq!(settings(&base.root)?, before);
+    add_publisher(&base.root, "extras", &extra.repo, &extra.public)?;
+    let order = || -> Result<Vec<String>> {
+        Ok(list_publishers(&base.root)?
+            .into_iter()
+            .map(|publisher| publisher.name)
+            .collect())
+    };
+    assert_eq!(order()?, ["canopa", "extras"]);
+    assert!(add_publisher(&base.root, "extras", &extra.repo, &extra.public).is_err());
+    assert!(
+        apply(&base.root, &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("publisher configuration changed")
+    );
+    let staged = base.root.with_extension("staged");
+    assert!(
+        crate::stage_boot_environment(&base.root, &staged, &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("publisher configuration changed")
+    );
+    assert!(!staged.exists());
+
+    prefer_publisher(&base.root, "extras")?;
+    assert_eq!(order()?, ["extras", "canopa"]);
+    let fresh = plan_for(install("desktop/plugin"))?;
+    prefer_publisher(&base.root, "extras")?;
+    let current = settings(&base.root)?;
+    assert_eq!(
+        current.publisher_generation,
+        before.publisher_generation + 2
+    );
+    assert_eq!(current.id, before.id);
+    assert_eq!(current.revision, before.revision);
+    crate::stage_boot_environment(&base.root, &staged, &fresh)?;
+    assert!(!base.root.join(PLUGIN).exists());
+    assert_eq!(fs::read_to_string(staged.join(PLUGIN))?, "extra");
+    let staged_settings = settings(&staged)?;
+    let parent = staged_settings
+        .boot_parent
+        .expect("staged image has a parent");
+    assert_eq!(parent.id, before.id);
+    assert_eq!(parent.revision, before.revision);
+    assert!(
+        remove_publisher(&staged, "extras")
+            .unwrap_err()
+            .to_string()
+            .contains("desktop/plugin is installed")
+    );
+    fs::rename(&extra.repo, extra.repo.with_extension("offline"))?;
+    remove_publisher(&base.root, "extras")?;
+    assert_eq!(order()?, ["canopa"]);
+    assert!(
+        remove_publisher(&base.root, "canopa")
+            .unwrap_err()
+            .to_string()
+            .contains("last publisher")
+    );
+    assert!(verify(&base.root)?.is_empty());
+    assert!(verify(&staged)?.is_empty());
     Ok(())
 }
 

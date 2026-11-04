@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     boot::kernel::{self, Artifacts},
-    image::{Image, Settings, State, root::Root},
+    image::{Image, Settings, State, publisher_generation_is_initial, root::Root},
     model::{FORMAT, Node, digest, validate_name},
     systemd::{self, Action as SystemdAction},
 };
@@ -71,6 +71,8 @@ pub struct Plan {
     pub(crate) solver: Option<SolverRevision>,
     pub(crate) image: String,
     pub(crate) base_revision: u64,
+    #[serde(default, skip_serializing_if = "publisher_generation_is_initial")]
+    publisher_generation: u64,
     pub(crate) catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
@@ -139,6 +141,14 @@ impl Plan {
     pub(crate) fn id(&self) -> Result<String> {
         ensure!(self.format == FORMAT, "unsupported plan format");
         Ok(digest(&serde_json::to_vec(self)?))
+    }
+
+    pub(crate) fn check_publisher_generation(&self, settings: &Settings) -> Result<()> {
+        ensure!(
+            self.publisher_generation == settings.publisher_generation,
+            "publisher configuration changed after this plan was saved; generate a new plan"
+        );
+        Ok(())
     }
 }
 
@@ -222,6 +232,7 @@ pub(crate) fn build(
         solver,
         image: state.settings.id.clone(),
         base_revision: state.settings.revision,
+        publisher_generation: state.settings.publisher_generation,
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
         request,
