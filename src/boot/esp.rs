@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::Seek,
-    os::unix::fs::{FileExt, OpenOptionsExt},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -12,7 +12,7 @@ use rustix::process::geteuid;
 use super::{
     Activation, BootEnvironment, artifact_helper,
     deploy::{DiskStage, OfflineDisk, PartitionExtent},
-    list_boot_environments,
+    list_boot_environments, source_date_epoch,
     systemd_boot::{self, Deployment, RetiredEntry, RootDeployment},
 };
 use crate::model::digest_reader;
@@ -22,6 +22,7 @@ const MAX_ESP_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const FAT32_BOOT_FLAGS: usize = 65;
 const FAT_DIRTY: u8 = 0x01;
+const FAT_EPOCH: u32 = 315532800; // 1980-01-01 00:00:00 UTC
 
 /// Read the boot inventory from the EFI System Partition of an offline disk.
 pub fn list_boot_environments_on_disk(
@@ -30,7 +31,7 @@ pub fn list_boot_environments_on_disk(
 ) -> Result<Vec<BootEnvironment>> {
     let disk = OfflineDisk::open(disk)?;
     let temp = tempfile::tempdir()?;
-    let esp = Esp::read(&disk, disk.esp(esp_partuuid)?, temp.path())?;
+    let esp = Esp::read(&disk, disk.esp(esp_partuuid)?, temp.path(), None)?;
     list_boot_environments(&esp.tree)
 }
 
@@ -76,9 +77,10 @@ fn activate_disk(
     output: &Path,
     install: Option<RootDeployment<'_>>,
 ) -> Result<String> {
+    let epoch = source_date_epoch()?;
     let stage = DiskStage::new(disk, output)?;
     let partition = stage.disk.esp(esp_partuuid)?;
-    let esp = Esp::read(&stage.disk, partition, &stage.directory())?;
+    let esp = Esp::read(&stage.disk, partition, &stage.directory(), epoch)?;
     esp.read_boot_files()?;
     let deployment = Deployment {
         disk: &stage.disk,
@@ -106,9 +108,10 @@ pub fn rollback_boot_environment_on_disk(
     id: Option<&str>,
     output: &Path,
 ) -> Result<String> {
+    let epoch = source_date_epoch()?;
     let stage = DiskStage::new(disk, output)?;
     let partition = stage.disk.esp(esp_partuuid)?;
-    let esp = Esp::read(&stage.disk, partition, &stage.directory())?;
+    let esp = Esp::read(&stage.disk, partition, &stage.directory(), epoch)?;
     esp.read_boot_files()?;
     let id = systemd_boot::rollback(&esp.tree, id, Some(&stage.disk))?;
     esp.write(&stage.disk, partition, ["loader/loader.conf"])?;
@@ -119,6 +122,7 @@ pub fn rollback_boot_environment_on_disk(
 struct Esp {
     work: PathBuf,
     tree: PathBuf,
+    epoch: Option<u32>,
 }
 
 struct FatEntry {
@@ -127,7 +131,12 @@ struct FatEntry {
 }
 
 impl Esp {
-    fn read(disk: &OfflineDisk, partition: &PartitionExtent, work: &Path) -> Result<Self> {
+    fn read(
+        disk: &OfflineDisk,
+        partition: &PartitionExtent,
+        work: &Path,
+        epoch: Option<u32>,
+    ) -> Result<Self> {
         ensure!(
             partition.bytes <= MAX_ESP_BYTES,
             "EFI partition exceeds 1 GiB"
@@ -144,6 +153,8 @@ impl Esp {
         let esp = Self {
             work: work.to_owned(),
             tree,
+            // FAT timestamps start in 1980 and have two-second resolution.
+            epoch: epoch.map(|epoch| epoch.max(FAT_EPOCH) & !1),
         };
         esp.clear_fat32_dirty_flag()?;
         esp.check()?;
@@ -389,17 +400,24 @@ impl Esp {
             .path()
             .file_name()
             .context("missing EFI verification filename")?;
-        let status = self
-            .fat_command("mcopy", &["-o"])?
-            .arg(&target)
-            .arg(filename)
-            .status()?;
+        let mut read_back = self.fat_command("mcopy", &["-o"])?;
+        if self.epoch.is_some() {
+            read_back.arg("-m");
+        }
+        let status = read_back.arg(&target).arg(filename).status()?;
         ensure!(
             status.success(),
             "mcopy could not read back EFI file {path} ({status})"
         );
+        let checked = File::open(verify.path())?;
+        if let Some(epoch) = self.epoch {
+            ensure!(
+                checked.metadata()?.mtime() == i64::from(epoch),
+                "mcopy did not apply SOURCE_DATE_EPOCH to EFI file {path}"
+            );
+        }
         ensure!(
-            digest_reader(File::open(verify.path())?)? == digest_reader(File::open(source)?)?,
+            digest_reader(checked)? == digest_reader(File::open(source)?)?,
             "the written EFI file {path} differs from its staged contents"
         );
         Ok(())
@@ -454,6 +472,11 @@ impl Esp {
             .env("MTOOLSRC", "/dev/null")
             .args(flags)
             .args(["-i", FAT]);
+        if let Some(epoch) = self.epoch {
+            command
+                .env("SOURCE_DATE_EPOCH", epoch.to_string())
+                .env("TZ", "UTC");
+        }
         Ok(command)
     }
 }

@@ -6,6 +6,7 @@ pub(crate) mod kernel;
 mod systemd_boot;
 
 use std::{
+    env::{self, VarError},
     ffi::OsStr,
     fs::{self, File},
     os::unix::fs::MetadataExt,
@@ -151,6 +152,18 @@ fn entry_id(image: &str, revision: u64) -> String {
 fn root_label(revision: u64) -> String {
     // A full revision fits in the 16 bytes available for an ext4 label.
     format!("{revision:016x}")
+}
+
+fn source_date_epoch() -> Result<Option<u32>> {
+    match env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => {
+            let message = "SOURCE_DATE_EPOCH must be a decimal timestamp from 0 to 4294967295";
+            ensure!(value.bytes().all(|byte| byte.is_ascii_digit()), "{message}");
+            Ok(Some(value.parse().context(message)?))
+        }
+        Err(VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).context("reading SOURCE_DATE_EPOCH"),
+    }
 }
 
 pub(crate) fn check_package_write_root(root: &Root) -> Result<()> {

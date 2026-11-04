@@ -1091,6 +1091,13 @@ caller can set `CPS_ESP_TOOLS_DIR` to the absolute path of a trusted tool
 directory. Use `activate --esp` for a detached ESP directory and
 `activate-device --esp` for a mounted ESP. [fsck.fat manual](https://man7.org/linux/man-pages/man8/fsck.fat.8.html)
 
+For repeatable offline activation and rollback, set `SOURCE_DATE_EPOCH`.
+CPS sets new and updated FAT entries to that time in UTC, rounds down to
+two-second precision, and uses January 1, 1980 for earlier epochs. It
+reads back the timestamps and contents of written files before publishing.
+Use the same source disk bytes, root export, command options, and mtools
+build to reproduce the output disk. [GNU mtools release history](https://github.com/vapier/mtools/blob/main/NEWS)
+
 For FAT32, CPS can clear a leftover dirty flag in its private copy
 when the primary and backup boot sectors otherwise agree. The copy still
 has to pass the read-only FAT check.

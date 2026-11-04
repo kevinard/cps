@@ -1,5 +1,4 @@
 use std::{
-    env::{self, VarError},
     fs::{self, OpenOptions},
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::Path,
@@ -13,7 +12,7 @@ use rustix::{
 };
 
 use super::{
-    artifact_helper, check_image_integrity, entry_id, kernel, root_label,
+    artifact_helper, check_image_integrity, entry_id, kernel, root_label, source_date_epoch,
     systemd_boot::canonical_partuuid,
 };
 use crate::{
@@ -202,16 +201,4 @@ fn export(
     .context("publishing the ext4 image")?;
     parent.as_file().sync_all()?;
     Ok((entry_id(&uuid, state.settings.revision), receipt))
-}
-
-fn source_date_epoch() -> Result<Option<u32>> {
-    match env::var("SOURCE_DATE_EPOCH") {
-        Ok(value) => {
-            let message = "SOURCE_DATE_EPOCH must be a decimal timestamp from 0 to 4294967295";
-            ensure!(value.bytes().all(|byte| byte.is_ascii_digit()), "{message}");
-            Ok(Some(value.parse().context(message)?))
-        }
-        Err(VarError::NotPresent) => Ok(None),
-        Err(error) => Err(error).context("reading SOURCE_DATE_EPOCH"),
-    }
 }

@@ -250,6 +250,17 @@ raw_activate base with-esp.raw "$base" bootable-base.raw --known-good --root-ima
 test "$(sha256sum with-esp.raw)" = "$original"
 assert_default bootable-base.raw "$base_id" known-good
 
+SOURCE_DATE_EPOCH=0 TZ=Pacific/Honolulu \
+    raw_activate base with-esp.raw "$base" reproducible-base.raw --known-good --root-image base.ext4
+sleep 2
+SOURCE_DATE_EPOCH=315532800 TZ=Asia/Tokyo \
+    raw_activate base with-esp.raw "$base" repeated-base.raw --known-good --root-image base.ext4
+cmp reproducible-base.raw repeated-base.raw
+TZ=UTC mdir -i reproducible-base.raw@@1048576 ::/loader/entries | grep -F '1980-01-01'
+SOURCE_DATE_EPOCH=invalid reject_raw 'SOURCE_DATE_EPOCH must be a decimal timestamp' \
+    raw_activate base with-esp.raw "$base" rejected.raw --known-good --root-image base.ext4
+test ! -e rejected.raw
+
 deploy bootable-base.raw staged.ext4 "$trial" deployed-trial.raw
 cp --sparse=always bootable-base.raw full-esp.raw
 free=$(mdir -i full-esp.raw@@1048576 ::/ | awk '/bytes free/ {sub(/bytes free/, ""); gsub(/[^0-9]/, ""); print}')
@@ -288,7 +299,9 @@ mren -i bootable-trial.raw@@1048576 \
     "::/loader/entries/$trial_id+2.conf" "::/loader/entries/$trial_id.conf"
 assert_default bootable-trial.raw "$trial_id" known-good
 before_rollback=$(sha256sum bootable-trial.raw)
-raw_rollback bootable-trial.raw rolled-back.raw
+SOURCE_DATE_EPOCH=1735689601 raw_rollback bootable-trial.raw rolled-back.raw
+SOURCE_DATE_EPOCH=1735689600 raw_rollback bootable-trial.raw repeated-rollback.raw
+cmp rolled-back.raw repeated-rollback.raw
 test "$(sha256sum bootable-trial.raw)" = "$before_rollback"
 assert_default rolled-back.raw "$base_id" known-good
 raw_list rolled-back.raw | grep -F "$trial_id"
@@ -324,9 +337,12 @@ test "$(sha256sum bootable-trial.raw)" = "$before_recycle"
 printf 'foreign file in retired directory\n' > unrelated
 mcopy -i bootable-trial.raw@@1048576 unrelated "::/EFI/cps/$base_id/keep"
 before_recycle=$(sha256sum bootable-trial.raw)
-recycled_id=$(raw_activate recycled bootable-trial.raw "$base" recycled.raw \
+recycled_id=$(SOURCE_DATE_EPOCH=1735689601 raw_activate recycled bootable-trial.raw "$base" recycled.raw \
     --root-image recycled.ext4 --replace "$base_id")
 recycled_id=${recycled_id#Activated }
+SOURCE_DATE_EPOCH=1735689600 raw_activate recycled bootable-trial.raw "$base" repeated-recycle.raw \
+    --root-image recycled.ext4 --replace "$base_id"
+cmp recycled.raw repeated-recycle.raw
 test "$(sha256sum bootable-trial.raw)" = "$before_recycle"
 cmp -n 1048576 bootable-trial.raw recycled.raw
 cmp -i "$((3 * 1024 * 1024)):0" -n "$((16 * 1024 * 1024))" recycled.raw recycled.ext4
@@ -358,3 +374,4 @@ reject_raw 'fsck.fat rejected the EFI partition' raw_list dirty.raw
 
 test -z "$(find . -maxdepth 1 -name '.cps-deploy-*' -print)"
 echo 'Verified activation and rollback update the same disk and preserve unrelated EFI files'
+echo 'Verified reproducible disk activation, rollback, and slot reuse'
