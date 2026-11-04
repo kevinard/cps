@@ -26,6 +26,8 @@ use super::{
     path_present, prepare_objects, read_catalog, read_key, read_limited, snapshot, write_atomic,
 };
 
+use crate::attestation::ATTESTATION_LIMIT;
+
 const ROOT_LIMIT: u64 = 1024 * 1024;
 const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
 const CHECKPOINT_FILES: [(&str, u64); 4] = [
@@ -257,6 +259,17 @@ async fn materialize(
     for (sha256, length) in release_blobs(&packages)? {
         fetch_object(verified, repo, "blobs", sha256, length, Some(length)).await?;
     }
+    for sha256 in catalog.attestations.values() {
+        fetch_object(
+            verified,
+            repo,
+            "attestations",
+            sha256,
+            ATTESTATION_LIMIT,
+            None,
+        )
+        .await?;
+    }
     write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)?;
     Ok(hash)
 }
@@ -380,6 +393,16 @@ pub fn export(repo: &Path, publisher: &str, trust_key: &Path, output: &Path) -> 
     }
     for (hash, length) in release_blobs(&release.packages)? {
         export_object(&root, stage.path(), "blobs", hash, length, Some(length))?;
+    }
+    for hash in release.attestations.values() {
+        export_object(
+            &root,
+            stage.path(),
+            "attestations",
+            hash,
+            ATTESTATION_LIMIT,
+            None,
+        )?;
     }
     write_atomic(
         &stage.path().join("current"),

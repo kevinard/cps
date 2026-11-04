@@ -11,7 +11,65 @@ use tough::{
 use url::Url;
 
 use super::*;
-use crate::release as mirror_release;
+use crate::{
+    attestation::{self, Toolchain},
+    kdl_format::{build, parse_manifest},
+    model::FileDigest,
+    publish_bundle, read_attestation, release as mirror_release,
+    repo::{read_key, read_signing_key, snapshot},
+};
+
+fn attach_evidence(fixture: &Fixture, catalog: &str) -> Result<(String, Vec<u8>)> {
+    let builder = Fixture::new()?;
+    let bundle = fixture._dir.path().join("bundle");
+    fs::create_dir_all(bundle.join("proto/usr/bin"))?;
+    let manifest_bytes = fs::read(&fixture.recipe)?;
+    let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
+    let recipe = format!(
+        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
+         toolchain \"{catalog}\" {{\n package \"desktop/compositor\"\n }}\n\
+         manifest \"manifest.kdl\" sha256=\"{}\"\n script \"true\"\n}}\n",
+        digest(&manifest_bytes),
+    );
+    let key = read_key(&fixture.public)?;
+    let release = snapshot(&fixture.repo, "canopa", &key, Some(catalog))?;
+    let payload = fs::read(fixture.proto.join(COMPOSITOR))?;
+    let envelope = attestation::sign(
+        &read_signing_key(&builder.private)?,
+        &manifest,
+        &manifest_bytes,
+        &build::parse(&recipe)?,
+        recipe.as_bytes(),
+        Toolchain {
+            publisher: "canopa".to_owned(),
+            key_sha256: digest(&key),
+            catalog_sha256: release.sha256,
+            package_manifests: BTreeMap::from([(
+                "desktop/compositor".to_owned(),
+                release.packages[0].sha256.clone(),
+            )]),
+        },
+        &BTreeMap::from([(
+            COMPOSITOR.to_owned(),
+            FileDigest {
+                sha256: digest(&payload),
+                size: payload.len() as u64,
+            },
+        )]),
+    )?;
+    fs::write(bundle.join("build.kdl"), &recipe)?;
+    fs::write(bundle.join("manifest.kdl"), manifest_bytes)?;
+    fs::write(bundle.join("attestation.json"), &envelope)?;
+    fs::write(bundle.join("proto").join(COMPOSITOR), payload)?;
+    let id = publish_bundle(
+        &fixture.repo,
+        &bundle,
+        &fixture.private,
+        &builder.public,
+        &digest(recipe.as_bytes()),
+    )?;
+    Ok((id, envelope))
+}
 
 fn sign_root(path: &Path, private: &Path, predecessor: Option<&Path>) -> Result<()> {
     let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate TUF key");
@@ -155,6 +213,7 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
         "2.0.0-0",
         f.file(COMPOSITOR, "new", "0755", "")?,
     )?;
+    let (id, envelope) = attach_evidence(&f, &initial)?;
     sign_release(&f, &second, 2, fresh, &anchor, &tuf_key)?;
     let blob = digest(b"new");
     let target = second.join("targets").join(format!("{blob}.blobs-{blob}"));
@@ -183,9 +242,25 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
     assert_eq!(fs::read_to_string(cache.join("current"))?.trim(), initial);
 
     fs::write(&target, b"new")?;
+    let hash = digest(&envelope);
+    let evidence = second
+        .join("targets")
+        .join(format!("{hash}.attestations-{hash}"));
+    fs::write(&evidence, vec![b'!'; envelope.len()])?;
+    let corrupt = refresh(&second).unwrap_err();
+    assert!(
+        format!("{corrupt:#}").contains("attestations/"),
+        "{corrupt:#}"
+    );
+    assert_eq!(fs::read_to_string(cache.join("current"))?.trim(), initial);
+    fs::write(&evidence, &envelope)?;
     let upgraded = refresh(&second)?;
     assert_ne!(upgraded, initial);
     assert_eq!(refresh(&second)?, upgraded);
+    assert_eq!(
+        read_attestation(&cache, "canopa", &f.public, &id)?,
+        envelope
+    );
 
     // The earlier plan still pins a verified catalog after the cache advances.
     apply(&f.root, &install)?;

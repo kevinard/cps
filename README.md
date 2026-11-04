@@ -67,15 +67,19 @@ Use the digest of the selected repository catalog, such as the digest recorded i
 
 ```sh
 cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
-    --sources sources --output hello-build --check-reproducible hello.build.kdl
-cps publish --repo repo --proto hello-build/proto --signing-key private.der hello-build/manifest.kdl
+    --sources sources --output hello-build --check-reproducible \
+    --builder-signing-key builder-private.der hello.build.kdl
+cps publish-bundle --repo repo --signing-key private.der --builder-key builder-public.der \
+    --recipe-sha256 "$reviewed_recipe_sha256" hello-build
 ```
 
 CPS resolves build dependencies against the pinned catalog and verifies their payloads. The toolchain and source mounts are read-only. The recipe gets a fixed user, hostname, locale, timezone, umask, paths, and `SOURCE_DATE_EPOCH` with fresh writable scratch space. Bubblewrap isolates namespaces and seccomp limits sockets to local Unix sockets. Package signing is a separate step with its own inputs. [Bubblewrap sandboxing](https://github.com/containers/bubblewrap/blob/main/README.md) · [SOURCE_DATE_EPOCH](https://reproducible-builds.org/docs/source-date-epoch/)
 
 The bundle contains the recipe, package manifest, and the declared regular file outputs. The manifest supplies the packaged modes, owners, directory entries, and symlinks. `--check-reproducible` repeats the build in a fresh sandbox and requires identical file hashes before making the bundle available. Both runs use the same worker kernel and CPU. Worker-level CPU, memory, and disk quotas are external to CPS.
 
-Run [`tests/build.sh`](tests/build.sh) on a worker with Bubblewrap, Bash, a C compiler with static libc, binutils, and OpenSSL. It exercises isolation, reproducibility, and installation of the resulting package.
+The optional worker key signs an in-toto statement in a DSSE envelope after both runs match. The statement records the recipe and source digests, pinned toolchain catalog and resolved package manifests, and the output hashes and lengths. Provision the worker public key and the expected recipe digest on the publishing machine from independently reviewed inputs. Keep the publishing key separate from the worker key. `publish-bundle` verifies the statement and streams the exact attested payloads into the repository. [in-toto statement specification](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md) · [DSSE signature protocol](https://github.com/secure-systems-lab/dsse/blob/master/protocol.md)
+
+Run [`tests/build.sh`](tests/build.sh) on a worker with Bubblewrap, Bash, a C compiler with static libc, binutils, Python 3, and OpenSSL. It exercises isolation, reproducibility, signed provenance, and package installation.
 
 ## Signed releases and mirrors
 
@@ -99,6 +103,8 @@ cps repo sync --repo /var/lib/cps/canopa --root canopa-root.json \
 Point `image-create` or the KDL image configuration at this cache. Give write access to the account that runs sync and keep the cache outside all boot roots on persistent storage. CPS uses the original provisioned root to identify the repository on each sync and stores authenticated root rotations and replay state under `.tuf`. Sync accepts HTTPS or a local `file:///` mirror, with trailing slashes on both URLs.
 
 Sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and the complete release. A failed download leaves the last complete release available. The cache retains previous content-addressed objects for saved plans. Planning and applying can use the last cached release offline. TUF freshness is checked at sync time.
+
+The publisher signs the association between each package and its build evidence. Export and sync carry the evidence with the release. To retrieve it, use `cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-key public.der cps://canopa/demo/hello@1.0.0-0`. Clients need a CPS version that supports attestations before they can read catalogs containing that field.
 
 ## Manifest and image behavior
 

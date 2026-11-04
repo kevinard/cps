@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail, ensure};
 use kdl::KdlDocument;
 
-use crate::model::{validate_digest, validate_name, validate_path, validate_publisher};
+use crate::model::{FileDigest, validate_digest, validate_name, validate_path, validate_publisher};
 
 use super::{Fields, document, one, schema};
 
@@ -14,13 +14,8 @@ pub(crate) struct BuildRecipe {
     pub packages: BTreeSet<String>,
     pub manifest: String,
     pub manifest_digest: String,
-    pub sources: BTreeMap<String, Source>,
+    pub sources: BTreeMap<String, FileDigest>,
     pub script: String,
-}
-
-pub(crate) struct Source {
-    pub sha256: String,
-    pub size: u64,
 }
 
 pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
@@ -87,7 +82,7 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
                 let size = fields.integer("size")?.context("missing source size")?;
                 ensure!(
                     sources
-                        .insert(path.clone(), Source { sha256, size })
+                        .insert(path.clone(), FileDigest { sha256, size })
                         .is_none(),
                     "duplicate source {path}"
                 );

@@ -70,6 +70,10 @@ impl Root {
         Ok(self.open_relative(path, OFlags::RDONLY | OFlags::DIRECTORY)?)
     }
 
+    pub(crate) fn subdir(&self, path: &str) -> Result<Self> {
+        Ok(Self(self.dir(path)?))
+    }
+
     pub fn file(&self, path: &str) -> Result<File> {
         validate_path(path)?;
         let file = self.open_relative(path, OFlags::RDONLY | OFlags::NONBLOCK)?;

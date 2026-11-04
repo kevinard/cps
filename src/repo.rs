@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
+    attestation::{ATTESTATION_LIMIT, VerifiedBuild, verify_bundle},
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest},
-    model::{Action, FORMAT, Manifest, Node, digest, digest_reader, validate_digest},
+    model::{Action, FORMAT, FileDigest, Manifest, Node, digest, digest_reader, validate_digest},
     systemd::{self, Action as SystemdAction},
 };
 
@@ -30,6 +31,8 @@ struct Catalog {
     format: u32,
     publisher: String,
     entries: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    attestations: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -94,6 +97,7 @@ fn load_manifest(repo: &Path, sha256: String) -> Result<Published> {
 pub struct Snapshot {
     pub sha256: String,
     pub packages: Vec<Published>,
+    attestations: BTreeMap<String, String>,
 }
 
 pub fn read_key(path: &Path) -> Result<Vec<u8>> {
@@ -106,6 +110,13 @@ pub fn read_key(path: &Path) -> Result<Vec<u8>> {
         .context("expected an Ed25519 DER public key")?;
     ensure!(key.len() == 32, "invalid Ed25519 public key length");
     Ok(key.to_vec())
+}
+
+pub(crate) fn read_signing_key(path: &Path) -> Result<Ed25519KeyPair> {
+    let bytes = read_limited(File::open(path)?, 1024)
+        .with_context(|| format!("reading signing key {}", path.display()))?;
+    Ed25519KeyPair::from_pkcs8_maybe_unchecked(&bytes)
+        .map_err(|e| anyhow::anyhow!("invalid Ed25519 PKCS#8 signing key: {e}"))
 }
 
 fn read_current(repo: &Path) -> Result<String> {
@@ -164,7 +175,28 @@ fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<
             &hex::decode(signed.signature)?,
         )
         .map_err(|_| anyhow::anyhow!("invalid signature on catalog {hash}"))?;
+    let mut evidence = BTreeSet::new();
+    for (id, digest) in &catalog.attestations {
+        validate_digest(digest)?;
+        ensure!(
+            catalog.entries.contains_key(id),
+            "attestation for absent package {id}"
+        );
+        ensure!(
+            evidence.insert(digest),
+            "duplicate package attestation {digest}"
+        );
+    }
     Ok(catalog)
+}
+
+pub fn read_attestation(repo: &Path, publisher: &str, key: &Path, id: &str) -> Result<Vec<u8>> {
+    let catalog = read_catalog(repo, &read_current(repo)?, publisher, &read_key(key)?)?;
+    let hash = catalog
+        .attestations
+        .get(id)
+        .with_context(|| format!("no build attestation for {id}"))?;
+    read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
 }
 
 pub fn snapshot(
@@ -190,6 +222,7 @@ pub fn snapshot(
     Ok(Snapshot {
         sha256: hash,
         packages,
+        attestations: catalog.attestations,
     })
 }
 
@@ -248,7 +281,7 @@ fn path_present(path: &Path) -> Result<bool> {
 
 fn prepare_objects(repo: &Path) -> Result<()> {
     let root = Root::open(repo)?;
-    for dir in ["catalogs", "manifests", "blobs"] {
+    for dir in ["catalogs", "manifests", "blobs", "attestations"] {
         if !path_present(&repo.join(dir))? {
             fs::create_dir(repo.join(dir))?;
         }
@@ -259,12 +292,45 @@ fn prepare_objects(repo: &Path) -> Result<()> {
 }
 
 pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<String> {
-    let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&fs::read(key)?)
-        .map_err(|e| anyhow::anyhow!("invalid Ed25519 PKCS#8 signing key: {e}"))?;
-    let mut manifest = parse_manifest(&fs::read_to_string(recipe)?)
+    let key = read_signing_key(key)?;
+    let manifest_bytes = read_limited(File::open(recipe)?, MANIFEST_LIMIT)?;
+    let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)
         .with_context(|| format!("parsing {}", recipe.display()))?;
     manifest.validate(false)?;
-    let proto = Root::open(proto)?;
+    publish_manifest(repo, Root::open(proto)?, manifest, &key, None)
+}
+
+pub fn publish_bundle(
+    repo: &Path,
+    bundle: &Path,
+    key: &Path,
+    builder_key: &Path,
+    reviewed_recipe: &str,
+) -> Result<String> {
+    let bundle = Root::open(bundle)?;
+    let key = read_signing_key(key)?;
+    let builder = read_key(builder_key)?;
+    ensure!(
+        builder.as_slice() != key.public_key().as_ref(),
+        "builder and publisher must use distinct keys"
+    );
+    let (manifest, verified) = verify_bundle(&bundle, &builder, reviewed_recipe)?;
+    publish_manifest(
+        repo,
+        bundle.subdir("proto")?,
+        manifest,
+        &key,
+        Some(verified),
+    )
+}
+
+fn publish_manifest(
+    repo: &Path,
+    proto: Root,
+    mut manifest: Manifest,
+    key: &Ed25519KeyPair,
+    evidence: Option<VerifiedBuild>,
+) -> Result<String> {
     let _lock = lock_repo(repo)?;
     ensure!(
         !path_present(&repo.join(".tuf"))?,
@@ -283,6 +349,7 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
             format: FORMAT,
             publisher: manifest.publisher.clone(),
             entries: BTreeMap::new(),
+            attestations: BTreeMap::new(),
         }
     };
     let tmpfiles: std::collections::BTreeSet<_> = manifest
@@ -299,7 +366,19 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
             let input = proto
                 .file(path)
                 .with_context(|| format!("reading build output {path}"))?;
-            let (hash, length) = store_blob(repo, input, tmpfiles.contains(path))
+            let expected = evidence
+                .as_ref()
+                .map(|build| {
+                    build
+                        .artifacts
+                        .get(path)
+                        .context("missing verified build output")
+                })
+                .transpose()?;
+            let FileDigest {
+                sha256: hash,
+                size: length,
+            } = store_blob(repo, input, tmpfiles.contains(path), expected)
                 .with_context(|| format!("publishing {path}"))?;
             *sha256 = Some(hash);
             *size = Some(length);
@@ -307,21 +386,38 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
     }
     manifest.validate(true)?;
     let id = manifest.id();
-    if let Some(existing) = catalog.entries.get(&id) {
+    let unchanged_manifest = if let Some(existing) = catalog.entries.get(&id) {
         let previous = load_manifest(repo, existing.clone())?;
         ensure!(
             previous.manifest == manifest,
             "{id} was already published with different content"
         );
+        true
+    } else {
+        let manifest = manifest_text(&manifest);
+        ensure!(
+            manifest.len() as u64 <= MANIFEST_LIMIT,
+            "manifest exceeds {MANIFEST_LIMIT} bytes"
+        );
+        let sha256 = store(repo, "manifests", manifest.as_bytes())?;
+        catalog.entries.insert(id.clone(), sha256);
+        false
+    };
+    if let Some(evidence) = evidence {
+        let hash = digest(&evidence.envelope);
+        if let Some(previous) = catalog.attestations.get(&id) {
+            ensure!(
+                previous == &hash,
+                "{id} already has a different build attestation"
+            );
+            read_object(repo, "attestations", previous, ATTESTATION_LIMIT)?;
+            return Ok(id);
+        }
+        let hash = store(repo, "attestations", &evidence.envelope)?;
+        catalog.attestations.insert(id.clone(), hash);
+    } else if unchanged_manifest {
         return Ok(id);
     }
-    let manifest = manifest_text(&manifest);
-    ensure!(
-        manifest.len() as u64 <= MANIFEST_LIMIT,
-        "manifest exceeds {MANIFEST_LIMIT} bytes"
-    );
-    let sha256 = store(repo, "manifests", manifest.as_bytes())?;
-    catalog.entries.insert(id.clone(), sha256);
     let signature = hex::encode(key.sign(&serde_json::to_vec(&catalog)?).as_ref());
     let signed = SignedCatalog { catalog, signature };
     let signed = serde_json::to_vec(&signed)?;
@@ -335,16 +431,35 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
     Ok(id)
 }
 
-fn store_blob(repo: &Path, mut input: File, validate_tmpfiles: bool) -> Result<(String, u64)> {
+fn store_blob(
+    repo: &Path,
+    mut input: File,
+    validate_tmpfiles: bool,
+    expected: Option<&FileDigest>,
+) -> Result<FileDigest> {
     let parent = repo.join("blobs");
     let mut temp = NamedTempFile::new_in(&parent)?;
-    let size = io::copy(&mut input, &mut temp)?;
+    let size = if let Some(file) = expected {
+        ensure!(
+            input.metadata()?.len() == file.size,
+            "attested payload length mismatch"
+        );
+        let size = io::copy(&mut input.take(file.size.saturating_add(1)), &mut temp)?;
+        ensure!(size == file.size, "attested payload length mismatch");
+        size
+    } else {
+        io::copy(&mut input, &mut temp)?
+    };
     temp.as_file_mut().rewind()?;
     if validate_tmpfiles {
         let bytes = read_limited(temp.reopen()?, TMPFILES_LIMIT)?;
         systemd::validate_tmpfiles(&bytes)?;
     }
     let hash = digest_reader(temp.as_file_mut())?;
+    ensure!(
+        expected.is_none_or(|file| file.sha256 == hash),
+        "attested payload digest mismatch"
+    );
     let path = parent.join(&hash);
     if path.try_exists()? {
         let existing = Root::open(repo)?.file(&format!("blobs/{hash}"))?;
@@ -359,7 +474,7 @@ fn store_blob(repo: &Path, mut input: File, validate_tmpfiles: bool) -> Result<(
         temp.persist_noclobber(path)?;
         File::open(parent)?.sync_all()?;
     }
-    Ok((hash, size))
+    Ok(FileDigest { sha256: hash, size })
 }
 
 pub fn stage_blob(repo: &Path, node: &Node, destination: &mut File) -> Result<()> {

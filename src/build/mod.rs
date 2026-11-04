@@ -16,20 +16,30 @@ use rustix::{
 use tempfile::TempDir;
 
 use crate::{
+    attestation::{self, RECIPE_LIMIT, Toolchain},
     image::root::Root,
     kdl_format::{
-        build::{BuildRecipe, Source, parse},
+        build::{BuildRecipe, parse},
         parse_manifest,
     },
-    model::{Action, Node, digest, digest_reader},
+    model::{FileDigest, Node, digest, digest_reader},
     plan::{resolve_packages, select_paths},
-    repo::{MANIFEST_LIMIT, read_key, read_limited, snapshot, stage_blob},
+    repo::{MANIFEST_LIMIT, read_key, read_limited, read_signing_key, snapshot, stage_blob},
 };
 
-const RECIPE_LIMIT: u64 = 1024 * 1024;
 const MOUNTS: &[&str] = &[
     "build", "dev", "out", "proc", "recipe", "run", "sources", "tmp",
 ];
+
+pub struct BuildOptions<'a> {
+    pub repo: &'a Path,
+    pub publisher: &'a str,
+    pub trust_key: &'a Path,
+    pub sources: &'a Path,
+    pub output: &'a Path,
+    pub check_reproducible: bool,
+    pub builder_signing_key: Option<&'a Path>,
+}
 
 /// Build one package using sources and a package toolchain pinned by the recipe.
 pub fn build(
@@ -41,6 +51,34 @@ pub fn build(
     output: &Path,
     check_reproducible: bool,
 ) -> Result<String> {
+    build_package(
+        recipe_path,
+        BuildOptions {
+            repo,
+            publisher,
+            trust_key,
+            sources,
+            output,
+            check_reproducible,
+            builder_signing_key: None,
+        },
+    )
+}
+
+pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<String> {
+    let BuildOptions {
+        repo,
+        publisher,
+        trust_key,
+        sources,
+        output,
+        check_reproducible,
+        builder_signing_key,
+    } = options;
+    ensure!(
+        builder_signing_key.is_none() || check_reproducible,
+        "builder signing requires --check-reproducible"
+    );
     ensure!(
         !geteuid().is_root(),
         "package builds require an unprivileged user"
@@ -68,14 +106,7 @@ pub fn build(
     );
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
     manifest.validate(false)?;
-    let paths: BTreeSet<_> = manifest
-        .action
-        .iter()
-        .filter_map(|action| match action {
-            Action::File { path, .. } => Some(path.as_str()),
-            _ => None,
-        })
-        .collect();
+    let paths = manifest.payload_paths();
 
     let destination = fs::canonicalize(parent(output))?;
     let name = output.file_name().context("missing build output name")?;
@@ -94,7 +125,7 @@ pub fn build(
     normalize(&script, recipe.epoch)?;
     let toolchain = work.path().join("toolchain");
     fs::create_dir(&toolchain)?;
-    prepare_toolchain(&toolchain, repo, publisher, trust_key, &recipe)?;
+    let resolved_toolchain = prepare_toolchain(&toolchain, repo, publisher, trust_key, &recipe)?;
 
     let stage = TempDir::new_in(&destination)?;
     let proto = stage.path().join("proto");
@@ -130,6 +161,21 @@ pub fn build(
         ("build.kdl", &recipe_bytes),
     ] {
         let path = stage.path().join(name);
+        fs::write(&path, bytes)?;
+        set_mode(&path, 0o644)?;
+        normalize(&path, recipe.epoch)?;
+    }
+    if let Some(key) = builder_signing_key {
+        let bytes = attestation::sign(
+            &read_signing_key(key)?,
+            &manifest,
+            &manifest_bytes,
+            &recipe,
+            &recipe_bytes,
+            resolved_toolchain,
+            &artifacts,
+        )?;
+        let path = stage.path().join("attestation.json");
         fs::write(&path, bytes)?;
         set_mode(&path, 0o644)?;
         normalize(&path, recipe.epoch)?;
@@ -179,7 +225,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 fn stage_sources(root: &Path, input: &Path, recipe: &BuildRecipe) -> Result<()> {
     let root = Root::open(root)?;
     let mut directories = BTreeSet::from([input.to_owned()]);
-    for (path, Source { sha256, size }) in &recipe.sources {
+    for (path, FileDigest { sha256, size }) in &recipe.sources {
         let mut source = root
             .file(path)
             .with_context(|| format!("opening build source {path}"))?;
@@ -223,14 +269,10 @@ fn prepare_toolchain(
     publisher: &str,
     trust_key: &Path,
     recipe: &BuildRecipe,
-) -> Result<()> {
-    let release = snapshot(
-        repo,
-        publisher,
-        &read_key(trust_key)?,
-        Some(&recipe.catalog),
-    )
-    .context("loading pinned toolchain catalog")?;
+) -> Result<Toolchain> {
+    let key = read_key(trust_key)?;
+    let release = snapshot(repo, publisher, &key, Some(&recipe.catalog))
+        .context("loading pinned toolchain catalog")?;
     let installed = resolve_packages(
         &BTreeMap::new(),
         &release.packages,
@@ -288,7 +330,15 @@ fn prepare_toolchain(
     }
     set_mode(path, 0o755)?;
     normalize(path, recipe.epoch)?;
-    Ok(())
+    Ok(Toolchain {
+        publisher: publisher.to_owned(),
+        key_sha256: digest(&key),
+        catalog_sha256: release.sha256,
+        package_manifests: installed
+            .into_iter()
+            .map(|(name, package)| (name, package.published.sha256))
+            .collect(),
+    })
 }
 
 fn run(
@@ -299,7 +349,7 @@ fn run(
     recipe: &BuildRecipe,
     paths: &BTreeSet<&str>,
     proto: Option<&Path>,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<BTreeMap<String, FileDigest>> {
     let output = TempDir::new_in(work)?;
     sandbox::run(toolchain, sources, script, output.path(), recipe.epoch)?;
     let root = Root::open(output.path())?;
@@ -309,7 +359,7 @@ fn run(
         let mut source = root
             .file(path)
             .with_context(|| format!("opening declared build output {path}"))?;
-        let hash = if let Some(proto) = proto {
+        let artifact = if let Some(proto) = proto {
             let destination = proto.join(path);
             fs::create_dir_all(parent(&destination))?;
             directories.extend(
@@ -324,16 +374,20 @@ fn run(
                 .write(true)
                 .create_new(true)
                 .open(&destination)?;
-            io::copy(&mut source, &mut file)?;
+            let size = io::copy(&mut source, &mut file)?;
             file.rewind()?;
             let hash = digest_reader(&mut file)?;
             set_mode(&destination, 0o644)?;
             normalize(&destination, recipe.epoch)?;
-            hash
+            FileDigest { sha256: hash, size }
         } else {
-            digest_reader(&mut source)?
+            let size = source.metadata()?.len();
+            FileDigest {
+                sha256: digest_reader(&mut source)?,
+                size,
+            }
         };
-        artifacts.insert((*path).to_owned(), hash);
+        artifacts.insert((*path).to_owned(), artifact);
     }
     for directory in directories.iter().rev() {
         set_mode(directory, 0o755)?;

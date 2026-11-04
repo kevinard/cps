@@ -9,8 +9,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cps::{
-    Activation, ImageConfig, Plan, Request, activate_boot_environment, apply, build, create_image,
-    list_boot_environments, plan, publish, read_image_config, release, rollback_boot_environment,
+    Activation, BuildOptions, ImageConfig, Plan, Request, activate_boot_environment, apply,
+    build_package, create_image, list_boot_environments, plan, publish, publish_bundle,
+    read_attestation, read_image_config, release, rollback_boot_environment,
     stage_boot_environment, verify,
 };
 
@@ -37,6 +38,8 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         check_reproducible: bool,
+        #[arg(long, requires = "check_reproducible")]
+        builder_signing_key: Option<PathBuf>,
         recipe: PathBuf,
     },
     /// Publish one manifest and its payloads to a local repository
@@ -48,6 +51,18 @@ enum Command {
         #[arg(long)]
         signing_key: PathBuf,
         manifest: PathBuf,
+    },
+    /// Publish a reproducible build bundle after verifying its worker signature and reviewed recipe
+    PublishBundle {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        builder_key: PathBuf,
+        #[arg(long)]
+        recipe_sha256: String,
+        bundle: PathBuf,
     },
     /// Export or synchronize a signed repository release
     Repo {
@@ -100,6 +115,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RepoCommand {
+    /// Print the signed build evidence for a full package ID in the current catalog
+    Attestation {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+        package_id: String,
+    },
     /// Export the current catalog and its objects for TUF signing
     Export {
         #[arg(long)]
@@ -235,16 +260,20 @@ fn run(command: Command) -> Result<ExitCode> {
             sources,
             output,
             check_reproducible,
+            builder_signing_key,
             recipe,
         } => {
-            let id = build(
+            let id = build_package(
                 &recipe,
-                &repo,
-                &publisher,
-                &trust_key,
-                &sources,
-                &output,
-                check_reproducible,
+                BuildOptions {
+                    repo: &repo,
+                    publisher: &publisher,
+                    trust_key: &trust_key,
+                    sources: &sources,
+                    output: &output,
+                    check_reproducible,
+                    builder_signing_key: builder_signing_key.as_deref(),
+                },
             )?;
             println!("Built {id} at {}", output.display());
         }
@@ -259,7 +288,30 @@ fn run(command: Command) -> Result<ExitCode> {
                 publish(&repo, &proto, &manifest, &signing_key)?
             );
         }
+        Command::PublishBundle {
+            repo,
+            signing_key,
+            builder_key,
+            recipe_sha256,
+            bundle,
+        } => {
+            println!(
+                "Published {}",
+                publish_bundle(&repo, &bundle, &signing_key, &builder_key, &recipe_sha256)?
+            );
+        }
         Command::Repo { command } => match command {
+            RepoCommand::Attestation {
+                repo,
+                publisher,
+                trust_key,
+                package_id,
+            } => {
+                let bytes = read_attestation(&repo, &publisher, &trust_key, &package_id)?;
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&bytes)?;
+                writeln!(stdout)?;
+            }
             RepoCommand::Export {
                 repo,
                 publisher,

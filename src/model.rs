@@ -6,6 +6,13 @@ use sha2::{Digest, Sha256};
 
 pub const FORMAT: u32 = 1;
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileDigest {
+    pub sha256: String,
+    pub size: u64,
+}
+
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -338,6 +345,16 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub(crate) fn payload_paths(&self) -> BTreeSet<&str> {
+        self.action
+            .iter()
+            .filter_map(|action| match action {
+                Action::File { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn id(&self) -> String {
         format!("cps://{}/{}@{}", self.publisher, self.name, self.version)
     }

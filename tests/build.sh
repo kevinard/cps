@@ -13,6 +13,10 @@ arch=$(uname -m)
 mkdir -p proto sources
 openssl genpkey -algorithm ED25519 -outform DER -out signing.der
 openssl pkey -inform DER -in signing.der -pubout -outform DER -out public.der
+openssl genpkey -algorithm ED25519 -outform DER -out builder.der
+openssl pkey -inform DER -in builder.der -pubout -outform DER -out builder-public.der
+openssl genpkey -algorithm ED25519 -outform DER -out other.der
+openssl pkey -inform DER -in other.der -pubout -outform DER -out other-public.der
 
 cat > probe.c <<'C'
 #define _GNU_SOURCE
@@ -139,8 +143,8 @@ export CPS_TEST_SECRET=should-be-cleared
 build_package() {
     "$cps" build --repo repo --publisher canopa --trust-key public.der --sources sources "$@"
 }
-build_package --check-reproducible --output first build.kdl
-(umask 077; build_package --check-reproducible --output second build.kdl)
+build_package --builder-signing-key builder.der --check-reproducible --output first build.kdl
+(umask 077; build_package --builder-signing-key builder.der --check-reproducible --output second build.kdl)
 diff -r first second
 test ! -e first/proto/unlisted
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
@@ -171,13 +175,57 @@ fi
 grep -F 'source digest or length mismatch for input' bad.log
 test ! -e bad
 
-"$cps" publish --repo repo --proto first/proto --signing-key signing.der first/manifest.kdl
+reviewed=$(sha build.kdl)
+publish_bundle() {
+    "$cps" publish-bundle --repo repo --signing-key signing.der "$@"
+}
+expect_failure() {
+    local expected=$1
+    shift
+    if "$@" > rejected.log 2>&1; then
+        echo "unexpected success: $*" >&2
+        exit 1
+    fi
+    grep -F "$expected" rejected.log
+}
+before=$(cat repo/current)
+expect_failure 'invalid builder attestation signature' publish_bundle \
+    --builder-key other-public.der --recipe-sha256 "$reviewed" first
+expect_failure 'build recipe differs from the reviewed digest' publish_bundle \
+    --builder-key builder-public.der --recipe-sha256 "$(sha unstable.kdl)" first
+cp -a first modified
+printf 'x' | dd of=modified/proto/hello bs=1 conv=notrunc status=none
+expect_failure 'attested payload digest mismatch' publish_bundle \
+    --builder-key builder-public.der --recipe-sha256 "$reviewed" modified
+test "$(cat repo/current)" = "$before"
+
+publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" first
 first_catalog=$(cat repo/current)
-"$cps" publish --repo repo --proto second/proto --signing-key signing.der second/manifest.kdl
+publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" second
 test "$(cat repo/current)" = "$first_catalog"
+"$cps" repo attestation --repo repo --publisher canopa --trust-key public.der \
+    cps://canopa/demo/hello@1.0.0-0 > envelope.json
+python3 - <<'PYTHON'
+import base64
+import json
+from pathlib import Path
+
+envelope = json.loads(Path('envelope.json').read_bytes())
+assert envelope == json.loads(Path('first/attestation.json').read_bytes())
+kind = envelope['payloadType'].encode('ascii')
+payload = base64.b64decode(envelope['payload'], validate=True)
+statement = json.loads(payload)
+assert statement['_type'] == 'https://in-toto.io/Statement/v1'
+assert statement['predicate']['identical_runs'] == 2
+assert set(statement['predicate']['toolchain']['package_manifests']) == {'build/shell', 'build/probe'}
+assert {subject['name'] for subject in statement['subject']} == {'manifest.kdl', 'proto/hello'}
+Path('pae').write_bytes(b'DSSEv1 %d %s %d %s' % (len(kind), kind, len(payload), payload))
+Path('signature').write_bytes(base64.b64decode(envelope['signatures'][0]['sig'], validate=True))
+PYTHON
+openssl pkeyutl -verify -pubin -keyform DER -inkey builder-public.der -rawin -in pae -sigfile signature
 "$cps" image-create --root image --repo repo --publisher canopa --trust-key public.der
 "$cps" plan --root image --output install.json install demo/hello
 "$cps" apply --root image install.json
 "$cps" verify --root image
 test "$(cat image/hello)" = 'hello from pinned input 1700000000'
-echo "Verified isolated build, reproducibility, and package installation"
+echo "Verified isolated build, reproducibility, signed provenance, and package installation"
