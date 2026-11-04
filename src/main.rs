@@ -12,9 +12,9 @@ use cps::query::{PackageRow, Scope, list_packages, package_manifest};
 use cps::{
     Activation, BuildOptions, BuildWitness, Plan, Request, SourceLayout, activate_boot_environment,
     add_publisher, apply, build_with_worker, create_configured_image, create_image, fetch_sources,
-    import_sources, list_boot_environments, list_publishers, plan, prefer_publisher, publish,
-    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
-    rollback_boot_environment, stage_boot_environment, verify,
+    generate_manifest, import_sources, list_boot_environments, list_publishers, plan,
+    prefer_publisher, publish, publish_witnessed_bundle, read_attestation, read_worker_config,
+    release, remove_publisher, rollback_boot_environment, stage_boot_environment, verify,
 };
 
 #[derive(Parser)]
@@ -52,6 +52,11 @@ enum Command {
         #[arg(long, requires = "check_reproducible")]
         builder_signing_key: Option<PathBuf>,
         recipe: PathBuf,
+    },
+    /// Prepare a package manifest for review
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
     },
     /// Publish one manifest and its payloads to a local repository
     Publish {
@@ -172,6 +177,24 @@ enum SourceCommand {
         #[arg(long)]
         from: PathBuf,
         recipe: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManifestCommand {
+    /// Generate KDL from a staged prototype tree
+    Generate {
+        #[arg(long)]
+        proto: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
+        name: String,
     },
 }
 
@@ -416,6 +439,19 @@ fn run(command: Command) -> Result<ExitCode> {
             let id = build_with_worker(&recipe, options, layout, &worker)?;
             println!("Built {id} at {}", output.display());
         }
+        Command::Manifest { command } => match command {
+            ManifestCommand::Generate {
+                proto,
+                publisher,
+                version,
+                uid,
+                gid,
+                name,
+            } => {
+                let text = generate_manifest(&proto, &publisher, &name, &version, uid, gid)?;
+                std::io::stdout().lock().write_all(text.as_bytes())?;
+            }
+        },
         Command::Publish {
             repo,
             proto,

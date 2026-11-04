@@ -2,6 +2,7 @@ mod apply;
 mod attestation;
 mod boot;
 mod build;
+mod generate;
 mod image;
 mod kdl_format;
 mod model;
@@ -22,6 +23,7 @@ pub use build::{
     build_with_worker,
     sources::{fetch_sources, import_sources},
 };
+pub use generate::generate_manifest;
 pub use image::publishers::{
     PublisherInfo, add_publisher, list_publishers, prefer_publisher, remove_publisher,
 };

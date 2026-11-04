@@ -111,6 +111,100 @@ fn dependency(kind: &str, name: &str, version: &str) -> String {
 }
 
 #[test]
+fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let f = Fixture::new()?;
+    let uid = geteuid().as_raw();
+    let gid = getegid().as_raw();
+    let generate =
+        |proto| crate::generate_manifest(proto, "canopa", "test/proto", "1.0.0-0", uid, gid);
+    let prepare = |proto: &Path, reverse: bool| -> Result<()> {
+        let directories = if reverse {
+            ["var/empty", "usr/bin"]
+        } else {
+            ["usr/bin", "var/empty"]
+        };
+        for path in directories {
+            let directory = proto.join(path);
+            fs::create_dir_all(&directory)?;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o751))?;
+        }
+        let payload = proto.join("usr/bin/tool #1");
+        fs::write(&payload, "tool payload")?;
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o755))?;
+        symlink("tool #1", proto.join("usr/bin/link"))?;
+        symlink("/outside-the-prototype", proto.join("external"))?;
+        Ok(())
+    };
+    let other = f.proto.with_extension("other");
+    prepare(&f.proto, false)?;
+    prepare(&other, true)?;
+    let manifest = generate(&f.proto)?;
+    assert_eq!(manifest, generate(&other)?);
+    let parsed = crate::kdl_format::parse_manifest(&manifest)?;
+    parsed.validate(false)?;
+    assert_eq!(parsed.action.len(), 7);
+
+    fs::write(&f.recipe, manifest)?;
+    publish(&f.repo, &f.proto, &f.recipe, &f.private)?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/proto".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    assert!(verify(&f.root)?.is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join("usr/bin/link"))?,
+        "tool payload"
+    );
+    assert_eq!(
+        fs::read_link(f.root.join("external"))?,
+        Path::new("/outside-the-prototype")
+    );
+    assert!(fs::read_dir(f.root.join("var/empty"))?.next().is_none());
+    assert_eq!(
+        fs::metadata(f.root.join("var/empty"))?.permissions().mode() & 0o777,
+        0o751
+    );
+
+    let file = f.proto.join("usr/bin/tool #1");
+    let hardlink = f.proto.join("hardlink");
+    fs::hard_link(&file, &hardlink)?;
+    assert!(
+        generate(&f.proto)
+            .unwrap_err()
+            .to_string()
+            .contains("hard-linked file")
+    );
+    fs::remove_file(hardlink)?;
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o4755))?;
+    assert!(
+        generate(&f.proto)
+            .unwrap_err()
+            .to_string()
+            .contains("special permission bits")
+    );
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
+    rustix::fs::setxattr(
+        &file,
+        "user.cps-test",
+        b"value",
+        rustix::fs::XattrFlags::empty(),
+    )?;
+    assert!(
+        generate(&f.proto)
+            .unwrap_err()
+            .to_string()
+            .contains("extended attributes")
+    );
+    Ok(())
+}
+
+#[test]
 fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
     use crate::kdl_format::parse_manifest;
     use crate::query::{Scope, list_packages, package_manifest};

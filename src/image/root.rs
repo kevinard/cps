@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use rustix::{
     fs::{
-        AtFlags, FileType, Mode, OFlags, ResolveFlags, chownat, fchmod, fchown, fstat, mkdirat,
-        open, openat2, readlinkat, renameat, statat, symlinkat, unlinkat,
+        AtFlags, FileType, Mode, OFlags, ResolveFlags, Stat, chownat, fchmod, fchown, fstat,
+        mkdirat, open, openat2, readlinkat, renameat, statat, symlinkat, unlinkat,
     },
     io::Errno,
     process::{Gid, Uid},
@@ -87,6 +87,31 @@ impl Root {
 
     pub(crate) fn as_file(&self) -> &File {
         &self.0
+    }
+
+    /// Visit each entry without following symlinks or crossing a mount.
+    /// Returning false from the visitor prunes the entry's descendants.
+    pub(crate) fn walk(
+        &self,
+        skip: Option<&str>,
+        mut visit: impl FnMut(&str, &File, &Stat) -> Result<bool>,
+    ) -> Result<()> {
+        let mut pending = child_paths(&self.0, "")?;
+        while let Some(path) = pending.pop() {
+            if skip == Some(path.as_str()) {
+                continue;
+            }
+            let entry = self
+                .open_relative(&path, OFlags::PATH | OFlags::NOFOLLOW)
+                .with_context(|| format!("opening tree entry {path:?}"))?;
+            let info = fstat(&entry)?;
+            if visit(&path, &entry, &info)?
+                && FileType::from_raw_mode(info.st_mode) == FileType::Directory
+            {
+                pending.extend(child_paths(&entry, &format!("{path}/"))?);
+            }
+        }
+        Ok(())
     }
 
     pub fn file(&self, path: &str) -> Result<File> {
@@ -267,6 +292,19 @@ impl Root {
         self.parent(path)?.0.sync_all()?;
         Ok(())
     }
+}
+
+fn child_paths(directory: &File, prefix: &str) -> Result<Vec<String>> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir(Root::fd_path(directory))? {
+        let name = entry?.file_name();
+        let name = name
+            .to_str()
+            .with_context(|| format!("non-UTF-8 name {name:?} in {prefix:?}"))?;
+        children.push(format!("{prefix}{name}"));
+    }
+    children.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(children)
 }
 
 fn directory_metadata(file: &File) -> Result<Node> {

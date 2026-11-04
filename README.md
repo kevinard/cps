@@ -54,6 +54,24 @@ against the installed digests before any writes. Repair preserves edited or
 removed configuration files declared with `preserve=#true`. Resolve path type
 conflicts involving directories or special files before retrying the plan.
 
+## Generating a manifest from a prototype
+
+Stage an install into a private prototype tree, for example with `DESTDIR`,
+then generate a KDL manifest for review.
+
+```sh
+cps manifest generate --proto proto --publisher canopa --version 1.0.0-0 demo/tool > tool.kdl
+cps publish --repo repo --proto proto --signing-key private.der tool.kdl
+```
+
+The generator emits file, directory, and symlink actions in deterministic order
+without following symlinks or crossing mounts. Ownership defaults to UID and
+GID zero. Use `--uid` and `--gid` to set explicit owners. Regular files and
+directories with extended attributes, hard-linked files, special modes, and
+special filesystem objects are rejected. Review the manifest and add dependency,
+configuration, and systemd declarations before publishing. Publication derives
+the payload hashes and lengths. [IPS prototype manifest generation](https://docs.oracle.com/cd/E88353_01/html/E37839/pkgsend-1.html)
+
 ## Finding and inspecting packages
 
 ```sh
