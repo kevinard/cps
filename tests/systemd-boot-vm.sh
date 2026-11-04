@@ -50,9 +50,10 @@ options='ro console=ttyS0 loglevel=3 init=/init'
 root_mib=64
 if $systemd_guest; then
     options='rw console=ttyS0 loglevel=3 init=/init systemd.log_target=console'
+    root_mib=256
+elif [[ $mode == kernel-upgrade ]]; then
     root_mib=128
 fi
-if [[ $mode == kernel-upgrade || $mode == rollback ]]; then root_mib=128; fi
 mkdir -p esp/EFI/BOOT proto/etc
 cp "$efi" esp/EFI/BOOT/BOOTX64.EFI
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
