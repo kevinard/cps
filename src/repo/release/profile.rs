@@ -87,7 +87,7 @@ pub fn sync_profile_with_payloads(
                 && state.settings.facets == definition.facets
                 && state
                     .publishers
-                    .as_slice()
+                    .signed_publishers()
                     .iter()
                     .map(|publisher| publisher.name.as_str())
                     .eq(sources.iter().map(|source| source.publisher)),

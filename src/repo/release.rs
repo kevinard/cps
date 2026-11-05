@@ -319,7 +319,8 @@ pub fn sync_with_required_catalogs(
     let guard = options.image.map(ImageGuard::open).transpose()?;
     if let Some(guard) = &guard {
         ensure!(
-            guard.state.publishers.release_profile().is_none(),
+            guard.state.publishers.release_profile().is_none()
+                || guard.state.publishers.is_local(publisher),
             "use repo sync-profile --image for an image that follows a signed profile"
         );
         guard.check_source(&source)?;

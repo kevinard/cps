@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     iter,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -9,7 +10,8 @@ use anyhow::{Context, Result, ensure};
 use super::{Image, Publisher, Publishers, Settings, State, builds, catalogs};
 use crate::{
     attestation::BuildTrust,
-    kdl_format::read_build_trust,
+    boot::{is_registered_btrfs, with_running_environment},
+    kdl_format::{read_build_trust, read_image_definition},
     model::validate_publisher,
     repo::{
         BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
@@ -89,7 +91,7 @@ impl Publishers {
             return Ok(None);
         };
         let (primary, companions) = self
-            .as_slice()
+            .signed_publishers()
             .split_first()
             .context("missing primary publisher")?;
         let (checkpoint, profile) = release_profile(
@@ -142,32 +144,45 @@ pub fn add_publisher_with_build_trust(
     key: &Path,
     policy: Option<&Path>,
 ) -> Result<()> {
-    let mut image = Image::open(root, true)?;
-    let configured = editable_publishers(&image)?;
-    ensure!(
-        configured.get(name).is_none(),
-        "publisher {name} is already configured"
-    );
-    let mut publisher = Publisher::from_config(name, repo, key)?;
-    if let Some(path) = policy {
-        let trust = read_build_trust(path)?.load(&publisher.key)?;
-        audit_installed_builds(
-            &publisher.repo,
-            name,
-            &publisher.key,
-            None,
-            |_| Ok(()),
-            &trust,
-            [],
-        )?;
-        publisher.build_trust = Some(trust);
-    } else {
-        catalog_index(&publisher.repo, name, &publisher.key, None)
-            .with_context(|| format!("verifying signed catalog for {name}"))?;
-    }
-    let mut publishers = configured.as_slice().to_vec();
-    publishers.push(publisher);
-    save(&mut image, Publishers::new(publishers, None)?, &[])
+    edit_publisher_order(root, |image, configured, registered| {
+        ensure!(
+            configured.get(name).is_none(),
+            "publisher {name} is already configured"
+        );
+        if configured.release_profile().is_some() {
+            let state = image.state()?;
+            ensure!(
+                !state.settings.profile_packages.is_empty(),
+                "install the signed profile composition before adding a local publisher"
+            );
+            image.verify_catalog_archives(&state)?;
+        }
+        let mut publisher = Publisher::from_config(name, repo, key)?;
+        if let Some(path) = policy {
+            let trust = read_build_trust(path)?.load(&publisher.key)?;
+            audit_installed_builds(
+                &publisher.repo,
+                name,
+                &publisher.key,
+                None,
+                |_| Ok(()),
+                &trust,
+                [],
+            )?;
+            publisher.build_trust = Some(trust);
+        } else {
+            catalog_index(&publisher.repo, name, &publisher.key, None)
+                .with_context(|| format!("verifying signed catalog for {name}"))?;
+        }
+        let mut publishers = configured.as_slice().to_vec();
+        publishers.push(publisher);
+        save(
+            image,
+            configured.with_publishers(publishers)?,
+            &[],
+            registered,
+        )
+    })
 }
 
 /// Move one or more configured publishers to authenticated replacement caches.
@@ -198,8 +213,7 @@ pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)
     if changed.is_empty() {
         return Ok(());
     }
-    let profile_name = state.publishers.release_profile().map(str::to_owned);
-    let publishers = Publishers::new(publishers, profile_name)?;
+    let publishers = state.publishers.with_publishers(publishers)?;
     let profile = publishers.select_profile(
         &state.settings.arch,
         &state.settings.facets,
@@ -243,7 +257,7 @@ pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)
         };
         check().with_context(|| format!("checking replacement catalog for {}", publisher.name))?;
     }
-    save(&mut image, publishers, &[])
+    save(&mut image, publishers, &[], false)
 }
 
 /// Replace the locally provisioned builder policy. Audit installed packages
@@ -274,8 +288,12 @@ pub fn set_publisher_build_trust(
     };
     if publisher.build_trust.as_ref() != Some(&trust) {
         publisher.build_trust = Some(trust);
-        let profile = state.publishers.release_profile().map(str::to_owned);
-        save(&mut image, Publishers::new(publishers, profile)?, &receipts)?;
+        save(
+            &mut image,
+            state.publishers.with_publishers(publishers)?,
+            &receipts,
+            false,
+        )?;
     } else if !receipts.is_empty() {
         let tx = image.db.transaction()?;
         builds::save_audit(&tx, &state.publishers, &state.settings, &receipts)?;
@@ -461,35 +479,54 @@ fn audit_archived<'a>(
 }
 
 pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
-    let mut image = Image::open(root, true)?;
-    let configured = editable_publishers(&image)?;
-    let mut publishers = configured.as_slice().to_vec();
-    let position = position(&publishers, name)?;
-    if position == 0 {
-        return Ok(());
-    }
-    publishers[..=position].rotate_right(1);
-    save(&mut image, Publishers::new(publishers, None)?, &[])
+    edit_publisher_order(root, |image, configured, registered| {
+        let mut publishers = configured.as_slice().to_vec();
+        let position = position(&publishers, name)?;
+        let first = configured.signed_publishers().len();
+        ensure!(
+            position >= first,
+            "the signed release profile fixes this image's publishers and their order"
+        );
+        if position == first {
+            return Ok(());
+        }
+        publishers[first..=position].rotate_right(1);
+        save(
+            image,
+            configured.with_publishers(publishers)?,
+            &[],
+            registered,
+        )
+    })
 }
 
 pub fn remove_publisher(root: &Path, name: &str) -> Result<()> {
-    let mut image = Image::open(root, true)?;
-    let configured = editable_publishers(&image)?;
-    let mut publishers = configured.as_slice().to_vec();
-    let position = position(&publishers, name)?;
-    ensure!(
-        publishers.len() > 1,
-        "cannot remove the image's last publisher"
-    );
-    for (package_name, package) in image.installed()? {
-        package.verify(&package_name, &configured)?;
+    edit_publisher_order(root, |image, configured, registered| {
+        let mut publishers = configured.as_slice().to_vec();
+        let position = position(&publishers, name)?;
         ensure!(
-            package.published.manifest.publisher != name,
-            "cannot remove publisher {name} while {package_name} is installed"
+            position >= configured.signed_publishers().len(),
+            "the signed release profile fixes this image's publishers and their order"
         );
-    }
-    publishers.remove(position);
-    save(&mut image, Publishers::new(publishers, None)?, &[])
+        ensure!(
+            publishers.len() > 1,
+            "cannot remove the image's last publisher"
+        );
+        for (package_name, package) in image.installed()? {
+            package.verify(&package_name, &configured)?;
+            ensure!(
+                package.published.manifest.publisher != name,
+                "cannot remove publisher {name} while {package_name} is installed"
+            );
+        }
+        publishers.remove(position);
+        save(
+            image,
+            configured.with_publishers(publishers)?,
+            &[],
+            registered,
+        )
+    })
 }
 
 fn position(publishers: &[Publisher], name: &str) -> Result<usize> {
@@ -500,18 +537,53 @@ fn position(publishers: &[Publisher], name: &str) -> Result<usize> {
         .with_context(|| format!("publisher {name} is not configured"))
 }
 
-fn editable_publishers(image: &Image) -> Result<Publishers> {
+fn edit_publisher_order(
+    path: &Path,
+    edit: impl FnOnce(&mut Image, Publishers, bool) -> Result<()>,
+) -> Result<()> {
+    let mut image = Image::open(path, true)?;
     image.require_clean()?;
     let publishers = image.publishers()?;
-    ensure!(
-        publishers.release_profile().is_none(),
-        "the signed release profile fixes this image's publishers and their order"
-    );
-    Ok(publishers)
+    if publishers.release_profile().is_none() || !is_registered_btrfs(&image.root)? {
+        return edit(&mut image, publishers, false);
+    }
+
+    let target = image.root.as_file().metadata()?;
+    // Acquire the ESP before reopening the image, as activation does.
+    drop(image);
+    let boot = read_image_definition(Path::new(crate::system::CONFIG))?
+        .boot_btrfs
+        .context("configure boot-btrfs to edit publishers on the installed image")?;
+    with_running_environment(
+        &boot.volume,
+        &boot.esp,
+        &boot.activation.root_partuuid,
+        |root, id, revision| {
+            let running = root.as_file().metadata()?;
+            ensure!(
+                (target.dev(), target.ino()) == (running.dev(), running.ino()),
+                "boot the selected image before changing its local publishers"
+            );
+            let mut image = Image::open_for_live_apply(root, id, revision)?;
+            image.require_clean()?;
+            let publishers = image.publishers()?;
+            edit(&mut image, publishers, true)
+        },
+    )
 }
 
-fn save(image: &mut Image, publishers: Publishers, receipts: &[BuildReceipt]) -> Result<()> {
+fn save(
+    image: &mut Image,
+    publishers: Publishers,
+    receipts: &[BuildReceipt],
+    registered: bool,
+) -> Result<()> {
     let mut settings = image.settings()?;
+    if registered {
+        // A snapshot taken before this edit must fail the boot parent revision check.
+        settings.boot_revision = Some(settings.boot_revision());
+        settings.revision = settings.next_revision()?;
+    }
     settings
         .catalog_checkpoints
         .retain(|name, _| publishers.get(name).is_some());

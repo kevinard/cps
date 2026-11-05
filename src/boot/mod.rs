@@ -272,6 +272,12 @@ pub(crate) fn check_package_write_root(root: &Root) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn is_registered_btrfs(root: &Root) -> Result<bool> {
+    Ok(root.as_file().metadata()?.ino() == 256
+        && fstatfs(root.as_file())?.f_type == libc::BTRFS_SUPER_MAGIC
+        && btrfs_boot::registered(root)?)
+}
+
 fn check_image_integrity(image: &Image) -> Result<()> {
     for finding in verify_image(image)? {
         ensure!(

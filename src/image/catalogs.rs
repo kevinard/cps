@@ -96,7 +96,7 @@ fn profile(catalog: &mut Catalog, hash: &str, name: &str, state: &State) -> Resu
         name,
         &state.settings.arch,
         &state.settings.facets,
-        state.publishers.as_slice()[1..]
+        state.publishers.signed_publishers()[1..]
             .iter()
             .map(|publisher| publisher.name.as_str()),
     )?;
@@ -177,9 +177,14 @@ pub(super) fn verify(db: &Connection, state: &State) -> Result<()> {
             "missing catalog checkpoint for installed publisher {publisher}"
         );
     }
-    for (index, publisher) in publishers.iter().enumerate() {
+    for publisher in publishers {
         let point = state.settings.catalog_checkpoints.get(&publisher.name);
-        let pin = signed.as_ref().map(|profile| &profile.companions[index]);
+        let pin = signed.as_ref().and_then(|profile| {
+            profile
+                .companions
+                .iter()
+                .find(|pin| pin.publisher == publisher.name)
+        });
         let Some(point) = point else {
             ensure!(
                 pin.is_none(),

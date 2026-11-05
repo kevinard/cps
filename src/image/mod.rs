@@ -45,6 +45,8 @@ const PROFILE_INTENT_IMAGE_FORMAT: u32 = 8;
 const FREEZE_IMAGE_FORMAT: u32 = 9;
 // Older clients cannot verify a boot entry after a live package transaction.
 const LIVE_IMAGE_FORMAT: u32 = 10;
+// Older clients interpret every publisher in a profiled image as signed.
+const LOCAL_PUBLISHER_IMAGE_FORMAT: u32 = 11;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +218,8 @@ pub(crate) enum Publishers {
     Profiled {
         release_profile: String,
         publishers: Vec<Publisher>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_count: Option<usize>,
     },
 }
 
@@ -225,6 +229,7 @@ impl Publishers {
             Some(release_profile) => Self::Profiled {
                 release_profile,
                 publishers,
+                signed_count: None,
             },
             None => match <[Publisher; 1]>::try_from(publishers) {
                 Ok([publisher]) => Self::Single(publisher),
@@ -252,6 +257,38 @@ impl Publishers {
         }
     }
 
+    pub(crate) fn signed_publishers(&self) -> &[Publisher] {
+        match self {
+            Self::Profiled {
+                publishers,
+                signed_count,
+                ..
+            } => &publishers[..signed_count.unwrap_or(publishers.len())],
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn is_local(&self, name: &str) -> bool {
+        self.release_profile().is_some()
+            && self.as_slice()[self.signed_publishers().len()..]
+                .iter()
+                .any(|publisher| publisher.name == name)
+    }
+
+    fn with_publishers(&self, publishers: Vec<Publisher>) -> Result<Self> {
+        let Some(profile) = self.release_profile() else {
+            return Self::new(publishers, None);
+        };
+        let count = self.signed_publishers().len();
+        let result = Self::Profiled {
+            release_profile: profile.to_owned(),
+            signed_count: (count != publishers.len()).then_some(count),
+            publishers,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<&Publisher> {
         self.as_slice()
             .iter()
@@ -259,7 +296,15 @@ impl Publishers {
     }
 
     pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
-        if settings.boot_revision.is_some()
+        if matches!(
+            self,
+            Self::Profiled {
+                signed_count: Some(_),
+                ..
+            }
+        ) {
+            LOCAL_PUBLISHER_IMAGE_FORMAT
+        } else if settings.boot_revision.is_some()
             || settings
                 .boot_parent
                 .as_ref()
@@ -298,6 +343,17 @@ impl Publishers {
         );
         if let Some(profile) = self.release_profile() {
             validate_name(profile).context("invalid image release profile")?;
+        }
+        if let Self::Profiled {
+            signed_count: Some(count),
+            publishers,
+            ..
+        } = self
+        {
+            ensure!(
+                *count > 0 && *count < publishers.len(),
+                "invalid signed publisher count"
+            );
         }
         let mut names = BTreeSet::new();
         for publisher in self.as_slice() {
@@ -687,6 +743,7 @@ impl Image {
                     | PROFILE_INTENT_IMAGE_FORMAT
                     | FREEZE_IMAGE_FORMAT
                     | LIVE_IMAGE_FORMAT
+                    | LOCAL_PUBLISHER_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -726,6 +783,16 @@ impl Image {
                     && settings.bootstrap_catalog.is_none()
                     && !settings.catalog_checkpoints.is_empty()),
             "protected packages require an installed signed profile"
+        );
+        ensure!(
+            !matches!(
+                publishers,
+                Publishers::Profiled {
+                    signed_count: Some(_),
+                    ..
+                }
+            ) || !settings.profile_packages.is_empty(),
+            "local publishers require an installed signed profile composition"
         );
         for (publisher, checkpoint) in &settings.catalog_checkpoints {
             ensure!(
