@@ -379,10 +379,8 @@ pub(crate) fn copy_payload(source: &File, node: &Node, destination: &mut File) -
 
 fn parse_mode(mode: &str) -> Result<u32> {
     ensure!(
-        mode.len() == 4
-            && mode.starts_with('0')
-            && mode.bytes().all(|b| (b'0'..=b'7').contains(&b)),
-        "expected a mode such as \"0755\""
+        mode.len() == 4 && mode.bytes().all(|b| (b'0'..=b'7').contains(&b)),
+        "expected a four-digit octal mode such as \"0755\" or \"1777\""
     );
     Ok(u32::from_str_radix(mode, 8)?)
 }
@@ -480,6 +478,20 @@ impl Action {
                 ..
             } => {
                 let mode = parse_mode(mode)?;
+                ensure!(
+                    mode & 0o1000 == 0,
+                    "sticky bits are only supported on directories"
+                );
+                if mode & 0o6000 != 0 {
+                    ensure!(
+                        *uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0 && !preserve,
+                        "setid bits require a root-owned executable with no group or other write access and preserve disabled"
+                    );
+                    ensure!(
+                        capabilities.is_none(),
+                        "setid bits cannot be combined with file capabilities"
+                    );
+                }
                 if let Some(original) = original_name {
                     ensure!(*preserve, "original-name requires preserve=#true");
                     let (package, path) = original.split_once(':').context(
@@ -511,7 +523,10 @@ impl Action {
                 (*uid, *gid)
             }
             Self::Dir { mode, uid, gid, .. } => {
-                parse_mode(mode)?;
+                ensure!(
+                    parse_mode(mode)? & 0o4000 == 0,
+                    "setuid directories are not supported"
+                );
                 (*uid, *gid)
             }
             Self::Symlink {

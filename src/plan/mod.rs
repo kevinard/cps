@@ -907,8 +907,17 @@ pub(crate) fn build(
             Some(target) if target.node.is_dir() => match &observed {
                 None => Some(target.node.clone()),
                 Some(existing) => {
-                    check_directory(path, existing, target)?;
-                    observed.clone()
+                    if !target.implicit
+                        && before.is_some_and(|old| !old.implicit && existing == &old.node)
+                    {
+                        // Update an explicitly owned directory only while its
+                        // metadata still matches the installed declaration.
+                        root.dir(path)?;
+                        Some(target.node.clone())
+                    } else {
+                        check_directory(path, existing, target)?;
+                        observed.clone()
+                    }
                 }
             },
             Some(target) => {

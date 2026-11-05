@@ -10,6 +10,9 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 mkdir -p proto/bin
+mkdir -p proto/tmp proto/var/shared
+chmod 1777 proto/tmp
+chmod 2775 proto/var/shared
 printf 'managed data\n' > proto/bin/tool
 chmod 0755 proto/bin/tool
 ln proto/bin/tool proto/bin/alias
@@ -27,6 +30,8 @@ id=${id%% at *}
 chmod 0750 image
 setfattr -n user.cps-root -v root-data image
 printf 'local data\n' > image/local-state
+printf 'local executable data\n' > image/local-setid
+chmod 6755 image/local-setid
 setfattr -n user.cps -v exported image/local-state
 source_state=$(sha256sum image/.cps/state.sqlite)
 
@@ -39,6 +44,9 @@ test "$(stat -c '%s:%a' root.ext4)" = '67108864:600'
 test "$(debugfs -R 'cat /bin/tool' root.ext4 2>/dev/null)" = 'managed data'
 test "$(debugfs -R 'cat /local-state' root.ext4 2>/dev/null)" = 'local data'
 debugfs -R 'stat /' root.ext4 2>/dev/null | grep -E 'Mode: +0750'
+debugfs -R 'stat /tmp' root.ext4 2>/dev/null | grep -E 'Mode: +0?1777'
+debugfs -R 'stat /var/shared' root.ext4 2>/dev/null | grep -E 'Mode: +0?2775'
+debugfs -R 'stat /local-setid' root.ext4 2>/dev/null | grep -E 'Mode: +0?6755'
 debugfs -R 'ea_list /' root.ext4 2>/dev/null | grep -F 'user.cps-root (9) = "root-data"'
 debugfs -R 'stat /bin/link' root.ext4 2>/dev/null | grep -Fx 'Fast link dest: "tool"'
 debugfs -R 'ea_list /local-state' root.ext4 2>/dev/null | grep -F 'user.cps (8) = "exported"'

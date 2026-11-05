@@ -63,10 +63,6 @@ pub fn generate_manifest_for_architecture(
         let mode = |allow_capability| {
             let mode = info.st_mode & 0o7777;
             ensure!(
-                mode <= 0o777,
-                "unsupported special permission bits at {path:?}"
-            );
-            ensure!(
                 !Root::has_xattrs(entry, allow_capability)
                     .with_context(|| format!("listing attributes at {path:?}"))?,
                 "unsupported extended attributes at {path:?}"

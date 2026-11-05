@@ -316,7 +316,7 @@ impl Root {
                 Self::set_file_metadata(&temp, node)
                     .with_context(|| format!("preparing file metadata for {path}"))?;
             }
-            Node::Dir { mode, uid, gid } => {
+            Node::Dir { .. } => {
                 mkdirat(staging, TEMP, Mode::RWXU)?;
                 let temp = openat2(
                     staging,
@@ -326,8 +326,7 @@ impl Root {
                     ResolveFlags::NO_SYMLINKS,
                 )?;
                 let temp = File::from(temp);
-                set_metadata(&temp, *mode, *uid, *gid)?;
-                temp.sync_all()?;
+                Self::set_directory_metadata(&temp, node)?;
             }
             Node::Symlink { target, uid, gid } => {
                 symlinkat(target.as_str(), staging, TEMP)?;
@@ -452,11 +451,20 @@ impl Root {
         }
     }
 
+    pub(crate) fn set_directory_metadata(file: &File, node: &Node) -> Result<()> {
+        let Node::Dir { uid, gid, mode } = *node else {
+            anyhow::bail!("expected directory metadata");
+        };
+        set_metadata(file, mode, uid, gid)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     pub fn repair_directory(&self, path: &str, before: &Node, after: &Node) -> Result<bool> {
         let Node::Dir { mode: old_mode, .. } = *before else {
             anyhow::bail!("expected directory metadata at {path}");
         };
-        let Node::Dir { uid, gid, mode } = *after else {
+        let Node::Dir { uid, gid, .. } = *after else {
             anyhow::bail!("expected directory metadata at {path}");
         };
         let file = self
@@ -478,8 +486,7 @@ impl Root {
             observed == *before || observed == intermediate,
             "unexpected state at {path}; pending transaction retained"
         );
-        set_metadata(&file, mode, uid, gid)?;
-        file.sync_all()?;
+        Self::set_directory_metadata(&file, after)?;
         ensure!(
             directory_metadata(&file)? == *after,
             "could not restore directory metadata at {path}; pending transaction retained"
@@ -586,6 +593,11 @@ fn set_metadata(file: &File, mode: u32, uid: u32, gid: u32) -> Result<()> {
         fchown(file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
     }
     fchmod(file, Mode::from_raw_mode(mode))?;
+    let info = fstat(file)?;
+    ensure!(
+        (info.st_uid, info.st_gid, info.st_mode & 0o7777) == (uid, gid, mode),
+        "filesystem did not retain the requested ownership and mode"
+    );
     Ok(())
 }
 
@@ -601,24 +613,26 @@ mod tests {
         let root = Root::open(temp.path())?;
         let path = temp.path().join("dir");
         fs::create_dir(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o770))?;
         let metadata = fs::metadata(&path)?;
         let (uid, gid) = (metadata.uid(), metadata.gid());
-        let before = Node::Dir {
-            uid: uid ^ 1,
-            gid,
-            mode: 0o700,
-        };
-        let after = Node::Dir {
-            uid,
-            gid,
-            mode: 0o755,
-        };
-        assert!(root.repair_directory("dir", &before, &after).is_err());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-        assert!(root.repair_directory("dir", &before, &after)?);
-        assert_eq!(root.inspect("dir")?, Some(after.clone()));
-        assert!(!root.repair_directory("dir", &before, &after)?);
+        for mode in [0o700, 0o2770, 0o3770] {
+            let before = Node::Dir {
+                uid: uid ^ 1,
+                gid,
+                mode,
+            };
+            let after = Node::Dir {
+                uid,
+                gid,
+                mode: 0o1777,
+            };
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o770))?;
+            assert!(root.repair_directory("dir", &before, &after).is_err());
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            assert!(root.repair_directory("dir", &before, &after)?);
+            assert_eq!(root.inspect("dir")?, Some(after.clone()));
+            assert!(!root.repair_directory("dir", &before, &after)?);
+        }
         Ok(())
     }
 }

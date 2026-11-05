@@ -100,7 +100,7 @@ regular-file hard-link group it records one payload path and aliases within the
 prototype. Groups extending outside the prototype are rejected. Ownership
 defaults to UID and GID zero. Use `--uid` and `--gid` to set explicit owners.
 The generator captures Linux file capabilities from executable inodes. It
-rejects namespaced capability sets, hard-linked symlinks, special modes and
+rejects namespaced capability sets, hard-linked symlinks, unsupported permission bits and
 filesystem objects, and other extended attributes on regular files or
 directories. Review the manifest and add dependency, configuration, and
 systemd declarations before publishing. Publication derives the payload
@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-37`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-38`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1215,6 +1215,37 @@ candidates. It keeps the dependencies needed by that solution, including a
 compatible alternative and any conditional dependencies that apply. The
 plan and apply work offline. Use `plan mark explicit` to keep an installed
 dependency before planning cleanup.
+
+### Filesystem permissions
+
+Modes use four octal digits. Directories support sticky and setgid bits,
+including `1777` for temporary directories and `2775` for shared group
+directories. Setuid directories and sticky regular files are rejected.
+Regular files can declare setuid or setgid modes such as `4755`, `2755`,
+and `6755`. These files must be root-owned executables, with no group or
+other write access, `preserve` disabled, and no file capabilities.
+
+CPS sets ownership before permissions, checks that the filesystem retained
+the requested values, and prepares privileged files privately before atomic
+publication. It probes setid file and setgid directory support before
+journaling a transaction. This catches Linux silently clearing setgid when
+the caller lacks the required group membership or `CAP_FSETID`.
+[Linux chmod behavior](https://man7.org/linux/man-pages/man2/chmod.2.html)
+
+Upgrades can change an explicitly managed directory's ownership and modes
+while its metadata still matches the installed declaration. CPS changes
+that inode in place and keeps its contents. Local metadata changes stop the
+upgrade for review; `plan repair` can restore the installed declaration.
+Directory changes and privileged file replacements can resume offline from
+the journal. Managed hard links follow their target's permissions.
+
+Use CPS `0.1.0-38` or later for package operations once a release uses these
+permission bits. Earlier clients reject the new manifests. Run
+`tests/file-modes-vm.sh` with the QEMU and kernel overrides to verify actual
+setuid/setgid execution, sticky deletion rules, group inheritance, failure
+without `CAP_FSETID`, interrupted offline recovery, repair, isolated boot
+clones, and removal of privileges by an upgrade. `tests/boot-export.sh`
+checks the bits in the exported ext4 image.
 
 ### Freezing package versions
 

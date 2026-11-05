@@ -411,13 +411,8 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
             .contains("extends outside the prototype")
     );
     fs::remove_file(hardlink)?;
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o4755))?;
-    assert!(
-        generate(&f.proto)
-            .unwrap_err()
-            .to_string()
-            .contains("special permission bits")
-    );
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o1755))?;
+    assert!(format!("{:#}", generate(&f.proto).unwrap_err()).contains("sticky bits"));
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
     rustix::fs::setxattr(
         &file,
@@ -2977,3 +2972,4 @@ fn exact_install_and_remove_offline() -> Result<()> {
 mod release;
 
 mod freezes;
+mod modes;

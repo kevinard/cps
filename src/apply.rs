@@ -552,11 +552,22 @@ fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> 
     }
     for write in writes.iter().filter(|write| write.replaces_file()) {
         if let Some(node) = &write.after
-            && node.capabilities().is_some()
+            && (node.capabilities().is_some()
+                || matches!(node, Node::File { mode, .. } if mode & 0o6000 != 0))
         {
             let probe = NamedTempFile::new_in(&dir)?;
             Root::set_file_metadata(probe.as_file(), node)
-                .with_context(|| format!("checking file capability support for {}", write.path))?;
+                .with_context(|| format!("checking file metadata support for {}", write.path))?;
+        }
+    }
+    for write in writes {
+        if let Some(node @ Node::Dir { mode, .. }) = &write.after
+            && mode & 0o2000 != 0
+        {
+            let probe = tempfile::tempdir_in(&dir)?;
+            Root::set_directory_metadata(&File::open(probe.path())?, node).with_context(|| {
+                format!("checking directory metadata support for {}", write.path)
+            })?;
         }
     }
     if let Some((path, node @ Node::File { sha256, .. })) = plan.config_payload() {
