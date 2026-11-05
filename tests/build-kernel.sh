@@ -7,6 +7,14 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cps=$(realpath -- "${CPS_TEST_BINARY:-"$project/target/debug/cps"}")
 output=$(realpath -m -- "${1:?usage: build-kernel.sh OUTPUT-DIRECTORY}")
 sources=$(realpath -- "${CPS_KERNEL_SOURCE_DIR:?Set CPS_KERNEL_SOURCE_DIR to the verified Linux source directory}")
+manifest=kernel.kdl
+release=6.12.115-cps-vm
+localversion=-cps-vm
+case ${CPS_KERNEL_VARIANT:-base} in
+    base) ;;
+    next) manifest=kernel-next.kdl; release=6.12.115-cps-vm-next; localversion=-cps-vm-next ;;
+    *) echo 'CPS_KERNEL_VARIANT must be base or next' >&2; exit 2 ;;
+esac
 [[ $(uname -m) == x86_64 ]] || { echo 'The QEMU kernel fixture needs an x86-64 worker' >&2; exit 1; }
 if [[ -n ${CPS_KERNEL_BC:-} ]]; then
     CPS_KERNEL_BC=$(realpath -- "$CPS_KERNEL_BC")
@@ -34,13 +42,17 @@ bash "$project/tests/seed-native-c.sh" "$work/native-kernel" --kernel
 recipe="$project/packaging/kernel-qemu"
 mkdir "$work/inputs"
 cp --reflink=auto -- "$sources/linux-6.12.115.tar.xz" "$recipe/vm.config" "$work/inputs/"
-sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/kernel.kdl" > kernel.kdl
+if [[ ${CPS_KERNEL_VARIANT:-base} == next ]]; then
+    printf 'CONFIG_HZ_1000=y\n' >> "$work/inputs/vm.config"
+fi
+sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/$manifest" > kernel.kdl
 kernel_version=$(awk -F 'version="' '/^package / {split($2, version, "\""); print version[1]}' kernel.kdl)
 test -n "$kernel_version"
 sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha kernel.kdl)/g" \
-    -e "s/@CONFIG_SHA256@/$(sha "$recipe/vm.config")/g" \
-    -e "s/@CONFIG_SIZE@/$(wc -c < "$recipe/vm.config")/g" \
+    -e "s/@CONFIG_SHA256@/$(sha "$work/inputs/vm.config")/g" \
+    -e "s/@CONFIG_SIZE@/$(wc -c < "$work/inputs/vm.config")/g" \
+    -e "s/@LOCALVERSION@/$localversion/g" -e "s/@KERNEL_RELEASE@/$release/g" \
     "$recipe/build.kdl.in" > build.kdl
 "$cps" source import --from "$work/inputs" --cache sources build.kdl
 "$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \
@@ -67,7 +79,6 @@ package=cps://canopa-kernel/system/kernel-qemu@$kernel_version
 "$cps" plan --root image --output install.json install "$package"
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine
-release=6.12.115-cps-vm
 cmp "bundle/proto/usr/lib/modules/$release/vmlinuz" "image/usr/lib/modules/$release/vmlinuz"
 printf '%s\n' "$release" > kernel-release
 printf '%s\n' "$package" > kernel-package

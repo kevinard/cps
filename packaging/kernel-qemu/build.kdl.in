@@ -10,14 +10,14 @@ build architecture="x86_64" epoch=1793361987 {
     command -v readelf >/dev/null
     tar -xf "$CPS_SOURCES/linux-6.12.115.tar.xz"
     cd linux-6.12.115
-    export ARCH=x86_64 LOCALVERSION=-cps-vm KBUILD_BUILD_USER=cps KBUILD_BUILD_HOST=build
+    export ARCH=x86_64 LOCALVERSION=@LOCALVERSION@ KBUILD_BUILD_USER=cps KBUILD_BUILD_HOST=build
     export KBUILD_BUILD_VERSION=1 KBUILD_BUILD_TIMESTAMP="$(date -u -d "@$SOURCE_DATE_EPOCH" '+%a %b %d %T UTC %Y')"
     make KCONFIG_ALLCONFIG="$CPS_SOURCES/vm.config" allnoconfig
     while IFS= read -r setting; do
         grep -Fxq "$setting" .config || { echo "Kernel configuration dropped $setting" >&2; exit 1; }
     done < "$CPS_SOURCES/vm.config"
     release=$(make -s kernelrelease)
-    test "$release" = 6.12.115-cps-vm
+    test "$release" = @KERNEL_RELEASE@
     make -j4 bzImage
     install -Dm644 arch/x86/boot/bzImage "$DESTDIR/usr/lib/modules/$release/vmlinuz"
     install -Dm644 .config "$DESTDIR/usr/lib/modules/$release/config"
