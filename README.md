@@ -1560,6 +1560,21 @@ Add `CPS_VM_BTRFS_HEALTH_FAIL=1` to change a managed file's metadata at
 trial boot and verify that two unblessed attempts fall back to the original
 subvolume.
 
+Run `tests/boot-profile-btrfs-vm.sh` to test a native Btrfs root assembled
+entirely through a signed release profile. Set `CPS_VM_CPS_FIXTURE`,
+`CPS_VM_KERNEL_FIXTURE`, `CPS_VM_SYSTEMD_FIXTURE`,
+`CPS_VM_USR_BASE_FIXTURE`, `CPS_VM_UTIL_LINUX_FIXTURE`, and
+`CPS_VM_BUSYBOX_FIXTURE` to the corresponding build outputs, and provide
+the QEMU, OVMF, and trusted `CPS_VM_MKFS_BTRFS` overrides. The test installs
+the source-built CPS, systemd, util-linux, BusyBox, and Btrfs-capable kernel
+with builder trust enforced by the signed profile. The ELF runtime comes
+from the signed merged `/usr` seed. It keeps signing keys outside the guest
+and mounts its repositories read-only. It captures the running root,
+stages an unfreeze, applies the profile upgrade to that private root, boots
+and blesses it, checks the default on reboot, and explicitly rolls back to
+the previous root with its original freeze. Both roots use the same signed
+kernel; the kernel replacement test below uses distinct kernels.
+
 Set `CPS_VM_KERNEL_FIXTURE` to the output from `tests/build-kernel.sh`
 to stage the signed Btrfs-capable kernel as part of the upgrade. The image
 requires its builder signature, audits the installed evidence after boot,
@@ -2013,14 +2028,16 @@ CPS_UTIL_LINUX_SOURCE_DIR=/path/to/verified-sources \
 tests/build-util-linux.sh target/util-linux-fixture target/usr-base-fixture
 ```
 
-The fixture builds `mount`, `umount`, `blkid`, and their libraries twice
+The fixture builds `mount`, `umount`, `blkid`, `sfdisk`, and their libraries twice
 offline. It publishes the matching outputs with signed build evidence, then
 installs the package into the signed merged base and runs the tools with its
 loader. The package also delivers the headers and linker inputs under the
 `devel` facet.
 
 Set `CPS_SYSTEMD_UTIL_LINUX_FIXTURE=target/util-linux-fixture` when running
-`tests/build-systemd.sh`. Systemd package revision `262.1.0-4` uses the
+`tests/build-systemd.sh`. Systemd package revision `262.1.0-5` uses util-linux
+`2.42.4-1`, including the GPT tools needed for native boot activation. The
+earlier systemd revision `262.1.0-4` uses util-linux `2.42.4-0`. Both use the
 util-linux, libseccomp, and ELF runtime packages directly from their pinned
 publisher catalogs. The libseccomp headers, pkg-config metadata, and library
 come from the same signed package. Set `CPS_SYSTEMD_LIBSECCOMP_VERSION=2.6.1-0`

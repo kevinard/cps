@@ -11,14 +11,15 @@ build architecture="x86_64" epoch=1789987631 {
     CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=3" LDFLAGS="-Wl,-z,relro,-z,now" \\
         ./configure --prefix=/usr --bindir=/usr/bin --sbindir=/usr/bin --libdir=/usr/lib \\
         --disable-all-programs --enable-libblkid --enable-libmount --enable-mount --enable-blkid \\
+        --enable-fdisks=check --enable-libfdisk --enable-libsmartcols --enable-libuuid \\
         --disable-static --disable-nls --disable-asciidoc --disable-poman --disable-bash-completion \\
         --without-systemd --without-udev --without-python
-    make -j4 mount umount blkid libmount/mount.pc libblkid/blkid.pc
+    make -j4 mount umount blkid sfdisk libmount/mount.pc libblkid/blkid.pc
 
-    for tool in mount umount blkid; do
+    for tool in mount umount blkid sfdisk; do
         install -Dm755 ".libs/$tool" "$DESTDIR/usr/bin/$tool"
     done
-    for library in libblkid libmount; do
+    for library in libblkid libmount libfdisk libsmartcols libuuid; do
         install -Dm644 ".libs/$library.so.1" "$DESTDIR/usr/lib/$library.so.1"
     done
     install -Dm644 libblkid/src/blkid.h "$DESTDIR/usr/include/blkid/blkid.h"

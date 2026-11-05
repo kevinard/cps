@@ -45,12 +45,12 @@ cat > repo/publish-policy.kdl <<POLICY
 schema-version 1
 publisher "canopa-util-linux" {
     builder-key "builder-public.der"
-    approve "system/util-linux" version="2.42.4-0" sha256="$reviewed"
+    approve "system/util-linux" version="2.42.4-1" sha256="$reviewed"
 }
 POLICY
 "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$reviewed" bundle
-package=cps://canopa-util-linux/system/util-linux@2.42.4-0
+package=cps://canopa-util-linux/system/util-linux@2.42.4-1
 "$cps" repo attestation --repo repo --publisher canopa-util-linux --trust-key release-public.der \
     "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
@@ -60,7 +60,7 @@ package=cps://canopa-util-linux/system/util-linux@2.42.4-0
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine
 loader=(env -i "$PWD/image/usr/lib/ld-linux-x86-64.so.2" --inhibit-cache --library-path "$PWD/image/usr/lib")
-for program in blkid mount umount; do
+for program in blkid mount umount sfdisk; do
     cmp "bundle/proto/usr/bin/$program" "image/usr/bin/$program"
     links=$("${loader[@]}" --list "image/usr/bin/$program")
     awk -v prefix="$PWD/image/" '$2 == "=>" && index($3, prefix) != 1 {print; exit 1}' <<< "$links"

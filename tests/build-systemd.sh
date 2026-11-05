@@ -20,8 +20,12 @@ case $seccomp_version in
 esac
 if [[ -n $util_linux ]]; then
     util_linux=$(realpath -- "$util_linux")
+    util_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$util_linux/util-linux.kdl")
+    case $util_version in 2.42.4-0|2.42.4-1) ;; *) echo 'Unsupported util-linux fixture' >&2; exit 2 ;; esac
+    util_package=cps://canopa-util-linux/system/util-linux@$util_version
     systemd_version=262.1.0-2
     if [[ $packaged_seccomp == 1 ]]; then systemd_version=262.1.0-4; fi
+    if [[ $util_version == 2.42.4-1 ]]; then systemd_version=262.1.0-5; fi
 fi
 CPS_SYSTEMD_TOOLS_ROOT=$(realpath -- "${CPS_SYSTEMD_TOOLS_ROOT:-/}")
 export CPS_SYSTEMD_TOOLS_ROOT
@@ -64,6 +68,14 @@ CPS_SYSTEMD_PACKAGED_LIBS=$packaged_libs CPS_SYSTEMD_PACKAGED_SECCOMP=$packaged_
     bash "$project/tests/seed-native-c.sh" "$work/native-systemd" --systemd
 if $configured; then
     # These paths come from the pinned ELF runtime and library packages.
+    # Newer runtime seeds also own the canonical loader aliases copied while
+    # inspecting build utilities. Keep those bytes under the runtime package.
+    for path in usr/lib/ld-linux-x86-64.so.2 usr/lib64/ld-linux-x86-64.so.2; do
+        if [[ -f $runtime/image/$path && -f $work/native-systemd/$path ]]; then
+            cmp "$work/native-systemd/$path" "$runtime/image/$path"
+            rm -- "$work/native-systemd/$path"
+        fi
+    done
     for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1,libseccomp.so.2}; do
         rm -f -- "$work/native-systemd/$path"
     done
@@ -112,7 +124,7 @@ if [[ $packaged_seccomp == 1 ]]; then
     sed -i 's/>=2.6.1-0/>=2.6.1-1/' systemd.kdl
 fi
 if [[ -n $util_linux ]]; then
-    sed -i 's/require "system\/systemd-vm-libs"/require "system\/util-linux" version="=2.42.4-0"/' systemd.kdl
+    sed -i "s/require \"system\/systemd-vm-libs\"/require \"system\/util-linux\" version=\"=$util_version\"/" systemd.kdl
 fi
 sed -e "/^@TOOLCHAIN@\$/ {
 r $work/toolchain-recipe

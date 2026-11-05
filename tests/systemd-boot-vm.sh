@@ -161,11 +161,15 @@ fi
 if [[ -n $util_linux_fixture ]]; then
     [[ -n $usr_base_fixture ]] || { echo 'CPS_VM_UTIL_LINUX_FIXTURE requires the merged /usr fixture' >&2; exit 2; }
     util_linux_fixture=$(realpath -- "$util_linux_fixture")
+    util_linux_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$util_linux_fixture/util-linux.kdl")
+    case $util_linux_version in 2.42.4-0|2.42.4-1) ;; *) echo 'Unsupported util-linux fixture' >&2; exit 2 ;; esac
+    util_linux_package=cps://canopa-util-linux/system/util-linux@$util_linux_version
     if [[ $cps_version == 0.1.0-1 ]]; then
         systemd_version=262.1.0-2
     else
         systemd_version=262.1.0-4
     fi
+    if [[ $util_linux_version == 2.42.4-1 ]]; then systemd_version=262.1.0-5; fi
     "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
         --trust-key "$util_linux_fixture/release-public.der" "$util_linux_package" >/dev/null
 fi
