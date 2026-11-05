@@ -29,3 +29,7 @@ url = "2"
 
 [dev-dependencies]
 jiff = "0.2"
+
+[[example]]
+name = "tuf-fixture"
+path = "tests/support/tuf_fixture.rs"

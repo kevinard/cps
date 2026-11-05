@@ -1619,9 +1619,20 @@ a signed release profile. Use a current CPS build on the host and provide the
 signed CPS and BusyBox fixtures. The test installs the signed base
 composition, publishes the companion update, and checks that the profile
 still selects the old kernel. It advances the profile through the automatic
-upgrade check before staging and booting the trial. When slot recycling is
-disabled, the test also moves the primary and companion caches together and
-checks that the previous saved plan is stale.
+upgrade check before staging and booting the trial. In the local repository
+scenario with slot recycling disabled, the test also moves the primary and
+companion repositories together and checks that the previous saved plan is
+stale.
+
+Build the disposable mirror signer with
+`cargo build --locked --example tuf-fixture`. With the same signed profile
+fixtures, set `CPS_VM_TUF_MIRRORS=1` for the rollback scenario. The test signs
+separate local TUF mirrors with throwaway keys, syncs the base profile
+index-only, and fetches its planned payloads. It advances a companion while
+the primary still pins the previous catalog, then checks rejection of a
+replayed TUF timestamp and missing or corrupt upgrade payloads. After fetching
+the restored payload, it takes the mirrors offline, stages the upgrade, and
+boots through blessing and rollback. This scenario runs without slot reuse.
 
 With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to bootstrap
 the base and activate the trial from a rescue VM with a writable virtio disk.

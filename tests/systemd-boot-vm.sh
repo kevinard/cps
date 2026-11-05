@@ -14,6 +14,7 @@ recycle=${CPS_VM_RECYCLE_SLOT:-0}
 device_activation=${CPS_VM_DEVICE_ACTIVATION:-0}
 installed_stage=${CPS_VM_INSTALLED_STAGE:-0}
 reprovision=${CPS_VM_REPROVISION:-0}
+tuf_mirrors=${CPS_VM_TUF_MIRRORS:-0}
 if [[ $recycle == 1 && $mode != rollback ]]; then
     echo 'CPS_VM_RECYCLE_SLOT requires the rollback scenario' >&2
     exit 2
@@ -130,6 +131,14 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
         0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-3]) protected_profiles=true ;;
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
+fi
+if [[ $tuf_mirrors == 1 ]]; then
+    if ! $profiled || [[ $recycle == 1 ]]; then
+        echo 'CPS_VM_TUF_MIRRORS requires a signed release profile and no slot reuse' >&2
+        exit 2
+    fi
+    tuf_fixture=$(realpath -- "${CPS_VM_TUF_FIXTURE:-$project/target/debug/examples/tuf-fixture}")
+    test -x "$tuf_fixture" || { echo "Missing TUF fixture signer: $tuf_fixture" >&2; exit 1; }
 fi
 if [[ -n $kernel_fixture ]]; then
     $profiled || { echo 'CPS_VM_KERNEL_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
@@ -303,6 +312,22 @@ profile_companions() {
             printf '%s\n' 'canopa-systemd-seed signed-systemd-seed systemd-seed-public.der'
         fi
     fi
+}
+
+profile_repositories() {
+    printf '%s\n' 'vm-profile profile-repo profile-public.der'
+    profile_companions
+}
+
+publish_vm_mirror() {
+    local name=$1 repository=$2 key=$3 version=$4
+    shift 4
+    local mirror="mirrors/$name" export="mirrors/$name/export-$version"
+    mkdir -p -- "$mirror"
+    "$cps" repo export --repo "$repository" --publisher "$name" --trust-key "$key" \
+        --output "$export" "$@" >/dev/null
+    (umask 077; "$tuf_fixture" "$export" "$mirror" "$version" > "$mirror/url")
+    rm -r -- "$export"
 }
 
 refresh_vm_profile() {
@@ -502,15 +527,14 @@ MANIFEST
     "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der previous-default.kdl
     base_test_catalog=$(cat repo/current)
     refresh_vm_profile base
+    if [[ $tuf_mirrors == 1 ]]; then
+        while read -r name repository key; do
+            publish_vm_mirror "$name" "$repository" "$key" 1
+        done < <(profile_repositories)
+        cp mirrors/vm-profile/metadata/timestamp.json base-tuf-timestamp.json
+    fi
     {
-        cat <<'CONFIG'
-schema-version 1
-facet "devel" #false
-publisher "vm-profile" {
-    repository "profile-repo"
-    trust-key "profile-public.der"
-}
-CONFIG
+        printf 'schema-version 1\nfacet "devel" #false\n'
         if [[ $reprovision == 1 ]]; then
             printf 'image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"\n'
             printf 'release-profile "boot" bootstrap-catalog="%s"\n' "$(cat profile-repo/current)"
@@ -518,8 +542,14 @@ CONFIG
             printf 'release-profile "boot"\n'
         fi
         while read -r name repository key; do
+            if [[ $tuf_mirrors == 1 ]]; then
+                repository="mirror-cache/$name"
+                mirror_url=$(cat "mirrors/$name/url")
+                printf 'mirror "%s" root="mirrors/%s/root.json" metadata="%smetadata/" targets="%stargets/"\n' \
+                    "$name" "$name" "$mirror_url" "$mirror_url"
+            fi
             printf 'publisher "%s" {\n    repository "%s"\n    trust-key "%s"\n}\n' "$name" "$repository" "$key"
-        done < <(profile_companions)
+        done < <(profile_repositories)
     } > image.kdl
 else
     cat > image.kdl <<CONFIG
@@ -531,6 +561,10 @@ publisher "$fixture_publisher" {
 }
 CONFIG
     if [[ $mode == facet-change ]]; then printf 'facet "doc.man" #false\n' >> image.kdl; fi
+fi
+if [[ $tuf_mirrors == 1 ]]; then
+    "$cps" repo sync-profile --config image.kdl --index-only
+    test -z "$(find mirror-cache -path '*/blobs/*' -type f -print -quit)"
 fi
 "$cps" image-create --root base --config image.kdl
 if ! $profiled && [[ -n $cps_fixture ]]; then
@@ -546,6 +580,10 @@ if $profiled; then
     "$cps" plan --root base --output install.json install-profile
 else
     "$cps" plan --root base --output install.json install "${packages[@]}"
+fi
+if [[ $tuf_mirrors == 1 ]]; then
+    "$cps" fetch --root base --plan install.json
+    echo 'Verified initial profile payloads were fetched into an index-only TUF cache'
 fi
 "$cps" apply --root base install.json
 "$cps" verify --root base --pristine
@@ -635,6 +673,7 @@ if [[ $mode == rollback ]]; then
     # A new upgrade should still be testable from an explicitly selected base.
     primary_pointer=repo/current
     if $profiled; then primary_pointer=profile-repo/current; fi
+    if [[ $tuf_mirrors == 1 ]]; then primary_pointer=mirror-cache/vm-profile/current; fi
     cp "$primary_pointer" base-catalog
     "$cps" boot-env rollback --disk "$base_disk" --esp-partuuid "$esp_uuid" \
         --output-disk pinned-base.raw "$base_id"
@@ -667,6 +706,11 @@ RELEASE
     "$cps" repo publish-release --repo repo --signing-key private.der retirement.kdl
 fi
 if $profiled; then
+    if [[ $tuf_mirrors == 1 ]]; then
+        publish_vm_mirror "$fixture_publisher" repo public.der 2 --retain-catalog "$base_test_catalog"
+        "$cps" repo sync-profile --config image.kdl --index-only --image base
+        cmp repo/current "mirror-cache/$fixture_publisher/current"
+    fi
     "$cps" plan --root base --output before-profile.json update > before-profile.log
     grep -Fq "\"$base_test_catalog\"" before-profile.json
     if grep -Eq '(Update|Install|Remove) .*system/kernel' before-profile.log; then
@@ -675,7 +719,23 @@ if $profiled; then
     fi
     echo 'Verified the signed profile kept the previous kernel after the companion advanced'
     refresh_vm_profile
-    if [[ $recycle == 0 ]]; then
+    if [[ $tuf_mirrors == 1 ]]; then
+        publish_vm_mirror vm-profile profile-repo profile-public.der 2 --retain-catalog "$(cat base-catalog)"
+        "$cps" repo sync-profile --config image.kdl --index-only --image base
+        cmp profile-repo/current "$primary_pointer"
+        timestamp=mirrors/vm-profile/metadata/timestamp.json
+        mv -- "$timestamp" trial-tuf-timestamp.json
+        cp -- base-tuf-timestamp.json "$timestamp"
+        if "$cps" repo sync-profile --config image.kdl --index-only --image base > tuf-replay.log 2>&1; then
+            echo 'TUF accepted the previous primary timestamp' >&2
+            exit 1
+        fi
+        grep -F 'Found version 1 of timestamp metadata when we had previously fetched version 2' \
+            tuf-replay.log || { cat tuf-replay.log >&2; exit 1; }
+        cmp profile-repo/current "$primary_pointer"
+        mv -- trial-tuf-timestamp.json "$timestamp"
+        echo 'Verified TUF rejected replay of the previous primary mirror timestamp'
+    elif [[ $recycle == 0 ]]; then
         mkdir relocated-repositories
         mv profile-repo relocated-repositories/
         primary_pointer=relocated-repositories/profile-repo/current
@@ -697,6 +757,37 @@ request=(update)
 if [[ $mode == facet-change ]]; then request=(change-facet doc.man=default optional=false); fi
 "$cps" plan --root base --output update.json "${request[@]}" | tee update.log
 cp -a esp esp-before
+if [[ $tuf_mirrors == 1 ]]; then
+    trial_payload=$(sha256sum proto/etc/cps-vm-state | cut -d' ' -f1)
+    test ! -e "mirror-cache/$fixture_publisher/blobs/$trial_payload"
+    if "$cps" boot-env stage --source base --root unfetched update.json > unfetched.log 2>&1; then
+        echo 'Staging accepted an unfetched upgrade' >&2
+        exit 1
+    fi
+    grep -F 'opening repository payload' unfetched.log || { cat unfetched.log >&2; exit 1; }
+    test ! -e unfetched
+    target="mirrors/$fixture_publisher/targets/$trial_payload.blobs-$trial_payload"
+    mv -- "$target" unavailable-target
+    if "$cps" fetch --root base --plan update.json > missing-target.log 2>&1; then
+        echo 'Fetch accepted a missing mirror payload' >&2
+        exit 1
+    fi
+    grep -F "$trial_payload" missing-target.log || { cat missing-target.log >&2; exit 1; }
+    test ! -e "mirror-cache/$fixture_publisher/blobs/$trial_payload"
+    cp -- unavailable-target "$target"
+    printf 'x' | dd of="$target" bs=1 conv=notrunc status=none
+    if "$cps" fetch --root base --plan update.json > corrupt-target.log 2>&1; then
+        echo 'Fetch accepted a corrupted mirror payload' >&2
+        exit 1
+    fi
+    grep -F 'Hash mismatch' corrupt-target.log || { cat corrupt-target.log >&2; exit 1; }
+    test ! -e "mirror-cache/$fixture_publisher/blobs/$trial_payload"
+    mv -- unavailable-target "$target"
+    "$cps" fetch --root base --plan update.json
+    mv -- mirrors offline-mirrors
+    diff -r esp-before esp
+    echo 'Verified an incomplete mirror could be retried before staging the upgrade offline'
+fi
 trial=$("$cps" boot-env stage --source base --root staged update.json)
 trial_id=${trial#Staged }
 trial_id=${trial_id%% at *}
