@@ -24,7 +24,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-26}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-27}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -106,7 +106,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-6]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-7]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -125,10 +125,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-6]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-7]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-6]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-7]) protected_profiles=true ;;
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
 fi
@@ -747,6 +747,25 @@ if $profiled; then
         cmp base-catalog "$primary_pointer"
         cmp repo/current "$companion_cache/current"
         echo 'Verified repair restored the withdrawn fallback kernel from a signed archive'
+
+        "$cps" image-create --root replay-base --config image.kdl
+        "$cps" plan --root replay-base --output replay-install.json install-profile
+        rm -- "$companion_cache/catalogs/$base_test_catalog"
+        if "$cps" fetch --root replay-base --plan replay-install.json > archive-replay.log 2>&1; then
+            echo 'Fetch replayed a saved plan with missing catalog metadata' >&2
+            exit 1
+        fi
+        grep -F "reading signed catalog for $fixture_publisher" archive-replay.log \
+            || { cat archive-replay.log >&2; exit 1; }
+        "$cps" fetch --root replay-base --plan replay-install.json \
+            --archive-cache "$fixture_publisher=fallback-archive"
+        "$cps" apply --root replay-base replay-install.json
+        "$cps" verify --root replay-base --pristine
+        cmp "$kernel" "replay-base/usr/lib/modules/$base_release/vmlinuz"
+        cmp base-catalog "$primary_pointer"
+        cmp repo/current "$companion_cache/current"
+        cmp repo/current "$companion_cache/.tuf/catalog"
+        echo 'Verified a saved profile plan replayed after its catalog was restored from a signed archive'
         publish_vm_mirror "$fixture_publisher" repo public.der 4 --retain-catalog "$base_test_catalog"
     fi
     "$cps" plan --root base --output before-profile.json update > before-profile.log

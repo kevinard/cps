@@ -182,7 +182,7 @@ enum Command {
         root: PathBuf,
         #[arg(long)]
         plan: PathBuf,
-        /// Use a synced historical archive for matching package payloads
+        /// Use a synced historical archive for pinned metadata and matching payloads
         #[arg(long = "archive-cache", value_name = "PUBLISHER=PATH", value_parser = parse_repository)]
         archive_caches: Vec<(String, PathBuf)>,
     },

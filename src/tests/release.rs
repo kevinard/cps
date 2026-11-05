@@ -1884,6 +1884,23 @@ publisher "canopa" archive-build-inputs={archive} {{
         fs::read(archive_sources.join("sha256").join(&source_hash))?,
         source_bytes
     );
+    fs::remove_file(protected_cache.join("build-inputs").join(&reviewed))?;
+    let publisher = crate::image::Publisher {
+        name: "canopa".into(),
+        repo: protected_cache.clone(),
+        key: read_key(&f.public)?,
+        build_trust: None,
+    };
+    mirror_release::ArchiveCache::open(&archive_cache, &publisher)?.restore_metadata(&publisher)?;
+    check(
+        &protected_cache,
+        Some(&admitted),
+        &work.join("restored-archive-inputs"),
+    )?;
+    assert_eq!(
+        fs::read_to_string(protected_cache.join("current"))?.trim(),
+        expected
+    );
 
     fs::rename(&f.repo, work.join("offline-repo"))?;
     fs::rename(&mirror, work.join("offline-mirror"))?;
@@ -2535,6 +2552,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
 #[test]
 fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()> {
     let f = Fixture::new()?;
+    let builder = Fixture::new()?;
     let work = f._dir.path();
     let anchor = work.join("root.json");
     let tuf_key = work.join("tuf-key.der");
@@ -2576,6 +2594,8 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
         "1.0.0-0",
         f.file(COMPOSITOR, "previous", "0644", "")?,
     )?;
+    let unsigned_pin = fs::read_to_string(f.repo.join("current"))?;
+    let (_, envelope) = attach_evidence(&f, unsigned_pin.trim(), &builder)?;
     let first = sync(1)?;
     let old_catalog = fs::read_to_string(cache.join("current"))?.trim().to_owned();
     let installed = work.join("installed");
@@ -2586,7 +2606,18 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
         packages: vec!["desktop/compositor".to_owned()],
     };
     let saved = plan(&f.root, request.clone())?;
-    apply(&installed, &plan(&installed, request)?)?;
+    apply(&installed, &plan(&installed, request.clone())?)?;
+    let pending = work.join("pending-image");
+    let pending_config = work.join("pending-image.kdl");
+    fs::write(
+        &pending_config,
+        format!(
+            "schema-version 1\npublisher \"canopa\" {{\n repository {cache:?}\n trust-key {:?}\n build-trust {{ builder-key {:?}; }}\n}}\n",
+            f.public, builder.public,
+        ),
+    )?;
+    create_configured_image(&pending, &pending_config)?;
+    let pending_plan = plan(&pending, request)?;
 
     f.package(
         "desktop/compositor",
@@ -2755,6 +2786,78 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     assert_eq!(fs::read_to_string(cache.join("current"))?, current);
     assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, current);
     assert!(!archive.join("current").exists());
+
+    // Recreate the cache at the image's original path from the newer mirror,
+    // which no longer exports the saved plan's catalog or manifest.
+    fs::rename(&cache, work.join("original-cache"))?;
+    fs::rename(&offline_second, &second)?;
+    assert_eq!(
+        mirror_release::sync_index(
+            &cache,
+            &anchor,
+            Url::from_directory_path(second.join("metadata"))
+                .unwrap()
+                .as_str(),
+            Url::from_directory_path(second.join("targets"))
+                .unwrap()
+                .as_str(),
+            "canopa",
+            &f.public,
+        )?,
+        current.trim()
+    );
+    fs::rename(&second, &offline_second)?;
+    let restored_catalog = cache.join("catalogs").join(&old_catalog);
+    let old_manifest = snapshot(
+        &archive,
+        "canopa",
+        &read_key(&f.public)?,
+        Some(&old_catalog),
+    )?
+    .packages
+    .remove(0)
+    .sha256;
+    let restored_manifest = cache.join("manifests").join(old_manifest);
+    let restored_evidence = cache.join("attestations").join(digest(&envelope));
+    assert!(
+        !restored_catalog.exists() && !restored_manifest.exists() && !restored_evidence.exists()
+    );
+    let error = fetch_plan(&pending, &pending_plan).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("reading signed catalog"),
+        "{error:#}"
+    );
+    let mut stale = pending_plan.clone();
+    stale.base_revision += 1;
+    let archives = [("canopa".to_owned(), archive.clone())];
+    let error = fetch_plan_with_archives(&pending, &stale, &archives).unwrap_err();
+    assert!(format!("{error:#}").contains("stale plan"));
+    assert!(!restored_catalog.exists());
+    let archived_evidence = archive.join("attestations").join(digest(&envelope));
+    let saved_evidence = fs::read(&archived_evidence)?;
+    fs::write(&archived_evidence, b"corrupt archive evidence")?;
+    let error = fetch_plan_with_archives(&pending, &pending_plan, &archives).unwrap_err();
+    assert!(format!("{error:#}").contains("digest mismatch for repository object attestations"));
+    assert!(!restored_catalog.exists());
+    fs::write(&archived_evidence, saved_evidence)?;
+    assert_eq!(
+        fetch_plan_with_archives(&pending, &pending_plan, &archives)?,
+        1
+    );
+    assert!(restored_catalog.is_file());
+    assert_eq!(fs::read(&restored_evidence)?, envelope);
+    fs::write(&restored_manifest, b"corrupt manifest")?;
+    fs::write(&restored_evidence, b"corrupt attestation")?;
+    assert!(fetch_plan(&pending, &pending_plan).is_err());
+    assert_eq!(
+        fetch_plan_with_archives(&pending, &pending_plan, &archives)?,
+        1
+    );
+    apply(&pending, &pending_plan)?;
+    assert!(verify(&pending)?.is_empty());
+    assert_eq!(fs::read(pending.join(COMPOSITOR))?, b"previous");
+    assert_eq!(fs::read_to_string(cache.join("current"))?, current);
+    assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, current);
     Ok(())
 }
 

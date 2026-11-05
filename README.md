@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-26`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-27`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -927,6 +927,12 @@ archive that lists the exact package manifest. It verifies the required
 payloads and copies them into the configured repository's blob cache
 without changing catalog pointers or the image. Other payloads use the
 configured mirror. An archive that already has verified bytes works offline.
+
+When an archive matches an exact catalog pin in a saved plan, fetch also
+restores the signed catalog, manifests, build evidence, and archived rebuild
+inputs before replaying the plan. This can recover a plan after the cache is
+rebuilt at its configured path. CPS still checks the image revision, publisher configuration, catalog
+history, and the complete plan before fetching payloads or applying it.
 
 ### Reclaiming mirror cache space
 
@@ -1670,6 +1676,8 @@ index-only, and fetches its planned payloads. It advances a companion while
 the primary still pins the previous catalog, and checks that pruning keeps
 the previous kernel after its mirror drops the pin. It then repairs a copy
 of the base root from a signed archive after deleting that cached kernel.
+It also restores a missing catalog from the archive and replays the saved
+profile installation against the original cache paths.
 The test rejects a replayed TUF timestamp and verifies that missing or corrupt
 payloads block promotion with `--profile-payloads`. After a successful retry, it takes the
 mirrors offline, stages the upgrade, and boots through blessing and rollback.

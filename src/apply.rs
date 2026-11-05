@@ -189,7 +189,7 @@ pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     fetch_plan_with_archives(path, plan, &[])
 }
 
-/// Fetch verified plan payloads, using explicitly provisioned archives for matching packages.
+/// Fetch verified plan payloads and recover exact historical pins from provisioned archives.
 pub fn fetch_plan_with_archives(
     path: &Path,
     plan: &Plan,
@@ -205,13 +205,10 @@ pub fn fetch_plan_with_archives(
     if image.applied(&plan.id()?)?.is_some() {
         return Ok(0);
     }
-    let (checked, next, _) = check_plan(&image, state, plan)?;
-    if checked.config_update_revision.is_some() {
-        return Ok(0);
-    }
+    check_plan_revision(&state, plan)?;
     let mut archives = BTreeMap::<_, Vec<_>>::new();
     for (name, path) in archive_caches {
-        let publisher = next
+        let publisher = state
             .publishers
             .get(name)
             .with_context(|| format!("archive publisher {name} is not configured"))?;
@@ -219,6 +216,27 @@ pub fn fetch_plan_with_archives(
             ArchiveCache::open(path, publisher)
                 .with_context(|| format!("opening archive cache {}", path.display()))?,
         );
+    }
+    for publisher in state.publishers.as_slice() {
+        let pin = if state.publishers.as_slice().len() == 1 {
+            plan.catalog.as_deref()
+        } else {
+            plan.catalogs.get(&publisher.name).map(String::as_str)
+        };
+        if let Some(archive) = archives
+            .get(publisher.name.as_str())
+            .into_iter()
+            .flatten()
+            .find(|archive| Some(archive.pin()) == pin)
+        {
+            archive.restore_metadata(publisher).with_context(|| {
+                format!("restoring pinned catalog metadata for {}", publisher.name)
+            })?;
+        }
+    }
+    let (checked, next, _) = check_plan(&image, state, plan)?;
+    if checked.config_update_revision.is_some() {
+        return Ok(0);
     }
     let mut count = 0;
     for (publisher, mut blobs) in payload_sources(&checked.writes, &next)? {
@@ -260,13 +278,7 @@ fn check_plan(
     state: State,
     plan: &Plan,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
-    ensure!(
-        plan.base_revision == state.settings.revision,
-        "stale plan for revision {}; image is at revision {}",
-        plan.base_revision,
-        state.settings.revision
-    );
-    plan.check_publisher_generation(&state.settings)?;
+    check_plan_revision(&state, plan)?;
     let (checked, next, receipts) =
         build(image, state, plan.request.clone(), Some(plan), plan.solver)?;
     ensure!(
@@ -274,6 +286,16 @@ fn check_plan(
         "saved plan differs from the verified plan; generate a new plan"
     );
     Ok((checked, next, receipts))
+}
+
+fn check_plan_revision(state: &State, plan: &Plan) -> Result<()> {
+    ensure!(
+        plan.base_revision == state.settings.revision,
+        "stale plan for revision {}; image is at revision {}",
+        plan.base_revision,
+        state.settings.revision
+    );
+    plan.check_publisher_generation(&state.settings)
 }
 
 pub(crate) fn apply_with(path: &Path, plan: &Plan, after_write: impl FnMut(&Write)) -> Result<u64> {
