@@ -32,26 +32,48 @@ pub fn archive_build_sources(
     let current = publication_base(repo)?.context("repository has no published catalog")?;
     let mut catalog = publication_catalog(repo, publisher, &key, Some(&current))?;
     let inputs = rebuild::read_archived(repo, &catalog, id)?;
-    let pins = source_pins(&inputs.recipe);
-    let destination = Root::open(repo)?.ensure_dir(OBJECTS)?;
     let source_cache = Root::open(source_cache)?;
-    for pin in pins.values() {
-        if !contains(&destination, pin)? {
-            let file = source_cache
-                .file(&format!("{}/{}", sources::OBJECTS, pin.sha256))
-                .with_context(|| format!("opening source cache object {}", pin.sha256))?;
-            copy_source(file, &destination, pin)?;
-        }
-    }
+    let (changed, count) = stage(repo, &mut catalog, id, &inputs.recipe, Some(&source_cache))?;
+    let hash = if changed {
+        write_catalog(repo, catalog, &key)?
+    } else {
+        current
+    };
+    Ok((hash, count))
+}
+
+pub(super) fn stage(
+    repo: &Path,
+    catalog: &mut super::Catalog,
+    id: &str,
+    recipe: &BuildRecipe,
+    source_cache: Option<&Root>,
+) -> Result<(bool, usize)> {
+    let pins = source_pins(recipe);
     let record = catalog
         .build_inputs
         .get_mut(id)
-        .expect("read archived inputs");
-    if record.sources_archived {
-        return Ok((current, pins.len()));
+        .with_context(|| format!("no archived rebuild inputs for {id}"))?;
+    if !pins.is_empty() {
+        let destination = Root::open(repo)?.ensure_dir(OBJECTS)?;
+        for pin in pins.values() {
+            if !contains(&destination, pin)? {
+                let file = source_cache
+                    .with_context(|| {
+                        format!(
+                            "provide --source-cache to archive source {} for {id}",
+                            pin.sha256
+                        )
+                    })?
+                    .file(&format!("{}/{}", sources::OBJECTS, pin.sha256))
+                    .with_context(|| format!("opening source cache object {}", pin.sha256))?;
+                copy_source(file, &destination, pin)?;
+            }
+        }
     }
+    let changed = !record.sources_archived;
     record.sources_archived = true;
-    Ok((write_catalog(repo, catalog, &key)?, pins.len()))
+    Ok((changed, pins.len()))
 }
 
 /// Populate a build source cache from a signed local archive or synchronized TUF mirror.

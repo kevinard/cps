@@ -762,12 +762,29 @@ async fn materialize(
         );
     }
     collect_rebuild_objects(&catalog, &mut rebuild_objects, &mut attestations);
-    entries.extend(catalog.entries);
-    attestations.extend(catalog.attestations.into_values());
-    cache_objects(verified, repo, publisher, entries, attestations, full).await?;
     for (hash, limit) in rebuild_objects {
         fetch_object(verified, repo, rebuild::OBJECTS, &hash, limit, None).await?;
     }
+    if catalog.source_archives_required {
+        let mut recipes = BTreeSet::new();
+        for inputs in catalog.build_inputs.values() {
+            if recipes.insert(&inputs.recipe) {
+                for pin in source_archive::archived_pins(repo, inputs)? {
+                    let name = format!("{}/{}", source_archive::OBJECTS, pin.sha256);
+                    checked_target(verified, &name, pin.size, Some(&pin.sha256), Some(pin.size))
+                        .with_context(|| {
+                            format!(
+                                "checking required archived source {} on the mirror",
+                                pin.sha256
+                            )
+                        })?;
+                }
+            }
+        }
+    }
+    entries.extend(catalog.entries);
+    attestations.extend(catalog.attestations.into_values());
+    cache_objects(verified, repo, publisher, entries, attestations, full).await?;
     Ok(StagedRelease {
         current: hash,
         retained: retained_hashes,
@@ -1037,6 +1054,7 @@ fn export_targets(
         let release = catalog_snapshot(repo, previous, (*pin).to_owned(), &key)?;
         export_catalog(&root, stage.path(), &release)?;
     }
+    let include_sources = include_sources || catalog.source_archives_required;
     let release = catalog_snapshot(repo, catalog, current.clone(), &key)?;
     export_catalog(&root, stage.path(), &release)?;
     if include_sources {

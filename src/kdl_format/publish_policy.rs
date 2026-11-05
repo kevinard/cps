@@ -22,6 +22,7 @@ pub(crate) struct PublishPolicy {
     pub recipes: BTreeMap<String, RecipeApproval>,
     pub verify_toolchains: bool,
     pub archive_build_inputs: bool,
+    pub require_source_archives: bool,
     pub profiles: BTreeMap<String, Profile>,
 }
 
@@ -182,6 +183,7 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
             "minimum-builders",
             "verify-toolchains",
             "archive-build-inputs",
+            "require-source-archives",
         ],
         true,
     )?;
@@ -200,6 +202,11 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
     };
     let verify_toolchains = flag("verify-toolchains")?;
     let archive_build_inputs = flag("archive-build-inputs")?;
+    let require_source_archives = flag("require-source-archives")?;
+    ensure!(
+        !require_source_archives || archive_build_inputs,
+        "require-source-archives requires archive-build-inputs"
+    );
     let minimum_builders = fields.integer("minimum-builders")?.unwrap_or(1);
     ensure!(
         (1..=MAX_BUILDERS).contains(&minimum_builders),
@@ -276,6 +283,7 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
         recipes,
         verify_toolchains,
         archive_build_inputs,
+        require_source_archives,
         profiles,
     })
 }

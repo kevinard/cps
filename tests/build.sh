@@ -452,7 +452,7 @@ CONFIG
 write_policy() {
     cat > release/publish-policy.kdl <<POLICY
 schema-version 1
-publisher "canopa" verify-toolchains=#true archive-build-inputs=#true {
+publisher "canopa" verify-toolchains=#true archive-build-inputs=#true require-source-archives=#true {
     builder-key "builder-public.der"
     approve "demo/hello" version="1.0.0-0" sha256="$1" toolchain-config="../review-toolchain.kdl"
 }
@@ -489,14 +489,18 @@ expect_failure 'attested payload digest mismatch' publish_bundle \
     --builder-key builder-public.der --recipe-sha256 "$reviewed" modified
 test ! -e release/current
 
-mv repo/blobs repo/offline-blobs
-publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" first
-mv repo/offline-blobs repo/blobs
+expect_failure 'provide --source-cache to archive source' publish_bundle \
+    --builder-key builder-public.der --recipe-sha256 "$reviewed" first
+expect_failure 'source digest or length mismatch' publish_bundle --source-cache cache \
+    --builder-key builder-public.der --recipe-sha256 "$reviewed" first
+test ! -e release/current
 mkdir publisher-sources
 printf 'hello from pinned input\n' > publisher-sources/input
 "$cps" source import --from publisher-sources --cache publisher-source-cache first/build.kdl
-"$cps" repo archive-sources --repo release --signing-key signing.der \
-    --source-cache publisher-source-cache cps://canopa/demo/hello@1.0.0-0
+mv repo/blobs repo/offline-blobs
+publish_bundle --source-cache publisher-source-cache \
+    --builder-key builder-public.der --recipe-sha256 "$reviewed" first
+mv repo/offline-blobs repo/blobs
 rm -r -- publisher-sources publisher-source-cache
 first_catalog=$(cat release/current)
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" second
@@ -558,6 +562,8 @@ subjects = {subject['name']: subject for subject in statement['subject']}
 assert set(subjects) == {'manifest.kdl', 'published-manifest.kdl', 'proto/hello'}
 catalog = json.loads((Path('release/catalogs') / Path('release/current').read_text().strip()).read_bytes())
 assert catalog['catalog']['toolchains_verified'] is True
+assert catalog['catalog']['source_archives_required'] is True
+assert catalog['catalog']['build_inputs']['cps://canopa/demo/hello@1.0.0-0']['sources_archived'] is True
 manifest_hash = catalog['catalog']['entries']['cps://canopa/demo/hello@1.0.0-0']['manifest']
 manifest = (Path('release/manifests') / manifest_hash).read_bytes()
 published = subjects['published-manifest.kdl']

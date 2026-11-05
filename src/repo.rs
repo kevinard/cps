@@ -52,6 +52,8 @@ pub(crate) struct Catalog {
     toolchains_verified: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     build_inputs: BTreeMap<String, rebuild::Digests>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    source_archives_required: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     withdrawals: BTreeMap<String, Withdrawal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +228,7 @@ impl Catalog {
             attestations_required: false,
             toolchains_verified: false,
             build_inputs: BTreeMap::new(),
+            source_archives_required: false,
             withdrawals: BTreeMap::new(),
             sequence: None,
             profiles_required: false,
@@ -242,6 +245,24 @@ impl Catalog {
             let withdrawn = self.withdrawals.get(id)?;
             Some((&withdrawn.manifest, withdrawn.attestation.as_deref()))
         }
+    }
+
+    fn check_source_archives(&self) -> Result<()> {
+        if self.source_archives_required {
+            ensure!(
+                self.attestations_required,
+                "source archive protection requires signed build evidence"
+            );
+            for id in self.entries.keys().chain(self.withdrawals.keys()) {
+                ensure!(
+                    self.build_inputs
+                        .get(id)
+                        .is_some_and(|inputs| inputs.sources_archived),
+                    "protected catalog requires a source archive for {id}"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn check_installed(&self, package: &Published) -> Result<Option<&str>> {
@@ -374,6 +395,10 @@ impl Catalog {
         ensure!(
             !self.toolchains_verified || next.toolchains_verified,
             "release disables the publisher's toolchain verification requirement"
+        );
+        ensure!(
+            !self.source_archives_required || next.source_archives_required,
+            "release disables the publisher's source archive requirement"
         );
         ensure!(
             !next.toolchains_verified
@@ -1138,6 +1163,7 @@ fn decode_catalog(
             validate_digest(hash).context("invalid rebuild input digest")?;
         }
     }
+    catalog.check_source_archives()?;
     Ok(catalog)
 }
 
@@ -1388,7 +1414,7 @@ pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<S
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)
         .with_context(|| format!("parsing {}", recipe.display()))?;
     manifest.validate(false)?;
-    publish_manifest(repo, Root::open(proto)?, manifest, &key, None)
+    publish_manifest(repo, Root::open(proto)?, manifest, &key, None, None)
 }
 
 fn exact_publisher(id: &str) -> Result<&str> {
@@ -1495,6 +1521,26 @@ pub fn publish_witnessed_bundle(
     reviewed_recipe: &str,
     witnesses: &[BuildWitness],
 ) -> Result<String> {
+    publish_witnessed_bundle_with_sources(
+        repo,
+        bundle,
+        key,
+        builder_key,
+        reviewed_recipe,
+        witnesses,
+        None,
+    )
+}
+
+pub fn publish_witnessed_bundle_with_sources(
+    repo: &Path,
+    bundle: &Path,
+    key: &Path,
+    builder_key: &Path,
+    reviewed_recipe: &str,
+    witnesses: &[BuildWitness],
+    source_cache: Option<&Path>,
+) -> Result<String> {
     let key = read_signing_key(key)?;
     let (proto, manifest, verified) = verify_publication(
         bundle,
@@ -1503,7 +1549,15 @@ pub fn publish_witnessed_bundle(
         witnesses,
         key.public_key().as_ref(),
     )?;
-    publish_manifest(repo, proto, manifest, &key, Some(verified))
+    let source_cache = source_cache.map(Root::open).transpose()?;
+    publish_manifest(
+        repo,
+        proto,
+        manifest,
+        &key,
+        Some(verified),
+        source_cache.as_ref(),
+    )
 }
 
 fn verify_publication(
@@ -1548,6 +1602,15 @@ fn verify_publication(
 }
 
 pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<String> {
+    publish_release_with_sources(repo, key, document, None)
+}
+
+pub fn publish_release_with_sources(
+    repo: &Path,
+    key: &Path,
+    document: &Path,
+    source_cache: Option<&Path>,
+) -> Result<String> {
     let bytes = read_limited(File::open(document)?, PUBLISH_RELEASE_LIMIT)?;
     let release = publish_release::parse(std::str::from_utf8(&bytes)?)
         .with_context(|| format!("reading release {}", document.display()))?;
@@ -1566,7 +1629,12 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
         .changes
         .iter()
         .any(|change| matches!(change, publish_release::Change::Bundle { .. }));
+    ensure!(
+        source_cache.is_none() || publishes_bundles,
+        "--source-cache requires a release with build bundles"
+    );
     let policy = read_publish_policy(repo, &catalog, publishes_bundles)?;
+    let source_cache = source_cache.map(Root::open).transpose()?;
     ensure!(
         !release.refresh_profiles
             || policy
@@ -1611,6 +1679,7 @@ pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<Strin
                     manifest,
                     Some(verified),
                     policy.as_ref(),
+                    source_cache.as_ref(),
                 )
                 .with_context(|| format!("staging {id}"))?;
             }
@@ -1667,6 +1736,7 @@ fn publish_manifest(
     manifest: Manifest,
     key: &Ed25519KeyPair,
     evidence: Option<VerifiedBuild>,
+    source_cache: Option<&Root>,
 ) -> Result<String> {
     let _lock = lock_repo(repo)?;
     let current = publication_base(repo)?;
@@ -1681,6 +1751,7 @@ fn publish_manifest(
         manifest,
         evidence,
         policy.as_ref(),
+        source_cache,
     )? {
         check_profiles(
             repo,
@@ -1701,7 +1772,12 @@ fn stage_manifest(
     manifest: Manifest,
     evidence: Option<VerifiedBuild>,
     policy: Option<&PublicationPolicy>,
+    source_cache: Option<&Root>,
 ) -> Result<bool> {
+    ensure!(
+        source_cache.is_none() || policy.is_some_and(|policy| policy.archive_build_inputs),
+        "--source-cache requires archive-build-inputs in the publish policy"
+    );
     ensure!(
         manifest.publisher == catalog.publisher,
         "bundle belongs to a different publisher"
@@ -1809,7 +1885,19 @@ fn stage_manifest(
         } else {
             false
         };
-        return Ok(!unchanged_manifest || added_attestation || added_inputs);
+        let require_archives = policy.is_some_and(|policy| policy.require_source_archives);
+        let added_sources = if source_cache.is_some() || require_archives {
+            source_archive::stage(repo, catalog, &id, &evidence.recipe, source_cache)?.0
+        } else {
+            false
+        };
+        let enabled_requirement = require_archives && !catalog.source_archives_required;
+        catalog.source_archives_required |= require_archives;
+        return Ok(!unchanged_manifest
+            || added_attestation
+            || added_inputs
+            || added_sources
+            || enabled_requirement);
     } else if unchanged_manifest {
         return Ok(false);
     }
@@ -1817,6 +1905,7 @@ fn stage_manifest(
 }
 
 fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
+    catalog.check_source_archives()?;
     catalog.sequence = Some(catalog.next_sequence()?);
     let signer = keys::signer(
         &catalog.publisher,
@@ -1844,6 +1933,7 @@ struct PublicationPolicy {
     minimum_builders: usize,
     verify_toolchains: bool,
     archive_build_inputs: bool,
+    require_source_archives: bool,
     profiles: BTreeMap<String, publish_policy::Profile>,
 }
 
@@ -1934,6 +2024,10 @@ fn read_publish_policy(
     );
     if publishes_bundles {
         ensure!(
+            !catalog.source_archives_required || policy.require_source_archives,
+            "protected repository requires source archives"
+        );
+        ensure!(
             catalog.build_inputs.is_empty() || policy.archive_build_inputs,
             "protected repository requires archiving rebuild inputs"
         );
@@ -1965,6 +2059,7 @@ fn read_publish_policy(
         minimum_builders: policy.minimum_builders,
         verify_toolchains: policy.verify_toolchains,
         archive_build_inputs: policy.archive_build_inputs,
+        require_source_archives: policy.require_source_archives,
         profiles: policy.profiles,
     }))
 }
@@ -2172,6 +2267,7 @@ mod tests {
                     "manifest": digest(b"reviewed manifest"),
                 }))?,
             )]),
+            source_archives_required: false,
             withdrawals: BTreeMap::from([(
                 withdrawn.clone(),
                 Withdrawal {
@@ -2214,6 +2310,13 @@ mod tests {
         assert!(format!("{error:#}").contains("drops or changes the rebuild inputs"));
         next.build_inputs.get_mut(&active).unwrap().sources_archived = true;
         previous.check_successor(&next, &base)?;
+        with_sources.source_archives_required = true;
+        let error = with_sources.check_source_archives().unwrap_err();
+        assert!(format!("{error:#}").contains(&withdrawn));
+        let error = with_sources.check_successor(&next, &base).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("disables the publisher's source archive requirement")
+        );
         let added = "cps://canopa/new@1.0.0-0";
         next.entries.insert(added.to_owned(), manifest.clone());
         let error = previous.check_successor(&next, &base).unwrap_err();

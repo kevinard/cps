@@ -130,8 +130,14 @@ if (( ${cps_version##*-} >= 17 )); then
     review_cps=' toolchain-config="../toolchain.kdl"'
 fi
 archive_build_inputs=
+require_source_archives=
+publication_sources=()
 if (( ${cps_version##*-} >= 18 )); then
     archive_build_inputs=' archive-build-inputs=#true'
+fi
+if (( ${cps_version##*-} >= 22 )); then
+    require_source_archives=' require-source-archives=#true'
+    publication_sources=(--source-cache sources)
 fi
 write_profile() {
     local name=$1
@@ -156,7 +162,7 @@ write_policy() {
     {
         cat <<POLICY
 schema-version 1
-publisher "canopa"$verify_toolchains$archive_build_inputs {
+publisher "canopa"$verify_toolchains$archive_build_inputs$require_source_archives {
     builder-key "builder-public.der"
     approve "system/sqlite" version="$sqlite_version" sha256="$sqlite_recipe"$review_bootstrap
     approve "system/libseccomp" version="$seccomp_version" sha256="$seccomp_recipe"$review_bootstrap
@@ -177,11 +183,12 @@ release "canopa" base="empty" {
     bundle "cps://canopa/system/libseccomp@$seccomp_version" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
 }
 RELEASE
-"$cps" repo publish-release --repo repo --signing-key "$work/release.der" bootstrap-release.kdl
+"$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
+    "${publication_sources[@]}" bootstrap-release.kdl
 archive_sources() {
     "$cps" repo archive-sources --repo repo --signing-key "$work/release.der" --source-cache sources "$1"
 }
-if (( ${cps_version##*-} >= 20 )); then
+if (( ${cps_version##*-} >= 20 && ${cps_version##*-} < 22 )); then
     archive_sources "cps://canopa/system/sqlite@$sqlite_version"
     archive_sources "cps://canopa/system/libseccomp@$seccomp_version"
 fi
@@ -214,8 +221,9 @@ release "canopa" base="$bootstrap_catalog" {
     bundle "$cps_package" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
 }
 RELEASE
-"$cps" repo publish-release --repo repo --signing-key "$work/release.der" release.kdl
-if (( ${cps_version##*-} >= 20 )); then archive_sources "$cps_package"; fi
+"$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
+    "${publication_sources[@]}" release.kdl
+if (( ${cps_version##*-} >= 20 && ${cps_version##*-} < 22 )); then archive_sources "$cps_package"; fi
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
     "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json

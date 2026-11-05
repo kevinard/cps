@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-21`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-22`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -376,7 +376,28 @@ cps repo verify-rebuild --repo /var/lib/cps/canopa --publisher canopa \
 ```
 
 When the source files are available for redistribution, the publisher can
-attach them to the exact package version using its verified build cache.
+include them in the publication using its build source cache. Set
+`archive-build-inputs=#true require-source-archives=#true` on the publish
+policy's `publisher` node to require the complete archive for every
+published version.
+
+```sh
+cps repo publish-release --repo repo --signing-key release-private.der \
+    --source-cache publisher-source-cache release.kdl
+```
+
+`publish-bundle` accepts the same `--source-cache` option. CPS verifies
+the source bytes against the reviewed recipe and advances the catalog
+after the entire release passes validation. It reuses verified sources
+already stored in the repository. A recipe without sources needs no
+cache. With `archive-build-inputs=#true` alone, supplying a cache archives
+sources for that publication.
+
+Once a signed catalog requires archives, later releases preserve that
+requirement. To enable it in an existing repository, first backfill
+every published version, including withdrawn versions. For packages
+with archived recipes and manifests, use `repo archive-sources` to
+attach the sources.
 
 ```sh
 cps repo archive-sources --repo repo --signing-key release-private.der \
@@ -389,6 +410,10 @@ Sign those targets through the same TUF release process. The source archive
 is available after withdrawal. A repository signs the archive record only
 after verifying every pinned source, and later catalogs preserve the record.
 Catalogs with source archive records require CPS `0.1.0-20` or later.
+Catalogs that require source archives need CPS `0.1.0-22` or later.
+For those catalogs, `repo export` includes the source targets automatically.
+Sync checks the signed target digests and sizes before promoting the catalog.
+Rebuilders download the files explicitly with `repo fetch-sources`.
 
 From a local repository or a synchronized source-inclusive mirror, prepare
 the cache without contacting the recipe's upstream URLs.

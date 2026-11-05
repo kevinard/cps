@@ -1816,6 +1816,92 @@ publisher "canopa" archive-build-inputs={archive} {{
     assert!(!withdrawn_cache.join("source-archives").exists());
     fs::rename(&source_mirror, work.join("offline-source-mirror"))?;
     assert_eq!(fetch(&withdrawn_cache, None)?, 1);
+
+    let protected = work.join("protected-repo");
+    fs::create_dir(&protected)?;
+    let policy_path = protected.join("publish-policy.kdl");
+    let policy = fs::read_to_string(f.repo.join("publish-policy.kdl"))?;
+    fs::write(
+        &policy_path,
+        policy.replace(
+            "archive-build-inputs=#true",
+            "archive-build-inputs=#true require-source-archives=#true",
+        ),
+    )?;
+    let release = work.join("protected-release.kdl");
+    fs::write(
+        &release,
+        format!(
+            "schema-version 1\nrelease \"canopa\" base=\"empty\" {{\n\
+         bundle {id:?} path=\"bundle\" builder-key=\"builder.der\" recipe-sha256={reviewed:?}\n}}\n"
+        ),
+    )?;
+    fs::copy(&builder.public, work.join("builder.der"))?;
+    let publish =
+        |cache| crate::publish_release_with_sources(&protected, &f.private, &release, cache);
+    let error = publish(None).unwrap_err();
+    assert!(format!("{error:#}").contains("provide --source-cache to archive source"));
+    assert!(!protected.join("current").exists());
+    let admitted = publish(Some(&rebuild_cache))?;
+    assert_eq!(fetch(&protected, Some(&admitted))?, 1);
+    fs::write(&policy_path, policy)?;
+    let error =
+        publish_bundle(&protected, &bundle, &f.private, &builder.public, &reviewed).unwrap_err();
+    assert!(format!("{error:#}").contains("protected repository requires source archives"));
+    withdraw_package(&protected, &f.private, id)?;
+
+    let complete_export = work.join("protected-export");
+    let expected = mirror_release::export(&protected, "canopa", &f.public, &complete_export)?;
+    let source_target = complete_export.join(format!("source-archives-{source_hash}"));
+    assert_eq!(fs::read(&source_target)?, source_bytes);
+    let protected_cache = work.join("protected-cache");
+    let sync_protected = |mirror: &Path| {
+        mirror_release::sync_index(
+            &protected_cache,
+            &anchor,
+            Url::from_directory_path(mirror.join("metadata"))
+                .unwrap()
+                .as_str(),
+            Url::from_directory_path(mirror.join("targets"))
+                .unwrap()
+                .as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    fs::remove_file(&source_target)?;
+    let incomplete = work.join("incomplete-protected-mirror");
+    sign_export(&complete_export, &incomplete, 1, fresh, &anchor, &tuf_key)?;
+    let error = sync_protected(&incomplete).unwrap_err();
+    assert!(format!("{error:#}").contains("checking required archived source"));
+    assert!(!protected_cache.join("current").exists());
+    fs::write(&source_target, vec![b'x'; source_bytes.len()])?;
+    let wrong = work.join("wrong-protected-mirror");
+    sign_export(&complete_export, &wrong, 2, fresh, &anchor, &tuf_key)?;
+    let error = sync_protected(&wrong).unwrap_err();
+    assert!(format!("{error:#}").contains("signed digest mismatch for source-archives"));
+    assert!(!protected_cache.join("current").exists());
+    fs::write(&source_target, source_bytes)?;
+    let complete = work.join("protected-mirror");
+    sign_export(&complete_export, &complete, 3, fresh, &anchor, &tuf_key)?;
+    assert_eq!(sync_protected(&complete)?, expected);
+    let new_source_cache = work.join("new-source-cache");
+    assert_eq!(
+        crate::fetch_build_sources(
+            &protected_cache,
+            "canopa",
+            &f.public,
+            id,
+            None,
+            &new_source_cache
+        )?,
+        1
+    );
+    assert_eq!(
+        fs::read(new_source_cache.join("sha256").join(&source_hash))?,
+        source_bytes
+    );
+
     fs::rename(&f.repo, work.join("offline-repo"))?;
     fs::rename(&mirror, work.join("offline-mirror"))?;
     fs::rename(&current_only, work.join("offline-current-only"))?;

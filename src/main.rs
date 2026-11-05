@@ -22,8 +22,8 @@ use cps::{
     fetch_sources, fetch_sources_with_local, fetch_toolchain, generate_manifest_for_architecture,
     import_sources, list_boot_environments, list_boot_environments_on_disk, list_config_updates,
     list_obsoletions, list_publishers, list_withdrawals, plan, prefer_publisher, publish,
-    publish_release, publish_witnessed_bundle, read_attestation, read_worker_config, release,
-    remove_publisher, resume_transaction, rollback_boot_environment,
+    publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
+    read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rotate_publisher_key, set_publisher_build_trust,
     set_publisher_repositories, stage_boot_environment, transaction_details, transaction_history,
     transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
@@ -95,6 +95,9 @@ enum Command {
         recipe_sha256: String,
         #[arg(long, value_name = "KEY=ATTESTATION", value_parser = parse_witness)]
         witness: Vec<BuildWitness>,
+        /// Cache of verified source files to include in the publication
+        #[arg(long)]
+        source_cache: Option<PathBuf>,
         bundle: PathBuf,
     },
     /// Export or synchronize a signed repository release
@@ -353,6 +356,9 @@ enum RepoCommand {
         repo: PathBuf,
         #[arg(long)]
         signing_key: PathBuf,
+        /// Cache of verified source files to include in the publication
+        #[arg(long)]
+        source_cache: Option<PathBuf>,
         release: PathBuf,
     },
     /// Print the signed build evidence for a full package ID
@@ -925,17 +931,19 @@ fn run(command: Command) -> Result<ExitCode> {
             builder_key,
             recipe_sha256,
             witness,
+            source_cache,
             bundle,
         } => {
             println!(
                 "Published {}",
-                publish_witnessed_bundle(
+                publish_witnessed_bundle_with_sources(
                     &repo,
                     &bundle,
                     &signing_key,
                     &builder_key,
                     &recipe_sha256,
-                    &witness
+                    &witness,
+                    source_cache.as_deref(),
                 )?
             );
         }
@@ -964,11 +972,17 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::PublishRelease {
                 repo,
                 signing_key,
+                source_cache,
                 release,
             } => {
                 println!(
                     "Published catalog {}",
-                    publish_release(&repo, &signing_key, &release)?
+                    publish_release_with_sources(
+                        &repo,
+                        &signing_key,
+                        &release,
+                        source_cache.as_deref()
+                    )?
                 );
             }
             RepoCommand::Attestation {
