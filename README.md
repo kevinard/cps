@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-30`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-31`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1422,6 +1422,48 @@ The command writes the selected partition and verifies it before publishing
 the first entry. `--known-good` makes that entry the initial default without
 a trial counter. If the root was already written, omit `--root-image` to
 verify its bytes against the receipt and finish registration.
+
+### Capturing a running Btrfs root
+
+`boot-env capture` takes a read-only snapshot of a CPS root subvolume and
+verifies it before publishing a new directory containing `root/`.
+Use a writable sibling subvolume on the same Btrfs filesystem for captures,
+mounted separately from the root subvolume.
+
+```sh
+cps boot-env capture --source / --output /var/lib/cps/captures/before-upgrade
+cps plan --root /var/lib/cps/captures/before-upgrade/root \
+    --output /scratch/upgrade.json update
+cps fetch --root /var/lib/cps/captures/before-upgrade/root --plan /scratch/upgrade.json
+cps boot-env prepare --source /var/lib/cps/captures/before-upgrade/root \
+    --output /scratch/upgrade --size-mib 2048 /scratch/upgrade.json
+```
+
+The capture retains the image identity and revision, so a saved plan for
+that revision also applies to the captured baseline. Snapshot creation
+holds the shared CPS image lock. Btrfs supplies a point-in-time view of the
+root subvolume while applications continue to write to the running root.
+Shared data mounted from other filesystems has its own lifecycle.
+CPS rejects nested subvolume stubs in the capture and verifies the package
+database, installed files, and catalog archives.
+[Btrfs subvolumes](https://btrfs.readthedocs.io/en/latest/Subvolumes.html)
+
+Run with privileges for Btrfs snapshot creation and deletion. A failed
+validation removes the private snapshot. An abrupt interruption can leave
+a `.cps-capture-*` directory containing `root/` in the capture parent.
+To remove a capture, run `btrfs subvolume delete CAPTURE/root`, followed
+by `rmdir CAPTURE`.
+
+The captured root can be staged and exported as ext4. Btrfs-native boot
+activation needs further implementation.
+
+Run `tests/boot-capture-vm.sh` with `CPS_VM_BTRFS` and
+`CPS_VM_MKFS_BTRFS` set to trusted Btrfs utilities, QEMU, and a kernel
+with built-in Btrfs and ext4 support. The test captures its running root,
+rejects nested subvolumes, verifies that later source writes leave the
+read-only capture intact, stages an upgrade, and boots its exported root.
+It uses the same `CPS_BIN`, `CPS_VM_QEMU`, `CPS_VM_QEMU_DATA`,
+`CPS_VM_KERNEL`, and `CPS_VM_BUSYBOX` overrides as the boot fixture.
 
 ### Activating a trial on an installed disk
 

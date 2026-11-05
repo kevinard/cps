@@ -16,13 +16,13 @@ use cps::{
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
     activate_deployed_boot_environment, activate_device_boot_environment,
     add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
-    build_with_toolchain_config, build_with_worker, create_configured_image, create_image,
-    deploy_and_activate_boot_environment, deploy_boot_environment, export_boot_environment,
-    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources,
-    fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
-    generate_manifest_for_architecture, import_sources, list_boot_environments,
-    list_boot_environments_on_disk, list_config_updates, list_obsoletions, list_publishers,
-    list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
+    build_with_toolchain_config, build_with_worker, capture_boot_environment,
+    create_configured_image, create_image, deploy_and_activate_boot_environment,
+    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt,
+    export_rebuild_inputs, fetch_build_sources, fetch_plan_with_archives, fetch_sources,
+    fetch_sources_with_local, fetch_toolchain, generate_manifest_for_architecture, import_sources,
+    list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
+    list_publishers, list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
     publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
     read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rotate_publisher_key, set_publisher_build_trust,
@@ -627,6 +627,14 @@ enum PlanCommand {
 
 #[derive(Subcommand)]
 enum BootCommand {
+    /// Capture a running CPS Btrfs root as a directory with a read-only root/
+    Capture {
+        #[arg(long)]
+        source: PathBuf,
+        /// New path in a separate subvolume on the same Btrfs filesystem
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// List registered boot environments and the configured default
     List {
         #[arg(long, required_unless_present = "disk", conflicts_with = "disk")]
@@ -1543,6 +1551,10 @@ fn run(command: Command) -> Result<ExitCode> {
                     _ => anyhow::bail!("specify --esp or the offline disk and output options"),
                 };
                 println!("Selected {id} for the next boot");
+            }
+            BootCommand::Capture { source, output } => {
+                let id = capture_boot_environment(&source, &output)?;
+                println!("Captured {id} at {}", output.display());
             }
             BootCommand::Stage { source, root, plan } => {
                 let id = stage_boot_environment(&source, &root, &load_plan(&plan)?)?;

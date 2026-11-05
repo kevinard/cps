@@ -541,11 +541,11 @@ impl Image {
     }
 
     pub(crate) fn open_query(path: &Path) -> Result<Self> {
-        Self::open_database(
-            Root::open(path)?,
-            false,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
+        Self::open_query_root(Root::open(path)?)
+    }
+
+    pub(crate) fn open_query_root(root: Root) -> Result<Self> {
+        Self::open_database(root, false, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     }
 
     pub(crate) fn open_for_apply(path: &Path) -> Result<Self> {

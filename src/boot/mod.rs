@@ -1,3 +1,4 @@
+mod capture;
 mod deploy;
 mod device;
 mod esp;
@@ -30,6 +31,7 @@ use crate::{
     verify::verify_image,
 };
 
+pub use capture::capture_boot_environment;
 pub use deploy::deploy_boot_environment;
 pub use esp::{
     activate_boot_environment_on_disk, deploy_and_activate_boot_environment,
