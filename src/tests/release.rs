@@ -2058,9 +2058,9 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(saved.catalogs["seed"], previous.trim());
     fetch_plan(&f.root, &saved)?;
     assert_eq!(fs::read(seed_cache.join(&blob))?, b"old");
-    let prune_seed = |images: &[PathBuf]| {
+    let prune_seed = |cache: &Path, images: &[PathBuf], apply| {
         mirror_release::prune_payloads(
-            &seed_cache,
+            cache,
             "seed",
             &seed.public,
             mirror_release::CacheRetention {
@@ -2068,10 +2068,10 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
                 images,
                 plans: &[],
             },
-            false,
+            apply,
         )
     };
-    assert!(prune_seed(&[])?.blobs.is_empty());
+    assert!(prune_seed(&seed_cache, &[], false)?.blobs.is_empty());
 
     let full = work.join("full-cache");
     mirror_release::sync(
@@ -2086,7 +2086,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(fs::read(full.join(&blob))?, b"old");
 
     // The mirror changes its retention list without a new current catalog.
-    // The empty profiled image still needs the original companion pin.
+    // The published profile still needs the original companion pin.
     let unretained_mirror = work.join("unretained-mirror");
     sign_publisher_release(
         &seed,
@@ -2109,8 +2109,12 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         "seed",
         &seed.public,
     )?;
-    assert_eq!(prune_seed(&[])?.blobs, [(digest(b"old"), 3)]);
-    assert!(prune_seed(std::slice::from_ref(&f.root))?.blobs.is_empty());
+    let orphan = digest(b"unreferenced");
+    let orphan_path = seed_cache.join("blobs").join(&orphan);
+    fs::write(&orphan_path, b"unreferenced")?;
+    assert_eq!(prune_seed(&seed_cache, &[], true)?.blobs, [(orphan, 12)]);
+    assert!(!orphan_path.exists());
+    assert_eq!(fs::read(seed_cache.join(&blob))?, b"old");
 
     seed.package_as(
         "seed",
@@ -2219,6 +2223,28 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(fs::read_to_string(seed_cache.join("current"))?, current);
     assert_eq!(plan(&f.root, Request::InstallProfile)?, saved);
     fs::write(&config, correct_config)?;
+
+    // The companion can promote before a write failure leaves the previous
+    // primary visible. Pruning must protect the old pin through this window.
+    let endpoints = primary_cache.join(".tuf/endpoints");
+    let saved_endpoints = work.join("previous-endpoints");
+    fs::rename(&endpoints, &saved_endpoints)?;
+    fs::create_dir(&endpoints)?;
+    let error = mirror_release::sync_profile(&config, true).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<tempfile::PersistError>()
+            .unwrap()
+            .error
+            .kind(),
+        std::io::ErrorKind::IsADirectory
+    );
+    assert_eq!(fs::read_to_string(primary_cache.join("current"))?, first);
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, latest);
+    assert!(prune_seed(&seed_cache, &[], true)?.blobs.is_empty());
+    assert_eq!(plan(&f.root, Request::InstallProfile)?, saved);
+    fs::remove_dir(&endpoints)?;
+    fs::rename(&saved_endpoints, &endpoints)?;
     assert_eq!(mirror_release::sync_profile(&config, true)?, second);
     assert_eq!(
         fs::read_to_string(primary_cache.join("current"))?.trim(),
@@ -2265,9 +2291,13 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
             .id,
         "cps://seed/library/runtime@1.0.0-0"
     );
-    assert!(prune_seed(&[])?.blobs.contains(&(digest(b"old"), 3)));
     assert!(
-        prune_seed(std::slice::from_ref(&bootstrap_root))?
+        prune_seed(&seed_cache, &[], false)?
+            .blobs
+            .contains(&(digest(b"old"), 3))
+    );
+    assert!(
+        prune_seed(&seed_cache, std::slice::from_ref(&bootstrap_root), false)?
             .blobs
             .is_empty()
     );
@@ -2372,8 +2402,32 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(cold_plan.catalogs, saved.catalogs);
     assert!(!cold_seed.join(&blob).exists());
     fetch_plan(&cold_root, &cold_plan)?;
+    let unretained_archive = work.join("unretained-archive");
+    sign_publisher_release(
+        &seed,
+        &unretained_archive,
+        5,
+        fresh,
+        &anchor,
+        &tuf_key,
+        "seed",
+    )?;
+    mirror_release::sync_index(
+        &cold_seed,
+        &anchor,
+        Url::from_directory_path(unretained_archive.join("metadata"))
+            .unwrap()
+            .as_str(),
+        Url::from_directory_path(unretained_archive.join("targets"))
+            .unwrap()
+            .as_str(),
+        "seed",
+        &seed.public,
+    )?;
+    assert!(prune_seed(&cold_seed, &[], true)?.blobs.is_empty());
     fs::rename(&archive_primary, work.join("offline-archive-primary"))?;
     fs::rename(&archive_seed, work.join("offline-archive-seed"))?;
+    fs::rename(&unretained_archive, work.join("offline-unretained-archive"))?;
     apply(&cold_root, &cold_plan)?;
     assert_eq!(fs::read(cold_root.join(payload))?, b"old");
 

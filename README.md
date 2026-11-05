@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-23`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-24`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -914,8 +914,17 @@ cps repo prune-cache --repo /var/lib/cps/canopa --publisher canopa \
 ```
 
 CPS keeps payloads referenced by the current catalog and by catalogs retained
-when that release was synchronized. Repeat `--keep-image` for each root that
-needs offline repair, including fallback roots. An image following a signed
+when that release was synchronized. Coordinated profile sync registers the
+visible profile's companion pins, including its configured bootstrap pin.
+Pruning keeps those payloads even when a standalone companion sync updates
+the mirror's retention list. If promotion stops partway through, pruning
+still follows the primary cache's visible catalog. If that pointer is
+unavailable or unknown, it conservatively keeps both registered selections.
+Run a coordinated sync with CPS `0.1.0-24` or later to register an existing
+profile, and use that version or later to prune its caches.
+
+Repeat `--keep-image` for each root that needs offline repair, including
+fallback roots. An image following a signed
 profile also keeps the profile's current pin for that cache. Repeat
 `--keep-plan` for saved plans and `--keep-catalog SHA256` for other historical
 catalogs needed by builds or releases. Supply the references for each cache
@@ -1629,7 +1638,8 @@ Build the disposable mirror signer with
 fixtures, set `CPS_VM_TUF_MIRRORS=1` for the rollback scenario. The test signs
 separate local TUF mirrors with throwaway keys, syncs the base profile
 index-only, and fetches its planned payloads. It advances a companion while
-the primary still pins the previous catalog, then checks rejection of a
+the primary still pins the previous catalog, and checks that pruning keeps
+the previous kernel after its mirror drops the pin. It then checks rejection of a
 replayed TUF timestamp and missing or corrupt upgrade payloads. After fetching
 the restored payload, it takes the mirrors offline, stages the upgrade, and
 boots through blessing and rollback. This scenario runs without slot reuse.

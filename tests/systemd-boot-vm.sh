@@ -24,7 +24,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-23}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-24}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -106,7 +106,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-3]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-4]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -125,10 +125,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-3]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-4]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-3]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-4]) protected_profiles=true ;;
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
 fi
@@ -710,6 +710,19 @@ if $profiled; then
         publish_vm_mirror "$fixture_publisher" repo public.der 2 --retain-catalog "$base_test_catalog"
         "$cps" repo sync-profile --config image.kdl --index-only --image base
         cmp repo/current "mirror-cache/$fixture_publisher/current"
+        publish_vm_mirror "$fixture_publisher" repo public.der 3
+        mirror_url=$(cat "mirrors/$fixture_publisher/url")
+        companion_cache="mirror-cache/$fixture_publisher"
+        "$cps" repo sync --repo "$companion_cache" --root "mirrors/$fixture_publisher/root.json" \
+            --metadata "${mirror_url}metadata/" --targets "${mirror_url}targets/" \
+            --publisher "$fixture_publisher" --trust-key public.der --index-only
+        test ! -s "$companion_cache/.tuf/retention/$(cat repo/current)"
+        "$cps" repo prune-cache --repo "$companion_cache" --publisher "$fixture_publisher" \
+            --trust-key public.der --apply
+        old_kernel_hash=$(sha256sum "$kernel" | cut -d' ' -f1)
+        cmp "$kernel" "$companion_cache/blobs/$old_kernel_hash"
+        echo 'Verified pruning kept the visible profile kernel after the companion mirror dropped its pin'
+        publish_vm_mirror "$fixture_publisher" repo public.der 4 --retain-catalog "$base_test_catalog"
     fi
     "$cps" plan --root base --output before-profile.json update > before-profile.log
     grep -Fq "\"$base_test_catalog\"" before-profile.json

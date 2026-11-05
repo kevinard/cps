@@ -10,12 +10,15 @@ use crate::{
     kdl_format::{PublisherConfig, read_image_definition},
     model::PackageSpec,
     plan::{CandidateSet, claim_source},
-    repo::{CatalogPin, ReleaseProfile, profiles::profile_paths, read_package, release_profile},
+    repo::{
+        CatalogPin, ReleaseProfile, profiles::profile_paths, read_catalog, read_current,
+        read_package, release_profile,
+    },
 };
 
 use super::{
-    ImageGuard, Mirror, SyncSelection, SyncSource, digest, lock_repo, record_catalog_checkpoint,
-    stage_release,
+    ImageGuard, Mirror, SyncSelection, SyncSource, cache::record_profile_pins, digest, lock_repo,
+    record_catalog_checkpoint, stage_release,
 };
 
 /// Materialize a signed profile's catalog set before advancing its primary pointer.
@@ -207,6 +210,33 @@ fn synchronize_profile(
                 pin.sha256
             )
         })?;
+    }
+    let previous_hash = read_current(primary_repo).ok();
+    // The old catalog may be damaged while the replay checkpoint already
+    // names a newer one. Reuse its recorded pins when repairing that cache.
+    let previous_profile = previous_hash
+        .as_ref()
+        .and_then(|hash| read_catalog(primary_repo, hash, primary.publisher, &primary.key).ok())
+        .and_then(|mut catalog| catalog.release_profiles.remove(name));
+    for (index, (source, repo, _)) in staged.iter().enumerate() {
+        let previous_pin = previous_profile.as_ref().and_then(|profile| {
+            profile
+                .companions
+                .iter()
+                .find(|pin| pin.publisher == source.publisher)
+        });
+        record_profile_pins(
+            repo,
+            &binding,
+            primary_repo,
+            previous_hash
+                .as_deref()
+                .map(|hash| (hash, previous_pin.map(|pin| pin.sha256.as_str()))),
+            &primary_release.current,
+            profiles
+                .iter()
+                .map(|(_, profile)| profile.companions[index].sha256.as_str()),
+        )?;
     }
     // Profile readers use the primary pointer as the visibility boundary.
     // Earlier catalogs and objects remain addressable by their original digests.
