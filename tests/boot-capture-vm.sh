@@ -13,6 +13,22 @@ btrfs=$(realpath -- "${CPS_VM_BTRFS:?Set CPS_VM_BTRFS to a trusted btrfs executa
 formatter=${CPS_VM_MKFS_BTRFS:?Set CPS_VM_MKFS_BTRFS to a trusted mkfs.btrfs executable}
 native_boot=${CPS_VM_BTRFS_BOOT:-0}
 health_fail=${CPS_VM_BTRFS_HEALTH_FAIL:-0}
+kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
+kernel_package=
+kernel_name=
+trial_release=
+if [[ -n $kernel_fixture ]]; then
+    [[ $native_boot == 1 ]] || { echo 'CPS_VM_KERNEL_FIXTURE requires CPS_VM_BTRFS_BOOT=1' >&2; exit 2; }
+    kernel_fixture=$(realpath -- "$kernel_fixture")
+    kernel_package=$(cat "$kernel_fixture/kernel-package")
+    kernel_name=${kernel_package%@*}
+    kernel_name=${kernel_name#cps://canopa-kernel/}
+    trial_release=$(cat "$kernel_fixture/kernel-release")
+    grep -Fx 'CONFIG_BTRFS_FS=y' "$kernel_fixture/image/usr/lib/modules/$trial_release/config"
+    "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
+        --trust-key "$kernel_fixture/release-public.der" "$kernel_package" >/dev/null
+    test "$trial_release" != "${CPS_VM_KERNEL_RELEASE:-$(uname -r)}"
+fi
 root_device=/dev/vda
 root_uuid=7adff456-af50-498f-b39a-dcf87cb4a7c1
 work=$(mktemp -d)
@@ -26,6 +42,11 @@ publish() {
     printf '%s\n' "$1" > proto/etc/cps-capture-version
     "$cps" manifest generate --proto proto --publisher test --version "$1" \
         --uid "$(id -u)" --gid "$(id -g)" test/live-root > manifest.kdl
+    if [[ $1 == 2.0.0-0 && -n $kernel_package ]]; then
+        sed '$d' manifest.kdl > linked.kdl
+        printf '    require "%s" version="=%s"\n}\n' "$kernel_name" "${kernel_package##*@}" >> linked.kdl
+        mv linked.kdl manifest.kdl
+    fi
     "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
 }
 publish 1.0.0-0
@@ -34,6 +55,16 @@ root="$work/files/@"
 "$cps" image-create --root "$root" --repo "$work/repo" --publisher test --trust-key public.der
 "$cps" plan --root "$root" --output install.json install test/live-root
 "$cps" apply --root "$root" install.json
+if [[ -n $kernel_fixture ]]; then
+    cat > kernel-builders.kdl <<POLICY
+schema-version 1
+build-trust {
+    builder-key "$kernel_fixture/builder-public.der"
+}
+POLICY
+    "$cps" publisher add --root "$root" --repo "$kernel_fixture/repo" \
+        --trust-key "$kernel_fixture/release-public.der" --build-trust kernel-builders.kdl canopa-kernel
+fi
 publish 2.0.0-0
 mkdir -p "$root"/{bin,usr/bin,proc,sys,dev,tmp,captures,scratch,repository} files/@captures
 cp -a repo/. "$root/repository/"
@@ -49,6 +80,19 @@ for tool in cp mke2fs e2fsck mount umount find sha256sum sfdisk flock; do
     cp "$binary" "$root/usr/bin/$tool"
     copy_runtime_deps "$root" "$binary"
 done
+if [[ -n $kernel_fixture ]]; then
+    cp -a "$kernel_fixture/repo" "$root/kernel-repository"
+    mkdir -p "$root"/usr/lib/kernel/install.d "$root/vm-modules/$trial_release"
+    : > "$root/vm-modules/$trial_release/load"
+    cp /usr/lib/kernel/install.d/90-loaderentry.install "$root/usr/lib/kernel/install.d/"
+    for tool in kernel-install install chown mkdir grep tr stat rm cmp; do
+        binary=$(command -v "$tool")
+        cp "$binary" "$root/usr/bin/$tool"
+        copy_runtime_deps "$root" "$binary"
+    done
+    printf '%s\n' "${CPS_VM_KERNEL_RELEASE:-$(uname -r)}" > "$root/etc/cps-btrfs-base-kernel"
+    printf '%s\n' "$trial_release" > "$root/etc/cps-btrfs-trial-kernel"
+fi
 if [[ $native_boot == 1 ]]; then
     setup_systemd_guest "$root"
     mkdir -p "$root"/{volume,efi,boot,run,var/tmp}
@@ -98,6 +142,18 @@ set -eu
 bb=/bin/busybox
 export PATH=/usr/bin:/bin
 version=$($bb cat /etc/cps-capture-version)
+if [ -f /etc/cps-btrfs-trial-kernel ]; then
+    if [ "$version" = 2.0.0-0 ]; then
+        test "$($bb uname -r)" = "$($bb cat /etc/cps-btrfs-trial-kernel)"
+        audit=$(cps publisher audit-builds --root / canopa-kernel)
+        echo "$audit"
+        test "$audit" = 'Verified build evidence for 1 installed package(s) from canopa-kernel'
+        echo "CPS_VM_BTRFS_KERNEL: trial $($bb uname -r)"
+    else
+        test "$($bb uname -r)" = "$($bb cat /etc/cps-btrfs-base-kernel)"
+        echo "CPS_VM_BTRFS_KERNEL: previous $($bb uname -r)"
+    fi
+fi
 if [ "$version" = 2.0.0-0 ] && [ -f /etc/cps-btrfs-fail-health ]; then
     if cps verify --root / > /run/rejected 2>&1; then exit 1; fi
     $bb grep -F 'etc/cps-capture-version' /run/rejected
@@ -165,7 +221,15 @@ if [ -f /etc/cps-btrfs-boot ]; then
 fi
 mount -t btrfs -o subvol=@captures "$root_device" /captures
 mount -t ext4 /dev/vdb /scratch
-cps publisher set-repository --root / --repo test=/repository
+if [ -f /etc/cps-btrfs-boot ]; then
+    boot_files=$(sha256sum /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI)
+    boot_paths=$(find /boot /efi -print)
+fi
+if [ -f /etc/cps-btrfs-trial-kernel ]; then
+    cps publisher set-repository --root / --repo test=/repository --repo canopa-kernel=/kernel-repository
+else
+    cps publisher set-repository --root / --repo test=/repository
+fi
 cps plan --root / --output /captures/upgrade.json update
 printf 'captured local state\n' > /etc/cps-capture-local
 before=$(sha256sum /.cps/state.sqlite)
@@ -238,7 +302,22 @@ test "$($bb cat "$stage/etc/cps-capture-version")" = 2.0.0-0
 test "$($bb cat /captures/base/root/etc/cps-capture-version)" = 1.0.0-0
 test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0
 test "$(sha256sum /.cps/state.sqlite)" = "$before"
+if [ -f /etc/cps-btrfs-boot ]; then
+    test "$(sha256sum /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI)" = "$boot_files"
+    test "$(find /boot /efi -print)" = "$boot_paths"
+fi
 cps verify --root "$stage"
+if [ -f /etc/cps-btrfs-trial-kernel ]; then
+    audit=$(cps publisher audit-builds --root "$stage" canopa-kernel)
+    echo "$audit"
+    test "$audit" = 'Verified build evidence for 1 installed package(s) from canopa-kernel'
+    release=$($bb cat /etc/cps-btrfs-trial-kernel)
+    found=false
+    for prepared in "$stage"/.cps/kernel-*/linux; do
+        if cmp -s "$prepared" "$stage/usr/lib/modules/$release/vmlinuz"; then found=true; fi
+    done
+    test "$found" = true
+fi
 cps boot-env export --root "$stage" --output /scratch/root.ext4 --size-mib 256 \
     --receipt > /scratch/root.kdl
 test "$($bb cat "$stage/etc/cps-capture-local")" = 'captured local state'
@@ -364,6 +443,10 @@ if [[ $native_boot == 1 ]]; then
         -drive if=pflash,format=raw,file=vars.fd -drive if=virtio,format=raw,file=disk.raw || { cat uefi.log; exit 1; }
     tr -d '\r' < uefi.log > uefi.log.clean
     cat uefi.log.clean
+    if [[ -n $kernel_fixture ]]; then
+        test "$(grep -Fxc "CPS_VM_BTRFS_KERNEL: trial $trial_release" uefi.log.clean)" = 2
+        grep -Fx "CPS_VM_BTRFS_KERNEL: previous ${CPS_VM_KERNEL_RELEASE:-$(uname -r)}" uefi.log.clean
+    fi
     if [[ $health_fail == 1 ]]; then
         test "$(grep -Fxc 'CPS_VM_BTRFS_BOOT: trial health failed without blessing' uefi.log.clean)" = 2
         grep -Fx 'CPS_VM_BTRFS_BOOT: previous root after exhausted trial' uefi.log.clean

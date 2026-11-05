@@ -24,7 +24,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-33}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-34}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -143,6 +143,7 @@ fi
 if [[ -n $kernel_fixture ]]; then
     $profiled || { echo 'CPS_VM_KERNEL_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
     kernel_fixture=$(realpath -- "$kernel_fixture")
+    if [[ -f "$kernel_fixture/kernel-package" ]]; then kernel_package=$(cat "$kernel_fixture/kernel-package"); fi
     trial_release=$(cat "$kernel_fixture/kernel-release")
     test "$trial_release" = 6.12.115-cps-vm
     trial_kernel="$kernel_fixture/image/usr/lib/modules/$trial_release/vmlinuz"
@@ -920,7 +921,7 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     done
     test -n "$prepared"
     if [[ -n $kernel_fixture ]]; then
-        grep -Fq 'Install cps://canopa-kernel/system/kernel-qemu 6.12.115-0' update.log
+        grep -Fq "Install ${kernel_package%@*} ${kernel_package##*@}" update.log
         cmp "$kernel_fixture/image/usr/lib/modules/$trial_release/config" "$staged_root/usr/lib/modules/$trial_release/config"
         test ! -e "${prepared%/*}/initrd"
     else

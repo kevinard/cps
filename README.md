@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-33`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-34`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1525,6 +1525,11 @@ Add `CPS_VM_BTRFS_HEALTH_FAIL=1` to change a managed file's metadata at
 trial boot and verify that two unblessed attempts fall back to the original
 subvolume.
 
+Set `CPS_VM_KERNEL_FIXTURE` to the output from `tests/build-kernel.sh`
+to stage the signed Btrfs-capable kernel as part of the upgrade. The image
+requires its builder signature, audits the installed evidence after boot,
+and checks the running kernel in both the trial and the previous root.
+
 ### Activating a trial on an installed disk
 
 You can plan and stage directly from the installed root during a rescue boot.
@@ -1851,7 +1856,7 @@ it installed. The worker toolchain still comes from prebuilt Arch packages.
 For the signed-profile rollback test, also set `CPS_VM_KERNEL_FIXTURE` to the
 build output directory. The signed trial installs the kernel and its build
 configuration directly from the fixture repository. This kernel has built-in
-virtio, ext4, and VFAT support and boots the QEMU test root without an initrd.
+virtio, ext4, Btrfs, and VFAT support and boots the QEMU test root without an initrd.
 The previous root keeps its original kernel and initrd.
 
 #### Testing source-built systemd and systemd-boot

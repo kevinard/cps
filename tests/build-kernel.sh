@@ -35,6 +35,8 @@ recipe="$project/packaging/kernel-qemu"
 mkdir "$work/inputs"
 cp --reflink=auto -- "$sources/linux-6.12.115.tar.xz" "$recipe/vm.config" "$work/inputs/"
 sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/kernel.kdl" > kernel.kdl
+kernel_version=$(awk -F 'version="' '/^package / {split($2, version, "\""); print version[1]}' kernel.kdl)
+test -n "$kernel_version"
 sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha kernel.kdl)/g" \
     -e "s/@CONFIG_SHA256@/$(sha "$recipe/vm.config")/g" \
@@ -52,12 +54,12 @@ cat > repo/publish-policy.kdl <<POLICY
 schema-version 1
 publisher "canopa-kernel" {
     builder-key "builder-public.der"
-    approve "system/kernel-qemu" version="6.12.115-0" sha256="$reviewed"
+    approve "system/kernel-qemu" version="$kernel_version" sha256="$reviewed"
 }
 POLICY
 "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$reviewed" bundle
-package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
+package=cps://canopa-kernel/system/kernel-qemu@$kernel_version
 "$cps" repo attestation --repo repo --publisher canopa-kernel --trust-key release-public.der \
     "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
@@ -68,4 +70,5 @@ package=cps://canopa-kernel/system/kernel-qemu@6.12.115-0
 release=6.12.115-cps-vm
 cmp "bundle/proto/usr/lib/modules/$release/vmlinuz" "image/usr/lib/modules/$release/vmlinuz"
 printf '%s\n' "$release" > kernel-release
+printf '%s\n' "$package" > kernel-package
 printf 'Verified reproducible kernel build, signed provenance, and installation of Linux %s\n' "$release"
