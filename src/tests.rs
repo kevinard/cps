@@ -160,6 +160,89 @@ fn live_install_recovers_offline_and_preserves_boot_identity() -> Result<()> {
 }
 
 #[test]
+fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
+    use std::collections::BTreeSet;
+
+    use crate::{
+        apply::apply_live,
+        image::{Image, root::Root},
+        kdl_format::parse_manifest,
+        query::package_manifest,
+    };
+
+    let fixture = Fixture::new()?;
+    let runtime = "system/runtime";
+    let path = "usr/lib/libexample.so.1";
+    let file = fixture.file(path, "version one", "0644", "")?;
+    let manifest = format!(
+        "schema-version 1\npackage {runtime:?} publisher=\"canopa\" version=\"1.0.0-0\" requires-reboot=#true {{\n{file}}}\n"
+    );
+    assert!(parse_manifest(&manifest.replace("#true", "\"true\"")).is_err());
+    fs::write(&fixture.recipe, manifest)?;
+    publish(
+        &fixture.repo,
+        &fixture.proto,
+        &fixture.recipe,
+        &fixture.private,
+    )?;
+    fixture.package(
+        "apps/example",
+        "1.0.0-0",
+        format!("    require {runtime:?}\n"),
+    )?;
+    fixture.package("apps/independent", "1.0.0-0", String::new())?;
+    fixture.create()?;
+
+    let verified = package_manifest(&fixture.root, runtime, true)?;
+    assert!(parse_manifest(&verified)?.requires_reboot);
+    let install = |name: &str| {
+        plan(
+            &fixture.root,
+            Request::Install {
+                packages: vec![name.into()],
+            },
+        )
+    };
+    let policy = BTreeSet::new();
+    let reason = "system/runtime declares requires-reboot in its manifest";
+    let initial = install("apps/example")?;
+    assert_eq!(initial.boot_reason(&policy).as_deref(), Some(reason));
+
+    let settings = Image::open_query(&fixture.root)?.settings()?;
+    let live =
+        Image::open_for_live_apply(Root::open(&fixture.root)?, &settings.id, settings.revision)?;
+    let error = apply_live(live, &initial, &policy).unwrap_err();
+    assert!(format!("{error:#}").contains(reason));
+    assert!(!fixture.root.join(path).exists());
+    assert!(crate::transaction_status(&fixture.root)?.pending.is_none());
+
+    apply(&fixture.root, &initial)?;
+    assert!(install("apps/independent")?.boot_reason(&policy).is_none());
+    let remove = plan(
+        &fixture.root,
+        Request::Remove {
+            packages: vec!["apps/example".into(), runtime.into()],
+        },
+    )?;
+    assert_eq!(remove.boot_reason(&policy).as_deref(), Some(reason));
+
+    fixture.package(
+        runtime,
+        "2.0.0-0",
+        fixture.file(path, "version two", "0644", "")?,
+    )?;
+    let upgrade = plan(&fixture.root, Request::Update)?;
+    assert_eq!(upgrade.boot_reason(&policy).as_deref(), Some(reason));
+    apply(&fixture.root, &upgrade)?;
+    assert!(
+        plan(&fixture.root, Request::Update)?
+            .boot_reason(&policy)
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn manifest_capabilities_require_a_protected_executable() -> Result<()> {
     use crate::kdl_format::{manifest_text, parse_manifest};
     let package = |metadata| {

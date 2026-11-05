@@ -31,6 +31,21 @@ keeps the current one as fallback. CPS reports when a reboot is needed
 and leaves the timing to you. Boot into the selected environment before
 making more package changes so the next boot includes all of your work.
 
+Package authors can mark packages for staging in the signed manifest.
+
+```kdl
+schema-version 1
+package "system/example-runtime" publisher="canopa" version="1.0.0-0" requires-reboot=#true {
+    file "usr/lib/libexample.so.1" mode="0644" uid=0 gid=0
+}
+```
+
+The system commands stage the whole transaction when they install, replace,
+or remove a marked package, including dependency changes. For replacements,
+CPS checks both the installed and selected manifests. An unchanged marked
+package does not require staging. The flag defaults to false, and
+distribution `stage-package` rules and boot path checks still apply.
+
 Use `--dry-run` to review the proposed transaction, `--yes` to confirm it
 in a script, or `--no-refresh` to use the current cached catalog. Fetching
 uncached package files can still contact the mirror. With configured

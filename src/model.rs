@@ -566,6 +566,8 @@ pub struct Manifest {
     pub systemd: Vec<crate::systemd::Action>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<crate::boot::kernel::Kernel>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_reboot: bool,
 }
 
 impl Manifest {

@@ -70,6 +70,8 @@ test "$(cps boot-env list --esp /efi)" = "$before"
 $bb cp /repository/catalog-base-upgrade /repository/current
 if [ -f /etc/cps-btrfs-trial-kernel ]; then
     cps upgrade --dry-run | $bb grep -F 'changes the boot kernel or initramfs'
+else
+    cps upgrade --dry-run | $bb grep -F 'test/live-root declares requires-reboot in its manifest'
 fi
 cps upgrade --yes
 test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0

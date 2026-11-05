@@ -55,6 +55,7 @@ pub fn generate_manifest_for_architecture(
         action: Vec::new(),
         systemd: Vec::new(),
         kernel: None,
+        requires_reboot: false,
     };
     let mut groups = BTreeMap::new();
     let root = Root::open(proto)?;

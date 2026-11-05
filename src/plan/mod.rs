@@ -132,6 +132,8 @@ pub struct PackageChange {
     pub publisher: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_reboot: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,6 +184,19 @@ impl Plan {
     pub(crate) fn boot_reason(&self, stage_packages: &BTreeSet<String>) -> Option<String> {
         if self.kernel_install.is_some() {
             return Some("the transaction changes the boot kernel or initramfs".into());
+        }
+        if let Some(change) = self
+            .package_changes
+            .iter()
+            .find(|change| change.requires_reboot)
+        {
+            let package = change.publisher.as_ref().map_or_else(
+                || change.name.clone(),
+                |publisher| format!("cps://{publisher}/{}", change.name),
+            );
+            return Some(format!(
+                "{package} declares requires-reboot in its manifest"
+            ));
         }
         if let Some(change) = self
             .package_changes
@@ -866,19 +881,15 @@ pub(crate) fn build(
         .chain(installed.keys())
         .collect::<BTreeSet<_>>()
     {
-        let from = state
-            .installed
-            .get(name)
-            .map(|old| old.published.manifest.version.to_string());
-        let to = installed
-            .get(name)
-            .map(|new| new.published.manifest.version.to_string());
+        let previous = state.installed.get(name).map(|old| &old.published.manifest);
+        let selected = installed.get(name).map(|new| &new.published.manifest);
+        let from = previous.map(|manifest| manifest.version.to_string());
+        let to = selected.map(|manifest| manifest.version.to_string());
         if from != to {
             let publisher = if state.publishers.as_slice().len() > 1 {
-                installed
-                    .get(name)
-                    .or_else(|| state.installed.get(name))
-                    .map(|entry| entry.published.manifest.publisher.clone())
+                selected
+                    .or(previous)
+                    .map(|manifest| manifest.publisher.clone())
             } else {
                 None
             };
@@ -887,6 +898,10 @@ pub(crate) fn build(
                 publisher,
                 from,
                 to,
+                requires_reboot: previous
+                    .into_iter()
+                    .chain(selected)
+                    .any(|manifest| manifest.requires_reboot),
             });
         }
     }

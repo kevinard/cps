@@ -62,6 +62,9 @@ publish() {
     printf '%s\n' "$1" > proto/etc/cps-capture-version
     "$cps" manifest generate --proto proto --publisher test --version "$1" \
         --uid "$(id -u)" --gid "$(id -g)" test/live-root > manifest.kdl
+    if [[ $system_commands == 1 && $1 != 1.0.0-0 ]]; then
+        sed -i '/^package /s/ {$/ requires-reboot=#true {/' manifest.kdl
+    fi
     if [[ $1 != 1.0.0-0 && -n $kernel_package ]]; then
         sed '$d' manifest.kdl > linked.kdl
         printf '    require "%s" version="=%s"\n}\n' "$kernel_name" "${kernel_package##*@}" >> linked.kdl
@@ -159,7 +162,6 @@ publisher "test" {
     trust-key "test.der"
 }
 boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid" options="rw console=ttyS0 loglevel=3 init=/init-systemd"
-stage-package "test/live-root"
 CONFIG
     fi
     if [[ $destroy == 1 ]]; then

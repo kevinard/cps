@@ -143,7 +143,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         doc.nodes().len() == 2,
         "expected only schema-version and package nodes"
     );
-    let fields = Fields::read(package, 1, &["publisher", "version", "architecture"], true)?;
+    let fields = Fields::read(
+        package,
+        1,
+        &["publisher", "version", "architecture", "requires-reboot"],
+        true,
+    )?;
     let mut manifest = Manifest {
         format: FORMAT,
         name: fields.string_arg(0)?,
@@ -154,6 +159,16 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         action: Vec::new(),
         systemd: Vec::new(),
         kernel: None,
+        requires_reboot: fields
+            .properties
+            .get("requires-reboot")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .context("requires-reboot must be #true or #false")
+            })
+            .transpose()?
+            .unwrap_or(false),
     };
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
@@ -336,6 +351,9 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     package.insert("version", manifest.version.to_string());
     if let Some(architecture) = &manifest.architecture {
         package.insert("architecture", architecture.as_str());
+    }
+    if manifest.requires_reboot {
+        package.insert("requires-reboot", true);
     }
     let children = package.ensure_children().nodes_mut();
     for dependency in &manifest.dependency {
