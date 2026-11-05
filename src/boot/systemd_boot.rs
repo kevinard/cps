@@ -261,6 +261,8 @@ pub(super) fn activate(
             && !root.starts_with(&esp),
         "use separate, inactive image and EFI directories"
     );
+    // Rollback and live writes acquire the ESP lock before any image lock.
+    let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let image = Image::open_query(&root)?;
     if volume.is_none() || !activation.known_good {
         image.root.offline_path()?;
@@ -281,7 +283,12 @@ pub(super) fn activate(
     let state = image.state()?;
     let settings = &state.settings;
     let image_id = canonical_partuuid(&settings.id).context("invalid image identity")?;
-    let id = entry_id(&image_id, settings.revision);
+    let boot_revision = if btrfs.is_some() {
+        settings.boot_revision()
+    } else {
+        settings.revision
+    };
+    let id = entry_id(&image_id, boot_revision);
     let fallback = match (activation.known_good, &settings.boot_parent) {
         (true, None) => None,
         (false, Some(parent)) => {
@@ -359,7 +366,6 @@ pub(super) fn activate(
     } else {
         None
     };
-    let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     if let Some(volume) = volume {
         volume.check_disk(&esp, &_lock, &partuuid)?;
     } else if let Some(target) = deployment.and_then(|deployment| deployment.target) {
@@ -386,7 +392,7 @@ pub(super) fn activate(
     };
     let description = Entry {
         id: &id,
-        revision: settings.revision,
+        revision: boot_revision,
         partuuid: &partuuid,
         parent: if existing_entry.is_some_and(|entry| entry.parent.is_none()) {
             None // Keep activation retries compatible with previously registered entries.
@@ -468,11 +474,19 @@ pub(super) fn activate(
                 .context("the fallback must be a verified Btrfs environment")?;
             volume.check_disk(&esp, &_lock, &base.partuuid)?;
             let (image, revision) = policy::entry_identity(&base.id)?;
-            _fallback_lock = Some(
-                volume
-                    .verify(record, image, revision)
-                    .context("checking the Btrfs fallback root")?,
+            let parent = volume
+                .verify(record, image, revision)
+                .context("checking the Btrfs fallback root")?;
+            ensure!(
+                parent.settings()?.revision
+                    == settings
+                        .boot_parent
+                        .as_ref()
+                        .context("missing boot parent")?
+                        .image_revision(),
+                "the base changed after staging; prepare a new upgrade"
             );
+            _fallback_lock = Some(parent);
         }
         if let Some(replace) = replace {
             ensure!(

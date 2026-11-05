@@ -12,7 +12,7 @@ use rustix::{
 };
 
 use crate::{
-    image::{BootParent, Image, root::Root},
+    image::{Image, root::Root},
     plan::Plan,
 };
 
@@ -122,10 +122,7 @@ fn snapshot_environment(source: &Path, output: &Path, plan: Option<&Plan>) -> Re
             super::btrfs_boot::clear_registration(&Root::open(&scratch.path().join("root"))?)?;
             finish_staged_root(
                 &scratch.path().join("root"),
-                BootParent {
-                    id: settings.id.clone(),
-                    revision: settings.revision,
-                },
+                settings.as_boot_parent(),
                 plan,
             )?
         } else {

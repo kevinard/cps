@@ -267,7 +267,7 @@ impl BtrfsVolume {
         let image = Image::open_query_root(root)?;
         let settings = image.settings()?;
         ensure!(
-            settings.id == image_id && settings.revision == revision,
+            settings.id == image_id && settings.boot_revision() == revision,
             "Btrfs root image or revision differs from its boot entry"
         );
         check_image_integrity(&image)?;
@@ -312,7 +312,7 @@ impl BtrfsVolume {
         let image = Image::open_query_root(root)?;
         let settings = image.settings()?;
         ensure!(
-            registered == super::entry_id(&settings.id, settings.revision).as_bytes(),
+            registered == super::entry_id(&settings.id, settings.boot_revision()).as_bytes(),
             "the running root's boot registration differs from its image identity"
         );
         settings

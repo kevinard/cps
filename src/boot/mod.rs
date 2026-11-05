@@ -126,10 +126,7 @@ fn staging_inputs<'a>(
     base.require_clean()?;
     check_staging_plan(&base, plan)?;
     let settings = base.settings()?;
-    let previous = BootParent {
-        id: settings.id,
-        revision: settings.revision,
-    };
+    let previous = settings.as_boot_parent();
     let destination = parent.as_file().metadata()?;
     let destination = (destination.dev(), destination.ino());
     let origin = base.root.as_file().metadata()?;

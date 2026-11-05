@@ -43,6 +43,8 @@ const DORMANT_CONFIG_IMAGE_FORMAT: u32 = 7;
 const PROFILE_INTENT_IMAGE_FORMAT: u32 = 8;
 // Older writers do not enforce persistent package version constraints.
 const FREEZE_IMAGE_FORMAT: u32 = 9;
+// Older clients cannot verify a boot entry after a live package transaction.
+const LIVE_IMAGE_FORMAT: u32 = 10;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +79,8 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_parent: Option<BootParent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bootstrap_catalog: Option<String>,
     #[serde(
         default,
@@ -110,9 +114,29 @@ pub(crate) fn publisher_generation_is_initial(generation: &u64) -> bool {
 pub struct BootParent {
     pub id: String,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<u64>,
+}
+
+impl BootParent {
+    pub(crate) fn image_revision(&self) -> u64 {
+        self.source_revision.unwrap_or(self.revision)
+    }
 }
 
 impl Settings {
+    pub(crate) fn boot_revision(&self) -> u64 {
+        self.boot_revision.unwrap_or(self.revision)
+    }
+
+    pub(crate) fn as_boot_parent(&self) -> BootParent {
+        BootParent {
+            id: self.id.clone(),
+            revision: self.boot_revision(),
+            source_revision: self.boot_revision.map(|_| self.revision),
+        }
+    }
+
     pub(crate) fn next_revision(&self) -> Result<u64> {
         self.revision
             .checked_add(1)
@@ -235,7 +259,14 @@ impl Publishers {
     }
 
     pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
-        if !settings.freezes.is_empty() {
+        if settings.boot_revision.is_some()
+            || settings
+                .boot_parent
+                .as_ref()
+                .is_some_and(|parent| parent.source_revision.is_some())
+        {
+            LIVE_IMAGE_FORMAT
+        } else if !settings.freezes.is_empty() {
             FREEZE_IMAGE_FORMAT
         } else if settings.bootstrap_catalog.is_some() {
             BOOTSTRAP_IMAGE_FORMAT
@@ -467,6 +498,7 @@ fn initialize(
         gid: getegid().as_raw(),
         created_directories: BTreeSet::new(),
         boot_parent: None,
+        boot_revision: None,
         bootstrap_catalog,
         archived_profile_catalog: None,
         catalog_checkpoints: BTreeMap::new(),
@@ -639,8 +671,20 @@ impl Image {
                     | DORMANT_CONFIG_IMAGE_FORMAT
                     | PROFILE_INTENT_IMAGE_FORMAT
                     | FREEZE_IMAGE_FORMAT
+                    | LIVE_IMAGE_FORMAT
             ),
             "unsupported image format"
+        );
+        ensure!(
+            settings
+                .boot_revision
+                .is_none_or(|revision| revision < settings.revision)
+                && settings.boot_parent.as_ref().is_none_or(|parent| {
+                    parent.source_revision.is_none_or(|revision| {
+                        parent.revision < revision && revision < settings.revision
+                    })
+                }),
+            "invalid boot revision"
         );
         Ok(settings)
     }
@@ -735,11 +779,14 @@ impl Image {
         self.require_clean()?;
         let mut settings = self.settings()?;
         ensure!(
-            settings.id == parent.id && parent.revision.checked_add(1) == Some(settings.revision),
+            settings.id == parent.id
+                && parent.image_revision().checked_add(1) == Some(settings.revision),
             "staged image does not descend from the requested base"
         );
         settings.id = new_identity()?;
         settings.boot_parent = Some(parent);
+        settings.boot_revision = None;
+        settings.format = self.publishers()?.image_format(&settings);
         self.db.execute(
             "UPDATE image SET data=?1 WHERE id=1",
             [serde_json::to_string(&settings)?],
