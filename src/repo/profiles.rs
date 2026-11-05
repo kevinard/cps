@@ -433,6 +433,7 @@ fn compose<'a>(
         Candidates {
             packages: catalogs.packages.iter().copied(),
             obsoletions: &catalogs.obsoletions,
+            freezes: &BTreeMap::new(),
         },
         &requested,
         false,
@@ -472,13 +473,21 @@ fn check_upgrade(
     let solver = Some(SolverRevision::SatV1);
     let compose = |installed: &_| profile_paths(&profile.architecture, &profile.facets, installed);
     let (after, new_paths) = if locked {
-        catalogs.update_profile(before, profile, Some(&BTreeSet::new()), solver, compose)?
+        catalogs.update_profile(
+            before,
+            profile,
+            &BTreeMap::new(),
+            Some(&BTreeSet::new()),
+            solver,
+            compose,
+        )?
     } else {
         let result = resolve_packages(
             before,
             Candidates {
                 packages: catalogs.packages.iter().copied(),
                 obsoletions: &catalogs.obsoletions,
+                freezes: &BTreeMap::new(),
             },
             &BTreeMap::new(),
             true,

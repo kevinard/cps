@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, ensure};
 
 use super::SolverRevision;
+use super::freeze::{self, FrozenPackage};
 use crate::{
     image::Installed,
     model::{Dependency, DependencyTarget, PackageSpec, Version},
@@ -14,6 +15,7 @@ use crate::{
 pub(crate) struct Candidates<'a, P> {
     pub packages: P,
     pub obsoletions: &'a BTreeMap<String, Version>,
+    pub freezes: &'a BTreeMap<String, FrozenPackage>,
 }
 
 pub(crate) enum Retention<'a> {
@@ -41,6 +43,16 @@ pub fn resolve<'a, T>(
     solver: Option<SolverRevision>,
     compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
 ) -> Result<(BTreeMap<String, Installed>, T)> {
+    for (name, spec) in requested {
+        if let Some(frozen) = available.freezes.get(*name) {
+            ensure!(
+                spec.version.is_none_or(|version| version == frozen.version),
+                "{name} is frozen at {}{}; use plan unfreeze before changing its version",
+                frozen.version,
+                freeze::reason_suffix(frozen)
+            );
+        }
+    }
     let mut candidates = BTreeMap::<_, Vec<_>>::new();
     let obsolete = |package: &Published| {
         let manifest = &package.manifest;
@@ -58,6 +70,13 @@ pub fn resolve<'a, T>(
             continue;
         }
         let manifest = &package.manifest;
+        if available
+            .freezes
+            .get(&manifest.name)
+            .is_some_and(|freeze| freeze.version != manifest.version)
+        {
+            continue;
+        }
         let spec = requested.get(manifest.name.as_str());
         let pinned = spec.and_then(|spec| spec.version);
         let previous = installed.get(&manifest.name);
@@ -150,10 +169,11 @@ pub fn resolve<'a, T>(
             })
             .collect();
         check(&installed).context("validating the resolved package set")?;
+        freeze::check(available.freezes, &installed)?;
         let composed = compose(&installed)?;
         Ok((installed, composed))
     };
-    match solver {
+    let result = match solver {
         Some(SolverRevision::SatV1) => {
             let retained = installed
                 .iter()
@@ -166,9 +186,16 @@ pub fn resolve<'a, T>(
             // Existing saved plans and pinned build recipes retain their original selection order.
             let mut selected = BTreeMap::new();
             search(&candidates, wanted.clone(), &mut selected)
-                .context("cannot satisfy package constraints")?;
-            materialize(selected)
+                .context("cannot satisfy package constraints")
+                .and_then(|()| materialize(selected))
         }
+    };
+    if available.freezes.is_empty() {
+        result
+    } else {
+        result.with_context(|| {
+            format!("resolving package selection with freezes: {}; use plan unfreeze to lift a constraint", available.freezes.iter().map(|(name, frozen)| format!("{name}@{}{}", frozen.version, freeze::reason_suffix(frozen))).collect::<Vec<_>>().join(", "))
+        })
     }
 }
 

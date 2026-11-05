@@ -52,6 +52,7 @@ pub(crate) fn verify_state(root: &Root, state: &State) -> Result<Vec<Finding>> {
 }
 
 fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding>> {
+    crate::plan::freeze::check(&state.settings.freezes, &state.installed)?;
     let expected = manifest_paths(state)?;
     let mut findings = Vec::new();
     if let Err(error) = check_dependencies(&state.installed) {

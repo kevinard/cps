@@ -503,6 +503,7 @@ fn resolve_toolchain(
         Candidates {
             packages: &candidates.packages,
             obsoletions: &candidates.obsoletions,
+            freezes: &BTreeMap::new(),
         },
         &requested,
         false,

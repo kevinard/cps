@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-34`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-35`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1216,7 +1216,42 @@ compatible alternative and any conditional dependencies that apply. The
 plan and apply work offline. Use `plan mark explicit` to keep an installed
 dependency before planning cleanup.
 
-Run `cargo test` for the desktop upgrade and interruption test.
+### Freezing package versions
+
+Keep a package at its installed version until explicitly unfreezing it.
+Freeze and unfreeze changes use saved plans and work offline.
+
+```sh
+cps plan --root image --output freeze.json freeze --reason "Validate graphics compatibility" library/libdisplay
+cps apply --root image freeze.json
+cps freeze --root image
+cps plan --root image --output unfreeze.json unfreeze library/libdisplay
+cps apply --root image unfreeze.json
+```
+
+A freeze constrains the complete `major.minor.patch-revision` version during
+installs, dependency resolution, and updates. Other packages can still advance
+when their dependencies allow it. A conflicting signed profile update fails
+with the freeze's reason; it cannot silently lift the constraint. Freezes
+follow staged roots and are recorded in transaction history without timestamps.
+Images with freezes require image format 9 and a CPS release that supports it.
+
+Removal and dependency cleanup remain allowed. The freeze survives removal and
+constrains later reinstallation. Specify `NAME@VERSION` to freeze a package
+that is not installed. For an installed package, an explicit version must
+match the installed version. Publisher selectors check the selected installed
+package, while the stored constraint applies to the package name and version.
+This follows [IPS package freezes](https://docs.oracle.com/cd/E26502_01/html/E28984/gilfr.html)
+with CPS's complete numeric versions.
+
+Run `tests/package-freezes.sh` for the CLI workflow. It also accepts
+`CPS_TEST_BINARY` for a packaged executable and `CPS_TEST_PREVIOUS_BINARY`
+to verify that an earlier client rejects the new image format. The signed
+profile VM test freezes SQLite in both independently assembled base images,
+checks a conflicting update, and verifies the retained freeze on the trial,
+default reboot, and rollback boots.
+
+Run `cargo test` for the desktop upgrade and interruption tests.
 
 ### Changing facets on an existing image
 

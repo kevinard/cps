@@ -24,7 +24,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-34}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-35}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -49,6 +49,8 @@ profiled=false
 signed_cps_builds=false
 protected_profiles=false
 package_intent=false
+package_freezes=false
+base_revision=1
 qemu=${CPS_VM_QEMU:-qemu-system-x86_64}
 efi=${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}
 if [[ -n $systemd_fixture ]]; then
@@ -131,6 +133,7 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
         0.1.0-[5-9]|0.1.0-[1-9][0-9]) protected_profiles=true ;;
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
+    if (( ${cps_version##*-} >= 35 )); then package_freezes=true; base_revision=2; fi
 fi
 if [[ $tuf_mirrors == 1 ]]; then
     if ! $profiled || [[ $recycle == 1 ]]; then
@@ -419,6 +422,9 @@ if $systemd_guest; then
             touch runtime/etc/cps-vm-assert-profile-protection
         fi
         if $package_intent; then touch runtime/etc/cps-vm-assert-package-intent; fi
+        if $package_freezes; then
+            printf '%s\n' "$sqlite_version" > runtime/etc/cps-vm-frozen-sqlite
+        fi
     else
         copy_runtime_deps runtime proto/usr/bin/cps
     fi
@@ -587,6 +593,14 @@ if [[ $tuf_mirrors == 1 ]]; then
     echo 'Verified initial profile payloads were fetched into an index-only TUF cache'
 fi
 "$cps" apply --root base install.json
+freeze_runtime() {
+    local root=$1
+    "$cps" plan --root "$root" --output "$root-freeze.json" freeze \
+        --reason 'VM runtime compatibility' system/sqlite
+    "$cps" apply --root "$root" "$root-freeze.json"
+    "$cps" freeze --root "$root" | grep -F $'system/sqlite\t'"$sqlite_version"$'\t"VM runtime compatibility"'
+}
+if $package_freezes; then freeze_runtime base; fi
 "$cps" verify --root base --pristine
 if [[ $mode == facet-change ]]; then printf 'local settings\n' > base/etc/cps-vm-optional.conf; fi
 if [[ $reprovision == 1 ]]; then
@@ -594,6 +608,7 @@ if [[ $reprovision == 1 ]]; then
     "$cps" plan --root repro-base --output repro-install.json install-profile
     cmp install.json repro-install.json
     "$cps" apply --root repro-base repro-install.json
+    if $package_freezes; then freeze_runtime repro-base; cmp base-freeze.json repro-base-freeze.json; fi
     "$cps" verify --root repro-base --pristine
 fi
 check_runtime_packages() {
@@ -658,7 +673,7 @@ else
     base_id=${base_id#Activated }
 fi
 if [[ $reprovision == 1 ]]; then
-    test "$base_id" = cps-a47593c2-e985-42d2-92b6-44c7057e1e96-1
+    test "$base_id" = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-$base_revision"
     "$cps" boot-env export --receipt --root repro-base --output repro-base.ext4 \
         --size-mib "$root_mib" > repro-base.kdl
     cmp base.ext4 repro-base.ext4
@@ -836,6 +851,22 @@ if $profiled; then
     fi
 fi
 request=(update)
+if $package_freezes; then
+    cp -a --reflink=auto base freeze-probe
+    "$cps" plan --root freeze-probe --output freeze-state.json freeze \
+        --reason 'VM boot-state compatibility' test/boot-state
+    "$cps" apply --root freeze-probe freeze-state.json
+    if "$cps" plan --root freeze-probe --output blocked.json update > freeze-rejected.log 2>&1; then
+        echo 'The signed profile update ignored a package freeze' >&2
+        exit 1
+    fi
+    grep -F 'VM boot-state compatibility' freeze-rejected.log
+    test ! -e blocked.json
+    "$cps" plan --root freeze-probe --output unfreeze-state.json unfreeze test/boot-state
+    "$cps" apply --root freeze-probe unfreeze-state.json
+    "$cps" plan --root freeze-probe --output unfrozen.json update >/dev/null
+    echo 'Verified the signed profile update required explicit unfreezing'
+fi
 if [[ $mode == facet-change ]]; then request=(change-facet doc.man=default optional=false); fi
 "$cps" plan --root base --output update.json "${request[@]}" | tee update.log
 cp -a esp esp-before
@@ -890,11 +921,11 @@ if $profiled; then
     test "$(cat base/etc/cps-vm-previous-default)" = 'previous default'
     test ! -e "$staged_root/etc/cps-vm-previous-default"
     "$cps" info --root "$staged_root" --available test/previous-default > /dev/null
-    trial_plan=$("$cps" transaction history --root "$staged_root" --limit 1 | awk -F '\t' '$1 == 2 && $3 == "update-profile" {print $2}')
+    trial_plan=$("$cps" transaction history --root "$staged_root" --limit 1 | awk -F '\t' -v revision="$((base_revision + 1))" '$1 == revision && $3 == "update-profile" {print $2}')
     "$cps" transaction show --root "$staged_root" "$trial_plan" > trial-history.json
     grep -Fq "\"kernel_release\": \"$trial_release\"" trial-history.json
-    grep -Fq '"base_revision": 1' trial-history.json
-    "$cps" transaction history --root base --limit 1 | grep -Fq $'\tinstall-profile'
+    grep -Fq "\"base_revision\": $base_revision" trial-history.json
+    "$cps" transaction history --root base --limit 2 | grep -Fq $'\tinstall-profile'
     echo 'Verified committed history in both boot environments'
 fi
 
@@ -1150,6 +1181,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
             test "$audits" = $'CPS_VM_CPS_BUILDS: trial verified\nCPS_VM_CPS_BUILDS: trial verified'
             printf '%s\n' "$audits"
         fi
+        if $package_freezes; then
+            freezes=$(tr -d '\r' < serial.log | grep '^CPS_VM_FREEZE: ')
+            test "$freezes" = $'CPS_VM_FREEZE: trial verified\nCPS_VM_FREEZE: trial verified'
+            printf '%s\n' "$freezes"
+        fi
         if $protected_profiles; then
             protections=$(tr -d '\r' < serial.log | grep '^CPS_VM_PROFILE_PROTECTION: ')
             test "$protections" = $'CPS_VM_PROFILE_PROTECTION: trial verified\nCPS_VM_PROFILE_PROTECTION: trial verified'
@@ -1251,6 +1287,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
         fi
         if $package_intent; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_PACKAGE_INTENT: previous verified'
+        fi
+        if $package_freezes; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_FREEZE: previous verified'
         fi
         if [[ -n $systemd_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_SYSTEMD: previous v262.1'

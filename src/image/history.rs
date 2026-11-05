@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::Image;
 use crate::{
     model::{digest, is_uuid, validate_digest},
-    plan::{IntentChange, PackageChange, Request},
+    plan::{FreezeChange, IntentChange, PackageChange, Request},
 };
 
 #[derive(Debug, Serialize)]
@@ -26,6 +26,8 @@ pub struct TransactionDetails {
     pub package_changes: Vec<PackageChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_changes: Vec<IntentChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub freeze_changes: Vec<FreezeChange>,
     pub catalogs: BTreeMap<String, String>,
     pub planned_path_changes: usize,
     pub payload_bytes: u64,

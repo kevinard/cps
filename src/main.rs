@@ -22,8 +22,8 @@ use cps::{
     export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources,
     fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
     generate_manifest_for_architecture, import_sources, list_boot_environments,
-    list_boot_environments_on_disk, list_config_updates, list_obsoletions, list_publishers,
-    list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
+    list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
+    list_publishers, list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
     publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
     read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
@@ -137,6 +137,11 @@ enum Command {
     },
     /// List the image's configured facet overrides
     Facet {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// List persistent package version freezes, offline
+    Freeze {
         #[arg(long)]
         root: PathBuf,
     },
@@ -583,6 +588,18 @@ enum TransactionCommand {
 
 #[derive(Subcommand)]
 enum PlanCommand {
+    /// Freeze installed or explicitly named versions until they are unfrozen
+    Freeze {
+        #[arg(required = true, value_name = "NAME[@VERSION]")]
+        packages: Vec<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Lift persistent package version constraints
+    Unfreeze {
+        #[arg(required = true, value_name = "NAME")]
+        packages: Vec<String>,
+    },
     /// Install one or more packages, optionally specifying publisher and version
     Install {
         #[arg(required = true)]
@@ -1426,12 +1443,24 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("{facet}\t{value}");
             }
         }
+        Command::Freeze { root } => {
+            println!("PACKAGE\tVERSION\tREASON");
+            for (name, freeze) in list_freezes(&root)? {
+                println!(
+                    "{name}\t{}\t{:?}",
+                    freeze.version,
+                    freeze.reason.as_deref().unwrap_or("")
+                );
+            }
+        }
         Command::Plan {
             root,
             output,
             request,
         } => {
             let request = match request {
+                PlanCommand::Freeze { packages, reason } => Request::Freeze { packages, reason },
+                PlanCommand::Unfreeze { packages } => Request::Unfreeze { packages },
                 PlanCommand::Install { packages } => Request::Install { packages },
                 PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
                 PlanCommand::InstallProfile => Request::InstallProfile,

@@ -1,5 +1,6 @@
 mod catalogs;
 mod config;
+pub(crate) mod freeze;
 mod intent;
 mod paths;
 mod repair;
@@ -26,6 +27,7 @@ use crate::{
 
 pub(crate) use catalogs::{CandidateSet, claim_source};
 pub use config::{ConfigChoice, ConfigUpdate, list_config_updates};
+pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
 pub use intent::{IntentChange, MarkChoice};
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
@@ -56,6 +58,13 @@ pub enum Request {
         choice: MarkChoice,
         packages: Vec<String>,
     },
+    Freeze {
+        packages: Vec<String>,
+        reason: Option<String>,
+    },
+    Unfreeze {
+        packages: Vec<String>,
+    },
     Remove {
         packages: Vec<String>,
     },
@@ -81,6 +90,8 @@ impl Request {
             Self::ExactInstall { .. } => "exact-install",
             Self::InstallProfile => "install-profile",
             Self::Mark { .. } => "mark",
+            Self::Freeze { .. } => "freeze",
+            Self::Unfreeze { .. } => "unfreeze",
             Self::Remove { .. } => "remove",
             Self::Autoremove => "autoremove",
             Self::ChangeFacet { .. } => "change-facet",
@@ -153,6 +164,8 @@ pub struct Plan {
     package_changes: Vec<PackageChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) intent_changes: Vec<IntentChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) freeze_changes: Vec<FreezeChange>,
     transfers: Vec<Transfer>,
     preserved: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,6 +203,7 @@ impl Plan {
                 .collect(),
             package_changes: Vec::new(),
             intent_changes: Vec::new(),
+            freeze_changes: Vec::new(),
             transfers: Vec::new(),
             preserved: Vec::new(),
             config_update_revision: None,
@@ -211,6 +225,7 @@ impl Plan {
             request: self.request.clone(),
             package_changes: self.package_changes.clone(),
             intent_changes: self.intent_changes.clone(),
+            freeze_changes: self.freeze_changes.clone(),
             catalogs,
             planned_path_changes: self
                 .writes
@@ -253,6 +268,24 @@ impl Plan {
                 "automatic"
             };
             lines.push(format!("Mark {} as {mark}", change.package));
+        }
+        if matches!(
+            self.request,
+            Request::Freeze { .. } | Request::Unfreeze { .. }
+        ) && self.freeze_changes.is_empty()
+        {
+            lines.push("Package freezes already match the requested state".to_owned());
+        }
+        for change in &self.freeze_changes {
+            lines.push(match &change.to {
+                Some(frozen) => format!(
+                    "Freeze {} at {}{}",
+                    change.name,
+                    frozen.version,
+                    freeze::reason_suffix(frozen)
+                ),
+                None => format!("Unfreeze {}", change.name),
+            });
         }
         if let Request::ChangeFacet { facets } = &self.request {
             for (name, value) in facets {
@@ -397,6 +430,12 @@ impl Plan {
             "pending package selection differs from the verified plan"
         );
         after.check_profile_intent(&next.installed)?;
+        let (freezes, changes) = freeze::changes(current, &self.request)?;
+        ensure!(
+            after.freezes == freezes && self.freeze_changes == changes,
+            "pending package freezes differ from the verified plan"
+        );
+        freeze::check(&after.freezes, &next.installed)?;
         Ok(())
     }
 
@@ -510,6 +549,21 @@ pub(crate) fn build(
         state.installed = installed;
         return Ok((plan, state, Vec::new()));
     }
+    if matches!(request, Request::Freeze { .. } | Request::Unfreeze { .. }) {
+        ensure!(
+            crate::verify::manifest_paths(&state)? == state.paths,
+            "path ownership index differs from installed manifests"
+        );
+        image.verify_catalog_archives(&state)?;
+        let (freezes, changes) = freeze::changes(&state, &request)?;
+        let mut plan =
+            Plan::with_selection(&state.settings, request, saved, solver, &state.installed);
+        plan.freeze_changes = changes;
+        state.settings.freezes = freezes;
+        state.settings.revision = state.settings.next_revision()?;
+        state.settings.format = state.publishers.image_format(&state.settings);
+        return Ok((plan, state, Vec::new()));
+    }
     let mut catalogs = catalogs::Catalogs::default();
     let mut receipts = Vec::new();
     let mut next_facets = None;
@@ -593,6 +647,7 @@ pub(crate) fn build(
                 Candidates {
                     packages: std::iter::empty(),
                     obsoletions: &BTreeMap::new(),
+                    freezes: &state.settings.freezes,
                 },
                 &requested,
                 false,
@@ -644,6 +699,7 @@ pub(crate) fn build(
                     "signed release profile has no recorded composition"
                 );
                 let installed = catalogs.candidates.replay(profile)?;
+                freeze::check(&state.settings.freezes, &installed)?;
                 let paths = effective_paths(&state.settings, &installed)?;
                 (installed, paths)
             } else if update_profile {
@@ -658,6 +714,7 @@ pub(crate) fn build(
                 catalogs.candidates.update_profile(
                     &state.installed,
                     profile,
+                    &state.settings.freezes,
                     state
                         .settings
                         .profile_intent
@@ -673,6 +730,7 @@ pub(crate) fn build(
                     Candidates {
                         packages: &catalogs.candidates.packages,
                         obsoletions: &catalogs.candidates.obsoletions,
+                        freezes: &state.settings.freezes,
                     },
                     &requested,
                     matches!(request, Request::Update),
@@ -723,6 +781,7 @@ pub(crate) fn build(
             state.settings.profile_intent = None;
         }
     }
+    freeze::check(&state.settings.freezes, &installed)?;
     // Resolving a vendor proposal changes local configuration, so a staged
     // boot environment can still be activated at its original revision.
     let revision = if matches!(request, Request::ResolveConfig { .. }) {

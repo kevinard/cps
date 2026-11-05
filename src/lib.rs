@@ -45,8 +45,8 @@ pub use image::{create_configured_image, create_image};
 pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{
-    ConfigChoice, ConfigUpdate, IntentChange, MarkChoice, PackageChange, Plan, Request,
-    list_config_updates, plan,
+    ConfigChoice, ConfigUpdate, FreezeChange, FrozenPackage, IntentChange, MarkChoice,
+    PackageChange, Plan, Request, list_config_updates, list_freezes, plan,
 };
 pub use repo::{
     BuildAudit, BuildWitness, archive_build_sources, export_rebuild_inputs, fetch_build_sources,

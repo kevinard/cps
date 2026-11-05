@@ -41,6 +41,8 @@ const CATALOG_ARCHIVE_IMAGE_FORMAT: u32 = 6;
 const DORMANT_CONFIG_IMAGE_FORMAT: u32 = 7;
 // Older writers cannot preserve the distinction between profile and operator roots.
 const PROFILE_INTENT_IMAGE_FORMAT: u32 = 8;
+// Older writers do not enforce persistent package version constraints.
+const FREEZE_IMAGE_FORMAT: u32 = 9;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +98,8 @@ pub struct Settings {
     pub(crate) config_updates: Option<BTreeMap<String, u64>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) dormant_configs: BTreeMap<String, DormantConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) freezes: BTreeMap<String, crate::plan::FrozenPackage>,
 }
 
 pub(crate) fn publisher_generation_is_initial(generation: &u64) -> bool {
@@ -231,7 +235,9 @@ impl Publishers {
     }
 
     pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
-        if settings.bootstrap_catalog.is_some() {
+        if !settings.freezes.is_empty() {
+            FREEZE_IMAGE_FORMAT
+        } else if settings.bootstrap_catalog.is_some() {
             BOOTSTRAP_IMAGE_FORMAT
         } else if settings.profile_intent.is_some() {
             PROFILE_INTENT_IMAGE_FORMAT
@@ -469,6 +475,7 @@ fn initialize(
         profile_intent: None,
         config_updates: Some(BTreeMap::new()),
         dormant_configs: BTreeMap::new(),
+        freezes: BTreeMap::new(),
     };
     settings.format = publishers.image_format(&settings);
     fs::create_dir_all(path)?;
@@ -631,6 +638,7 @@ impl Image {
                     | CATALOG_ARCHIVE_IMAGE_FORMAT
                     | DORMANT_CONFIG_IMAGE_FORMAT
                     | PROFILE_INTENT_IMAGE_FORMAT
+                    | FREEZE_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -714,6 +722,7 @@ impl Image {
         let installed = self.installed()?;
         settings.check_profile_packages(&installed)?;
         settings.check_profile_intent(&installed)?;
+        crate::plan::freeze::check(&settings.freezes, &installed)?;
         Ok(State {
             settings,
             publishers,

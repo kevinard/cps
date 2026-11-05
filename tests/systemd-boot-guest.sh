@@ -562,6 +562,15 @@ if [ -f /etc/cps-vm-assert-package-intent ]; then
     esac
     printf 'CPS_VM_PACKAGE_INTENT: %s verified\n' "$state"
 fi
+if [ -f /etc/cps-vm-frozen-sqlite ]; then
+    frozen_version=$("$bb" cat /etc/cps-vm-frozen-sqlite)
+    listing=$(/usr/bin/cps freeze --root /)
+    expected=$(printf 'system/sqlite\t%s\t"VM runtime compatibility"' "$frozen_version")
+    case "$listing" in *"$expected"*) ;; *) printf '%s\n' "$listing" >&2; exit 1 ;; esac
+    preview=$(/usr/bin/cps plan --root / --output /run/unfreeze-runtime.json unfreeze system/sqlite)
+    case "$preview" in *'Unfreeze system/sqlite'*) ;; *) printf '%s\n' "$preview" >&2; exit 1 ;; esac
+    printf 'CPS_VM_FREEZE: %s verified\n' "$state"
+fi
 if [ -f /etc/cps-vm-assert-extra-publisher ]; then
     publisher=absent
     if [ -f /etc/cps-vm-extra-marker ]; then

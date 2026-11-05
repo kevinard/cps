@@ -156,11 +156,13 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         &self,
         before: &BTreeMap<String, Installed>,
         profile: &ReleaseProfile,
+        freezes: &BTreeMap<String, super::FrozenPackage>,
         local_roots: Option<&BTreeSet<String>>,
         solver: Option<SolverRevision>,
         compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
     ) -> Result<(BTreeMap<String, Installed>, T)> {
         let locked = self.replay(profile)?;
+        super::freeze::check(freezes, &locked)?;
         let mut requested = BTreeMap::new();
         for (name, package) in &locked {
             let manifest = &package.published.manifest;
@@ -198,6 +200,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
             resolve::Candidates {
                 packages,
                 obsoletions: &self.obsoletions,
+                freezes,
             },
             &requested,
             true,

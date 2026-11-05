@@ -2975,3 +2975,5 @@ fn exact_install_and_remove_offline() -> Result<()> {
 }
 
 mod release;
+
+mod freezes;
