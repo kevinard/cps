@@ -107,6 +107,59 @@ fn dependency(kind: &str, name: &str, version: &str) -> String {
 }
 
 #[test]
+fn live_install_recovers_offline_and_preserves_boot_identity() -> Result<()> {
+    use std::{collections::BTreeSet, panic};
+
+    use crate::{
+        apply::{apply_to_image, resume_live},
+        image::{Image, root::Root},
+    };
+
+    let fixture = Fixture::new()?;
+    let path = "usr/bin/live-app";
+    fixture.package(
+        "apps/live",
+        "1.0.0-0",
+        fixture.file(path, "new", "0755", "")?,
+    )?;
+    fixture.create()?;
+    let before = Image::open_query(&fixture.root)?.settings()?;
+    let install = plan(
+        &fixture.root,
+        Request::Install {
+            packages: vec!["apps/live".into()],
+        },
+    )?;
+    let open =
+        || Image::open_for_live_apply(Root::open(&fixture.root)?, &before.id, before.revision);
+    let interrupted = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        apply_to_image(open().unwrap(), &install, Some(&BTreeSet::new()), |write| {
+            if write.path == path {
+                panic!("interrupted");
+            }
+        })
+    }));
+    assert!(interrupted.is_err());
+    assert_eq!(fs::read_to_string(fixture.root.join(path))?, "new");
+    assert!(
+        crate::transaction_status(&fixture.root)?
+            .pending
+            .unwrap()
+            .live
+    );
+    assert!(crate::resume_transaction(&fixture.root).is_err());
+    fs::rename(&fixture.repo, fixture.repo.with_extension("offline"))?;
+    assert_eq!(resume_live(open()?)?, Some(before.revision + 1));
+    assert_eq!(resume_live(open()?)?, None);
+    let after = Image::open_query(&fixture.root)?.settings()?;
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(after.boot_revision(), before.revision);
+    assert_eq!(after.as_boot_parent().image_revision(), after.revision);
+    assert!(verify(&fixture.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn manifest_capabilities_require_a_protected_executable() -> Result<()> {
     use crate::kdl_format::{manifest_text, parse_manifest};
     let package = |metadata| {

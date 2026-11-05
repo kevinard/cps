@@ -320,7 +320,7 @@ pub(crate) fn apply_live(
     apply_to_image(image, plan, Some(stage_packages), |_| {})
 }
 
-fn apply_to_image(
+pub(crate) fn apply_to_image(
     mut image: Image,
     plan: &Plan,
     live: Option<&BTreeSet<String>>,
@@ -521,10 +521,11 @@ fn finish(
         if let Some(kernel) = work.kernel_install {
             kernel.prepare(&image.root, path, &work.next.settings.id)?;
         }
+        let phase = if pending.is_live() { "live" } else { "offline" };
         for finding in verify_state(&image.root, work.next)? {
             ensure!(
                 !finding.is_error,
-                "transaction actions left an inconsistent image: {}",
+                "{phase} actions left an inconsistent image: {}",
                 finding.message
             );
         }

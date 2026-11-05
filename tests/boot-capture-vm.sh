@@ -16,6 +16,11 @@ health_fail=${CPS_VM_BTRFS_HEALTH_FAIL:-0}
 destroy=${CPS_VM_BTRFS_DESTROY:-0}
 destroy_failed=${CPS_VM_BTRFS_DESTROY_FAILED:-0}
 staged_transactions=${CPS_VM_STAGED_TRANSACTIONS:-0}
+system_commands=${CPS_VM_SYSTEM_COMMANDS:-0}
+if [[ $system_commands == 1 && ( $native_boot != 1 || $health_fail != 0 || $destroy != 0 || $destroy_failed != 0 || $staged_transactions != 0 ) ]]; then
+    echo 'CPS_VM_SYSTEM_COMMANDS requires a successful native trial' >&2
+    exit 2
+fi
 if [[ $staged_transactions == 1 && ( $native_boot != 1 || $health_fail != 0 || $destroy != 0 || $destroy_failed != 0 ) ]]; then
     echo 'CPS_VM_STAGED_TRANSACTIONS requires a successful native trial without destruction' >&2
     exit 2
@@ -80,6 +85,27 @@ POLICY
     "$cps" publisher add --root "$root" --repo "$kernel_fixture/repo" \
         --trust-key "$kernel_fixture/release-public.der" --build-trust kernel-builders.kdl canopa-kernel
 fi
+if [[ $system_commands == 1 ]]; then
+    mkdir -p app/usr/bin service/usr/{bin,lib/systemd/system}
+    cat > service/usr/lib/systemd/system/cps-demo.service <<'UNIT'
+[Service]
+ExecStart=/usr/bin/cps-demo-service
+UNIT
+    for version in 1.0.0-0 2.0.0-0; do
+        printf '#!/bin/sh\nprintf "%%s\\n" %s\n' "$version" > app/usr/bin/cps-demo
+        printf '#!/bin/sh\nprintf "%%s\\n" %s > /run/cps-demo-version\nexec /bin/busybox sleep 600\n' \
+            "$version" > service/usr/bin/cps-demo-service
+        chmod 755 app/usr/bin/cps-demo service/usr/bin/cps-demo-service
+        "$cps" manifest generate --proto service --publisher test --version "$version" \
+            --uid "$(id -u)" --gid "$(id -g)" test/cps-demo-service > service.kdl
+        "$cps" publish --repo repo --proto service --signing-key private.der service.kdl
+        "$cps" manifest generate --proto app --publisher test --version "$version" \
+            --uid "$(id -u)" --gid "$(id -g)" test/cps-demo > app.kdl
+        sed -i '$i\    require "test/cps-demo-service" version="='"$version"'"' app.kdl
+        "$cps" publish --repo repo --proto app --signing-key private.der app.kdl
+        cp repo/current "catalog-$version"
+    done
+fi
 publish 2.0.0-0
 mkdir -p "$root"/{bin,usr/bin,proc,sys,dev,tmp,captures,scratch,repository} files/@captures
 cp -a repo/. "$root/repository/"
@@ -120,6 +146,22 @@ if [[ -n $kernel_fixture ]]; then
 fi
 if [[ $native_boot == 1 ]]; then
     setup_systemd_guest "$root"
+    if [[ $system_commands == 1 ]]; then
+        mkdir -p "$root/etc/cps"
+        cp public.der "$root/etc/cps/test.der"
+        cp catalog-{1.0.0-0,2.0.0-0} "$root/repository/"
+        cp repo/current "$root/repository/catalog-base-upgrade"
+        install -m755 "$project/tests/system-workflow-guest.sh" "$root/usr/local/libexec/cps-system-workflow"
+        cat > "$root/etc/cps/image.kdl" <<CONFIG
+schema-version 1
+publisher "test" {
+    repository "/repository"
+    trust-key "test.der"
+}
+boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid" options="rw console=ttyS0 loglevel=3 init=/init-systemd"
+stage-package "test/live-root"
+CONFIG
+    fi
     if [[ $destroy == 1 ]]; then
         touch "$root/etc/cps-btrfs-destroy"
         install -m755 "$project/tests/boot-destroy-guest.sh" "$root/usr/local/libexec/cps-vm-destroy"
@@ -178,6 +220,9 @@ GUEST
 set -eu
 bb=/bin/busybox
 export PATH=/usr/bin:/bin
+if [ -x /usr/local/libexec/cps-system-workflow ]; then
+    exec /usr/local/libexec/cps-system-workflow
+fi
 version=$($bb cat /etc/cps-capture-version)
 trial_version=$($bb cat /etc/cps-btrfs-trial-version)
 if [ -f /etc/cps-btrfs-trial-kernel ]; then
@@ -393,10 +438,17 @@ cps boot-env export --root "$stage" --output /scratch/root.ext4 --size-mib 256 \
 test "$($bb cat "$stage/etc/cps-capture-local")" = 'captured local state'
 echo 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root'
 if [ -f /etc/cps-btrfs-boot ]; then
+    boot_options='console=ttyS0 loglevel=3 init=/init-systemd'
+    if [ -x /usr/local/libexec/cps-system-workflow ]; then boot_options="rw $boot_options"; fi
     base=$(cps boot-env activate-btrfs --known-good --root /volume/@ --btrfs-volume /volume \
-        --esp /efi --root-partuuid "$root_uuid" --options 'console=ttyS0 loglevel=3 init=/init-systemd')
+        --esp /efi --root-partuuid "$root_uuid" --options "$boot_options")
     base=${base#Activated }
     echo "$base" > /captures/base-id
+    if [ -x /usr/local/libexec/cps-system-workflow ]; then
+        $bb chown 0:0 /captures
+        $bb sync
+        exit 0
+    fi
     cps boot-env capture --source / --output /captures/protected
     cps boot-env stage-btrfs --source /captures/protected/root --output /captures/protected-trial /captures/upgrade.json
     test "$($bb cat /captures/protected-trial/root/etc/cps-capture-version)" = 2.0.0-0
@@ -518,6 +570,7 @@ if [[ $native_boot == 1 ]]; then
     if [[ -n $kernel_fixture ]]; then
         trial_boots=2
         if [[ $destroy == 1 ]]; then trial_boots=5; fi
+        if [[ $system_commands == 1 ]]; then trial_boots=1; fi
         test "$(grep -Fxc "CPS_VM_BTRFS_KERNEL: trial $trial_release" uefi.log.clean)" = "$trial_boots"
         if [[ $destroy != 1 ]]; then
             grep -Fx "CPS_VM_BTRFS_KERNEL: previous ${CPS_VM_KERNEL_RELEASE:-$(uname -r)}" uefi.log.clean
@@ -533,6 +586,10 @@ if [[ $native_boot == 1 ]]; then
         if [[ $destroy_failed == 1 ]]; then
             grep -Fx 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed' uefi.log.clean
         fi
+    elif [[ $system_commands == 1 ]]; then
+        grep -Fx 'CPS_VM_SYSTEM: installed and upgraded in place, then staged the base upgrade' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: staged upgrade booted with the live package' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: rolled back to the base with the live package' uefi.log.clean
     else
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial blessed' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial default after reboot' uefi.log.clean

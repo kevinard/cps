@@ -178,6 +178,7 @@ pub(crate) fn run(
         run_tool(
             command("systemd-sysusers", path).arg("--").args(sysusers),
             "sysusers",
+            live,
         )?;
     }
     if rules.stream_position()? != 0 {
@@ -196,6 +197,7 @@ pub(crate) fn run(
             tool.args(["--create", "--exclude-prefix=/.cps", "--", "-"])
                 .stdin(Stdio::from(rules)),
             "tmpfiles",
+            live,
         )?;
     }
     if !presets.is_empty() {
@@ -204,6 +206,7 @@ pub(crate) fn run(
                 .args(["--no-reload", "--preset-mode=enable-only", "preset", "--"])
                 .args(presets),
             "presets",
+            live,
         )?;
     }
     root.sync()?;
@@ -340,21 +343,24 @@ impl LiveServices {
                         .args(["--no-block", "stop", "--"])
                         .args(stop),
                     "stop",
+                    true,
                 )?;
             }
             if self.reload {
-                run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload")?;
+                run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload", true)?;
             }
             if !restart.is_empty() {
                 run_tool(
                     live_systemctl()
                         .args(["--no-block", "try-restart", "--"])
-                        .args(restart),
+                        .args(&restart),
                     "restart",
+                    true,
                 )?;
+                println!("Restart scheduled for {}.", restart.join(", "));
             }
         } else if self.reload {
-            run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload")?;
+            run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload", true)?;
         }
         Ok(())
     }
@@ -406,11 +412,15 @@ fn command(program: &str, root: &Path) -> Command {
     command
 }
 
-fn run_tool(command: &mut Command, action: &str) -> Result<()> {
+fn run_tool(command: &mut Command, action: &str, live: bool) -> Result<()> {
     let status = command
         .status()
         .with_context(|| format!("running systemd {action}"))?;
-    ensure!(status.success(), "systemd {action} failed with {status}");
+    let phase = if live { "live" } else { "offline" };
+    ensure!(
+        status.success(),
+        "{phase} systemd {action} failed with {status}"
+    );
     Ok(())
 }
 

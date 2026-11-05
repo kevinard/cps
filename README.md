@@ -4,6 +4,65 @@ CPS is an image-oriented package manager for Linux, written in Rust and inspired
 
 Repository reads cap catalogs at 64 MiB and manifests at 32 MiB. CPS streams payloads to the staging directory with the signed length as a bound and checks the digest before recording a transaction.
 
+## Using CPS on an installed Btrfs system
+
+On a distribution configured for CPS system commands, search by a name
+fragment and use the package name from the result.
+
+```sh
+sudo cps search htop
+sudo cps install apps/htop
+htop
+sudo cps upgrade
+sudo cps status
+```
+
+`install` and `upgrade` select dependencies, preview the package changes
+and their activation mode, and ask once before downloading and applying
+them. Ordinary changes apply to the running system. Restart any open
+applications to use updated files. CPS reloads the systemd manager when
+system unit files change and queues restarts for active services owned
+by updated packages. New services follow the package's preset policy.
+
+A transaction that changes the kernel, initramfs, other boot paths, or
+a package marked for staging is applied in a new Btrfs environment.
+CPS selects the new environment for a trial on the next reboot and
+keeps the current one as fallback. CPS reports when a reboot is needed
+and leaves the timing to you. Boot into the selected environment before
+making more package changes so the next boot includes all of your work.
+
+Use `--dry-run` to review the proposed transaction, `--yes` to confirm it
+in a script, or `--no-refresh` to use the current cached catalog. Fetching
+uncached package files can still contact the mirror. With configured
+mirrors, `upgrade` checks for updates and `install` reuses recently
+synchronized catalogs. `cps resume` completes an interrupted live
+transaction using the files saved in its journal. The explicit
+`plan`, `fetch`, `apply`, and `boot-env` commands remain available for
+administering images and boot environments.
+
+For distribution installers, put the usual publisher and mirror
+configuration in `/etc/cps/image.kdl` and add, for example:
+
+```kdl
+boot-btrfs volume="/cps" environments="/cps/@environments" esp="/efi" root-partuuid="7adff456-af50-498f-b39a-dcf87cb4a7c1" options="rw"
+stage-package "system/elf-runtime"
+stage-package "system/systemd"
+```
+
+Use the real partition UUID and package names. Mount the Btrfs top-level
+subvolume read-write at `volume`, create a separate, root-owned subvolume
+for `environments` below it, and mount the writable EFI System Partition
+at `esp`. Register the initial root with `boot-env activate-btrfs --known-good`
+and install the CPS health service for trial boot assessment. Keep the
+repository caches at stable paths outside the boot roots. Use `options`
+for any kernel arguments the installation requires. Use `kernel` and
+`initrd` only for images that supply boot files manually.
+
+The first live transaction upgrades the image state format so the boot
+entry keeps its identity while the package revision advances. Use the
+current CPS for managing and verifying those roots. Changes to the running
+root use the same verified, resumable package journal as image transactions.
+
 ## Build and try it
 
 Build with `cargo build --locked`. CPS needs Linux with `openat2` and `/proc`, plus the SQLite and libseccomp development libraries. The example uses OpenSSL to generate a local Ed25519 signing key. Run it as your regular user, with package UID and GID matching that user.
@@ -1619,6 +1678,11 @@ to stage the signed Btrfs-capable kernel as part of the upgrade. The image
 requires its builder signature, audits the installed evidence after boot,
 and checks the running kernel in both the trial and the previous root.
 
+Set `CPS_VM_SYSTEM_COMMANDS=1` with `CPS_VM_BTRFS_BOOT=1` in
+`tests/boot-capture-vm.sh` to exercise the everyday commands. The guest
+installs a package live, upgrades its running service, boots a staged
+upgrade, and rolls back to the system with the live package still installed.
+
 ### Reclaiming old Btrfs environments
 
 Retire an obsolete registered Btrfs root after its replacement has booted
@@ -1668,7 +1732,7 @@ paths. Use writable scratch space outside the mounted root for the plan,
 staged tree, and export. CPS holds a shared image lock while copying and
 rejects nested mounts, including bind mounts.
 
-`apply` requires an inactive working image. CPS rejects package transactions
+`apply` requires an inactive working image. This command rejects transactions
 against the running root and against a mounted ext4 root with a CPS revision
 label, including during a rescue boot. Ext4 root labels consisting of exactly
 16 lowercase hexadecimal digits are reserved for these deployments.
