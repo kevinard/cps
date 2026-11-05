@@ -225,11 +225,13 @@ impl Esp {
         self.read_file_if_present("loader", "loader.conf", MAX_CONFIG_BYTES)?;
         if self.has_directory("loader", "entries")? {
             for entry in self.children("loader/entries")? {
-                if entry.name.to_ascii_lowercase().ends_with(".conf") {
+                let lower = entry.name.to_ascii_lowercase();
+                if lower.ends_with(".conf") || lower.ends_with(".cps-destroy") {
                     ensure!(
                         !entry.directory
                             && entry.name.starts_with("cps-")
-                            && entry.name.ends_with(".conf")
+                            && (entry.name.ends_with(".conf")
+                                || entry.name.ends_with(".cps-destroy"))
                             && safe_name(&entry.name),
                         "the EFI partition has an invalid or non-CPS boot entry {:?}",
                         entry.name

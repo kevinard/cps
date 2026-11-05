@@ -13,6 +13,16 @@ btrfs=$(realpath -- "${CPS_VM_BTRFS:?Set CPS_VM_BTRFS to a trusted btrfs executa
 formatter=${CPS_VM_MKFS_BTRFS:?Set CPS_VM_MKFS_BTRFS to a trusted mkfs.btrfs executable}
 native_boot=${CPS_VM_BTRFS_BOOT:-0}
 health_fail=${CPS_VM_BTRFS_HEALTH_FAIL:-0}
+destroy=${CPS_VM_BTRFS_DESTROY:-0}
+destroy_failed=${CPS_VM_BTRFS_DESTROY_FAILED:-0}
+if [[ $destroy == 1 && ( $native_boot != 1 || $health_fail != 0 ) ]]; then
+    echo 'CPS_VM_BTRFS_DESTROY requires native boot without health failure' >&2
+    exit 2
+fi
+if [[ $destroy_failed == 1 && ( $native_boot != 1 || $health_fail != 1 || $destroy != 0 ) ]]; then
+    echo 'CPS_VM_BTRFS_DESTROY_FAILED requires a failed native trial without CPS_VM_BTRFS_DESTROY' >&2
+    exit 2
+fi
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 kernel_package=
 kernel_name=
@@ -95,6 +105,13 @@ if [[ -n $kernel_fixture ]]; then
 fi
 if [[ $native_boot == 1 ]]; then
     setup_systemd_guest "$root"
+    if [[ $destroy == 1 ]]; then
+        touch "$root/etc/cps-btrfs-destroy"
+        install -m755 "$project/tests/boot-destroy-guest.sh" "$root/usr/local/libexec/cps-vm-destroy"
+        cc -O2 -Wall -Wextra "$project/tests/support/deny-unlink.c" -o "$root/usr/local/libexec/cps-vm-deny-unlink"
+        copy_runtime_deps "$root" "$root/usr/local/libexec/cps-vm-deny-unlink"
+    fi
+    if [[ $destroy_failed == 1 ]]; then touch "$root/etc/cps-btrfs-destroy-failed"; fi
     mkdir -p "$root"/{volume,efi,boot,run,var/tmp}
     cp "$kernel" "$root/boot/vmlinuz"
     cp "$project/packaging/systemd/cps-boot-health.service" "$root/usr/lib/systemd/system/"
@@ -130,9 +147,14 @@ for arg in $($bb cat /proc/cmdline); do
     case "$arg" in rootflags=*) flags=$arg ;; esac
 done
 test -n "$flags"
-for entry in /efi/loader/entries/cps-*+*.conf; do
+for entry in /efi/loader/entries/cps-*.conf; do
     test -f "$entry" || continue
-    if $bb grep -F " $flags " "$entry"; then : > /run/cps-vm-counted; fi
+    if $bb grep -F " $flags " "$entry"; then
+        name=${entry##*/}
+        id=${name%%+*}
+        echo "${id%.conf}" > /run/cps-vm-id
+        case "$name" in *+*) : > /run/cps-vm-counted ;; esac
+    fi
 done
 exec /usr/lib/systemd/systemd
 GUEST
@@ -164,6 +186,9 @@ if [ "$version" = 2.0.0-0 ] && [ -f /etc/cps-btrfs-fail-health ]; then
     exec $bb reboot -f
 fi
 cps verify --root /
+if [ -f /etc/cps-btrfs-destroy ] && [ ! -f /run/cps-vm-counted ]; then
+    exec /usr/local/libexec/cps-vm-destroy
+fi
 if [ "$version" = 2.0.0-0 ]; then
     test "$($bb cat /etc/cps-capture-local)" = 'captured local state'
     if [ -f /run/cps-vm-counted ]; then
@@ -196,6 +221,21 @@ if [ -f /etc/cps-btrfs-fail-health ]; then
     echo 'CPS_VM_BTRFS_BOOT: previous root after exhausted trial'
 else
     echo 'CPS_VM_BTRFS_BOOT: previous root after rollback'
+fi
+if [ -f /etc/cps-btrfs-destroy-failed ]; then
+    found=false
+    for entry in /efi/loader/entries/cps-*+0-*.conf /efi/loader/entries/cps-*+0.conf; do
+        test -f "$entry" || continue
+        id=${entry##*/}
+        id=${id%%+*}
+        cps boot-env destroy-btrfs --esp /efi --btrfs-volume /volume "$id"
+        test ! -e "/efi/EFI/cps/$id"
+        found=true
+    done
+    test "$found" = true
+    test ! -e /volume/@captures/trial/root
+    cps verify --root /
+    echo 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed'
 fi
 $bb sync
 exec $bb poweroff -f
@@ -436,7 +476,9 @@ run capture.log "$root_drive" "root=$root_device rootfstype=btrfs rootflags=subv
 grep -Fx 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root' capture.log.clean
 if [[ $native_boot == 1 ]]; then
     cp "${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS}" vars.fd
-    timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${data_args[@]}" \
+    uefi_timeout=180
+    if [[ $destroy == 1 ]]; then uefi_timeout=300; fi
+    timeout "${CPS_VM_TIMEOUT:-$uefi_timeout}" "$qemu" "${data_args[@]}" \
         -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
         -serial file:uefi.log \
         -drive "if=pflash,format=raw,readonly=on,file=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE}" \
@@ -444,12 +486,23 @@ if [[ $native_boot == 1 ]]; then
     tr -d '\r' < uefi.log > uefi.log.clean
     cat uefi.log.clean
     if [[ -n $kernel_fixture ]]; then
-        test "$(grep -Fxc "CPS_VM_BTRFS_KERNEL: trial $trial_release" uefi.log.clean)" = 2
-        grep -Fx "CPS_VM_BTRFS_KERNEL: previous ${CPS_VM_KERNEL_RELEASE:-$(uname -r)}" uefi.log.clean
+        trial_boots=2
+        if [[ $destroy == 1 ]]; then trial_boots=5; fi
+        test "$(grep -Fxc "CPS_VM_BTRFS_KERNEL: trial $trial_release" uefi.log.clean)" = "$trial_boots"
+        if [[ $destroy != 1 ]]; then
+            grep -Fx "CPS_VM_BTRFS_KERNEL: previous ${CPS_VM_KERNEL_RELEASE:-$(uname -r)}" uefi.log.clean
+        fi
     fi
-    if [[ $health_fail == 1 ]]; then
+    if [[ $destroy == 1 ]]; then
+        grep -Fx 'CPS_VM_BTRFS_DESTROY: staged another trial from the blessed root' uefi.log.clean
+        grep -Fx 'CPS_VM_BTRFS_DESTROY: retired old root and artifacts after retry' uefi.log.clean
+        grep -Fx 'CPS_VM_BTRFS_DESTROY: previous root booted after cleanup' uefi.log.clean
+    elif [[ $health_fail == 1 ]]; then
         test "$(grep -Fxc 'CPS_VM_BTRFS_BOOT: trial health failed without blessing' uefi.log.clean)" = 2
         grep -Fx 'CPS_VM_BTRFS_BOOT: previous root after exhausted trial' uefi.log.clean
+        if [[ $destroy_failed == 1 ]]; then
+            grep -Fx 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed' uefi.log.clean
+        fi
     else
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial blessed' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial default after reboot' uefi.log.clean

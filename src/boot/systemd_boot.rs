@@ -1,4 +1,6 @@
+mod destroy;
 pub(super) mod policy;
+pub use destroy::destroy_btrfs_boot_environment;
 
 use std::{
     fs::{self, File},
@@ -35,6 +37,7 @@ pub struct BootEnvironment {
     pub root_partuuid: String,
     pub tries_left: Option<u32>,
     pub is_default: bool,
+    pub is_retiring: bool,
 }
 
 pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
@@ -45,14 +48,25 @@ pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
         .as_ref()
         .and_then(|policy| policy.selected(&entries))
         .map(|entry| entry.id.clone());
-    Ok(entries
+    let mut all: Vec<_> = entries.into_iter().map(|entry| (entry, false)).collect();
+    for entry in destroy::pending(&esp)? {
+        ensure!(
+            !all.iter().any(|(live, _)| live.id == entry.id),
+            "duplicate live and retiring boot environment {}",
+            entry.id
+        );
+        all.push((entry, true));
+    }
+    all.sort_by(|(a, _), (b, _)| (b.revision, &b.id).cmp(&(a.revision, &a.id)));
+    Ok(all
         .into_iter()
-        .map(|entry| BootEnvironment {
+        .map(|(entry, is_retiring)| BootEnvironment {
             is_default: selected.as_deref() == Some(&entry.id),
             id: entry.id,
             title: entry.title,
             root_partuuid: entry.partuuid,
             tries_left: entry.tries,
+            is_retiring,
         })
         .collect())
 }
@@ -358,6 +372,10 @@ pub(super) fn activate(
         );
     }
     let (policy, existing) = inventory(&esp)?;
+    ensure!(
+        !destroy::pending(&esp)?.iter().any(|entry| entry.id == id),
+        "this boot environment is retiring; finish destroy-btrfs first"
+    );
     let existing_entry = existing.iter().find(|entry| entry.id == id);
 
     // Retries of entries created before artifact hashes keep the original BLS text.
@@ -386,6 +404,10 @@ pub(super) fn activate(
             .map(|artifacts| artifacts.kernel.release.as_str()),
     }
     .render();
+    ensure!(
+        description.len() <= policy::MAX_ENTRY_BYTES,
+        "boot entry exceeds 64 KiB"
+    );
     if let Some(entry) = existing_entry {
         ensure!(
             !activation.known_good || entry.tries.is_none(),

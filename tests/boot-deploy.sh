@@ -173,6 +173,9 @@ reject_activation 'invalid SHA-256 digest "broken"' \
 truncate -s 4097 oversized.kdl
 reject_activation 'root export receipt is too large' \
     base base.raw "$base" oversized.kdl --known-good
+oversized_options=$(python3 -c 'print("a" * 65536)')
+reject_activation 'boot entry exceeds 64 KiB' \
+    base base.raw "$base" base.kdl --known-good --options "$oversized_options"
 test -z "$(ls -A esp)"
 base_id=$(activate_checked base base.raw "$base" base.kdl --known-good)
 base_id=${base_id#Activated }

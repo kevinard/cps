@@ -268,7 +268,7 @@ pub(crate) fn offline_path(root: &Root) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn decode_mount_path(encoded: &[u8]) -> Result<PathBuf> {
+pub(crate) fn decode_mount_path(encoded: &[u8]) -> Result<PathBuf> {
     let mut remaining = encoded;
     let mut decoded = Vec::with_capacity(encoded.len());
     while let Some((&first, rest)) = remaining.split_first() {

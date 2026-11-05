@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -12,6 +12,7 @@ use crate::boot::btrfs_boot::BtrfsRecord;
 
 const OPTIONS: &str = "timeout 0\neditor no\nauto-entries no\nauto-firmware no\n";
 const AUTO: &str = "default cps-*.conf\n";
+pub(super) const MAX_ENTRY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum LoaderPolicy {
@@ -141,6 +142,7 @@ pub(super) fn entry_identity(id: &str) -> Result<(&str, u64)> {
     Ok((image, number))
 }
 
+#[derive(Debug)]
 pub(super) struct BootEntry {
     pub path: PathBuf,
     pub id: String,
@@ -166,74 +168,89 @@ pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
             "the EFI partition has a non-CPS boot entry: {name}"
         );
         ensure!(entry.file_type()?.is_file(), "invalid CPS entry {name}");
-        let (id, tries) = match name.split_once('+') {
-            None => (name, None),
-            Some((id, count)) => {
-                let left = if let Some((left, done)) = count.split_once('-') {
-                    done.parse::<u32>().context("invalid boot attempts done")?;
-                    left
-                } else {
-                    count
-                };
-                (
-                    id,
-                    Some(left.parse::<u32>().context("invalid boot attempts left")?),
-                )
-            }
-        };
-        let (_, revision) = entry_identity(id)?;
+        let parsed = read_entry(entry.path(), name)?;
         ensure!(
-            !entries.iter().any(|entry: &BootEntry| entry.id == id),
-            "duplicate CPS entry {id}"
+            !entries
+                .iter()
+                .any(|entry: &BootEntry| entry.id == parsed.id),
+            "duplicate CPS entry {}",
+            parsed.id
         );
-        let path = entry.path();
-        let description =
-            String::from_utf8(read_regular(&path)?.context("boot entry disappeared")?)?;
-        let title = boot_field(&description, "title")?
-            .context("CPS boot entry has no title")?
-            .to_owned();
-        ensure!(
-            boot_field(&description, "sort-key")? == Some("cps")
-                && boot_field(&description, "version")? == Some(revision.to_string().as_str()),
-            "boot entry sort key or version differs from CPS policy: {id}"
-        );
-        let options =
-            boot_field(&description, "options")?.context("CPS boot entry has no options")?;
-        let mut roots = options
-            .split_ascii_whitespace()
-            .filter_map(|arg| arg.strip_prefix("root="));
-        let partuuid = roots
-            .next()
-            .and_then(|root| root.strip_prefix("PARTUUID="))
-            .context("CPS boot entry is missing its root PARTUUID")?;
-        ensure!(
-            roots.next().is_none(),
-            "multiple root options in CPS boot entry {id}"
-        );
-        let partuuid = canonical_partuuid(partuuid)?;
-        let parent = field(&description, "# cps-parent ")?;
-        if let Some(parent) = parent {
-            ensure!(
-                entry_identity(parent)?.1.checked_add(1) == Some(revision),
-                "invalid parent for {id}"
-            );
-        }
-        let parent = parent.map(str::to_owned);
-        let btrfs = BtrfsRecord::parse(&description, options)?;
-        entries.push(BootEntry {
-            path,
-            id: id.to_owned(),
-            revision,
-            tries,
-            description,
-            title,
-            partuuid,
-            parent,
-            btrfs,
-        });
+        entries.push(parsed);
     }
     entries.sort_by(|a, b| (b.revision, &b.id).cmp(&(a.revision, &a.id)));
     Ok(entries)
+}
+
+/// Parse the original BLS text retained during an interrupted destruction.
+pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
+    let (id, tries) = match name.split_once('+') {
+        None => (name, None),
+        Some((id, count)) => {
+            let left = if let Some((left, done)) = count.split_once('-') {
+                done.parse::<u32>().context("invalid boot attempts done")?;
+                left
+            } else {
+                count
+            };
+            (
+                id,
+                Some(left.parse::<u32>().context("invalid boot attempts left")?),
+            )
+        }
+    };
+    let (_, revision) = entry_identity(id)?;
+    ensure!(
+        fs::symlink_metadata(&path)?.is_file(),
+        "boot entry is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    File::open(&path)?
+        .take(MAX_ENTRY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_ENTRY_BYTES, "boot entry exceeds 64 KiB");
+    let description = String::from_utf8(bytes)?;
+    let title = boot_field(&description, "title")?
+        .context("CPS boot entry has no title")?
+        .to_owned();
+    ensure!(
+        boot_field(&description, "sort-key")? == Some("cps")
+            && boot_field(&description, "version")? == Some(revision.to_string().as_str()),
+        "boot entry sort key or version differs from CPS policy: {id}"
+    );
+    let options = boot_field(&description, "options")?.context("CPS boot entry has no options")?;
+    let mut roots = options
+        .split_ascii_whitespace()
+        .filter_map(|arg| arg.strip_prefix("root="));
+    let partuuid = roots
+        .next()
+        .and_then(|root| root.strip_prefix("PARTUUID="))
+        .context("CPS boot entry is missing its root PARTUUID")?;
+    ensure!(
+        roots.next().is_none(),
+        "multiple root options in CPS boot entry {id}"
+    );
+    let partuuid = canonical_partuuid(partuuid)?;
+    let parent = field(&description, "# cps-parent ")?;
+    if let Some(parent) = parent {
+        ensure!(
+            entry_identity(parent)?.1.checked_add(1) == Some(revision),
+            "invalid parent for {id}"
+        );
+    }
+    let parent = parent.map(str::to_owned);
+    let btrfs = BtrfsRecord::parse(&description, options)?;
+    Ok(BootEntry {
+        path,
+        id: id.to_owned(),
+        revision,
+        tries,
+        description,
+        title,
+        partuuid,
+        parent,
+        btrfs,
+    })
 }
 
 pub(in crate::boot) fn field<'a>(entry: &'a str, prefix: &str) -> Result<Option<&'a str>> {

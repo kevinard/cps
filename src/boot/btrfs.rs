@@ -36,6 +36,9 @@ struct VolumeArgs {
     name: [u8; 4088],
 }
 
+const _: () = assert!(size_of::<SnapshotArgs>() == 4096);
+const _: () = assert!(size_of::<VolumeArgs>() == 4096);
+
 /// Publish a verified read-only snapshot inside a new capture directory.
 pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> {
     snapshot_environment(source, output, None)
@@ -167,6 +170,23 @@ fn read_only(root: &Root) -> Result<bool> {
     // SAFETY: BTRFS_IOC_SUBVOL_GETFLAGS writes one u64 to the provided buffer.
     unsafe { ioctl(root.as_file(), Updater::<FLAGS, _>::new(&mut flags)) }?;
     Ok(flags & READ_ONLY != 0)
+}
+
+pub(super) fn destroy_by_id(volume: &Root, subvolid: u64) -> Result<()> {
+    ensure!(subvolid >= 256, "cannot destroy the Btrfs top-level volume");
+    let mut args = SnapshotArgs {
+        fd: 0,
+        transid: 0,
+        flags: 1 << 4, // BTRFS_SUBVOL_SPEC_BY_ID
+        reserved: [0; 4],
+        name: [0; 4040],
+    };
+    args.name[..8].copy_from_slice(&subvolid.to_ne_bytes());
+    const DESTROY: Opcode = opcode::write::<SnapshotArgs>(0x94, 63);
+    // SAFETY: the UAPI union holds subvolid when SPEC_BY_ID is set.
+    unsafe { ioctl(volume.as_file(), Updater::<DESTROY, _>::new(&mut args)) }
+        .context("deleting the registered Btrfs subvolume by ID")?;
+    volume.sync().context("committing Btrfs subvolume deletion")
 }
 
 fn check_snapshot_tree(root: &Root) -> Result<()> {

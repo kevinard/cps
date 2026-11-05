@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Canopa Package System prototype"
 
+[profile.dev.package.sha2]
+opt-level = 3
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

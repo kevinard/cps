@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-35`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-36`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1564,6 +1564,46 @@ Set `CPS_VM_KERNEL_FIXTURE` to the output from `tests/build-kernel.sh`
 to stage the signed Btrfs-capable kernel as part of the upgrade. The image
 requires its builder signature, audits the installed evidence after boot,
 and checks the running kernel in both the trial and the previous root.
+
+### Reclaiming old Btrfs environments
+
+Retire an obsolete registered Btrfs root after its replacement has booted
+successfully. Use the host's mount namespace and unmount the old root first.
+
+```sh
+cps boot-env list --esp /efi
+cps boot-env destroy-btrfs --esp /efi --btrfs-volume /mnt/cps-volume --dry-run "$old_id"
+cps boot-env destroy-btrfs --esp /efi --btrfs-volume /mnt/cps-volume "$old_id"
+```
+
+The command keeps the selected known-good environment, its recorded fallback,
+the running environment's recorded fallback, and the loader's configured default.
+It rejects the running root, mounted roots,
+roots with nested subvolumes or mounts, and trials with attempts left. It checks
+the registered filesystem and subvolume identity, then deletes by subvolume ID.
+Only that subvolume and its private CPS boot artifacts are removed. Other
+captures and shared subvolumes keep their own contents and lifecycle.
+
+CPS first renames the boot entry to a durable `.cps-destroy` retirement record,
+then commits subvolume deletion before removing boot artifacts and the record.
+`boot-env list` shows interrupted cleanup as `retiring`. Retry the same command
+to finish; activation of that identity stays blocked until cleanup completes.
+Keep the recorded root path stable during this operation.
+
+Btrfs refuses to delete its filesystem default subvolume. If it is the obsolete
+root, choose another filesystem default, such as top-level ID 5 with
+`btrfs subvolume set-default 5 /mnt/cps-volume`, then retry. CPS boot entries
+select their subvolume explicitly. Storage reclamation continues in the
+background after the deletion transaction commits.
+[Btrfs subvolume deletion](https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html)
+
+Set `CPS_VM_BTRFS_DESTROY=1` for the native VM test to stage and bless another
+root, test the destruction guards, recover from the kernel's default-subvolume
+refusal and an injected artifact-cleanup failure, and boot the retained fallback
+after cleanup. This fixture uses a native C compiler for its failure-injection
+helper. Combine
+`CPS_VM_BTRFS_HEALTH_FAIL=1` and `CPS_VM_BTRFS_DESTROY_FAILED=1` to verify
+that an exhausted trial with damaged managed files can be discarded.
 
 ### Activating a trial on an installed disk
 

@@ -263,6 +263,18 @@ impl BtrfsVolume {
     }
 
     pub fn verify(&self, record: &BtrfsRecord, image_id: &str, revision: u64) -> Result<Image> {
+        let root = self.open_registered(record, &super::entry_id(image_id, revision))?;
+        let image = Image::open_query_root(root)?;
+        let settings = image.settings()?;
+        ensure!(
+            settings.id == image_id && settings.revision == revision,
+            "Btrfs root image or revision differs from its boot entry"
+        );
+        check_image_integrity(&image)?;
+        Ok(image)
+    }
+
+    pub fn open_registered(&self, record: &BtrfsRecord, id: &str) -> Result<Root> {
         ensure!(
             record.fsid == self.fsid,
             "the boot entry belongs to a different Btrfs filesystem"
@@ -272,19 +284,46 @@ impl BtrfsVolume {
             self.record(&root, &self.path.join(&record.path))? == *record,
             "Btrfs subvolume identity differs from its boot entry"
         );
+        ensure!(
+            registration(&root)?.as_deref() == Some(id.as_bytes()),
+            "Btrfs root registration differs from its boot entry"
+        );
+        Ok(root)
+    }
+
+    pub fn destroy(&self, record: &BtrfsRecord, root: &Root) -> Result<()> {
+        ensure!(
+            self.record(root, &self.path.join(&record.path))? == *record,
+            "Btrfs subvolume changed before destruction"
+        );
+        super::btrfs::destroy_by_id(&self.root, record.subvolid)
+    }
+
+    pub fn running_parent(&self) -> Result<Option<String>> {
+        let root = Root::open(Path::new("/"))?;
+        if fstatfs(root.as_file())?.f_type != libc::BTRFS_SUPER_MAGIC
+            || uuid_string(&filesystem_info(&root)?.fsid) != self.fsid
+        {
+            return Ok(None);
+        }
+        let Some(registered) = registration(&root)? else {
+            return Ok(None);
+        };
         let image = Image::open_query_root(root)?;
         let settings = image.settings()?;
         ensure!(
-            settings.id == image_id && settings.revision == revision,
-            "Btrfs root image or revision differs from its boot entry"
+            registered == super::entry_id(&settings.id, settings.revision).as_bytes(),
+            "the running root's boot registration differs from its image identity"
         );
-        ensure!(
-            registration(&image.root)?.as_deref()
-                == Some(super::entry_id(image_id, revision).as_bytes()),
-            "Btrfs root registration differs from its boot entry"
-        );
-        check_image_integrity(&image)?;
-        Ok(image)
+        settings
+            .boot_parent
+            .map(|parent| {
+                Ok(super::entry_id(
+                    &canonical_partuuid(&parent.id)?,
+                    parent.revision,
+                ))
+            })
+            .transpose()
     }
 }
 

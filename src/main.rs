@@ -18,10 +18,10 @@ use cps::{
     activate_device_boot_environment, add_publisher_with_build_trust, apply, archive_build_sources,
     audit_publisher_builds, build_with_toolchain_config, build_with_worker,
     capture_boot_environment, create_configured_image, create_image,
-    deploy_and_activate_boot_environment, deploy_boot_environment, export_boot_environment,
-    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources,
-    fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
-    generate_manifest_for_architecture, import_sources, list_boot_environments,
+    deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
+    export_boot_environment, export_boot_environment_receipt, export_rebuild_inputs,
+    fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
+    fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
     list_publishers, list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
     publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
@@ -646,6 +646,16 @@ enum PlanCommand {
 
 #[derive(Subcommand)]
 enum BootCommand {
+    /// Retire an inactive Btrfs root and its boot artifacts, or resume its cleanup
+    DestroyBtrfs {
+        #[arg(long)]
+        esp: PathBuf,
+        #[arg(long)]
+        btrfs_volume: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        id: String,
+    },
     /// Stage a saved plan in a writable Btrfs snapshot of a read-only baseline
     StageBtrfs {
         #[arg(long)]
@@ -1583,10 +1593,14 @@ fn run(command: Command) -> Result<ExitCode> {
                     println!("DEFAULT\tSTATUS\tID\tROOT PARTUUID\tTITLE");
                     for environment in environments {
                         let marker = if environment.is_default { "*" } else { "-" };
-                        let status = match environment.tries_left {
-                            None => "known-good".to_owned(),
-                            Some(0) => "exhausted".to_owned(),
-                            Some(tries) => format!("trial ({tries} left)"),
+                        let status = if environment.is_retiring {
+                            "retiring".to_owned()
+                        } else {
+                            match environment.tries_left {
+                                None => "known-good".to_owned(),
+                                Some(0) => "exhausted".to_owned(),
+                                Some(tries) => format!("trial ({tries} left)"),
+                            }
                         };
                         println!(
                             "{marker}\t{status}\t{}\t{}\t{}",
@@ -1594,6 +1608,22 @@ fn run(command: Command) -> Result<ExitCode> {
                         );
                     }
                 }
+            }
+            BootCommand::DestroyBtrfs {
+                esp,
+                btrfs_volume,
+                dry_run,
+                id,
+            } => {
+                let id = destroy_btrfs_boot_environment(&esp, &btrfs_volume, &id, dry_run)?;
+                println!(
+                    "{} {id}",
+                    if dry_run {
+                        "Would destroy"
+                    } else {
+                        "Destroyed"
+                    }
+                );
             }
             BootCommand::Rollback {
                 esp,

@@ -42,8 +42,8 @@ pub use esp::{
 pub use export::{export_boot_environment, export_boot_environment_receipt};
 pub use systemd_boot::{
     Activation, BootEnvironment, RootDeployment, activate_boot_environment,
-    activate_deployed_boot_environment, activate_device_boot_environment, list_boot_environments,
-    rollback_boot_environment,
+    activate_deployed_boot_environment, activate_device_boot_environment,
+    destroy_btrfs_boot_environment, list_boot_environments, rollback_boot_environment,
 };
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
