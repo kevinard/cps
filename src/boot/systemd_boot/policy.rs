@@ -231,7 +231,7 @@ pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
     Ok(entries)
 }
 
-fn field<'a>(entry: &'a str, prefix: &str) -> Result<Option<&'a str>> {
+pub(super) fn field<'a>(entry: &'a str, prefix: &str) -> Result<Option<&'a str>> {
     let mut values = entry.lines().filter_map(|line| line.strip_prefix(prefix));
     let value = values.next();
     ensure!(

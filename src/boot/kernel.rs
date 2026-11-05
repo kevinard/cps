@@ -53,8 +53,8 @@ impl Kernel {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Artifacts {
     pub kernel: Kernel,
-    linux_sha256: String,
-    initrd_sha256: Option<String>,
+    pub(super) linux_sha256: String,
+    pub(super) initrd_sha256: Option<String>,
 }
 
 pub(crate) fn selected(

@@ -115,6 +115,7 @@ publish test repo 1.0.0-0
 "$cps" apply --root base install.json
 mkdir -p base/boot
 printf 'test kernel\n' > base/boot/vmlinuz
+printf 'test initramfs\n' > base/boot/initrd
 
 export_with_receipt() {
     "$cps" boot-env export --root "$1" --output "$1.ext4" --size-mib 16 --receipt > "$1.kdl"
@@ -123,7 +124,7 @@ activate_checked() {
     local root=$1 disk=$2 partuuid=$3 receipt=$4
     shift 4
     "$cps" boot-env activate --root "$root" --esp esp --root-partuuid "$partuuid" \
-        --disk "$disk" --receipt "$receipt" "$@"
+        --disk "$disk" --receipt "$receipt" --initrd boot/initrd "$@"
 }
 reject_activation() {
     local message=$1
@@ -168,6 +169,17 @@ test -z "$(ls -A esp)"
 base_id=$(activate_checked base base.raw "$base" base.kdl --known-good)
 base_id=${base_id#Activated }
 test -f "esp/loader/entries/$base_id.conf"
+kernel_hash=$(sha256sum base/boot/vmlinuz)
+initrd_hash=$(sha256sum base/boot/initrd)
+grep -Fx "# cps-linux-sha256 ${kernel_hash%% *}" "esp/loader/entries/$base_id.conf"
+grep -Fx "# cps-initrd-sha256 ${initrd_hash%% *}" "esp/loader/entries/$base_id.conf"
+
+cp -a esp legacy-esp
+sed -i '/^# cps-.*-sha256 /d' "legacy-esp/loader/entries/$base_id.conf"
+cp -a legacy-esp legacy-before
+"$cps" boot-env activate --root base --esp legacy-esp --root-partuuid "$base" \
+    --disk base.raw --receipt base.kdl --known-good --initrd boot/initrd
+diff -r legacy-before legacy-esp
 
 "$cps" boot-env stage --source base --root staged update.json
 export_with_receipt staged
@@ -185,6 +197,18 @@ cp staged.raw tampered.raw
 printf 'changed deployed bytes' | dd of=tampered.raw bs=1M seek=19 conv=notrunc status=none
 reject_activation 'does not match the root export receipt' \
     staged tampered.raw "$trial" staged.kdl
+diff -r esp-before esp
+for file in vmlinuz.efi initramfs.img; do
+    artifact="esp/EFI/cps/$base_id/$file"
+    printf '!' | dd of="$artifact" bs=1 count=1 conv=notrunc status=none
+    reject_activation 'boot artifact digest mismatch' staged staged.raw "$trial" staged.kdl
+    cp -- "esp-before/EFI/cps/$base_id/$file" "$artifact"
+    diff -r esp-before esp
+done
+base_entry="loader/entries/$base_id.conf"
+printf '\tlinux\t/other.efi\n' >> "esp/$base_entry"
+reject_activation 'duplicate fallback kernel path' staged staged.raw "$trial" staged.kdl
+cp -- "esp-before/$base_entry" "esp/$base_entry"
 diff -r esp-before esp
 
 trial_id=$(activate_checked staged staged.raw "$trial" staged.kdl)
@@ -211,7 +235,8 @@ raw_activate() {
     local root=$1 disk=$2 partuuid=$3 output=$4
     shift 4
     "$cps" boot-env activate --root "$root" --root-partuuid "$partuuid" \
-        --receipt "$root.kdl" --disk "$disk" --esp-partuuid "$esp" --output-disk "$output" "$@"
+        --receipt "$root.kdl" --disk "$disk" --esp-partuuid "$esp" --output-disk "$output" \
+        --initrd boot/initrd "$@"
 }
 raw_list() {
     "$cps" boot-env list --disk "$1" --esp-partuuid "$esp"

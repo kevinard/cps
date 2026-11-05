@@ -24,7 +24,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-28}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-29}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -106,7 +106,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-8]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-9]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -125,10 +125,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-8]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-9]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-8]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-9]) protected_profiles=true ;;
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
 fi
@@ -1185,6 +1185,19 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
                 '$1 == "*" && $2 == "known-good" && $3 == id && $4 == part && index($5, release) {found=1} END {exit !found}' "$4"
         }
         assert_default "$trial_id" "$trial_uuid" "$trial_release" before-rollback.log
+        cp --reflink=auto --sparse=always disk.raw corrupted-fallback.raw
+        cp -- "$kernel" corrupted-kernel
+        printf '!' | dd of=corrupted-kernel bs=1 count=1 conv=notrunc status=none
+        if cmp -s "$kernel" corrupted-kernel; then exit 1; fi
+        mcopy -o -i corrupted-fallback.raw@@1048576 corrupted-kernel "::/EFI/cps/$base_id/vmlinuz.efi"
+        if "$cps" boot-env rollback --disk corrupted-fallback.raw --esp-partuuid "$esp_uuid" \
+            --output-disk rejected-rollback.raw > rejected.log 2>&1; then
+            echo 'Rollback accepted a corrupt fallback kernel' >&2
+            exit 1
+        fi
+        grep -F 'boot artifact digest mismatch' rejected.log
+        test ! -e rejected-rollback.raw
+        rm -- corrupted-fallback.raw corrupted-kernel
         if [[ $device_activation == 1 ]]; then
             run_device_guest rollback disk.raw rollback.raw
             cmp -n 1048576 disk.raw rollback.raw

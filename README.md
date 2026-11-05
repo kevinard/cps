@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-28`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-29`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1498,8 +1498,12 @@ unregistered slot. If the new environment is already registered, omit
 `--root-image` and `--replace` to verify it and finish activation.
 
 Activation copies boot files from the selected root and publishes its Boot
-Loader Specification entry last. With manually supplied boot files the
-kernel path defaults to `boot/vmlinuz`. Use `--initrd` if the kernel needs
+Loader Specification entry last. New entries record SHA-256 digests of the
+kernel and initramfs in comments. CPS checks those bytes before using an
+entry as an activation fallback or rollback target. Older entries retain
+the path and file checks available from their original metadata.
+With manually supplied boot files the kernel path defaults to
+`boot/vmlinuz`. Use `--initrd` if the kernel needs
 one to mount the root and `--options` for additional kernel arguments.
 
 With `--esp-partuuid` and `--output-disk`, CPS edits a private copy of the

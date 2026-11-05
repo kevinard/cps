@@ -2,7 +2,7 @@ mod policy;
 
 use std::{
     fs::{self, File},
-    io::{self, Read},
+    io::{self, Read, Seek},
     path::{Path, PathBuf},
 };
 
@@ -19,10 +19,13 @@ use super::{
 use crate::{
     image::{Image, root::Root},
     kdl_format::boot_export::ExportReceipt,
-    model::{digest_reader, is_uuid},
+    model::{digest, digest_reader, is_uuid, validate_digest},
 };
 
-use self::policy::{BootEntry, LoaderPolicy, inventory};
+use self::policy::{BootEntry, LoaderPolicy, field, inventory};
+
+const LINUX_HASH: &str = "# cps-linux-sha256 ";
+const INITRD_HASH: &str = "# cps-initrd-sha256 ";
 
 #[derive(Debug)]
 pub struct BootEnvironment {
@@ -248,24 +251,32 @@ pub(super) fn activate(
     };
 
     let managed = kernel::selected(&state.installed, &state.paths)?;
-    let (kernel, initrd) = if let Some(artifacts) = &managed {
+    let (kernel, initrd, linux_sha256, initrd_sha256) = if let Some(artifacts) = &managed {
         ensure!(
             activation.kernel == "boot/vmlinuz" && activation.initrd.is_none(),
             "the image uses kernel-install artifacts; omit --kernel and --initrd"
         );
-        artifacts.open_prepared(&image.root)?
+        let (kernel, initrd) = artifacts.open_prepared(&image.root)?;
+        (
+            kernel,
+            initrd,
+            artifacts.linux_sha256.clone(),
+            artifacts.initrd_sha256.clone(),
+        )
     } else {
-        let kernel = image
+        let mut kernel = image
             .root
             .file(&activation.kernel)
             .context("opening the environment kernel")?;
-        let initrd = activation
+        let mut initrd = activation
             .initrd
             .as_deref()
             .map(|path| image.root.file(path))
             .transpose()
             .context("opening the environment initramfs")?;
-        (kernel, initrd)
+        let linux_sha256 = digest_artifact(&mut kernel)?;
+        let initrd_sha256 = initrd.as_mut().map(digest_artifact).transpose()?;
+        (kernel, initrd, linux_sha256, initrd_sha256)
     };
     let receipt = if let Some(deployment) = deployment {
         let receipt = read_export_receipt(deployment.receipt)?;
@@ -305,6 +316,13 @@ pub(super) fn activate(
     let (policy, existing) = inventory(&esp)?;
     let existing_entry = existing.iter().find(|entry| entry.id == id);
 
+    // Retries of entries created before artifact hashes keep the original BLS text.
+    let record_hashes = if let Some(entry) = existing_entry {
+        field(&entry.description, LINUX_HASH)?.is_some()
+            || field(&entry.description, INITRD_HASH)?.is_some()
+    } else {
+        true
+    };
     let description = Entry {
         id: &id,
         revision: settings.revision,
@@ -315,7 +333,9 @@ pub(super) fn activate(
             fallback.as_deref()
         },
         options: &activation.options,
-        initrd: initrd.is_some(),
+        linux_sha256: &linux_sha256,
+        initrd_sha256: initrd_sha256.as_deref(),
+        record_hashes,
         kernel_release: managed
             .as_ref()
             .map(|artifacts| artifacts.kernel.release.as_str()),
@@ -458,11 +478,17 @@ pub(super) fn activate(
     let efi = ensure_dir(&esp, "EFI")?;
     let artifacts = ensure_dir(&ensure_dir(&efi, "cps")?, &id)?;
     let mut files = Vec::new();
-    if install(&artifacts.join("vmlinuz.efi"), kernel)? {
+    if install(&artifacts.join("vmlinuz.efi"), kernel, &linux_sha256)? {
         files.push(format!("EFI/cps/{id}/vmlinuz.efi"));
     }
     if let Some(initrd) = initrd
-        && install(&artifacts.join("initramfs.img"), initrd)?
+        && install(
+            &artifacts.join("initramfs.img"),
+            initrd,
+            initrd_sha256
+                .as_deref()
+                .context("missing initramfs digest")?,
+        )?
     {
         files.push(format!("EFI/cps/{id}/initramfs.img"));
     }
@@ -478,10 +504,7 @@ pub(super) fn activate(
             None => format!("{id}.conf"),
             Some(_) => format!("{id}+{}.conf", activation.tries),
         };
-        install(
-            &entries.join(&file),
-            io::Cursor::new(description.as_bytes()),
-        )?;
+        install_text(&entries.join(&file), &description)?;
         files.push(format!("loader/entries/{file}"));
     }
     if let Some(fallback) = fallback
@@ -532,7 +555,7 @@ fn retire_device_entry(
 ) -> Result<()> {
     // Remember the retired identity before removing its boot entry. The
     // directory fsync must complete before any write to the root partition.
-    install(marker, io::Cursor::new(format!("{id}\n")))?;
+    install_text(marker, &format!("{id}\n"))?;
     let entries = File::open(esp.join("loader/entries"))?;
     if let Some(retired) = retired {
         fs::remove_file(esp.join("loader/entries").join(retired.file))?;
@@ -580,7 +603,9 @@ struct Entry<'a> {
     partuuid: &'a str,
     options: &'a str,
     parent: Option<&'a str>,
-    initrd: bool,
+    linux_sha256: &'a str,
+    initrd_sha256: Option<&'a str>,
+    record_hashes: bool,
     kernel_release: Option<&'a str>,
 }
 
@@ -592,7 +617,9 @@ impl Entry<'_> {
             partuuid,
             options,
             parent,
-            initrd,
+            linux_sha256,
+            initrd_sha256,
+            record_hashes,
             kernel_release,
         } = self;
         let title = match kernel_release {
@@ -605,8 +632,14 @@ impl Entry<'_> {
         if let Some(parent) = parent {
             entry.push_str(&format!("# cps-parent {parent}\n"));
         }
-        if *initrd {
+        if *record_hashes {
+            entry.push_str(&format!("{LINUX_HASH}{linux_sha256}\n"));
+        }
+        if let Some(initrd_sha256) = initrd_sha256 {
             entry.push_str(&format!("initrd /EFI/cps/{id}/initramfs.img\n"));
+            if *record_hashes {
+                entry.push_str(&format!("{INITRD_HASH}{initrd_sha256}\n"));
+            }
         }
         entry.push_str(&format!(
             "options root=PARTUUID={partuuid} rootwait {options}\n"
@@ -618,23 +651,68 @@ impl Entry<'_> {
 fn verify_fallback_artifacts(esp: &Path, id: &str, entry: &str) -> Result<()> {
     let esp = Root::open(esp)?;
     let kernel = format!("EFI/cps/{id}/vmlinuz.efi");
-    let expected = format!("linux /{kernel}");
+    let mut linux = None;
+    let mut initrd = None;
+    // systemd-boot recognizes tabs as separators and skips leading whitespace.
+    for (key, value) in entry
+        .lines()
+        .filter_map(|line| line.trim_ascii_start().split_once([' ', '\t']))
+    {
+        match key {
+            "linux" => ensure!(
+                linux.replace(value.trim_ascii()).is_none(),
+                "duplicate fallback kernel path"
+            ),
+            "initrd" => ensure!(
+                initrd.replace(value.trim_ascii()).is_none(),
+                "duplicate fallback initramfs path"
+            ),
+            "efi" | "uki" | "uki-url" => bail!("unexpected fallback loader type {key}"),
+            _ => {}
+        }
+    }
     ensure!(
-        entry.lines().any(|line| line == expected),
+        linux.and_then(|path| path.strip_prefix('/')) == Some(kernel.as_str()),
         "unexpected fallback kernel path"
     );
-    esp.file(&kernel)
-        .context("opening the known-good fallback kernel")?;
-    let initrd = format!("EFI/cps/{id}/initramfs.img");
-    for path in entry
-        .lines()
-        .filter_map(|line| line.strip_prefix("initrd /"))
-    {
-        ensure!(path == initrd, "unexpected fallback initramfs path");
-        esp.file(path)
-            .context("opening the known-good fallback initramfs")?;
+    let linux_sha256 = field(entry, LINUX_HASH)?;
+    let initrd_sha256 = field(entry, INITRD_HASH)?;
+    if linux_sha256.is_some() || initrd_sha256.is_some() {
+        ensure!(
+            linux_sha256.is_some() && initrd_sha256.is_some() == initrd.is_some(),
+            "incomplete boot artifact digests in entry {id}"
+        );
+    }
+    verify_artifact(&esp, &kernel, linux_sha256)
+        .context("checking the known-good fallback kernel")?;
+    if let Some(path) = initrd {
+        let expected = format!("EFI/cps/{id}/initramfs.img");
+        ensure!(
+            path.strip_prefix('/') == Some(expected.as_str()),
+            "unexpected fallback initramfs path"
+        );
+        verify_artifact(&esp, &expected, initrd_sha256)
+            .context("checking the known-good fallback initramfs")?;
     }
     Ok(())
+}
+
+fn verify_artifact(esp: &Root, path: &str, sha256: Option<&str>) -> Result<()> {
+    let file = esp.file(path)?;
+    if let Some(sha256) = sha256 {
+        validate_digest(sha256)?;
+        ensure!(
+            digest_reader(file)? == sha256,
+            "boot artifact digest mismatch at {path}"
+        );
+    }
+    Ok(())
+}
+
+fn digest_artifact(file: &mut File) -> Result<String> {
+    let hash = digest_reader(&mut *file)?;
+    file.rewind()?;
+    Ok(hash)
 }
 
 pub(super) fn canonical_partuuid(value: &str) -> Result<String> {
@@ -687,7 +765,12 @@ fn read_regular(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn install(path: &Path, mut bytes: impl Read) -> Result<bool> {
+fn install_text(path: &Path, text: &str) -> Result<()> {
+    install(path, text.as_bytes(), &digest(text.as_bytes()))?;
+    Ok(())
+}
+
+fn install(path: &Path, mut bytes: impl Read, sha256: &str) -> Result<bool> {
     let parent = path.parent().context("missing EFI destination directory")?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -698,7 +781,7 @@ fn install(path: &Path, mut bytes: impl Read) -> Result<bool> {
             );
             let current = File::open(path)?;
             ensure!(
-                digest_reader(&current)? == digest_reader(&mut bytes)?,
+                digest_reader(&current)? == sha256,
                 "boot file {} already exists with different contents",
                 path.display()
             );
@@ -711,6 +794,12 @@ fn install(path: &Path, mut bytes: impl Read) -> Result<bool> {
     }
     let mut temp = NamedTempFile::new_in(parent)?;
     io::copy(&mut bytes, &mut temp)?;
+    temp.as_file_mut().rewind()?;
+    ensure!(
+        digest_reader(temp.as_file())? == sha256,
+        "boot file {} changed while being copied",
+        path.display()
+    );
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)?;
     File::open(parent)?.sync_all()?;
