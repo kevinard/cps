@@ -1,6 +1,6 @@
 # Canopa Package System
 
-This Rust prototype manages disposable Linux directory images from a signed local repository. It stores immutable package manifests and SHA-256 file payloads, plans changes across the image, and verifies installed files offline.
+CPS is an image-oriented package manager for Linux, written in Rust and inspired by IPS. It manages signed repositories and release profiles, plans recoverable image transactions, stages upgrades into systemd boot environments, and verifies installed files offline. Its build and publishing tools support pinned inputs, isolated reproducible builds, and independently signed build evidence.
 
 Repository reads cap catalogs at 64 MiB and manifests at 32 MiB. CPS streams payloads to the staging directory with the signed length as a bound and checks the digest before recording a transaction.
 
@@ -1206,7 +1206,7 @@ Upgrade CPS before using catalogs with signed release profile records.
 - New plans use Resolvo to resolve compatible versions and report incompatible requirements. When selected file actions collide, CPS excludes the conflicting version or pair of versions and retries. Directory sharing still requires identical metadata. SAT resolution has a 60-second time limit. Saved plans record their solver version so apply can verify the same selection against the pinned catalog. Plans created before solver versioning retain their original behavior. [Resolvo](https://github.com/prefix-dev/resolvo)
 - Actions support `file`, `dir`, `symlink`, and `hardlink`. A symlink specifies `target` in place of `mode`. Use `hardlink "bin/tool" target="usr/bin/tool"` to share the inode of an immutable regular file in the same package. The target is relative to the image root and supplies ownership, mode, and content. The optional `arch` and `facet` selectors match image policy. A hard link's target must be selected whenever the alias is selected. Facets default to enabled and can be set with `image-create --facet doc.man=false`. [IPS hard-link actions](https://docs.oracle.com/cd/E53394_01/html/E54820/pkgterms.html)
 - Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. When the vendor file changes, find its new copy in `image/.cps/config-updates/<revision>/`.
-- The image must be inactive and reside on one filesystem. Install and update require existing explicit directory metadata to match the selected action. Transitions between a directory and a file or symlink are rejected. When ownership ends, CPS prunes directories it recorded creating if they are empty and their metadata still matches. It keeps pre-existing directories and directories with local content or extended attributes.
+- The image must be inactive and reside on one filesystem. Existing explicit directory metadata must match either the installed declaration or the selected action; matching installed directories can be updated in place. Unmanaged or locally changed directory metadata must already match the selected action. Transitions between a directory and a file or symlink are rejected. When ownership ends, CPS prunes directories it recorded creating if they are empty and their metadata still matches. It keeps pre-existing directories and directories with local content or extended attributes.
 
 Use `cps plan --root image --output cleanup.json autoremove` to preview
 removing unused dependencies. CPS solves from the explicitly installed
@@ -1240,7 +1240,9 @@ Directory changes and privileged file replacements can resume offline from
 the journal. Managed hard links follow their target's permissions.
 
 Use CPS `0.1.0-38` or later for package operations once a release uses these
-permission bits. Earlier clients reject the new manifests. Run
+permission bits. Roll out the updated client using compatible metadata before
+publishing a release that needs the new bits; earlier clients reject those
+manifests. Run
 `tests/file-modes-vm.sh` with the QEMU and kernel overrides to verify actual
 setuid/setgid execution, sticky deletion rules, group inheritance, failure
 without `CAP_FSETID`, interrupted offline recovery, repair, isolated boot
