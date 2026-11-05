@@ -24,6 +24,13 @@ applications to use updated files. CPS reloads the systemd manager when
 system unit files change and queues restarts for active services owned
 by updated packages. New services follow the package's preset policy.
 
+When a new package is available from several publishers, an interactive
+`install` shows a choice with the newest matching version from each.
+Press Enter for the first choice or enter a number. Use
+`cps://PUBLISHER/NAME` to select a publisher explicitly. `--yes` and
+`--dry-run` use the configured search order. Installed packages keep
+their original publisher.
+
 A transaction that changes the kernel, initramfs, other boot paths, or
 a package marked for staging is applied in a new Btrfs environment.
 CPS selects the new environment for a trial on the next reboot and
@@ -1140,8 +1147,8 @@ publisher "extras" {
 }
 ```
 
-For a new package, the solver considers versions from the first publisher that
-offers the package name. An installed package stays with its original
+By default, for a new package, the solver considers versions from the first
+publisher that offers the package name. An installed package stays with its original
 publisher. Each plan that resolves packages pins a signed catalog per publisher,
 and apply checks the same catalog set and stages the selected payloads before
 changing the image. [IPS publisher search order and stickiness](https://docs.oracle.com/cd/E53394_01/html/E54739/gijmo.html)
@@ -1160,7 +1167,7 @@ satisfies all dependencies. A version on its own keeps normal publisher order.
 On an existing image, use `publisher list` to inspect search order.
 `publisher add --root image --repo /var/lib/cps/extras --trust-key extras.der extras`
 verifies the signed catalog before appending it. Use
-`publisher prefer --root image extras` to move it to the front.
+`publisher prefer --root image extras` to move it to the front of its group.
 `publisher remove --root image extras` requires that no installed package
 comes from that publisher and at least one publisher remains.
 These changes invalidate outstanding plans for the image and preserve its
@@ -1190,8 +1197,8 @@ Use the new paths in the KDL configuration used for subsequent mirror syncs.
 Add `release-profile "desktop"` to the image KDL to follow that profile in the
 first publisher's signed catalog. Configure the same architecture, facets, and
 publisher order as the profile. Each companion repository must have the signed
-catalog referenced by the profile. Changing publisher membership or order
-requires a new image configuration. Repository paths can be relocated in place.
+catalog referenced by the profile. The signed publishers keep their signed
+membership and order. Repository paths can be relocated in place.
 
 On an image with no installed packages, use the profile's checked roots and
 dependencies directly.
@@ -1212,6 +1219,30 @@ packages. Only a signed profile update can replace the protected set.
 Older profiles can still be used with ordinary `plan install`. Use
 `repo publish-release` with `refresh-profiles=#true` to record the
 composition before using `install-profile`.
+
+After installing the signed composition, you can append a locally trusted
+publisher with a signed repository or an already synchronized mirror cache.
+
+```sh
+sudo cps publisher add --root / --repo /var/lib/cps/extras \
+    --trust-key /etc/cps/keys/extras.der extras
+sudo cps install cps://extras/apps/editor
+```
+
+The image stores local publishers after the signed ones. `publisher prefer`
+reorders local publishers within that group. `publisher remove` removes a
+local publisher once its packages have been removed. A local package can
+depend on the protected base, and CPS rejects package selections that would
+replace a protected manifest or conflict with its files. On an installed
+Btrfs system, publisher membership edits use the boot configuration in
+`/etc/cps/image.kdl` and apply to the running known-good environment.
+
+Keep the signed publishers and their mirror definitions in the profile's
+image configuration. Sync third-party mirror caches separately with
+`repo sync`, using `--image /` for subsequent syncs after adding the
+publisher. A profile update uses the signed companion pins and each local
+publisher's current verified catalog. Use a CPS version that supports local
+publishers to manage images with this configuration.
 
 To install a particular published release, set `bootstrap-catalog` to the
 primary publisher's signed catalog digest.

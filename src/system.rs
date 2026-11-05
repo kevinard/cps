@@ -20,6 +20,7 @@ use crate::{
     image::Image,
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments, plan,
+    query::{InstallSource, SelectSource, select_install_sources},
     release::{SyncOptions, sync_profile_for_image, sync_with_options},
 };
 
@@ -91,6 +92,24 @@ impl System {
     }
 
     pub fn plan(&self, request: Request, refresh: bool) -> Result<Change> {
+        self.plan_request(request, refresh, None)
+    }
+
+    pub fn plan_with_source_selection(
+        &self,
+        request: Request,
+        refresh: bool,
+        mut choose: impl FnMut(&str, &[InstallSource]) -> Result<usize>,
+    ) -> Result<Change> {
+        self.plan_request(request, refresh, Some(&mut choose))
+    }
+
+    fn plan_request(
+        &self,
+        mut request: Request,
+        refresh: bool,
+        choose: Option<&mut SelectSource<'_>>,
+    ) -> Result<Change> {
         let upgrade = matches!(request, Request::Update);
         ensure!(
             upgrade || matches!(request, Request::Install { .. }),
@@ -99,6 +118,9 @@ impl System {
         self.check_running()?;
         if refresh {
             self.refresh(upgrade)?;
+        }
+        if let (Request::Install { packages }, Some(choose)) = (&mut request, choose) {
+            select_install_sources(Path::new(ROOT), packages, choose)?;
         }
         let plan = plan(Path::new(ROOT), request)?;
         let boot_reason = plan.boot_reason(&self.definition.stage_packages);

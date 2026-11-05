@@ -46,6 +46,95 @@ pub struct PackageRow {
     pub status: Status,
 }
 
+pub struct InstallSource {
+    pub publisher: String,
+    pub version: String,
+}
+
+pub(crate) type SelectSource<'a> = dyn FnMut(&str, &[InstallSource]) -> Result<usize> + 'a;
+
+/// Qualify uninstalled package requests with their selected publisher.
+pub(crate) fn select_install_sources(
+    root: &Path,
+    packages: &mut [String],
+    choose: &mut SelectSource<'_>,
+) -> Result<()> {
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let publishers = image.publishers()?;
+    if publishers.as_slice().len() < 2 {
+        return Ok(());
+    }
+    let installed = installed(&image, &publishers)?;
+    let specs = packages
+        .iter()
+        .map(|input| Ok((input.as_str(), PackageSpec::parse(input)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut choices = specs
+        .into_iter()
+        .filter(|(_, spec)| spec.publisher.is_none() && !installed.contains_key(spec.name))
+        .map(|(input, spec)| (input.to_owned(), (spec, Vec::new())))
+        .collect::<BTreeMap<_, _>>();
+    if choices.is_empty() {
+        return Ok(());
+    }
+    let settings = image.settings()?;
+    let pins = image.release_pins(&publishers, &settings)?;
+    for publisher in publishers.as_slice() {
+        let (catalog, obsolete) = available(
+            &image,
+            &publishers,
+            &settings,
+            publisher,
+            pins.get(&publisher.name),
+        )?;
+        for (spec, sources) in choices.values_mut() {
+            let matching = catalog.iter().find(|entry| {
+                entry.name == spec.name
+                    && spec.version.is_none_or(|version| version == entry.version)
+                    && obsolete
+                        .get(spec.name)
+                        .is_none_or(|cutoff| entry.version > *cutoff)
+            });
+            if let Some(entry) = matching {
+                sources.push(InstallSource {
+                    publisher: publisher.name.clone(),
+                    version: entry.version.to_string(),
+                });
+            }
+        }
+    }
+    drop(image);
+
+    let mut selected = BTreeMap::new();
+    for input in packages.iter() {
+        let Some((spec, sources)) = choices.get(input).filter(|(_, sources)| sources.len() > 1)
+        else {
+            continue;
+        };
+        if selected.contains_key(input) {
+            continue;
+        }
+        let index = choose(input, sources)?;
+        let source = sources.get(index).context("invalid publisher selection")?;
+        let version = spec
+            .version
+            .map(|version| format!("@{version}"))
+            .unwrap_or_default();
+        selected.insert(
+            input.clone(),
+            format!("cps://{}/{}{version}", source.publisher, spec.name),
+        );
+    }
+    drop(choices);
+    for package in packages {
+        if let Some(qualified) = selected.get(package) {
+            package.clone_from(qualified);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileRole {
     Root,

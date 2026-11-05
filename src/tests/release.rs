@@ -910,6 +910,183 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
 }
 
 #[test]
+fn local_publishers_offer_choices_without_replacing_the_signed_profile() -> Result<()> {
+    let main = Fixture::new()?;
+    let companion = Fixture::new()?;
+    let extras = Fixture::new()?;
+    let base = "desktop/base";
+    let library = "library/runtime";
+    let editor = "apps/editor";
+    companion.package_as("seed", library, "1.0.0-0", String::new())?;
+    let pin = fs::read_to_string(companion.repo.join("current"))?;
+    companion.package_as("seed", library, "2.0.0-0", String::new())?;
+    for version in ["1.0.0-0", "2.0.0-0"] {
+        main.package(
+            base,
+            version,
+            main.file(COMPOSITOR, version, "0755", "")?
+                + &dependency("require", library, "1.0.0-0"),
+        )?;
+    }
+    main.package(editor, "1.0.0-0", String::new())?;
+    extras.package_as("extras", base, "9.0.0-0", String::new())?;
+    extras.package_as("extras", library, "9.0.0-0", String::new())?;
+    extras.package_as(
+        "extras",
+        editor,
+        "2.0.0-0",
+        format!("    require {library:?}\n"),
+    )?;
+    extras.package_as(
+        "extras",
+        "apps/conflict",
+        "1.0.0-0",
+        extras.file(COMPOSITOR, "conflicting content", "0755", "")?,
+    )?;
+    let work = extras._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    let cache = work.join("cache");
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_root(&anchor, &tuf_key, None)?;
+    let sync_extras = |version, image: Option<&Path>| -> Result<String> {
+        let mirror = work.join(format!("mirror-{version}"));
+        sign_publisher_release(
+            &extras, &mirror, version, fresh, &anchor, &tuf_key, "extras",
+        )?;
+        let endpoint = |role| Url::from_directory_path(mirror.join(role)).unwrap();
+        mirror_release::sync_with_options(
+            &cache,
+            &anchor,
+            endpoint("metadata").as_str(),
+            endpoint("targets").as_str(),
+            "extras",
+            &extras.public,
+            mirror_release::SyncOptions {
+                index_only: true,
+                image,
+            },
+        )
+    };
+    sync_extras(1, None)?;
+
+    let refresh = |version: &str| -> Result<()> {
+        fs::write(
+            main.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "unused.der"
+    profile "desktop" architecture="x86_64" {{
+        package "desktop/base@{version}"
+        publisher "seed" catalog={:?} {{ repository {:?}; trust-key {:?}; }}
+    }}
+}}
+"#,
+                pin.trim(),
+                companion.repo,
+                companion.public
+            ),
+        )?;
+        let release = main._dir.path().join("refresh.kdl");
+        let current = fs::read_to_string(main.repo.join("current"))?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                current.trim()
+            ),
+        )?;
+        publish_release(&main.repo, &main.private, &release)?;
+        Ok(())
+    };
+    refresh("1.0.0-0")?;
+    let config = main._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            main.repo, main.public, companion.repo, companion.public
+        ),
+    )?;
+    create_configured_image(&main.root, &config)?;
+    let add = || crate::add_publisher(&main.root, "extras", &cache, &extras.public);
+    assert!(add().is_err());
+    apply(&main.root, &plan(&main.root, Request::InstallProfile)?)?;
+    let install = |packages| plan(&main.root, Request::Install { packages });
+    let previous = install(vec![editor.into()])?;
+    add()?;
+    assert!(
+        apply(&main.root, &previous)
+            .unwrap_err()
+            .to_string()
+            .contains("publisher configuration changed")
+    );
+    assert!(crate::prefer_publisher(&main.root, "seed").is_err());
+    assert!(crate::remove_publisher(&main.root, "canopa").is_err());
+    assert!(install(vec![format!("cps://extras/{base}")]).is_err());
+    assert!(install(vec!["cps://extras/apps/conflict".into()]).is_err());
+
+    let mut requests = [base.to_owned(), editor.to_owned(), editor.to_owned()];
+    let mut prompts = 0;
+    crate::query::select_install_sources(&main.root, &mut requests, &mut |name, choices| {
+        prompts += 1;
+        assert_eq!(name, editor);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| (choice.publisher.as_str(), choice.version.as_str()))
+                .collect::<Vec<_>>(),
+            [("canopa", "1.0.0-0"), ("extras", "2.0.0-0")]
+        );
+        Ok(1)
+    })?;
+    assert_eq!(prompts, 1);
+    assert_eq!(
+        requests,
+        [base, "cps://extras/apps/editor", "cps://extras/apps/editor"]
+    );
+    apply(&main.root, &install(requests.into())?)?;
+    assert!(crate::remove_publisher(&main.root, "extras").is_err());
+    assert!(install(vec![format!("cps://canopa/{editor}")]).is_err());
+
+    extras.package_as(
+        "extras",
+        editor,
+        "3.0.0-0",
+        format!("    require {library:?}\n"),
+    )?;
+    sync_extras(2, Some(&main.root))?;
+    refresh("2.0.0-0")?;
+    let upgrade = plan(&main.root, Request::Update)?;
+    assert_eq!(upgrade.catalogs["seed"], pin.trim());
+    let staged = main._dir.path().join("upgrade");
+    crate::stage_boot_environment(&main.root, &staged, &upgrade)?;
+    assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "2.0.0-0");
+    let installed = list_packages(&staged, Scope::Installed)?;
+    assert!(
+        installed
+            .iter()
+            .any(|row| row.id == "cps://extras/apps/editor@3.0.0-0")
+    );
+    assert!(
+        installed
+            .iter()
+            .any(|row| row.id == "cps://seed/library/runtime@1.0.0-0")
+    );
+    for repo in [&main.repo, &companion.repo, &cache] {
+        fs::rename(repo, repo.with_extension("offline"))?;
+    }
+    assert!(verify(&staged)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Result<()> {
     let f = Fixture::new()?;
     f.package("library/legacy", "1.0.0-0", String::new())?;
@@ -3363,6 +3540,9 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     }
     let error = apply(&f.root, &fork).unwrap_err();
     assert!(format!("{error:#}").contains(reason), "{error:#}");
+    let extras = Fixture::new()?;
+    extras.package_as("extras", "apps/extra", "1.0.0-0", String::new())?;
+    crate::add_publisher(&f.root, "extras", &extras.repo, &extras.public)?;
     check_guarded_sync(&f, &seed, &plain, [&good_primary, &good_seed], reason)?;
 
     for (source, (_, replacement)) in [&f.repo, &seed.repo].into_iter().zip(&replacements) {

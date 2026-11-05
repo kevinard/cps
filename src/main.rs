@@ -942,10 +942,41 @@ fn print_packages(rows: impl IntoIterator<Item = PackageRow>) -> Result<()> {
     Ok(())
 }
 
+fn choose_install_source(package: &str, sources: &[cps::query::InstallSource]) -> Result<usize> {
+    eprintln!("Choose a publisher for {package}");
+    for (index, source) in sources.iter().enumerate() {
+        eprintln!("  {}. {} ({})", index + 1, source.publisher, source.version);
+    }
+    loop {
+        eprint!("Publisher [1] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        ensure!(
+            io::stdin().read_line(&mut answer)? != 0,
+            "publisher selection canceled"
+        );
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Ok(0);
+        }
+        if let Ok(number) = answer.parse::<usize>()
+            && (1..=sources.len()).contains(&number)
+        {
+            return Ok(number - 1);
+        }
+        eprintln!("Enter a number from 1 to {}.", sources.len());
+    }
+}
+
 fn change_system(options: SystemOptions, request: Request) -> Result<()> {
     let system = System::load(&options.config)?;
     let _lock = system.lock()?;
-    let change = system.plan(request, !options.no_refresh)?;
+    let refresh = !options.no_refresh;
+    let change = if !options.yes && !options.dry_run && io::stdin().is_terminal() {
+        system.plan_with_source_selection(request, refresh, choose_install_source)?
+    } else {
+        system.plan(request, refresh)?
+    };
     if change.is_empty() {
         println!("Nothing to do.");
         return Ok(());
