@@ -508,9 +508,29 @@ cmp first/attestation.json rebuild-inputs/attestation.json
 mkdir rebuild-sources
 printf 'hello from pinned input\n' > rebuild-sources/input
 "$cps" build --toolchain-config review-toolchain.kdl --sources rebuild-sources --output rebuilt \
-    --check-reproducible "$rebuild_recipe"
-diff -r first/proto rebuilt/proto
-echo 'Verified rebuilding from the signed release archive'
+    --check-reproducible --builder-signing-key other.der "$rebuild_recipe"
+verify_rebuild() {
+    "$cps" repo verify-rebuild --repo release --publisher canopa --trust-key public.der \
+        --catalog "$first_catalog" "$@" cps://canopa/demo/hello@1.0.0-0
+}
+verify_rebuild --bundle rebuilt --witness-key other-public.der
+verify_rebuild --bundle rebuilt
+expect_failure 'already signed the admitted build' verify_rebuild --bundle first --witness-key builder-public.der
+expect_failure 'publisher keys cannot serve as rebuild witnesses' verify_rebuild --bundle rebuilt --witness-key public.der
+expect_failure 'rebuilt payload digest differs at hello' verify_rebuild --bundle modified
+cp -a rebuilt wrong-witness
+cp mismatch/attestation.json wrong-witness/attestation.json
+expect_failure 'rebuild witness statement differs from the admitted build' verify_rebuild \
+    --bundle wrong-witness --witness-key other-public.der
+printf '\n' >> wrong-witness/build.kdl
+expect_failure 'rebuild recipe differs from the admitted build' verify_rebuild --bundle wrong-witness
+cp -a rebuilt extra-payload
+touch extra-payload/proto/unlisted
+expect_failure 'unexpected entry in rebuilt payload tree at unlisted' verify_rebuild --bundle extra-payload
+rm -- extra-payload/proto/unlisted extra-payload/proto/hello
+ln -s "$work/first/proto/hello" extra-payload/proto/hello
+expect_failure 'unexpected entry in rebuilt payload tree at hello' verify_rebuild --bundle extra-payload
+echo 'Verified a separately signed rebuild against the signed release archive'
 "$cps" repo attestation --repo release --publisher canopa --trust-key public.der \
     cps://canopa/demo/hello@1.0.0-0 > envelope.json
 python3 - <<'PYTHON'

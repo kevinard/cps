@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-18`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-19`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -370,6 +370,8 @@ recipe=$(cps repo rebuild-inputs --repo /var/lib/cps/canopa --publisher canopa \
 cps source fetch --cache source-cache "$recipe"
 cps build --toolchain-config toolchain.kdl --source-cache source-cache \
     --check-reproducible --output rebuilt "$recipe"
+cps repo verify-rebuild --repo /var/lib/cps/canopa --publisher canopa \
+    --trust-key canopa.der --bundle rebuilt cps://canopa/demo/hello@1.0.0-0
 ```
 
 `repo rebuild-inputs` verifies the signed catalog, archived bytes, and
@@ -383,7 +385,18 @@ those for withdrawn versions. The recipe pins the source archives and
 toolchain catalogs. Supply source archives without URLs through
 `cps source import` or `cps source fetch --from`, and configure local
 toolchain repositories with the pinned catalogs and provisioned trust keys.
-The attestation provides the published output hashes for comparison.
+`repo verify-rebuild` compares the exact recipe and reviewed manifest in
+the bundle, the reconstructed published manifest, and every payload's
+length and digest against the signed release. It rejects undeclared
+entries in the payload tree. It works offline with the catalog and its
+version 3 attestation, including for packages published before recipe
+archiving. It accepts the same `--catalog` pin as input extraction.
+
+To verify a signed rebuild, build with `--builder-signing-key` and pass that
+builder's provisioned public key to `repo verify-rebuild --witness-key`.
+CPS verifies the witness signature over the same statement, including the
+resolved toolchain and source pins. It checks that the key is distinct
+from the publisher and the builders who signed the admitted statement.
 
 ### Verifying builds on images and workers
 

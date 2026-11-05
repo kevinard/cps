@@ -50,7 +50,7 @@ pub use plan::{
 pub use repo::{
     BuildAudit, BuildWitness, export_rebuild_inputs, list_obsoletions, list_withdrawals, publish,
     publish_bundle, publish_release, publish_witnessed_bundle, read_attestation, release,
-    rotate_publisher_key, withdraw_package,
+    rotate_publisher_key, verify_rebuild, withdraw_package,
 };
 pub use verify::{Finding, verify, verify_pristine};
 

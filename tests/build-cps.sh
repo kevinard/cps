@@ -247,4 +247,8 @@ for library in libsqlite3.so.0 libseccomp.so.2 libc.so.6 libm.so.6 libgcc_s.so.1
     grep -F "$library => $PWD/image/usr/lib/$library (" <<< "$libraries"
 done
 "${loader[@]}" image/usr/bin/cps verify --root image --pristine
+if (( ${cps_version##*-} >= 19 )); then
+    "${loader[@]}" image/usr/bin/cps repo verify-rebuild --repo repo --publisher canopa \
+        --trust-key release-public.der --bundle bundle "$cps_package"
+fi
 printf 'Verified reproducible CPS build, signed provenance, and installation from Git %s\n' "$revision"

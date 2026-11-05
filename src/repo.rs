@@ -34,7 +34,7 @@ mod keys;
 mod profiles;
 mod rebuild;
 pub mod release;
-pub use rebuild::export_rebuild_inputs;
+pub use rebuild::{export_rebuild_inputs, verify_rebuild};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

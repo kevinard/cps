@@ -1604,7 +1604,14 @@ fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -
     let builder = Fixture::new()?;
     let work = f._dir.path();
     let id = "cps://canopa/test/rebuild@1.0.0-0";
-    let manifest = b"schema-version 1\n// Reviewed bytes and layout\npackage \"test/rebuild\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
+    let output = "usr/share/cps/reference";
+    let bytes = b"deterministic build output";
+    let manifest = br#"schema-version 1
+// Reviewed bytes and layout
+package "test/rebuild" publisher="canopa" version="1.0.0-0" {
+    file "usr/share/cps/reference" mode="0644" uid=0 gid=0
+}
+"#;
     let catalog = digest(b"legacy pinned toolchain");
     let recipe = format!(
         "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain \"{catalog}\" {{ package \"build/tool\"; }}\n    manifest \"build.kdl/nested/manifest.kdl\" sha256=\"{}\"\n    script \"true\"\n}}\n",
@@ -1612,7 +1619,8 @@ fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -
     );
     let reviewed = digest(recipe.as_bytes());
     let bundle = work.join("bundle");
-    fs::create_dir_all(bundle.join("proto"))?;
+    fs::create_dir_all(bundle.join("proto/usr/share/cps"))?;
+    fs::write(bundle.join("proto").join(output), bytes)?;
     fs::write(bundle.join("build.kdl"), &recipe)?;
     fs::write(bundle.join("manifest.kdl"), manifest)?;
     let envelope = attestation::sign(
@@ -1627,7 +1635,13 @@ fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -
             catalog_sha256: catalog,
             package_manifests: BTreeMap::from([("build/tool".into(), digest(b"tool"))]),
         }),
-        &BTreeMap::new(),
+        &BTreeMap::from([(
+            output.into(),
+            FileDigest {
+                sha256: digest(bytes),
+                size: bytes.len() as u64,
+            },
+        )]),
     )?;
     fs::write(bundle.join("attestation.json"), &envelope)?;
     fs::create_dir(&f.repo)?;
@@ -1649,12 +1663,16 @@ publisher "canopa" archive-build-inputs={archive} {{
     let extract = |repo: &Path, catalog, output: &Path| {
         crate::export_rebuild_inputs(repo, "canopa", &f.public, id, catalog, output)
     };
+    let compare = |repo: &Path, catalog| {
+        crate::verify_rebuild(repo, "canopa", &f.public, id, catalog, &bundle, None)
+    };
     policy("#false")?;
     publish()?;
     let no_archive = work.join("no-archive");
     let error = extract(&f.repo, None, &no_archive).unwrap_err();
     assert!(format!("{error:#}").contains("no archived rebuild inputs"));
     assert!(!no_archive.exists());
+    assert_eq!(compare(&f.repo, None)?, 1);
     policy("#true")?;
     publish()?;
     let archived = fs::read_to_string(f.repo.join("current"))?;
@@ -1735,6 +1753,10 @@ publisher "canopa" archive-build-inputs={archive} {{
     fs::rename(&current_only, work.join("offline-current-only"))?;
     check(&withdrawn_cache, None, &work.join("withdrawn"))?;
     check(&cache, Some(archived.trim()), &work.join("historical"))?;
+    fs::remove_file(bundle.join("attestation.json"))?;
+    assert_eq!(fs::read_dir(withdrawn_cache.join("blobs"))?.count(), 0);
+    assert_eq!(compare(&withdrawn_cache, None)?, 1);
+    assert_eq!(compare(&cache, Some(archived.trim()))?, 1);
     Ok(())
 }
 

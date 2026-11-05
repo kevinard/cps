@@ -1,21 +1,25 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
-use rustix::fs::{RenameFlags, renameat_with};
+use rustix::fs::{FileType, RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::{
-    attestation::{ATTESTATION_LIMIT, VerifiedBuild, check_rebuild_inputs},
-    kdl_format::{build, parse_manifest},
+    attestation::{ATTESTATION_LIMIT, VerifiedBuild, verify_rebuild_inputs},
+    image::root::Root,
+    kdl_format::build,
+    model::{FileDigest, digest_reader},
 };
 
 use super::{
-    Catalog, MANIFEST_LIMIT, exact_publisher, read_catalog, read_current, read_key, read_object,
-    store, write_atomic,
+    Catalog, MANIFEST_LIMIT, exact_publisher, read_catalog, read_current, read_key, read_limited,
+    read_object, store, write_atomic,
 };
 
 pub(super) const OBJECTS: &str = "build-inputs";
@@ -67,43 +71,16 @@ pub fn export_rebuild_inputs(
     pin: Option<&str>,
     output: &Path,
 ) -> Result<PathBuf> {
-    ensure!(
-        exact_publisher(id)? == publisher,
-        "package ID belongs to a different publisher"
-    );
-    let hash = match pin {
-        Some(hash) => hash.to_owned(),
-        None => read_current(repo)?,
-    };
-    let catalog = read_catalog(repo, &hash, publisher, &read_key(trust_key)?)?;
+    let catalog = selected_catalog(repo, publisher, &read_key(trust_key)?, id, pin)?;
     let inputs = catalog
         .build_inputs
         .get(id)
         .with_context(|| format!("no archived rebuild inputs for {id}"))?;
-    let (published, attestation) = catalog
-        .package_record(id)
-        .context("missing package record for rebuild inputs")?;
-    let envelope = read_object(
-        repo,
-        "attestations",
-        attestation.context("missing build attestation for rebuild inputs")?,
-        ATTESTATION_LIMIT,
-    )?;
+    let (published_hash, envelope) = admitted_build(repo, &catalog, id)?;
     let recipe = read_object(repo, OBJECTS, &inputs.recipe, build::RECIPE_LIMIT)?;
     let manifest = read_object(repo, OBJECTS, &inputs.manifest, MANIFEST_LIMIT)?;
-    let definition = build::parse(std::str::from_utf8(&recipe)?)?;
-    ensure!(
-        definition.manifest_digest == inputs.manifest
-            && parse_manifest(std::str::from_utf8(&manifest)?)?.id() == id,
-        "archived recipe and manifest do not match for {id}"
-    );
-    check_rebuild_inputs(
-        &envelope,
-        id,
-        &inputs.recipe,
-        &manifest,
-        published.manifest_digest(),
-    )?;
+    let definition =
+        verify_rebuild_inputs(&envelope, id, &recipe, &manifest, published_hash)?.recipe;
 
     let parent = output
         .parent()
@@ -147,4 +124,107 @@ pub fn export_rebuild_inputs(
     .context("publishing rebuild inputs directory")?;
     directory.sync_all()?;
     Ok(output.join("source").join(recipe_name))
+}
+
+/// Check a local rebuild against the version 3 attestation admitted by the signed catalog.
+/// Returns the number of verified payloads.
+pub fn verify_rebuild(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    id: &str,
+    pin: Option<&str>,
+    bundle: &Path,
+    witness_key: Option<&Path>,
+) -> Result<usize> {
+    let anchor = read_key(trust_key)?;
+    let catalog = selected_catalog(repo, publisher, &anchor, id, pin)?;
+    let (published_hash, envelope) = admitted_build(repo, &catalog, id)?;
+    let bundle = Root::open(bundle)?;
+    let recipe = read_limited(bundle.file("build.kdl")?, build::RECIPE_LIMIT)?;
+    let manifest = read_limited(bundle.file("manifest.kdl")?, MANIFEST_LIMIT)?;
+    let build = verify_rebuild_inputs(&envelope, id, &recipe, &manifest, published_hash)?;
+    if let Some(inputs) = catalog.build_inputs.get(id) {
+        ensure!(
+            inputs.recipe == crate::model::digest(&recipe)
+                && inputs.manifest == build.recipe.manifest_digest,
+            "rebuild inputs differ from the signed archive for {id}"
+        );
+    }
+    if let Some(witness_key) = witness_key {
+        let key = read_key(witness_key)?;
+        ensure!(
+            !catalog
+                .publisher_keys(&anchor)?
+                .iter()
+                .any(|publisher| publisher.as_slice() == key),
+            "publisher keys cannot serve as rebuild witnesses"
+        );
+        let envelope = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
+        build.check_witness(&envelope, &key)?;
+    }
+    verify_artifacts(&bundle.subdir("proto")?, &build.artifacts)?;
+    Ok(build.artifacts.len())
+}
+
+fn selected_catalog(
+    repo: &Path,
+    publisher: &str,
+    anchor: &[u8],
+    id: &str,
+    pin: Option<&str>,
+) -> Result<Catalog> {
+    ensure!(
+        exact_publisher(id)? == publisher,
+        "package ID belongs to a different publisher"
+    );
+    let hash = match pin {
+        Some(hash) => hash.to_owned(),
+        None => read_current(repo)?,
+    };
+    read_catalog(repo, &hash, publisher, anchor)
+}
+
+fn admitted_build<'a>(repo: &Path, catalog: &'a Catalog, id: &str) -> Result<(&'a str, Vec<u8>)> {
+    let (published, attestation) = catalog
+        .package_record(id)
+        .with_context(|| format!("no published package {id}"))?;
+    let attestation = attestation.with_context(|| format!("no build attestation for {id}"))?;
+    let envelope = read_object(repo, "attestations", attestation, ATTESTATION_LIMIT)?;
+    Ok((published.manifest_digest(), envelope))
+}
+
+fn verify_artifacts(proto: &Root, artifacts: &BTreeMap<String, FileDigest>) -> Result<()> {
+    let directories: BTreeSet<_> = artifacts
+        .keys()
+        .flat_map(|path| Path::new(path).ancestors().skip(1))
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    proto.walk(None, |path, _, info| {
+        let declared = match FileType::from_raw_mode(info.st_mode) {
+            FileType::Directory => directories.contains(Path::new(path)),
+            FileType::RegularFile => artifacts.contains_key(path),
+            _ => false,
+        };
+        ensure!(
+            declared,
+            "unexpected entry in rebuilt payload tree at {path}"
+        );
+        Ok(true)
+    })?;
+    for (path, expected) in artifacts {
+        let mut file = proto
+            .file(path)
+            .with_context(|| format!("opening rebuilt payload {path}"))?;
+        ensure!(
+            file.metadata()?.len() == expected.size,
+            "rebuilt payload length differs at {path}"
+        );
+        let sha256 = digest_reader(file.by_ref().take(expected.size.saturating_add(1)))?;
+        ensure!(
+            sha256 == expected.sha256 && file.metadata()?.len() == expected.size,
+            "rebuilt payload digest differs at {path}"
+        );
+    }
+    Ok(())
 }

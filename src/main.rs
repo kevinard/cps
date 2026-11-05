@@ -26,7 +26,7 @@ use cps::{
     rollback_boot_environment, rollback_boot_environment_on_disk, rotate_publisher_key,
     set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
     transaction_details, transaction_history, transaction_status, verify, verify_pristine,
-    withdraw_package,
+    verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -379,6 +379,24 @@ enum RepoCommand {
         /// New directory for the authenticated inputs
         #[arg(long)]
         output: PathBuf,
+        package_id: String,
+    },
+    /// Compare a local build bundle with the attestation admitted by a signed catalog
+    VerifyRebuild {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+        /// Select a historical signed catalog by SHA-256
+        #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Verify the bundle's matching statement under a separate builder key
+        #[arg(long)]
+        witness_key: Option<PathBuf>,
         package_id: String,
     },
     /// Withdraw an exact published version from future package selections
@@ -944,6 +962,29 @@ fn run(command: Command) -> Result<ExitCode> {
                     &output,
                 )?;
                 println!("{}", recipe.display());
+            }
+            RepoCommand::VerifyRebuild {
+                repo,
+                publisher,
+                trust_key,
+                catalog,
+                bundle,
+                witness_key,
+                package_id,
+            } => {
+                let count = verify_rebuild(
+                    &repo,
+                    &publisher,
+                    &trust_key,
+                    &package_id,
+                    catalog.as_deref(),
+                    &bundle,
+                    witness_key.as_deref(),
+                )?;
+                println!("Verified {count} rebuilt payload(s) for {package_id}");
+                if witness_key.is_some() {
+                    println!("Verified a matching statement from a separate rebuild signer");
+                }
             }
             RepoCommand::Withdraw {
                 repo,
