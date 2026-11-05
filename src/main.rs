@@ -511,6 +511,9 @@ enum RepoCommand {
         /// Cache the catalogs, manifests, and build evidence without downloading payloads
         #[arg(long)]
         index_only: bool,
+        /// Fetch the signed profile's selected payloads before promoting it
+        #[arg(long, conflicts_with = "index_only")]
+        profile_payloads: bool,
     },
     /// Preview or remove unused payload files from a TUF mirror cache
     PruneCache {
@@ -1167,12 +1170,18 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::SyncProfile {
                 config,
                 index_only,
+                profile_payloads,
                 image,
             } => {
-                let synchronized = match image {
-                    Some(image) => release::sync_profile_for_image(&config, index_only, &image)?,
-                    None => release::sync_profile(&config, index_only)?,
+                let payloads = if profile_payloads {
+                    release::ProfilePayloads::Composition
+                } else if index_only {
+                    release::ProfilePayloads::IndexOnly
+                } else {
+                    release::ProfilePayloads::All
                 };
+                let synchronized =
+                    release::sync_profile_with_payloads(&config, payloads, image.as_deref())?;
                 println!("Synchronized {}", synchronized);
             }
             RepoCommand::PruneCache {

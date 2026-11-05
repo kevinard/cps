@@ -1984,7 +1984,7 @@ fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -
     f.package(
         "desktop/compositor",
         "1.0.0-0",
-        "    require \"library/runtime\"\n".to_owned(),
+        f.file(COMPOSITOR, "compositor", "0755", "")? + "    require \"library/runtime\"\n",
     )?;
     f.package("test/retire", "1.0.0-0", String::new())?;
     fs::write(
@@ -1995,6 +1995,7 @@ publisher "canopa" {{
     builder-key "builder.der"
     profile "desktop" architecture="x86_64" {{
         package "desktop/compositor"
+        facet "devel" #false
         publisher "seed" catalog={:?} {{
             repository {:?}
             trust-key {:?}
@@ -2028,6 +2029,7 @@ publisher "canopa" {{
                 r#"schema-version 1
 architecture "x86_64"
 release-profile "desktop"
+facet "devel" #false
 publisher "canopa" {{
     repository {:?}
     trust-key {:?}
@@ -2120,7 +2122,19 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         "seed",
         "library/runtime",
         "3.0.0-0",
-        seed.file(payload, "latest", "0644", "")?,
+        seed.file(payload, "latest", "0644", "")?
+            + &seed.file(
+                "usr/include/runtime.h",
+                "disabled header",
+                "0644",
+                "facet=\"devel\"",
+            )?,
+    )?;
+    seed.package_as(
+        "seed",
+        "library/unrelated",
+        "1.0.0-0",
+        seed.file("usr/lib/unrelated.marker", "unrelated package", "0644", "")?,
     )?;
     let latest = fs::read_to_string(seed.repo.join("current"))?;
     let policy = f.repo.join("publish-policy.kdl");
@@ -2224,13 +2238,41 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(plan(&f.root, Request::InstallProfile)?, saved);
     fs::write(&config, correct_config)?;
 
+    let prefetch = |config: &Path| {
+        mirror_release::sync_profile_with_payloads(
+            config,
+            mirror_release::ProfilePayloads::Composition,
+            None,
+        )
+    };
+    let latest_blob = digest(b"latest");
+    let latest_target = next_seed_mirror
+        .join("targets")
+        .join(format!("{latest_blob}.blobs-{latest_blob}"));
+    let saved_target = work.join("latest-target");
+    fs::rename(&latest_target, &saved_target)?;
+    let error = prefetch(&config).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("reading target blobs/{latest_blob}")),
+        "{error:#}"
+    );
+    assert_eq!(fs::read_to_string(primary_cache.join("current"))?, first);
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, current);
+    fs::write(&latest_target, b"broken")?;
+    let error = prefetch(&config).unwrap_err();
+    assert!(format!("{error:#}").contains("Hash mismatch"), "{error:#}");
+    assert!(!seed_cache.join("blobs").join(&latest_blob).exists());
+    assert_eq!(fs::read_to_string(primary_cache.join("current"))?, first);
+    assert_eq!(fs::read_to_string(seed_cache.join("current"))?, current);
+    fs::rename(&saved_target, &latest_target)?;
+
     // The companion can promote before a write failure leaves the previous
     // primary visible. Pruning must protect the old pin through this window.
     let endpoints = primary_cache.join(".tuf/endpoints");
     let saved_endpoints = work.join("previous-endpoints");
     fs::rename(&endpoints, &saved_endpoints)?;
     fs::create_dir(&endpoints)?;
-    let error = mirror_release::sync_profile(&config, true).unwrap_err();
+    let error = prefetch(&config).unwrap_err();
     assert_eq!(
         error
             .downcast_ref::<tempfile::PersistError>()
@@ -2245,7 +2287,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(plan(&f.root, Request::InstallProfile)?, saved);
     fs::remove_dir(&endpoints)?;
     fs::rename(&saved_endpoints, &endpoints)?;
-    assert_eq!(mirror_release::sync_profile(&config, true)?, second);
+    assert_eq!(prefetch(&config)?, second);
     assert_eq!(
         fs::read_to_string(primary_cache.join("current"))?.trim(),
         second
@@ -2255,7 +2297,13 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     create_configured_image(&fresh_root, &config)?;
     let new_plan = plan(&fresh_root, Request::InstallProfile)?;
     assert_eq!(new_plan.catalogs["seed"], latest.trim());
-    fetch_plan(&fresh_root, &new_plan)?;
+    assert_eq!(
+        fs::read(seed_cache.join("blobs").join(&latest_blob))?,
+        b"latest"
+    );
+    for bytes in [b"new".as_slice(), b"disabled header", b"unrelated package"] {
+        assert!(!seed_cache.join("blobs").join(digest(bytes)).exists());
+    }
 
     let bootstrap_config = work.join("bootstrap.kdl");
     fs::write(
@@ -2390,7 +2438,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         assert!(!cold_seed.join("current").exists());
     }
     configure_cold(&archive_primary, &archive_seed)?;
-    assert_eq!(mirror_release::sync_profile(&cold_config, true)?, second);
+    assert_eq!(prefetch(&cold_config)?, second);
     assert_eq!(
         fs::read_to_string(cold_primary.join("current"))?.trim(),
         second
@@ -2400,8 +2448,15 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     create_configured_image(&cold_root, &cold_config)?;
     let cold_plan = plan(&cold_root, Request::InstallProfile)?;
     assert_eq!(cold_plan.catalogs, saved.catalogs);
-    assert!(!cold_seed.join(&blob).exists());
-    fetch_plan(&cold_root, &cold_plan)?;
+    assert_eq!(fs::read(cold_seed.join(&blob))?, b"old");
+    assert_eq!(
+        fs::read(cold_seed.join("blobs").join(&latest_blob))?,
+        b"latest"
+    );
+    assert_eq!(
+        fs::read(cold_primary.join("blobs").join(digest(b"compositor")))?,
+        b"compositor"
+    );
     let unretained_archive = work.join("unretained-archive");
     sign_publisher_release(
         &seed,

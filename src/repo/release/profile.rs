@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     kdl_format::{PublisherConfig, read_image_definition},
-    model::PackageSpec,
+    model::{Node, PackageSpec},
     plan::{CandidateSet, claim_source},
     repo::{
         CatalogPin, ReleaseProfile, profiles::profile_paths, read_catalog, read_current,
@@ -23,18 +23,41 @@ use super::{
 
 /// Materialize a signed profile's catalog set before advancing its primary pointer.
 pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
-    synchronize_profile(config, index_only, None)
+    sync_profile_with_payloads(config, ProfilePayloads::from_index_only(index_only), None)
 }
 
 pub fn sync_profile_for_image(config: &Path, index_only: bool, root: &Path) -> Result<String> {
-    synchronize_profile(config, index_only, Some(ImageGuard::open(root)?))
+    sync_profile_with_payloads(
+        config,
+        ProfilePayloads::from_index_only(index_only),
+        Some(root),
+    )
 }
 
-fn synchronize_profile(
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum ProfilePayloads {
+    All,
+    IndexOnly,
+    Composition,
+}
+
+impl ProfilePayloads {
+    fn from_index_only(index_only: bool) -> Self {
+        if index_only {
+            Self::IndexOnly
+        } else {
+            Self::All
+        }
+    }
+}
+
+/// Verify and cache a signed profile with the requested payload coverage.
+pub fn sync_profile_with_payloads(
     config: &Path,
-    index_only: bool,
-    guard: Option<ImageGuard>,
+    payloads: ProfilePayloads,
+    image: Option<&Path>,
 ) -> Result<String> {
+    let guard = image.map(ImageGuard::open).transpose()?;
     let definition = read_image_definition(config)?;
     let name = definition
         .release_profile
@@ -114,12 +137,13 @@ fn synchronize_profile(
     let (primary_repo, companion_repos) = repositories
         .split_first()
         .context("missing primary cache")?;
-    let full = !index_only;
+    let full = payloads == ProfilePayloads::All;
+    let prefetch = payloads == ProfilePayloads::Composition;
     let bootstrap_pin = definition
         .bootstrap_catalog
         .as_ref()
         .map(|hash| CatalogPin::primary(primary.publisher.to_owned(), hash.clone()));
-    let primary_release = stage_release(
+    let (primary_release, primary_mirror) = stage_release(
         primary_repo,
         primary,
         full,
@@ -131,6 +155,10 @@ fn synchronize_profile(
         },
     )
     .with_context(|| format!("staging primary publisher {}", primary.publisher))?;
+    let mut mirrors = Vec::new();
+    if prefetch {
+        mirrors.push(primary_mirror);
+    }
     let current_pin = CatalogPin::primary(
         primary.publisher.to_owned(),
         primary_release.current.clone(),
@@ -157,6 +185,10 @@ fn synchronize_profile(
                 || !profile.composition.is_empty(),
             "bootstrap catalog has no recorded signed composition for profile {name}"
         );
+        ensure!(
+            !prefetch || !profile.composition.is_empty(),
+            "--profile-payloads requires a recorded signed composition for profile {name}"
+        );
         profiles.push((pin, profile));
     }
     let mut staged = Vec::with_capacity(companions.len());
@@ -165,7 +197,7 @@ fn synchronize_profile(
             .iter()
             .map(|(_, profile)| &profile.companions[index])
             .collect::<Vec<_>>();
-        let release = stage_release(
+        let (release, mirror) = stage_release(
             repo,
             source,
             full,
@@ -182,6 +214,9 @@ fn synchronize_profile(
                 source.publisher
             )
         })?;
+        if prefetch {
+            mirrors.push(mirror);
+        }
         if let Some(guard) = &guard {
             // The first profile is the staged primary's current profile. A
             // separately retained bootstrap profile may deliberately be older.
@@ -193,6 +228,7 @@ fn synchronize_profile(
         }
         staged.push((source, repo, release));
     }
+    let mut selected_blobs = BTreeMap::new();
     for (pin, profile) in profiles
         .iter()
         .filter(|(_, profile)| !profile.composition.is_empty())
@@ -203,6 +239,7 @@ fn synchronize_profile(
             &definition.publishers,
             &sources,
             &repositories,
+            prefetch.then_some(&mut selected_blobs),
         )
         .with_context(|| {
             format!(
@@ -211,6 +248,17 @@ fn synchronize_profile(
             )
         })?;
     }
+    for ((source, repo), mirror) in sources.iter().zip(&repositories).zip(mirrors) {
+        if let Some(blobs) = selected_blobs.remove(source.publisher) {
+            mirror
+                .fetch_payloads(repo, &blobs)
+                .with_context(|| format!("fetching profile payloads for {}", source.publisher))?;
+        }
+    }
+    ensure!(
+        selected_blobs.is_empty(),
+        "profile payloads have no configured publisher"
+    );
     let previous_hash = read_current(primary_repo).ok();
     // The old catalog may be damaged while the replay checkpoint already
     // names a newer one. Reuse its recorded pins when repairing that cache.
@@ -261,6 +309,7 @@ fn check_composition(
     config: &[PublisherConfig],
     sources: &[SyncSource<'_>],
     repositories: &[PathBuf],
+    payloads: Option<&mut BTreeMap<String, BTreeMap<String, u64>>>,
 ) -> Result<()> {
     let mut candidates = CandidateSet::default();
     let mut origins = BTreeMap::new();
@@ -297,6 +346,28 @@ fn check_composition(
         }
     }
     let installed = candidates.replay(profile)?;
-    profile_paths(&profile.architecture, &profile.facets, &installed)?;
+    let paths = profile_paths(&profile.architecture, &profile.facets, &installed)?;
+    if let Some(payloads) = payloads {
+        for managed in paths.into_values() {
+            let Node::File { sha256, size, .. } = managed.node else {
+                continue;
+            };
+            let name = managed
+                .owners
+                .first()
+                .context("profile file has no owner")?;
+            let publisher = &installed[name].published.manifest.publisher;
+            let length = payloads
+                .entry(publisher.clone())
+                .or_default()
+                .entry(sha256)
+                .or_insert(size);
+            ensure!(
+                *length == size,
+                "conflicting profile payload lengths for {}",
+                installed[name].published.manifest.id()
+            );
+        }
+    }
     Ok(())
 }

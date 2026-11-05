@@ -129,7 +129,9 @@ fn endpoint(value: &str) -> Result<Url> {
 mod cache;
 mod profile;
 pub use cache::{CacheRetention, PruneReport, prune_payloads};
-pub use profile::{sync_profile, sync_profile_for_image};
+pub use profile::{
+    ProfilePayloads, sync_profile, sync_profile_for_image, sync_profile_with_payloads,
+};
 
 #[derive(Clone)]
 struct Mirror {
@@ -321,7 +323,7 @@ pub fn sync_with_required_catalogs(
         guard.check_source(&source)?;
     }
     let _lock = lock_repo(repo)?;
-    let release = stage_release(
+    let (release, _) = stage_release(
         repo,
         &source,
         !options.index_only,
@@ -444,6 +446,22 @@ impl ImageGuard {
 struct StagedRelease {
     current: String,
     retained: Vec<String>,
+}
+
+struct StagedMirror {
+    verified: Repository,
+    _scratch: TempDir,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl StagedMirror {
+    fn fetch_payloads(&self, repo: &Path, blobs: &BTreeMap<String, u64>) -> Result<()> {
+        self.runtime.block_on(fetch_verified_payloads(
+            &self.verified,
+            repo,
+            blobs.iter().map(|(hash, length)| (hash.as_str(), *length)),
+        ))
+    }
 }
 
 struct SyncSource<'a> {
@@ -598,14 +616,14 @@ fn stage_release(
     source: &SyncSource<'_>,
     full: bool,
     selection: SyncSelection<'_>,
-) -> Result<StagedRelease> {
+) -> Result<(StagedRelease, StagedMirror)> {
     let state = repo.join(".tuf");
     let directory = initialize_cache(repo, source, &selection)?;
     let scratch = TempDir::new_in(&state)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
+    let (release, verified) = runtime.block_on(async {
         let verified = load_mirror(
             &state,
             &directory,
@@ -615,7 +633,7 @@ fn stage_release(
         )
         .await?;
         prepare_objects(repo)?;
-        match selection {
+        let release = match selection {
             SyncSelection::Current {
                 required,
                 guard,
@@ -636,8 +654,17 @@ fn stage_release(
             SyncSelection::Archive(pin) => {
                 materialize_archive(repo, &verified, source, full, pin).await
             }
-        }
-    })
+        }?;
+        Ok::<_, anyhow::Error>((release, verified))
+    })?;
+    Ok((
+        release,
+        StagedMirror {
+            verified,
+            _scratch: scratch,
+            runtime,
+        },
+    ))
 }
 
 async fn load_mirror(
@@ -744,14 +771,20 @@ pub(crate) fn fetch_repository_payloads(
         .build()?;
     runtime.block_on(async {
         let verified = load_mirror(&state, &directory, scratch.path(), mirror, None).await?;
-        stream::iter(missing)
-            .map(|(hash, length)| {
-                fetch_object(&verified, repo, "blobs", hash, length, Some(length))
-            })
-            .buffer_unordered(PAYLOAD_DOWNLOADS)
-            .try_for_each(|()| async { Ok(()) })
-            .await
+        fetch_verified_payloads(&verified, repo, missing).await
     })
+}
+
+async fn fetch_verified_payloads<'a>(
+    verified: &Repository,
+    repo: &Path,
+    blobs: impl IntoIterator<Item = (&'a str, u64)>,
+) -> Result<()> {
+    stream::iter(blobs)
+        .map(|(hash, length)| fetch_object(verified, repo, "blobs", hash, length, Some(length)))
+        .buffer_unordered(PAYLOAD_DOWNLOADS)
+        .try_for_each(|()| async { Ok(()) })
+        .await
 }
 
 pub(super) fn fetch_source_archives(

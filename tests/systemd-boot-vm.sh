@@ -24,7 +24,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-24}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-25}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -106,7 +106,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-4]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-5]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -125,10 +125,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-4]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-5]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-4]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-5]) protected_profiles=true ;;
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
 fi
@@ -734,8 +734,32 @@ if $profiled; then
     refresh_vm_profile
     if [[ $tuf_mirrors == 1 ]]; then
         publish_vm_mirror vm-profile profile-repo profile-public.der 2 --retain-catalog "$(cat base-catalog)"
-        "$cps" repo sync-profile --config image.kdl --index-only --image base
+        trial_payload=$(sha256sum proto/etc/cps-vm-state | cut -d' ' -f1)
+        cached_payload="mirror-cache/$fixture_publisher/blobs/$trial_payload"
+        target="mirrors/$fixture_publisher/targets/$trial_payload.blobs-$trial_payload"
+        test ! -e "$cached_payload"
+        prefetch=(repo sync-profile --config image.kdl --profile-payloads --image base)
+        mv -- "$target" unavailable-target
+        if "$cps" "${prefetch[@]}" > missing-target.log 2>&1; then
+            echo 'Profile sync promoted a release with a missing payload' >&2
+            exit 1
+        fi
+        grep -F "reading target blobs/$trial_payload" missing-target.log || { cat missing-target.log >&2; exit 1; }
+        cmp base-catalog "$primary_pointer"
+        cp -- unavailable-target "$target"
+        printf 'x' | dd of="$target" bs=1 conv=notrunc status=none
+        if "$cps" "${prefetch[@]}" > corrupt-target.log 2>&1; then
+            echo 'Profile sync promoted a release with a corrupted payload' >&2
+            exit 1
+        fi
+        grep -F 'Hash mismatch' corrupt-target.log || { cat corrupt-target.log >&2; exit 1; }
+        cmp base-catalog "$primary_pointer"
+        test ! -e "$cached_payload"
+        mv -- unavailable-target "$target"
+        "$cps" "${prefetch[@]}"
         cmp profile-repo/current "$primary_pointer"
+        cmp proto/etc/cps-vm-state "$cached_payload"
+        echo 'Verified profile promotion waited for the selected payloads'
         timestamp=mirrors/vm-profile/metadata/timestamp.json
         mv -- "$timestamp" trial-tuf-timestamp.json
         cp -- base-tuf-timestamp.json "$timestamp"
@@ -771,39 +795,23 @@ if [[ $mode == facet-change ]]; then request=(change-facet doc.man=default optio
 "$cps" plan --root base --output update.json "${request[@]}" | tee update.log
 cp -a esp esp-before
 if [[ $tuf_mirrors == 1 ]]; then
-    trial_payload=$(sha256sum proto/etc/cps-vm-state | cut -d' ' -f1)
-    test ! -e "mirror-cache/$fixture_publisher/blobs/$trial_payload"
+    mv -- "$cached_payload" saved-payload
     if "$cps" boot-env stage --source base --root unfetched update.json > unfetched.log 2>&1; then
         echo 'Staging accepted an unfetched upgrade' >&2
         exit 1
     fi
-    grep -F 'opening repository payload' unfetched.log || { cat unfetched.log >&2; exit 1; }
+    grep -F "opening repository payload $trial_payload" unfetched.log || { cat unfetched.log >&2; exit 1; }
     test ! -e unfetched
-    target="mirrors/$fixture_publisher/targets/$trial_payload.blobs-$trial_payload"
-    mv -- "$target" unavailable-target
-    if "$cps" fetch --root base --plan update.json > missing-target.log 2>&1; then
-        echo 'Fetch accepted a missing mirror payload' >&2
-        exit 1
-    fi
-    grep -F "$trial_payload" missing-target.log || { cat missing-target.log >&2; exit 1; }
-    test ! -e "mirror-cache/$fixture_publisher/blobs/$trial_payload"
-    cp -- unavailable-target "$target"
-    printf 'x' | dd of="$target" bs=1 conv=notrunc status=none
-    if "$cps" fetch --root base --plan update.json > corrupt-target.log 2>&1; then
-        echo 'Fetch accepted a corrupted mirror payload' >&2
-        exit 1
-    fi
-    grep -F 'Hash mismatch' corrupt-target.log || { cat corrupt-target.log >&2; exit 1; }
-    test ! -e "mirror-cache/$fixture_publisher/blobs/$trial_payload"
-    mv -- unavailable-target "$target"
-    "$cps" fetch --root base --plan update.json
+    mv -- saved-payload "$cached_payload"
     mv -- mirrors offline-mirrors
     diff -r esp-before esp
-    echo 'Verified an incomplete mirror could be retried before staging the upgrade offline'
 fi
 trial=$("$cps" boot-env stage --source base --root staged update.json)
 trial_id=${trial#Staged }
 trial_id=${trial_id%% at *}
+if [[ $tuf_mirrors == 1 ]]; then
+    echo 'Verified staging worked offline with the prefetched profile payloads'
+fi
 diff -r esp-before esp
 test "$(cat base/etc/cps-vm-state)" = previous
 if [[ $mode == facet-change ]]; then

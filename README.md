@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-24`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-25`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -861,6 +861,21 @@ order, dependencies, selected paths, kernel actions, and builder trust from
 the signed profile and supplied KDL. These checks also run in index-only
 mode. Older profiles without a recorded composition can still synchronize
 their catalog pins.
+
+Use `--profile-payloads` to fetch the effective files selected by the signed
+composition before the profile becomes current. It includes a configured
+bootstrap composition and leaves payloads for unrelated packages and
+disabled facets for on-demand fetch.
+
+```sh
+cps repo sync-profile --config image.kdl --profile-payloads --image image
+```
+
+CPS verifies these downloads against the same TUF snapshots used to stage
+the catalogs. If any required download fails, the primary pointer stays on
+the previous release. The flag requires a recorded signed composition.
+Plans that change packages outside that composition can still need
+`cps fetch`.
 
 If a companion mirror is behind or the staged composition fails validation,
 clients can still select the previous primary catalog and its cached
@@ -1639,10 +1654,11 @@ fixtures, set `CPS_VM_TUF_MIRRORS=1` for the rollback scenario. The test signs
 separate local TUF mirrors with throwaway keys, syncs the base profile
 index-only, and fetches its planned payloads. It advances a companion while
 the primary still pins the previous catalog, and checks that pruning keeps
-the previous kernel after its mirror drops the pin. It then checks rejection of a
-replayed TUF timestamp and missing or corrupt upgrade payloads. After fetching
-the restored payload, it takes the mirrors offline, stages the upgrade, and
-boots through blessing and rollback. This scenario runs without slot reuse.
+the previous kernel after its mirror drops the pin. It checks rejection of a
+replayed TUF timestamp and verifies that missing or corrupt payloads block
+promotion with `--profile-payloads`. After a successful retry, it takes the
+mirrors offline, stages the upgrade, and boots through blessing and rollback.
+This scenario runs without slot reuse.
 
 With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to bootstrap
 the base and activate the trial from a rescue VM with a writable virtio disk.
