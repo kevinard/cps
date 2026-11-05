@@ -4,6 +4,7 @@ mod esp;
 mod export;
 pub(crate) mod kernel;
 mod systemd_boot;
+mod tree;
 
 use std::{
     env::{self, VarError},

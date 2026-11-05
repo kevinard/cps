@@ -59,6 +59,7 @@ sleep 1
 repro_export "0$epoch" repro-second.ext4 > repro-second.kdl
 cmp repro-first.ext4 repro-second.ext4
 cmp repro-first.kdl repro-second.kdl
+grep -E ' tree-sha256="[0-9a-f]{64}"$' repro-first.kdl
 TZ=UTC dumpe2fs -h repro-first.ext4 2>/dev/null | grep -E 'Filesystem created: +Wed Jan  1 00:00:00 2025$'
 debugfs -R 'ea_list /' repro-first.ext4 2>/dev/null | grep -F 'user.cps-root (9) = "root-data"'
 debugfs -R 'ea_list /local-state' repro-first.ext4 2>/dev/null | grep -F 'user.cps (8) = "exported"'

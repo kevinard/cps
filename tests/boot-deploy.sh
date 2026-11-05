@@ -116,6 +116,11 @@ publish test repo 1.0.0-0
 mkdir -p base/boot
 printf 'test kernel\n' > base/boot/vmlinuz
 printf 'test initramfs\n' > base/boot/initrd
+printf 'local configuration\n' > base/etc/local.conf
+chmod 0644 base/etc/local.conf
+ln base/etc/local.conf base/etc/local-alias
+ln -s local.conf base/etc/local-link
+setfattr -n user.cps -v local base/etc/local.conf
 
 export_with_receipt() {
     "$cps" boot-env export --root "$1" --output "$1.ext4" --size-mib 16 --receipt > "$1.kdl"
@@ -162,6 +167,9 @@ reject_activation 'image state differs from the root export receipt' \
 sed 's/ bytes=/ revision=1 bytes=/' base.kdl > duplicate.kdl
 reject_activation 'duplicate root-export property revision' \
     base base.raw "$base" duplicate.kdl --known-good
+sed -E 's/tree-sha256="[0-9a-f]+"/tree-sha256="broken"/' base.kdl > malformed-tree.kdl
+reject_activation 'invalid SHA-256 digest "broken"' \
+    base base.raw "$base" malformed-tree.kdl --known-good
 truncate -s 4097 oversized.kdl
 reject_activation 'root export receipt is too large' \
     base base.raw "$base" oversized.kdl --known-good
@@ -176,9 +184,10 @@ grep -Fx "# cps-initrd-sha256 ${initrd_hash%% *}" "esp/loader/entries/$base_id.c
 
 cp -a esp legacy-esp
 sed -i '/^# cps-.*-sha256 /d' "legacy-esp/loader/entries/$base_id.conf"
+sed -E 's/ tree-sha256="[0-9a-f]+"$//' base.kdl > legacy.kdl
 cp -a legacy-esp legacy-before
 "$cps" boot-env activate --root base --esp legacy-esp --root-partuuid "$base" \
-    --disk base.raw --receipt base.kdl --known-good --initrd boot/initrd
+    --disk base.raw --receipt legacy.kdl --known-good --initrd boot/initrd
 diff -r legacy-before legacy-esp
 
 "$cps" boot-env stage --source base --root staged update.json
@@ -187,6 +196,25 @@ deploy base.raw staged.ext4 "$trial" staged.raw
 deploy template.raw staged.ext4 "$trial" without-base.raw
 deploy different-revision.raw staged.ext4 "$trial" wrong-base-revision.raw
 cp -a esp esp-before
+for change in kernel config mode hardlink symlink xattr root-xattr; do
+    cp -a staged "changed-$change"
+    changed="changed-$change"
+    case "$change" in
+        kernel) printf 'replaced kernel\n' > "$changed/boot/vmlinuz" ;;
+        config) printf 'edited configuration\n' > "$changed/etc/local.conf" ;;
+        mode) chmod 0600 "$changed/etc/local.conf" ;;
+        hardlink)
+            rm -- "$changed/etc/local-alias"
+            cp -a -- "$changed/etc/local.conf" "$changed/etc/local-alias"
+            ;;
+        symlink) ln -sfn local-alias "$changed/etc/local-link" ;;
+        xattr) setfattr -n user.cps -v changed "$changed/etc/local.conf" ;;
+        root-xattr) setfattr -n user.cps -v changed "$changed" ;;
+    esac
+    cmp staged/.cps/state.sqlite "$changed/.cps/state.sqlite"
+    reject_activation 'root tree differs from the root export receipt' "$changed" staged.raw "$trial" staged.kdl
+    diff -r esp-before esp
+done
 reject_activation 'checking the known-good fallback partition' \
     staged without-base.raw "$trial" staged.kdl
 reject_activation 'at revision 1' \
@@ -211,7 +239,9 @@ reject_activation 'duplicate fallback kernel path' staged staged.raw "$trial" st
 cp -- "esp-before/$base_entry" "esp/$base_entry"
 diff -r esp-before esp
 
-trial_id=$(activate_checked staged staged.raw "$trial" staged.kdl)
+cp -a staged staged-copy
+touch -d @1 staged-copy/etc/local.conf
+trial_id=$(activate_checked staged-copy staged.raw "$trial" staged.kdl)
 trial_id=${trial_id#Activated }
 test -f "esp/loader/entries/$trial_id+2.conf"
 activate_checked staged staged.raw "$trial" staged.kdl --tries 9

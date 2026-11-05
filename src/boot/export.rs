@@ -13,7 +13,7 @@ use rustix::{
 
 use super::{
     artifact_helper, check_image_integrity, entry_id, kernel, root_label, source_date_epoch,
-    systemd_boot::canonical_partuuid,
+    systemd_boot::canonical_partuuid, tree,
 };
 use crate::{
     image::{Image, root::Root},
@@ -126,6 +126,10 @@ fn export(
         );
         Ok(true)
     })?;
+    let tree_sha256 = emit_receipt
+        .then(|| tree::digest(&image.root))
+        .transpose()
+        .context("fingerprinting the root before export")?;
 
     let temp = tempfile::Builder::new()
         .prefix(".cps-export-")
@@ -193,12 +197,17 @@ fn export(
         );
     }
     checked.sync_all()?;
-    let receipt = if emit_receipt {
+    let receipt = if let Some(tree_sha256) = tree_sha256 {
+        ensure!(
+            tree::digest(&image.root)? == tree_sha256,
+            "root tree changed during export"
+        );
         Some(
             ExportReceipt {
                 image: uuid.clone(),
                 revision: state.settings.revision,
                 state_sha256: digest_reader(image.root.file(".cps/state.sqlite")?)?,
+                tree_sha256: Some(tree_sha256),
                 bytes,
                 sha256: digest_reader(checked)?,
             }

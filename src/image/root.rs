@@ -123,7 +123,7 @@ impl Root {
         &self.0
     }
 
-    /// Visit each entry without following symlinks or crossing a mount.
+    /// Visit entries in sorted depth-first order without following symlinks or crossing a mount.
     /// Returning false from the visitor prunes the entry's descendants.
     pub(crate) fn walk(
         &self,

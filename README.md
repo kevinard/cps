@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-29`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-30`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1455,6 +1455,13 @@ settings. CPS publishes the directory only after formatting and verifying
 the image and writing its receipt. A formatting or verification failure
 leaves the requested output path available for retry. An abrupt interruption
 can leave a private `.cps-prepare-*` directory in the output parent.
+
+New export receipts include a SHA-256 fingerprint of the source tree. CPS
+checks the tree before and after formatting and checks it again during
+activation. The fingerprint covers paths, file contents, modes, owners,
+symbolic links, hard links within the root, and extended attributes. It is
+independent of inode numbers and timestamps. Older receipts still verify
+the package database and exported partition bytes.
 
 Use separate `stage` and `export` commands when you need to edit the staged
 root or resolve configuration updates before exporting it.

@@ -14,7 +14,7 @@ use super::{
     check_image_integrity,
     deploy::{OfflineDisk, offline_file},
     device::{is_fat, mounted_esp_disk},
-    entry_id, kernel,
+    entry_id, kernel, tree,
 };
 use crate::{
     image::{Image, root::Root},
@@ -288,6 +288,13 @@ pub(super) fn activate(
             receipt.state_sha256 == digest_reader(image.root.file(".cps/state.sqlite")?)?,
             "image state differs from the root export receipt"
         );
+        if let Some(expected) = &receipt.tree_sha256 {
+            ensure!(
+                tree::digest(&image.root).context("fingerprinting the root for activation")?
+                    == *expected,
+                "root tree differs from the root export receipt"
+            );
+        }
         if deployment.root.is_none() {
             if let Some(target) = deployment.target {
                 target.verify(&partuuid, &receipt)?;
