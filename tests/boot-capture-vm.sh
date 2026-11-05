@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture a running Btrfs CPS root and boot its staged upgrade on ext4.
+# Capture a running Btrfs root and boot the staged subvolume and ext4 export.
 set -euo pipefail
 umask 022
 
@@ -102,13 +102,38 @@ reject 'destination already exists' --source / --output /captures/base
 printf 'running local state\n' > /etc/cps-capture-local
 test "$($bb cat /captures/base/root/etc/cps-capture-local)" = 'captured local state'
 cps verify --root /captures/base/root
-cps boot-env stage --source /captures/base/root --root /scratch/staged /captures/upgrade.json
-test "$($bb cat /scratch/staged/etc/cps-capture-version)" = 2.0.0-0
+btrfs subvolume snapshot /captures/base/root /captures/writable
+if cps boot-env stage-btrfs --source /captures/writable --output /captures/rejected /captures/upgrade.json > /tmp/rejected 2>&1; then exit 1; fi
+$bb grep -F 'requires a read-only baseline' /tmp/rejected
+btrfs subvolume delete /captures/writable
+blob=$(printf '2.0.0-0\n' | sha256sum)
+blob=${blob%% *}
+$bb mv "/repository/blobs/$blob" /tmp/payload
+if cps boot-env stage-btrfs --source /captures/base/root --output /captures/rejected /captures/upgrade.json > /tmp/rejected 2>&1; then exit 1; fi
+$bb grep -F 'opening repository payload' /tmp/rejected
+test ! -e /captures/rejected
+test -z "$(find /captures -maxdepth 1 -name '.cps-capture-*')"
+$bb mv /tmp/payload "/repository/blobs/$blob"
+cps boot-env stage-btrfs --source /captures/base/root --output /captures/trial /captures/upgrade.json > /tmp/first 2>&1 &
+first=$!
+cps boot-env stage-btrfs --source /captures/base/root --output /captures/trial /captures/upgrade.json > /tmp/second 2>&1 &
+second=$!
+successes=0
+if wait "$first"; then successes=$((successes + 1)); fi
+if wait "$second"; then successes=$((successes + 1)); fi
+test "$successes" = 1
+test -z "$(find /captures -maxdepth 1 -name '.cps-capture-*')"
+stage=/captures/trial/root
+btrfs property get "$stage" ro | $bb grep -Fx 'ro=false'
+test "$($bb stat -c %i "$stage")" = 256
+test "$($bb cat "$stage/etc/cps-capture-version")" = 2.0.0-0
+test "$($bb cat /captures/base/root/etc/cps-capture-version)" = 1.0.0-0
 test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0
 test "$(sha256sum /.cps/state.sqlite)" = "$before"
-cps boot-env export --root /scratch/staged --output /scratch/root.ext4 --size-mib 256 \
+cps verify --root "$stage"
+cps boot-env export --root "$stage" --output /scratch/root.ext4 --size-mib 256 \
     --receipt > /scratch/root.kdl
-test "$($bb cat /scratch/staged/etc/cps-capture-local)" = 'captured local state'
+test "$($bb cat "$stage/etc/cps-capture-local")" = 'captured local state'
 echo 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root'
 umount /scratch
 umount /captures
@@ -127,7 +152,21 @@ test "$($bb cat /etc/cps-capture-local)" = 'captured local state'
 cps verify --root /
 echo 'CPS_VM_CAPTURE_BOOT: booted the upgrade prepared from the running Btrfs root'
 GUEST
-chmod +x "$root/init" "$root/init-trial"
+cat > "$root/init-original" <<'GUEST'
+#!/bin/sh
+set -eu
+bb=/bin/busybox
+trap '$bb poweroff -f' EXIT
+export PATH=/usr/bin:/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0
+test "$($bb cat /etc/cps-capture-local)" = 'running local state'
+cps verify --root /
+echo 'CPS_VM_BTRFS_ORIGINAL: booted the previous root after staging its upgrade'
+GUEST
+chmod +x "$root/init" "$root/init-trial" "$root/init-original"
 truncate -s 512M source.btrfs
 "$formatter" -q -f --rootdir files --subvol default:@ --subvol rw:@captures source.btrfs
 truncate -s 768M scratch.ext4
@@ -147,8 +186,12 @@ run() {
 run capture.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@ rootwait rw init=/init' \
     -drive if=virtio,format=raw,file=scratch.ext4
 grep -Fx 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root' capture.log.clean
+run native.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@captures/trial/root rootwait ro init=/init-trial'
+grep -Fx 'CPS_VM_CAPTURE_BOOT: booted the upgrade prepared from the running Btrfs root' native.log.clean
+run original.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@ rootwait ro init=/init-original'
+grep -Fx 'CPS_VM_BTRFS_ORIGINAL: booted the previous root after staging its upgrade' original.log.clean
 debugfs -R "dump /root.ext4 $work/staged.ext4" scratch.ext4
 test -f staged.ext4
 run boot.log staged.ext4 'root=/dev/vda rootfstype=ext4 rootwait ro init=/init-trial'
 grep -Fx 'CPS_VM_CAPTURE_BOOT: booted the upgrade prepared from the running Btrfs root' boot.log.clean
-echo 'Verified read-only live root capture, nested subvolume rejection, staging, export, and upgrade boot'
+echo 'Verified live capture, atomic Btrfs staging, native upgrade and previous-root boots, and ext4 export'

@@ -11,9 +11,12 @@ use rustix::{
     ioctl::{Opcode, Updater, ioctl, opcode},
 };
 
-use crate::image::{Image, root::Root};
+use crate::{
+    image::{BootParent, Image, root::Root},
+    plan::Plan,
+};
 
-use super::{check_image_integrity, entry_id};
+use super::{check_image_integrity, check_staging_plan, entry_id, finish_staged_root};
 
 const READ_ONLY: u64 = 1 << 1;
 
@@ -35,6 +38,15 @@ struct VolumeArgs {
 
 /// Publish a verified read-only snapshot inside a new capture directory.
 pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> {
+    snapshot_environment(source, output, None)
+}
+
+/// Stage a saved plan in a new writable Btrfs snapshot of an inactive baseline.
+pub fn stage_btrfs_boot_environment(source: &Path, output: &Path, plan: &Plan) -> Result<String> {
+    snapshot_environment(source, output, Some(plan))
+}
+
+fn snapshot_environment(source: &Path, output: &Path, plan: Option<&Plan>) -> Result<String> {
     let source = fs::canonicalize(source).context("opening the root to capture")?;
     let root = Root::open(&source)?;
     ensure!(
@@ -46,6 +58,14 @@ pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> 
     image.require_clean()?;
     let origin = image.root.as_file();
     let settings = image.settings()?;
+    if let Some(plan) = plan {
+        image.root.offline_path()?;
+        ensure!(
+            read_only(&image.root)?,
+            "Btrfs staging requires a read-only baseline"
+        );
+        check_staging_plan(&image, plan)?;
+    }
     let name = output.file_name().context("expected a new capture name")?;
     let parent = output
         .parent()
@@ -70,7 +90,7 @@ pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> 
     let mut args = SnapshotArgs {
         fd: i64::from(origin.as_raw_fd()),
         transid: 0,
-        flags: READ_ONLY,
+        flags: if plan.is_some() { 0 } else { READ_ONLY },
         reserved: [0; 4],
         name: [0; 4040],
     };
@@ -78,35 +98,37 @@ pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> 
     const SNAPSHOT: Opcode = opcode::write::<SnapshotArgs>(0x94, 23);
     // SAFETY: the argument has the exact Btrfs UAPI layout and a NUL-terminated name.
     unsafe { ioctl(directory.as_file(), Updater::<SNAPSHOT, _>::new(&mut args)) }
-        .context("creating a read-only snapshot on the same Btrfs filesystem")?;
+        .context("creating a snapshot on the same Btrfs filesystem")?;
 
     let mut published = false;
     let result = (|| {
         let captured = Image::open_query(&scratch.path().join("root"))?;
-        let mut flags = 0u64;
-        const FLAGS: Opcode = opcode::read::<u64>(0x94, 25);
-        // SAFETY: BTRFS_IOC_SUBVOL_GETFLAGS writes one u64 to the provided buffer.
-        unsafe {
-            ioctl(
-                captured.root.as_file(),
-                Updater::<FLAGS, _>::new(&mut flags),
-            )
-        }?;
-        ensure!(flags & READ_ONLY != 0, "the captured subvolume is writable");
+        ensure!(
+            read_only(&captured.root)? == plan.is_none(),
+            "the snapshot read-only flag differs from the requested mode"
+        );
         let captured_settings = captured.settings()?;
         ensure!(
             captured_settings.id == settings.id && captured_settings.revision == settings.revision,
             "captured image identity or revision changed"
         );
-        captured.root.walk(None, |path, _, info| {
-            ensure!(
-                FileType::from_raw_mode(info.st_mode) != FileType::Directory || info.st_ino != 2,
-                "capture omits nested Btrfs subvolume {path:?}"
-            );
-            Ok(true)
-        })?;
+        check_snapshot_tree(&captured.root)?;
         check_image_integrity(&captured).context("verifying the captured root")?;
-        syncfs(captured.root.as_file())?;
+        drop(captured);
+        let id = if let Some(plan) = plan {
+            finish_staged_root(
+                &scratch.path().join("root"),
+                BootParent {
+                    id: settings.id.clone(),
+                    revision: settings.revision,
+                },
+                plan,
+            )?
+        } else {
+            entry_id(&settings.id, settings.revision)
+        };
+        check_snapshot_tree(&Root::open(&scratch.path().join("root"))?)?;
+        syncfs(directory.as_file())?;
         renameat_with(
             parent.as_file(),
             scratch
@@ -120,7 +142,7 @@ pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> 
         .context("publishing the captured root")?;
         published = true;
         parent.as_file().sync_all()?;
-        Ok(entry_id(&settings.id, settings.revision))
+        Ok(id)
     })();
     if let Err(error) = &result
         && !published
@@ -136,4 +158,22 @@ pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> 
             .with_context(|| format!("removing the failed capture after {error:#}"))?;
     }
     result
+}
+
+fn read_only(root: &Root) -> Result<bool> {
+    let mut flags = 0u64;
+    const FLAGS: Opcode = opcode::read::<u64>(0x94, 25);
+    // SAFETY: BTRFS_IOC_SUBVOL_GETFLAGS writes one u64 to the provided buffer.
+    unsafe { ioctl(root.as_file(), Updater::<FLAGS, _>::new(&mut flags)) }?;
+    Ok(flags & READ_ONLY != 0)
+}
+
+fn check_snapshot_tree(root: &Root) -> Result<()> {
+    root.walk(None, |path, _, info| {
+        ensure!(
+            FileType::from_raw_mode(info.st_mode) != FileType::Directory || info.st_ino != 2,
+            "capture omits nested Btrfs subvolume {path:?}"
+        );
+        Ok(true)
+    })
 }

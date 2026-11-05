@@ -25,7 +25,7 @@ pub use boot::{
     deploy_and_activate_boot_environment, deploy_boot_environment, export_boot_environment,
     export_boot_environment_receipt, list_boot_environments, list_boot_environments_on_disk,
     prepare_boot_environment, rollback_boot_environment, rollback_boot_environment_on_disk,
-    stage_boot_environment,
+    stage_boot_environment, stage_btrfs_boot_environment,
 };
 pub use build::{
     BuildOptions, BuildSettings, BuildWorker, SourceLayout, build, build_cached_package,

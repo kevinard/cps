@@ -1,4 +1,4 @@
-mod capture;
+mod btrfs;
 mod deploy;
 mod device;
 mod esp;
@@ -31,7 +31,7 @@ use crate::{
     verify::verify_image,
 };
 
-pub use capture::capture_boot_environment;
+pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub use deploy::deploy_boot_environment;
 pub use esp::{
     activate_boot_environment_on_disk, deploy_and_activate_boot_environment,
@@ -95,10 +95,6 @@ fn staging_inputs<'a>(
     destination: &'a Path,
     plan: &Plan,
 ) -> Result<StagingInputs<'a>> {
-    ensure!(
-        !matches!(plan.request, Request::ResolveConfig { .. }),
-        "apply configuration review directly to an inactive root"
-    );
     let source = fs::canonicalize(source).context("opening the base image directory")?;
     ensure!(
         source != Path::new("/"),
@@ -126,12 +122,8 @@ fn staging_inputs<'a>(
     let base = Image::open_query(&source)?;
     base.root.offline_path()?;
     base.require_clean()?;
+    check_staging_plan(&base, plan)?;
     let settings = base.settings()?;
-    ensure!(
-        settings.id == plan.image && settings.revision == plan.base_revision,
-        "plan does not match the base image and revision"
-    );
-    plan.check_publisher_generation(&settings)?;
     let previous = BootParent {
         id: settings.id,
         revision: settings.revision,
@@ -178,6 +170,23 @@ fn stage_root(base: Image, previous: BootParent, staged: &Path, plan: &Plan) -> 
     );
     drop(base);
 
+    finish_staged_root(staged, previous, plan)
+}
+
+fn check_staging_plan(base: &Image, plan: &Plan) -> Result<()> {
+    ensure!(
+        !matches!(plan.request, Request::ResolveConfig { .. }),
+        "apply configuration review directly to an inactive root"
+    );
+    let settings = base.settings()?;
+    ensure!(
+        settings.id == plan.image && settings.revision == plan.base_revision,
+        "plan does not match the base image and revision"
+    );
+    plan.check_publisher_generation(&settings)
+}
+
+fn finish_staged_root(staged: &Path, previous: BootParent, plan: &Plan) -> Result<String> {
     apply(staged, plan).context("applying the plan in the staged root")?;
     let image = Image::open(staged, true)?;
     check_image_integrity(&image)?;

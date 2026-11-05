@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-31`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-32`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1454,14 +1454,29 @@ a `.cps-capture-*` directory containing `root/` in the capture parent.
 To remove a capture, run `btrfs subvolume delete CAPTURE/root`, followed
 by `rmdir CAPTURE`.
 
-The captured root can be staged and exported as ext4. Btrfs-native boot
-activation needs further implementation.
+Use `stage-btrfs` to apply a saved plan in a writable snapshot of the
+read-only baseline on the same Btrfs filesystem.
+
+```sh
+cps boot-env stage-btrfs --source /var/lib/cps/captures/before-upgrade/root \
+    --output /var/lib/cps/captures/trial /scratch/upgrade.json
+```
+
+The command verifies the baseline and its plan, applies the transaction in
+a private subvolume, prepares the selected kernel, and assigns a fresh CPS
+image identity with its recorded parent. It publishes `trial/root/` after
+verification. A failed transaction deletes the private subvolume. The new
+root is writable for configuration review and boot.
+
+Both the captured baseline and a staged Btrfs root can be exported as ext4.
+Selecting Btrfs roots through CPS boot activation needs further implementation.
 
 Run `tests/boot-capture-vm.sh` with `CPS_VM_BTRFS` and
 `CPS_VM_MKFS_BTRFS` set to trusted Btrfs utilities, QEMU, and a kernel
 with built-in Btrfs and ext4 support. The test captures its running root,
 rejects nested subvolumes, verifies that later source writes leave the
-read-only capture intact, stages an upgrade, and boots its exported root.
+read-only capture intact, and checks failed and concurrent staging. It boots
+the staged Btrfs subvolume, the previous root, and the exported ext4 root.
 It uses the same `CPS_BIN`, `CPS_VM_QEMU`, `CPS_VM_QEMU_DATA`,
 `CPS_VM_KERNEL`, and `CPS_VM_BUSYBOX` overrides as the boot fixture.
 

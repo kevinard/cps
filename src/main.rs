@@ -26,8 +26,9 @@ use cps::{
     publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
     read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rotate_publisher_key, set_publisher_build_trust,
-    set_publisher_repositories, stage_boot_environment, transaction_details, transaction_history,
-    transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
+    set_publisher_repositories, stage_boot_environment, stage_btrfs_boot_environment,
+    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
+    verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -627,6 +628,15 @@ enum PlanCommand {
 
 #[derive(Subcommand)]
 enum BootCommand {
+    /// Stage a saved plan in a writable Btrfs snapshot of a read-only baseline
+    StageBtrfs {
+        #[arg(long)]
+        source: PathBuf,
+        /// New directory containing the staged root/ subvolume
+        #[arg(long)]
+        output: PathBuf,
+        plan: PathBuf,
+    },
     /// Capture a running CPS Btrfs root as a directory with a read-only root/
     Capture {
         #[arg(long)]
@@ -1559,6 +1569,14 @@ fn run(command: Command) -> Result<ExitCode> {
             BootCommand::Stage { source, root, plan } => {
                 let id = stage_boot_environment(&source, &root, &load_plan(&plan)?)?;
                 println!("Staged {id} at {}", root.display());
+            }
+            BootCommand::StageBtrfs {
+                source,
+                output,
+                plan,
+            } => {
+                let id = stage_btrfs_boot_environment(&source, &output, &load_plan(&plan)?)?;
+                println!("Staged {id} at {}", output.join("root").display());
             }
             BootCommand::Prepare {
                 source,
