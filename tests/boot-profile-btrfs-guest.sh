@@ -48,8 +48,22 @@ if [ "${1:-}" != observe ]; then
         cps plan --root /environments/base/root --output /run/unfreeze.json unfreeze test/desktop
         cps boot-env stage-btrfs --source /environments/base/root --output /environments/trial /run/unfreeze.json
         trial=/environments/trial/root
+        base_release=$("$bb" cat /etc/cps-btrfs-release)
+        base_kernel=$(sha256sum "/usr/lib/modules/$base_release/vmlinuz"); base_kernel=${base_kernel%% *}
         cps plan --root "$trial" --output /run/update.json update
         cps apply --root "$trial" /run/update.json
+        next_release=$("$bb" cat "$trial/etc/cps-btrfs-release")
+        test "$base_release" != "$next_release"
+        test ! -e "$trial/usr/lib/modules/$base_release/vmlinuz"
+        next_kernel=$(sha256sum "$trial/usr/lib/modules/$next_release/vmlinuz"); next_kernel=${next_kernel%% *}
+        test "$base_kernel" != "$next_kernel"
+        prepared=false
+        for artifact in "$trial"/.cps/kernel-*/linux; do
+            digest=$(sha256sum "$artifact"); digest=${digest%% *}
+            if [ "$digest" = "$next_kernel" ]; then prepared=true; fi
+        done
+        test "$prepared" = true
+        test "$(sha256sum "/usr/lib/modules/$base_release/vmlinuz")" = "$base_kernel  /usr/lib/modules/$base_release/vmlinuz"
         test "$("$bb" cat "$trial/etc/cps-btrfs-state")" = trial
         test "$("$bb" cat /etc/cps-btrfs-state)" = previous
         test "$(cps transaction history --root /)" = "$before"
@@ -100,6 +114,7 @@ while read -r publisher; do
     cps publisher audit-builds --root / "$publisher"
 done < /etc/cps-btrfs-build-publishers
 printf 'CPS_VM_SIGNED_BTRFS: %s signed stack and kernel verified\n' "$state"
+printf 'CPS_VM_SIGNED_BTRFS_KERNEL: %s %s\n' "$state" "$("$bb" uname -r)"
 base=$("$bb" cat /environments/base-id)
 freezes=$(cps freeze --root /)
 if [ "$state" = trial ]; then

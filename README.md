@@ -1564,16 +1564,22 @@ Run `tests/boot-profile-btrfs-vm.sh` to test a native Btrfs root assembled
 entirely through a signed release profile. Set `CPS_VM_CPS_FIXTURE`,
 `CPS_VM_KERNEL_FIXTURE`, `CPS_VM_SYSTEMD_FIXTURE`,
 `CPS_VM_USR_BASE_FIXTURE`, `CPS_VM_UTIL_LINUX_FIXTURE`, and
-`CPS_VM_BUSYBOX_FIXTURE` to the corresponding build outputs, and provide
+`CPS_VM_BUSYBOX_FIXTURE` to the corresponding build outputs. Also set
+`CPS_VM_NEXT_KERNEL_FIXTURE` to a distinct signed kernel build and
+`CPS_VM_UTILITIES_FIXTURE` to the GNU tools build below, and provide
 the QEMU, OVMF, and trusted `CPS_VM_MKFS_BTRFS` overrides. The test installs
 the source-built CPS, systemd, util-linux, BusyBox, and Btrfs-capable kernel
 with builder trust enforced by the signed profile. The ELF runtime comes
 from the signed merged `/usr` seed. It keeps signing keys outside the guest
 and mounts its repositories read-only. It captures the running root,
-stages an unfreeze, applies the profile upgrade to that private root, boots
+stages an unfreeze, applies the profile and kernel upgrade to that private root, boots
 and blesses it, checks the default on reboot, and explicitly rolls back to
-the previous root with its original freeze. Both roots use the same signed
-kernel; the kernel replacement test below uses distinct kernels.
+the previous root with its original freeze and kernel. It imports both
+verified kernel bundles under a temporary release key and pins their builder
+keys in the signed profile. The staged guest runs its packaged kernel-install
+and GNU utilities to prepare fresh artifacts. The test checks distinct kernel
+bytes, prepared artifacts, and the running release on both trial boots and
+after rollback.
 
 Set `CPS_VM_KERNEL_FIXTURE` to the output from `tests/build-kernel.sh`
 to stage the signed Btrfs-capable kernel as part of the upgrade. The image
@@ -1958,6 +1964,13 @@ CPS builds the EFI kernel twice in fresh offline sandboxes, verifies the matchin
 outputs, and publishes `system/kernel-qemu` with signed build evidence. Set
 `CPS_KERNEL_BC` to an extracted trusted `bc` binary if the worker does not have
 it installed. The worker toolchain still comes from prebuilt Arch packages.
+
+Set `CPS_KERNEL_VARIANT=next` with a new output directory to build package
+revision `6.12.115-2`. That variant uses release `6.12.115-cps-vm-next` and
+`CONFIG_HZ_1000=y`; the base variant uses `6.12.115-cps-vm`. Both use the same
+verified upstream archive, and each has its own pinned manifest and configuration.
+Use the base and next outputs as `CPS_VM_KERNEL_FIXTURE` and
+`CPS_VM_NEXT_KERNEL_FIXTURE` for the signed native Btrfs test.
 
 For the signed-profile rollback test, also set `CPS_VM_KERNEL_FIXTURE` to the
 build output directory. The signed trial installs the kernel and its build

@@ -7,6 +7,8 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cps=$(realpath -- "${CPS_BIN:-$project/target/debug/cps}")
 cps_fixture=$(realpath -- "${CPS_VM_CPS_FIXTURE:?Set CPS_VM_CPS_FIXTURE}")
 kernel_fixture=$(realpath -- "${CPS_VM_KERNEL_FIXTURE:?Set CPS_VM_KERNEL_FIXTURE}")
+next_kernel_fixture=$(realpath -- "${CPS_VM_NEXT_KERNEL_FIXTURE:?Set CPS_VM_NEXT_KERNEL_FIXTURE to the next signed kernel build}")
+utilities_fixture=$(realpath -- "${CPS_VM_UTILITIES_FIXTURE:?Set CPS_VM_UTILITIES_FIXTURE to the signed GNU tools build}")
 systemd_fixture=$(realpath -- "${CPS_VM_SYSTEMD_FIXTURE:?Set CPS_VM_SYSTEMD_FIXTURE}")
 usr_base_fixture=$(realpath -- "${CPS_VM_USR_BASE_FIXTURE:?Set CPS_VM_USR_BASE_FIXTURE}")
 util_linux_fixture=$(realpath -- "${CPS_VM_UTIL_LINUX_FIXTURE:?Set CPS_VM_UTIL_LINUX_FIXTURE}")
@@ -17,7 +19,11 @@ code=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE}
 vars=${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS}
 release=$(cat "$kernel_fixture/kernel-release")
 kernel="$kernel_fixture/image/usr/lib/modules/$release/vmlinuz"
+next_release=$(cat "$next_kernel_fixture/kernel-release")
+test "$release" != "$next_release"
+! cmp -s "$kernel" "$next_kernel_fixture/image/usr/lib/modules/$next_release/vmlinuz"
 grep -Fx 'CONFIG_BTRFS_FS=y' "$kernel_fixture/image/usr/lib/modules/$release/config"
+grep -Fx 'CONFIG_BTRFS_FS=y' "$next_kernel_fixture/image/usr/lib/modules/$next_release/config"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
@@ -25,7 +31,7 @@ cd -- "$work"
 mkdir repos runtime
 for pair in "canopa:$cps_fixture" "canopa-kernel:$kernel_fixture" \
     "canopa-systemd:$systemd_fixture" "canopa-usr-base:$usr_base_fixture" \
-    "canopa-util-linux:$util_linux_fixture" "canopa-bootstrap:$busybox_fixture"; do
+    "canopa-util-linux:$util_linux_fixture" "canopa-bootstrap:$busybox_fixture" "canopa-utilities:$utilities_fixture"; do
     publisher=${pair%%:*}
     fixture=${pair#*:}
     cp -a -- "$fixture/repo" "repos/$publisher"
@@ -40,11 +46,31 @@ keypair() {
 }
 keypair vm-test
 keypair vm-profile
-publishers=(vm-test canopa canopa-kernel canopa-systemd canopa-usr-base canopa-util-linux canopa-bootstrap)
+keypair canopa-kernel
+mv repos/canopa-kernel original-kernel-repo
+mkdir repos/canopa-kernel
+cp "$next_kernel_fixture/builder-public.der" canopa-kernel-next-builder.der
+{
+    printf 'schema-version 1\npublisher "canopa-kernel" {\n'
+    printf '    builder-key "../../canopa-kernel-builder.der"\n    builder-key "../../canopa-kernel-next-builder.der"\n'
+    for fixture in "$kernel_fixture" "$next_kernel_fixture"; do
+        package=$(cat "$fixture/kernel-package")
+        "$cps" repo attestation --repo "$fixture/repo" --publisher canopa-kernel \
+            --trust-key "$fixture/release-public.der" "$package" > /dev/null
+        recipe=$(sha256sum "$fixture/build.kdl"); recipe=${recipe%% *}
+        printf '    approve "system/kernel-qemu" version="%s" sha256="%s"\n' "${package##*@}" "$recipe"
+    done
+    printf '}\n'
+} > repos/canopa-kernel/publish-policy.kdl
+for fixture in "$kernel_fixture" "$next_kernel_fixture"; do
+    recipe=$(sha256sum "$fixture/build.kdl"); recipe=${recipe%% *}
+    "$cps" publish-bundle --repo repos/canopa-kernel --signing-key canopa-kernel-private.der \
+        --builder-key "$fixture/builder-public.der" --recipe-sha256 "$recipe" "$fixture/bundle"
+done
+publishers=(vm-test canopa canopa-kernel canopa-systemd canopa-usr-base canopa-util-linux canopa-bootstrap canopa-utilities)
 mkdir -p runtime/{etc/systemd/system.conf.d,etc/systemd/system,usr/local/libexec}
 printf '%s\n' "${publishers[@]}" vm-profile > runtime/etc/cps-btrfs-publishers
-printf '%s\n' canopa canopa-kernel canopa-systemd canopa-util-linux canopa-bootstrap > runtime/etc/cps-btrfs-build-publishers
-printf '%s\n' "$release" > runtime/etc/cps-btrfs-release
+printf '%s\n' canopa canopa-kernel canopa-systemd canopa-util-linux canopa-bootstrap canopa-utilities > runtime/etc/cps-btrfs-build-publishers
 printf 'root:x:0:0:root:/root:/bin/sh\n' > runtime/etc/passwd
 printf 'root:x:0:\n' > runtime/etc/group
 printf 'ID=canopa\nPRETTY_NAME="Canopa signed Btrfs VM"\n' > runtime/etc/os-release
@@ -77,11 +103,12 @@ UNIT
 publish_desktop() {
     mkdir -p desktop/etc
     printf '%s\n' "$2" > desktop/etc/cps-btrfs-state
+    printf '%s\n' "$3" > desktop/etc/cps-btrfs-release
     "$cps" manifest generate --proto desktop --publisher vm-test --version "$1" \
         --uid "$(id -u)" --gid "$(id -g)" test/desktop > desktop.kdl
     "$cps" publish --repo repos/vm-test --proto desktop --signing-key vm-test-private.der desktop.kdl
 }
-publish_desktop 1.0.0-0 previous
+publish_desktop 1.0.0-0 previous "$release"
 cps_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$cps_fixture/cps.kdl")
 systemd_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$systemd_fixture/systemd.kdl")
 kernel_package=$(cat "$kernel_fixture/kernel-package")
@@ -94,13 +121,16 @@ package "test/btrfs-stack" publisher="vm-profile" version="$1" {
     require "system/cps" version="=$cps_version"
     require "system/systemd-vm" version="=$systemd_version"
     require "system/busybox" version="=1.38.0-1"
-    require "system/kernel-qemu" version="=${kernel_package##*@}"
+    require "system/coreutils" version="=9.12.0-0"
+    require "system/grep" version="=3.12.0-0"
+    require "system/kernel-qemu" version="=$2"
 }
 MANIFEST
     "$cps" publish --repo repos/vm-profile --proto desktop --signing-key vm-profile-private.der stack.kdl
 }
-publish_stack 1.0.0-0
-publish_stack 2.0.0-0
+publish_stack 1.0.0-0 "${kernel_package##*@}"
+next_kernel_package=$(cat "$next_kernel_fixture/kernel-package")
+publish_stack 2.0.0-0 "${next_kernel_package##*@}"
 refresh_profile() {
     {
         printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
@@ -109,7 +139,11 @@ refresh_profile() {
             printf '        publisher "%s" catalog="%s" {\n' "$publisher" "$(cat "repos/$publisher/current")"
             printf '            repository "../%s"\n            trust-key "../../%s-public.der"\n' "$publisher" "$publisher"
             if [[ -f $publisher-builder.der ]]; then
-                printf '            build-trust { builder-key "../../%s-builder.der"; }\n' "$publisher"
+                printf '            build-trust {\n                builder-key "../../%s-builder.der"\n' "$publisher"
+                if [[ $publisher == canopa-kernel ]]; then
+                    printf '                builder-key "../../canopa-kernel-next-builder.der"\n'
+                fi
+                printf '            }\n'
             fi
             printf '        }\n'
         done
@@ -142,7 +176,9 @@ for fixture_path in "canopa:$cps_fixture:usr/bin/cps" \
     cmp "files/@/$path" "$fixture/image/$path"
 done
 cmp files/@/usr/bin/sfdisk "$util_linux_fixture/image/usr/bin/sfdisk"
-publish_desktop 2.0.0-0 trial
+cmp files/@/usr/bin/coreutils "$utilities_fixture/image/usr/bin/coreutils"
+cmp files/@/usr/bin/grep "$utilities_fixture/image/usr/bin/grep"
+publish_desktop 2.0.0-0 trial "$next_release"
 refresh_profile 2.0.0-0
 # Only immutable signed objects go to the guest; publication policy contains
 # host-side paths, and private signing keys always stay outside these disks.
@@ -191,4 +227,7 @@ run boot.log -drive if=pflash,format=raw,readonly=on,file="$code" \
 markers=$(grep '^CPS_VM_SIGNED_BTRFS: ' boot.log.clean)
 test "$markers" = $'CPS_VM_SIGNED_BTRFS: trial signed stack and kernel verified\nCPS_VM_SIGNED_BTRFS: trial blessed\nCPS_VM_SIGNED_BTRFS: trial signed stack and kernel verified\nCPS_VM_SIGNED_BTRFS: trial default after reboot\nCPS_VM_SIGNED_BTRFS: previous signed stack and kernel verified\nCPS_VM_SIGNED_BTRFS: previous root restored with its freeze and kernel'
 printf '%s\n' "$markers"
+kernel_markers=$(grep '^CPS_VM_SIGNED_BTRFS_KERNEL: ' boot.log.clean)
+test "$kernel_markers" = "$(printf 'CPS_VM_SIGNED_BTRFS_KERNEL: trial %s\nCPS_VM_SIGNED_BTRFS_KERNEL: trial %s\nCPS_VM_SIGNED_BTRFS_KERNEL: previous %s' "$next_release" "$next_release" "$release")"
+printf '%s\n' "$kernel_markers"
 echo 'Verified a signed system stack through native Btrfs staging, blessing, reboot, and rollback'
