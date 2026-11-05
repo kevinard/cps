@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-36`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-37`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1647,6 +1647,22 @@ the package database and exported partition bytes.
 
 Use separate `stage` and `export` commands when you need to edit the staged
 root or resolve configuration updates before exporting it.
+
+A private staged environment can receive several saved transactions before
+activation. For example, stage an `unfreeze` plan, then plan and apply the
+package update against that new root. Its image identity stays the same and
+its recorded boot parent remains the original known-good source. Export after
+the last transaction and use the fresh receipt when activating it. Receipts
+from an earlier revision remain invalid. Registered Btrfs roots and installed
+ext4 roots retain their package-write protection.
+
+Use the current CPS for boot operations after activating an environment with
+several transactions. Earlier clients reject its parent metadata. Set
+`CPS_VM_STAGED_TRANSACTIONS=1` on the native Btrfs VM test to freeze, unfreeze,
+and update a private root before its first activation. The signed-profile
+rollback VM uses that option to apply a review transaction after staging,
+reject the old receipt, and verify the reviewed root through blessing,
+reboot, and rollback.
 
 With a known-good base already registered, use a dedicated, unregistered
 Linux filesystem partition on the same GPT disk as the mounted ESP for the

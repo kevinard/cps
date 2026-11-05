@@ -433,3 +433,42 @@ reject_raw 'fsck.fat rejected the EFI partition' raw_list dirty.raw
 test -z "$(find . -maxdepth 1 -name '.cps-deploy-*' -print)"
 echo 'Verified activation and rollback update the same disk and preserve unrelated EFI files'
 echo 'Verified reproducible disk activation, rollback, and slot reuse'
+
+# Lift a hold in a private staged root, update it, then activate that same
+# identity against its original known-good parent and a fresh export receipt.
+cp -a base review-base
+"$cps" plan --root review-base --output hold.json freeze --reason 'Review before upgrade' test/root
+"$cps" apply --root review-base hold.json
+export_with_receipt review-base
+review_base_id=$(raw_activate review-base with-esp.raw "$base" review-base.raw --known-good --root-image review-base.ext4)
+review_base_id=${review_base_id#Activated }
+"$cps" plan --root review-base --output lift.json unfreeze test/root
+"$cps" boot-env stage --source review-base --root reviewed lift.json
+export_with_receipt reviewed
+mv reviewed.ext4 before-review.ext4
+mv reviewed.kdl before-review.kdl
+"$cps" plan --root reviewed --output reviewed-update.json update
+"$cps" apply --root reviewed reviewed-update.json
+reject_raw 'receipt is for a different image or revision' "$cps" boot-env activate \
+    --root reviewed --disk review-base.raw --root-partuuid "$trial" --esp-partuuid "$esp" \
+    --receipt before-review.kdl --root-image before-review.ext4 --initrd boot/initrd --output-disk rejected.raw
+test ! -e rejected.raw
+export_with_receipt reviewed
+reviewed_id=$(raw_activate reviewed review-base.raw "$trial" reviewed.raw --root-image reviewed.ext4)
+reviewed_id=${reviewed_id#Activated }
+assert_default reviewed.raw "$reviewed_id" 'trial (2 left)'
+mcopy -i reviewed.raw@@1048576 "::/loader/entries/$reviewed_id+2.conf" - | grep -Fx "# cps-parent $review_base_id"
+if [[ -n ${CPS_TEST_LEGACY_BOOT_BINARY:-} ]]; then
+    before_legacy=$(sha256sum reviewed.raw)
+    if "$CPS_TEST_LEGACY_BOOT_BINARY" boot-env list --disk reviewed.raw --esp-partuuid "$esp" > legacy-boot.log 2>&1; then
+        echo 'An earlier client accepted parent metadata it cannot interpret' >&2
+        exit 1
+    fi
+    grep -F 'invalid parent' legacy-boot.log
+    test "$(sha256sum reviewed.raw)" = "$before_legacy"
+fi
+raw_rollback reviewed.raw reviewed-rollback.raw
+assert_default reviewed-rollback.raw "$review_base_id" known-good
+test "$(cat base/etc/version)" = 1.0.0-0
+test "$(cat reviewed/etc/version)" = 3.0.0-0
+echo 'Verified staged unfreeze and update activate together and roll back to the original parent'

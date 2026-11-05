@@ -15,6 +15,11 @@ native_boot=${CPS_VM_BTRFS_BOOT:-0}
 health_fail=${CPS_VM_BTRFS_HEALTH_FAIL:-0}
 destroy=${CPS_VM_BTRFS_DESTROY:-0}
 destroy_failed=${CPS_VM_BTRFS_DESTROY_FAILED:-0}
+staged_transactions=${CPS_VM_STAGED_TRANSACTIONS:-0}
+if [[ $staged_transactions == 1 && ( $native_boot != 1 || $health_fail != 0 || $destroy != 0 || $destroy_failed != 0 ) ]]; then
+    echo 'CPS_VM_STAGED_TRANSACTIONS requires a successful native trial without destruction' >&2
+    exit 2
+fi
 if [[ $destroy == 1 && ( $native_boot != 1 || $health_fail != 0 ) ]]; then
     echo 'CPS_VM_BTRFS_DESTROY requires native boot without health failure' >&2
     exit 2
@@ -52,7 +57,7 @@ publish() {
     printf '%s\n' "$1" > proto/etc/cps-capture-version
     "$cps" manifest generate --proto proto --publisher test --version "$1" \
         --uid "$(id -u)" --gid "$(id -g)" test/live-root > manifest.kdl
-    if [[ $1 == 2.0.0-0 && -n $kernel_package ]]; then
+    if [[ $1 != 1.0.0-0 && -n $kernel_package ]]; then
         sed '$d' manifest.kdl > linked.kdl
         printf '    require "%s" version="=%s"\n}\n' "$kernel_name" "${kernel_package##*@}" >> linked.kdl
         mv linked.kdl manifest.kdl
@@ -78,6 +83,16 @@ fi
 publish 2.0.0-0
 mkdir -p "$root"/{bin,usr/bin,proc,sys,dev,tmp,captures,scratch,repository} files/@captures
 cp -a repo/. "$root/repository/"
+printf '2.0.0-0\n' > "$root/etc/cps-btrfs-trial-version"
+if [[ $staged_transactions == 1 ]]; then
+    cp repo/current before-review-catalog
+    publish 3.0.0-0
+    cp -a repo/. "$root/repository/"
+    mv "$root/repository/current" "$root/repository/review-catalog"
+    cp before-review-catalog "$root/repository/current"
+    touch "$root/etc/cps-btrfs-staged-transactions"
+    printf '3.0.0-0\n' > "$root/etc/cps-btrfs-trial-version"
+fi
 cp "$busybox" "$root/bin/busybox"
 ln -s busybox "$root/bin/sh"
 copy_runtime_deps "$root" "$busybox"
@@ -139,7 +154,7 @@ mount -t tmpfs tmpfs /tmp
 while read -r module name; do insmod "$module"; done < "/vm-modules/$($bb uname -r)/load"
 mount -t vfat /dev/vda1 /efi
 mount -t btrfs -o subvolid=5 /dev/vda2 /volume
-if [ -f /etc/cps-btrfs-fail-health ] && [ "$($bb cat /etc/cps-capture-version)" = 2.0.0-0 ]; then
+if [ -f /etc/cps-btrfs-fail-health ] && [ "$($bb cat /etc/cps-capture-version)" = "$($bb cat /etc/cps-btrfs-trial-version)" ]; then
     $bb chmod 0600 /volume/@captures/trial/root/etc/cps-capture-version
 fi
 flags=
@@ -164,8 +179,9 @@ set -eu
 bb=/bin/busybox
 export PATH=/usr/bin:/bin
 version=$($bb cat /etc/cps-capture-version)
+trial_version=$($bb cat /etc/cps-btrfs-trial-version)
 if [ -f /etc/cps-btrfs-trial-kernel ]; then
-    if [ "$version" = 2.0.0-0 ]; then
+    if [ "$version" = "$trial_version" ]; then
         test "$($bb uname -r)" = "$($bb cat /etc/cps-btrfs-trial-kernel)"
         audit=$(cps publisher audit-builds --root / canopa-kernel)
         echo "$audit"
@@ -176,7 +192,7 @@ if [ -f /etc/cps-btrfs-trial-kernel ]; then
         echo "CPS_VM_BTRFS_KERNEL: previous $($bb uname -r)"
     fi
 fi
-if [ "$version" = 2.0.0-0 ] && [ -f /etc/cps-btrfs-fail-health ]; then
+if [ "$version" = "$trial_version" ] && [ -f /etc/cps-btrfs-fail-health ]; then
     if cps verify --root / > /run/rejected 2>&1; then exit 1; fi
     $bb grep -F 'etc/cps-capture-version' /run/rejected
     systemctl is-failed --quiet cps-boot-health.service
@@ -189,7 +205,7 @@ cps verify --root /
 if [ -f /etc/cps-btrfs-destroy ] && [ ! -f /run/cps-vm-counted ]; then
     exec /usr/local/libexec/cps-vm-destroy
 fi
-if [ "$version" = 2.0.0-0 ]; then
+if [ "$version" = "$trial_version" ]; then
     test "$($bb cat /etc/cps-capture-local)" = 'captured local state'
     if [ -f /run/cps-vm-counted ]; then
         systemctl is-active --quiet cps-boot-health.service
@@ -339,6 +355,20 @@ stage=/captures/trial/root
 btrfs property get "$stage" ro | $bb grep -Fx 'ro=false'
 test "$($bb stat -c %i "$stage")" = 256
 test "$($bb cat "$stage/etc/cps-capture-version")" = 2.0.0-0
+if [ -f /etc/cps-btrfs-staged-transactions ]; then
+    cps plan --root "$stage" --output /tmp/review-freeze.json freeze --reason 'Review staged desktop' test/live-root
+    cps apply --root "$stage" /tmp/review-freeze.json
+    $bb cat /repository/review-catalog > /repository/current
+    cps plan --root "$stage" --output /tmp/held.json update
+    cps plan --root "$stage" --output /tmp/unfreeze.json unfreeze test/live-root
+    cps apply --root "$stage" /tmp/unfreeze.json
+    if cps apply --root "$stage" /tmp/held.json > /tmp/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'stale plan' /tmp/rejected
+    cps plan --root "$stage" --output /tmp/review-upgrade.json update
+    cps apply --root "$stage" /tmp/review-upgrade.json
+    test "$($bb cat "$stage/etc/cps-capture-version")" = 3.0.0-0
+    echo 'CPS_VM_STAGED_TRANSACTIONS: unfroze and upgraded the private Btrfs root'
+fi
 test "$($bb cat /captures/base/root/etc/cps-capture-version)" = 1.0.0-0
 test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0
 test "$(sha256sum /.cps/state.sqlite)" = "$before"
@@ -417,7 +447,7 @@ export PATH=/usr/bin:/bin
 mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-test "$($bb cat /etc/cps-capture-version)" = 2.0.0-0
+test "$($bb cat /etc/cps-capture-version)" = "$($bb cat /etc/cps-btrfs-trial-version)"
 test "$($bb cat /etc/cps-capture-local)" = 'captured local state'
 cps verify --root /
 echo 'CPS_VM_CAPTURE_BOOT: booted the upgrade prepared from the running Btrfs root'
@@ -507,6 +537,9 @@ if [[ $native_boot == 1 ]]; then
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial blessed' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial default after reboot' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_BOOT: previous root after rollback' uefi.log.clean
+    fi
+    if [[ $staged_transactions == 1 ]]; then
+        grep -Fx 'CPS_VM_STAGED_TRANSACTIONS: unfroze and upgraded the private Btrfs root' capture.log.clean
     fi
 else
     run native.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@captures/trial/root rootwait ro init=/init-trial'

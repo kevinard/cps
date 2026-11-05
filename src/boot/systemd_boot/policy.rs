@@ -142,6 +142,16 @@ pub(super) fn entry_identity(id: &str) -> Result<(&str, u64)> {
     Ok((image, number))
 }
 
+pub(super) fn check_parent(parent: &str, child: &str) -> Result<()> {
+    let (parent_image, parent_revision) = entry_identity(parent)?;
+    let (child_image, child_revision) = entry_identity(child)?;
+    ensure!(
+        parent_image != child_image && parent_revision < child_revision,
+        "invalid boot environment parent"
+    );
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) struct BootEntry {
     pub path: PathBuf,
@@ -233,10 +243,7 @@ pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
     let partuuid = canonical_partuuid(partuuid)?;
     let parent = field(&description, "# cps-parent ")?;
     if let Some(parent) = parent {
-        ensure!(
-            entry_identity(parent)?.1.checked_add(1) == Some(revision),
-            "invalid parent for {id}"
-        );
+        check_parent(parent, id).with_context(|| format!("invalid parent for {id}"))?;
     }
     let parent = parent.map(str::to_owned);
     let btrfs = BtrfsRecord::parse(&description, options)?;
@@ -305,7 +312,31 @@ fn directory_exists(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::boot_field;
+    use super::{boot_field, check_parent};
+
+    #[test]
+    fn boot_parent_precedes_a_distinct_staged_image_after_several_transactions()
+    -> anyhow::Result<()> {
+        let parent = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
+        let child = "cps-61d0a34e-1f51-4cda-963d-cdcd58d5acef";
+        check_parent(parent, &format!("{child}-3"))?;
+        check_parent(parent, &format!("{child}-5"))?;
+        for invalid in [
+            format!("{child}-2"),
+            format!("{child}-1"),
+            "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-3".to_owned(),
+        ] {
+            assert!(check_parent(parent, &invalid).is_err());
+        }
+        assert!(
+            check_parent(
+                "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-18446744073709551615",
+                &format!("{child}-5")
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn boot_options_reject_duplicates_with_alternate_whitespace() -> anyhow::Result<()> {

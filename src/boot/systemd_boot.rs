@@ -285,13 +285,12 @@ pub(super) fn activate(
     let fallback = match (activation.known_good, &settings.boot_parent) {
         (true, None) => None,
         (false, Some(parent)) => {
-            ensure!(
-                parent.revision.checked_add(1) == Some(settings.revision),
-                "the staged image has changed since staging"
-            );
             let parent_id =
                 canonical_partuuid(&parent.id).context("invalid base image identity")?;
-            Some(entry_id(&parent_id, parent.revision))
+            let parent = entry_id(&parent_id, parent.revision);
+            policy::check_parent(&parent, &id)
+                .context("the staged image does not descend from its recorded base")?;
+            Some(parent)
         }
         (true, Some(_)) => bail!("a staged environment must be activated as a counted trial"),
         (false, None) => {

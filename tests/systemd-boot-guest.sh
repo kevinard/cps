@@ -571,6 +571,17 @@ if [ -f /etc/cps-vm-frozen-sqlite ]; then
     case "$preview" in *'Unfreeze system/sqlite'*) ;; *) printf '%s\n' "$preview" >&2; exit 1 ;; esac
     printf 'CPS_VM_FREEZE: %s verified\n' "$state"
 fi
+if [ -f /etc/cps-vm-staged-transactions ]; then
+    listing=$(/usr/bin/cps freeze --root /)
+    if [ "$state" = previous ]; then
+        case "$listing" in *"$(printf 'test/boot-state\t')"*) exit 1 ;; esac
+        printf 'CPS_VM_STAGED_TRANSACTIONS: previous unchanged\n'
+    else
+        expected=$(printf 'test/boot-state\t2.0.0-0\t"VM staged review"')
+        case "$listing" in *"$expected"*) ;; *) printf '%s\n' "$listing" >&2; exit 1 ;; esac
+        printf 'CPS_VM_STAGED_TRANSACTIONS: %s reviewed\n' "$state"
+    fi
+fi
 if [ -f /etc/cps-vm-assert-extra-publisher ]; then
     publisher=absent
     if [ -f /etc/cps-vm-extra-marker ]; then

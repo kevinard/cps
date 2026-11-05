@@ -213,6 +213,19 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     )?;
     apply(&f.root, &plan(&f.root, Request::InstallProfile)?)?;
     apply(&f.root, &plan(&f.root, freeze(name.into()))?)?;
+    fs::create_dir(f.root.join("boot"))?;
+    fs::write(f.root.join("boot/vmlinuz"), "fixture kernel")?;
+    let esp = f._dir.path().join("esp");
+    fs::create_dir(&esp)?;
+    let mut activation = crate::Activation {
+        root_partuuid: "7adff456-af50-498f-b39a-dcf87cb4a7c1".into(),
+        kernel: "boot/vmlinuz".into(),
+        initrd: None,
+        options: String::new(),
+        tries: 2,
+        known_good: true,
+    };
+    let base_id = crate::activate_boot_environment(&f.root, &esp, &activation)?;
     let freezes = list_freezes(&f.root)?;
     publish_profile("2.0.0-0")?;
     let error = plan(&f.root, Request::Update).unwrap_err();
@@ -234,10 +247,23 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     assert!(list_freezes(&next_root)?.is_empty());
     let staged = Image::open_query(&next_root)?.settings()?;
     assert_eq!(
-        staged.boot_parent.unwrap().id,
+        staged.boot_parent.as_ref().unwrap().id,
         Image::open_query(&f.root)?.settings()?.id
     );
     apply(&next_root, &plan(&next_root, Request::Update)?)?;
+    let after = Image::open_query(&next_root)?.settings()?;
+    assert_eq!(after.id, staged.id);
+    assert_eq!(after.boot_parent, staged.boot_parent);
+    assert_eq!(after.revision, staged.revision + 1);
+    activation.known_good = false;
+    activation.root_partuuid = "b52060cf-81ab-4b8a-ad84-3aa69000ed49".into();
+    let next_id = crate::activate_boot_environment(&next_root, &esp, &activation)?;
+    assert!(
+        crate::list_boot_environments(&esp)?
+            .iter()
+            .any(|entry| entry.id == next_id && entry.is_default)
+    );
+    assert_eq!(crate::rollback_boot_environment(&esp, None)?, base_id);
     assert_eq!(fs::read_to_string(next_root.join(COMPOSITOR))?, "base 2");
     assert_eq!(list_freezes(&f.root)?, freezes);
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "base 1");

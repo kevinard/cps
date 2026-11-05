@@ -15,6 +15,7 @@ device_activation=${CPS_VM_DEVICE_ACTIVATION:-0}
 installed_stage=${CPS_VM_INSTALLED_STAGE:-0}
 reprovision=${CPS_VM_REPROVISION:-0}
 tuf_mirrors=${CPS_VM_TUF_MIRRORS:-0}
+staged_transactions=${CPS_VM_STAGED_TRANSACTIONS:-0}
 if [[ $recycle == 1 && $mode != rollback ]]; then
     echo 'CPS_VM_RECYCLE_SLOT requires the rollback scenario' >&2
     exit 2
@@ -24,7 +25,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-36}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-37}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -134,6 +135,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
     if (( ${cps_version##*-} >= 35 )); then package_freezes=true; base_revision=2; fi
+fi
+if [[ $staged_transactions == 1 ]] && { ! $profiled || (( ${cps_version##*-} < 37 )) || [[ $device_activation != 0 || $recycle != 0 ]]; }; then
+    echo 'CPS_VM_STAGED_TRANSACTIONS requires a current signed profile without device activation or slot reuse' >&2
+    exit 2
 fi
 if [[ $tuf_mirrors == 1 ]]; then
     if ! $profiled || [[ $recycle == 1 ]]; then
@@ -425,6 +430,7 @@ if $systemd_guest; then
         if $package_freezes; then
             printf '%s\n' "$sqlite_version" > runtime/etc/cps-vm-frozen-sqlite
         fi
+        if [[ $staged_transactions == 1 ]]; then touch runtime/etc/cps-vm-staged-transactions; fi
     else
         copy_runtime_deps runtime proto/usr/bin/cps
     fi
@@ -897,6 +903,22 @@ else
     trial_id=${trial#Staged }
 fi
 trial_id=${trial_id%% at *}
+if [[ $staged_transactions == 1 ]]; then
+    "$cps" plan --root "$staged_root" --output review.json freeze --reason 'VM staged review' test/boot-state
+    "$cps" apply --root "$staged_root" review.json
+    trial_id="${trial_id%-*}-$((base_revision + 2))"
+    if [[ $tuf_mirrors == 1 ]]; then
+        if "$cps" boot-env activate --root "$staged_root" --esp esp --root-partuuid "$trial_uuid" \
+            --disk "$base_disk" --receipt "$staged_receipt" --options "$options" > stale-review.log 2>&1; then
+            echo 'Activation accepted an export from before the staged review' >&2
+            exit 1
+        fi
+        grep -F 'receipt is for a different image or revision' stale-review.log
+    fi
+    staged_image=reviewed.ext4
+    staged_receipt=reviewed.kdl
+    echo 'Verified an additional reviewed transaction kept the original boot parent'
+fi
 diff -r esp-before esp
 test "$(cat base/etc/cps-vm-state)" = previous
 if [[ $mode == facet-change ]]; then
@@ -921,7 +943,7 @@ if $profiled; then
     test "$(cat base/etc/cps-vm-previous-default)" = 'previous default'
     test ! -e "$staged_root/etc/cps-vm-previous-default"
     "$cps" info --root "$staged_root" --available test/previous-default > /dev/null
-    trial_plan=$("$cps" transaction history --root "$staged_root" --limit 1 | awk -F '\t' -v revision="$((base_revision + 1))" '$1 == revision && $3 == "update-profile" {print $2}')
+    trial_plan=$("$cps" transaction history --root "$staged_root" --limit 2 | awk -F '\t' -v revision="$((base_revision + 1))" '$1 == revision && $3 == "update-profile" {print $2}')
     "$cps" transaction show --root "$staged_root" "$trial_plan" > trial-history.json
     grep -Fq "\"kernel_release\": \"$trial_release\"" trial-history.json
     grep -Fq "\"base_revision\": $base_revision" trial-history.json
@@ -979,7 +1001,7 @@ if [[ $recycle == 1 ]]; then
     printf 'administrator-setting\n' > "$staged_root/etc/cps-vm.conf"
     printf 'administrator-policy\n' > "$staged_root/etc/cps-vm-policy.conf"
 fi
-if [[ $tuf_mirrors != 1 ]]; then
+if [[ $tuf_mirrors != 1 || $staged_transactions == 1 ]]; then
     "$cps" boot-env export --receipt --root "$staged_root" --output "$staged_image" --size-mib "$root_mib" > "$staged_receipt"
 fi
 test "$(sha256sum base.ext4)" = "$base_payload"
@@ -1186,6 +1208,11 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
             test "$freezes" = $'CPS_VM_FREEZE: trial verified\nCPS_VM_FREEZE: trial verified'
             printf '%s\n' "$freezes"
         fi
+        if [[ $staged_transactions == 1 ]]; then
+            reviews=$(tr -d '\r' < serial.log | grep '^CPS_VM_STAGED_TRANSACTIONS: ')
+            test "$reviews" = $'CPS_VM_STAGED_TRANSACTIONS: trial reviewed\nCPS_VM_STAGED_TRANSACTIONS: trial reviewed'
+            printf '%s\n' "$reviews"
+        fi
         if $protected_profiles; then
             protections=$(tr -d '\r' < serial.log | grep '^CPS_VM_PROFILE_PROTECTION: ')
             test "$protections" = $'CPS_VM_PROFILE_PROTECTION: trial verified\nCPS_VM_PROFILE_PROTECTION: trial verified'
@@ -1290,6 +1317,9 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
         fi
         if $package_freezes; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_FREEZE: previous verified'
+        fi
+        if [[ $staged_transactions == 1 ]]; then
+            tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_STAGED_TRANSACTIONS: previous unchanged'
         fi
         if [[ -n $systemd_fixture ]]; then
             tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_SYSTEMD: previous v262.1'
