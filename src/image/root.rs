@@ -108,6 +108,21 @@ impl Root {
         Ok(Self(self.dir(path)?))
     }
 
+    /// Open a Btrfs subvolume beneath a verified top-level volume.
+    pub(crate) fn subvolume(&self, path: &str) -> Result<Self> {
+        validate_path(path)?;
+        Ok(Self(
+            openat2(
+                &self.0,
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            )?
+            .into(),
+        ))
+    }
+
     pub(crate) fn ensure_dir(&self, path: &str) -> Result<Self> {
         validate_path(path)?;
         let (parent, name) = self.parent(path)?;

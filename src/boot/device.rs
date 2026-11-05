@@ -31,6 +31,24 @@ pub(super) fn mounted_esp_disk(path: &Path, locked: &File) -> Result<Option<Offl
     Ok(Some(disk))
 }
 
+pub(super) fn mounted_root_disk(
+    esp: &Path,
+    locked: &File,
+    device: &Path,
+    partuuid: &str,
+) -> Result<OfflineDisk> {
+    let esp_part = esp_partition(esp, locked)?;
+    let target = block_node(device)?;
+    let root_part = KernelPartition::read(target.metadata()?.rdev())?;
+    ensure!(
+        esp_part.disk == root_part.disk,
+        "Btrfs root and mounted ESP must be on the same GPT disk"
+    );
+    let disk = esp_part.open_disk()?;
+    disk.check_device_extents(partuuid, root_part.extent, esp_part.extent)?;
+    Ok(disk)
+}
+
 pub(super) struct DevicePartition {
     file: File,
     bytes: u64,

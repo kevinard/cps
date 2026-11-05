@@ -88,7 +88,7 @@ fn activate_disk(
         root: install,
         target: None,
     };
-    let update = systemd_boot::activate(root, &esp.tree, activation, Some(deployment))?;
+    let update = systemd_boot::activate(root, &esp.tree, activation, Some(deployment), None)?;
     if let Some(retired) = &update.retired {
         esp.remove_entry(retired)?;
     }
@@ -113,7 +113,7 @@ pub fn rollback_boot_environment_on_disk(
     let partition = stage.disk.esp(esp_partuuid)?;
     let esp = Esp::read(&stage.disk, partition, &stage.directory(), epoch)?;
     esp.read_boot_files()?;
-    let id = systemd_boot::rollback(&esp.tree, id, Some(&stage.disk))?;
+    let id = systemd_boot::rollback(&esp.tree, id, Some(&stage.disk), None)?;
     esp.write(&stage.disk, partition, ["loader/loader.conf"])?;
     stage.publish()?;
     Ok(id)

@@ -14,21 +14,22 @@ use cps::query::{
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, MarkChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
-    activate_deployed_boot_environment, activate_device_boot_environment,
-    add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
-    build_with_toolchain_config, build_with_worker, capture_boot_environment,
-    create_configured_image, create_image, deploy_and_activate_boot_environment,
-    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt,
-    export_rebuild_inputs, fetch_build_sources, fetch_plan_with_archives, fetch_sources,
-    fetch_sources_with_local, fetch_toolchain, generate_manifest_for_architecture, import_sources,
-    list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
-    list_publishers, list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
+    activate_btrfs_boot_environment, activate_deployed_boot_environment,
+    activate_device_boot_environment, add_publisher_with_build_trust, apply, archive_build_sources,
+    audit_publisher_builds, build_with_toolchain_config, build_with_worker,
+    capture_boot_environment, create_configured_image, create_image,
+    deploy_and_activate_boot_environment, deploy_boot_environment, export_boot_environment,
+    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources,
+    fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
+    generate_manifest_for_architecture, import_sources, list_boot_environments,
+    list_boot_environments_on_disk, list_config_updates, list_obsoletions, list_publishers,
+    list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
     publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
     read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
-    rollback_boot_environment_on_disk, rotate_publisher_key, set_publisher_build_trust,
-    set_publisher_repositories, stage_boot_environment, stage_btrfs_boot_environment,
-    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
-    verify_rebuild, withdraw_package,
+    rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
+    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
+    stage_btrfs_boot_environment, transaction_details, transaction_history, transaction_status,
+    verify, verify_pristine, verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -665,8 +666,32 @@ enum BootCommand {
         /// Publish the rollback in a new disk file
         #[arg(long, requires = "disk")]
         output_disk: Option<PathBuf>,
+        /// Mounted Btrfs top-level volume for checking a subvolume root
+        #[arg(long, requires = "esp", conflicts_with = "disk")]
+        btrfs_volume: Option<PathBuf>,
         /// Environment ID. Defaults to the previous known-good environment.
         id: Option<String>,
+    },
+    /// Publish a systemd-boot entry for a root on a mounted Btrfs volume
+    ActivateBtrfs {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        btrfs_volume: PathBuf,
+        #[arg(long)]
+        esp: PathBuf,
+        #[arg(long)]
+        root_partuuid: String,
+        #[arg(long, default_value = "boot/vmlinuz")]
+        kernel: String,
+        #[arg(long)]
+        initrd: Option<String>,
+        #[arg(long, default_value = "")]
+        options: String,
+        #[arg(long, default_value_t = 2)]
+        tries: u32,
+        #[arg(long)]
+        known_good: bool,
     },
     /// Clone the base image and apply a saved plan in a new directory
     Stage {
@@ -1546,6 +1571,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 disk,
                 esp_partuuid,
                 output_disk,
+                btrfs_volume,
                 id,
             } => {
                 let id = match (
@@ -1554,13 +1580,41 @@ fn run(command: Command) -> Result<ExitCode> {
                     esp_partuuid.as_deref(),
                     output_disk.as_deref(),
                 ) {
-                    (Some(esp), None, None, None) => rollback_boot_environment(esp, id.as_deref())?,
+                    (Some(esp), None, None, None) => {
+                        if let Some(volume) = btrfs_volume.as_deref() {
+                            rollback_btrfs_boot_environment(esp, volume, id.as_deref())?
+                        } else {
+                            rollback_boot_environment(esp, id.as_deref())?
+                        }
+                    }
                     (None, Some(disk), Some(partuuid), Some(output)) => {
                         rollback_boot_environment_on_disk(disk, partuuid, id.as_deref(), output)?
                     }
                     _ => anyhow::bail!("specify --esp or the offline disk and output options"),
                 };
                 println!("Selected {id} for the next boot");
+            }
+            BootCommand::ActivateBtrfs {
+                root,
+                btrfs_volume,
+                esp,
+                root_partuuid,
+                kernel,
+                initrd,
+                options,
+                tries,
+                known_good,
+            } => {
+                let activation = Activation {
+                    root_partuuid,
+                    kernel,
+                    initrd,
+                    options,
+                    tries,
+                    known_good,
+                };
+                let id = activate_btrfs_boot_environment(&root, &btrfs_volume, &esp, &activation)?;
+                println!("Activated {id}");
             }
             BootCommand::Capture { source, output } => {
                 let id = capture_boot_environment(&source, &output)?;

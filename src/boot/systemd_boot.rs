@@ -1,4 +1,4 @@
-mod policy;
+pub(super) mod policy;
 
 use std::{
     fs::{self, File},
@@ -11,6 +11,7 @@ use rustix::fs::{FlockOperation, flock};
 use tempfile::NamedTempFile;
 
 use super::{
+    btrfs_boot::{BtrfsRecord, BtrfsVolume, mark_registered},
     check_image_integrity,
     deploy::{OfflineDisk, offline_file},
     device::{is_fat, mounted_esp_disk},
@@ -57,10 +58,15 @@ pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
 }
 
 pub fn rollback_boot_environment(esp: &Path, id: Option<&str>) -> Result<String> {
-    rollback(esp, id, None)
+    rollback(esp, id, None, None)
 }
 
-pub(super) fn rollback(esp: &Path, id: Option<&str>, disk: Option<&OfflineDisk>) -> Result<String> {
+pub(super) fn rollback(
+    esp: &Path,
+    id: Option<&str>,
+    disk: Option<&OfflineDisk>,
+    volume: Option<&BtrfsVolume>,
+) -> Result<String> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let mounted = if disk.is_none() {
@@ -88,7 +94,21 @@ pub(super) fn rollback(esp: &Path, id: Option<&str>, disk: Option<&OfflineDisk>)
         }
     };
     verify_fallback_artifacts(&esp, &target.id, &target.description)?;
-    if let Some(disk) = disk.or(mounted.as_ref()) {
+    let _root_lock = if let Some(record) = &target.btrfs {
+        let volume = volume.context("use --btrfs-volume to verify this rollback root")?;
+        volume.check_disk(&esp, &lock, &target.partuuid)?;
+        let (image, revision) = policy::entry_identity(&target.id)?;
+        Some(
+            volume
+                .verify(record, image, revision)
+                .context("checking the Btrfs rollback root")?,
+        )
+    } else {
+        None
+    };
+    if target.btrfs.is_none()
+        && let Some(disk) = disk.or(mounted.as_ref())
+    {
         let (image, revision) = policy::entry_identity(&target.id)?;
         disk.verify_filesystem(&target.partuuid, image, revision)
             .context("checking the rollback root partition")?;
@@ -152,7 +172,7 @@ pub fn activate_boot_environment(
     esp: &Path,
     activation: &Activation,
 ) -> Result<String> {
-    Ok(activate(root, esp, activation, None)?.id)
+    Ok(activate(root, esp, activation, None, None)?.id)
 }
 
 /// Activate an environment after verifying its deployed root in an offline disk.
@@ -170,7 +190,7 @@ pub fn activate_deployed_boot_environment(
         root: None,
         target: None,
     };
-    Ok(activate(root, esp, activation, Some(deployment))?.id)
+    Ok(activate(root, esp, activation, Some(deployment), None)?.id)
 }
 
 /// Deploy or verify an inactive partition before publishing its boot entry.
@@ -191,7 +211,7 @@ pub fn activate_device_boot_environment(
         root: root_deployment,
         target: Some(&target),
     };
-    Ok(activate(root, esp, activation, Some(deployment))?.id)
+    Ok(activate(root, esp, activation, Some(deployment), None)?.id)
 }
 
 pub(super) struct ActivationUpdate {
@@ -210,6 +230,7 @@ pub(super) fn activate(
     esp: &Path,
     activation: &Activation,
     deployment: Option<Deployment<'_>>,
+    volume: Option<&BtrfsVolume>,
 ) -> Result<ActivationUpdate> {
     let partuuid = canonical_partuuid(&activation.root_partuuid)?;
     validate_options(&activation.options)?;
@@ -227,7 +248,21 @@ pub(super) fn activate(
         "use separate, inactive image and EFI directories"
     );
     let image = Image::open_query(&root)?;
-    image.root.offline_path()?;
+    if volume.is_none() || !activation.known_good {
+        image.root.offline_path()?;
+    }
+    let btrfs = volume
+        .map(|volume| volume.record(&image.root, &root))
+        .transpose()?;
+    if btrfs.is_some() {
+        ensure!(
+            !activation
+                .options
+                .split_ascii_whitespace()
+                .any(|arg| arg.starts_with("rootflags=") || arg.starts_with("rootfstype=")),
+            "Btrfs activation supplies rootflags and rootfstype"
+        );
+    }
     check_image_integrity(&image)?;
     let state = image.state()?;
     let settings = &state.settings;
@@ -312,7 +347,9 @@ pub(super) fn activate(
         None
     };
     let _lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
-    if let Some(target) = deployment.and_then(|deployment| deployment.target) {
+    if let Some(volume) = volume {
+        volume.check_disk(&esp, &_lock, &partuuid)?;
+    } else if let Some(target) = deployment.and_then(|deployment| deployment.target) {
         target.check_esp(&esp, &_lock)?;
     } else {
         ensure!(
@@ -340,6 +377,7 @@ pub(super) fn activate(
             fallback.as_deref()
         },
         options: &activation.options,
+        btrfs: btrfs.as_ref(),
         linux_sha256: &linux_sha256,
         initrd_sha256: initrd_sha256.as_deref(),
         record_hashes,
@@ -390,6 +428,7 @@ pub(super) fn activate(
         );
     }
     let mut retired = None;
+    let mut _fallback_lock = None;
     if let Some(fallback) = fallback.as_deref().filter(|_| select_trial) {
         let base = find_known_good(&existing, fallback)
             .context("the base must have a known-good boot entry")?;
@@ -401,6 +440,19 @@ pub(super) fn activate(
             "select the known-good base environment {fallback} before activating its upgrade"
         );
         verify_fallback_artifacts(&esp, fallback, &base.description)?;
+        if let Some(volume) = volume {
+            let record = base
+                .btrfs
+                .as_ref()
+                .context("the fallback must be a verified Btrfs environment")?;
+            volume.check_disk(&esp, &_lock, &base.partuuid)?;
+            let (image, revision) = policy::entry_identity(&base.id)?;
+            _fallback_lock = Some(
+                volume
+                    .verify(record, image, revision)
+                    .context("checking the Btrfs fallback root")?,
+            );
+        }
         if let Some(replace) = replace {
             ensure!(
                 replace != base.id && partuuid != base.partuuid,
@@ -422,7 +474,11 @@ pub(super) fn activate(
         ensure!(
             !existing.iter().any(|entry| entry.id != id
                 && Some(entry.id.as_str()) != replace
-                && entry.partuuid == partuuid),
+                && entry.partuuid == partuuid
+                && !matches!((&entry.btrfs, &btrfs), (Some(existing), Some(candidate))
+                    if existing.fsid == candidate.fsid
+                        && existing.subvolid != candidate.subvolid
+                        && existing.uuid != candidate.uuid)),
             "each environment requires a distinct root PARTUUID"
         );
     } else if existing_entry.is_none() {
@@ -478,6 +534,9 @@ pub(super) fn activate(
                 .disk
                 .verify_filesystem(&partuuid, &image_id, settings.revision)?;
         }
+    }
+    if btrfs.is_some() {
+        mark_registered(&image.root, &id)?;
     }
     let loader = ensure_dir(&esp, "loader")?;
     let entries = ensure_dir(&loader, "entries")?;
@@ -609,6 +668,7 @@ struct Entry<'a> {
     revision: u64,
     partuuid: &'a str,
     options: &'a str,
+    btrfs: Option<&'a BtrfsRecord>,
     parent: Option<&'a str>,
     linux_sha256: &'a str,
     initrd_sha256: Option<&'a str>,
@@ -623,6 +683,7 @@ impl Entry<'_> {
             revision,
             partuuid,
             options,
+            btrfs,
             parent,
             linux_sha256,
             initrd_sha256,
@@ -648,9 +709,16 @@ impl Entry<'_> {
                 entry.push_str(&format!("{INITRD_HASH}{initrd_sha256}\n"));
             }
         }
-        entry.push_str(&format!(
-            "options root=PARTUUID={partuuid} rootwait {options}\n"
-        ));
+        if let Some(btrfs) = btrfs {
+            entry.push_str(&btrfs.render());
+            entry.push_str(&format!(
+                "options root=PARTUUID={partuuid} rootwait rootfstype=btrfs rootflags=subvolid={} {options}\n", btrfs.subvolid
+            ));
+        } else {
+            entry.push_str(&format!(
+                "options root=PARTUUID={partuuid} rootwait {options}\n"
+            ));
+        }
         entry
     }
 }

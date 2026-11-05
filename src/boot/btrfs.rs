@@ -116,6 +116,7 @@ fn snapshot_environment(source: &Path, output: &Path, plan: Option<&Plan>) -> Re
         check_image_integrity(&captured).context("verifying the captured root")?;
         drop(captured);
         let id = if let Some(plan) = plan {
+            super::btrfs_boot::clear_registration(&Root::open(&scratch.path().join("root"))?)?;
             finish_staged_root(
                 &scratch.path().join("root"),
                 BootParent {

@@ -11,6 +11,10 @@ kernel=${CPS_VM_KERNEL:-/boot/vmlinuz-linux}
 busybox=${CPS_VM_BUSYBOX:-/usr/lib/initcpio/busybox}
 btrfs=$(realpath -- "${CPS_VM_BTRFS:?Set CPS_VM_BTRFS to a trusted btrfs executable}")
 formatter=${CPS_VM_MKFS_BTRFS:?Set CPS_VM_MKFS_BTRFS to a trusted mkfs.btrfs executable}
+native_boot=${CPS_VM_BTRFS_BOOT:-0}
+health_fail=${CPS_VM_BTRFS_HEALTH_FAIL:-0}
+root_device=/dev/vda
+root_uuid=7adff456-af50-498f-b39a-dcf87cb4a7c1
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
@@ -40,11 +44,108 @@ strip --strip-debug -o "$root/usr/bin/cps" "$cps"
 copy_runtime_deps "$root" "$cps"
 cp "$btrfs" "$root/usr/bin/btrfs"
 copy_runtime_deps "$root" "$btrfs"
-for tool in cp mke2fs e2fsck mount umount find sha256sum; do
+for tool in cp mke2fs e2fsck mount umount find sha256sum sfdisk flock; do
     binary=$(command -v "$tool")
     cp "$binary" "$root/usr/bin/$tool"
     copy_runtime_deps "$root" "$binary"
 done
+if [[ $native_boot == 1 ]]; then
+    setup_systemd_guest "$root"
+    mkdir -p "$root"/{volume,efi,boot,run,var/tmp}
+    cp "$kernel" "$root/boot/vmlinuz"
+    cp "$project/packaging/systemd/cps-boot-health.service" "$root/usr/lib/systemd/system/"
+    mkdir -p "$root/usr/lib/systemd/system/boot-complete.target.requires"
+    ln -s ../cps-boot-health.service "$root/usr/lib/systemd/system/boot-complete.target.requires/"
+    cat > "$root/etc/cps-btrfs-boot" <<GUEST
+root_device=/dev/vda2
+root_uuid=$root_uuid
+GUEST
+    root_device=/dev/vda2
+    if [[ $health_fail == 1 ]]; then touch "$root/etc/cps-btrfs-fail-health"; fi
+    cat > "$root/init-systemd" <<'GUEST'
+#!/bin/sh
+set -eu
+bb=/bin/busybox
+export PATH=/usr/bin:/bin
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+while read -r module name; do insmod "$module"; done < "/vm-modules/$($bb uname -r)/load"
+mount -t vfat /dev/vda1 /efi
+mount -t btrfs -o subvolid=5 /dev/vda2 /volume
+if [ -f /etc/cps-btrfs-fail-health ] && [ "$($bb cat /etc/cps-capture-version)" = 2.0.0-0 ]; then
+    $bb chmod 0600 /volume/@captures/trial/root/etc/cps-capture-version
+fi
+flags=
+for arg in $($bb cat /proc/cmdline); do
+    case "$arg" in rootflags=*) flags=$arg ;; esac
+done
+test -n "$flags"
+for entry in /efi/loader/entries/cps-*+*.conf; do
+    test -f "$entry" || continue
+    if $bb grep -F " $flags " "$entry"; then : > /run/cps-vm-counted; fi
+done
+exec /usr/lib/systemd/systemd
+GUEST
+    cat > "$root/usr/local/libexec/cps-vm-observe" <<'GUEST'
+#!/bin/sh
+set -eu
+bb=/bin/busybox
+export PATH=/usr/bin:/bin
+version=$($bb cat /etc/cps-capture-version)
+if [ "$version" = 2.0.0-0 ] && [ -f /etc/cps-btrfs-fail-health ]; then
+    if cps verify --root / > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'etc/cps-capture-version' /run/rejected
+    systemctl is-failed --quiet cps-boot-health.service
+    if systemctl is-active --quiet systemd-bless-boot.service; then exit 1; fi
+    echo 'CPS_VM_BTRFS_BOOT: trial health failed without blessing'
+    $bb sync
+    exec $bb reboot -f
+fi
+cps verify --root /
+if [ "$version" = 2.0.0-0 ]; then
+    test "$($bb cat /etc/cps-capture-local)" = 'captured local state'
+    if [ -f /run/cps-vm-counted ]; then
+        systemctl is-active --quiet cps-boot-health.service
+        systemctl is-active --quiet systemd-bless-boot.service
+        echo 'CPS_VM_BTRFS_BOOT: trial blessed'
+    else
+        echo 'CPS_VM_BTRFS_BOOT: trial default after reboot'
+        cps boot-env list --esp /efi
+        before=$(sha256sum /efi/loader/loader.conf)
+        if cps boot-env rollback --esp /efi > /run/rejected 2>&1; then exit 1; fi
+        $bb grep -F 'use --btrfs-volume' /run/rejected
+        test "$(sha256sum /efi/loader/loader.conf)" = "$before"
+        parent=$($bb cat /volume/@captures/base-id)
+        entry="/efi/loader/entries/$parent.conf"
+        $bb cp "$entry" /run/base-entry
+        $bb sed 's/^# cps-btrfs-uuid .*/# cps-btrfs-uuid 11111111-1111-4111-8111-111111111111/' /run/base-entry > "$entry"
+        if cps boot-env rollback --esp /efi --btrfs-volume /volume > /run/rejected 2>&1; then exit 1; fi
+        $bb grep -F 'Btrfs subvolume identity differs' /run/rejected
+        test "$(sha256sum /efi/loader/loader.conf)" = "$before"
+        $bb cat /run/base-entry > "$entry"
+        cps boot-env rollback --esp /efi --btrfs-volume /volume
+    fi
+    $bb sync
+    exec $bb reboot -f
+fi
+test "$version" = 1.0.0-0
+test "$($bb cat /etc/cps-capture-local)" = 'running local state'
+if [ -f /etc/cps-btrfs-fail-health ]; then
+    echo 'CPS_VM_BTRFS_BOOT: previous root after exhausted trial'
+else
+    echo 'CPS_VM_BTRFS_BOOT: previous root after rollback'
+fi
+$bb sync
+exec $bb poweroff -f
+GUEST
+    chmod +x "$root/init-systemd"
+fi
 cat > "$root/init" <<'GUEST'
 #!/bin/sh
 set -eu
@@ -55,7 +156,14 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
-mount -t btrfs -o subvol=@captures /dev/vda /captures
+root_device=/dev/vda
+if [ -f /etc/cps-btrfs-boot ]; then
+    . /etc/cps-btrfs-boot
+    while read -r module name; do insmod "$module"; done < "/vm-modules/$($bb uname -r)/load"
+    mount -t vfat /dev/vda1 /efi
+    mount -t btrfs -o subvolid=5 "$root_device" /volume
+fi
+mount -t btrfs -o subvol=@captures "$root_device" /captures
 mount -t ext4 /dev/vdb /scratch
 cps publisher set-repository --root / --repo test=/repository
 cps plan --root / --output /captures/upgrade.json update
@@ -135,8 +243,51 @@ cps boot-env export --root "$stage" --output /scratch/root.ext4 --size-mib 256 \
     --receipt > /scratch/root.kdl
 test "$($bb cat "$stage/etc/cps-capture-local")" = 'captured local state'
 echo 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root'
+if [ -f /etc/cps-btrfs-boot ]; then
+    base=$(cps boot-env activate-btrfs --known-good --root /volume/@ --btrfs-volume /volume \
+        --esp /efi --root-partuuid "$root_uuid" --options 'console=ttyS0 loglevel=3 init=/init-systemd')
+    base=${base#Activated }
+    echo "$base" > /captures/base-id
+    cps boot-env capture --source / --output /captures/protected
+    cps boot-env stage-btrfs --source /captures/protected/root --output /captures/protected-trial /captures/upgrade.json
+    test "$($bb cat /captures/protected-trial/root/etc/cps-capture-version)" = 2.0.0-0
+    btrfs subvolume delete /captures/protected-trial/root /captures/protected/root
+    $bb rmdir /captures/protected-trial /captures/protected
+    before=$(sha256sum /efi/loader/loader.conf)
+    if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume/@ \
+        --esp /efi --root-partuuid "$root_uuid" > /tmp/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'top-level subvolume' /tmp/rejected
+    test "$(sha256sum /efi/loader/loader.conf)" = "$before"
+    cps plan --root /volume/@captures/trial/root --output /tmp/mark.json mark explicit test/live-root
+    staged_state=$(sha256sum /volume/@captures/trial/root/.cps/state.sqlite)
+    $bb mkfifo /tmp/release
+    flock --shared /volume/@captures/trial/root/.cps/lock sh -c ': > /tmp/locked; read released < /tmp/release' &
+    holding=$!
+    while [ ! -e /tmp/locked ]; do $bb sleep 0.01; done
+    cps apply --root /volume/@captures/trial/root /tmp/mark.json > /tmp/race-rejected 2>&1 &
+    applying=$!
+    attempts=0
+    while ! $bb grep -q locks "/proc/$applying/wchan"; do
+        attempts=$((attempts + 1))
+        test "$attempts" -lt 1000
+        $bb sleep 0.01
+    done
+    cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume \
+        --esp /efi --root-partuuid "$root_uuid" --options 'console=ttyS0 loglevel=3 init=/init-systemd'
+    echo released > /tmp/release
+    wait "$holding"
+    if wait "$applying"; then exit 1; fi
+    $bb grep -F 'registered Btrfs root' /tmp/race-rejected
+    if cps apply --root /volume/@captures/trial/root /tmp/mark.json > /tmp/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'registered Btrfs root' /tmp/rejected
+    test "$(sha256sum /volume/@captures/trial/root/.cps/state.sqlite)" = "$staged_state"
+    cps boot-env list --esp /efi
+    umount /efi
+    umount /volume
+fi
 umount /scratch
 umount /captures
+$bb sync
 GUEST
 cat > "$root/init-trial" <<'GUEST'
 #!/bin/sh
@@ -169,6 +320,24 @@ GUEST
 chmod +x "$root/init" "$root/init-trial" "$root/init-original"
 truncate -s 512M source.btrfs
 "$formatter" -q -f --rootdir files --subvol default:@ --subvol rw:@captures source.btrfs
+root_drive=source.btrfs
+if [[ $native_boot == 1 ]]; then
+    truncate -s 640M disk.raw
+    sfdisk --quiet disk.raw <<PARTITIONS
+label: gpt
+unit: sectors
+start=2048,size=196608,type=uefi,uuid=9a138d0b-f9aa-4a2a-b527-93392ad7e812
+start=198656,size=1048576,type=linux,uuid=$root_uuid
+PARTITIONS
+    mkdir -p esp/EFI/BOOT
+    cp "${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}" esp/EFI/BOOT/BOOTX64.EFI
+    truncate -s 96M esp.fat
+    mkfs.fat -F 32 esp.fat >/dev/null
+    mcopy -s -i esp.fat esp/EFI ::/
+    dd if=esp.fat of=disk.raw bs=1M seek=1 conv=notrunc,sparse status=none
+    dd if=source.btrfs of=disk.raw bs=1M seek=97 conv=notrunc,sparse status=none
+    root_drive=disk.raw
+fi
 truncate -s 768M scratch.ext4
 mke2fs -q -F -t ext4 scratch.ext4
 data_args=()
@@ -183,13 +352,32 @@ run() {
     tr -d '\r' < "$log" > "$log.clean"
     cat "$log.clean"
 }
-run capture.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@ rootwait rw init=/init' \
+run capture.log "$root_drive" "root=$root_device rootfstype=btrfs rootflags=subvol=@ rootwait rw init=/init" \
     -drive if=virtio,format=raw,file=scratch.ext4
 grep -Fx 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root' capture.log.clean
-run native.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@captures/trial/root rootwait ro init=/init-trial'
-grep -Fx 'CPS_VM_CAPTURE_BOOT: booted the upgrade prepared from the running Btrfs root' native.log.clean
-run original.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@ rootwait ro init=/init-original'
-grep -Fx 'CPS_VM_BTRFS_ORIGINAL: booted the previous root after staging its upgrade' original.log.clean
+if [[ $native_boot == 1 ]]; then
+    cp "${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS}" vars.fd
+    timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${data_args[@]}" \
+        -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
+        -serial file:uefi.log \
+        -drive "if=pflash,format=raw,readonly=on,file=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE}" \
+        -drive if=pflash,format=raw,file=vars.fd -drive if=virtio,format=raw,file=disk.raw || { cat uefi.log; exit 1; }
+    tr -d '\r' < uefi.log > uefi.log.clean
+    cat uefi.log.clean
+    if [[ $health_fail == 1 ]]; then
+        test "$(grep -Fxc 'CPS_VM_BTRFS_BOOT: trial health failed without blessing' uefi.log.clean)" = 2
+        grep -Fx 'CPS_VM_BTRFS_BOOT: previous root after exhausted trial' uefi.log.clean
+    else
+        grep -Fx 'CPS_VM_BTRFS_BOOT: trial blessed' uefi.log.clean
+        grep -Fx 'CPS_VM_BTRFS_BOOT: trial default after reboot' uefi.log.clean
+        grep -Fx 'CPS_VM_BTRFS_BOOT: previous root after rollback' uefi.log.clean
+    fi
+else
+    run native.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@captures/trial/root rootwait ro init=/init-trial'
+    grep -Fx 'CPS_VM_CAPTURE_BOOT: booted the upgrade prepared from the running Btrfs root' native.log.clean
+    run original.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@ rootwait ro init=/init-original'
+    grep -Fx 'CPS_VM_BTRFS_ORIGINAL: booted the previous root after staging its upgrade' original.log.clean
+fi
 debugfs -R "dump /root.ext4 $work/staged.ext4" scratch.ext4
 test -f staged.ext4
 run boot.log staged.ext4 'root=/dev/vda rootfstype=ext4 rootwait ro init=/init-trial'

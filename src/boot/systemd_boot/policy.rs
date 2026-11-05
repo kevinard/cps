@@ -8,6 +8,7 @@ use anyhow::{Context, Result, ensure};
 use tempfile::NamedTempFile;
 
 use super::{canonical_partuuid, read_regular};
+use crate::boot::btrfs_boot::BtrfsRecord;
 
 const OPTIONS: &str = "timeout 0\neditor no\nauto-entries no\nauto-firmware no\n";
 const AUTO: &str = "default cps-*.conf\n";
@@ -149,6 +150,7 @@ pub(super) struct BootEntry {
     pub title: String,
     pub partuuid: String,
     pub parent: Option<String>,
+    pub btrfs: Option<BtrfsRecord>,
 }
 
 pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
@@ -187,15 +189,16 @@ pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
         let path = entry.path();
         let description =
             String::from_utf8(read_regular(&path)?.context("boot entry disappeared")?)?;
-        let title = field(&description, "title ")?
+        let title = boot_field(&description, "title")?
             .context("CPS boot entry has no title")?
             .to_owned();
         ensure!(
-            field(&description, "sort-key ")? == Some("cps")
-                && field(&description, "version ")? == Some(revision.to_string().as_str()),
+            boot_field(&description, "sort-key")? == Some("cps")
+                && boot_field(&description, "version")? == Some(revision.to_string().as_str()),
             "boot entry sort key or version differs from CPS policy: {id}"
         );
-        let options = field(&description, "options ")?.context("CPS boot entry has no options")?;
+        let options =
+            boot_field(&description, "options")?.context("CPS boot entry has no options")?;
         let mut roots = options
             .split_ascii_whitespace()
             .filter_map(|arg| arg.strip_prefix("root="));
@@ -216,6 +219,7 @@ pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
             );
         }
         let parent = parent.map(str::to_owned);
+        let btrfs = BtrfsRecord::parse(&description, options)?;
         entries.push(BootEntry {
             path,
             id: id.to_owned(),
@@ -225,19 +229,30 @@ pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
             title,
             partuuid,
             parent,
+            btrfs,
         });
     }
     entries.sort_by(|a, b| (b.revision, &b.id).cmp(&(a.revision, &a.id)));
     Ok(entries)
 }
 
-pub(super) fn field<'a>(entry: &'a str, prefix: &str) -> Result<Option<&'a str>> {
+pub(in crate::boot) fn field<'a>(entry: &'a str, prefix: &str) -> Result<Option<&'a str>> {
     let mut values = entry.lines().filter_map(|line| line.strip_prefix(prefix));
     let value = values.next();
     ensure!(
         values.next().is_none(),
         "duplicate boot entry field {prefix}"
     );
+    Ok(value)
+}
+
+fn boot_field<'a>(entry: &'a str, key: &str) -> Result<Option<&'a str>> {
+    let mut values = entry.lines().filter_map(|line| {
+        let (name, value) = line.trim_ascii_start().split_once([' ', '\t'])?;
+        (name == key).then(|| value.trim_ascii())
+    });
+    let value = values.next();
+    ensure!(values.next().is_none(), "duplicate boot entry field {key}");
     Ok(value)
 }
 
@@ -268,5 +283,26 @@ fn directory_exists(path: &Path) -> Result<bool> {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::boot_field;
+
+    #[test]
+    fn boot_options_reject_duplicates_with_alternate_whitespace() -> anyhow::Result<()> {
+        assert_eq!(
+            boot_field("\toptions\troot=PARTUUID=test  \n", "options")?,
+            Some("root=PARTUUID=test")
+        );
+        assert!(
+            boot_field(
+                "options root=PARTUUID=test\n\toptions\trootflags=subvolid=278\n",
+                "options"
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

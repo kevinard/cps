@@ -537,6 +537,7 @@ impl Image {
             Root::open(path)?,
             exclusive,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            false,
         )
     }
 
@@ -545,16 +546,29 @@ impl Image {
     }
 
     pub(crate) fn open_query_root(root: Root) -> Result<Self> {
-        Self::open_database(root, false, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        Self::open_database(
+            root,
+            false,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            false,
+        )
     }
 
     pub(crate) fn open_for_apply(path: &Path) -> Result<Self> {
-        let root = Root::open(path)?;
-        crate::boot::check_package_write_root(&root)?;
-        Self::open_database(root, true, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        Self::open_database(
+            Root::open(path)?,
+            true,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            true,
+        )
     }
 
-    fn open_database(root: Root, exclusive: bool, flags: rusqlite::OpenFlags) -> Result<Self> {
+    fn open_database(
+        root: Root,
+        exclusive: bool,
+        flags: rusqlite::OpenFlags,
+        package_write: bool,
+    ) -> Result<Self> {
         let state_dir = root.dir(".cps").context("opening image state")?;
         let lock = root.file(".cps/lock")?;
         flock(
@@ -565,6 +579,9 @@ impl Image {
                 FlockOperation::LockShared
             },
         )?;
+        if package_write {
+            crate::boot::check_package_write_root(&root)?;
+        }
         root.file(".cps/state.sqlite")?;
         let db =
             Connection::open_with_flags(Root::fd_path(&state_dir).join("state.sqlite"), flags)?;

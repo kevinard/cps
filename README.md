@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-32`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-33`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1469,7 +1469,6 @@ verification. A failed transaction deletes the private subvolume. The new
 root is writable for configuration review and boot.
 
 Both the captured baseline and a staged Btrfs root can be exported as ext4.
-Selecting Btrfs roots through CPS boot activation needs further implementation.
 
 Run `tests/boot-capture-vm.sh` with `CPS_VM_BTRFS` and
 `CPS_VM_MKFS_BTRFS` set to trusted Btrfs utilities, QEMU, and a kernel
@@ -1479,6 +1478,52 @@ read-only capture intact, and checks failed and concurrent staging. It boots
 the staged Btrfs subvolume, the previous root, and the exported ext4 root.
 It uses the same `CPS_BIN`, `CPS_VM_QEMU`, `CPS_VM_QEMU_DATA`,
 `CPS_VM_KERNEL`, and `CPS_VM_BUSYBOX` overrides as the boot fixture.
+
+### Activating Btrfs roots
+
+Use a single-device Btrfs filesystem directly on a GPT Linux filesystem
+partition, with the writable VFAT ESP on the same disk. Mount the Btrfs
+top-level subvolume (ID 5) read-write so CPS can verify and register named
+roots beneath it.
+The commands use the disk's 512-byte logical sector layout.
+
+```sh
+mount -t btrfs -o subvolid=5 "/dev/disk/by-partuuid/$root_partuuid" /mnt/cps-volume
+cps boot-env activate-btrfs --known-good --root /mnt/cps-volume/@ \
+    --btrfs-volume /mnt/cps-volume --esp /efi --root-partuuid "$root_partuuid"
+cps boot-env activate-btrfs --root /mnt/cps-volume/@captures/trial/root \
+    --btrfs-volume /mnt/cps-volume --esp /efi --root-partuuid "$root_partuuid"
+cps boot-env list --esp /efi
+cps boot-env rollback --esp /efi --btrfs-volume /mnt/cps-volume
+```
+
+Register the original known-good root before activating its staged upgrade.
+Bootstrap can read the running root through its top-level path. Each entry
+records the filesystem UUID, subvolume UUID and ID, and root path. CPS
+compares the mounted filesystem's device with the GPT root partition and
+ESP, checks the CPS image identity and revision, and verifies the fallback
+root and its boot artifacts. The kernel receives the recorded subvolume ID
+through `rootflags`. Keep registered paths stable so rollback can check
+their identities and installed contents.
+[Btrfs ioctl documentation](https://btrfs.readthedocs.io/en/stable/btrfs-ioctl.html)
+
+Native activation marks the root with the `user.cps.boot-environment`
+extended attribute before publishing its boot entry. CPS checks that mark
+under the image's exclusive lock before applying package transactions.
+`stage-btrfs` clears the inherited mark on its private writable snapshot.
+Activation retries accept the matching registration. If activation fails
+after marking the root, rerun it to finish registration.
+
+The package's health service and systemd blessing apply to Btrfs trials.
+Set `CPS_VM_BTRFS_BOOT=1` on `tests/boot-capture-vm.sh`, provide
+`CPS_VM_OVMF_CODE`, `CPS_VM_OVMF_VARS`, and a trusted
+`CPS_VM_SYSTEMD_BOOT` EFI binary, and use the installed systemd runtime.
+This mode tests activation, a transaction waiting while registration
+completes, blessing, the trial's default on reboot, rejection of altered
+subvolume metadata, and rollback to the previous root.
+Add `CPS_VM_BTRFS_HEALTH_FAIL=1` to change a managed file's metadata at
+trial boot and verify that two unblessed attempts fall back to the original
+subvolume.
 
 ### Activating a trial on an installed disk
 

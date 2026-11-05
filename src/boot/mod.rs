@@ -1,4 +1,5 @@
 mod btrfs;
+mod btrfs_boot;
 mod deploy;
 mod device;
 mod esp;
@@ -32,6 +33,7 @@ use crate::{
 };
 
 pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
+pub use btrfs_boot::{activate_btrfs_boot_environment, rollback_btrfs_boot_environment};
 pub use deploy::deploy_boot_environment;
 pub use esp::{
     activate_boot_environment_on_disk, deploy_and_activate_boot_environment,
@@ -239,8 +241,16 @@ pub(crate) fn check_package_write_root(root: &Root) -> Result<()> {
     root.offline_path()
         .context("use boot-env stage to prepare package changes from an installed root")?;
     let directory = root.as_file();
+    let filesystem = fstatfs(directory)?.f_type;
+    if directory.metadata()?.ino() == 256 && filesystem == libc::BTRFS_SUPER_MAGIC {
+        ensure!(
+            !btrfs_boot::registered(root)?,
+            "use boot-env stage-btrfs to prepare package changes from a registered Btrfs root"
+        );
+        return Ok(());
+    }
     // Inode 2 is the ext4 filesystem root, including through a bind mount.
-    if directory.metadata()?.ino() != 2 || fstatfs(directory)?.f_type != libc::EXT4_SUPER_MAGIC {
+    if directory.metadata()?.ino() != 2 || filesystem != libc::EXT4_SUPER_MAGIC {
         return Ok(());
     }
     const GETFSLABEL: Opcode = opcode::read::<[u8; 256]>(0x94, 49);
