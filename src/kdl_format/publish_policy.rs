@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -19,8 +19,14 @@ pub(crate) struct PublishPolicy {
     pub publisher: String,
     pub builder_keys: BTreeSet<String>,
     pub minimum_builders: usize,
-    pub recipes: BTreeMap<String, String>,
+    pub recipes: BTreeMap<String, RecipeApproval>,
+    pub verify_toolchains: bool,
     pub profiles: BTreeMap<String, Profile>,
+}
+
+pub(crate) struct RecipeApproval {
+    pub sha256: String,
+    pub toolchain_config: Option<PathBuf>,
 }
 
 pub(crate) struct Profile {
@@ -168,8 +174,18 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
         "expected schema-version and publisher nodes"
     );
     let node = one(&doc, "publisher")?;
-    let fields = Fields::read(node, 1, &["minimum-builders"], true)?;
+    let fields = Fields::read(node, 1, &["minimum-builders", "verify-toolchains"], true)?;
     let publisher = fields.string_arg(0)?;
+    let verify_toolchains = fields
+        .properties
+        .get("verify-toolchains")
+        .map(|value| {
+            value
+                .as_bool()
+                .context("verify-toolchains must be #true or #false")
+        })
+        .transpose()?
+        .unwrap_or(false);
     let minimum_builders = fields.integer("minimum-builders")?.unwrap_or(1);
     ensure!(
         (1..=MAX_BUILDERS).contains(&minimum_builders),
@@ -190,15 +206,38 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
                 );
             }
             "approve" => {
-                let fields = Fields::read(node, 1, &["version", "sha256"], false)?;
+                let fields =
+                    Fields::read(node, 1, &["version", "sha256", "toolchain-config"], false)?;
                 let name = fields.string_arg(0)?;
                 validate_name(&name)?;
                 let version: Version = fields.required_string("version")?.parse()?;
                 let digest = fields.required_string("sha256")?;
                 validate_digest(&digest).context("invalid approved recipe digest")?;
                 let id = format!("cps://{publisher}/{name}@{version}");
+                let toolchain_config = fields
+                    .string("toolchain-config")?
+                    .map(|path| -> Result<PathBuf> {
+                        ensure!(
+                            !path.is_empty(),
+                            "empty toolchain configuration path for {id}"
+                        );
+                        Ok(parent.join(path))
+                    })
+                    .transpose()?;
                 ensure!(
-                    recipes.insert(id.clone(), digest).is_none(),
+                    !verify_toolchains || toolchain_config.is_some(),
+                    "publish policy requires a toolchain configuration for {id}"
+                );
+                ensure!(
+                    recipes
+                        .insert(
+                            id.clone(),
+                            RecipeApproval {
+                                sha256: digest,
+                                toolchain_config
+                            }
+                        )
+                        .is_none(),
                     "duplicate approval for {id}"
                 );
             }
@@ -221,6 +260,7 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
         builder_keys,
         minimum_builders,
         recipes,
+        verify_toolchains,
         profiles,
     })
 }

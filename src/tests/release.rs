@@ -79,6 +79,161 @@ fn attach_evidence(
     Ok((id, envelope))
 }
 
+#[test]
+fn publisher_independently_checks_the_signed_toolchain_closure() -> Result<()> {
+    use crate::attestation::{PinnedPackage, PinnedToolchain};
+    use crate::kdl_format::build::PublisherPin;
+
+    let f = Fixture::new()?;
+    let seed = Fixture::new()?;
+    let tools = Fixture::new()?;
+    let builder = Fixture::new()?;
+    let library = "build/library";
+    let compiler = "build/compiler";
+    seed.package_as("seed", library, "1.0.0-0", String::new())?;
+    seed.package_as("seed", library, "2.0.0-0", String::new())?;
+    tools.package_as(
+        "tools",
+        compiler,
+        "1.0.0-0",
+        format!("    require {library:?}\n"),
+    )?;
+    let sources = [("seed", &seed), ("tools", &tools)]
+        .into_iter()
+        .map(|(name, source)| -> Result<_> {
+            let key = read_key(&source.public)?;
+            let release = snapshot(&source.repo, name, &key, None)?;
+            Ok((
+                PublisherPin {
+                    name: name.to_owned(),
+                    catalog_sha256: release.sha256,
+                    key_sha256: digest(&key),
+                },
+                release.packages,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let package = |name: &str, version: &str| {
+        let published = sources
+            .iter()
+            .flat_map(|(_, packages)| packages)
+            .find(|pkg| pkg.manifest.name == name && pkg.manifest.version.to_string() == version)
+            .unwrap();
+        PinnedPackage {
+            publisher: published.manifest.publisher.clone(),
+            version: published.manifest.version,
+            sha256: published.sha256.clone(),
+        }
+    };
+    let config = f._dir.path().join("toolchain.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+publisher "tools" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            seed.repo, seed.public, tools.repo, tools.public
+        ),
+    )?;
+    let bundle = f._dir.path().join("bundle");
+    fs::create_dir_all(bundle.join("proto"))?;
+    let manifest =
+        b"schema-version 1\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
+    fs::write(bundle.join("manifest.kdl"), manifest)?;
+    let mut recipe =
+        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {\n    toolchain solver=\"sat-v1\" {\n"
+            .to_owned();
+    for (pin, _) in &sources {
+        recipe.push_str(&format!(
+            "        publisher {:?} catalog={:?} key-sha256={:?}\n",
+            pin.name, pin.catalog_sha256, pin.key_sha256
+        ));
+    }
+    recipe.push_str(&format!(
+        "        package \"cps://tools/{compiler}@1.0.0-0\"\n    }}\n    manifest \"manifest.kdl\" sha256={:?}\n    script \"true\"\n}}\n",
+        digest(manifest),
+    ));
+    let reviewed = digest(recipe.as_bytes());
+    fs::write(bundle.join("build.kdl"), &recipe)?;
+    let sign = |library_version: Option<&str>| -> Result<()> {
+        let mut package_manifests =
+            BTreeMap::from([(compiler.to_owned(), package(compiler, "1.0.0-0"))]);
+        if let Some(version) = library_version {
+            package_manifests.insert(library.to_owned(), package(library, version));
+        }
+        let envelope = attestation::sign(
+            &read_signing_key(&builder.private)?,
+            &parse_manifest(std::str::from_utf8(manifest)?)?,
+            manifest,
+            &build::parse(&recipe)?,
+            recipe.as_bytes(),
+            Toolchain::Pinned(PinnedToolchain {
+                publishers: sources.iter().map(|(pin, _)| pin.clone()).collect(),
+                package_manifests,
+            }),
+            &BTreeMap::new(),
+        )?;
+        fs::write(bundle.join("attestation.json"), envelope)?;
+        Ok(())
+    };
+    // A higher version on the current pointer cannot change a reviewed pin.
+    seed.package_as("seed", library, "3.0.0-0", String::new())?;
+    fs::create_dir(&f.repo)?;
+    let policy = f.repo.join("publish-policy.kdl");
+    let write_policy = |strict: bool| {
+        let setting = if strict { "#true" } else { "#false" };
+        fs::write(
+            &policy,
+            format!(
+                r#"schema-version 1
+publisher "canopa" verify-toolchains={setting} {{
+    builder-key {:?}
+    approve "test/compiled" version="1.0.0-0" sha256="{reviewed}" toolchain-config="../toolchain.kdl"
+}}
+"#,
+                builder.public
+            ),
+        )
+    };
+    write_policy(true)?;
+    let publish = || publish_bundle(&f.repo, &bundle, &f.private, &builder.public, &reviewed);
+    let release = f._dir.path().join("release.kdl");
+    fs::copy(&builder.public, f._dir.path().join("builder.der"))?;
+    fs::write(
+        &release,
+        format!(
+            r#"schema-version 1
+release "canopa" base="empty" {{
+    bundle "cps://canopa/test/compiled@1.0.0-0" path="bundle" builder-key="builder.der" recipe-sha256="{reviewed}"
+}}
+"#
+        ),
+    )?;
+    for version in [None, Some("1.0.0-0")] {
+        sign(version)?;
+        for error in [
+            publish().unwrap_err(),
+            publish_release(&f.repo, &f.private, &release).unwrap_err(),
+        ] {
+            assert!(
+                format!("{error:#}").contains(
+                    "attested toolchain differs from the independently resolved toolchain"
+                )
+            );
+        }
+        assert!(!f.repo.join("current").exists());
+    }
+    sign(Some("2.0.0-0"))?;
+    let current = publish_release(&f.repo, &f.private, &release)?;
+    publish()?;
+    write_policy(false)?;
+    let error = publish().unwrap_err();
+    assert!(format!("{error:#}").contains("protected repository requires toolchain verification"));
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?.trim(), current);
+    Ok(())
+}
+
 fn sign_root(path: &Path, private: &Path, predecessor: Option<&Path>) -> Result<()> {
     let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate TUF key");
     fs::write(private, document.as_ref())?;

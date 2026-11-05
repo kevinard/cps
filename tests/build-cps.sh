@@ -121,6 +121,14 @@ mkdir repo
 cp builder-public.der repo/
 sqlite_recipe=$(sha sqlite.build.kdl)
 seccomp_recipe=$(sha libseccomp.build.kdl)
+verify_toolchains=
+review_bootstrap=
+review_cps=
+if (( ${cps_version##*-} >= 17 )); then
+    verify_toolchains=' verify-toolchains=#true'
+    review_bootstrap=' toolchain-config="../bootstrap-toolchain.kdl"'
+    review_cps=' toolchain-config="../toolchain.kdl"'
+fi
 write_profile() {
     local name=$1
     shift
@@ -144,14 +152,14 @@ write_policy() {
     {
         cat <<POLICY
 schema-version 1
-publisher "canopa" {
+publisher "canopa"$verify_toolchains {
     builder-key "builder-public.der"
-    approve "system/sqlite" version="$sqlite_version" sha256="$sqlite_recipe"
-    approve "system/libseccomp" version="$seccomp_version" sha256="$seccomp_recipe"
+    approve "system/sqlite" version="$sqlite_version" sha256="$sqlite_recipe"$review_bootstrap
+    approve "system/libseccomp" version="$seccomp_version" sha256="$seccomp_recipe"$review_bootstrap
 POLICY
         write_profile cps-build-libs "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version"
         if [[ -n $reviewed ]]; then
-            printf '    approve "system/cps" version="%s" sha256="%s"\n' "$cps_version" "$reviewed"
+            printf '    approve "system/cps" version="%s" sha256="%s"%s\n' "$cps_version" "$reviewed" "$review_cps"
             write_profile cps-runtime "system/cps@$cps_version"
         fi
         printf '}\n'

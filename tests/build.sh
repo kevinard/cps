@@ -441,12 +441,19 @@ test ! -e bad-cache
 reviewed=$(sha build.kdl)
 mkdir release
 cp builder-public.der release/
+cat > review-toolchain.kdl <<'CONFIG'
+schema-version 1
+publisher "canopa" {
+    repository "repo"
+    trust-key "public.der"
+}
+CONFIG
 write_policy() {
     cat > release/publish-policy.kdl <<POLICY
 schema-version 1
-publisher "canopa" {
+publisher "canopa" verify-toolchains=#true {
     builder-key "builder-public.der"
-    approve "demo/hello" version="1.0.0-0" sha256="$1"
+    approve "demo/hello" version="1.0.0-0" sha256="$1" toolchain-config="../review-toolchain.kdl"
 }
 POLICY
 }
@@ -481,7 +488,9 @@ expect_failure 'attested payload digest mismatch' publish_bundle \
     --builder-key builder-public.der --recipe-sha256 "$reviewed" modified
 test ! -e release/current
 
+mv repo/blobs repo/offline-blobs
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" first
+mv repo/offline-blobs repo/blobs
 first_catalog=$(cat release/current)
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" second
 mv release/publish-policy.kdl policy.saved
@@ -510,6 +519,7 @@ assert set(statement['predicate']['toolchain']['package_manifests']) == {'build/
 subjects = {subject['name']: subject for subject in statement['subject']}
 assert set(subjects) == {'manifest.kdl', 'published-manifest.kdl', 'proto/hello'}
 catalog = json.loads((Path('release/catalogs') / Path('release/current').read_text().strip()).read_bytes())
+assert catalog['catalog']['toolchains_verified'] is True
 manifest_hash = catalog['catalog']['entries']['cps://canopa/demo/hello@1.0.0-0']['manifest']
 manifest = (Path('release/manifests') / manifest_hash).read_bytes()
 published = subjects['published-manifest.kdl']

@@ -44,6 +44,8 @@ pub(crate) struct Catalog {
     attestations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     attestations_required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    toolchains_verified: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     withdrawals: BTreeMap<String, Withdrawal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +218,7 @@ impl Catalog {
             entries: BTreeMap::new(),
             attestations: BTreeMap::new(),
             attestations_required: false,
+            toolchains_verified: false,
             withdrawals: BTreeMap::new(),
             sequence: None,
             profiles_required: false,
@@ -360,6 +363,16 @@ impl Catalog {
         ensure!(
             !self.attestations_required || next.attestations_required,
             "release disables the publisher's build evidence requirement"
+        );
+        ensure!(
+            !self.toolchains_verified || next.toolchains_verified,
+            "release disables the publisher's toolchain verification requirement"
+        );
+        ensure!(
+            !next.toolchains_verified
+                || self.toolchains_verified
+                || (self.entries.is_empty() && self.withdrawals.is_empty()),
+            "release claims toolchain verification after packages were published"
         );
         ensure!(
             !self.profiles_required || next.profiles_required,
@@ -1067,12 +1080,20 @@ fn decode_catalog(
         !catalog.attestations_required || catalog.attestations.len() == catalog.entries.len(),
         "protected catalog contains a package without build evidence"
     );
+    ensure!(
+        !catalog.toolchains_verified || catalog.attestations_required,
+        "toolchain verification requires signed build evidence"
+    );
     for (id, withdrawal) in &catalog.withdrawals {
         ensure!(
             exact_publisher(id)? == publisher && !catalog.entries.contains_key(id),
             "invalid withdrawal for {id}"
         );
         withdrawal.manifest.validate()?;
+        ensure!(
+            !catalog.toolchains_verified || withdrawal.attestation.is_some(),
+            "toolchain-verified catalog withdrew a package without build evidence"
+        );
         if let Some(digest) = &withdrawal.attestation {
             validate_digest(digest)?;
             ensure!(
@@ -1656,6 +1677,7 @@ fn stage_manifest(
     if let Some(policy) = policy {
         policy.verify(&id, evidence.as_ref())?;
         catalog.attestations_required = true;
+        catalog.toolchains_verified |= policy.verify_toolchains;
     }
     if let Some(evidence) = &evidence {
         for rotation in &catalog.key_rotations {
@@ -1767,18 +1789,20 @@ fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Res
 
 struct PublicationPolicy {
     approved: BTreeSet<String>,
-    recipes: BTreeMap<String, String>,
+    recipes: BTreeMap<String, publish_policy::RecipeApproval>,
     minimum_builders: usize,
+    verify_toolchains: bool,
     profiles: BTreeMap<String, publish_policy::Profile>,
 }
 
 impl PublicationPolicy {
     fn verify(&self, id: &str, evidence: Option<&VerifiedBuild>) -> Result<()> {
         let build = evidence.context("publish policy requires an attested build bundle")?;
-        ensure!(
-            self.recipes.get(id) == Some(&build.recipe_sha256),
-            "build recipe is not approved for {id}"
-        );
+        let approval = self
+            .recipes
+            .get(id)
+            .filter(|approval| approval.sha256 == build.recipe_sha256)
+            .with_context(|| format!("build recipe is not approved for {id}"))?;
         ensure!(
             build
                 .builders()
@@ -1790,6 +1814,14 @@ impl PublicationPolicy {
             "publish policy requires {} distinct build signers",
             self.minimum_builders
         );
+        ensure!(
+            !self.verify_toolchains || build.published_manifest.is_some(),
+            "toolchain verification policy requires version 3 build evidence"
+        );
+        if let Some(config) = &approval.toolchain_config {
+            crate::build::verify_toolchain(config, &build.recipe, &build.toolchain)
+                .with_context(|| format!("checking the build toolchain for {id}"))?;
+        }
         Ok(())
     }
 }
@@ -1844,6 +1876,18 @@ fn read_publish_policy(
         !catalog.profiles_required || !policy.profiles.is_empty(),
         "protected repository requires release composition profiles"
     );
+    if publishes_bundles {
+        ensure!(
+            !catalog.toolchains_verified || policy.verify_toolchains,
+            "protected repository requires toolchain verification"
+        );
+        ensure!(
+            !policy.verify_toolchains
+                || catalog.toolchains_verified
+                || (catalog.entries.is_empty() && catalog.withdrawals.is_empty()),
+            "enable toolchain verification before the repository's first publication"
+        );
+    }
     let mut approved = BTreeSet::new();
     if publishes_bundles {
         for path in policy.builder_keys {
@@ -1859,6 +1903,7 @@ fn read_publish_policy(
         approved,
         recipes: policy.recipes,
         minimum_builders: policy.minimum_builders,
+        verify_toolchains: policy.verify_toolchains,
         profiles: policy.profiles,
     }))
 }
@@ -2058,11 +2103,12 @@ mod tests {
             entries: BTreeMap::from([(active.clone(), manifest.clone())]),
             attestations: BTreeMap::from([(active.clone(), attestation.clone())]),
             attestations_required: true,
+            toolchains_verified: true,
             withdrawals: BTreeMap::from([(
                 withdrawn.clone(),
                 Withdrawal {
                     manifest: CatalogEntry::Portable(digest(b"withdrawn manifest")),
-                    attestation: None,
+                    attestation: Some(digest(b"withdrawn build evidence")),
                 },
             )]),
             sequence: NonZeroU64::new(1),
@@ -2089,6 +2135,17 @@ mod tests {
         next.attestations_required = false;
         assert!(previous.check_successor(&next, &base).is_err());
         next.attestations_required = true;
+        next.toolchains_verified = false;
+        let error = previous.check_successor(&next, &base).unwrap_err();
+        assert!(format!("{error:#}").contains("disables the publisher's toolchain verification"));
+        let mut unchecked = previous.clone();
+        unchecked.toolchains_verified = false;
+        next.toolchains_verified = true;
+        let error = unchecked.check_successor(&next, &base).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("claims toolchain verification after packages were published")
+        );
 
         next.profiles_required = false;
         assert!(previous.check_successor(&next, &base).is_err());

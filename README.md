@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-16`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-17`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -316,6 +316,32 @@ publisher "canopa" {
 ```
 
 Protected repositories accept packages through `publish-bundle` and `repo publish-release`. CPS checks the verified worker key and recipe digest against the policy, independently of the command-line arguments. The publisher signs the protection flag into the catalog, and later publication fails if the policy file is missing. Keep bootstrap packages in a separate toolchain repository. Export carries package attestations and leaves the publisher's local policy and key files on the publishing machine.
+
+For distribution repositories, enable toolchain verification before the
+first publication.
+
+```kdl
+schema-version 1
+publisher "canopa" verify-toolchains=#true {
+    builder-key "builder-public.der"
+    approve "demo/hello" version="1.0.0-0" sha256="<reviewed recipe SHA-256>" toolchain-config="../review-toolchain.kdl"
+}
+```
+
+The signer uses its own KDL toolchain configuration and authenticated local
+catalogs to resolve every requested tool and transitive dependency. It uses
+the recipe's pinned catalog digests and solver version, then compares the
+complete selection with the version 3 build statement. This works offline
+with signed catalogs and manifests and uses any builder trust configured for
+those toolchain publishers. The signer can perform the check without
+installing the tools or fetching their payloads.
+
+The `toolchain-config` path is relative to the publishing repository. It
+accepts the same publisher blocks as the build command, including a single
+publisher for a legacy one-catalog recipe. A repository can also set it on
+individual approvals. With `verify-toolchains=#true`, every approval needs a
+configuration and the signed catalog preserves the requirement across
+releases. Upgrade clients before distributing catalogs that enable it.
 
 For independent rebuilds, set `minimum-builders=2` on the policy's `publisher` node and provision a `builder-key` for each worker. Run the same pinned recipe on each worker and pass the additional signed statements with `--witness`. The publishing policy defaults to one worker key.
 

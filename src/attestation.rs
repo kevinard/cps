@@ -211,14 +211,14 @@ struct Predicate {
     identical_runs: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Toolchain {
     Legacy(LegacyToolchain),
     Pinned(PinnedToolchain),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LegacyToolchain {
     pub publisher: String,
@@ -227,14 +227,14 @@ pub(crate) struct LegacyToolchain {
     pub package_manifests: BTreeMap<String, String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PinnedToolchain {
     pub publishers: Vec<PublisherPin>,
     pub package_manifests: BTreeMap<String, PinnedPackage>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PinnedPackage {
     pub publisher: String,
@@ -311,6 +311,8 @@ pub(crate) struct VerifiedBuild {
     signatures: BTreeMap<String, Vec<u8>>,
     pub artifacts: BTreeMap<String, FileDigest>,
     pub recipe_sha256: String,
+    pub recipe: BuildRecipe,
+    pub toolchain: Toolchain,
     pub published_manifest: Option<FileDigest>,
 }
 
@@ -552,6 +554,8 @@ pub(crate) fn verify_bundle(
             signatures: BTreeMap::from([(digest(builder_key), signature)]),
             artifacts,
             recipe_sha256: reviewed_recipe.to_owned(),
+            recipe,
+            toolchain: predicate.toolchain,
             published_manifest,
         },
     ))
