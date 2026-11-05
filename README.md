@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-25`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-26`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -910,9 +910,23 @@ Fetch revalidates the plan against the image and its pinned catalogs. If a
 required payload is missing or damaged, fetch refreshes TUF metadata using the
 mirror endpoints saved by `repo sync` and verifies the exact target. Use the
 sync account to fetch into its cache. Fetch leaves the image and the cache's
-current catalog unchanged. A payload absent from the mirror must already be in
-the local cache, which matters when an older plan references a withdrawn
-version.
+current catalog unchanged. A cached copy or a historical archive can supply
+payloads the live mirror has dropped. To recover a missing payload for a saved
+plan or an installed package, provision a historical cache with
+`repo sync --archive-catalog` and pass it to fetch.
+
+```sh
+cps plan --root image --output repair.json repair system/kernel
+cps fetch --root image --plan repair.json --archive-cache canopa=/var/lib/cps/archive/kernel
+cps apply --root image repair.json
+```
+
+Repeat `--archive-cache PUBLISHER=PATH` for multiple archives. CPS checks
+the archive with the image's publisher key and uses the first supplied
+archive that lists the exact package manifest. It verifies the required
+payloads and copies them into the configured repository's blob cache
+without changing catalog pointers or the image. Other payloads use the
+configured mirror. An archive that already has verified bytes works offline.
 
 ### Reclaiming mirror cache space
 
@@ -1654,9 +1668,10 @@ fixtures, set `CPS_VM_TUF_MIRRORS=1` for the rollback scenario. The test signs
 separate local TUF mirrors with throwaway keys, syncs the base profile
 index-only, and fetches its planned payloads. It advances a companion while
 the primary still pins the previous catalog, and checks that pruning keeps
-the previous kernel after its mirror drops the pin. It checks rejection of a
-replayed TUF timestamp and verifies that missing or corrupt payloads block
-promotion with `--profile-payloads`. After a successful retry, it takes the
+the previous kernel after its mirror drops the pin. It then repairs a copy
+of the base root from a signed archive after deleting that cached kernel.
+The test rejects a replayed TUF timestamp and verifies that missing or corrupt
+payloads block promotion with `--profile-payloads`. After a successful retry, it takes the
 mirrors offline, stages the upgrade, and boots through blessing and rollback.
 This scenario runs without slot reuse.
 

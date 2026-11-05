@@ -11,7 +11,7 @@ use tuf::sign_root;
 use super::*;
 use crate::{
     attestation::{self, LegacyToolchain, Toolchain},
-    create_configured_image, fetch_plan, fetch_toolchain,
+    create_configured_image, fetch_plan, fetch_plan_with_archives, fetch_toolchain,
     kdl_format::{build, parse_manifest},
     list_obsoletions, list_withdrawals,
     model::FileDigest,
@@ -2638,7 +2638,8 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     assert!(blob_dir.join("local-note").exists());
 
     fs::rename(first, work.join("offline-first"))?;
-    fs::rename(second, work.join("offline-second"))?;
+    let offline_second = work.join("offline-second");
+    fs::rename(&second, &offline_second)?;
     apply(&f.root, &saved)?;
     assert_eq!(fs::read(f.root.join(COMPOSITOR))?, b"previous");
     fs::write(installed.join(COMPOSITOR), b"damaged")?;
@@ -2651,7 +2652,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     apply(&installed, &repair)?;
     assert_eq!(fs::read(installed.join(COMPOSITOR))?, b"previous");
     assert_eq!(prune(&[], &[], &[], true)?.blobs, [(old_blob.clone(), 8)]);
-    assert!(!blob_dir.join(old_blob).exists());
+    assert!(!blob_dir.join(&old_blob).exists());
     assert!(blob_dir.join(new_blob).exists());
     assert_eq!(fs::read_to_string(cache.join("current"))?, current);
     assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, current);
@@ -2661,6 +2662,99 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
             .len(),
         1
     );
+
+    fs::write(installed.join(COMPOSITOR), b"damaged")?;
+    let request = Request::Repair {
+        packages: Vec::new(),
+    };
+    let repair = plan(&installed, request.clone())?;
+    fs::rename(&offline_second, &second)?;
+    let error = fetch_plan(&installed, &repair).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("checking TUF target blobs/{old_blob}")),
+        "{error:#}"
+    );
+    fs::rename(&second, &offline_second)?;
+
+    let provision_archive = |repo: &Path, pin: &str, name: &str| -> Result<(PathBuf, PathBuf)> {
+        let targets = work.join(format!("{name}-targets"));
+        mirror_release::export_archive(repo, "canopa", &f.public, &targets, pin, false)?;
+        let mirror = work.join(format!("{name}-mirror"));
+        sign_export(&targets, &mirror, 1, fresh, &anchor, &tuf_key)?;
+        let archive = work.join(name);
+        assert_eq!(
+            mirror_release::sync_archive(
+                &archive,
+                &anchor,
+                Url::from_directory_path(mirror.join("metadata"))
+                    .unwrap()
+                    .as_str(),
+                Url::from_directory_path(mirror.join("targets"))
+                    .unwrap()
+                    .as_str(),
+                "canopa",
+                &f.public,
+                mirror_release::ArchiveSyncOptions {
+                    catalog: pin,
+                    index_only: true
+                },
+            )?,
+            pin
+        );
+        Ok((mirror, archive))
+    };
+    let restore = |archive: &Path| {
+        fetch_plan_with_archives(
+            &installed,
+            &repair,
+            &[("canopa".into(), archive.to_owned())],
+        )
+    };
+    let error = restore(&cache).unwrap_err();
+    assert!(format!("{error:#}").contains("archive cache requires repo sync --archive-catalog"));
+    let fork = work.join("fork");
+    let actions = f.file(COMPOSITOR, "different", "0644", "")?;
+    fs::write(
+        &f.recipe,
+        format!(
+            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}}}\n"
+        ),
+    )?;
+    publish(&fork, &f.proto, &f.recipe, &f.private)?;
+    let fork_pin = fs::read_to_string(fork.join("current"))?;
+    let (_, fork_cache) = provision_archive(&fork, fork_pin.trim(), "fork-cache")?;
+    let error = restore(&fork_cache).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("installed manifest digest differs from the signed catalog")
+    );
+    assert!(!blob_dir.join(&old_blob).exists());
+
+    let (archive_mirror, archive) = provision_archive(&f.repo, &old_catalog, "old-archive")?;
+    let archive_blob = archive.join("blobs").join(&old_blob);
+    assert!(!archive_blob.exists());
+    let target = archive_mirror
+        .join("targets")
+        .join(format!("{old_blob}.blobs-{old_blob}"));
+    fs::write(&target, b"tampered")?;
+    let error = restore(&archive).unwrap_err();
+    assert!(format!("{error:#}").contains("Hash mismatch"), "{error:#}");
+    assert!(!archive_blob.exists());
+    assert!(!blob_dir.join(&old_blob).exists());
+    fs::write(&target, b"previous")?;
+    assert_eq!(restore(&archive)?, 1);
+    assert_eq!(fs::read(&archive_blob)?, b"previous");
+    assert_eq!(fs::read(blob_dir.join(&old_blob))?, b"previous");
+    fs::rename(&archive_mirror, work.join("offline-archive"))?;
+    fs::write(blob_dir.join(&old_blob), b"tampered")?;
+    assert_eq!(restore(&archive)?, 1);
+    assert_eq!(fs::read(installed.join(COMPOSITOR))?, b"damaged");
+    assert_eq!(plan(&installed, request)?, repair);
+    apply(&installed, &repair)?;
+    assert!(verify(&installed)?.is_empty());
+    assert_eq!(fs::read(installed.join(COMPOSITOR))?, b"previous");
+    assert_eq!(fs::read_to_string(cache.join("current"))?, current);
+    assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, current);
+    assert!(!archive.join("current").exists());
     Ok(())
 }
 

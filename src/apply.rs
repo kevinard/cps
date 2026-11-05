@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
     fs::{self, File},
     io::Seek,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -18,7 +18,11 @@ use crate::{
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
     plan::{Plan, Write, build, config_update_prefix, hardlink_groups, payloads},
-    repo::{BuildReceipt, release::fetch_payloads, stage_blob},
+    repo::{
+        BuildReceipt, Published,
+        release::{ArchiveCache, fetch_payloads},
+        stage_blob,
+    },
     systemd::{self, Action as SystemdAction},
     verify::{manifest_paths, verify_state},
 };
@@ -170,13 +174,27 @@ pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
     })
 }
 
-type PublisherPayloads<'a> = (&'a Publisher, BTreeMap<&'a str, &'a Node>);
+struct OwnedPayload<'a> {
+    node: &'a Node,
+    package: &'a Published,
+}
+
+type PublisherPayloads<'a> = (&'a Publisher, BTreeMap<&'a str, OwnedPayload<'a>>);
 
 pub fn apply(path: &Path, plan: &Plan) -> Result<u64> {
     apply_with(path, plan, |_| {})
 }
 
 pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
+    fetch_plan_with_archives(path, plan, &[])
+}
+
+/// Fetch verified plan payloads, using explicitly provisioned archives for matching packages.
+pub fn fetch_plan_with_archives(
+    path: &Path,
+    plan: &Plan,
+    archive_caches: &[(String, PathBuf)],
+) -> Result<usize> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
@@ -191,18 +209,46 @@ pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     if checked.config_update_revision.is_some() {
         return Ok(0);
     }
+    let mut archives = BTreeMap::<_, Vec<_>>::new();
+    for (name, path) in archive_caches {
+        let publisher = next
+            .publishers
+            .get(name)
+            .with_context(|| format!("archive publisher {name} is not configured"))?;
+        archives.entry(name.as_str()).or_default().push(
+            ArchiveCache::open(path, publisher)
+                .with_context(|| format!("opening archive cache {}", path.display()))?,
+        );
+    }
     let mut count = 0;
-    for (publisher, blobs) in payload_sources(&checked.writes, &next)? {
+    for (publisher, mut blobs) in payload_sources(&checked.writes, &next)? {
+        count += blobs.len();
+        for archive in archives.get(publisher.name.as_str()).into_iter().flatten() {
+            let mut matches = BTreeMap::new();
+            let mut packages = BTreeMap::new();
+            for (&hash, payload) in &blobs {
+                let covered = match packages.entry(payload.package.manifest.name.as_str()) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(entry) => *entry.insert(archive.covers(payload.package)?),
+                };
+                if covered {
+                    matches.insert(hash, payload.node);
+                }
+            }
+            for hash in matches.keys() {
+                blobs.remove(hash);
+            }
+            archive.restore(publisher, matches)?;
+        }
         let blobs = blobs
             .into_iter()
-            .map(|(hash, node)| {
-                let Node::File { size, .. } = node else {
+            .map(|(hash, payload)| {
+                let Node::File { size, .. } = payload.node else {
                     unreachable!("payloads contain only files");
                 };
                 (hash, *size)
             })
-            .collect::<BTreeMap<_, _>>();
-        count += blobs.len();
+            .collect();
         fetch_payloads(publisher, blobs)
             .with_context(|| format!("preparing payloads from {}", publisher.name))?;
     }
@@ -499,9 +545,9 @@ fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> 
         file.persist_noclobber(dir.join(sha256))?;
     } else {
         for (publisher, blobs) in payload_sources(writes, state)? {
-            for (hash, node) in blobs {
+            for (hash, payload) in blobs {
                 let mut file = NamedTempFile::new_in(&dir)?;
-                stage_blob(&publisher.repo, node, file.as_file_mut())?;
+                stage_blob(&publisher.repo, payload.node, file.as_file_mut())?;
                 file.as_file().sync_all()?;
                 file.persist_noclobber(dir.join(hash))?;
             }
@@ -539,10 +585,13 @@ fn payload_sources<'a>(
             .get(name)
             .context("file's owning package is absent")?;
         let publisher = owner.published.manifest.publisher.as_str();
-        by_publisher
-            .entry(publisher)
-            .or_default()
-            .insert(sha256.as_str(), node);
+        by_publisher.entry(publisher).or_default().insert(
+            sha256.as_str(),
+            OwnedPayload {
+                node,
+                package: &owner.published,
+            },
+        );
     }
     by_publisher
         .into_iter()

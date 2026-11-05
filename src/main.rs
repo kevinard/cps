@@ -18,12 +18,13 @@ use cps::{
     add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
     build_with_toolchain_config, build_with_worker, create_configured_image, create_image,
     deploy_and_activate_boot_environment, deploy_boot_environment, export_boot_environment,
-    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources, fetch_plan,
-    fetch_sources, fetch_sources_with_local, fetch_toolchain, generate_manifest_for_architecture,
-    import_sources, list_boot_environments, list_boot_environments_on_disk, list_config_updates,
-    list_obsoletions, list_publishers, list_withdrawals, plan, prefer_publisher, publish,
-    publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
-    read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
+    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources,
+    fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
+    generate_manifest_for_architecture, import_sources, list_boot_environments,
+    list_boot_environments_on_disk, list_config_updates, list_obsoletions, list_publishers,
+    list_withdrawals, plan, prefer_publisher, publish, publish_release_with_sources,
+    publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
+    remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rotate_publisher_key, set_publisher_build_trust,
     set_publisher_repositories, stage_boot_environment, transaction_details, transaction_history,
     transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
@@ -181,6 +182,9 @@ enum Command {
         root: PathBuf,
         #[arg(long)]
         plan: PathBuf,
+        /// Use a synced historical archive for matching package payloads
+        #[arg(long = "archive-cache", value_name = "PUBLISHER=PATH", value_parser = parse_repository)]
+        archive_caches: Vec<(String, PathBuf)>,
     },
     /// Apply or resume a saved plan
     Apply {
@@ -1450,9 +1454,13 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&entry)?);
             }
         },
-        Command::Fetch { root, plan } => {
+        Command::Fetch {
+            root,
+            plan,
+            archive_caches,
+        } => {
             let saved = load_plan(&plan)?;
-            let count = fetch_plan(&root, &saved)?;
+            let count = fetch_plan_with_archives(&root, &saved, &archive_caches)?;
             println!("Verified {count} plan payloads");
         }
         Command::Verify { root, pristine } => {

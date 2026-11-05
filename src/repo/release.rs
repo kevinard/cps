@@ -126,8 +126,10 @@ fn endpoint(value: &str) -> Result<Url> {
     Ok(url)
 }
 
+mod archive;
 mod cache;
 mod profile;
+pub(crate) use archive::ArchiveCache;
 pub use cache::{CacheRetention, PruneReport, prune_payloads};
 pub use profile::{
     ProfilePayloads, sync_profile, sync_profile_for_image, sync_profile_with_payloads,

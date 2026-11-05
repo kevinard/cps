@@ -15,8 +15,8 @@ mod transport;
 mod verify;
 
 pub use apply::{
-    PendingTransaction, TransactionStatus, apply, fetch_plan, resume_transaction,
-    transaction_status,
+    PendingTransaction, TransactionStatus, apply, fetch_plan, fetch_plan_with_archives,
+    resume_transaction, transaction_status,
 };
 pub use boot::{
     Activation, BootEnvironment, RootDeployment, activate_boot_environment,
