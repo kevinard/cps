@@ -276,6 +276,7 @@ publisher "canopa" {
     trust-key "public.der"
 }
 CONFIG
+"$cps" repo fetch-toolchain --toolchain-config toolchain.kdl multi-build.kdl
 "$cps" build --toolchain-config toolchain.kdl --source-cache cache \
     --builder-signing-key builder.der --check-reproducible --output multi multi-build.kdl
 cmp first/proto/hello multi/proto/hello

@@ -266,4 +266,7 @@ if (( ${cps_version##*-} >= 20 )); then
     done
     diff -r sources/sha256 recovered-sources/sha256
 fi
+if (( ${cps_version##*-} >= 21 )); then
+    "${loader[@]}" image/usr/bin/cps repo fetch-toolchain --toolchain-config toolchain.kdl build.kdl
+fi
 printf 'Verified reproducible CPS build, signed provenance, and installation from Git %s\n' "$revision"

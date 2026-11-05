@@ -269,6 +269,42 @@ pub fn sync_with_options(
     trust_key: &Path,
     options: SyncOptions<'_>,
 ) -> Result<String> {
+    sync_with_required_catalogs(
+        repo,
+        trusted_root,
+        metadata_url,
+        targets_url,
+        publisher,
+        trust_key,
+        options,
+        &[],
+    )
+}
+
+/// Sync only if the authenticated mirror also advertises all the requested catalog pins.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_with_required_catalogs(
+    repo: &Path,
+    trusted_root: &Path,
+    metadata_url: &str,
+    targets_url: &str,
+    publisher: &str,
+    trust_key: &Path,
+    options: SyncOptions<'_>,
+    required: &[String],
+) -> Result<String> {
+    ensure!(
+        required.len() <= MAX_RETAINED + 1,
+        "too many required catalogs"
+    );
+    let required = required
+        .iter()
+        .map(|hash| -> Result<_> {
+            validate_digest(hash)?;
+            Ok(CatalogPin::primary(publisher.to_owned(), hash.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let pins = required.iter().collect::<Vec<_>>();
     let source = SyncSource::new(
         trusted_root,
         Mirror::new(metadata_url, targets_url)?,
@@ -289,7 +325,7 @@ pub fn sync_with_options(
         &source,
         !options.index_only,
         None,
-        &[],
+        &pins,
         guard.as_ref(),
         false,
     )?;
@@ -538,7 +574,15 @@ async fn load_mirror(
 }
 
 pub(crate) fn fetch_payloads(publisher: &Publisher, blobs: BTreeMap<&str, u64>) -> Result<()> {
-    let repo = &publisher.repo;
+    fetch_repository_payloads(&publisher.repo, &publisher.name, &publisher.key, blobs)
+}
+
+pub(crate) fn fetch_repository_payloads(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    blobs: BTreeMap<&str, u64>,
+) -> Result<()> {
     let mut missing = Vec::new();
     for (hash, length) in blobs {
         validate_digest(hash)?;
@@ -557,7 +601,7 @@ pub(crate) fn fetch_payloads(publisher: &Publisher, blobs: BTreeMap<&str, u64>) 
     );
     let _lock = lock_repo(repo)?;
     let directory = open_state(repo)?;
-    check_cache_origin(&directory, &publisher.name, &publisher.key)?;
+    check_cache_origin(&directory, publisher, key)?;
     let mirror = Mirror::read(&directory)?;
     let scratch = TempDir::new_in(&state)?;
     let runtime = tokio::runtime::Builder::new_current_thread()

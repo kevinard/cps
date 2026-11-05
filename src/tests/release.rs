@@ -13,7 +13,7 @@ use url::Url;
 use super::*;
 use crate::{
     attestation::{self, LegacyToolchain, Toolchain},
-    create_configured_image, fetch_plan,
+    create_configured_image, fetch_plan, fetch_toolchain,
     kdl_format::{build, parse_manifest},
     list_obsoletions, list_withdrawals,
     model::FileDigest,
@@ -3217,6 +3217,182 @@ fn legacy_cache_relocation_requires_the_applied_catalog() -> Result<()> {
         crate::list_publishers(&f.root)?[0].repository,
         locations[0].1
     );
+    Ok(())
+}
+
+#[test]
+fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -> Result<()> {
+    let primary = Fixture::new()?;
+    let tools = Fixture::new()?;
+    let shell = "pinned shell";
+    let compiler = "pinned compiler";
+    let latest = "current compiler";
+    let unused = "unused tool";
+    primary.package(
+        "build/shell",
+        "1.0.0-0",
+        primary.file("usr/bin/sh", shell, "0755", "")?,
+    )?;
+    primary.package(
+        "build/unused",
+        "1.0.0-0",
+        primary.file("usr/bin/unused", unused, "0755", "")?,
+    )?;
+    let compiler_actions = |bytes| -> Result<String> {
+        Ok(tools.file("usr/bin/cc", bytes, "0755", "")?
+            + &dependency("require", "build/shell", "1.0.0-0"))
+    };
+    tools.package_as(
+        "tools",
+        "build/compiler",
+        "1.0.0-0",
+        compiler_actions(compiler)?,
+    )?;
+    let current = |repo: &Path| -> Result<String> {
+        Ok(fs::read_to_string(repo.join("current"))?.trim().to_owned())
+    };
+    let primary_pin = current(&primary.repo)?;
+    let tools_pin = current(&tools.repo)?;
+    tools.package_as(
+        "tools",
+        "build/compiler",
+        "2.0.0-0",
+        compiler_actions(latest)?,
+    )?;
+    withdraw_package(
+        &tools.repo,
+        &tools.private,
+        "cps://tools/build/compiler@1.0.0-0",
+    )?;
+
+    let work = primary._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let primary_cache = work.join("canopa-cache");
+    let tools_cache = work.join("tools-cache");
+    let sync = |fixture: &Fixture, cache: &Path, publisher, mirror: &Path, pin: &str| {
+        mirror_release::sync_with_required_catalogs(
+            cache,
+            &anchor,
+            Url::from_directory_path(mirror.join("metadata"))
+                .unwrap()
+                .as_str(),
+            Url::from_directory_path(mirror.join("targets"))
+                .unwrap()
+                .as_str(),
+            publisher,
+            &fixture.public,
+            mirror_release::SyncOptions {
+                index_only: true,
+                image: None,
+            },
+            &[pin.to_owned()],
+        )
+    };
+    let primary_mirror = work.join("canopa-mirror");
+    sign_release(&primary, &primary_mirror, 1, fresh, &anchor, &tuf_key)?;
+    assert_eq!(
+        sync(
+            &primary,
+            &primary_cache,
+            "canopa",
+            &primary_mirror,
+            &primary_pin
+        )?,
+        primary_pin
+    );
+
+    let unretained = work.join("without-retained");
+    sign_publisher_release(&tools, &unretained, 1, fresh, &anchor, &tuf_key, "tools")?;
+    let error = sync(&tools, &tools_cache, "tools", &unretained, &tools_pin).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("does not advertise required catalog {tools_pin}"))
+    );
+    assert!(!tools_cache.join("current").exists());
+
+    let export = work.join("tools-export");
+    let latest_catalog = mirror_release::export_with_retained(
+        &tools.repo,
+        "tools",
+        &tools.public,
+        &export,
+        std::slice::from_ref(&tools_pin),
+    )?;
+    let tools_mirror = work.join("tools-mirror");
+    sign_export(&export, &tools_mirror, 2, fresh, &anchor, &tuf_key)?;
+    assert_eq!(
+        sync(&tools, &tools_cache, "tools", &tools_mirror, &tools_pin)?,
+        latest_catalog
+    );
+
+    let recipe = work.join("build.kdl");
+    fs::write(
+        &recipe,
+        format!(
+            "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
+         toolchain solver=\"sat-v1\" {{\n\
+         publisher \"canopa\" catalog={primary_pin:?} key-sha256={:?}\n\
+         publisher \"tools\" catalog={tools_pin:?} key-sha256={:?}\n\
+         package \"cps://tools/build/compiler@1.0.0-0\"\n }}\n\
+         manifest \"manifest.kdl\" sha256={:?}\n script \"exit 1\"\n}}\n",
+            digest(&read_key(&primary.public)?),
+            digest(&read_key(&tools.public)?),
+            digest(b"reviewed manifest"),
+        ),
+    )?;
+    let config = work.join("toolchain.kdl");
+    let write_config = |policy: &str| {
+        fs::write(
+            &config,
+            format!(
+                "schema-version 1\n\
+             publisher \"canopa\" {{ repository {primary_cache:?}; trust-key {:?}; }}\n\
+             publisher \"tools\" {{ repository {tools_cache:?}; trust-key {:?}; {policy} }}\n",
+                primary.public, tools.public,
+            ),
+        )
+    };
+    let shell_blob = primary_cache.join("blobs").join(digest(shell.as_bytes()));
+    let compiler_blob = tools_cache.join("blobs").join(digest(compiler.as_bytes()));
+    write_config(&format!(
+        "build-trust {{ builder-key {:?}; }};",
+        primary.public
+    ))?;
+    let error = fetch_toolchain(&recipe, &config).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("build attestation"),
+        "{error:#}"
+    );
+    assert!(!shell_blob.exists());
+    assert!(!compiler_blob.exists());
+
+    write_config("")?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 2);
+    assert_eq!(fs::read_to_string(&shell_blob)?, shell);
+    assert_eq!(fs::read_to_string(&compiler_blob)?, compiler);
+    assert!(
+        !primary_cache
+            .join("blobs")
+            .join(digest(unused.as_bytes()))
+            .exists()
+    );
+    assert!(
+        !tools_cache
+            .join("blobs")
+            .join(digest(latest.as_bytes()))
+            .exists()
+    );
+    assert_eq!(current(&primary_cache)?, primary_pin);
+    assert_eq!(current(&tools_cache)?, latest_catalog);
+
+    fs::write(&compiler_blob, "corrupt bytes!!")?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 2);
+    assert_eq!(fs::read_to_string(&compiler_blob)?, compiler);
+    fs::rename(&primary_mirror, work.join("offline-canopa"))?;
+    fs::rename(&tools_mirror, work.join("offline-tools"))?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 2);
     Ok(())
 }
 

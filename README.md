@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-20`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-21`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -368,6 +368,7 @@ catalog containing these records.
 recipe=$(cps repo rebuild-inputs --repo /var/lib/cps/canopa --publisher canopa \
     --trust-key canopa.der --output reviewed cps://canopa/demo/hello@1.0.0-0)
 cps source fetch --cache source-cache "$recipe"
+cps repo fetch-toolchain --toolchain-config toolchain.kdl "$recipe"
 cps build --toolchain-config toolchain.kdl --source-cache source-cache \
     --check-reproducible --output rebuilt "$recipe"
 cps repo verify-rebuild --repo /var/lib/cps/canopa --publisher canopa \
@@ -414,6 +415,23 @@ those for withdrawn versions. The recipe pins the source archives and
 toolchain catalogs. Supply source archives without URLs through
 `cps source import` or `cps source fetch --from`, and configure local
 toolchain repositories with the pinned catalogs and provisioned trust keys.
+For a new mirror cache, sync each toolchain publisher with its catalog
+digest from the recipe.
+
+```sh
+cps repo sync --repo /var/lib/cps/build/canopa --root tuf-root.json \
+    --metadata "$metadata_url" --targets "$targets_url" --publisher canopa \
+    --trust-key canopa.der --index-only --require-catalog "$catalog_sha256"
+```
+
+Repeat `--require-catalog` when provisioning one cache for several recipes.
+The signed mirror release must advertise each digest as current or include
+it through `repo export --retain-catalog`. Point the toolchain configuration
+at the synchronized caches. `repo fetch-toolchain` resolves the pinned
+selection with the same solver and builder trust policy as the build. It
+downloads and verifies the selected payloads across publishers. The build
+verifies those payloads again and runs offline.
+
 `repo verify-rebuild` compares the exact recipe and reviewed manifest in
 the bundle, the reconstructed published manifest, and every payload's
 length and digest against the signed release. It rejects undeclared
@@ -826,8 +844,7 @@ mirror endpoints saved by `repo sync` and verifies the exact target. Use the
 sync account to fetch into its cache. Fetch leaves the image and the cache's
 current catalog unchanged. A payload absent from the mirror must already be in
 the local cache, which matters when an older plan references a withdrawn
-version. Use full `repo sync` when provisioning a toolchain cache for offline
-builds.
+version.
 
 ### Reclaiming mirror cache space
 

@@ -27,7 +27,10 @@ use crate::{
     },
     model::{FileDigest, Node, digest, digest_reader},
     plan::{CandidateSet, Candidates, resolve_packages, select_paths},
-    repo::{MANIFEST_LIMIT, read_key, read_limited, read_signing_key, snapshot, stage_blob},
+    repo::{
+        MANIFEST_LIMIT, read_key, read_limited, read_signing_key,
+        release::fetch_repository_payloads, snapshot, stage_blob,
+    },
 };
 
 const MOUNTS: &[&str] = &[
@@ -554,6 +557,40 @@ pub(crate) fn verify_toolchain(
     Ok(())
 }
 
+/// Verify the pinned build selection and fetch only its required toolchain payloads.
+pub fn fetch_toolchain(recipe_path: &Path, config: &Path) -> Result<usize> {
+    let (_, recipe) = read(recipe_path)?;
+    let selection = resolve_toolchain(ToolchainLocation::Config(config), &recipe)?;
+    let mut required = BTreeMap::<_, BTreeMap<_, u64>>::new();
+    for managed in selection.paths.values() {
+        if let Node::File { sha256, size, .. } = &managed.node {
+            let publisher = selection.file_publisher(managed)?;
+            let length = required
+                .entry(publisher)
+                .or_default()
+                .entry(sha256.as_str())
+                .or_insert(*size);
+            ensure!(
+                *length == *size,
+                "conflicting toolchain payload lengths for {sha256}"
+            );
+        }
+    }
+    let mut count = 0;
+    for source in &selection.repositories {
+        if let Some(blobs) = required.remove(source.pin.name.as_str()) {
+            count += blobs.len();
+            fetch_repository_payloads(&source.repository, &source.pin.name, &source.key, blobs)
+                .with_context(|| format!("fetching pinned toolchain for {}", source.pin.name))?;
+        }
+    }
+    ensure!(
+        required.is_empty(),
+        "toolchain payload has no configured publisher"
+    );
+    Ok(count)
+}
+
 fn prepare_toolchain(
     path: &Path,
     location: ToolchainLocation<'_>,
@@ -580,12 +617,7 @@ fn prepare_toolchain(
             Node::Symlink { target, .. } => symlink(target, &file)?,
             Node::Hardlink { .. } => {}
             Node::File { mode, .. } => {
-                let owner = managed.owners.first().context("unowned toolchain file")?;
-                let publisher = selection.installed[owner]
-                    .published
-                    .manifest
-                    .publisher
-                    .as_str();
+                let publisher = selection.file_publisher(managed)?;
                 let mut destination = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -626,6 +658,11 @@ fn prepare_toolchain(
 }
 
 impl ResolvedToolchain {
+    fn file_publisher(&self, managed: &Managed) -> Result<&str> {
+        let owner = managed.owners.first().context("unowned toolchain file")?;
+        Ok(&self.installed[owner].published.manifest.publisher)
+    }
+
     fn evidence(self, pins: &ToolchainPins) -> Result<Toolchain> {
         let Self {
             repositories,

@@ -19,14 +19,14 @@ use cps::{
     build_with_toolchain_config, build_with_worker, create_configured_image, create_image,
     deploy_and_activate_boot_environment, deploy_boot_environment, export_boot_environment,
     export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources, fetch_plan,
-    fetch_sources, fetch_sources_with_local, generate_manifest_for_architecture, import_sources,
-    list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
-    list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
-    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
-    resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
-    rotate_publisher_key, set_publisher_build_trust, set_publisher_repositories,
-    stage_boot_environment, transaction_details, transaction_history, transaction_status, verify,
-    verify_pristine, verify_rebuild, withdraw_package,
+    fetch_sources, fetch_sources_with_local, fetch_toolchain, generate_manifest_for_architecture,
+    import_sources, list_boot_environments, list_boot_environments_on_disk, list_config_updates,
+    list_obsoletions, list_publishers, list_withdrawals, plan, prefer_publisher, publish,
+    publish_release, publish_witnessed_bundle, read_attestation, read_worker_config, release,
+    remove_publisher, resume_transaction, rollback_boot_environment,
+    rollback_boot_environment_on_disk, rotate_publisher_key, set_publisher_build_trust,
+    set_publisher_repositories, stage_boot_environment, transaction_details, transaction_history,
+    transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -424,6 +424,12 @@ enum RepoCommand {
         catalog: Option<String>,
         package_id: String,
     },
+    /// Fetch payloads for the toolchain pinned by a build recipe
+    FetchToolchain {
+        #[arg(long)]
+        toolchain_config: PathBuf,
+        recipe: PathBuf,
+    },
     /// Withdraw an exact published version from future package selections
     Withdraw {
         #[arg(long)]
@@ -478,6 +484,9 @@ enum RepoCommand {
         /// Cache the catalog, manifests, and build evidence without downloading payloads
         #[arg(long)]
         index_only: bool,
+        /// Require this catalog to be current or retained in the signed mirror release
+        #[arg(long = "require-catalog", value_name = "SHA256")]
+        required_catalogs: Vec<String>,
     },
     /// Verify a signed release profile and its pinned companion catalogs from TUF mirrors
     SyncProfile {
@@ -1042,6 +1051,13 @@ fn run(command: Command) -> Result<ExitCode> {
                 )?;
                 println!("Verified {count} archived source object(s) for {package_id}");
             }
+            RepoCommand::FetchToolchain {
+                toolchain_config,
+                recipe,
+            } => {
+                let count = fetch_toolchain(&recipe, &toolchain_config)?;
+                println!("Verified {count} toolchain payload(s)");
+            }
             RepoCommand::Withdraw {
                 repo,
                 signing_key,
@@ -1086,10 +1102,11 @@ fn run(command: Command) -> Result<ExitCode> {
                 trust_key,
                 index_only,
                 image,
+                required_catalogs,
             } => {
                 println!(
                     "Synchronized {}",
-                    release::sync_with_options(
+                    release::sync_with_required_catalogs(
                         &repo,
                         &root,
                         &metadata,
@@ -1099,7 +1116,8 @@ fn run(command: Command) -> Result<ExitCode> {
                         release::SyncOptions {
                             index_only,
                             image: image.as_deref()
-                        }
+                        },
+                        &required_catalogs,
                     )?
                 );
             }
