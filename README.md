@@ -2052,6 +2052,30 @@ reboot, and rollback. The VM defaults to the matching systemd revision for
 the selected CPS fixture. Set `CPS_VM_SYSTEMD_VERSION=262.1.0-1` to reuse
 that earlier systemd revision.
 
+#### Building GNU tools for boot preparation
+
+Place the verified `coreutils-9.12.tar.xz` and `grep-3.12.tar.xz` releases in
+a local source directory. Verify their detached signatures using the GNU
+keyring and the expected release keys: coreutils uses
+`6C37DC12121A5006BC1DB804DF6FD971306037D9`, and grep uses
+`155D3FC500C834486D1EEA677FD9FCCB000BEEEE`.
+[Coreutils sources and signature](https://ftp.gnu.org/gnu/coreutils/)
+· [Grep release announcement](https://lists.gnu.org/archive/html/info-gnu/2025-04/msg00008.html)
+
+```sh
+CPS_GNU_SOURCE_DIR=/path/to/verified-sources \
+tests/build-gnu-tools.sh target/gnu-tools-fixture target/usr-base-fixture
+```
+
+The KDL recipes pin each archive's size and SHA-256 digest. The fixture
+builds the GNU coreutils commands as one binary with command symlinks and
+builds GNU grep separately. Both builds run twice in the isolated CPS
+environment before publication with manifest-bound builder evidence.
+The installation check resolves libraries from the signed merged base and
+exercises `install`, file modes, and the GNU grep `-G` behavior used by
+systemd's kernel-install plugin. Package dependencies require the ELF
+runtime; the boot profile explicitly selects these utility packages.
+
 #### Testing a source-built BusyBox
 
 On an x86-64 Arch Linux worker with a native GCC toolchain, run

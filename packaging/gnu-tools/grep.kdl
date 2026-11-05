@@ -1,0 +1,6 @@
+schema-version 1
+package "system/grep" publisher="canopa-utilities" version="3.12.0-0" architecture="x86_64" {
+    require "system/elf-runtime"
+    file "usr/bin/grep" mode="0755" uid=0 gid=0
+    file "usr/share/licenses/grep/COPYING" mode="0644" uid=0 gid=0
+}
