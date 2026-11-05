@@ -26,7 +26,7 @@ const FORMATTER_CONFIG: &str = "mke2fs.conf";
 
 /// Export an inactive CPS root to a new, checked ext4 partition payload.
 pub fn export_boot_environment(root: &Path, output: &Path, size_mib: u64) -> Result<String> {
-    let (id, _) = export(root, output, size_mib, false)?;
+    let (id, _) = export(root, output, ExportSpec::new(size_mib)?, false)?;
     Ok(id)
 }
 
@@ -36,23 +36,39 @@ pub fn export_boot_environment_receipt(
     output: &Path,
     size_mib: u64,
 ) -> Result<String> {
-    let (_, receipt) = export(root, output, size_mib, true)?;
+    export_with_receipt(root, output, ExportSpec::new(size_mib)?)
+}
+
+pub(super) fn export_with_receipt(root: &Path, output: &Path, spec: ExportSpec) -> Result<String> {
+    let (_, receipt) = export(root, output, spec, true)?;
     receipt.context("missing root export receipt")
+}
+
+pub(super) struct ExportSpec {
+    bytes: u64,
+    epoch: Option<u32>,
+}
+
+impl ExportSpec {
+    pub(super) fn new(size_mib: u64) -> Result<Self> {
+        let bytes = size_mib
+            .checked_mul(1024 * 1024)
+            .filter(|bytes| *bytes <= i64::MAX as u64)
+            .context("ext4 image size is out of range")?;
+        ensure!(size_mib >= 16, "an ext4 image requires at least 16 MiB");
+        Ok(Self {
+            bytes,
+            epoch: source_date_epoch()?,
+        })
+    }
 }
 
 fn export(
     root: &Path,
     output: &Path,
-    size_mib: u64,
+    ExportSpec { bytes, epoch }: ExportSpec,
     emit_receipt: bool,
 ) -> Result<(String, Option<String>)> {
-    let bytes = size_mib
-        .checked_mul(1024 * 1024)
-        .filter(|bytes| *bytes <= i64::MAX as u64)
-        .context("ext4 image size is out of range")?;
-    ensure!(size_mib >= 16, "an ext4 image requires at least 16 MiB");
-    let epoch = source_date_epoch()?;
-
     let root = fs::canonicalize(root).context("opening the image to export")?;
     ensure!(
         root != Path::new("/"),

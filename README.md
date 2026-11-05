@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-27`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-28`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1440,13 +1440,24 @@ label, including during a rescue boot. Ext4 root labels consisting of exactly
 ```sh
 mount -t ext4 -o ro,noload "/dev/disk/by-partuuid/$base_partuuid" /mnt/canopa
 cps plan --root /mnt/canopa --output /scratch/upgrade.json update
-cps boot-env stage --source /mnt/canopa --root /scratch/staged /scratch/upgrade.json
-cps boot-env export --root /scratch/staged --output /scratch/staged.ext4 \
-    --size-mib 2048 --receipt > /scratch/staged.kdl
+cps fetch --root /mnt/canopa --plan /scratch/upgrade.json
+cps boot-env prepare --source /mnt/canopa --output /scratch/upgrade \
+    --size-mib 2048 /scratch/upgrade.json
 ```
 
 Use `ro,noload` on a clean ext4 filesystem to avoid journal writes to the
 source partition. [Linux ext4 mount options](https://docs.kernel.org/admin-guide/ext4.html)
+
+`prepare` creates a new directory containing `root/`, `root.ext4`, and
+`receipt.kdl`. It uses cached plan payloads and the same checks as `stage`
+and `export`, including the selected kernel and `SOURCE_DATE_EPOCH`
+settings. CPS publishes the directory only after formatting and verifying
+the image and writing its receipt. A formatting or verification failure
+leaves the requested output path available for retry. An abrupt interruption
+can leave a private `.cps-prepare-*` directory in the output parent.
+
+Use separate `stage` and `export` commands when you need to edit the staged
+root or resolve configuration updates before exporting it.
 
 With a known-good base already registered, use a dedicated, unregistered
 Linux filesystem partition on the same GPT disk as the mounted ESP for the
@@ -1454,10 +1465,10 @@ trial. The disk must use 512-byte logical sectors, and the ext4 export must
 match the partition size.
 
 ```sh
-cps boot-env activate-device --root /scratch/staged --esp /efi \
+cps boot-env activate-device --root /scratch/upgrade/root --esp /efi \
     --device "/dev/disk/by-partuuid/$trial_partuuid" \
     --root-partuuid "$trial_partuuid" \
-    --receipt /scratch/staged.kdl --root-image /scratch/staged.ext4
+    --receipt /scratch/upgrade/receipt.kdl --root-image /scratch/upgrade/root.ext4
 ```
 
 CPS checks the GPT and compares the kernel's device extents to the requested
@@ -1679,8 +1690,9 @@ of the base root from a signed archive after deleting that cached kernel.
 It also restores a missing catalog from the archive and replays the saved
 profile installation against the original cache paths.
 The test rejects a replayed TUF timestamp and verifies that missing or corrupt
-payloads block promotion with `--profile-payloads`. After a successful retry, it takes the
-mirrors offline, stages the upgrade, and boots through blessing and rollback.
+payloads block promotion with `--profile-payloads`. After a successful retry,
+it takes the mirrors offline and prepares the upgrade in one command. It
+deploys that bundle and boots through blessing and rollback.
 This scenario runs without slot reuse.
 
 With the signed kernel fixture, set `CPS_VM_DEVICE_ACTIVATION=1` to bootstrap

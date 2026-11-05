@@ -8,8 +8,9 @@ mod systemd_boot;
 use std::{
     env::{self, VarError},
     ffi::OsStr,
-    fs::{self, File},
-    os::unix::fs::MetadataExt,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
     process::{Command, Stdio},
 };
@@ -41,6 +42,56 @@ pub use systemd_boot::{
 };
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
+    let inputs = staging_inputs(source, destination, plan)?;
+    let staged = tempfile::Builder::new()
+        .prefix(".cps-be-")
+        .tempdir_in(Root::fd_path(inputs.parent.as_file()))?;
+    let id = stage_root(inputs.base, inputs.previous, staged.path(), plan)?;
+    publish_directory(&inputs.parent, staged.path(), inputs.name)
+        .context("publishing the staged root")?;
+    Ok(id)
+}
+
+/// Stage and export a saved plan as one directory ready for explicit activation.
+pub fn prepare_boot_environment(
+    source: &Path,
+    output: &Path,
+    plan: &Plan,
+    size_mib: u64,
+) -> Result<String> {
+    let spec = export::ExportSpec::new(size_mib)?;
+    let inputs = staging_inputs(source, output, plan)?;
+    let bundle = tempfile::Builder::new()
+        .prefix(".cps-prepare-")
+        .tempdir_in(Root::fd_path(inputs.parent.as_file()))?;
+    let root = bundle.path().join("root");
+    fs::create_dir(&root)?;
+    let id = stage_root(inputs.base, inputs.previous, &root, plan)?;
+    let receipt = export::export_with_receipt(&root, &bundle.path().join("root.ext4"), spec)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(bundle.path().join("receipt.kdl"))?;
+    file.write_all(receipt.as_bytes())?;
+    file.sync_all()?;
+    publish_directory(&inputs.parent, bundle.path(), inputs.name)
+        .context("publishing the prepared boot environment")?;
+    Ok(id)
+}
+
+struct StagingInputs<'a> {
+    base: Image,
+    previous: BootParent,
+    parent: Root,
+    name: &'a OsStr,
+}
+
+fn staging_inputs<'a>(
+    source: &Path,
+    destination: &'a Path,
+    plan: &Plan,
+) -> Result<StagingInputs<'a>> {
     ensure!(
         !matches!(plan.request, Request::ResolveConfig { .. }),
         "apply configuration review directly to an inactive root"
@@ -103,10 +154,16 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
         );
         Ok(true)
     })?;
-    let staged = tempfile::Builder::new()
-        .prefix(".cps-be-")
-        .tempdir_in(Root::fd_path(parent.as_file()))?;
-    let status = artifact_helper("cp", staged.path())
+    Ok(StagingInputs {
+        base,
+        previous,
+        parent,
+        name,
+    })
+}
+
+fn stage_root(base: Image, previous: BootParent, staged: &Path, plan: &Plan) -> Result<String> {
+    let status = artifact_helper("cp", staged)
         .stdin(Stdio::from(base.root.as_file().try_clone()?))
         .args(["-a", "--reflink=auto", "--one-file-system", "--"])
         .args(["/proc/self/fd/0/.", "."])
@@ -118,31 +175,31 @@ pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) ->
     );
     drop(base);
 
-    apply(staged.path(), plan).context("applying the plan in the staged root")?;
-    let image = Image::open(staged.path(), true)?;
+    apply(staged, plan).context("applying the plan in the staged root")?;
+    let image = Image::open(staged, true)?;
     check_image_integrity(&image)?;
     let state = image.state()?;
     if let Some(kernel) = kernel::selected(&state.installed, &state.paths)? {
         kernel.open_prepared(&image.root)?;
     }
     let settings = image.fork_for_boot(previous)?;
-    drop(image);
+    Ok(entry_id(&settings.id, settings.revision))
+}
 
+fn publish_directory(parent: &Root, staged: &Path, name: &OsStr) -> Result<()> {
     let stage_name = staged
-        .path()
         .file_name()
         .context("missing staging directory name")?;
-    syncfs(&File::open(staged.path())?)?;
+    syncfs(&File::open(staged)?)?;
     renameat_with(
         parent.as_file(),
         stage_name,
         parent.as_file(),
         name,
         RenameFlags::NOREPLACE,
-    )
-    .context("publishing the staged root")?;
+    )?;
     parent.as_file().sync_all()?;
-    Ok(entry_id(&settings.id, settings.revision))
+    Ok(())
 }
 
 fn entry_id(image: &str, revision: u64) -> String {

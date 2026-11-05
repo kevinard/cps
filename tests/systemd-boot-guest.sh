@@ -23,6 +23,7 @@ copy_runtime_deps() {
 # The writable disk is the one later booted through systemd-boot.
 run_device_guest() {
     local mode=$1 source=$2 output=$3 stage=${4:-}
+    local payload=${5:-$stage.ext4} receipt=${6:-$stage.kdl}
     local inputs="device-$mode-inputs"
     local program binary name repository key data_args=() scratch_args=()
     local programs=(mount sfdisk blkid e2fsck)
@@ -53,8 +54,8 @@ run_device_guest() {
                       -drive if=virtio,format=raw,file=installed-copy.raw)
     elif [[ $mode != rollback ]]; then
         cp -a -- "$stage" "$inputs/staged"
-        cp --sparse=always -- "$stage.ext4" "$inputs/staged.ext4"
-        cp -- "$stage.kdl" "$inputs/staged.kdl"
+        cp --sparse=always -- "$payload" "$inputs/staged.ext4"
+        cp -- "$receipt" "$inputs/staged.kdl"
         if [[ $mode != bootstrap ]]; then cp -- base.kdl "$inputs/"; fi
     fi
     {

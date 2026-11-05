@@ -119,3 +119,57 @@ test ! -e corrupt.ext4
 test -z "$(find . -maxdepth 1 -name '.cps-export-*' -print)"
 
 echo 'Verified atomic and reproducible ext4 export, metadata preservation, and failure cleanup'
+
+printf 'managed data\n' > image/bin/tool
+printf 'updated data\n' > proto/bin/tool
+"$cps" manifest generate --proto proto --publisher test --version 2.0.0-0 \
+    --uid "$(id -u)" --gid "$(id -g)" test/payload > upgrade.kdl
+"$cps" publish --repo repo --proto proto --signing-key private.der upgrade.kdl
+"$cps" plan --root image --output upgrade.json update
+prepare() {
+    SOURCE_DATE_EPOCH="$epoch" "$cps" boot-env prepare --source image --output "$1" \
+        --size-mib 16 upgrade.json
+}
+reject_prepare() {
+    local expected=$1 output=$2
+    if prepare "$output" > rejected.log 2>&1; then
+        echo "Unexpected success preparing $output" >&2
+        exit 1
+    fi
+    grep -F "$expected" rejected.log
+}
+reject_prepare 'must be outside the base image' image/inner
+test ! -e image/inner
+dd if=/dev/urandom of=image/large-file bs=1M count=20 status=none
+reject_prepare 'mke2fs failed' prepared
+test ! -e prepared
+test -z "$(find . -maxdepth 1 -name '.cps-prepare-*' -print)"
+rm -- image/large-file
+result=$(prepare prepared)
+grep -E '^Prepared cps-[0-9a-f-]+-2 at prepared$' <<< "$result"
+test "$(cat prepared/root/bin/tool)" = 'updated data'
+test "$(debugfs -R 'cat /bin/tool' prepared/root.ext4 2>/dev/null)" = 'updated data'
+test "$(cat prepared/root/local-state)" = 'local data'
+test "$(stat -c '%s:%a' prepared/root.ext4)" = '16777216:600'
+test "$(stat -c '%a' prepared/receipt.kdl)" = 600
+state_hash=$(sha256sum prepared/root/.cps/state.sqlite | cut -d' ' -f1)
+payload_hash=$(sha256sum prepared/root.ext4 | cut -d' ' -f1)
+grep -F "state-sha256=\"$state_hash\" bytes=16777216 sha256=\"$payload_hash\"" prepared/receipt.kdl
+test "$(sha256sum image/.cps/state.sqlite)" = "$source_state"
+test "$(cat image/bin/tool)" = 'managed data'
+reject_prepare 'destination already exists' prepared
+test "$(sha256sum prepared/root.ext4 | cut -d' ' -f1)" = "$payload_hash"
+
+prepare prepare-race > prepare-first.log 2>&1 &
+first=$!
+prepare prepare-race > prepare-second.log 2>&1 &
+second=$!
+successes=0
+if wait "$first"; then successes=$((successes + 1)); fi
+if wait "$second"; then successes=$((successes + 1)); fi
+test "$successes" = 1
+grep -E 'destination already exists|publishing the prepared boot environment' prepare-{first,second}.log
+e2fsck -fn prepare-race/root.ext4 >/dev/null
+test -f prepare-race/receipt.kdl
+test -z "$(find . -maxdepth 1 -name '.cps-prepare-*' -print)"
+echo 'Verified atomic boot preparation, late failure cleanup, and a single winner on concurrent preparation'

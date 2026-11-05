@@ -22,9 +22,9 @@ use cps::{
     fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
     generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_obsoletions, list_publishers,
-    list_withdrawals, plan, prefer_publisher, publish, publish_release_with_sources,
-    publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
-    remove_publisher, resume_transaction, rollback_boot_environment,
+    list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
+    publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
+    read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rotate_publisher_key, set_publisher_build_trust,
     set_publisher_repositories, stage_boot_environment, transaction_details, transaction_history,
     transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
@@ -656,6 +656,16 @@ enum BootCommand {
         source: PathBuf,
         #[arg(long)]
         root: PathBuf,
+        plan: PathBuf,
+    },
+    /// Stage and export a saved plan as one directory for explicit activation
+    Prepare {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, value_name = "MIB")]
+        size_mib: u64,
         plan: PathBuf,
     },
     /// Export an inactive root to a new ext4 partition image
@@ -1537,6 +1547,15 @@ fn run(command: Command) -> Result<ExitCode> {
             BootCommand::Stage { source, root, plan } => {
                 let id = stage_boot_environment(&source, &root, &load_plan(&plan)?)?;
                 println!("Staged {id} at {}", root.display());
+            }
+            BootCommand::Prepare {
+                source,
+                output,
+                size_mib,
+                plan,
+            } => {
+                let id = prepare_boot_environment(&source, &output, &load_plan(&plan)?, size_mib)?;
+                println!("Prepared {id} at {}", output.display());
             }
             BootCommand::Export {
                 root,

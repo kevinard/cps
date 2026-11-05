@@ -24,7 +24,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-27}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-28}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $device_activation == 1 && ( $mode != rollback || -z $kernel_fixture ) ]]; then
     echo 'CPS_VM_DEVICE_ACTIVATION requires rollback and a signed kernel fixture' >&2
@@ -106,7 +106,7 @@ if [[ -n $cps_fixture ]]; then
     fixture_publisher=vm-test
     case $cps_version in
         0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-7]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
+        0.1.0-[2-9]|0.1.0-1[0-9]|0.1.0-2[0-8]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
@@ -125,10 +125,10 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
     }
     profiled=true
     case $cps_version in
-        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-7]) signed_cps_builds=true ;;
+        0.1.0-[3-9]|0.1.0-1[0-9]|0.1.0-2[0-8]) signed_cps_builds=true ;;
     esac
     case $cps_version in
-        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-7]) protected_profiles=true ;;
+        0.1.0-[5-9]|0.1.0-1[0-9]|0.1.0-2[0-8]) protected_profiles=true ;;
     esac
     if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
 fi
@@ -850,38 +850,47 @@ if [[ $tuf_mirrors == 1 ]]; then
     mv -- mirrors offline-mirrors
     diff -r esp-before esp
 fi
-trial=$("$cps" boot-env stage --source base --root staged update.json)
-trial_id=${trial#Staged }
-trial_id=${trial_id%% at *}
+staged_root=staged
+staged_image=staged.ext4
+staged_receipt=staged.kdl
 if [[ $tuf_mirrors == 1 ]]; then
-    echo 'Verified staging worked offline with the prefetched profile payloads'
+    trial=$("$cps" boot-env prepare --source base --output prepared-upgrade --size-mib "$root_mib" update.json)
+    trial_id=${trial#Prepared }
+    staged_root=prepared-upgrade/root
+    staged_image=prepared-upgrade/root.ext4
+    staged_receipt=prepared-upgrade/receipt.kdl
+    echo 'Verified one boot preparation staged and exported the prefetched upgrade offline'
+else
+    trial=$("$cps" boot-env stage --source base --root "$staged_root" update.json)
+    trial_id=${trial#Staged }
 fi
+trial_id=${trial_id%% at *}
 diff -r esp-before esp
 test "$(cat base/etc/cps-vm-state)" = previous
 if [[ $mode == facet-change ]]; then
     test ! -e base/usr/share/man/man1/cps-vm.1
-    test "$(cat staged/usr/share/man/man1/cps-vm.1)" = trial
-    cmp base/etc/cps-vm-state staged/etc/cps-vm-state
-    cmp <("$cps" list --root base) <("$cps" list --root staged)
+    test "$(cat "$staged_root/usr/share/man/man1/cps-vm.1")" = trial
+    cmp base/etc/cps-vm-state "$staged_root/etc/cps-vm-state"
+    cmp <("$cps" list --root base) <("$cps" list --root "$staged_root")
     grep -Fq 'Add usr/share/man/man1/cps-vm.1' update.log
     grep -Fq 'Preserve local config etc/cps-vm-optional.conf' update.log
-    cmp base/etc/cps-vm-optional.conf staged/etc/cps-vm-optional.conf
+    cmp base/etc/cps-vm-optional.conf "$staged_root/etc/cps-vm-optional.conf"
     "$cps" verify --root base
-    "$cps" verify --root staged
+    "$cps" verify --root "$staged_root"
 else
-    test "$(cat staged/etc/cps-vm-state)" = trial
+    test "$(cat "$staged_root/etc/cps-vm-state")" = trial
     grep -Fq 'Link etc/cps-vm-boot-state to etc/cps-vm-state' update.log
     "$cps" verify --root base --pristine
-    "$cps" verify --root staged --pristine
+    "$cps" verify --root "$staged_root" --pristine
 fi
-check_runtime_packages staged
+check_runtime_packages "$staged_root"
 if $profiled; then
     grep -Fq 'Remove cps://vm-profile/test/previous-default 1.0.0-0' update.log
     test "$(cat base/etc/cps-vm-previous-default)" = 'previous default'
-    test ! -e staged/etc/cps-vm-previous-default
-    "$cps" info --root staged --available test/previous-default > /dev/null
-    trial_plan=$("$cps" transaction history --root staged --limit 1 | awk -F '\t' '$1 == 2 && $3 == "update-profile" {print $2}')
-    "$cps" transaction show --root staged "$trial_plan" > trial-history.json
+    test ! -e "$staged_root/etc/cps-vm-previous-default"
+    "$cps" info --root "$staged_root" --available test/previous-default > /dev/null
+    trial_plan=$("$cps" transaction history --root "$staged_root" --limit 1 | awk -F '\t' '$1 == 2 && $3 == "update-profile" {print $2}')
+    "$cps" transaction show --root "$staged_root" "$trial_plan" > trial-history.json
     grep -Fq "\"kernel_release\": \"$trial_release\"" trial-history.json
     grep -Fq '"base_revision": 1' trial-history.json
     "$cps" transaction history --root base --limit 1 | grep -Fq $'\tinstall-profile'
@@ -892,7 +901,7 @@ if [[ $mode == rollback ]]; then
     cp "$primary_pointer" trial-catalog
     cp base-catalog "$primary_pointer"
     "$cps" plan --root base --output base-catalog-plan.json update >/dev/null
-    if "$cps" plan --root staged --output replay.json update > replay.log 2>&1; then
+    if "$cps" plan --root "$staged_root" --output replay.json update > replay.log 2>&1; then
         echo 'The staged environment accepted a replayed primary catalog' >&2
         exit 1
     fi
@@ -903,28 +912,28 @@ fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     grep -Fq "Prepare Linux $trial_release with kernel-install" update.log
     cmp "$kernel" "base/usr/lib/modules/$base_release/vmlinuz"
-    test ! -e "staged/usr/lib/modules/$base_release/vmlinuz"
-    cmp "$trial_kernel" "staged/usr/lib/modules/$trial_release/vmlinuz"
+    test ! -e "$staged_root/usr/lib/modules/$base_release/vmlinuz"
+    cmp "$trial_kernel" "$staged_root/usr/lib/modules/$trial_release/vmlinuz"
     prepared=
-    for file in staged/.cps/kernel-*/linux; do
+    for file in "$staged_root"/.cps/kernel-*/linux; do
         if cmp -s "$file" "$trial_kernel"; then prepared=$file; break; fi
     done
     test -n "$prepared"
     if [[ -n $kernel_fixture ]]; then
         grep -Fq 'Install cps://canopa-kernel/system/kernel-qemu 6.12.115-0' update.log
-        cmp "$kernel_fixture/image/usr/lib/modules/$trial_release/config" "staged/usr/lib/modules/$trial_release/config"
+        cmp "$kernel_fixture/image/usr/lib/modules/$trial_release/config" "$staged_root/usr/lib/modules/$trial_release/config"
         test ! -e "${prepared%/*}/initrd"
     else
-        cmp "staged/usr/lib/modules/$trial_release/initrd" "${prepared%/*}/initrd"
+        cmp "$staged_root/usr/lib/modules/$trial_release/initrd" "${prepared%/*}/initrd"
     fi
     printf 'corrupt prepared kernel' > "$prepared"
-    if "$cps" boot-env export --root staged --output rejected.ext4 --size-mib "$root_mib" 2> rejected.log; then
+    if "$cps" boot-env export --root "$staged_root" --output rejected.ext4 --size-mib "$root_mib" 2> rejected.log; then
         echo "Export accepted a corrupted prepared kernel" >&2
         exit 1
     fi
     grep -q 'kernel artifact digest mismatch' rejected.log
     test ! -e rejected.ext4
-    if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
+    if "$cps" boot-env activate --root "$staged_root" --esp esp --root-partuuid "$trial_uuid" \
         --options "$options" 2> rejected.log; then
         echo "Activation accepted a corrupted prepared kernel" >&2
         exit 1
@@ -935,20 +944,22 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
 fi
 
 if [[ $recycle == 1 ]]; then
-    printf 'administrator-setting\n' > staged/etc/cps-vm.conf
-    printf 'administrator-policy\n' > staged/etc/cps-vm-policy.conf
+    printf 'administrator-setting\n' > "$staged_root/etc/cps-vm.conf"
+    printf 'administrator-policy\n' > "$staged_root/etc/cps-vm-policy.conf"
 fi
-"$cps" boot-env export --receipt --root staged --output staged.ext4 --size-mib "$root_mib" > staged.kdl
+if [[ $tuf_mirrors != 1 ]]; then
+    "$cps" boot-env export --receipt --root "$staged_root" --output "$staged_image" --size-mib "$root_mib" > "$staged_receipt"
+fi
 test "$(sha256sum base.ext4)" = "$base_payload"
 diff -r esp-before esp
 if [[ $device_activation != 1 ]]; then
-    "$cps" boot-env deploy --disk "$base_disk" --root-image staged.ext4 \
+    "$cps" boot-env deploy --disk "$base_disk" --root-image "$staged_image" \
         --root-partuuid "$trial_uuid" --output deployed.raw
     cmp -n "$((trial_mib * 1024 * 1024))" "$base_disk" deployed.raw
 fi
 
 mv "esp/EFI/cps/$base_id/vmlinuz.efi" saved-kernel
-if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
+if "$cps" boot-env activate --root "$staged_root" --esp esp --root-partuuid "$trial_uuid" \
     --options "$options" 2> rejected.log; then
     echo "Activation accepted a missing fallback kernel" >&2
     exit 1
@@ -956,7 +967,7 @@ fi
 grep -q 'known-good fallback kernel' rejected.log
 mv saved-kernel "esp/EFI/cps/$base_id/vmlinuz.efi"
 
-if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$base_uuid" \
+if "$cps" boot-env activate --root "$staged_root" --esp esp --root-partuuid "$base_uuid" \
     --options "$options" 2> rejected.log; then
     echo "Activation accepted the fallback's root partition" >&2
     exit 1
@@ -965,14 +976,14 @@ grep -q 'distinct root PARTUUID' rejected.log
 diff -r esp-before esp
 
 if [[ $device_activation == 1 ]]; then
-    run_device_guest initial "$base_disk" disk.raw staged
+    run_device_guest initial "$base_disk" disk.raw "$staged_root" "$staged_image" "$staged_receipt"
     cmp -n 1048576 "$base_disk" disk.raw
     cmp -i "$((base_mib * 1024 * 1024))" -n "$((root_mib * 1024 * 1024))" "$base_disk" disk.raw
-    cmp -i "$((trial_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" disk.raw staged.ext4
+    cmp -i "$((trial_mib * 1024 * 1024)):0" -n "$((root_mib * 1024 * 1024))" disk.raw "$staged_image"
     cmp -i "$(((trial_mib + root_mib) * 1024 * 1024))" "$base_disk" disk.raw
 else
-    "$cps" boot-env activate --root staged --root-partuuid "$trial_uuid" \
-        --disk deployed.raw --receipt staged.kdl --esp-partuuid "$esp_uuid" --output-disk disk.raw \
+    "$cps" boot-env activate --root "$staged_root" --root-partuuid "$trial_uuid" \
+        --disk deployed.raw --receipt "$staged_receipt" --esp-partuuid "$esp_uuid" --output-disk disk.raw \
         --options "$options" --tries 2
     cmp -n 1048576 deployed.raw disk.raw
     cmp -i "$((base_mib * 1024 * 1024))" deployed.raw disk.raw
@@ -982,7 +993,7 @@ mcopy -s -i disk.raw@@1048576 ::/EFI ::/loader esp-activated/
 diff -r esp-before/EFI/BOOT esp-activated/EFI/BOOT
 mv esp esp-detached
 mv esp-activated esp
-"$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
+"$cps" boot-env activate --root "$staged_root" --esp esp --root-partuuid "$trial_uuid" \
     --options "$options" --tries 9
 test -f "esp/loader/entries/$trial_id+2.conf"
 test ! -e "esp/loader/entries/$trial_id+9.conf"
@@ -995,7 +1006,7 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     if [[ -n $kernel_fixture ]]; then
         test ! -e "esp/EFI/cps/$trial_id/initramfs.img"
     else
-        cmp "staged/usr/lib/modules/$trial_release/initrd" "esp/EFI/cps/$trial_id/initramfs.img"
+        cmp "$staged_root/usr/lib/modules/$trial_release/initrd" "esp/EFI/cps/$trial_id/initramfs.img"
     fi
 fi
 
@@ -1003,9 +1014,9 @@ if [[ $mode == rollback ]]; then
     grep -Fq 'Install cps://extras/test/extra-marker 1.0.0-0' update.log
     grep -Fq "Remove cps://$fixture_publisher/test/legacy-marker 1.0.0-0" update.log
     test ! -e base/etc/cps-vm-extra-marker
-    test "$(cat staged/etc/cps-vm-extra-marker)" = extras
+    test "$(cat "$staged_root/etc/cps-vm-extra-marker")" = extras
     test "$(cat base/etc/cps-vm-legacy-marker)" = legacy
-    test ! -e staged/etc/cps-vm-legacy-marker
+    test ! -e "$staged_root/etc/cps-vm-legacy-marker"
     cp esp/loader/loader.conf config-before-rejected-rollback
     if "$cps" boot-env rollback --esp esp "$trial_id" 2> rejected.log; then
         echo 'Rollback accepted an unblessed trial' >&2
@@ -1018,19 +1029,19 @@ fi
 if $health_failure; then
     # Simulate an offline modification after checked activation.
     if [[ $mode == catalog-health-fail ]]; then
-        debugfs -R 'dump /.cps/state.sqlite trial.sqlite' staged.ext4 >/dev/null
+        debugfs -R 'dump /.cps/state.sqlite trial.sqlite' "$staged_image" >/dev/null
         changed=$(sqlite3 -batch -bail trial.sqlite \
             "UPDATE catalog_archives SET catalog=x'00'; SELECT changes();")
         test "$changed" -gt 0
         printf '%s\n' 'rm /.cps/state.sqlite' 'write trial.sqlite /.cps/state.sqlite' > corrupt-debugfs
-        debugfs -w -f corrupt-debugfs staged.ext4 >/dev/null
-        debugfs -R 'dump /.cps/state.sqlite modified.sqlite' staged.ext4 >/dev/null
+        debugfs -w -f corrupt-debugfs "$staged_image" >/dev/null
+        debugfs -R 'dump /.cps/state.sqlite modified.sqlite' "$staged_image" >/dev/null
         cmp trial.sqlite modified.sqlite
     else
-        debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' staged.ext4 >/dev/null
-        debugfs -R 'stat /etc/cps-vm-state' staged.ext4 2>/dev/null | grep -Eq 'Mode: +0600'
+        debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' "$staged_image" >/dev/null
+        debugfs -R 'stat /etc/cps-vm-state' "$staged_image" 2>/dev/null | grep -Eq 'Mode: +0600'
     fi
-    dd if=staged.ext4 of=disk.raw bs=1M seek="$trial_mib" conv=notrunc status=none
+    dd if="$staged_image" of=disk.raw bs=1M seek="$trial_mib" conv=notrunc status=none
 fi
 
 cp "$vars" vars.fd
@@ -1150,7 +1161,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
             printf '%s\n' "$utilities"
         fi
         if $signed_insmod; then
-            modules=$(awk '{printf " %s", $2}' "staged/vm-modules/$trial_release/load")
+            modules=$(awk '{printf " %s", $2}' "$staged_root/vm-modules/$trial_release/load")
             loaded=$(tr -d '\r' < serial.log | grep '^CPS_VM_INSMOD: ')
             test "$loaded" = "$(printf 'CPS_VM_INSMOD: trial%s\nCPS_VM_INSMOD: trial%s' "$modules" "$modules")"
         fi
@@ -1243,14 +1254,14 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
                 recycled_id=$(sed -n 's/^CPS_VM_INSTALLED_STAGE: //p' device-installed-activation.log)
                 test -n "$recycled_id"
             else
-                "$cps" plan --root staged --output recycle.json update | tee recycle-plan.log
+                "$cps" plan --root "$staged_root" --output recycle.json update | tee recycle-plan.log
                 grep -Fq 'test/boot-state 2.0.0-0 -> 3.0.0-0' recycle-plan.log
-                result=$("$cps" boot-env stage --source staged --root recycled recycle.json)
+                result=$("$cps" boot-env stage --source "$staged_root" --root recycled recycle.json)
                 recycled_id=${result#Staged }
                 recycled_id=${recycled_id%% at *}
                 test "$(cat recycled/etc/cps-vm.conf)" = administrator-setting
                 test "$(cat recycled/etc/cps-vm-policy.conf)" = administrator-policy
-                test "$(stat -c %a staged/etc/cps-vm-policy.conf)" = 644
+                test "$(stat -c %a "$staged_root/etc/cps-vm-policy.conf")" = 644
                 test "$(stat -c %a recycled/etc/cps-vm-policy.conf)" = 600
                 "$cps" config list --root recycled | tee config-review.log
                 grep -Fq '"etc/cps-vm.conf"' config-review.log
@@ -1329,7 +1340,7 @@ fi
 # Reproduce the exhausted ESP state on the host-facing directory and verify
 # that another invocation of activate cannot replenish the boot counter.
 mv "esp/loader/entries/$trial_id+2.conf" "esp/loader/entries/$trial_id+0-2.conf"
-if "$cps" boot-env activate --root staged --esp esp --root-partuuid "$trial_uuid" \
+if "$cps" boot-env activate --root "$staged_root" --esp esp --root-partuuid "$trial_uuid" \
     --options "$options" 2> rejected.log; then
     echo "Activation reset the exhausted counter" >&2
     exit 1
