@@ -541,15 +541,24 @@ if [ -f /etc/cps-vm-assert-profile-protection ]; then
     printf 'CPS_VM_PROFILE_PROTECTION: %s verified\n' "$state"
 fi
 if [ -f /etc/cps-vm-assert-package-intent ]; then
-    /usr/bin/cps list --root / --intent > /run/package-intent
-    "$bb" grep -Fxq "$(printf 'cps://vm-profile/test/boot-stack@1.0.0-0\t-\troot')" /run/package-intent
-    /usr/bin/cps plan --root / --output /run/mark-intent.json mark explicit test/boot-stack \
-        > /run/mark-intent.log
-    "$bb" grep -Fxq 'Mark cps://vm-profile/test/boot-stack@1.0.0-0 as locally requested' /run/mark-intent.log
+    listing=$(/usr/bin/cps list --root / --intent)
+    case "$listing" in
+        *"$(printf 'cps://vm-profile/test/boot-stack@1.0.0-0\t-\troot')"*) ;;
+        *) printf '%s\n' "$listing" >&2; exit 1 ;;
+    esac
+    preview=$(/usr/bin/cps plan --root / --output /run/mark-intent.json mark explicit test/boot-stack)
+    case "$preview" in
+        *'Mark cps://vm-profile/test/boot-stack@1.0.0-0 as locally requested'*) ;;
+        *) printf '%s\n' "$preview" >&2; exit 1 ;;
+    esac
     if /usr/bin/cps apply --root / /run/mark-intent.json > /run/mark-rejected.log 2>&1; then
         exit 1
     fi
-    "$bb" grep -Fq 'use boot-env stage to prepare package changes from an installed root' /run/mark-rejected.log
+    rejection=$("$bb" cat /run/mark-rejected.log)
+    case "$rejection" in
+        *'use boot-env stage to prepare package changes from an installed root'*) ;;
+        *) printf '%s\n' "$rejection" >&2; exit 1 ;;
+    esac
     printf 'CPS_VM_PACKAGE_INTENT: %s verified\n' "$state"
 fi
 if [ -f /etc/cps-vm-assert-extra-publisher ]; then
