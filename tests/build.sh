@@ -451,7 +451,7 @@ CONFIG
 write_policy() {
     cat > release/publish-policy.kdl <<POLICY
 schema-version 1
-publisher "canopa" verify-toolchains=#true {
+publisher "canopa" verify-toolchains=#true archive-build-inputs=#true {
     builder-key "builder-public.der"
     approve "demo/hello" version="1.0.0-0" sha256="$1" toolchain-config="../review-toolchain.kdl"
 }
@@ -500,6 +500,17 @@ expect_failure 'protected repository is missing publish-policy.kdl' publish_bund
     --builder-key builder-public.der --recipe-sha256 "$reviewed" first
 mv policy.saved release/publish-policy.kdl
 test "$(cat release/current)" = "$first_catalog"
+rebuild_recipe=$("$cps" repo rebuild-inputs --repo release --publisher canopa --trust-key public.der \
+    --catalog "$first_catalog" --output rebuild-inputs cps://canopa/demo/hello@1.0.0-0)
+cmp first/build.kdl "$rebuild_recipe"
+cmp first/manifest.kdl "$(dirname -- "$rebuild_recipe")/manifest.kdl"
+cmp first/attestation.json rebuild-inputs/attestation.json
+mkdir rebuild-sources
+printf 'hello from pinned input\n' > rebuild-sources/input
+"$cps" build --toolchain-config review-toolchain.kdl --sources rebuild-sources --output rebuilt \
+    --check-reproducible "$rebuild_recipe"
+diff -r first/proto rebuilt/proto
+echo 'Verified rebuilding from the signed release archive'
 "$cps" repo attestation --repo release --publisher canopa --trust-key public.der \
     cps://canopa/demo/hello@1.0.0-0 > envelope.json
 python3 - <<'PYTHON'
@@ -577,6 +588,8 @@ PYTHON
 
 "$cps" repo export --repo release --publisher canopa --trust-key public.der --output targets
 test -f "targets/attestations-$(sha first/attestation.json)"
+cmp first/build.kdl "targets/build-inputs-$(sha first/build.kdl)"
+cmp first/manifest.kdl "targets/build-inputs-$(sha first/manifest.kdl)"
 test ! -e targets/publish-policy.kdl
 test ! -e targets/builder-public.der
 protected_image() {

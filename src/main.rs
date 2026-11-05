@@ -17,15 +17,16 @@ use cps::{
     activate_deployed_boot_environment, activate_device_boot_environment,
     add_publisher_with_build_trust, apply, audit_publisher_builds, build_with_toolchain_config,
     build_with_worker, create_configured_image, create_image, deploy_and_activate_boot_environment,
-    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt, fetch_plan,
-    fetch_sources, fetch_sources_with_local, generate_manifest_for_architecture, import_sources,
-    list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
-    list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
-    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
-    resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
-    rotate_publisher_key, set_publisher_build_trust, set_publisher_repositories,
-    stage_boot_environment, transaction_details, transaction_history, transaction_status, verify,
-    verify_pristine, withdraw_package,
+    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt,
+    export_rebuild_inputs, fetch_plan, fetch_sources, fetch_sources_with_local,
+    generate_manifest_for_architecture, import_sources, list_boot_environments,
+    list_boot_environments_on_disk, list_config_updates, list_obsoletions, list_publishers,
+    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
+    read_attestation, read_worker_config, release, remove_publisher, resume_transaction,
+    rollback_boot_environment, rollback_boot_environment_on_disk, rotate_publisher_key,
+    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
+    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
+    withdraw_package,
 };
 
 #[derive(Parser)]
@@ -362,6 +363,22 @@ enum RepoCommand {
         publisher: String,
         #[arg(long)]
         trust_key: PathBuf,
+        package_id: String,
+    },
+    /// Extract the recipe, reviewed manifest, and attestation for an exact package
+    RebuildInputs {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+        /// Select a historical signed catalog by SHA-256
+        #[arg(long)]
+        catalog: Option<String>,
+        /// New directory for the authenticated inputs
+        #[arg(long)]
+        output: PathBuf,
         package_id: String,
     },
     /// Withdraw an exact published version from future package selections
@@ -909,6 +926,24 @@ fn run(command: Command) -> Result<ExitCode> {
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(&bytes)?;
                 writeln!(stdout)?;
+            }
+            RepoCommand::RebuildInputs {
+                repo,
+                publisher,
+                trust_key,
+                catalog,
+                output,
+                package_id,
+            } => {
+                let recipe = export_rebuild_inputs(
+                    &repo,
+                    &publisher,
+                    &trust_key,
+                    &package_id,
+                    catalog.as_deref(),
+                    &output,
+                )?;
+                println!("{}", recipe.display());
             }
             RepoCommand::Withdraw {
                 repo,

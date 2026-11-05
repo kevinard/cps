@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-17`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-18`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -352,6 +352,38 @@ cps publish-bundle --repo repo --signing-key private.der --builder-key worker-a-
 ```
 
 CPS counts distinct authorized keys whose signatures cover the same build statement, including the exact payload hashes and pinned inputs. The release stores those signatures together in the DSSE envelope. Administrators establish worker independence by assigning keys to separately operated workers.
+
+### Rebuilding a published package
+
+Set `archive-build-inputs=#true` on the publishing policy's `publisher` node
+to make reviewed recipes and their input manifests available to rebuilders.
+CPS requires version 3 build evidence and signs the digests of both exact
+documents into the catalog. Once the archive is in use, later releases keep
+existing records and include inputs for new packages. For a previously
+published version, republish the original bundle with its original
+attestation to add its inputs. Clients need archive support to consume a
+catalog containing these records.
+
+```sh
+recipe=$(cps repo rebuild-inputs --repo /var/lib/cps/canopa --publisher canopa \
+    --trust-key canopa.der --output reviewed cps://canopa/demo/hello@1.0.0-0)
+cps source fetch --cache source-cache "$recipe"
+cps build --toolchain-config toolchain.kdl --source-cache source-cache \
+    --check-reproducible --output rebuilt "$recipe"
+```
+
+`repo rebuild-inputs` verifies the signed catalog, archived bytes, and
+their binding to the admitted attestation before writing a new directory.
+The command prints the recipe path, preserves the manifest's relative path,
+and writes the original attestation alongside the recipe directory. Use
+`--catalog SHA256` to select a cached historical catalog.
+
+Both full and index-only mirror sync carry the archived inputs, including
+those for withdrawn versions. The recipe pins the source archives and
+toolchain catalogs. Supply source archives without URLs through
+`cps source import` or `cps source fetch --from`, and configure local
+toolchain repositories with the pinned catalogs and provisioned trust keys.
+The attestation provides the published output hashes for comparison.
 
 ### Verifying builds on images and workers
 

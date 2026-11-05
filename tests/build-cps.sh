@@ -129,6 +129,10 @@ if (( ${cps_version##*-} >= 17 )); then
     review_bootstrap=' toolchain-config="../bootstrap-toolchain.kdl"'
     review_cps=' toolchain-config="../toolchain.kdl"'
 fi
+archive_build_inputs=
+if (( ${cps_version##*-} >= 18 )); then
+    archive_build_inputs=' archive-build-inputs=#true'
+fi
 write_profile() {
     local name=$1
     shift
@@ -152,7 +156,7 @@ write_policy() {
     {
         cat <<POLICY
 schema-version 1
-publisher "canopa"$verify_toolchains {
+publisher "canopa"$verify_toolchains$archive_build_inputs {
     builder-key "builder-public.der"
     approve "system/sqlite" version="$sqlite_version" sha256="$sqlite_recipe"$review_bootstrap
     approve "system/libseccomp" version="$seccomp_version" sha256="$seccomp_recipe"$review_bootstrap
@@ -207,6 +211,13 @@ RELEASE
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
     "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
+if [[ -n $archive_build_inputs ]]; then
+    recovered=$("$cps" repo rebuild-inputs --repo repo --publisher canopa --trust-key release-public.der \
+        --output reviewed-cps "$cps_package")
+    cmp build.kdl "$recovered"
+    cmp cps.kdl "$(dirname -- "$recovered")/cps.kdl"
+    cmp bundle/attestation.json reviewed-cps/attestation.json
+fi
 cat > image.kdl <<CONFIG
 schema-version 1
 release-profile "cps-runtime"

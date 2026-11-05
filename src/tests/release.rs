@@ -1599,6 +1599,146 @@ fn sign_export(
 }
 
 #[test]
+fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -> Result<()> {
+    let f = Fixture::new()?;
+    let builder = Fixture::new()?;
+    let work = f._dir.path();
+    let id = "cps://canopa/test/rebuild@1.0.0-0";
+    let manifest = b"schema-version 1\n// Reviewed bytes and layout\npackage \"test/rebuild\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
+    let catalog = digest(b"legacy pinned toolchain");
+    let recipe = format!(
+        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain \"{catalog}\" {{ package \"build/tool\"; }}\n    manifest \"build.kdl/nested/manifest.kdl\" sha256=\"{}\"\n    script \"true\"\n}}\n",
+        digest(manifest),
+    );
+    let reviewed = digest(recipe.as_bytes());
+    let bundle = work.join("bundle");
+    fs::create_dir_all(bundle.join("proto"))?;
+    fs::write(bundle.join("build.kdl"), &recipe)?;
+    fs::write(bundle.join("manifest.kdl"), manifest)?;
+    let envelope = attestation::sign(
+        &read_signing_key(&builder.private)?,
+        &parse_manifest(std::str::from_utf8(manifest)?)?,
+        manifest,
+        &build::parse(&recipe)?,
+        recipe.as_bytes(),
+        Toolchain::Legacy(LegacyToolchain {
+            publisher: "seed".into(),
+            key_sha256: digest(&read_key(&f.public)?),
+            catalog_sha256: catalog,
+            package_manifests: BTreeMap::from([("build/tool".into(), digest(b"tool"))]),
+        }),
+        &BTreeMap::new(),
+    )?;
+    fs::write(bundle.join("attestation.json"), &envelope)?;
+    fs::create_dir(&f.repo)?;
+    let policy = |archive: &str| {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" archive-build-inputs={archive} {{
+    builder-key {:?}
+    approve "test/rebuild" version="1.0.0-0" sha256="{reviewed}"
+}}
+"#,
+                builder.public
+            ),
+        )
+    };
+    let publish = || publish_bundle(&f.repo, &bundle, &f.private, &builder.public, &reviewed);
+    let extract = |repo: &Path, catalog, output: &Path| {
+        crate::export_rebuild_inputs(repo, "canopa", &f.public, id, catalog, output)
+    };
+    policy("#false")?;
+    publish()?;
+    let no_archive = work.join("no-archive");
+    let error = extract(&f.repo, None, &no_archive).unwrap_err();
+    assert!(format!("{error:#}").contains("no archived rebuild inputs"));
+    assert!(!no_archive.exists());
+    policy("#true")?;
+    publish()?;
+    let archived = fs::read_to_string(f.repo.join("current"))?;
+    publish()?;
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, archived);
+    policy("#false")?;
+    let error = publish().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("protected repository requires archiving rebuild inputs")
+    );
+    policy("#true")?;
+    let check = |repo: &Path, catalog, output: &Path| -> Result<()> {
+        let path = extract(repo, catalog, output)?;
+        assert_eq!(path, output.join("source/rebuild.kdl"));
+        assert_eq!(fs::read(path)?, recipe.as_bytes());
+        assert_eq!(
+            fs::read(output.join("source/build.kdl/nested/manifest.kdl"))?,
+            manifest
+        );
+        assert_eq!(fs::read(output.join("attestation.json"))?, envelope);
+        assert!(extract(repo, catalog, output).is_err());
+        Ok(())
+    };
+    check(&f.repo, None, &work.join("local"))?;
+
+    withdraw_package(&f.repo, &f.private, id)?;
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let mirror = work.join("mirror");
+    fs::create_dir(&mirror)?;
+    let export = mirror.join("export");
+    mirror_release::export_with_retained(
+        &f.repo,
+        "canopa",
+        &f.public,
+        &export,
+        &[archived.trim().into()],
+    )?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_export(&export, &mirror, 1, fresh, &anchor, &tuf_key)?;
+    let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+    let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+    let cache = work.join("cache");
+    let sync = || {
+        mirror_release::sync_index(
+            &cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    assert_eq!(sync()?, fs::read_to_string(f.repo.join("current"))?.trim());
+    let corrupted = cache.join("build-inputs").join(&reviewed);
+    fs::write(&corrupted, vec![b'x'; recipe.len()])?;
+    let corrupt = work.join("corrupt");
+    let error = extract(&cache, None, &corrupt).unwrap_err();
+    assert!(format!("{error:#}").contains("digest mismatch for repository object build-inputs"));
+    assert!(!corrupt.exists());
+    sync()?;
+    let current_only = work.join("current-only");
+    sign_release(&f, &current_only, 1, fresh, &anchor, &tuf_key)?;
+    let withdrawn_cache = work.join("withdrawn-cache");
+    let metadata = Url::from_directory_path(current_only.join("metadata")).unwrap();
+    let targets = Url::from_directory_path(current_only.join("targets")).unwrap();
+    mirror_release::sync_index(
+        &withdrawn_cache,
+        &anchor,
+        metadata.as_str(),
+        targets.as_str(),
+        "canopa",
+        &f.public,
+    )?;
+    fs::rename(&f.repo, work.join("offline-repo"))?;
+    fs::rename(&mirror, work.join("offline-mirror"))?;
+    fs::rename(&current_only, work.join("offline-current-only"))?;
+    check(&withdrawn_cache, None, &work.join("withdrawn"))?;
+    check(&cache, Some(archived.trim()), &work.join("historical"))?;
+    Ok(())
+}
+
+#[test]
 fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -> Result<()> {
     let f = Fixture::new()?;
     let seed = Fixture::new()?;

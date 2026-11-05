@@ -312,6 +312,8 @@ pub(crate) struct VerifiedBuild {
     pub artifacts: BTreeMap<String, FileDigest>,
     pub recipe_sha256: String,
     pub recipe: BuildRecipe,
+    pub recipe_document: Vec<u8>,
+    pub manifest_document: Vec<u8>,
     pub toolchain: Toolchain,
     pub published_manifest: Option<FileDigest>,
 }
@@ -555,10 +557,35 @@ pub(crate) fn verify_bundle(
             artifacts,
             recipe_sha256: reviewed_recipe.to_owned(),
             recipe,
+            recipe_document: recipe_bytes,
+            manifest_document: manifest_bytes,
             toolchain: predicate.toolchain,
             published_manifest,
         },
     ))
+}
+
+pub(crate) fn check_rebuild_inputs(
+    envelope: &[u8],
+    id: &str,
+    recipe_hash: &str,
+    manifest: &[u8],
+    published_hash: &str,
+) -> Result<()> {
+    let (payload, _) = decode_envelope(envelope)?;
+    let statement = parse_statement(&payload)?;
+    let subjects = subjects(statement.subject)?;
+    ensure!(
+        statement.predicate_type == PUBLISHED_PREDICATE
+            && statement.predicate.package == id
+            && statement.predicate.recipe_sha256 == recipe_hash
+            && subjects.get("manifest.kdl") == Some(&file_digest(manifest))
+            && subjects
+                .get(PUBLISHED_MANIFEST)
+                .is_some_and(|file| file.sha256 == published_hash),
+        "archived rebuild inputs differ from the admitted build statement"
+    );
+    Ok(())
 }
 
 fn parse_statement(payload: &[u8]) -> Result<Statement> {

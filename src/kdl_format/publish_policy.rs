@@ -21,6 +21,7 @@ pub(crate) struct PublishPolicy {
     pub minimum_builders: usize,
     pub recipes: BTreeMap<String, RecipeApproval>,
     pub verify_toolchains: bool,
+    pub archive_build_inputs: bool,
     pub profiles: BTreeMap<String, Profile>,
 }
 
@@ -174,18 +175,31 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
         "expected schema-version and publisher nodes"
     );
     let node = one(&doc, "publisher")?;
-    let fields = Fields::read(node, 1, &["minimum-builders", "verify-toolchains"], true)?;
+    let fields = Fields::read(
+        node,
+        1,
+        &[
+            "minimum-builders",
+            "verify-toolchains",
+            "archive-build-inputs",
+        ],
+        true,
+    )?;
     let publisher = fields.string_arg(0)?;
-    let verify_toolchains = fields
-        .properties
-        .get("verify-toolchains")
-        .map(|value| {
-            value
-                .as_bool()
-                .context("verify-toolchains must be #true or #false")
-        })
-        .transpose()?
-        .unwrap_or(false);
+    let flag = |name: &str| -> Result<bool> {
+        Ok(fields
+            .properties
+            .get(name)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .with_context(|| format!("{name} must be #true or #false"))
+            })
+            .transpose()?
+            .unwrap_or(false))
+    };
+    let verify_toolchains = flag("verify-toolchains")?;
+    let archive_build_inputs = flag("archive-build-inputs")?;
     let minimum_builders = fields.integer("minimum-builders")?.unwrap_or(1);
     ensure!(
         (1..=MAX_BUILDERS).contains(&minimum_builders),
@@ -261,6 +275,7 @@ pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
         minimum_builders,
         recipes,
         verify_toolchains,
+        archive_build_inputs,
         profiles,
     })
 }

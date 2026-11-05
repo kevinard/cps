@@ -27,7 +27,7 @@ use crate::{
 use super::{
     CATALOG_LIMIT, Catalog, CatalogEntry, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot,
     catalog_snapshot, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
-    read_current, read_key, read_limited, read_package, read_pointer, write_atomic,
+    read_current, read_key, read_limited, read_package, read_pointer, rebuild, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -637,6 +637,7 @@ async fn materialize(
     }
     let mut entries = BTreeMap::new();
     let mut attestations = BTreeSet::new();
+    let mut rebuild_objects = BTreeMap::new();
     let mut retained_hashes = Vec::new();
     if verified
         .targets()
@@ -658,6 +659,7 @@ async fn materialize(
             for required in required.iter().filter(|required| required.sha256 == pin) {
                 required.check_lineage(&previous, key)?;
             }
+            collect_rebuild_objects(&previous, &mut rebuild_objects, &mut attestations);
             entries.extend(previous.entries);
             attestations.extend(previous.attestations.into_values());
             retained_hashes.push(pin.to_owned());
@@ -670,13 +672,36 @@ async fn materialize(
             pin.sha256
         );
     }
+    collect_rebuild_objects(&catalog, &mut rebuild_objects, &mut attestations);
     entries.extend(catalog.entries);
     attestations.extend(catalog.attestations.into_values());
     cache_objects(verified, repo, publisher, entries, attestations, full).await?;
+    for (hash, limit) in rebuild_objects {
+        fetch_object(verified, repo, rebuild::OBJECTS, &hash, limit, None).await?;
+    }
     Ok(StagedRelease {
         current: hash,
         retained: retained_hashes,
     })
+}
+
+fn collect_rebuild_objects(
+    catalog: &Catalog,
+    objects: &mut BTreeMap<String, u64>,
+    attestations: &mut BTreeSet<String>,
+) {
+    for (id, inputs) in &catalog.build_inputs {
+        for (hash, limit) in inputs.objects() {
+            objects
+                .entry(hash.to_owned())
+                .and_modify(|current| *current = (*current).min(limit))
+                .or_insert(limit);
+        }
+        if let Some((_, Some(hash))) = catalog.package_record(id) {
+            // Include admitted evidence for withdrawn rebuilds in a fresh cache.
+            attestations.insert(hash.to_owned());
+        }
+    }
 }
 
 fn record_catalog_checkpoint(repo: &Path, hash: &str) -> Result<()> {
@@ -944,6 +969,11 @@ fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> 
     }
     for hash in release.builds.attestations.values() {
         export_object(root, output, "attestations", hash, ATTESTATION_LIMIT, None)?;
+    }
+    for inputs in release.build_inputs.values() {
+        for (hash, limit) in inputs.objects() {
+            export_object(root, output, rebuild::OBJECTS, hash, limit, None)?;
+        }
     }
     Ok(())
 }

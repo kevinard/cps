@@ -32,7 +32,9 @@ const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
 mod keys;
 mod profiles;
+mod rebuild;
 pub mod release;
+pub use rebuild::export_rebuild_inputs;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +48,8 @@ pub(crate) struct Catalog {
     attestations_required: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     toolchains_verified: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    build_inputs: BTreeMap<String, rebuild::Digests>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     withdrawals: BTreeMap<String, Withdrawal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,6 +223,7 @@ impl Catalog {
             attestations: BTreeMap::new(),
             attestations_required: false,
             toolchains_verified: false,
+            build_inputs: BTreeMap::new(),
             withdrawals: BTreeMap::new(),
             sequence: None,
             profiles_required: false,
@@ -410,6 +415,20 @@ impl Catalog {
                 ensure!(
                     next_attestation == Some(attestation),
                     "release drops or changes the build attestation for {id}"
+                );
+            }
+        }
+        for (id, inputs) in &self.build_inputs {
+            ensure!(
+                next.build_inputs.get(id) == Some(inputs),
+                "release drops or changes the rebuild inputs for {id}"
+            );
+        }
+        if !self.build_inputs.is_empty() {
+            for id in next.entries.keys().chain(next.withdrawals.keys()) {
+                ensure!(
+                    self.package_record(id).is_some() || next.build_inputs.contains_key(id),
+                    "release omits rebuild inputs for new package {id}"
                 );
             }
         }
@@ -638,6 +657,7 @@ pub struct Snapshot {
     pub sha256: String,
     pub packages: Vec<Published>,
     pub(crate) builds: BuildEvidence,
+    build_inputs: BTreeMap<String, rebuild::Digests>,
     withdrawals: BTreeMap<String, Withdrawal>,
     pub(crate) obsoletions: BTreeMap<String, Version>,
 }
@@ -1102,6 +1122,18 @@ fn decode_catalog(
             );
         }
     }
+    for (id, inputs) in &catalog.build_inputs {
+        ensure!(
+            catalog.attestations_required
+                && catalog
+                    .package_record(id)
+                    .is_some_and(|(_, attestation)| attestation.is_some()),
+            "rebuild inputs require an admitted build attestation for {id}"
+        );
+        for (hash, _) in inputs.objects() {
+            validate_digest(hash).context("invalid rebuild input digest")?;
+        }
+    }
     Ok(catalog)
 }
 
@@ -1143,6 +1175,7 @@ fn catalog_snapshot(
         sha256: hash,
         packages,
         builds,
+        build_inputs: catalog.build_inputs,
         withdrawals: catalog.withdrawals,
         obsoletions: catalog.obsoletions,
     })
@@ -1329,7 +1362,13 @@ fn path_present(path: &Path) -> Result<bool> {
 
 fn prepare_objects(repo: &Path) -> Result<()> {
     let root = Root::open(repo)?;
-    for dir in ["catalogs", "manifests", "blobs", "attestations"] {
+    for dir in [
+        "catalogs",
+        "manifests",
+        "blobs",
+        "attestations",
+        rebuild::OBJECTS,
+    ] {
         if !path_present(&repo.join(dir))? {
             fs::create_dir(repo.join(dir))?;
         }
@@ -1749,16 +1788,24 @@ fn stage_manifest(
         }
         let envelope = evidence.envelope()?;
         let hash = digest(&envelope);
-        if let Some(previous) = catalog.attestations.get(&id) {
+        let added_attestation = if let Some(previous) = catalog.attestations.get(&id) {
             ensure!(
                 previous == &hash,
                 "{id} already has a different build attestation"
             );
             read_object(repo, "attestations", previous, ATTESTATION_LIMIT)?;
-            return Ok(false);
-        }
-        let hash = store(repo, "attestations", &envelope)?;
-        catalog.attestations.insert(id.clone(), hash);
+            false
+        } else {
+            let hash = store(repo, "attestations", &envelope)?;
+            catalog.attestations.insert(id.clone(), hash);
+            true
+        };
+        let added_inputs = if policy.is_some_and(|policy| policy.archive_build_inputs) {
+            rebuild::archive(repo, catalog, &id, &evidence)?
+        } else {
+            false
+        };
+        return Ok(!unchanged_manifest || added_attestation || added_inputs);
     } else if unchanged_manifest {
         return Ok(false);
     }
@@ -1792,6 +1839,7 @@ struct PublicationPolicy {
     recipes: BTreeMap<String, publish_policy::RecipeApproval>,
     minimum_builders: usize,
     verify_toolchains: bool,
+    archive_build_inputs: bool,
     profiles: BTreeMap<String, publish_policy::Profile>,
 }
 
@@ -1817,6 +1865,10 @@ impl PublicationPolicy {
         ensure!(
             !self.verify_toolchains || build.published_manifest.is_some(),
             "toolchain verification policy requires version 3 build evidence"
+        );
+        ensure!(
+            !self.archive_build_inputs || build.published_manifest.is_some(),
+            "archiving rebuild inputs requires version 3 build evidence"
         );
         if let Some(config) = &approval.toolchain_config {
             crate::build::verify_toolchain(config, &build.recipe, &build.toolchain)
@@ -1878,6 +1930,10 @@ fn read_publish_policy(
     );
     if publishes_bundles {
         ensure!(
+            catalog.build_inputs.is_empty() || policy.archive_build_inputs,
+            "protected repository requires archiving rebuild inputs"
+        );
+        ensure!(
             !catalog.toolchains_verified || policy.verify_toolchains,
             "protected repository requires toolchain verification"
         );
@@ -1904,6 +1960,7 @@ fn read_publish_policy(
         recipes: policy.recipes,
         minimum_builders: policy.minimum_builders,
         verify_toolchains: policy.verify_toolchains,
+        archive_build_inputs: policy.archive_build_inputs,
         profiles: policy.profiles,
     }))
 }
@@ -2104,6 +2161,13 @@ mod tests {
             attestations: BTreeMap::from([(active.clone(), attestation.clone())]),
             attestations_required: true,
             toolchains_verified: true,
+            build_inputs: BTreeMap::from([(
+                active.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "recipe": digest(b"reviewed recipe"),
+                    "manifest": digest(b"reviewed manifest"),
+                }))?,
+            )]),
             withdrawals: BTreeMap::from([(
                 withdrawn.clone(),
                 Withdrawal {
@@ -2131,6 +2195,16 @@ mod tests {
         let mut next = previous.clone();
         next.sequence = NonZeroU64::new(3);
         previous.check_successor(&next, &base)?;
+
+        let inputs = next.build_inputs.remove(&active).unwrap();
+        let error = previous.check_successor(&next, &base).unwrap_err();
+        assert!(format!("{error:#}").contains("drops or changes the rebuild inputs"));
+        next.build_inputs.insert(active.clone(), inputs);
+        let added = "cps://canopa/new@1.0.0-0";
+        next.entries.insert(added.to_owned(), manifest.clone());
+        let error = previous.check_successor(&next, &base).unwrap_err();
+        assert!(format!("{error:#}").contains("omits rebuild inputs for new package"));
+        next.entries.remove(added);
 
         next.attestations_required = false;
         assert!(previous.check_successor(&next, &base).is_err());
