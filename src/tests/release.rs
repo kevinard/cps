@@ -1902,6 +1902,59 @@ publisher "canopa" archive-build-inputs={archive} {{
         source_bytes
     );
 
+    let archive_targets = work.join("protected-archive-targets");
+    mirror_release::export_archive(
+        &protected,
+        "canopa",
+        &f.public,
+        &archive_targets,
+        &admitted,
+        false,
+    )?;
+    let archive = work.join("protected-archive-mirror");
+    sign_export(&archive_targets, &archive, 1, fresh, &anchor, &tuf_key)?;
+    let archive_cache = work.join("protected-archive-cache");
+    assert_eq!(
+        mirror_release::sync_archive(
+            &archive_cache,
+            &anchor,
+            Url::from_directory_path(archive.join("metadata"))
+                .unwrap()
+                .as_str(),
+            Url::from_directory_path(archive.join("targets"))
+                .unwrap()
+                .as_str(),
+            "canopa",
+            &f.public,
+            mirror_release::ArchiveSyncOptions {
+                catalog: &admitted,
+                index_only: true
+            },
+        )?,
+        admitted
+    );
+    check(
+        &archive_cache,
+        Some(&admitted),
+        &work.join("archive-inputs"),
+    )?;
+    let archive_sources = work.join("archive-sources");
+    assert_eq!(
+        crate::fetch_build_sources(
+            &archive_cache,
+            "canopa",
+            &f.public,
+            id,
+            Some(&admitted),
+            &archive_sources
+        )?,
+        1
+    );
+    assert_eq!(
+        fs::read(archive_sources.join("sha256").join(&source_hash))?,
+        source_bytes
+    );
+
     fs::rename(&f.repo, work.join("offline-repo"))?;
     fs::rename(&mirror, work.join("offline-mirror"))?;
     fs::rename(&current_only, work.join("offline-current-only"))?;
@@ -3479,6 +3532,162 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
     fs::rename(&primary_mirror, work.join("offline-canopa"))?;
     fs::rename(&tools_mirror, work.join("offline-tools"))?;
     assert_eq!(fetch_toolchain(&recipe, &config)?, 2);
+    Ok(())
+}
+
+#[test]
+fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let payload = "pinned compiler";
+    let path = "usr/bin/cc";
+    fixture.package(
+        "build/compiler",
+        "1.0.0-0",
+        fixture.file(path, payload, "0755", "")?,
+    )?;
+    let pointer = fixture.repo.join("current");
+    let pin = fs::read_to_string(&pointer)?.trim().to_owned();
+    fixture.package(
+        "build/compiler",
+        "2.0.0-0",
+        fixture.file(path, "new compiler", "0755", "")?,
+    )?;
+    withdraw_package(
+        &fixture.repo,
+        &fixture.private,
+        "cps://canopa/build/compiler@1.0.0-0",
+    )?;
+    let live_pin = fs::read_to_string(&pointer)?.trim().to_owned();
+    let work = fixture._dir.path();
+    fs::write(&pointer, format!("{pin}\n"))?;
+    fixture.package("build/unrelated", "1.0.0-0", String::new())?;
+    let fork = fs::read_to_string(&pointer)?.trim().to_owned();
+    fs::write(&pointer, format!("{live_pin}\n"))?;
+    let rejected = work.join("fork-export");
+    let error = mirror_release::export_archive(
+        &fixture.repo,
+        "canopa",
+        &fixture.public,
+        &rejected,
+        &fork,
+        false,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("release drops or changes the published manifest"));
+    assert!(!rejected.exists());
+
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let live = work.join("live");
+    sign_release(&fixture, &live, 2, fresh, &anchor, &tuf_key)?;
+    let targets = work.join("archive-targets");
+    assert_eq!(
+        mirror_release::export_archive(
+            &fixture.repo,
+            "canopa",
+            &fixture.public,
+            &targets,
+            &pin,
+            false
+        )?,
+        pin
+    );
+    assert_eq!(fs::read_to_string(targets.join("archive"))?.trim(), pin);
+    assert!(!targets.join("current").exists());
+    assert!(!targets.join(format!("catalogs-{live_pin}")).exists());
+    assert!(
+        !targets
+            .join(format!("blobs-{}", digest(b"new compiler")))
+            .exists()
+    );
+    assert_eq!(fs::read_to_string(&pointer)?.trim(), live_pin);
+    let archive = work.join("archive");
+    sign_export(&targets, &archive, 1, fresh, &anchor, &tuf_key)?;
+
+    let endpoint = |mirror: &Path, role| Url::from_directory_path(mirror.join(role)).unwrap();
+    let sync_live = |cache: &Path, mirror: &Path| {
+        mirror_release::sync_index(
+            cache,
+            &anchor,
+            endpoint(mirror, "metadata").as_str(),
+            endpoint(mirror, "targets").as_str(),
+            "canopa",
+            &fixture.public,
+        )
+    };
+    let sync_archive = |cache: &Path, mirror: &Path, catalog: &str| {
+        mirror_release::sync_archive(
+            cache,
+            &anchor,
+            endpoint(mirror, "metadata").as_str(),
+            endpoint(mirror, "targets").as_str(),
+            "canopa",
+            &fixture.public,
+            mirror_release::ArchiveSyncOptions {
+                catalog,
+                index_only: true,
+            },
+        )
+    };
+    let live_cache = work.join("live-cache");
+    let archive_cache = work.join("archive-cache");
+    let error = sync_live(&live_cache, &archive).unwrap_err();
+    assert!(format!("{error:#}").contains("archive mirror requires repo sync --archive-catalog"));
+    assert!(!live_cache.join(".tuf/trusted").exists());
+    assert_eq!(sync_live(&live_cache, &live)?, live_pin);
+    let error = sync_archive(&live_cache, &archive, &pin).unwrap_err();
+    assert!(format!("{error:#}").contains("archive sync requires a dedicated cache"));
+    let error = sync_archive(&archive_cache, &live, &pin).unwrap_err();
+    assert!(format!("{error:#}").contains("archive mirror advertises a live catalog"));
+    assert!(!archive_cache.join(".tuf/trusted").exists());
+    let error = sync_archive(&work.join("wrong-pin"), &archive, &live_pin).unwrap_err();
+    assert!(format!("{error:#}").contains("checking the signed archive marker"));
+    assert_eq!(sync_archive(&archive_cache, &archive, &pin)?, pin);
+    assert!(!archive_cache.join("current").exists());
+    assert!(!archive_cache.join(".tuf/catalog").exists());
+    let error = sync_live(&archive_cache, &live).unwrap_err();
+    assert!(format!("{error:#}").contains("archive cache requires repo sync --archive-catalog"));
+    let error = sync_archive(&archive_cache, &archive, &live_pin).unwrap_err();
+    assert!(format!("{error:#}").contains("archive cache is bound to a different catalog"));
+
+    let recipe = work.join("build.kdl");
+    fs::write(
+        &recipe,
+        format!(
+            "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
+         toolchain {pin:?} {{ package \"build/compiler\"; }}\n\
+         manifest \"manifest.kdl\" sha256={:?}\n script \"exit 1\"\n}}\n",
+            digest(b"reviewed manifest"),
+        ),
+    )?;
+    let config = work.join("toolchain.kdl");
+    fs::write(
+        &config,
+        format!(
+            "schema-version 1\npublisher \"canopa\" {{ repository {archive_cache:?}; trust-key {:?}; }}\n",
+            fixture.public,
+        ),
+    )?;
+    let blob = archive_cache.join("blobs").join(digest(payload.as_bytes()));
+    assert!(!blob.exists());
+    let saved = work.join("offline-archive");
+    fs::rename(&archive, &saved)?;
+    fs::rename(&live, &archive)?;
+    let error = fetch_toolchain(&recipe, &config).unwrap_err();
+    assert!(format!("{error:#}").contains("archive mirror advertises a live catalog"));
+    assert!(!blob.exists());
+    fs::rename(&archive, &live)?;
+    fs::rename(&saved, &archive)?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 1);
+    assert_eq!(fs::read_to_string(blob)?, payload);
+    fs::rename(&archive, &saved)?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 1);
+    assert_eq!(
+        fs::read_to_string(live_cache.join("current"))?.trim(),
+        live_pin
+    );
     Ok(())
 }
 

@@ -40,6 +40,7 @@ const ENDPOINTS_LIMIT: u64 = 8192;
 const PAYLOAD_DOWNLOADS: usize = 8;
 const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
 const PROFILE_BINDING: &str = "profile";
+const ARCHIVE: &str = "archive";
 const RETAINED: &str = "retained";
 const MAX_RETAINED: usize = 32;
 const RETAINED_LIMIT: u64 = (65 * MAX_RETAINED) as u64;
@@ -324,13 +325,52 @@ pub fn sync_with_required_catalogs(
         repo,
         &source,
         !options.index_only,
-        None,
-        &pins,
-        guard.as_ref(),
-        false,
+        SyncSelection::Current {
+            binding: None,
+            required: &pins,
+            guard: guard.as_ref(),
+            defer_checkpoint: false,
+        },
     )?;
     source.promote(repo, &release, None)?;
     Ok(release.current)
+}
+
+pub struct ArchiveSyncOptions<'a> {
+    pub catalog: &'a str,
+    pub index_only: bool,
+}
+
+/// Cache one exact catalog from a separate, authenticated archive mirror.
+pub fn sync_archive(
+    repo: &Path,
+    trusted_root: &Path,
+    metadata_url: &str,
+    targets_url: &str,
+    publisher: &str,
+    trust_key: &Path,
+    options: ArchiveSyncOptions<'_>,
+) -> Result<String> {
+    validate_digest(options.catalog)?;
+    let source = SyncSource::new(
+        trusted_root,
+        Mirror::new(metadata_url, targets_url)?,
+        publisher,
+        trust_key,
+    )?;
+    let _lock = lock_repo(repo)?;
+    stage_release(
+        repo,
+        &source,
+        !options.index_only,
+        SyncSelection::Archive(options.catalog),
+    )?;
+    write_atomic(
+        &repo.join(".tuf/endpoints"),
+        source.mirror.document().as_bytes(),
+        false,
+    )?;
+    Ok(options.catalog.to_owned())
 }
 
 struct ImageGuard {
@@ -462,21 +502,26 @@ impl<'a> SyncSource<'a> {
     }
 }
 
-// The caller holds the cache lock until promotion or failure.
-fn stage_release(
+enum SyncSelection<'a> {
+    Current {
+        binding: Option<&'a str>,
+        required: &'a [&'a CatalogPin],
+        guard: Option<&'a ImageGuard>,
+        defer_checkpoint: bool,
+    },
+    Archive(&'a str),
+}
+
+fn initialize_cache(
     repo: &Path,
     source: &SyncSource<'_>,
-    full: bool,
-    binding: Option<&str>,
-    required: &[&CatalogPin],
-    guard: Option<&ImageGuard>,
-    defer_checkpoint: bool,
-) -> Result<StagedRelease> {
+    selection: &SyncSelection<'_>,
+) -> Result<Root> {
     let SyncSource {
         publisher,
         key,
         anchor,
-        mirror,
+        ..
     } = source;
     let state = repo.join(".tuf");
     let origin = format!("{}\n{publisher}\n{}\n", digest(anchor), hex::encode(key));
@@ -487,31 +532,75 @@ fn stage_release(
         File::open(repo)?.sync_all()?;
     }
     let directory = open_state(repo)?;
+    let trusted_exists = path_present(&state.join("trusted"))?;
+    let has_origin = path_present(&state.join("origin"))?;
+    let ready = published || path_present(&state.join("endpoints"))?;
+    let archive = path_present(&state.join(ARCHIVE))?;
+    match selection {
+        SyncSelection::Current { .. } => ensure!(
+            !archive,
+            "archive cache requires repo sync --archive-catalog"
+        ),
+        SyncSelection::Archive(pin) => {
+            ensure!(!published, "archive sync requires a dedicated cache");
+            if archive {
+                ensure!(
+                    read_pointer(&state, ARCHIVE)? == *pin,
+                    "archive cache is bound to a different catalog"
+                );
+            } else {
+                ensure!(
+                    !ready
+                        && !has_origin
+                        && !trusted_exists
+                        && !path_present(&state.join(PROFILE_BINDING))?,
+                    "archive sync requires a dedicated cache"
+                );
+                write_atomic(&state.join(ARCHIVE), format!("{pin}\n").as_bytes(), true)?;
+            }
+        }
+    }
     if path_present(&state.join(PROFILE_BINDING))? {
-        let binding = binding.context("TUF cache is managed by repo sync-profile")?;
+        let SyncSelection::Current {
+            binding: Some(binding),
+            ..
+        } = selection
+        else {
+            anyhow::bail!("TUF cache is managed by repo sync-profile");
+        };
         ensure!(
             read_limited(directory.file(PROFILE_BINDING)?, 65)? == binding.as_bytes(),
             "TUF cache is bound to a different release profile or companion cache set"
         );
     }
-    let trusted_exists = path_present(&state.join("trusted"))?;
-    if path_present(&state.join("origin"))? {
+    if has_origin {
         ensure!(
             read_limited(directory.file("origin")?, origin.len() as u64)? == origin.as_bytes(),
             "TUF cache was initialized with a different trust root or publisher"
         );
     } else {
         ensure!(
-            !published && !trusted_exists,
+            !ready && !trusted_exists,
             "TUF cache is missing its trust configuration"
         );
         write_atomic(&state.join("origin"), origin.as_bytes(), true)?;
     }
     ensure!(
-        !published || trusted_exists,
+        !ready || trusted_exists,
         "TUF cache is missing its trusted metadata"
     );
+    Ok(directory)
+}
 
+// The caller holds the cache lock until promotion or failure.
+fn stage_release(
+    repo: &Path,
+    source: &SyncSource<'_>,
+    full: bool,
+    selection: SyncSelection<'_>,
+) -> Result<StagedRelease> {
+    let state = repo.join(".tuf");
+    let directory = initialize_cache(repo, source, &selection)?;
     let scratch = TempDir::new_in(&state)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -521,21 +610,33 @@ fn stage_release(
             &state,
             &directory,
             scratch.path(),
-            mirror.clone(),
-            Some(anchor.clone()),
+            source.mirror.clone(),
+            Some(source.anchor.clone()),
         )
         .await?;
         prepare_objects(repo)?;
-        materialize(
-            repo,
-            &verified,
-            source,
-            full,
-            required,
-            guard,
-            defer_checkpoint,
-        )
-        .await
+        match selection {
+            SyncSelection::Current {
+                required,
+                guard,
+                defer_checkpoint,
+                ..
+            } => {
+                materialize(
+                    repo,
+                    &verified,
+                    source,
+                    full,
+                    required,
+                    guard,
+                    defer_checkpoint,
+                )
+                .await
+            }
+            SyncSelection::Archive(pin) => {
+                materialize_archive(repo, &verified, source, full, pin).await
+            }
+        }
     })
 }
 
@@ -565,12 +666,46 @@ async fn load_mirror(
         .datastore(scratch)
         .load()
         .await;
+    if let Ok(verified) = &result {
+        check_mirror_mode(state, verified)?;
+    }
     // The library writes root, timestamp and snapshot only after verifying each role.
     // Retain that progress even when a later role or the release contents fail to download.
     if path_present(&scratch.join("root.json"))? {
         checkpoint(state, scratch, trusted_exists)?;
     }
     result.context("verifying TUF metadata")
+}
+
+fn check_mirror_mode(state: &Path, verified: &Repository) -> Result<()> {
+    let targets = &verified.targets().signed;
+    if path_present(&state.join(ARCHIVE))? {
+        ensure!(
+            targets
+                .find_target(&TargetName::new("current")?, false)
+                .is_err(),
+            "archive mirror advertises a live catalog"
+        );
+        let pin = read_pointer(state, ARCHIVE)?;
+        let marker = format!("{pin}\n");
+        let size = marker.len() as u64;
+        checked_target(
+            verified,
+            ARCHIVE,
+            size,
+            Some(&digest(marker.as_bytes())),
+            Some(size),
+        )
+        .with_context(|| format!("checking the signed archive marker for catalog {pin}"))?;
+    } else {
+        ensure!(
+            targets
+                .find_target(&TargetName::new(ARCHIVE)?, false)
+                .is_err(),
+            "archive mirror requires repo sync --archive-catalog"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn fetch_payloads(publisher: &Publisher, blobs: BTreeMap<&str, u64>) -> Result<()> {
@@ -762,6 +897,51 @@ async fn materialize(
         );
     }
     collect_rebuild_objects(&catalog, &mut rebuild_objects, &mut attestations);
+    cache_rebuild_objects(verified, repo, &catalog, rebuild_objects).await?;
+    entries.extend(catalog.entries);
+    attestations.extend(catalog.attestations.into_values());
+    cache_objects(verified, repo, publisher, entries, attestations, full).await?;
+    Ok(StagedRelease {
+        current: hash,
+        retained: retained_hashes,
+    })
+}
+
+async fn materialize_archive(
+    repo: &Path,
+    verified: &Repository,
+    source: &SyncSource<'_>,
+    full: bool,
+    hash: &str,
+) -> Result<StagedRelease> {
+    fetch_object(verified, repo, "catalogs", hash, CATALOG_LIMIT, None).await?;
+    let catalog = read_catalog(repo, hash, source.publisher, &source.key)?;
+    let mut rebuild_objects = BTreeMap::new();
+    let mut attestations = BTreeSet::new();
+    collect_rebuild_objects(&catalog, &mut rebuild_objects, &mut attestations);
+    cache_rebuild_objects(verified, repo, &catalog, rebuild_objects).await?;
+    attestations.extend(catalog.attestations.into_values());
+    cache_objects(
+        verified,
+        repo,
+        source.publisher,
+        catalog.entries,
+        attestations,
+        full,
+    )
+    .await?;
+    Ok(StagedRelease {
+        current: hash.to_owned(),
+        retained: Vec::new(),
+    })
+}
+
+async fn cache_rebuild_objects(
+    verified: &Repository,
+    repo: &Path,
+    catalog: &Catalog,
+    rebuild_objects: BTreeMap<String, u64>,
+) -> Result<()> {
     for (hash, limit) in rebuild_objects {
         fetch_object(verified, repo, rebuild::OBJECTS, &hash, limit, None).await?;
     }
@@ -782,13 +962,7 @@ async fn materialize(
             }
         }
     }
-    entries.extend(catalog.entries);
-    attestations.extend(catalog.attestations.into_values());
-    cache_objects(verified, repo, publisher, entries, attestations, full).await?;
-    Ok(StagedRelease {
-        current: hash,
-        retained: retained_hashes,
-    })
+    Ok(())
 }
 
 fn collect_rebuild_objects(
@@ -1014,7 +1188,14 @@ pub fn export_with_retained(
     output: &Path,
     retained: &[String],
 ) -> Result<String> {
-    export_targets(repo, publisher, trust_key, output, retained, false)
+    export_targets(
+        repo,
+        publisher,
+        trust_key,
+        output,
+        ExportSelection::Current(retained),
+        false,
+    )
 }
 
 /// Also include large source targets attached to the signed catalog.
@@ -1025,7 +1206,38 @@ pub fn export_with_sources(
     output: &Path,
     retained: &[String],
 ) -> Result<String> {
-    export_targets(repo, publisher, trust_key, output, retained, true)
+    export_targets(
+        repo,
+        publisher,
+        trust_key,
+        output,
+        ExportSelection::Current(retained),
+        true,
+    )
+}
+
+/// Export a pinned catalog to a separate archive target set without a live pointer.
+pub fn export_archive(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    output: &Path,
+    pin: &str,
+    include_sources: bool,
+) -> Result<String> {
+    export_targets(
+        repo,
+        publisher,
+        trust_key,
+        output,
+        ExportSelection::Archive(pin),
+        include_sources,
+    )
+}
+
+enum ExportSelection<'a> {
+    Current(&'a [String]),
+    Archive(&'a str),
 }
 
 fn export_targets(
@@ -1033,13 +1245,30 @@ fn export_targets(
     publisher: &str,
     trust_key: &Path,
     output: &Path,
-    retained: &[String],
+    selection: ExportSelection<'_>,
     include_sources: bool,
 ) -> Result<String> {
     let key = read_key(trust_key)?;
     let current = read_current(repo)?;
-    let retained = retained_catalogs(retained.iter().map(String::as_str), &current)?;
     let catalog = read_catalog(repo, &current, publisher, &key)?;
+    let (pointer, hash, catalog, retained) = match selection {
+        ExportSelection::Current(retained) => {
+            let pins = retained_catalogs(retained.iter().map(String::as_str), &current)?;
+            ("current", current, catalog, pins)
+        }
+        ExportSelection::Archive(pin) => {
+            let archived = if pin == current {
+                catalog
+            } else {
+                let archived = read_catalog(repo, pin, publisher, &key)?;
+                archived.check_successor(&catalog, pin).with_context(|| {
+                    format!("checking archive catalog {pin} against current {current}")
+                })?;
+                archived
+            };
+            (ARCHIVE, pin.to_owned(), archived, BTreeSet::new())
+        }
+    };
     let root = Root::open(repo)?;
     let parent = output
         .parent()
@@ -1048,14 +1277,14 @@ fn export_targets(
     let stage = TempDir::new_in(parent)?;
     for pin in &retained {
         let previous = read_catalog(repo, pin, publisher, &key)?;
-        previous.check_successor(&catalog, pin).with_context(|| {
-            format!("checking retained catalog {pin} against current {current}")
-        })?;
+        previous
+            .check_successor(&catalog, pin)
+            .with_context(|| format!("checking retained catalog {pin} against current {hash}"))?;
         let release = catalog_snapshot(repo, previous, (*pin).to_owned(), &key)?;
         export_catalog(&root, stage.path(), &release)?;
     }
     let include_sources = include_sources || catalog.source_archives_required;
-    let release = catalog_snapshot(repo, catalog, current.clone(), &key)?;
+    let release = catalog_snapshot(repo, catalog, hash.clone(), &key)?;
     export_catalog(&root, stage.path(), &release)?;
     if include_sources {
         for inputs in release
@@ -1084,8 +1313,8 @@ fn export_targets(
         write_atomic(&stage.path().join(RETAINED), document.as_bytes(), false)?;
     }
     write_atomic(
-        &stage.path().join("current"),
-        format!("{current}\n").as_bytes(),
+        &stage.path().join(pointer),
+        format!("{hash}\n").as_bytes(),
         false,
     )?;
 
@@ -1101,7 +1330,7 @@ fn export_targets(
         RenameFlags::NOREPLACE,
     )?;
     directory.sync_all()?;
-    Ok(current)
+    Ok(hash)
 }
 
 fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> {

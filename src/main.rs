@@ -466,6 +466,9 @@ enum RepoCommand {
         /// Include a historical catalog and its objects in this mirror release
         #[arg(long = "retain-catalog")]
         retained: Vec<String>,
+        /// Export an exact catalog to a separate archive mirror
+        #[arg(long, value_name = "SHA256", conflicts_with = "retained")]
+        archive_catalog: Option<String>,
         /// Include archived build sources as TUF targets
         #[arg(long)]
         include_sources: bool,
@@ -493,6 +496,9 @@ enum RepoCommand {
         /// Require this catalog to be current or retained in the signed mirror release
         #[arg(long = "require-catalog", value_name = "SHA256")]
         required_catalogs: Vec<String>,
+        /// Sync an exact catalog from a separate archive mirror into a dedicated cache
+        #[arg(long, value_name = "SHA256", conflicts_with_all = ["image", "required_catalogs"])]
+        archive_catalog: Option<String>,
     },
     /// Verify a signed release profile and its pinned companion catalogs from TUF mirrors
     SyncProfile {
@@ -1096,16 +1102,25 @@ fn run(command: Command) -> Result<ExitCode> {
                 output,
                 retained,
                 include_sources,
+                archive_catalog,
             } => {
-                let export = if include_sources {
-                    release::export_with_sources
+                let hash = if let Some(catalog) = archive_catalog {
+                    release::export_archive(
+                        &repo,
+                        &publisher,
+                        &trust_key,
+                        &output,
+                        &catalog,
+                        include_sources,
+                    )?
+                } else if include_sources {
+                    release::export_with_sources(&repo, &publisher, &trust_key, &output, &retained)?
                 } else {
-                    release::export_with_retained
+                    release::export_with_retained(
+                        &repo, &publisher, &trust_key, &output, &retained,
+                    )?
                 };
-                println!(
-                    "Exported {}",
-                    export(&repo, &publisher, &trust_key, &output, &retained)?
-                );
+                println!("Exported {hash}");
             }
             RepoCommand::Sync {
                 repo,
@@ -1117,9 +1132,22 @@ fn run(command: Command) -> Result<ExitCode> {
                 index_only,
                 image,
                 required_catalogs,
+                archive_catalog,
             } => {
-                println!(
-                    "Synchronized {}",
+                let hash = if let Some(catalog) = archive_catalog {
+                    release::sync_archive(
+                        &repo,
+                        &root,
+                        &metadata,
+                        &targets,
+                        &publisher,
+                        &trust_key,
+                        release::ArchiveSyncOptions {
+                            catalog: &catalog,
+                            index_only,
+                        },
+                    )?
+                } else {
                     release::sync_with_required_catalogs(
                         &repo,
                         &root,
@@ -1129,11 +1157,12 @@ fn run(command: Command) -> Result<ExitCode> {
                         &trust_key,
                         release::SyncOptions {
                             index_only,
-                            image: image.as_deref()
+                            image: image.as_deref(),
                         },
                         &required_catalogs,
                     )?
-                );
+                };
+                println!("Synchronized {hash}");
             }
             RepoCommand::SyncProfile {
                 config,

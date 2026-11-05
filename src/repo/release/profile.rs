@@ -14,7 +14,8 @@ use crate::{
 };
 
 use super::{
-    ImageGuard, Mirror, SyncSource, digest, lock_repo, record_catalog_checkpoint, stage_release,
+    ImageGuard, Mirror, SyncSelection, SyncSource, digest, lock_repo, record_catalog_checkpoint,
+    stage_release,
 };
 
 /// Materialize a signed profile's catalog set before advancing its primary pointer.
@@ -119,10 +120,12 @@ fn synchronize_profile(
         primary_repo,
         primary,
         full,
-        Some(&binding),
-        bootstrap_pin.as_ref().as_slice(),
-        guard.as_ref(),
-        guard.is_some(),
+        SyncSelection::Current {
+            binding: Some(&binding),
+            required: bootstrap_pin.as_ref().as_slice(),
+            guard: guard.as_ref(),
+            defer_checkpoint: guard.is_some(),
+        },
     )
     .with_context(|| format!("staging primary publisher {}", primary.publisher))?;
     let current_pin = CatalogPin::primary(
@@ -163,10 +166,12 @@ fn synchronize_profile(
             repo,
             source,
             full,
-            None,
-            &required,
-            guard.as_ref(),
-            guard.is_some(),
+            SyncSelection::Current {
+                binding: None,
+                required: &required,
+                guard: guard.as_ref(),
+                defer_checkpoint: guard.is_some(),
+            },
         )
         .with_context(|| {
             format!(

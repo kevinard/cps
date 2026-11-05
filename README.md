@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-22`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-23`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -456,6 +456,34 @@ at the synchronized caches. `repo fetch-toolchain` resolves the pinned
 selection with the same solver and builder trust policy as the build. It
 downloads and verifies the selected payloads across publishers. The build
 verifies those payloads again and runs offline.
+
+For pins outside the live mirror's retention window, publish a separate TUF
+archive for the exact catalog. Export from a repository that still has the
+catalog and its objects. CPS checks an older catalog against the publisher's
+current catalog before exporting it.
+
+```sh
+cps repo export --repo toolchain-repo --publisher tools --trust-key tools.der \
+    --archive-catalog "$catalog_sha256" --output archive-targets
+```
+
+Sign the targets as a separate TUF repository and provision its trusted
+root to rebuilders. Use one archive cache per catalog pin.
+
+```sh
+cps repo sync --repo "cache/tools/$catalog_sha256" --root archive-root.json \
+    --metadata "$archive_metadata_url" --targets "$archive_targets_url" \
+    --publisher tools --trust-key tools.der --index-only \
+    --archive-catalog "$catalog_sha256"
+```
+
+Point the toolchain configuration at that cache. The archive has no live
+catalog pointer and uses independent TUF replay state. CPS checks the exact
+pin in the signed archive metadata on sync and on later downloads.
+`repo rebuild-inputs` and `repo fetch-sources` can also use an archive cache
+with an explicit `--catalog` pin. The archive includes required source
+targets, and `--include-sources` adds optional sources recorded by the
+archived catalog.
 
 `repo verify-rebuild` compares the exact recipe and reviewed manifest in
 the bundle, the reconstructed published manifest, and every payload's
