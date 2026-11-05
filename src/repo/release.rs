@@ -19,15 +19,17 @@ use tough::{
 use url::Url;
 
 use crate::{
+    build::sources::publish_verified,
     image::{Image, Publisher, State},
-    model::{Action, digest, digest_reader, validate_digest, validate_publisher},
+    model::{Action, FileDigest, digest, digest_reader, validate_digest, validate_publisher},
     transport::https_client,
 };
 
 use super::{
     CATALOG_LIMIT, Catalog, CatalogEntry, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot,
     catalog_snapshot, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
-    read_current, read_key, read_limited, read_package, read_pointer, rebuild, write_atomic,
+    read_current, read_key, read_limited, read_package, read_pointer, rebuild, source_archive,
+    write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -573,6 +575,49 @@ pub(crate) fn fetch_payloads(publisher: &Publisher, blobs: BTreeMap<&str, u64>) 
     })
 }
 
+pub(super) fn fetch_source_archives(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    destination: &Root,
+    missing: Vec<&FileDigest>,
+) -> Result<()> {
+    let state = repo.join(".tuf");
+    ensure!(
+        path_present(&state)?,
+        "source archive object {} is missing and the repository has no TUF mirror",
+        missing[0].sha256
+    );
+    let _lock = lock_repo(repo)?;
+    let directory = open_state(repo)?;
+    check_cache_origin(&directory, publisher, key)?;
+    let mirror = Mirror::read(&directory)?;
+    let scratch = TempDir::new_in(&state)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let verified = load_mirror(&state, &directory, scratch.path(), mirror, None).await?;
+        let output = Root::fd_path(destination.as_file());
+        let verified = &verified;
+        let output = &output;
+        stream::iter(missing)
+            .map(|pin| async move {
+                let name = format!("{}/{}", source_archive::OBJECTS, pin.sha256);
+                let (target_name, target) =
+                    checked_target(verified, &name, pin.size, Some(&pin.sha256), Some(pin.size))
+                        .with_context(|| {
+                            format!("checking archived source {} on the mirror", pin.sha256)
+                        })?;
+                let temp = download_target(verified, &name, &target_name, target, output).await?;
+                publish_verified(destination, temp, pin)
+            })
+            .buffer_unordered(PAYLOAD_DOWNLOADS)
+            .try_for_each(|()| async { Ok(()) })
+            .await
+    })
+}
+
 fn check_cache_origin(directory: &Root, publisher: &str, key: &[u8]) -> Result<()> {
     let identity = format!("\n{publisher}\n{}\n", hex::encode(key));
     let origin = String::from_utf8(read_limited(
@@ -863,9 +908,21 @@ async fn download(
     }
 
     let parent = Path::new(name).parent().context("missing target parent")?;
-    let mut file = NamedTempFile::new_in(repo.join(parent))?;
+    Ok(Some(
+        download_target(verified, name, &target_name, target, &repo.join(parent)).await?,
+    ))
+}
+
+async fn download_target(
+    verified: &Repository,
+    name: &str,
+    target_name: &TargetName,
+    target: &tough::schema::Target,
+    parent: &Path,
+) -> Result<NamedTempFile> {
+    let mut file = NamedTempFile::new_in(parent)?;
     let stream = verified
-        .read_target(&target_name)
+        .read_target(target_name)
         .await?
         .with_context(|| format!("missing TUF target {name}"))?;
     pin_mut!(stream);
@@ -880,7 +937,7 @@ async fn download(
     }
     ensure!(written == target.length, "short download for {name}");
     file.as_file().sync_all()?;
-    Ok(Some(file))
+    Ok(file)
 }
 
 /// Export the signed catalog and its reachable objects as a tree of TUF targets.
@@ -895,6 +952,28 @@ pub fn export_with_retained(
     trust_key: &Path,
     output: &Path,
     retained: &[String],
+) -> Result<String> {
+    export_targets(repo, publisher, trust_key, output, retained, false)
+}
+
+/// Also include large source targets attached to the signed catalog.
+pub fn export_with_sources(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    output: &Path,
+    retained: &[String],
+) -> Result<String> {
+    export_targets(repo, publisher, trust_key, output, retained, true)
+}
+
+fn export_targets(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    output: &Path,
+    retained: &[String],
+    include_sources: bool,
 ) -> Result<String> {
     let key = read_key(trust_key)?;
     let current = read_current(repo)?;
@@ -916,6 +995,24 @@ pub fn export_with_retained(
     }
     let release = catalog_snapshot(repo, catalog, current.clone(), &key)?;
     export_catalog(&root, stage.path(), &release)?;
+    if include_sources {
+        for inputs in release
+            .build_inputs
+            .values()
+            .filter(|inputs| inputs.sources_archived)
+        {
+            for pin in source_archive::archived_pins(repo, inputs)? {
+                export_object(
+                    &root,
+                    stage.path(),
+                    source_archive::OBJECTS,
+                    &pin.sha256,
+                    pin.size,
+                    Some(pin.size),
+                )?;
+            }
+        }
+    }
     if !retained.is_empty() {
         let mut document = String::new();
         for pin in retained {

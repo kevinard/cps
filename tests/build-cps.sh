@@ -178,6 +178,13 @@ release "canopa" base="empty" {
 }
 RELEASE
 "$cps" repo publish-release --repo repo --signing-key "$work/release.der" bootstrap-release.kdl
+archive_sources() {
+    "$cps" repo archive-sources --repo repo --signing-key "$work/release.der" --source-cache sources "$1"
+}
+if (( ${cps_version##*-} >= 20 )); then
+    archive_sources "cps://canopa/system/sqlite@$sqlite_version"
+    archive_sources "cps://canopa/system/libseccomp@$seccomp_version"
+fi
 bootstrap_catalog=$(cat repo/current)
 cp bootstrap-toolchain.kdl toolchain.kdl
 append_toolchain_publisher "$pins" toolchain.kdl canopa repo release-public.der
@@ -208,6 +215,7 @@ release "canopa" base="$bootstrap_catalog" {
 }
 RELEASE
 "$cps" repo publish-release --repo repo --signing-key "$work/release.der" release.kdl
+if (( ${cps_version##*-} >= 20 )); then archive_sources "$cps_package"; fi
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
     "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
@@ -250,5 +258,12 @@ done
 if (( ${cps_version##*-} >= 19 )); then
     "${loader[@]}" image/usr/bin/cps repo verify-rebuild --repo repo --publisher canopa \
         --trust-key release-public.der --bundle bundle "$cps_package"
+fi
+if (( ${cps_version##*-} >= 20 )); then
+    for package in "$cps_package" "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"; do
+        "${loader[@]}" image/usr/bin/cps repo fetch-sources --repo repo --publisher canopa \
+            --trust-key release-public.der --source-cache recovered-sources "$package"
+    done
+    diff -r sources/sha256 recovered-sources/sha256
 fi
 printf 'Verified reproducible CPS build, signed provenance, and installation from Git %s\n' "$revision"

@@ -15,18 +15,18 @@ use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, MarkChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
     activate_deployed_boot_environment, activate_device_boot_environment,
-    add_publisher_with_build_trust, apply, audit_publisher_builds, build_with_toolchain_config,
-    build_with_worker, create_configured_image, create_image, deploy_and_activate_boot_environment,
-    deploy_boot_environment, export_boot_environment, export_boot_environment_receipt,
-    export_rebuild_inputs, fetch_plan, fetch_sources, fetch_sources_with_local,
-    generate_manifest_for_architecture, import_sources, list_boot_environments,
-    list_boot_environments_on_disk, list_config_updates, list_obsoletions, list_publishers,
-    list_withdrawals, plan, prefer_publisher, publish, publish_release, publish_witnessed_bundle,
-    read_attestation, read_worker_config, release, remove_publisher, resume_transaction,
-    rollback_boot_environment, rollback_boot_environment_on_disk, rotate_publisher_key,
-    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
-    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
-    verify_rebuild, withdraw_package,
+    add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
+    build_with_toolchain_config, build_with_worker, create_configured_image, create_image,
+    deploy_and_activate_boot_environment, deploy_boot_environment, export_boot_environment,
+    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources, fetch_plan,
+    fetch_sources, fetch_sources_with_local, generate_manifest_for_architecture, import_sources,
+    list_boot_environments, list_boot_environments_on_disk, list_config_updates, list_obsoletions,
+    list_publishers, list_withdrawals, plan, prefer_publisher, publish, publish_release,
+    publish_witnessed_bundle, read_attestation, read_worker_config, release, remove_publisher,
+    resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
+    rotate_publisher_key, set_publisher_build_trust, set_publisher_repositories,
+    stage_boot_environment, transaction_details, transaction_history, transaction_status, verify,
+    verify_pristine, verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -399,6 +399,31 @@ enum RepoCommand {
         witness_key: Option<PathBuf>,
         package_id: String,
     },
+    /// Attach verified source files to a published build
+    ArchiveSources {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        source_cache: PathBuf,
+        package_id: String,
+    },
+    /// Fetch archived sources into a build source cache
+    FetchSources {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        trust_key: PathBuf,
+        #[arg(long)]
+        source_cache: PathBuf,
+        /// Select a historical signed catalog by SHA-256
+        #[arg(long)]
+        catalog: Option<String>,
+        package_id: String,
+    },
     /// Withdraw an exact published version from future package selections
     Withdraw {
         #[arg(long)]
@@ -429,6 +454,9 @@ enum RepoCommand {
         /// Include a historical catalog and its objects in this mirror release
         #[arg(long = "retain-catalog")]
         retained: Vec<String>,
+        /// Include archived build sources as TUF targets
+        #[arg(long)]
+        include_sources: bool,
     },
     /// Verify and cache a release from a TUF mirror
     Sync {
@@ -986,6 +1014,34 @@ fn run(command: Command) -> Result<ExitCode> {
                     println!("Verified a matching statement from a separate rebuild signer");
                 }
             }
+            RepoCommand::ArchiveSources {
+                repo,
+                signing_key,
+                source_cache,
+                package_id,
+            } => {
+                let (catalog, count) =
+                    archive_build_sources(&repo, &signing_key, &source_cache, &package_id)?;
+                println!("Archived {count} source object(s) for {package_id} in catalog {catalog}");
+            }
+            RepoCommand::FetchSources {
+                repo,
+                publisher,
+                trust_key,
+                source_cache,
+                catalog,
+                package_id,
+            } => {
+                let count = fetch_build_sources(
+                    &repo,
+                    &publisher,
+                    &trust_key,
+                    &package_id,
+                    catalog.as_deref(),
+                    &source_cache,
+                )?;
+                println!("Verified {count} archived source object(s) for {package_id}");
+            }
             RepoCommand::Withdraw {
                 repo,
                 signing_key,
@@ -1009,12 +1065,16 @@ fn run(command: Command) -> Result<ExitCode> {
                 trust_key,
                 output,
                 retained,
+                include_sources,
             } => {
+                let export = if include_sources {
+                    release::export_with_sources
+                } else {
+                    release::export_with_retained
+                };
                 println!(
                     "Exported {}",
-                    release::export_with_retained(
-                        &repo, &publisher, &trust_key, &output, &retained
-                    )?
+                    export(&repo, &publisher, &trust_key, &output, &retained)?
                 );
             }
             RepoCommand::Sync {

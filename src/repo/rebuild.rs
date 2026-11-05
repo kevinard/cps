@@ -27,8 +27,10 @@ pub(super) const OBJECTS: &str = "build-inputs";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Digests {
-    recipe: String,
+    pub(super) recipe: String,
     manifest: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) sources_archived: bool,
 }
 
 impl Digests {
@@ -37,6 +39,12 @@ impl Digests {
             (&self.recipe, build::RECIPE_LIMIT),
             (&self.manifest, MANIFEST_LIMIT),
         ]
+    }
+
+    pub(super) fn preserved_by(&self, next: &Self) -> bool {
+        self.recipe == next.recipe
+            && self.manifest == next.manifest
+            && (!self.sources_archived || next.sources_archived)
     }
 }
 
@@ -49,16 +57,48 @@ pub(super) fn archive(
     let inputs = Digests {
         recipe: store(repo, OBJECTS, &evidence.recipe_document)?,
         manifest: store(repo, OBJECTS, &evidence.manifest_document)?,
+        sources_archived: false,
     };
     if let Some(previous) = catalog.build_inputs.get(id) {
         ensure!(
-            previous == &inputs,
+            inputs.preserved_by(previous),
             "{id} already has different rebuild inputs"
         );
         return Ok(false);
     }
     catalog.build_inputs.insert(id.to_owned(), inputs);
     Ok(true)
+}
+
+pub(super) struct ArchivedInputs {
+    recipe_document: Vec<u8>,
+    manifest_document: Vec<u8>,
+    envelope: Vec<u8>,
+    pub(super) recipe: build::BuildRecipe,
+}
+
+pub(super) fn read_archived(repo: &Path, catalog: &Catalog, id: &str) -> Result<ArchivedInputs> {
+    let inputs = catalog
+        .build_inputs
+        .get(id)
+        .with_context(|| format!("no archived rebuild inputs for {id}"))?;
+    let (published_hash, envelope) = admitted_build(repo, catalog, id)?;
+    let recipe_document = read_object(repo, OBJECTS, &inputs.recipe, build::RECIPE_LIMIT)?;
+    let manifest_document = read_object(repo, OBJECTS, &inputs.manifest, MANIFEST_LIMIT)?;
+    let recipe = verify_rebuild_inputs(
+        &envelope,
+        id,
+        &recipe_document,
+        &manifest_document,
+        published_hash,
+    )?
+    .recipe;
+    Ok(ArchivedInputs {
+        recipe_document,
+        manifest_document,
+        envelope,
+        recipe,
+    })
 }
 
 /// Extract an authenticated build recipe, its manifest, and the admitted attestation.
@@ -72,15 +112,7 @@ pub fn export_rebuild_inputs(
     output: &Path,
 ) -> Result<PathBuf> {
     let catalog = selected_catalog(repo, publisher, &read_key(trust_key)?, id, pin)?;
-    let inputs = catalog
-        .build_inputs
-        .get(id)
-        .with_context(|| format!("no archived rebuild inputs for {id}"))?;
-    let (published_hash, envelope) = admitted_build(repo, &catalog, id)?;
-    let recipe = read_object(repo, OBJECTS, &inputs.recipe, build::RECIPE_LIMIT)?;
-    let manifest = read_object(repo, OBJECTS, &inputs.manifest, MANIFEST_LIMIT)?;
-    let definition =
-        verify_rebuild_inputs(&envelope, id, &recipe, &manifest, published_hash)?.recipe;
+    let inputs = read_archived(repo, &catalog, id)?;
 
     let parent = output
         .parent()
@@ -92,19 +124,23 @@ pub fn export_rebuild_inputs(
     let directory = File::open(parent)?;
     let stage = TempDir::new_in(parent)?;
     let source = stage.path().join("source");
-    let manifest_path = source.join(&definition.manifest);
+    let manifest_path = source.join(&inputs.recipe.manifest);
     let manifest_parent = manifest_path
         .parent()
         .context("missing reviewed manifest directory")?;
     fs::create_dir_all(manifest_parent)?;
-    let recipe_name = if Path::new(&definition.manifest).starts_with("build.kdl") {
+    let recipe_name = if Path::new(&inputs.recipe.manifest).starts_with("build.kdl") {
         "rebuild.kdl"
     } else {
         "build.kdl"
     };
-    write_atomic(&source.join(recipe_name), &recipe, true)?;
-    write_atomic(&manifest_path, &manifest, true)?;
-    write_atomic(&stage.path().join("attestation.json"), &envelope, true)?;
+    write_atomic(&source.join(recipe_name), &inputs.recipe_document, true)?;
+    write_atomic(&manifest_path, &inputs.manifest_document, true)?;
+    write_atomic(
+        &stage.path().join("attestation.json"),
+        &inputs.envelope,
+        true,
+    )?;
     for path in manifest_parent
         .ancestors()
         .take_while(|path| path.starts_with(stage.path()))
@@ -167,7 +203,7 @@ pub fn verify_rebuild(
     Ok(build.artifacts.len())
 }
 
-fn selected_catalog(
+pub(super) fn selected_catalog(
     repo: &Path,
     publisher: &str,
     anchor: &[u8],

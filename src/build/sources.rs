@@ -23,7 +23,7 @@ use crate::{
     transport::https_client,
 };
 
-pub(super) const OBJECTS: &str = "sha256";
+pub(crate) const OBJECTS: &str = "sha256";
 
 /// Fetch missing pinned inputs over HTTPS and verify every object in the recipe.
 pub fn fetch_sources(recipe: &Path, cache: &Path) -> Result<usize> {
@@ -85,17 +85,7 @@ fn cache_sources(recipe: &Path, cache: &Path, local: Option<Root>, fetch: bool) 
                 .block_on(download(client, url, temp.as_file_mut(), pin))
                 .with_context(|| format!("fetching source {name}"))?;
         }
-        temp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o444))?;
-        temp.as_file().sync_all()?;
-        match temp.persist_noclobber(directory.join(hash)) {
-            Ok(_) => cache.as_file().sync_all()?,
-            Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
-                // Another fetch may have published this digest while we were streaming it.
-                verify_cached(cache.file(hash)?, pin)?;
-            }
-            Err(err) => return Err(err.into()),
-        }
+        publish_verified(&cache, temp, pin)?;
     }
     Ok(recipe.sources.len())
 }
@@ -111,7 +101,7 @@ fn find_local<'a>(root: &Root, aliases: &[(&'a str, &Source)]) -> Result<Option<
     Ok(None)
 }
 
-pub(super) fn copy_verified(
+pub(crate) fn copy_verified(
     source: File,
     destination: &mut File,
     pin: &FileDigest,
@@ -130,13 +120,27 @@ pub(super) fn copy_verified(
     Ok(())
 }
 
-fn verify_cached(file: File, pin: &FileDigest) -> Result<()> {
+pub(crate) fn verify_cached(file: File, pin: &FileDigest) -> Result<()> {
     ensure!(
         file.metadata()?.len() == pin.size
             && digest_reader(file.take(pin.size.saturating_add(1)))? == pin.sha256,
         "cached source {} differs from its pin",
         pin.sha256
     );
+    Ok(())
+}
+
+pub(crate) fn publish_verified(cache: &Root, temp: NamedTempFile, pin: &FileDigest) -> Result<()> {
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o444))?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(Root::fd_path(cache.as_file()).join(&pin.sha256)) {
+        Ok(_) => cache.as_file().sync_all()?,
+        Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_cached(cache.file(&pin.sha256)?, pin)?;
+        }
+        Err(err) => return Err(err.into()),
+    }
     Ok(())
 }
 

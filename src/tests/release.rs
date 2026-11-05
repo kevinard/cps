@@ -1606,6 +1606,8 @@ fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -
     let id = "cps://canopa/test/rebuild@1.0.0-0";
     let output = "usr/share/cps/reference";
     let bytes = b"deterministic build output";
+    let source_bytes = b"pinned source bytes";
+    let source_hash = digest(source_bytes);
     let manifest = br#"schema-version 1
 // Reviewed bytes and layout
 package "test/rebuild" publisher="canopa" version="1.0.0-0" {
@@ -1614,8 +1616,9 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
 "#;
     let catalog = digest(b"legacy pinned toolchain");
     let recipe = format!(
-        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain \"{catalog}\" {{ package \"build/tool\"; }}\n    manifest \"build.kdl/nested/manifest.kdl\" sha256=\"{}\"\n    script \"true\"\n}}\n",
+        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain \"{catalog}\" {{ package \"build/tool\"; }}\n    manifest \"build.kdl/nested/manifest.kdl\" sha256=\"{}\"\n    source \"input\" sha256=\"{source_hash}\" size={}\n    script \"true\"\n}}\n",
         digest(manifest),
+        source_bytes.len(),
     );
     let reviewed = digest(recipe.as_bytes());
     let bundle = work.join("bundle");
@@ -1699,6 +1702,21 @@ publisher "canopa" archive-build-inputs={archive} {{
     check(&f.repo, None, &work.join("local"))?;
 
     withdraw_package(&f.repo, &f.private, id)?;
+    let source_cache = work.join("publisher-sources");
+    fs::create_dir_all(source_cache.join("sha256"))?;
+    let input = source_cache.join("sha256").join(&source_hash);
+    let current = fs::read_to_string(f.repo.join("current"))?;
+    fs::write(&input, vec![b'x'; source_bytes.len()])?;
+    let archive_sources = || crate::archive_build_sources(&f.repo, &f.private, &source_cache, id);
+    let error = archive_sources().unwrap_err();
+    assert!(format!("{error:#}").contains("source digest or length mismatch"));
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, current);
+    fs::write(&input, source_bytes)?;
+    let (with_sources, count) = archive_sources()?;
+    assert_eq!(count, 1);
+    assert_ne!(with_sources, current.trim());
+    assert_eq!(archive_sources()?.0, with_sources);
+    fs::remove_file(input)?;
     let anchor = work.join("root.json");
     let tuf_key = work.join("tuf.der");
     sign_root(&anchor, &tuf_key, None)?;
@@ -1748,6 +1766,56 @@ publisher "canopa" archive-build-inputs={archive} {{
         "canopa",
         &f.public,
     )?;
+    let rebuild_cache = work.join("rebuild-cache");
+    let fetch = |repo: &Path, pin| {
+        crate::fetch_build_sources(repo, "canopa", &f.public, id, pin, &rebuild_cache)
+    };
+    let error = fetch(&withdrawn_cache, None).unwrap_err();
+    assert!(format!("{error:#}").contains("checking archived source"));
+    let sync_sources = |mirror: &Path, version, corrupted: bool| -> Result<()> {
+        fs::create_dir(mirror)?;
+        let export = mirror.join("export");
+        mirror_release::export_with_sources(&f.repo, "canopa", &f.public, &export, &[])?;
+        let target = export.join(format!("source-archives-{source_hash}"));
+        assert_eq!(fs::read(&target)?, source_bytes);
+        if corrupted {
+            fs::write(&target, vec![b'x'; source_bytes.len()])?;
+        }
+        sign_export(&export, mirror, version, fresh, &anchor, &tuf_key)?;
+        let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+        let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+        mirror_release::sync_index(
+            &withdrawn_cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )?;
+        Ok(())
+    };
+    sync_sources(&work.join("wrong-sources"), 2, true)?;
+    let error = fetch(&withdrawn_cache, None).unwrap_err();
+    assert!(format!("{error:#}").contains("signed digest mismatch for source-archives"));
+    assert!(!rebuild_cache.join("sha256").join(&source_hash).exists());
+    let source_mirror = work.join("source-mirror");
+    sync_sources(&source_mirror, 3, false)?;
+    let target = source_mirror
+        .join("targets")
+        .join(format!("{source_hash}.source-archives-{source_hash}"));
+    fs::write(&target, vec![b'x'; source_bytes.len()])?;
+    let error = fetch(&withdrawn_cache, None).unwrap_err();
+    assert!(format!("{error:#}").contains("Hash mismatch"));
+    assert!(!rebuild_cache.join("sha256").join(&source_hash).exists());
+    fs::write(&target, source_bytes)?;
+    assert_eq!(fetch(&withdrawn_cache, Some(&with_sources))?, 1);
+    assert_eq!(
+        fs::read(rebuild_cache.join("sha256").join(&source_hash))?,
+        source_bytes
+    );
+    assert!(!withdrawn_cache.join("source-archives").exists());
+    fs::rename(&source_mirror, work.join("offline-source-mirror"))?;
+    assert_eq!(fetch(&withdrawn_cache, None)?, 1);
     fs::rename(&f.repo, work.join("offline-repo"))?;
     fs::rename(&mirror, work.join("offline-mirror"))?;
     fs::rename(&current_only, work.join("offline-current-only"))?;

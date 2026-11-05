@@ -240,7 +240,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS package and its dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-19`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-20`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -373,6 +373,35 @@ cps build --toolchain-config toolchain.kdl --source-cache source-cache \
 cps repo verify-rebuild --repo /var/lib/cps/canopa --publisher canopa \
     --trust-key canopa.der --bundle rebuilt cps://canopa/demo/hello@1.0.0-0
 ```
+
+When the source files are available for redistribution, the publisher can
+attach them to the exact package version using its verified build cache.
+
+```sh
+cps repo archive-sources --repo repo --signing-key release-private.der \
+    --source-cache publisher-source-cache cps://canopa/demo/hello@1.0.0-0
+cps repo export --repo repo --publisher canopa --trust-key canopa.der \
+    --include-sources --output source-mirror-targets
+```
+
+Sign those targets through the same TUF release process. The source archive
+is available after withdrawal. A repository signs the archive record only
+after verifying every pinned source, and later catalogs preserve the record.
+Catalogs with source archive records require CPS `0.1.0-20` or later.
+
+From a local repository or a synchronized source-inclusive mirror, prepare
+the cache without contacting the recipe's upstream URLs.
+
+```sh
+cps repo fetch-sources --repo /var/lib/cps/canopa --publisher canopa \
+    --trust-key canopa.der --source-cache source-cache cps://canopa/demo/hello@1.0.0-0
+```
+
+Use this command in place of `cps source fetch` in the rebuild workflow.
+Both full and index-only sync leave source targets for this explicit fetch.
+CPS checks the TUF target digest and size against the verified recipe before
+writing to the worker's source cache. Valid cached sources can be reused
+offline. The same `--catalog` pin selects a historical archived release.
 
 `repo rebuild-inputs` verifies the signed catalog, archived bytes, and
 their binding to the admitted attestation before writing a new directory.

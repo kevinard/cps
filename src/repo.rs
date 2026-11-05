@@ -34,7 +34,9 @@ mod keys;
 mod profiles;
 mod rebuild;
 pub mod release;
+mod source_archive;
 pub use rebuild::{export_rebuild_inputs, verify_rebuild};
+pub use source_archive::{archive_build_sources, fetch_build_sources};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -420,7 +422,9 @@ impl Catalog {
         }
         for (id, inputs) in &self.build_inputs {
             ensure!(
-                next.build_inputs.get(id) == Some(inputs),
+                next.build_inputs
+                    .get(id)
+                    .is_some_and(|next| inputs.preserved_by(next)),
                 "release drops or changes the rebuild inputs for {id}"
             );
         }
@@ -2200,6 +2204,16 @@ mod tests {
         let error = previous.check_successor(&next, &base).unwrap_err();
         assert!(format!("{error:#}").contains("drops or changes the rebuild inputs"));
         next.build_inputs.insert(active.clone(), inputs);
+        let mut with_sources = previous.clone();
+        with_sources
+            .build_inputs
+            .get_mut(&active)
+            .unwrap()
+            .sources_archived = true;
+        let error = with_sources.check_successor(&next, &base).unwrap_err();
+        assert!(format!("{error:#}").contains("drops or changes the rebuild inputs"));
+        next.build_inputs.get_mut(&active).unwrap().sources_archived = true;
+        previous.check_successor(&next, &base)?;
         let added = "cps://canopa/new@1.0.0-0";
         next.entries.insert(added.to_owned(), manifest.clone());
         let error = previous.check_successor(&next, &base).unwrap_err();

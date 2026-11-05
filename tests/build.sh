@@ -491,6 +491,12 @@ test ! -e release/current
 mv repo/blobs repo/offline-blobs
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" first
 mv repo/offline-blobs repo/blobs
+mkdir publisher-sources
+printf 'hello from pinned input\n' > publisher-sources/input
+"$cps" source import --from publisher-sources --cache publisher-source-cache first/build.kdl
+"$cps" repo archive-sources --repo release --signing-key signing.der \
+    --source-cache publisher-source-cache cps://canopa/demo/hello@1.0.0-0
+rm -r -- publisher-sources publisher-source-cache
 first_catalog=$(cat release/current)
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" second
 mv release/publish-policy.kdl policy.saved
@@ -505,9 +511,9 @@ rebuild_recipe=$("$cps" repo rebuild-inputs --repo release --publisher canopa --
 cmp first/build.kdl "$rebuild_recipe"
 cmp first/manifest.kdl "$(dirname -- "$rebuild_recipe")/manifest.kdl"
 cmp first/attestation.json rebuild-inputs/attestation.json
-mkdir rebuild-sources
-printf 'hello from pinned input\n' > rebuild-sources/input
-"$cps" build --toolchain-config review-toolchain.kdl --sources rebuild-sources --output rebuilt \
+"$cps" repo fetch-sources --repo release --publisher canopa --trust-key public.der \
+    --catalog "$first_catalog" --source-cache rebuild-sources cps://canopa/demo/hello@1.0.0-0
+"$cps" build --toolchain-config review-toolchain.kdl --source-cache rebuild-sources --output rebuilt \
     --check-reproducible --builder-signing-key other.der "$rebuild_recipe"
 verify_rebuild() {
     "$cps" repo verify-rebuild --repo release --publisher canopa --trust-key public.der \
@@ -606,7 +612,8 @@ for path in ('builder-public.der', 'other-public.der'):
                     '-inkey', path, '-rawin', '-in', 'pae', '-sigfile', 'signature'], check=True)
 PYTHON
 
-"$cps" repo export --repo release --publisher canopa --trust-key public.der --output targets
+"$cps" repo export --repo release --publisher canopa --trust-key public.der --include-sources --output targets
+test -f "targets/source-archives-$(printf 'hello from pinned input\n' | sha256sum | cut -d' ' -f1)"
 test -f "targets/attestations-$(sha first/attestation.json)"
 cmp first/build.kdl "targets/build-inputs-$(sha first/build.kdl)"
 cmp first/manifest.kdl "targets/build-inputs-$(sha first/manifest.kdl)"
