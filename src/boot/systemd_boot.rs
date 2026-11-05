@@ -5,6 +5,7 @@ pub use destroy::destroy_btrfs_boot_environment;
 use std::{
     fs::{self, File},
     io::{self, Read, Seek},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -155,6 +156,44 @@ fn lock_esp(esp: &Path, operation: FlockOperation) -> Result<File> {
     );
     flock(&file, operation)?;
     Ok(file)
+}
+
+pub(super) fn with_running_environment<T>(
+    volume: &BtrfsVolume,
+    esp: &Path,
+    partuuid: &str,
+    action: impl FnOnce(Root, &str, u64) -> Result<T>,
+) -> Result<T> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let lock = lock_esp(&esp, FlockOperation::LockShared)?;
+    let partuuid = canonical_partuuid(partuuid)?;
+    volume.check_disk(&esp, &lock, &partuuid)?;
+    let (policy, entries) = inventory(&esp)?;
+    let selected = policy
+        .and_then(|policy| policy.selected(&entries))
+        .context("no CPS boot environment is selected")?;
+    ensure!(
+        selected.tries.is_none(),
+        "a trial is pending; boot it before making more package changes"
+    );
+    ensure!(
+        selected.partuuid == partuuid,
+        "the selected root uses a different partition"
+    );
+    let record = selected
+        .btrfs
+        .as_ref()
+        .context("expected a registered Btrfs root")?;
+    let registered = volume.open_registered(record, &selected.id)?;
+    let running = Root::open(Path::new("/"))?;
+    let expected = registered.as_file().metadata()?;
+    let actual = running.as_file().metadata()?;
+    ensure!(
+        (expected.dev(), expected.ino()) == (actual.dev(), actual.ino()),
+        "a different system is selected for the next boot; reboot before changing packages"
+    );
+    let (id, revision) = policy::entry_identity(&selected.id)?;
+    action(running, id, revision)
 }
 
 pub struct Activation {

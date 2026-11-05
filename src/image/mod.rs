@@ -602,6 +602,21 @@ impl Image {
         )
     }
 
+    pub(crate) fn open_for_live_apply(root: Root, id: &str, revision: u64) -> Result<Self> {
+        let image = Self::open_database(
+            root,
+            true,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            false,
+        )?;
+        let settings = image.settings()?;
+        ensure!(
+            settings.id == id && settings.boot_revision() == revision,
+            "the running image differs from its boot entry"
+        );
+        Ok(image)
+    }
+
     fn open_database(
         root: Root,
         exclusive: bool,

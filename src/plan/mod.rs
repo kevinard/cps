@@ -179,6 +179,55 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub(crate) fn boot_reason(&self, stage_packages: &BTreeSet<String>) -> Option<String> {
+        if self.kernel_install.is_some() {
+            return Some("the transaction changes the boot kernel or initramfs".into());
+        }
+        if let Some(change) = self
+            .package_changes
+            .iter()
+            .find(|change| stage_packages.contains(&change.name))
+        {
+            return Some(format!("{} is configured for staged changes", change.name));
+        }
+        self.writes
+            .iter()
+            .filter(|write| write.before != write.after || write.detach)
+            .find(|write| {
+                let path = Path::new(&write.path);
+                [
+                    "boot",
+                    "efi",
+                    "usr/lib/modules",
+                    "usr/lib/firmware",
+                    "usr/lib/kernel",
+                    "usr/lib/systemd/boot",
+                    "usr/lib/systemd/systemd",
+                    "usr/bin/cps",
+                    "etc/cps",
+                    "etc/fstab",
+                    "etc/crypttab",
+                ]
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+                    || write.path.starts_with("usr/lib/ld-linux")
+                    || write.path.starts_with("lib64/ld-linux")
+            })
+            .map(|write| format!("the transaction changes {}", write.path))
+    }
+
+    pub(crate) fn has_changes(&self) -> bool {
+        !self.package_changes.is_empty()
+            || !self.intent_changes.is_empty()
+            || !self.writes.is_empty()
+            || !self.systemd.is_empty()
+            || self.kernel_install.is_some()
+    }
+
+    pub(crate) fn package_changes(&self) -> &[PackageChange] {
+        &self.package_changes
+    }
+
     fn with_selection(
         settings: &Settings,
         request: Request,

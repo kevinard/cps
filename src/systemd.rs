@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Seek, Write},
     os::unix::ffi::OsStringExt,
@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     image::{Installed, Managed, State, root::Root},
     model::Node,
+    plan::Plan,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -133,7 +134,14 @@ pub(crate) fn validate_tmpfiles(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run(root: &Root, path: &Path, actions: &[Action], state: &State) -> Result<()> {
+pub(crate) fn run(
+    root: &Root,
+    path: &Path,
+    actions: &[Action],
+    state: &State,
+    live: bool,
+) -> Result<()> {
+    let runtime = live.then(|| Root::open(Path::new("/run"))).transpose()?;
     let mut sysusers = Vec::new();
     let mut presets = Vec::new();
     let mut rules = tempfile::tempfile_in(path.join(".cps/stage"))?;
@@ -151,7 +159,7 @@ pub(crate) fn run(root: &Root, path: &Path, actions: &[Action], state: &State) -
         match action {
             Action::Sysusers(name) => sysusers.push(name),
             Action::Tmpfiles(name) => {
-                if let Some(bytes) = tmpfiles_config(root, name)? {
+                if let Some(bytes) = tmpfiles_config(root, runtime.as_ref(), name)? {
                     validate_tmpfiles(&bytes).with_context(|| format!("validating {name}"))?;
                     rules.write_all(&bytes)?;
                     rules.write_all(b"\n")?;
@@ -159,7 +167,7 @@ pub(crate) fn run(root: &Root, path: &Path, actions: &[Action], state: &State) -
             }
             Action::Preset(unit) => {
                 // Administrator unit overrides, including masks, take priority.
-                if !unit_overridden(root, unit)? {
+                if !unit_overridden(root, runtime.as_ref(), unit)? {
                     presets.push(unit);
                 }
             }
@@ -174,9 +182,18 @@ pub(crate) fn run(root: &Root, path: &Path, actions: &[Action], state: &State) -
     }
     if rules.stream_position()? != 0 {
         rules.rewind()?;
+        let mut tool = command("systemd-tmpfiles", path);
+        if live {
+            tool.args([
+                "--exclude-prefix=/dev",
+                "--exclude-prefix=/proc",
+                "--exclude-prefix=/sys",
+            ]);
+        } else {
+            tool.arg("-E");
+        }
         run_tool(
-            command("systemd-tmpfiles", path)
-                .args(["--create", "-E", "--exclude-prefix=/.cps", "--", "-"])
+            tool.args(["--create", "--exclude-prefix=/.cps", "--", "-"])
                 .stdin(Stdio::from(rules)),
             "tmpfiles",
         )?;
@@ -193,10 +210,17 @@ pub(crate) fn run(root: &Root, path: &Path, actions: &[Action], state: &State) -
     Ok(())
 }
 
-fn unit_overridden(root: &Root, unit: &str) -> Result<bool> {
+fn unit_overridden(root: &Root, runtime: Option<&Root>, unit: &str) -> Result<bool> {
     for directory in ["etc", "run", "usr/local/lib"] {
-        if root
-            .inspect(&format!("{directory}/systemd/system/{unit}"))?
+        let (tree, prefix) = if directory == "run"
+            && let Some(runtime) = runtime
+        {
+            (runtime, String::new())
+        } else {
+            (root, format!("{directory}/"))
+        };
+        if tree
+            .inspect(&format!("{prefix}systemd/system/{unit}"))?
             .is_some()
         {
             return Ok(true);
@@ -205,19 +229,165 @@ fn unit_overridden(root: &Root, unit: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn tmpfiles_config(root: &Root, name: &str) -> Result<Option<Vec<u8>>> {
+fn tmpfiles_config(root: &Root, runtime: Option<&Root>, name: &str) -> Result<Option<Vec<u8>>> {
     // Read and validate the exact bytes given to tmpfiles. A target-local
     // replacement or mask takes precedence over the packaged configuration.
     for directory in ["etc", "run", "usr/local/lib", "usr/lib"] {
-        let path = format!("{directory}/tmpfiles.d/{name}");
-        match root.inspect(&path)? {
+        let (tree, prefix) = if directory == "run"
+            && let Some(runtime) = runtime
+        {
+            (runtime, String::new())
+        } else {
+            (root, format!("{directory}/"))
+        };
+        let path = format!("{prefix}tmpfiles.d/{name}");
+        match tree.inspect(&path)? {
             None => {}
             Some(Node::Symlink { target, .. }) if target == "/dev/null" => return Ok(None),
-            Some(Node::File { .. }) => return Ok(Some(root.read_file(&path)?)),
+            Some(Node::File { .. }) => return Ok(Some(tree.read_file(&path)?)),
             Some(_) => bail!("invalid tmpfiles configuration at {path}"),
         }
     }
     bail!("missing tmpfiles configuration {name}")
+}
+
+pub(crate) struct LiveServices {
+    reload: bool,
+    restart: BTreeSet<String>,
+    stop: BTreeSet<String>,
+}
+
+impl LiveServices {
+    pub(crate) fn plan(plan: &Plan, current: &State, next: &State) -> Self {
+        let changed = plan
+            .package_changes()
+            .iter()
+            .map(|change| change.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut services = Self {
+            reload: plan
+                .systemd
+                .iter()
+                .any(|action| matches!(action, Action::Preset(_))),
+            restart: BTreeSet::new(),
+            stop: BTreeSet::new(),
+        };
+        for write in &plan.writes {
+            if write.before == write.after && !write.detach {
+                continue;
+            }
+            if let Some(path) = unit_path(&write.path) {
+                services.reload = true;
+                let name = path.split('/').next().unwrap_or(path);
+                let name = name.strip_suffix(".d").unwrap_or(name);
+                if service_name(name) {
+                    services.restart.insert(name.to_owned());
+                }
+            }
+        }
+        for (path, managed) in &current.paths {
+            let Some(unit) = unit_path(path).filter(|name| service_name(name)) else {
+                continue;
+            };
+            if !next.paths.contains_key(path) {
+                services.stop.insert(unit.to_owned());
+                services.restart.remove(unit);
+            } else if managed
+                .owners
+                .iter()
+                .any(|owner| changed.contains(owner.as_str()))
+            {
+                services.restart.insert(unit.to_owned());
+            }
+        }
+        services
+    }
+
+    pub(crate) fn run(&self) -> Result<()> {
+        if !self.restart.is_empty() || !self.stop.is_empty() {
+            let output = live_systemctl()
+                .args([
+                    "list-units",
+                    "--type=service",
+                    "--state=active,activating,reloading",
+                    "--plain",
+                    "--no-legend",
+                    "--full",
+                ])
+                .output()
+                .context("listing running services")?;
+            ensure!(
+                output.status.success(),
+                "listing running services failed with {}",
+                output.status
+            );
+            let units = std::str::from_utf8(&output.stdout)?;
+            let mut stop = Vec::new();
+            let mut restart = Vec::new();
+            for unit in units
+                .lines()
+                .filter_map(|line| line.split_ascii_whitespace().next())
+            {
+                if matches_service(&self.stop, unit) {
+                    stop.push(unit);
+                } else if matches_service(&self.restart, unit) {
+                    restart.push(unit);
+                }
+            }
+            if !stop.is_empty() {
+                run_tool(
+                    live_systemctl()
+                        .args(["--no-block", "stop", "--"])
+                        .args(stop),
+                    "stop",
+                )?;
+            }
+            if self.reload {
+                run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload")?;
+            }
+            if !restart.is_empty() {
+                run_tool(
+                    live_systemctl()
+                        .args(["--no-block", "try-restart", "--"])
+                        .args(restart),
+                    "restart",
+                )?;
+            }
+        } else if self.reload {
+            run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload")?;
+        }
+        Ok(())
+    }
+}
+
+fn unit_path(path: &str) -> Option<&str> {
+    path.strip_prefix("usr/lib/systemd/system/")
+        .or_else(|| path.strip_prefix("etc/systemd/system/"))
+}
+
+fn service_name(name: &str) -> bool {
+    name.ends_with(".service")
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.@:\\-".contains(&c))
+}
+
+fn matches_service(services: &BTreeSet<String>, unit: &str) -> bool {
+    services.contains(unit)
+        || unit
+            .split_once('@')
+            .is_some_and(|(template, _)| services.contains(&format!("{template}@.service")))
+}
+
+fn live_systemctl() -> Command {
+    let mut command = Command::new("systemctl");
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .args(["--system", "--no-pager"])
+        .stdin(Stdio::null());
+    command
 }
 
 fn command(program: &str, root: &Path) -> Command {
@@ -240,10 +410,7 @@ fn run_tool(command: &mut Command, action: &str) -> Result<()> {
     let status = command
         .status()
         .with_context(|| format!("running systemd {action}"))?;
-    ensure!(
-        status.success(),
-        "offline systemd {action} failed with {status}"
-    );
+    ensure!(status.success(), "systemd {action} failed with {status}");
     Ok(())
 }
 

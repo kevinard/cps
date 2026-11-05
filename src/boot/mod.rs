@@ -32,7 +32,9 @@ use crate::{
     verify::verify_image,
 };
 
+pub(crate) use btrfs::stage_running_btrfs;
 pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
+pub(crate) use btrfs_boot::with_running_environment;
 pub use btrfs_boot::{activate_btrfs_boot_environment, rollback_btrfs_boot_environment};
 pub use deploy::deploy_boot_environment;
 pub use esp::{
@@ -213,7 +215,7 @@ fn publish_directory(parent: &Root, staged: &Path, name: &OsStr) -> Result<()> {
     Ok(())
 }
 
-fn entry_id(image: &str, revision: u64) -> String {
+pub(crate) fn entry_id(image: &str, revision: u64) -> String {
     format!("cps-{image}-{revision}")
 }
 

@@ -10,6 +10,7 @@ mod model;
 mod plan;
 pub mod query;
 mod repo;
+pub mod system;
 mod systemd;
 mod transport;
 mod verify;

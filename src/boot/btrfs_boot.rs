@@ -346,6 +346,16 @@ pub fn rollback_btrfs_boot_environment(
     systemd_boot::rollback(esp, id, None, Some(&volume))
 }
 
+pub(crate) fn with_running_environment<T>(
+    volume: &Path,
+    esp: &Path,
+    partuuid: &str,
+    action: impl FnOnce(Root, &str, u64) -> Result<T>,
+) -> Result<T> {
+    let volume = BtrfsVolume::open(volume)?;
+    systemd_boot::with_running_environment(&volume, esp, partuuid, action)
+}
+
 fn filesystem_info(root: &Root) -> Result<FsInfo> {
     ensure!(
         fstatfs(root.as_file())?.f_type == libc::BTRFS_SUPER_MAGIC,

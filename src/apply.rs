@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs::{self, File},
     io::Seek,
     path::{Path, PathBuf},
@@ -17,7 +17,7 @@ use crate::{
         root::{ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
-    plan::{Plan, Write, build, config_update_prefix, hardlink_groups, payloads},
+    plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads},
     repo::{
         BuildReceipt, Published,
         release::{ArchiveCache, fetch_payloads},
@@ -53,6 +53,7 @@ struct Pending {
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum PendingRecord {
+    Live { live: Box<Journal> },
     Journaled { journaled: Box<Journal> },
     Dormant { dormant: Pending },
     Archived { archived: Pending },
@@ -71,9 +72,13 @@ struct PendingWork<'a> {
 }
 
 impl PendingRecord {
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live { .. })
+    }
+
     fn work(&self) -> PendingWork<'_> {
         match self {
-            Self::Journaled { journaled } => PendingWork {
+            Self::Journaled { journaled } | Self::Live { live: journaled } => PendingWork {
                 id: &journaled.id,
                 writes: &journaled.plan.writes,
                 next: &journaled.next,
@@ -100,7 +105,9 @@ impl PendingRecord {
 
     fn mark_files_ready(&mut self) {
         *match self {
-            Self::Journaled { journaled } => &mut journaled.files_ready,
+            Self::Journaled { journaled } | Self::Live { live: journaled } => {
+                &mut journaled.files_ready
+            }
             Self::Dormant { dormant: pending }
             | Self::Archived { archived: pending }
             | Self::Profiled { profiled: pending }
@@ -112,8 +119,9 @@ impl PendingRecord {
     }
 
     fn recorded_plan(&self) -> Result<Option<&Plan>> {
-        let Self::Journaled { journaled } = self else {
-            return Ok(None);
+        let journaled = match self {
+            Self::Journaled { journaled } | Self::Live { live: journaled } => journaled,
+            _ => return Ok(None),
         };
         ensure!(
             journaled.plan.id()? == journaled.id,
@@ -145,6 +153,7 @@ pub struct PendingTransaction {
     pub target_revision: u64,
     pub files_ready: bool,
     pub plan_summary: Option<String>,
+    pub live: bool,
 }
 
 pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
@@ -165,6 +174,7 @@ pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
                 target_revision: work.next.settings.revision,
                 files_ready: work.files_ready,
                 plan_summary,
+                live: pending.is_live(),
             })
         })
         .transpose()?;
@@ -299,8 +309,24 @@ fn check_plan_revision(state: &State, plan: &Plan) -> Result<()> {
 }
 
 pub(crate) fn apply_with(path: &Path, plan: &Plan, after_write: impl FnMut(&Write)) -> Result<u64> {
+    apply_to_image(Image::open_for_apply(path)?, plan, None, after_write)
+}
+
+pub(crate) fn apply_live(
+    image: Image,
+    plan: &Plan,
+    stage_packages: &BTreeSet<String>,
+) -> Result<u64> {
+    apply_to_image(image, plan, Some(stage_packages), |_| {})
+}
+
+fn apply_to_image(
+    mut image: Image,
+    plan: &Plan,
+    live: Option<&BTreeSet<String>>,
+    after_write: impl FnMut(&Write),
+) -> Result<u64> {
     let id = plan.id()?;
-    let mut image = Image::open_for_apply(path)?;
     let state = image.state()?;
     ensure!(
         plan.image == state.settings.id,
@@ -311,39 +337,75 @@ pub(crate) fn apply_with(path: &Path, plan: &Plan, after_write: impl FnMut(&Writ
             pending.work().id == id,
             "a different plan is pending; use transaction status to identify it"
         );
-        return resume_pending(&mut image, &state, pending, Some(plan), after_write);
+        return resume_pending(
+            &mut image,
+            &state,
+            pending,
+            Some(plan),
+            live.is_some(),
+            after_write,
+        );
     }
     if let Some(revision) = image.applied(&id)? {
         return Ok(revision);
     }
-    let (checked, next, receipts) = check_plan(&image, state, plan)?;
+    let current = live.map(|_| state.clone());
+    let (checked, mut next, receipts) = check_plan(&image, state, plan)?;
     let stage = image.stage()?;
-    let offline = offline_target(
-        &image.root,
-        !checked.systemd.is_empty() || checked.kernel_install.is_some(),
-    )?;
+    let after = if let (Some(stage_packages), Some(current)) = (live, &current) {
+        check_live_plan(&checked, stage_packages)?;
+        next.settings.boot_revision = Some(current.settings.boot_revision());
+        next.settings.format = next.publishers.image_format(&next.settings);
+        AfterFiles::Live(systemd::LiveServices::plan(&checked, current, &next))
+    } else {
+        AfterFiles::offline(&image.root, &checked)?
+    };
     prepare(&image.root, &stage, &checked, &next)?;
     let repo_backed = checked.catalog.is_some() || !checked.catalogs.is_empty();
-    let pending = PendingRecord::Journaled {
-        journaled: Box::new(Journal {
-            id,
-            plan: checked,
-            state_sha256: state_digest(&next)?,
-            next,
-            files_ready: false,
-        }),
+    let journal = Box::new(Journal {
+        id,
+        plan: checked,
+        state_sha256: state_digest(&next)?,
+        next,
+        files_ready: false,
+    });
+    let pending = if live.is_some() {
+        PendingRecord::Live { live: journal }
+    } else {
+        PendingRecord::Journaled { journaled: journal }
     };
     image.record_pending(&pending, pending.work().next, &receipts, repo_backed)?;
-    finish(&mut image, &stage, pending, None, offline, after_write)
+    finish(&mut image, &stage, pending, None, after, after_write)
 }
 
 pub fn resume_transaction(path: &Path) -> Result<Option<u64>> {
-    let mut image = Image::open_for_apply(path)?;
+    resume_image(Image::open_for_apply(path)?, false)
+}
+
+pub(crate) fn resume_live(image: Image) -> Result<Option<u64>> {
+    resume_image(image, true)
+}
+
+fn resume_image(mut image: Image, live: bool) -> Result<Option<u64>> {
     let state = image.state()?;
     let Some(pending) = image.pending::<PendingRecord>()? else {
         return Ok(None);
     };
-    resume_pending(&mut image, &state, pending, None, |_| {}).map(Some)
+    resume_pending(&mut image, &state, pending, None, live, |_| {}).map(Some)
+}
+
+fn check_live_plan(plan: &Plan, stage_packages: &BTreeSet<String>) -> Result<()> {
+    ensure!(
+        matches!(
+            plan.request,
+            Request::Install { .. } | Request::Update | Request::UpdateProfile
+        ),
+        "this request cannot be applied live"
+    );
+    if let Some(reason) = plan.boot_reason(stage_packages) {
+        anyhow::bail!("staging required because {reason}");
+    }
+    Ok(())
 }
 
 fn resume_pending(
@@ -351,8 +413,13 @@ fn resume_pending(
     state: &State,
     pending: PendingRecord,
     saved: Option<&Plan>,
+    live: bool,
     after_write: impl FnMut(&Write),
 ) -> Result<u64> {
+    ensure!(
+        pending.is_live() == live,
+        "resume the transaction in its original mode"
+    );
     let work = pending.work();
     let recorded = pending.recorded_plan()?;
     let plan = recorded
@@ -360,6 +427,15 @@ fn resume_pending(
         .context("this older transaction requires its saved plan; rerun apply with that plan")?;
     validate_digest(work.id)?;
     plan.check_recovery_state(state, work.next)?;
+    let expected_boot_revision = if live {
+        Some(state.settings.boot_revision())
+    } else {
+        state.settings.boot_revision
+    };
+    ensure!(
+        work.next.settings.boot_revision == expected_boot_revision,
+        "pending state has a different boot revision"
+    );
     ensure!(
         recorded.is_some()
             || (work.writes == plan.writes
@@ -374,16 +450,34 @@ fn resume_pending(
     image
         .verify_catalog_archives(work.next)
         .context("verifying catalog archives for the pending transaction")?;
-    let offline = offline_target(
-        &image.root,
-        !work.systemd.is_empty() || work.kernel_install.is_some(),
-    )?;
+    let after = if live {
+        check_live_plan(plan, &BTreeSet::new())?;
+        AfterFiles::Live(systemd::LiveServices::plan(plan, state, work.next))
+    } else {
+        AfterFiles::offline(&image.root, plan)?
+    };
     ensure!(
-        !work.files_ready || offline.is_some(),
-        "pending transaction has an invalid offline phase"
+        !work.files_ready || !matches!(after, AfterFiles::None),
+        "pending transaction has an invalid final phase"
     );
     let stage = image.stage()?;
-    finish(image, &stage, pending, saved, offline, after_write)
+    finish(image, &stage, pending, saved, after, after_write)
+}
+
+enum AfterFiles {
+    None,
+    Offline(PathBuf),
+    Live(systemd::LiveServices),
+}
+
+impl AfterFiles {
+    fn offline(root: &Root, plan: &Plan) -> Result<Self> {
+        if plan.systemd.is_empty() && plan.kernel_install.is_none() {
+            Ok(Self::None)
+        } else {
+            Ok(Self::Offline(systemd::offline_path(root)?))
+        }
+    }
 }
 
 fn finish(
@@ -391,7 +485,7 @@ fn finish(
     stage: &File,
     mut pending: PendingRecord,
     saved: Option<&Plan>,
-    offline: Option<std::path::PathBuf>,
+    after: AfterFiles,
     mut after_write: impl FnMut(&Write),
 ) -> Result<u64> {
     let work = pending.work();
@@ -403,38 +497,50 @@ fn finish(
             &work.next.paths,
             &mut after_write,
         )?;
-        if offline.is_some() {
+        if !matches!(after, AfterFiles::None) {
             pending.mark_files_ready();
             image.update_pending(&pending)?;
         }
     }
     let work = pending.work();
-    if let Some(path) = offline {
+    if !matches!(after, AfterFiles::None) {
+        let path = match &after {
+            AfterFiles::Offline(path) => path.as_path(),
+            AfterFiles::Live(_) => Path::new("/"),
+            AfterFiles::None => unreachable!(),
+        };
         if !work.systemd.is_empty() {
-            systemd::run(&image.root, &path, work.systemd, work.next)?;
+            systemd::run(
+                &image.root,
+                path,
+                work.systemd,
+                work.next,
+                pending.is_live(),
+            )?;
         }
         if let Some(kernel) = work.kernel_install {
-            kernel.prepare(&image.root, &path, &work.next.settings.id)?;
+            kernel.prepare(&image.root, path, &work.next.settings.id)?;
         }
         for finding in verify_state(&image.root, work.next)? {
             ensure!(
                 !finding.is_error,
-                "offline actions left an inconsistent image: {}",
+                "transaction actions left an inconsistent image: {}",
                 finding.message
             );
+        }
+        if let AfterFiles::Live(services) = after {
+            services.run()?;
         }
     }
     let revision = work.next.settings.revision;
     let plan = match &pending {
-        PendingRecord::Journaled { journaled } => &journaled.plan,
+        PendingRecord::Journaled { journaled } | PendingRecord::Live { live: journaled } => {
+            &journaled.plan
+        }
         _ => saved.context("missing verified plan for the pending transaction")?,
     };
     image.commit(work.id, work.next, &plan.transaction_details(work.next))?;
     Ok(revision)
-}
-
-fn offline_target(root: &Root, needed: bool) -> Result<Option<std::path::PathBuf>> {
-    needed.then(|| systemd::offline_path(root)).transpose()
 }
 
 fn write_files(

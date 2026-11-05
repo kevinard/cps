@@ -1,16 +1,17 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::Write,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use cps::query::{
     PackageRow, Scope, list_facets, list_package_intent, list_packages, package_manifest,
 };
+use cps::system::{self, System};
 use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, MarkChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
@@ -41,6 +42,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install packages on the running system
+    Install {
+        #[command(flatten)]
+        options: SystemOptions,
+        #[arg(required = true, value_name = "PACKAGE")]
+        packages: Vec<String>,
+    },
+    /// Upgrade the system and stage changes that require a reboot
+    Upgrade {
+        #[command(flatten)]
+        options: SystemOptions,
+    },
+    /// Show an interrupted change or a system waiting for reboot
+    Status {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+    },
+    /// Finish an interrupted live package transaction
+    Resume {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+    },
     /// Prepare pinned package sources for offline builds
     Source {
         #[command(subcommand)]
@@ -147,7 +170,7 @@ enum Command {
     },
     /// List installed packages or versions in the configured signed catalogs
     List {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         #[arg(long)]
         available: bool,
@@ -159,7 +182,7 @@ enum Command {
     },
     /// Search package names in the signed catalog or installed image
     Search {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         #[arg(long)]
         installed: bool,
@@ -167,7 +190,7 @@ enum Command {
     },
     /// Show an installed or available package's manifest in KDL
     Info {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         #[arg(long)]
         available: bool,
@@ -217,6 +240,22 @@ enum Command {
         #[command(subcommand)]
         command: BootCommand,
     },
+}
+
+#[derive(Args)]
+struct SystemOptions {
+    /// Distribution configuration for the running system
+    #[arg(long, default_value = system::CONFIG)]
+    config: PathBuf,
+    /// Confirm the displayed transaction without prompting
+    #[arg(short = 'y', long, conflicts_with = "dry_run")]
+    yes: bool,
+    /// Preview the transaction without applying it
+    #[arg(long)]
+    dry_run: bool,
+    /// Use the currently cached catalog
+    #[arg(long)]
+    no_refresh: bool,
 }
 
 #[derive(Subcommand)]
@@ -903,8 +942,96 @@ fn print_packages(rows: impl IntoIterator<Item = PackageRow>) -> Result<()> {
     Ok(())
 }
 
+fn change_system(options: SystemOptions, request: Request) -> Result<()> {
+    let system = System::load(&options.config)?;
+    let _lock = system.lock()?;
+    let change = system.plan(request, !options.no_refresh)?;
+    if change.is_empty() {
+        println!("Nothing to do.");
+        return Ok(());
+    }
+    for package in change.packages() {
+        let name = package.publisher.as_ref().map_or_else(
+            || package.name.clone(),
+            |publisher| format!("cps://{publisher}/{}", package.name),
+        );
+        match (&package.from, &package.to) {
+            (Some(old), Some(new)) => println!("Update {name} {old} → {new}"),
+            (None, Some(new)) => println!("Install {name} {new}"),
+            (Some(old), None) => println!("Remove {name} {old}"),
+            (None, None) => {}
+        }
+    }
+    if let Some(reason) = change.boot_reason() {
+        println!("A reboot will be required because {reason}.");
+    } else {
+        println!("Changes will take effect on the running system.");
+    }
+    if options.dry_run {
+        return Ok(());
+    }
+    if !options.yes {
+        ensure!(
+            io::stdin().is_terminal(),
+            "use --yes to confirm in a non-interactive session"
+        );
+        eprint!("Proceed? [y/N] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Canceled.");
+            return Ok(());
+        }
+    }
+    if let Some(id) = system.apply(&change)? {
+        println!("Prepared {id}. Reboot when ready to use the new system.");
+    } else {
+        println!("Changes are available now.");
+    }
+    Ok(())
+}
+
 fn run(command: Command) -> Result<ExitCode> {
     match command {
+        Command::Install { options, packages } => {
+            change_system(options, Request::Install { packages })?
+        }
+        Command::Upgrade { options } => change_system(options, Request::Update)?,
+        Command::Status { config } => {
+            let system = System::load(&config)?;
+            let (running, entries) = system.boot_status()?;
+            let status = transaction_status(Path::new("/"))?;
+            println!("Running {running}, package revision {}", status.revision);
+            if let Some(pending) = status.pending {
+                println!(
+                    "Transaction {} is incomplete. Run cps resume.",
+                    pending.plan_id
+                );
+            }
+            if let Some(next) = entries
+                .iter()
+                .find(|entry| entry.is_default && entry.id != running)
+            {
+                println!("Reboot pending into {}.", next.id);
+            } else if entries
+                .iter()
+                .any(|entry| entry.id == running && entry.tries_left.is_some())
+            {
+                println!("This system is running as a trial.");
+            } else {
+                println!("No reboot pending.");
+            }
+        }
+        Command::Resume { config } => {
+            let system = System::load(&config)?;
+            let _lock = system.lock()?;
+            if let Some(revision) = system.resume()? {
+                println!("Recovered the live transaction at package revision {revision}.");
+            } else {
+                println!("No pending transaction.");
+            }
+        }
         Command::Source { command } => {
             let count = match command {
                 SourceCommand::Fetch {
@@ -1507,13 +1634,17 @@ fn run(command: Command) -> Result<ExitCode> {
                     );
                     println!(
                         "{}",
-                        if pending.files_ready {
+                        if pending.files_ready && pending.live {
+                            "Live actions pending"
+                        } else if pending.files_ready {
                             "Offline actions pending"
                         } else {
                             "File writes pending"
                         }
                     );
-                    if pending.plan_summary.is_some() {
+                    if pending.live {
+                        println!("Recover with cps resume");
+                    } else if pending.plan_summary.is_some() {
                         println!("Recover with transaction resume");
                     } else {
                         println!("Recover with apply and the original saved plan");

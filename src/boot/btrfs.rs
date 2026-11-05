@@ -41,15 +41,24 @@ const _: () = assert!(size_of::<VolumeArgs>() == 4096);
 
 /// Publish a verified read-only snapshot inside a new capture directory.
 pub fn capture_boot_environment(source: &Path, output: &Path) -> Result<String> {
-    snapshot_environment(source, output, None)
+    snapshot_environment(source, output, None, false)
 }
 
 /// Stage a saved plan in a new writable Btrfs snapshot of an inactive baseline.
 pub fn stage_btrfs_boot_environment(source: &Path, output: &Path, plan: &Plan) -> Result<String> {
-    snapshot_environment(source, output, Some(plan))
+    snapshot_environment(source, output, Some(plan), false)
 }
 
-fn snapshot_environment(source: &Path, output: &Path, plan: Option<&Plan>) -> Result<String> {
+pub(crate) fn stage_running_btrfs(output: &Path, plan: &Plan) -> Result<String> {
+    snapshot_environment(Path::new("/"), output, Some(plan), true)
+}
+
+fn snapshot_environment(
+    source: &Path,
+    output: &Path,
+    plan: Option<&Plan>,
+    from_running: bool,
+) -> Result<String> {
     let source = fs::canonicalize(source).context("opening the root to capture")?;
     let root = Root::open(&source)?;
     ensure!(
@@ -62,11 +71,13 @@ fn snapshot_environment(source: &Path, output: &Path, plan: Option<&Plan>) -> Re
     let origin = image.root.as_file();
     let settings = image.settings()?;
     if let Some(plan) = plan {
-        image.root.offline_path()?;
-        ensure!(
-            read_only(&image.root)?,
-            "Btrfs staging requires a read-only baseline"
-        );
+        if !from_running {
+            image.root.offline_path()?;
+            ensure!(
+                read_only(&image.root)?,
+                "Btrfs staging requires a read-only baseline"
+            );
+        }
         check_staging_plan(&image, plan)?;
     }
     let name = output.file_name().context("expected a new capture name")?;

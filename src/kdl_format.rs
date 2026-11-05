@@ -572,6 +572,15 @@ pub(crate) struct ImageDefinition {
     pub bootstrap_catalog: Option<String>,
     pub image_id: Option<String>,
     pub mirrors: BTreeMap<String, MirrorConfig>,
+    pub boot_btrfs: Option<BtrfsConfig>,
+    pub stage_packages: BTreeSet<String>,
+}
+
+pub(crate) struct BtrfsConfig {
+    pub volume: PathBuf,
+    pub environments: PathBuf,
+    pub esp: PathBuf,
+    pub activation: crate::boot::Activation,
 }
 
 pub(crate) struct MirrorConfig {
@@ -600,6 +609,8 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         bootstrap_catalog: None,
         image_id: None,
         mirrors: BTreeMap::new(),
+        boot_btrfs: None,
+        stage_packages: BTreeSet::new(),
     };
     let mut architecture = false;
     let mut names = BTreeSet::new();
@@ -624,6 +635,52 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 ensure!(
                     config.mirrors.insert(name.clone(), mirror).is_none(),
                     "duplicate mirror for publisher {name}"
+                );
+            }
+            "boot-btrfs" => {
+                ensure!(config.boot_btrfs.is_none(), "duplicate boot-btrfs node");
+                let fields = Fields::read(
+                    node,
+                    0,
+                    &[
+                        "volume",
+                        "environments",
+                        "esp",
+                        "root-partuuid",
+                        "options",
+                        "kernel",
+                        "initrd",
+                        "tries",
+                    ],
+                    false,
+                )?;
+                let tries = fields.integer("tries")?.unwrap_or(2);
+                ensure!(
+                    (1..=99).contains(&tries),
+                    "boot tries must be between 1 and 99"
+                );
+                config.boot_btrfs = Some(BtrfsConfig {
+                    volume: parent.join(fields.required_string("volume")?),
+                    environments: parent.join(fields.required_string("environments")?),
+                    esp: parent.join(fields.required_string("esp")?),
+                    activation: crate::boot::Activation {
+                        root_partuuid: fields.required_string("root-partuuid")?,
+                        kernel: fields
+                            .string("kernel")?
+                            .unwrap_or_else(|| "boot/vmlinuz".into()),
+                        initrd: fields.string("initrd")?,
+                        options: fields.string("options")?.unwrap_or_default(),
+                        tries: tries.try_into()?,
+                        known_good: false,
+                    },
+                });
+            }
+            "stage-package" => {
+                let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                validate_name(&name)?;
+                ensure!(
+                    config.stage_packages.insert(name.clone()),
+                    "duplicate stage-package {name}"
                 );
             }
             "architecture" => {
