@@ -5110,6 +5110,109 @@ fn tuf_cache_remembers_a_newer_publisher_catalog_after_a_failed_download() -> Re
 }
 
 #[test]
+fn tuf_delta_fetch_reconstructs_from_installed_files_and_falls_back() -> Result<()> {
+    let f = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let key = work.join("tuf-key.der");
+    let cache = work.join("cache");
+    let second_image = work.join("fallback-image");
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_root(&anchor, &key, None)?;
+    let old = "old data in a binary file\n".repeat(4096);
+    let new = format!("inserted prefix!{old}");
+    let old_hash = digest(old.as_bytes());
+    let new_hash = digest(new.as_bytes());
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, &old, "0755", "")?,
+    )?;
+    let previous = fs::read_to_string(f.repo.join("current"))?
+        .trim()
+        .to_owned();
+    let mirror = work.join("base-mirror");
+    sign_release(&f, &mirror, 1, fresh, &anchor, &key)?;
+    let sync = |mirror: &Path| -> Result<String> {
+        let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+        let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+        mirror_release::sync_index(
+            &cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    sync(&mirror)?;
+    for root in [&f.root, &second_image] {
+        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        let install = plan(
+            root,
+            Request::Install {
+                packages: vec!["desktop/compositor".into()],
+            },
+        )?;
+        fetch_plan(root, &install)?;
+        apply(root, &install)?;
+    }
+    fs::remove_file(cache.join("blobs").join(&old_hash))?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, &new, "0755", "")?,
+    )?;
+    let export = work.join("delta-export");
+    mirror_release::export_with_deltas(
+        &f.repo,
+        "canopa",
+        &f.public,
+        &export,
+        &[],
+        false,
+        &[previous],
+    )?;
+    let delta_name = format!("delta-v1-{old_hash}-{new_hash}");
+    let mut patch = fs::read(export.join(&delta_name))?;
+    assert!(patch.len() < new.len() / 8);
+    let full_name = format!("{new_hash}.blobs-{new_hash}");
+    let updated = work.join("updated-mirror");
+    sign_export(&export, &updated, 2, fresh, &anchor, &key)?;
+    fs::remove_file(updated.join("targets").join(&full_name))?;
+    sync(&updated)?;
+    let upgrade = plan(&f.root, Request::Update)?;
+    fetch_plan(&f.root, &upgrade)?;
+    apply(&f.root, &upgrade)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, new);
+
+    // The second patch is valid TUF data and produces the right length, but
+    // it reconstructs different bytes. CPS must reject it before publishing.
+    fs::remove_file(cache.join("blobs").join(&new_hash))?;
+    let literal = patch
+        .windows(b"inserted prefix!".len())
+        .position(|bytes| bytes == b"inserted prefix!")
+        .expect("inserted literal");
+    patch[literal] ^= 1;
+    fs::write(export.join(delta_name), patch)?;
+    let fallback = work.join("fallback-mirror");
+    sign_export(&export, &fallback, 3, fresh, &anchor, &key)?;
+    let full = fallback.join("targets").join(full_name);
+    let offline = work.join("full-offline");
+    fs::rename(&full, &offline)?;
+    sync(&fallback)?;
+    let upgrade = plan(&second_image, Request::Update)?;
+    assert!(fetch_plan(&second_image, &upgrade).is_err());
+    assert!(!cache.join("blobs").join(&new_hash).exists());
+    assert_eq!(fs::read_to_string(second_image.join(COMPOSITOR))?, old);
+    fs::rename(&offline, &full)?;
+    fetch_plan(&second_image, &upgrade)?;
+    apply(&second_image, &upgrade)?;
+    assert_eq!(fs::read_to_string(second_image.join(COMPOSITOR))?, new);
+    Ok(())
+}
+
+#[test]
 fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
     let f = Fixture::new()?;
     let extras = Fixture::new()?;

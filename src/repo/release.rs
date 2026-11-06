@@ -129,6 +129,7 @@ fn endpoint(value: &str) -> Result<Url> {
 
 mod archive;
 mod cache;
+mod delta;
 mod profile;
 pub(crate) use archive::ArchiveCache;
 pub use cache::{CacheRetention, PruneReport, prune_payloads};
@@ -819,8 +820,25 @@ fn check_mirror_mode(state: &Path, verified: &Repository) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn fetch_payloads(publisher: &Publisher, blobs: BTreeMap<&str, u64>) -> Result<()> {
-    fetch_repository_payloads(&publisher.repo, &publisher.name, &publisher.key, blobs)
+#[derive(Clone, Copy)]
+pub(crate) struct DeltaBase<'a> {
+    pub path: &'a str,
+    pub hash: &'a str,
+    pub length: u64,
+}
+
+pub(crate) fn fetch_payloads<'a>(
+    publisher: &Publisher,
+    root: &Root,
+    blobs: impl IntoIterator<Item = (&'a str, u64, Option<DeltaBase<'a>>)>,
+) -> Result<()> {
+    fetch_payload_set(
+        &publisher.repo,
+        &publisher.name,
+        &publisher.key,
+        blobs,
+        Some(root),
+    )
 }
 
 pub(crate) fn fetch_repository_payloads(
@@ -829,11 +847,27 @@ pub(crate) fn fetch_repository_payloads(
     key: &[u8],
     blobs: BTreeMap<&str, u64>,
 ) -> Result<()> {
+    fetch_payload_set(
+        repo,
+        publisher,
+        key,
+        blobs.into_iter().map(|(hash, length)| (hash, length, None)),
+        None,
+    )
+}
+
+fn fetch_payload_set<'a>(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    blobs: impl IntoIterator<Item = (&'a str, u64, Option<DeltaBase<'a>>)>,
+    root: Option<&Root>,
+) -> Result<()> {
     let mut missing = Vec::new();
-    for (hash, length) in blobs {
+    for (hash, length, base) in blobs {
         validate_digest(hash)?;
         if !cached_object(repo, &format!("blobs/{hash}"), hash, length)? {
-            missing.push((hash, length));
+            missing.push((hash, length, base));
         }
     }
     if missing.is_empty() {
@@ -855,8 +889,66 @@ pub(crate) fn fetch_repository_payloads(
         .build()?;
     runtime.block_on(async {
         let verified = load_mirror(&state, &directory, scratch.path(), mirror, None).await?;
-        fetch_verified_payloads(&verified, repo, missing).await
+        let mut full = Vec::new();
+        for (hash, length, base) in missing {
+            if let (Some(root), Some(base)) = (root, base)
+                && try_delta(&verified, repo, root, base, hash, length)
+                    .await
+                    .is_ok()
+            {
+                continue;
+            }
+            full.push((hash, length));
+        }
+        fetch_verified_payloads(&verified, repo, full).await
     })
+}
+
+async fn try_delta(
+    verified: &Repository,
+    repo: &Path,
+    image: &Root,
+    base: DeltaBase<'_>,
+    hash: &str,
+    length: u64,
+) -> Result<()> {
+    ensure!(
+        base.length <= delta::FILE_LIMIT && length <= delta::FILE_LIMIT && base.hash != hash,
+        "file is outside the supported delta range"
+    );
+    validate_digest(base.hash)?;
+    let name = delta::target_name(base.hash, hash);
+    let (target_name, target) =
+        checked_target(verified, &name, delta::patch_limit(length), None, None)?;
+    checked_target(
+        verified,
+        &format!("blobs/{hash}"),
+        length,
+        Some(hash),
+        Some(length),
+    )?;
+    let base = Root::open(repo)?
+        .file(&format!("blobs/{}", base.hash))
+        .and_then(|file| delta::verified_bytes(file, base.hash, base.length))
+        .or_else(|_| delta::verified_bytes(image.file(base.path)?, base.hash, base.length))?;
+    let parent = repo.join("blobs");
+    let patch = download_target(verified, &name, &target_name, target, &parent).await?;
+    let mut result = NamedTempFile::new_in(&parent)?;
+    delta::reconstruct(
+        &base,
+        std::io::BufReader::new(patch.reopen()?),
+        &mut result,
+        length,
+    )?;
+    result.as_file_mut().rewind()?;
+    ensure!(
+        digest_reader(result.as_file_mut())? == hash,
+        "reconstructed payload digest mismatch"
+    );
+    result.as_file().sync_all()?;
+    result.persist(parent.join(hash))?;
+    File::open(&parent)?.sync_all()?;
+    Ok(())
 }
 
 async fn fetch_verified_payloads<'a>(
@@ -1284,8 +1376,11 @@ async fn download_target(
         .await
         .with_context(|| format!("reading target {name}"))?
     {
+        written = written
+            .checked_add(bytes.len() as u64)
+            .filter(|length| *length <= target.length)
+            .with_context(|| format!("download exceeds signed length for {name}"))?;
         file.write_all(&bytes)?;
-        written += bytes.len() as u64;
     }
     ensure!(written == target.length, "short download for {name}");
     file.as_file().sync_all()?;
@@ -1312,6 +1407,7 @@ pub fn export_with_retained(
         output,
         ExportSelection::Current(retained),
         false,
+        &[],
     )
 }
 
@@ -1330,6 +1426,28 @@ pub fn export_with_sources(
         output,
         ExportSelection::Current(retained),
         true,
+        &[],
+    )
+}
+
+/// Include optional payload patches based on earlier signed catalogs.
+pub fn export_with_deltas(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    output: &Path,
+    retained: &[String],
+    include_sources: bool,
+    delta_from: &[String],
+) -> Result<String> {
+    export_targets(
+        repo,
+        publisher,
+        trust_key,
+        output,
+        ExportSelection::Current(retained),
+        include_sources,
+        delta_from,
     )
 }
 
@@ -1349,6 +1467,7 @@ pub fn export_archive(
         output,
         ExportSelection::Archive(pin),
         include_sources,
+        &[],
     )
 }
 
@@ -1364,6 +1483,7 @@ fn export_targets(
     output: &Path,
     selection: ExportSelection<'_>,
     include_sources: bool,
+    delta_from: &[String],
 ) -> Result<String> {
     let key = read_key(trust_key)?;
     let current = read_current(repo)?;
@@ -1403,6 +1523,20 @@ fn export_targets(
     let include_sources = include_sources || catalog.source_archives_required;
     let release = catalog_snapshot(repo, catalog, hash.clone(), &key)?;
     export_catalog(&root, stage.path(), &release)?;
+    if !delta_from.is_empty() {
+        let pins = retained_catalogs(delta_from.iter().map(String::as_str), &hash)
+            .context("checking delta base catalog pins")?;
+        let current = read_catalog(repo, &hash, publisher, &key)?;
+        let mut seen = BTreeSet::new();
+        for pin in pins {
+            let previous = read_catalog(repo, pin, publisher, &key)?;
+            previous
+                .check_successor(&current, pin)
+                .with_context(|| format!("checking delta base catalog {pin}"))?;
+            let previous = catalog_snapshot(repo, previous, pin.to_owned(), &key)?;
+            delta::export(&root, stage.path(), &previous, &release, &mut seen)?;
+        }
+    }
     if include_sources {
         for inputs in release
             .build_inputs

@@ -529,8 +529,11 @@ enum RepoCommand {
         /// Include a historical catalog and its objects in this mirror release
         #[arg(long = "retain-catalog")]
         retained: Vec<String>,
+        /// Export byte-level payload patches against an earlier catalog
+        #[arg(long = "delta-from", value_name = "SHA256")]
+        delta_from: Vec<String>,
         /// Export an exact catalog to a separate archive mirror
-        #[arg(long, value_name = "SHA256", conflicts_with = "retained")]
+        #[arg(long, value_name = "SHA256", conflicts_with_all = ["retained", "delta_from"])]
         archive_catalog: Option<String>,
         /// Include archived build sources as TUF targets
         #[arg(long)]
@@ -1365,6 +1368,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 trust_key,
                 output,
                 retained,
+                delta_from,
                 include_sources,
                 archive_catalog,
             } => {
@@ -1376,6 +1380,16 @@ fn run(command: Command) -> Result<ExitCode> {
                         &output,
                         &catalog,
                         include_sources,
+                    )?
+                } else if !delta_from.is_empty() {
+                    release::export_with_deltas(
+                        &repo,
+                        &publisher,
+                        &trust_key,
+                        &output,
+                        &retained,
+                        include_sources,
+                        &delta_from,
                     )?
                 } else if include_sources {
                     release::export_with_sources(&repo, &publisher, &trust_key, &output, &retained)?

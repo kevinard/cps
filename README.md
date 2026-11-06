@@ -929,6 +929,25 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 
 Full sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and downloads the complete release. A failed download leaves the previous cache available. Sync can repair a damaged cache object when the mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can work offline once the required metadata and payloads are cached.
 
+For smaller upgrade downloads, include byte-level patches when exporting a
+mirror release. Pass `--delta-from` with a previously signed catalog digest
+that your users are likely to have installed. Repeat the option for other
+baselines.
+
+```sh
+cps repo export --repo repo --publisher canopa --trust-key public.der \
+    --delta-from "$previous_catalog" --output release-targets
+```
+
+The export compares new versions against the newest earlier version of the
+same package and architecture in each supplied catalog. It includes patches
+that save space and keeps the full payloads. Sign the entire export with TUF.
+During `cps upgrade` or `cps fetch`, CPS can use the old installed or cached
+file as a base. It checks the patch's TUF metadata and verifies the complete
+result against the signed package manifest. If a patch is unavailable,
+doesn't apply, or fails verification, CPS fetches the full file. Patch
+generation and application support files up to 64 MiB.
+
 When preparing a cache for an existing image, add `--image /path/to/image`
 to `repo sync`. CPS verifies the candidate against the installed publisher
 key, checkpoint, and signed catalog archive before advancing the cache's CPS

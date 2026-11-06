@@ -20,7 +20,7 @@ use crate::{
     plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads},
     repo::{
         BuildReceipt, Published,
-        release::{ArchiveCache, fetch_payloads},
+        release::{ArchiveCache, DeltaBase, fetch_payloads},
         stage_blob,
     },
     systemd::{self, Action as SystemdAction},
@@ -187,6 +187,7 @@ pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
 struct OwnedPayload<'a> {
     node: &'a Node,
     package: &'a Published,
+    base: Option<DeltaBase<'a>>,
 }
 
 type PublisherPayloads<'a> = (&'a Publisher, BTreeMap<&'a str, OwnedPayload<'a>>);
@@ -268,16 +269,13 @@ pub fn fetch_plan_with_archives(
             }
             archive.restore(publisher, matches)?;
         }
-        let blobs = blobs
-            .into_iter()
-            .map(|(hash, payload)| {
-                let Node::File { size, .. } = payload.node else {
-                    unreachable!("payloads contain only files");
-                };
-                (hash, *size)
-            })
-            .collect();
-        fetch_payloads(publisher, blobs)
+        let blobs = blobs.into_iter().map(|(hash, payload)| {
+            let Node::File { size, .. } = payload.node else {
+                unreachable!("payloads contain only files");
+            };
+            (hash, *size, payload.base)
+        });
+        fetch_payloads(publisher, &image.root, blobs)
             .with_context(|| format!("preparing payloads from {}", publisher.name))?;
     }
     Ok(count)
@@ -730,6 +728,16 @@ fn payload_sources<'a>(
             OwnedPayload {
                 node,
                 package: &owner.published,
+                base: match &write.before {
+                    Some(Node::File { sha256, size, .. }) if path == write.path => {
+                        Some(DeltaBase {
+                            path,
+                            hash: sha256,
+                            length: *size,
+                        })
+                    }
+                    _ => None,
+                },
             },
         );
     }
