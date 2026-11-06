@@ -16,9 +16,9 @@ use cps::{
     Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, MarkChoice, Plan, Request,
     RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
     activate_btrfs_boot_environment, activate_deployed_boot_environment,
-    activate_device_boot_environment, add_publisher_with_build_trust, apply, archive_build_sources,
-    audit_publisher_builds, build_with_toolchain_config, build_with_worker,
-    capture_boot_environment, create_configured_image, create_image,
+    activate_device_boot_environment, add_publisher_from_url, add_publisher_with_build_trust,
+    apply, archive_build_sources, audit_publisher_builds, build_with_toolchain_config,
+    build_with_worker, capture_boot_environment, create_configured_image, create_image,
     deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
     export_boot_environment, export_boot_environment_receipt, export_rebuild_inputs,
     fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
@@ -308,10 +308,20 @@ enum PublisherCommand {
     },
     /// Verify and append a publisher to the image's search order
     Add {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
-        #[arg(long)]
-        repo: PathBuf,
+        /// Existing local repository
+        #[arg(long, required_unless_present = "url", conflicts_with = "url")]
+        repo: Option<PathBuf>,
+        /// Base URL of a TUF mirror containing metadata/ and targets/
+        #[arg(long, requires = "tuf_root")]
+        url: Option<String>,
+        /// Trusted TUF root metadata obtained from the publisher
+        #[arg(long, requires = "url")]
+        tuf_root: Option<PathBuf>,
+        /// Cache directory for a URL mirror
+        #[arg(long, requires = "url")]
+        cache: Option<PathBuf>,
         #[arg(long)]
         trust_key: PathBuf,
         /// Require builder signatures from this KDL policy
@@ -1493,17 +1503,44 @@ fn run(command: Command) -> Result<ExitCode> {
             PublisherCommand::Add {
                 root,
                 repo,
+                url,
+                tuf_root,
+                cache,
                 trust_key,
                 build_trust,
                 name,
             } => {
-                add_publisher_with_build_trust(
-                    &root,
-                    &name,
-                    &repo,
-                    &trust_key,
-                    build_trust.as_deref(),
-                )?;
+                if let Some(url) = url {
+                    let (cache, _lock) = if let Some(cache) = cache {
+                        (cache, None)
+                    } else {
+                        ensure!(
+                            fs::canonicalize(&root)? == Path::new("/"),
+                            "use --cache with an offline image"
+                        );
+                        let system = System::load(Path::new(system::CONFIG))?;
+                        let lock = system.lock()?;
+                        (system.publisher_cache(&name)?, Some(lock))
+                    };
+                    let cache = add_publisher_from_url(
+                        &root,
+                        &name,
+                        &url,
+                        &tuf_root.context("missing trusted TUF root")?,
+                        &trust_key,
+                        &cache,
+                        build_trust.as_deref(),
+                    )?;
+                    println!("Added {name} from {url} (cache {})", cache.display());
+                } else {
+                    add_publisher_with_build_trust(
+                        &root,
+                        &name,
+                        &repo.context("missing local repository")?,
+                        &trust_key,
+                        build_trust.as_deref(),
+                    )?;
+                }
             }
             PublisherCommand::SetRepository { root, repo } => {
                 set_publisher_repositories(&root, &repo)?;

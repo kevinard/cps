@@ -19,9 +19,11 @@ use crate::{
     fetch_plan,
     image::Image,
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
-    list_boot_environments, plan,
+    list_boot_environments,
+    model::validate_publisher,
+    plan,
     query::{InstallSource, SelectSource, select_install_sources},
-    release::{SyncOptions, sync_profile_for_image, sync_with_options},
+    release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
 };
 
 pub const CONFIG: &str = "/etc/cps/image.kdl";
@@ -89,6 +91,17 @@ impl System {
         );
         flock(&lock, FlockOperation::LockExclusive)?;
         Ok(lock)
+    }
+
+    pub fn publisher_cache(&self, publisher: &str) -> Result<PathBuf> {
+        validate_publisher(publisher)?;
+        self.check_running()?;
+        // This sibling subvolume is shared by the running root and its trials.
+        Ok(self
+            .boot()
+            .environments
+            .join("repositories")
+            .join(publisher))
     }
 
     pub fn plan(&self, request: Request, refresh: bool) -> Result<Change> {
@@ -211,6 +224,14 @@ impl System {
     }
 
     fn refresh(&self, upgrade: bool) -> Result<()> {
+        self.refresh_configured_mirrors(upgrade)?;
+        if upgrade {
+            refresh_url_publishers(Path::new(ROOT))?;
+        }
+        Ok(())
+    }
+
+    fn refresh_configured_mirrors(&self, upgrade: bool) -> Result<()> {
         let definition = &self.definition;
         if definition.mirrors.is_empty() {
             return Ok(());

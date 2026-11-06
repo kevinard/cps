@@ -40,6 +40,7 @@ const ENDPOINTS_LIMIT: u64 = 8192;
 const PAYLOAD_DOWNLOADS: usize = 8;
 const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
 const PROFILE_BINDING: &str = "profile";
+const REFRESH_ROOT: &str = "refresh-root.json";
 const ARCHIVE: &str = "archive";
 const RETAINED: &str = "retained";
 const MAX_RETAINED: usize = 32;
@@ -147,6 +148,18 @@ impl Mirror {
             metadata: endpoint(metadata)?,
             targets: endpoint(targets)?,
         })
+    }
+
+    fn from_base(base: &str) -> Result<Self> {
+        let base = if base.ends_with('/') {
+            endpoint(base)?
+        } else {
+            endpoint(&format!("{base}/"))?
+        };
+        Self::new(
+            base.join("metadata/")?.as_str(),
+            base.join("targets/")?.as_str(),
+        )
     }
 
     fn read(state: &Root) -> Result<Self> {
@@ -326,19 +339,87 @@ pub fn sync_with_required_catalogs(
         guard.check_source(&source)?;
     }
     let _lock = lock_repo(repo)?;
+    sync_current_locked(repo, &source, !options.index_only, &pins, guard.as_ref())
+}
+
+fn sync_current_locked(
+    repo: &Path,
+    source: &SyncSource<'_>,
+    full: bool,
+    required: &[&CatalogPin],
+    guard: Option<&ImageGuard>,
+) -> Result<String> {
     let (release, _) = stage_release(
         repo,
-        &source,
-        !options.index_only,
+        source,
+        full,
         SyncSelection::Current {
             binding: None,
-            required: &pins,
-            guard: guard.as_ref(),
+            required,
+            guard,
             defer_checkpoint: false,
         },
     )?;
     source.promote(repo, &release, None)?;
     Ok(release.current)
+}
+
+/// Prepare an independent mirror cache and record its original root for refreshes.
+pub(crate) fn sync_url_publisher(
+    repo: &Path,
+    base: &str,
+    trusted_root: &Path,
+    publisher: &str,
+    trust_key: &Path,
+) -> Result<()> {
+    let source = SyncSource::new(trusted_root, Mirror::from_base(base)?, publisher, trust_key)?;
+    let _lock = lock_repo(repo)?;
+    if path_present(&repo.join("current"))? {
+        let directory =
+            open_state(repo).context("use a new directory or a synchronized TUF cache")?;
+        ensure!(
+            Mirror::read(&directory)?.document() == source.mirror.document(),
+            "the cache is configured for a different mirror URL"
+        );
+    }
+    let refresh_root = repo.join(".tuf").join(REFRESH_ROOT);
+    if path_present(&refresh_root)? {
+        let directory = open_state(repo)?;
+        ensure!(
+            read_limited(directory.file(REFRESH_ROOT)?, ROOT_LIMIT)? == source.anchor,
+            "the cache is configured for a different TUF root"
+        );
+    }
+    sync_current_locked(repo, &source, false, &[], None)?;
+    write_atomic(&refresh_root, &source.anchor, true)
+}
+
+pub(crate) fn refresh_url_publishers(root: &Path) -> Result<()> {
+    let guard = ImageGuard::open(root)?;
+    let publishers = &guard.state.publishers;
+    // Profile sync alone controls the primary and companion catalogs.
+    for publisher in &publishers.as_slice()[publishers.signed_publishers().len()..] {
+        let repo = &publisher.repo;
+        if !path_present(&repo.join(".tuf").join(REFRESH_ROOT))? {
+            continue;
+        }
+        let refresh = || -> Result<()> {
+            let _lock = lock_repo(repo)?;
+            let directory = open_state(repo)?;
+            let source = SyncSource {
+                publisher: &publisher.name,
+                key: publisher.key.clone(),
+                anchor: read_limited(directory.file(REFRESH_ROOT)?, ROOT_LIMIT)?,
+                mirror: Mirror::read(&directory)?,
+            };
+            sync_current_locked(repo, &source, false, &[], Some(&guard))?;
+            Ok(())
+        };
+        eprintln!("Refreshing publisher {}…", publisher.name);
+        refresh()
+            .with_context(|| format!("refreshing third-party publisher {}", publisher.name))?;
+    }
+    Ok(())
 }
 
 pub struct ArchiveSyncOptions<'a> {

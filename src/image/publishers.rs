@@ -1,11 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::{self, File},
+    io::ErrorKind,
     iter,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
+use rustix::fs::{RenameFlags, renameat_with, syncfs};
 
 use super::{Image, Publisher, Publishers, Settings, State, builds, catalogs};
 use crate::{
@@ -16,7 +19,7 @@ use crate::{
     repo::{
         BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
         audit_installed_builds, canonical_repo, catalog_index, read_selected_catalog,
-        release_profile,
+        release::sync_url_publisher, release_profile,
     },
 };
 
@@ -137,6 +140,74 @@ pub fn add_publisher(root: &Path, name: &str, repo: &Path, key: &Path) -> Result
     add_publisher_with_build_trust(root, name, repo, key, None)
 }
 
+/// Verify a URL mirror before admitting its publisher to the image.
+pub fn add_publisher_from_url(
+    root: &Path,
+    name: &str,
+    url: &str,
+    trusted_root: &Path,
+    key: &Path,
+    cache: &Path,
+    policy: Option<&Path>,
+) -> Result<PathBuf> {
+    validate_publisher(name)?;
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let configured = image.publishers()?;
+    check_new_publisher(&image, &configured, name)?;
+
+    let leaf = cache
+        .file_name()
+        .context("expected a mirror cache directory")?;
+    let parent = cache
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let parent = fs::canonicalize(parent)?;
+    let cache = parent.join(leaf);
+    for publisher in configured.as_slice() {
+        ensure!(
+            !cache.starts_with(&publisher.repo) && !publisher.repo.starts_with(&cache),
+            "mirror cache overlaps the configured repository for {}",
+            publisher.name
+        );
+    }
+    drop(image);
+
+    match cache.symlink_metadata() {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir() && cache.join("current").is_file(),
+                "use a new directory or an already synchronized mirror cache"
+            );
+            sync_url_publisher(&cache, url, trusted_root, name, key)?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let scratch = tempfile::Builder::new()
+                .prefix(".cps-mirror-")
+                .tempdir_in(&parent)?;
+            sync_url_publisher(scratch.path(), url, trusted_root, name, key)?;
+            let directory = File::open(&parent)?;
+            renameat_with(
+                &directory,
+                scratch
+                    .path()
+                    .file_name()
+                    .context("missing temporary cache name")?,
+                &directory,
+                leaf,
+                RenameFlags::NOREPLACE,
+            )
+            .context("publishing the verified mirror cache")?;
+            syncfs(&directory)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    add_publisher_with_build_trust(root, name, &cache, key, policy)?;
+    Ok(cache)
+}
+
 pub fn add_publisher_with_build_trust(
     root: &Path,
     name: &str,
@@ -145,18 +216,7 @@ pub fn add_publisher_with_build_trust(
     policy: Option<&Path>,
 ) -> Result<()> {
     edit_publisher_order(root, |image, configured, registered| {
-        ensure!(
-            configured.get(name).is_none(),
-            "publisher {name} is already configured"
-        );
-        if configured.release_profile().is_some() {
-            let state = image.state()?;
-            ensure!(
-                !state.settings.profile_packages.is_empty(),
-                "install the signed profile composition before adding a local publisher"
-            );
-            image.verify_catalog_archives(&state)?;
-        }
+        check_new_publisher(image, &configured, name)?;
         let mut publisher = Publisher::from_config(name, repo, key)?;
         if let Some(path) = policy {
             let trust = read_build_trust(path)?.load(&publisher.key)?;
@@ -183,6 +243,22 @@ pub fn add_publisher_with_build_trust(
             registered,
         )
     })
+}
+
+fn check_new_publisher(image: &Image, configured: &Publishers, name: &str) -> Result<()> {
+    ensure!(
+        configured.get(name).is_none(),
+        "publisher {name} is already configured"
+    );
+    if configured.release_profile().is_some() {
+        let state = image.state()?;
+        ensure!(
+            !state.settings.profile_packages.is_empty(),
+            "install the signed profile composition before adding a local publisher"
+        );
+        image.verify_catalog_archives(&state)?;
+    }
+    Ok(())
 }
 
 /// Move one or more configured publishers to authenticated replacement caches.
