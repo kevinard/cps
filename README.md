@@ -1220,13 +1220,31 @@ Older profiles can still be used with ordinary `plan install`. Use
 `repo publish-release` with `refresh-profiles=#true` to record the
 composition before using `install-profile`.
 
-After installing the signed composition, you can append a locally trusted
-publisher with a signed repository or an already synchronized mirror cache.
+After installing the signed composition, you can add a locally trusted
+publisher directly from a TUF mirror URL. Obtain its TUF root metadata and
+CPS publisher key through a trusted channel before adding it.
 
 ```sh
-sudo cps publisher add --root / --repo /var/lib/cps/extras \
-    --trust-key /etc/cps/keys/extras.der extras
+sudo cps publisher add extras --url https://packages.example.org/extras/ \
+    --tuf-root /etc/cps/keys/extras-root.json \
+    --trust-key /etc/cps/keys/extras.der
 sudo cps install cps://extras/apps/editor
+sudo cps upgrade
+```
+
+The URL must serve `metadata/` and `targets/` beneath it. CPS verifies
+and registers the mirror in one command, and `upgrade` refreshes it
+automatically using the saved trust root. The default cache lives in
+`repositories/NAME` under the configured Btrfs environments directory so
+it is available across boots. Use `--cache PATH` for a different location
+or when adding to an offline image. Use `--no-refresh` on `upgrade` to
+use already cached catalogs.
+
+For a local repository or a manually managed mirror cache, use `--repo`.
+
+```sh
+sudo cps publisher add extras --repo /var/lib/cps/extras \
+    --trust-key /etc/cps/keys/extras.der
 ```
 
 The image stores local publishers after the signed ones. `publisher prefer`
@@ -1238,11 +1256,11 @@ Btrfs system, publisher membership edits use the boot configuration in
 `/etc/cps/image.kdl` and apply to the running known-good environment.
 
 Keep the signed publishers and their mirror definitions in the profile's
-image configuration. Sync third-party mirror caches separately with
-`repo sync`, using `--image /` for subsequent syncs after adding the
-publisher. A profile update uses the signed companion pins and each local
-publisher's current verified catalog. Use a CPS version that supports local
-publishers to manage images with this configuration.
+image configuration. CPS refreshes URL-added publishers independently of
+the signed profile sync. A profile update uses the signed companion pins
+and each local publisher's current verified catalog. For manually managed
+mirrors, run `repo sync --image /` with the mirror options to check the
+new catalog against the installed system.
 
 To install a particular published release, set `bootstrap-catalog` to the
 primary publisher's signed catalog digest.

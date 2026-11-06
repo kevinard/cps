@@ -910,7 +910,7 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
 }
 
 #[test]
-fn local_publishers_offer_choices_without_replacing_the_signed_profile() -> Result<()> {
+fn url_publishers_refresh_and_offer_choices_without_replacing_the_signed_profile() -> Result<()> {
     let main = Fixture::new()?;
     let companion = Fixture::new()?;
     let extras = Fixture::new()?;
@@ -949,26 +949,20 @@ fn local_publishers_offer_choices_without_replacing_the_signed_profile() -> Resu
     let cache = work.join("cache");
     let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
     sign_root(&anchor, &tuf_key, None)?;
-    let sync_extras = |version, image: Option<&Path>| -> Result<String> {
+    let served = work.join("mirror");
+    let serve_extras = |version| -> Result<()> {
         let mirror = work.join(format!("mirror-{version}"));
         sign_publisher_release(
             &extras, &mirror, version, fresh, &anchor, &tuf_key, "extras",
         )?;
-        let endpoint = |role| Url::from_directory_path(mirror.join(role)).unwrap();
-        mirror_release::sync_with_options(
-            &cache,
-            &anchor,
-            endpoint("metadata").as_str(),
-            endpoint("targets").as_str(),
-            "extras",
-            &extras.public,
-            mirror_release::SyncOptions {
-                index_only: true,
-                image,
-            },
-        )
+        let next = work.join("next-mirror");
+        std::os::unix::fs::symlink(&mirror, &next)?;
+        fs::rename(next, &served)?;
+        Ok(())
     };
-    sync_extras(1, None)?;
+    serve_extras(1)?;
+    let url = Url::from_directory_path(&served).unwrap();
+    let url = url.as_str().trim_end_matches('/');
 
     let refresh = |version: &str| -> Result<()> {
         fs::write(
@@ -1015,12 +1009,24 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         ),
     )?;
     create_configured_image(&main.root, &config)?;
-    let add = || crate::add_publisher(&main.root, "extras", &cache, &extras.public);
-    assert!(add().is_err());
+    let add = |key: &Path, cache: &Path| {
+        crate::add_publisher_from_url(&main.root, "extras", url, &anchor, key, cache, None)
+    };
+    assert!(add(&extras.public, &cache).is_err());
+    assert!(!cache.exists());
     apply(&main.root, &plan(&main.root, Request::InstallProfile)?)?;
     let install = |packages| plan(&main.root, Request::Install { packages });
     let previous = install(vec![editor.into()])?;
-    add()?;
+    assert!(
+        add(&extras.public, &companion.repo)
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps")
+    );
+    assert!(add(&main.public, &cache).is_err());
+    assert!(!cache.exists());
+    assert_eq!(crate::list_publishers(&main.root)?.len(), 2);
+    assert_eq!(add(&extras.public, &cache)?, cache);
     assert!(
         apply(&main.root, &previous)
             .unwrap_err()
@@ -1061,7 +1067,25 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         "3.0.0-0",
         format!("    require {library:?}\n"),
     )?;
-    sync_extras(2, Some(&main.root))?;
+    serve_extras(2)?;
+    let saved_root = cache.join(".tuf/refresh-root.json");
+    let original = fs::read(&saved_root)?;
+    let old_extra = fs::read(cache.join("current"))?;
+    fs::write(&saved_root, b"changed anchor")?;
+    let error = mirror_release::refresh_url_publishers(&main.root).unwrap_err();
+    assert!(format!("{error:#}").contains("different trust root or publisher"));
+    assert_eq!(fs::read(cache.join("current"))?, old_extra);
+    fs::write(&saved_root, original)?;
+
+    // Even a marked cache cannot make a signed companion refresh independently.
+    fs::create_dir(companion.repo.join(".tuf"))?;
+    fs::write(companion.repo.join(".tuf/refresh-root.json"), b"invalid")?;
+    let primary_before = fs::read(main.repo.join("current"))?;
+    let companion_before = fs::read(companion.repo.join("current"))?;
+    mirror_release::refresh_url_publishers(&main.root)?;
+    assert_ne!(fs::read(cache.join("current"))?, old_extra);
+    assert_eq!(fs::read(main.repo.join("current"))?, primary_before);
+    assert_eq!(fs::read(companion.repo.join("current"))?, companion_before);
     refresh("2.0.0-0")?;
     let upgrade = plan(&main.root, Request::Update)?;
     assert_eq!(upgrade.catalogs["seed"], pin.trim());
