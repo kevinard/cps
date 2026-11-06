@@ -173,6 +173,14 @@ pub struct CacheRetention<'a> {
 pub struct PruneReport {
     pub blobs: Vec<(String, u64)>,
     pub bytes: u64,
+    pub registered_roots: Vec<RetainedRoot>,
+}
+
+#[derive(Debug)]
+pub struct RetainedRoot {
+    pub id: String,
+    pub package_payloads: usize,
+    pub catalog: Option<String>,
 }
 
 pub(super) fn record_retention(state: &Path, release: &StagedRelease) -> Result<()> {
@@ -200,6 +208,17 @@ pub fn prune_payloads(
     publisher: &str,
     trust_key: &Path,
     keep: CacheRetention<'_>,
+    apply: bool,
+) -> Result<PruneReport> {
+    prune_with_registered_roots(repo, publisher, trust_key, keep, &[], apply)
+}
+
+pub(crate) fn prune_with_registered_roots(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    keep: CacheRetention<'_>,
+    registered: &[(String, Image)],
     apply: bool,
 ) -> Result<PruneReport> {
     validate_publisher(publisher)?;
@@ -241,33 +260,58 @@ pub fn prune_payloads(
         catalogs.insert(hash.clone());
     }
     let mut live = BTreeSet::new();
-    for (image, path) in images.iter().zip(keep.images) {
-        image
-            .require_clean()
-            .with_context(|| format!("checking kept image {}", path.display()))?;
+    let mut registered_roots = Vec::new();
+    let explicit = images
+        .iter()
+        .zip(keep.images)
+        .map(|(image, path)| (image, path.display().to_string(), false));
+    let automatic = registered
+        .iter()
+        .map(|(id, image)| (image, id.clone(), true));
+    for (image, label, automatic) in explicit.chain(automatic) {
         let state = image.state()?;
         let configured = state.publishers.get(publisher);
+        if automatic && configured.is_none_or(|configured| configured.repo != repo) {
+            continue;
+        }
         ensure!(
             configured.is_some_and(|configured| configured.repo == repo && configured.key == key),
-            "kept image {} does not use this cache for {publisher}",
-            path.display()
+            "kept image {label} does not use this cache and key for {publisher}"
         );
+        image
+            .require_clean()
+            .with_context(|| format!("checking kept image {label}"))?;
+        image.verify_catalog_archives(&state)?;
         let pins = image.release_pins(&state.publishers, &state.settings)?;
-        if let Some(pin) = pins.get(publisher) {
+        let pin = pins.get(publisher);
+        if let Some(pin) = pin {
             pin.read(&repo, publisher, &key)?;
             catalogs.insert(pin.sha256.clone());
         }
+        let mut payloads = BTreeSet::new();
         for (name, installed) in &state.installed {
             installed.verify(name, &state.publishers)?;
             if installed.published.manifest.publisher == publisher {
-                live.extend(
+                payloads.extend(
                     release_blobs([&installed.published])?
                         .into_keys()
                         .map(str::to_owned),
                 );
             }
         }
+        if automatic {
+            registered_roots.push(RetainedRoot {
+                id: label,
+                package_payloads: payloads.len(),
+                catalog: pin.map(|pin| pin.sha256.clone()),
+            });
+        }
+        live.extend(payloads);
     }
+    ensure!(
+        registered.is_empty() || !registered_roots.is_empty(),
+        "no registered boot root uses this cache for {publisher}"
+    );
     for plan in keep.plans {
         plan.id()?;
         for hash in payloads(&plan.writes).into_keys() {
@@ -287,6 +331,7 @@ pub fn prune_payloads(
     let mut report = PruneReport {
         blobs: Vec::new(),
         bytes: 0,
+        registered_roots,
     };
     for entry in fs::read_dir(Root::fd_path(&directory))? {
         let entry = entry?;

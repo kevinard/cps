@@ -1252,6 +1252,12 @@ unavailable or unknown, it conservatively keeps both registered selections.
 Run a coordinated sync with CPS `0.1.0-24` or later to register an existing
 profile, and use that version or later to prune its caches.
 
+On an installed Btrfs system, add `--system-config /etc/cps/image.kdl` to
+discover registered roots that use the selected cache. The preview reports
+each retained boot entry, its package payload count, and any profile
+catalog it keeps. The boot entries and image states stay locked while CPS
+computes and applies the retention set.
+
 Repeat `--keep-image` for each root that needs offline repair, including
 fallback roots. An image following a signed
 profile also keeps the profile's current pin for that cache. Repeat

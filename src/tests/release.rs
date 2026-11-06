@@ -3328,6 +3328,24 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     assert_eq!(report.bytes, 14);
     assert!(report.blobs.iter().any(|(hash, _)| hash == &old_blob));
     assert!(blob_dir.join(&old_blob).exists() && blob_dir.join(&orphan).exists());
+    let report = mirror_release::prune_with_registered_roots(
+        &cache,
+        "canopa",
+        &f.public,
+        mirror_release::CacheRetention {
+            catalogs: &[],
+            images: &[],
+            plans: &[],
+        },
+        &[(
+            "fallback".into(),
+            crate::image::Image::open_query(&installed)?,
+        )],
+        false,
+    )?;
+    assert_eq!(report.blobs, [(orphan.clone(), 6)]);
+    assert_eq!(report.registered_roots[0].id, "fallback");
+    assert_eq!(report.registered_roots[0].package_payloads, 1);
     for report in [
         prune(std::slice::from_ref(&old_catalog), &[], &[], false)?,
         prune(&[], std::slice::from_ref(&installed), &[], false)?,

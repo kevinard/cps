@@ -120,6 +120,39 @@ pub(super) fn rollback(
     Ok(target.id.clone())
 }
 
+pub(super) fn with_registered_images<T>(
+    esp: &Path,
+    volume: &BtrfsVolume,
+    partuuid: &str,
+    action: impl FnOnce(&[(String, Image)]) -> Result<T>,
+) -> Result<T> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let lock = lock_esp(&esp, FlockOperation::LockShared)?;
+    let partuuid = canonical_partuuid(partuuid)?;
+    volume.check_disk(&esp, &lock, &partuuid)?;
+    let (_, entries) = inventory(&esp)?;
+    let mut images = Vec::new();
+    for entry in entries
+        .into_iter()
+        .filter(|entry| entry.partuuid == partuuid)
+    {
+        let record = entry
+            .btrfs
+            .as_ref()
+            .context("expected a Btrfs entry for this partition")?;
+        let (image, revision) = policy::entry_identity(&entry.id)?;
+        let image = volume
+            .open_image(record, image, revision)
+            .with_context(|| format!("opening registered root {}", entry.id))?;
+        images.push((entry.id, image));
+    }
+    ensure!(
+        !images.is_empty(),
+        "no registered roots on the configured Btrfs volume"
+    );
+    action(&images)
+}
+
 pub(super) fn preview_btrfs_rollback(
     esp: &Path,
     volume: &BtrfsVolume,

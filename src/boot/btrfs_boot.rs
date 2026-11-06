@@ -361,6 +361,15 @@ pub fn preview_btrfs_rollback(
     systemd_boot::preview_btrfs_rollback(esp, &BtrfsVolume::open(volume)?, id, paths)
 }
 
+pub(crate) fn with_registered_images<T>(
+    volume: &Path,
+    esp: &Path,
+    partuuid: &str,
+    action: impl FnOnce(&[(String, Image)]) -> Result<T>,
+) -> Result<T> {
+    systemd_boot::with_registered_images(esp, &BtrfsVolume::open(volume)?, partuuid, action)
+}
+
 pub(crate) fn with_running_environment<T>(
     volume: &Path,
     esp: &Path,

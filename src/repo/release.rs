@@ -132,7 +132,8 @@ mod cache;
 mod delta;
 mod profile;
 pub(crate) use archive::ArchiveCache;
-pub use cache::{CacheRetention, PruneReport, prune_payloads};
+pub(crate) use cache::prune_with_registered_roots;
+pub use cache::{CacheRetention, PruneReport, RetainedRoot, prune_payloads};
 pub use profile::{
     ProfilePayloads, sync_profile, sync_profile_for_image, sync_profile_with_payloads,
 };

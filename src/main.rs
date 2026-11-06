@@ -789,6 +789,9 @@ enum RepoCommand {
         /// Keep payloads used by this saved plan
         #[arg(long = "keep-plan")]
         plans: Vec<PathBuf>,
+        /// Retain the roots registered in this installed system's boot configuration
+        #[arg(long)]
+        system_config: Option<PathBuf>,
         /// Remove the listed files
         #[arg(long)]
         apply: bool,
@@ -1829,23 +1832,34 @@ fn run(command: Command) -> Result<ExitCode> {
                 catalogs,
                 images,
                 plans,
+                system_config,
                 apply,
             } => {
                 let plans = plans
                     .iter()
                     .map(|path| load_plan(path))
                     .collect::<Result<Vec<_>>>()?;
-                let report = release::prune_payloads(
-                    &repo,
-                    &publisher,
-                    &trust_key,
-                    release::CacheRetention {
-                        catalogs: &catalogs,
-                        images: &images,
-                        plans: &plans,
-                    },
-                    apply,
-                )?;
+                let keep = release::CacheRetention {
+                    catalogs: &catalogs,
+                    images: &images,
+                    plans: &plans,
+                };
+                let report = if let Some(config) = system_config {
+                    System::load(&config)?
+                        .prune_cache(&repo, &publisher, &trust_key, keep, apply)?
+                } else {
+                    release::prune_payloads(&repo, &publisher, &trust_key, keep, apply)?
+                };
+                for root in &report.registered_roots {
+                    print!(
+                        "Keep {} package payload(s) for {}",
+                        root.package_payloads, root.id
+                    );
+                    if let Some(catalog) = &root.catalog {
+                        print!(" and catalog {catalog}");
+                    }
+                    println!();
+                }
                 for (hash, length) in &report.blobs {
                     println!("{hash}\t{length}");
                 }

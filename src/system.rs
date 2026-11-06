@@ -190,6 +190,29 @@ impl System {
         Ok(lock)
     }
 
+    /// Prune a system cache while retaining payloads for its registered boot roots.
+    pub fn prune_cache(
+        &self,
+        repo: &Path,
+        publisher: &str,
+        key: &Path,
+        keep: crate::release::CacheRetention<'_>,
+        apply: bool,
+    ) -> Result<crate::release::PruneReport> {
+        let _lock = self.lock()?;
+        let boot = self.boot();
+        crate::boot::with_registered_images(
+            &boot.volume,
+            &boot.esp,
+            &boot.activation.root_partuuid,
+            |images| {
+                crate::release::prune_with_registered_roots(
+                    repo, publisher, key, keep, images, apply,
+                )
+            },
+        )
+    }
+
     pub fn publisher_cache(&self, publisher: &str) -> Result<PathBuf> {
         validate_publisher(publisher)?;
         self.check_running()?;
