@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Plan, Retention, SolverRevision, resolve};
+use super::{Plan, Renames, Retention, SolverRevision, resolve};
 use crate::{
     attestation::BuildTrust,
     image::{Image, Installed, Publisher, State},
@@ -18,6 +18,7 @@ pub(super) struct Catalogs {
     pub legacy: Option<String>,
     pub pins: BTreeMap<String, String>,
     pub candidates: CandidateSet<Published>,
+    pub renames: Renames,
     pub profile: Option<ReleaseProfile>,
     pub checkpoints: BTreeMap<String, CatalogCheckpoint>,
     builds: BTreeMap<String, SelectedBuilds>,
@@ -158,12 +159,13 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         profile: &ReleaseProfile,
         freezes: &BTreeMap<String, super::FrozenPackage>,
         local_roots: Option<&BTreeSet<String>>,
+        renames: &BTreeMap<&str, PackageSpec<'_>>,
         solver: Option<SolverRevision>,
         compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
     ) -> Result<(BTreeMap<String, Installed>, T)> {
         let locked = self.replay(profile)?;
         super::freeze::check(freezes, &locked)?;
-        let mut requested = BTreeMap::new();
+        let mut requested = renames.clone();
         for (name, package) in &locked {
             let manifest = &package.published.manifest;
             if let Some(previous) = before.get(name) {
@@ -285,6 +287,7 @@ pub(super) fn load(
     state: &State,
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     saved: Option<&Plan>,
+    updating: bool,
 ) -> Result<Catalogs> {
     let publishers = state.publishers.as_slice();
     let single = publishers.len() == 1;
@@ -327,6 +330,7 @@ pub(super) fn load(
         saved_pin(&publishers[0].name)?,
     )?;
     let mut catalogs = Catalogs::default();
+    let mut snapshots = Vec::new();
     for publisher in publishers {
         let pin = saved_pin(&publisher.name)?;
         let signed = profile
@@ -349,6 +353,17 @@ pub(super) fn load(
             publisher,
             &snapshot.builds.history,
         )?;
+        catalogs.renames.add(
+            &state.installed,
+            &publisher.name,
+            &snapshot.rename_targets,
+            &snapshot.obsoletions,
+        );
+        snapshots.push((publisher, signed, snapshot));
+    }
+    catalogs.renames.check_request(updating)?;
+    catalogs.renames.reserve_sources(&mut sources)?;
+    for (publisher, signed, snapshot) in snapshots {
         catalogs
             .checkpoints
             .insert(publisher.name.clone(), snapshot.builds.history.clone());

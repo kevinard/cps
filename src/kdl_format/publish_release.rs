@@ -28,6 +28,10 @@ pub(crate) enum Change {
     },
     Withdraw(String),
     Obsolete(String),
+    Rename {
+        id: String,
+        to: String,
+    },
 }
 
 fn path(value: String) -> Result<PathBuf> {
@@ -71,6 +75,7 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
         let fields = match kind {
             "bundle" => Fields::read(node, 1, &["path", "builder-key", "recipe-sha256"], true)?,
             "withdraw" | "obsolete" => Fields::read(node, 1, &[], false)?,
+            "rename" => Fields::read(node, 1, &["to"], false)?,
             _ => bail!("unknown release action {kind}"),
         };
         let id = fields.string_arg(0)?;
@@ -80,13 +85,28 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
             "release action requires a full package ID for {publisher}: {id}"
         );
         ensure!(ids.insert(id.clone()), "duplicate release action for {id}");
-        if kind == "obsolete" {
+        if matches!(kind, "obsolete" | "rename") {
             ensure!(
                 obsoletions.insert(spec.name.to_owned()),
-                "duplicate obsoletion for {}",
+                "duplicate retirement for {}",
                 spec.name
             );
-            changes.push(Change::Obsolete(id));
+            if kind == "rename" {
+                let to = fields.required_string("to")?;
+                let target = PackageSpec::parse(&to)?;
+                ensure!(
+                    target.publisher.is_none_or(|name| name == publisher)
+                        && target.version.is_none()
+                        && target.name != spec.name,
+                    "rename requires a different, unversioned package name in {publisher}"
+                );
+                changes.push(Change::Rename {
+                    id,
+                    to: target.name.to_owned(),
+                });
+            } else {
+                changes.push(Change::Obsolete(id));
+            }
             continue;
         }
         if kind == "withdraw" {

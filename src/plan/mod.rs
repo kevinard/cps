@@ -3,6 +3,7 @@ mod config;
 pub(crate) mod freeze;
 mod intent;
 mod paths;
+mod rename;
 mod repair;
 mod resolve;
 mod update;
@@ -33,6 +34,7 @@ pub use intent::{IntentChange, MarkChoice};
 pub(crate) use paths::{
     check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
 };
+pub(crate) use rename::Renames;
 pub(crate) use resolve::{
     Candidates, Retention, check as check_dependencies, resolve as resolve_packages,
 };
@@ -808,7 +810,8 @@ fn build_with_update_diagnostics(
                 }
                 _ => BTreeMap::new(),
             };
-            catalogs = catalogs::load(image, &state, &requested, saved)?;
+            let updating = matches!(request, Request::Update | Request::UpdateProfile);
+            catalogs = catalogs::load(image, &state, &requested, saved, updating)?;
             update_profile |= saved.is_none()
                 && matches!(request, Request::Update)
                 && !state.installed.is_empty()
@@ -828,7 +831,13 @@ fn build_with_update_diagnostics(
             if track_profile_intent && state.settings.profile_intent.is_none() {
                 state.settings.profile_intent = Some(image.reconstruct_profile_intent(&state)?);
             }
-            let (installed, paths) = if install_profile {
+            catalogs.renames.check_freezes(&state.settings.freezes)?;
+            catalogs.renames.check_profile(
+                |name| state.settings.profile_packages.contains_key(name),
+                catalogs.profile.as_ref().filter(|_| update_profile),
+            )?;
+            let successors = catalogs.renames.requirements();
+            let (mut installed, paths) = if install_profile {
                 let profile = catalogs
                     .profile
                     .as_ref()
@@ -860,6 +869,7 @@ fn build_with_update_diagnostics(
                         .as_ref()
                         .filter(|_| track_profile_intent)
                         .map(|intent| &intent.local),
+                    &successors,
                     solver,
                     |installed| composition_paths(&state.settings, installed, solver),
                 )?
@@ -872,12 +882,19 @@ fn build_with_update_diagnostics(
                         freezes: &state.settings.freezes,
                         profile_packages: &state.settings.profile_packages,
                     },
-                    &requested,
+                    if updating { &successors } else { &requested },
                     matches!(request, Request::Update),
                     matches!(request, Request::ExactInstall { .. }),
                     solver,
                 )?
             };
+            if let Some(intent) = &mut state.settings.profile_intent {
+                catalogs.renames.transfer_local(&mut intent.local);
+            } else if !update_profile {
+                catalogs
+                    .renames
+                    .transfer_explicit(&state.installed, &mut installed);
+            }
             receipts = catalogs.verify_builds(image, &state, &installed)?;
             if install_profile || update_profile {
                 let profile = catalogs.profile.as_ref().expect("applied profile");

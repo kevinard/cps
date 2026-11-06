@@ -14,8 +14,8 @@ use crate::{
     kdl_format::publish_policy::{Companion, Profile},
     model::{Node, PackageSpec, Version},
     plan::{
-        CandidateSet, Candidates, Retention, SolverRevision, check_directory, check_path_type,
-        resolve_packages, select_paths,
+        CandidateSet, Candidates, Renames, Retention, SolverRevision, check_directory,
+        check_path_type, resolve_packages, select_paths,
     },
 };
 
@@ -251,10 +251,26 @@ pub(super) fn check(
                     &companions,
                     explicit,
                 )?;
-                let sticky = before
+                let mut sticky = before
                     .iter()
                     .map(|(name, pkg)| (name.clone(), pkg.published.manifest.publisher.as_str()))
                     .collect();
+                let mut renames = Renames::default();
+                renames.add(
+                    &before,
+                    &catalog.publisher,
+                    &catalog.rename_targets()?,
+                    &catalog.obsoletions,
+                );
+                for companion in &companions {
+                    renames.add(
+                        &before,
+                        companion.name,
+                        &companion.current.rename_targets,
+                        &companion.current.obsoletions,
+                    );
+                }
+                renames.reserve_sources(&mut sticky)?;
                 let current = candidates(
                     catalog,
                     &packages,
@@ -271,6 +287,7 @@ pub(super) fn check(
                     &target,
                     &next,
                     historical.is_some(),
+                    &renames,
                 )?;
                 check_companion_builds(&companions, &after)?;
                 runtime::check(repo, &catalog.publisher, profile, &after, &paths)
@@ -470,15 +487,19 @@ fn check_upgrade(
     target: &BTreeMap<String, Installed>,
     profile: &ReleaseProfile,
     locked: bool,
+    renames: &Renames,
 ) -> Result<Composition> {
     let solver = Some(SolverRevision::SatV2);
     let compose = |installed: &_| profile_paths(&profile.architecture, &profile.facets, installed);
+    let successors = renames.requirements();
     let (after, new_paths) = if locked {
+        renames.check_profile(|_| true, Some(profile))?;
         catalogs.update_profile(
             before,
             profile,
             &BTreeMap::new(),
             Some(&BTreeSet::new()),
+            &successors,
             solver,
             compose,
         )?
@@ -491,7 +512,7 @@ fn check_upgrade(
                 freezes: &BTreeMap::new(),
                 profile_packages: &BTreeMap::new(),
             },
-            &BTreeMap::new(),
+            &successors,
             true,
             Retention::All,
             solver,

@@ -1321,6 +1321,38 @@ catalogs. Inspect the cutoffs with `cps repo obsoletions --repo repo --publisher
 canopa --trust-key public.der`. Clients need obsoletion support to read catalogs
 containing these records.
 
+### Renaming packages within a publisher
+
+Publish the successor before the rename or include its build bundle in the
+same release. Add a `rename` action to the reviewed release document.
+
+```kdl
+schema-version 1
+release "canopa" base="<reviewed catalog SHA-256>" {
+    rename "cps://canopa/apps/old-editor@2.0.0-0" to="apps/editor"
+}
+```
+
+The source version is an obsoletion cutoff and must be newer than every
+published version of the old name. The publisher signs the rename and
+permanently retires the old name. Later releases can rename the successor
+again, and clients that skip releases follow the chain to its final name.
+Update clients before publishing a catalog with rename records.
+
+`cps upgrade` removes an installed source and selects its successor from
+the same publisher in one transaction. It carries forward explicit
+installation intent and keeps automatic dependencies automatic unless
+another explicit request or the signed profile marks the successor as
+explicit. Update packages that depend on the old name as part of the release.
+If the installed source is frozen, the successor cannot satisfy a freeze
+or other constraints, or the successor is installed from another publisher,
+CPS blocks the upgrade. If the source belongs to the protected signed
+composition, the new signed profile must include the successor.
+
+Use `cps upgrade --dry-run` or `cps check-updates --json` to preview the
+transaction. Other catalog-based package changes wait until the rename
+has been applied.
+
 ### Publisher order
 
 An image configuration can declare multiple publisher blocks in search order.

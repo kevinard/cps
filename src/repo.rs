@@ -62,6 +62,8 @@ pub(crate) struct Catalog {
     profiles_required: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     obsoletions: BTreeMap<String, Version>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    renames: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     key_rotations: Vec<keys::Rotation>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -233,6 +235,7 @@ impl Catalog {
             sequence: None,
             profiles_required: false,
             obsoletions: BTreeMap::new(),
+            renames: BTreeMap::new(),
             key_rotations: Vec::new(),
             release_profiles: BTreeMap::new(),
         }
@@ -335,6 +338,11 @@ impl Catalog {
             spec.publisher == Some(&self.publisher),
             "obsoletion belongs to a different publisher"
         );
+        ensure!(
+            !self.renames.contains_key(spec.name),
+            "cannot change the signed rename cutoff for {}",
+            spec.name
+        );
         let cutoff = spec.version.context("obsoletion requires a version")?;
         if let Some(previous) = self.obsoletions.get(spec.name) {
             ensure!(
@@ -378,6 +386,97 @@ impl Catalog {
         }
         self.obsoletions.insert(spec.name.to_owned(), cutoff);
         Ok(true)
+    }
+
+    fn rename(&mut self, id: &str, to: String) -> Result<bool> {
+        let spec = PackageSpec::parse(id)?;
+        if let Some(existing) = self.renames.get(spec.name) {
+            ensure!(
+                existing == &to,
+                "cannot change the signed rename for {}",
+                spec.name
+            );
+            ensure!(
+                self.obsoletions.get(spec.name).copied() == spec.version,
+                "cannot change the signed rename cutoff for {}",
+                spec.name
+            );
+            return Ok(false);
+        }
+        self.obsolete(id)?;
+        self.renames.insert(spec.name.to_owned(), to);
+        Ok(true)
+    }
+
+    pub(crate) fn rename_targets(&self) -> Result<BTreeMap<String, String>> {
+        if self.renames.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let active = self
+            .entries
+            .keys()
+            .map(|id| Ok(PackageSpec::parse(id)?.name))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let mut published = active.clone();
+        for id in self.withdrawals.keys() {
+            published.insert(PackageSpec::parse(id)?.name);
+        }
+        for (name, to) in &self.renames {
+            validate_name(name)?;
+            validate_name(to)?;
+            let cutoff = self
+                .obsoletions
+                .get(name)
+                .with_context(|| format!("rename of {name} has no obsoletion cutoff"))?;
+            ensure!(
+                !active.contains(name.as_str()),
+                "renamed package {name} is still published"
+            );
+            let prefix = format!("cps://{}/{name}@", self.publisher);
+            let mut withdrawn = self
+                .withdrawals
+                .range(prefix.clone()..)
+                .map(|(id, _)| id)
+                .take_while(|id| id.starts_with(&prefix))
+                .peekable();
+            ensure!(
+                withdrawn.peek().is_some(),
+                "no published versions to rename for {name}"
+            );
+            for id in withdrawn {
+                ensure!(
+                    PackageSpec::parse(id)?
+                        .version
+                        .is_some_and(|version| version < *cutoff),
+                    "rename cutoff for {name} must be newer than {id}"
+                );
+            }
+        }
+        let mut resolved = BTreeMap::<&str, &str>::new();
+        for name in self.renames.keys() {
+            let mut chain = BTreeSet::new();
+            let mut target = name.as_str();
+            while let Some(to) = self.renames.get(target) {
+                if let Some(&terminal) = resolved.get(target) {
+                    target = terminal;
+                    break;
+                }
+                ensure!(
+                    chain.insert(target),
+                    "package rename cycle involving {target}"
+                );
+                target = to;
+            }
+            ensure!(
+                published.contains(target),
+                "rename of {name} has no published successor {target}"
+            );
+            resolved.extend(chain.into_iter().map(|name| (name, target)));
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|(name, to)| (name.to_owned(), to.to_owned()))
+            .collect())
     }
 
     pub(crate) fn check_successor(&self, next: &Self, previous_hash: &str) -> Result<()> {
@@ -427,6 +526,13 @@ impl Catalog {
                     .get(name)
                     .is_some_and(|next| next >= cutoff),
                 "release drops or lowers the obsoletion for {name}"
+            );
+        }
+        for (name, to) in &self.renames {
+            ensure!(
+                next.renames.get(name) == Some(to)
+                    && next.obsoletions.get(name) == self.obsoletions.get(name),
+                "release drops or changes the signed rename for {name}"
             );
         }
         for (id, manifest) in &self.entries {
@@ -713,6 +819,7 @@ pub struct Snapshot {
     build_inputs: BTreeMap<String, rebuild::Digests>,
     withdrawals: BTreeMap<String, Withdrawal>,
     pub(crate) obsoletions: BTreeMap<String, Version>,
+    pub(crate) rename_targets: BTreeMap<String, String>,
 }
 
 pub(crate) struct BuildEvidence {
@@ -1137,6 +1244,7 @@ fn decode_catalog(
             "obsoletion for {name} reuses a published version"
         );
     }
+    catalog.rename_targets()?;
     let mut evidence = BTreeSet::new();
     for (id, digest) in &catalog.attestations {
         validate_digest(digest)?;
@@ -1220,6 +1328,7 @@ fn catalog_snapshot(
     hash: String,
     key: &[u8],
 ) -> Result<Snapshot> {
+    let rename_targets = catalog.rename_targets()?;
     let builds = catalog.take_build_evidence(&hash, key)?;
     let mut packages = Vec::with_capacity(catalog.entries.len());
     for (id, entry) in catalog.entries {
@@ -1232,6 +1341,7 @@ fn catalog_snapshot(
         build_inputs: catalog.build_inputs,
         withdrawals: catalog.withdrawals,
         obsoletions: catalog.obsoletions,
+        rename_targets,
     })
 }
 
@@ -1709,9 +1819,11 @@ pub fn publish_release_with_sources(
             }
             publish_release::Change::Withdraw(id) => changed |= catalog.withdraw(&id)?,
             publish_release::Change::Obsolete(id) => changed |= catalog.obsolete(&id)?,
+            publish_release::Change::Rename { id, to } => changed |= catalog.rename(&id, to)?,
         }
     }
     if changed || release.refresh_profiles {
+        catalog.rename_targets()?;
         let previous = (!changed).then(|| catalog.release_profiles.clone());
         check_profiles(
             repo,
@@ -1766,6 +1878,10 @@ fn publish_manifest(
     let current = publication_base(repo)?;
     let mut catalog = publication_catalog(repo, &manifest.publisher, key, current.as_deref())?;
     let id = manifest.id();
+    ensure!(
+        !catalog.renames.contains_key(&manifest.name),
+        "cannot publish {id} under a renamed package name"
+    );
     let policy = read_publish_policy(repo, &catalog, true)?;
     prepare_objects(repo)?;
     if stage_manifest(
@@ -1930,6 +2046,7 @@ fn stage_manifest(
 }
 
 fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
+    catalog.rename_targets()?;
     catalog.check_source_archives()?;
     catalog.sequence = Some(catalog.next_sequence()?);
     let signer = keys::signer(
@@ -2275,6 +2392,32 @@ mod tests {
     }
 
     #[test]
+    fn catalog_successors_preserve_signed_renames() -> Result<()> {
+        let mut previous = Catalog::empty("canopa");
+        let old = "cps://canopa/apps/old@1.0.0-0";
+        let new = "cps://canopa/apps/new@1.0.0-0";
+        for id in [old, new] {
+            previous
+                .entries
+                .insert(id.to_owned(), CatalogEntry::Portable(digest(id.as_bytes())));
+        }
+        previous.rename("cps://canopa/apps/old@2.0.0-0", "apps/new".into())?;
+        previous.sequence = NonZeroU64::new(1);
+        let base = digest(b"previous catalog");
+        let mut next = previous.clone();
+        next.sequence = NonZeroU64::new(2);
+        next.withdraw(new)?;
+        assert_eq!(next.rename_targets()?["apps/old"], "apps/new");
+        previous.check_successor(&next, &base)?;
+        next.renames.clear();
+        let error = previous.check_successor(&next, &base).unwrap_err();
+        assert!(format!("{error:#}").contains("drops or changes the signed rename"));
+        next.renames.insert("apps/old".into(), "apps/other".into());
+        assert!(previous.check_successor(&next, &base).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn catalog_successors_preserve_signed_publication_records() -> Result<()> {
         let base = digest(b"base catalog");
         let active = "cps://canopa/desktop@2.0.0-0".to_owned();
@@ -2306,6 +2449,7 @@ mod tests {
             sequence: NonZeroU64::new(1),
             profiles_required: true,
             obsoletions: BTreeMap::from([("desktop/retired".to_owned(), "2.0.0-0".parse()?)]),
+            renames: BTreeMap::new(),
             key_rotations: Vec::new(),
             release_profiles: BTreeMap::from([(
                 "desktop".to_owned(),

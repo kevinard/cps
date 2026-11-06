@@ -1271,6 +1271,248 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
 }
 
 #[test]
+fn signed_renames_upgrade_in_one_transaction_and_preserve_install_intent() -> Result<()> {
+    use crate::{add_publisher, prefer_publisher, resume_transaction};
+
+    let f = Fixture::new()?;
+    let other = Fixture::new()?;
+    let old = "apps/old-editor";
+    let intermediate = "apps/editor";
+    let successor = "apps/text-editor";
+    let old_addon = "apps/old-addon";
+    let addon = "apps/addon";
+    let launcher = "apps/launcher";
+    f.package(old, "1.0.0-0", f.file(COMPOSITOR, "old", "0755", "")?)?;
+    f.package(old_addon, "1.0.0-0", String::new())?;
+    f.package(
+        launcher,
+        "1.0.0-0",
+        dependency("require", old_addon, "1.0.0-0"),
+    )?;
+    other.package_as("other", successor, "9.0.0-0", String::new())?;
+    f.create()?;
+    add_publisher(&f.root, "other", &other.repo, &other.public)?;
+    prefer_publisher(&f.root, "other")?;
+    let install = |packages: &[&str]| Request::Install {
+        packages: packages.iter().map(|name| (*name).into()).collect(),
+    };
+    apply(&f.root, &plan(&f.root, install(&[old, launcher]))?)?;
+    let conflicting = f._dir.path().join("conflicting-publisher");
+    crate::stage_boot_environment(
+        &f.root,
+        &conflicting,
+        &plan(&f.root, install(&["cps://other/apps/text-editor"]))?,
+    )?;
+    f.package(
+        intermediate,
+        "1.0.0-0",
+        f.file(COMPOSITOR, "intermediate", "0755", "")?,
+    )?;
+    f.package(successor, "1.0.0-0", f.file(COMPOSITOR, "new", "0755", "")?)?;
+    f.package(addon, "1.0.0-0", String::new())?;
+
+    let release = f._dir.path().join("rename.kdl");
+    let publish_rename = |actions: &str| -> Result<String> {
+        let current = fs::read_to_string(f.repo.join("current"))?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} {{\n{actions}\n}}\n",
+                current.trim()
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)
+    };
+    let current = fs::read_to_string(f.repo.join("current"))?;
+    for target in ["cps://other/apps/editor", "apps/missing"] {
+        assert!(
+            publish_rename(&format!(
+                "rename \"cps://canopa/{old}@2.0.0-0\" to={target:?}"
+            ))
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(f.repo.join("current"))?, current);
+    }
+    publish_rename(&format!(
+        "rename \"cps://canopa/{old}@2.0.0-0\" to={intermediate:?}\nrename \"cps://canopa/{old_addon}@2.0.0-0\" to={addon:?}"
+    ))?;
+    assert!(
+        plan(&f.root, Request::Update).is_err(),
+        "launcher still requires the old addon"
+    );
+    assert!(
+        format!("{:#}", plan(&f.root, install(&[launcher])).unwrap_err())
+            .contains("upgrade the image")
+    );
+    f.package(launcher, "2.0.0-0", String::new())?;
+    let saved = plan(&f.root, Request::Update)?;
+    publish_rename(&format!(
+        "rename \"cps://canopa/{intermediate}@2.0.0-0\" to={successor:?}"
+    ))?;
+    let error = plan(&conflicting, Request::Update).unwrap_err();
+    assert!(format!("{error:#}").contains("reserved for a different publisher"));
+    let staged = f._dir.path().join("pinned-rename");
+    crate::stage_boot_environment(&f.root, &staged, &saved)?;
+    assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "intermediate");
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
+    let current = fs::read_to_string(f.repo.join("current"))?;
+    assert!(
+        publish_rename(&format!(
+            "rename \"cps://canopa/{successor}@2.0.0-0\" to={old:?}"
+        ))
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, current);
+    assert!(f.package(old, "3.0.0-0", String::new()).is_err());
+
+    for (freeze, unfreeze, message) in [
+        (old.to_owned(), old, "validate the replacement"),
+        (
+            format!("{successor}@9.0.0-0"),
+            successor,
+            "resolving package selection with freezes",
+        ),
+    ] {
+        apply(
+            &f.root,
+            &plan(
+                &f.root,
+                Request::Freeze {
+                    packages: vec![freeze],
+                    reason: Some("validate the replacement".into()),
+                },
+            )?,
+        )?;
+        let error = plan(&f.root, Request::Update).unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+        apply(
+            &f.root,
+            &plan(
+                &f.root,
+                Request::Unfreeze {
+                    packages: vec![unfreeze.into()],
+                },
+            )?,
+        )?;
+    }
+
+    let upgrade = plan(&f.root, Request::Update)?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("rename-plan.json"),
+        &upgrade,
+        COMPOSITOR,
+    )?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    resume_transaction(&f.root)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "new");
+    let installed = list_packages(&f.root, Scope::Installed)?;
+    assert_eq!(
+        installed
+            .iter()
+            .map(|row| (row.id.as_str(), row.status))
+            .collect::<Vec<_>>(),
+        [
+            ("cps://canopa/apps/addon@1.0.0-0", Status::Dependency),
+            ("cps://canopa/apps/launcher@2.0.0-0", Status::Explicit),
+            ("cps://canopa/apps/text-editor@1.0.0-0", Status::Explicit),
+        ]
+    );
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn signed_profile_renames_require_the_successor_and_keep_local_marks_separate() -> Result<()> {
+    use crate::query::{ProfileRole, list_package_intent};
+
+    let f = Fixture::new()?;
+    let base = "apps/base";
+    let next_base = "apps/new-base";
+    let local = "apps/local";
+    let next_local = "apps/new-local";
+    for name in [base, next_base, local, next_local, "apps/unrelated"] {
+        f.package(name, "1.0.0-0", String::new())?;
+    }
+    let policy = |name: &str| -> Result<()> {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"unused.der\"\n    profile \"desktop\" architecture=\"x86_64\" {{ package {name:?}; }}\n}}\n"
+            ),
+        )?;
+        Ok(())
+    };
+    let release = f._dir.path().join("release.kdl");
+    let publish_profile = |actions: &str| -> Result<String> {
+        let current = fs::read_to_string(f.repo.join("current"))?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true {{\n{actions}\n}}\n",
+                current.trim()
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)
+    };
+    policy(base)?;
+    publish_profile("")?;
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            "schema-version 1\nrelease-profile \"desktop\"\npublisher \"canopa\" {{ repository {:?}; trust-key {:?}; }}\n",
+            f.repo, f.public
+        ),
+    )?;
+    crate::create_configured_image(&f.root, &config)?;
+    apply(&f.root, &plan(&f.root, Request::InstallProfile)?)?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Install {
+                packages: vec![local.into()],
+            },
+        )?,
+    )?;
+    let actions = format!(
+        "rename \"cps://canopa/{base}@2.0.0-0\" to={next_base:?}\nrename \"cps://canopa/{local}@2.0.0-0\" to={next_local:?}"
+    );
+    let current = fs::read_to_string(f.repo.join("current"))?;
+    policy("apps/unrelated")?;
+    let error = publish_profile(&actions).unwrap_err();
+    assert!(format!("{error:#}").contains("signed profile update must include its successor"));
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?, current);
+    policy(next_base)?;
+    publish_profile(&actions)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert_eq!(update.request, Request::UpdateProfile);
+    apply(&f.root, &update)?;
+    let intent = list_package_intent(&f.root)?;
+    assert_eq!(
+        intent
+            .iter()
+            .map(|row| (row.id.as_str(), row.requested, row.profile))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "cps://canopa/apps/new-base@1.0.0-0",
+                false,
+                ProfileRole::Root
+            ),
+            (
+                "cps://canopa/apps/new-local@1.0.0-0",
+                true,
+                ProfileRole::None
+            ),
+        ]
+    );
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn upgrade_profile_reuses_signed_baseline_roots_and_companions() -> Result<()> {
     let f = Fixture::new()?;
     let seed = Fixture::new()?;
