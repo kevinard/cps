@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs::{self, File},
     io::{self, IsTerminal, Write},
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -106,31 +108,27 @@ enum Command {
     },
     /// Build a package with verified inputs in an offline sandbox
     Build {
-        #[arg(long, required_unless_present = "toolchain_config")]
-        repo: Option<PathBuf>,
-        #[arg(long, required_unless_present = "toolchain_config")]
-        publisher: Option<String>,
-        #[arg(long, required_unless_present = "toolchain_config")]
-        trust_key: Option<PathBuf>,
-        /// Worker-local repository and trust key locations for the pinned publishers
-        #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_key"])]
-        toolchain_config: Option<PathBuf>,
-        #[arg(long, required_unless_present = "source_cache")]
-        sources: Option<PathBuf>,
-        #[arg(long, conflicts_with = "sources")]
-        source_cache: Option<PathBuf>,
+        #[command(flatten)]
+        inputs: BuildInputs,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
         check_reproducible: bool,
-        #[arg(long)]
-        worker_config: Option<PathBuf>,
         #[arg(long, requires = "check_reproducible")]
         builder_signing_key: Option<PathBuf>,
-        /// Override a build option declared in the recipe
-        #[arg(long = "option", value_name = "NAME=VALUE")]
-        recipe_options: Vec<String>,
         recipe: PathBuf,
+    },
+    /// Run a shell or command with a recipe's verified toolchain and sources
+    Develop {
+        #[command(flatten)]
+        inputs: BuildInputs,
+        /// Host directory to mount read-write at /build/workspace
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        recipe: PathBuf,
+        /// Run this command instead of starting an interactive shell
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<OsString>,
     },
     /// Prepare a package manifest for review
     Manifest {
@@ -329,6 +327,92 @@ enum Command {
         #[command(subcommand)]
         command: BootCommand,
     },
+}
+
+#[derive(Args)]
+struct BuildInputs {
+    #[arg(long, required_unless_present = "toolchain_config")]
+    repo: Option<PathBuf>,
+    #[arg(long, required_unless_present = "toolchain_config")]
+    publisher: Option<String>,
+    #[arg(long, required_unless_present = "toolchain_config")]
+    trust_key: Option<PathBuf>,
+    /// Worker-local repository and trust key locations for the pinned publishers
+    #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_key"])]
+    toolchain_config: Option<PathBuf>,
+    #[arg(long, required_unless_present = "source_cache")]
+    sources: Option<PathBuf>,
+    #[arg(long, conflicts_with = "sources")]
+    source_cache: Option<PathBuf>,
+    #[arg(long)]
+    worker_config: Option<PathBuf>,
+    /// Override a build option declared in the recipe
+    #[arg(long = "option", value_name = "NAME=VALUE")]
+    recipe_options: Vec<String>,
+}
+
+struct PreparedBuildInputs<'a> {
+    sources: (&'a Path, SourceLayout),
+    toolchain: BuildToolchain<'a>,
+    worker: cps::BuildWorker,
+    overrides: BTreeMap<String, String>,
+}
+
+impl BuildInputs {
+    fn prepare(&self) -> Result<PreparedBuildInputs<'_>> {
+        let input = self
+            .source_cache
+            .as_deref()
+            .or(self.sources.as_deref())
+            .context("missing build sources")?;
+        let layout = if self.source_cache.is_some() {
+            SourceLayout::Cache
+        } else {
+            SourceLayout::Directory
+        };
+        let worker = self
+            .worker_config
+            .as_deref()
+            .map(read_worker_config)
+            .transpose()?
+            .unwrap_or_default();
+        let toolchain = if let Some(config) = self.toolchain_config.as_deref() {
+            BuildToolchain::Config(config)
+        } else {
+            BuildToolchain::Single {
+                repo: self
+                    .repo
+                    .as_deref()
+                    .context("missing toolchain repository")?,
+                publisher: self
+                    .publisher
+                    .as_deref()
+                    .context("missing toolchain publisher")?,
+                trust_key: self
+                    .trust_key
+                    .as_deref()
+                    .context("missing toolchain trust key")?,
+            }
+        };
+        let mut overrides = BTreeMap::new();
+        for option in &self.recipe_options {
+            let (name, value) = option
+                .split_once('=')
+                .context("expected --option NAME=VALUE")?;
+            ensure!(
+                overrides
+                    .insert(name.to_owned(), value.to_owned())
+                    .is_none(),
+                "duplicate --option {name}"
+            );
+        }
+        Ok(PreparedBuildInputs {
+            sources: (input, layout),
+            toolchain,
+            worker,
+            overrides,
+        })
+    }
 }
 
 #[derive(Args)]
@@ -1377,72 +1461,48 @@ fn run(command: Command) -> Result<ExitCode> {
             println!("Verified {count} pinned source(s) in the cache");
         }
         Command::Build {
-            repo,
-            publisher,
-            trust_key,
-            toolchain_config,
-            sources,
-            source_cache,
+            inputs,
             output,
             check_reproducible,
-            worker_config,
             builder_signing_key,
-            recipe_options,
             recipe,
         } => {
-            let input = source_cache
-                .as_deref()
-                .or(sources.as_deref())
-                .context("missing build sources")?;
-            let layout = if source_cache.is_some() {
-                SourceLayout::Cache
-            } else {
-                SourceLayout::Directory
-            };
-            let worker = worker_config
-                .as_deref()
-                .map(read_worker_config)
-                .transpose()?
-                .unwrap_or_default();
-            let toolchain = if let Some(config) = toolchain_config.as_deref() {
-                BuildToolchain::Config(config)
-            } else {
-                BuildToolchain::Single {
-                    repo: repo.as_deref().context("missing toolchain repository")?,
-                    publisher: publisher
-                        .as_deref()
-                        .context("missing toolchain publisher")?,
-                    trust_key: trust_key
-                        .as_deref()
-                        .context("missing toolchain trust key")?,
-                }
-            };
-            let mut overrides = BTreeMap::new();
-            for option in recipe_options {
-                let (name, value) = option
-                    .split_once('=')
-                    .context("expected --option NAME=VALUE")?;
-                ensure!(
-                    overrides
-                        .insert(name.to_owned(), value.to_owned())
-                        .is_none(),
-                    "duplicate --option {name}"
-                );
-            }
+            let inputs = inputs.prepare()?;
             let id = build_with_recipe_options(
                 &recipe,
-                toolchain,
+                inputs.toolchain,
                 BuildSettings {
-                    sources: input,
+                    sources: inputs.sources.0,
                     output: &output,
                     check_reproducible,
                     builder_signing_key: builder_signing_key.as_deref(),
                 },
-                layout,
-                &worker,
-                &overrides,
+                inputs.sources.1,
+                &inputs.worker,
+                &inputs.overrides,
             )?;
             println!("Built {id} at {}", output.display());
+        }
+        Command::Develop {
+            inputs,
+            workspace,
+            recipe,
+            command,
+        } => {
+            let inputs = inputs.prepare()?;
+            let status = cps::develop(
+                &recipe,
+                inputs.toolchain,
+                inputs.sources,
+                workspace.as_deref(),
+                &command,
+                &inputs.worker,
+                &inputs.overrides,
+            )?;
+            let code = status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
+            return Ok(ExitCode::from(code as u8));
         }
         Command::Manifest { command } => match command {
             ManifestCommand::Generate {

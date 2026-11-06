@@ -340,7 +340,10 @@ and its matching direct dependents together. Profile roles are `root`,
 `dependency`, or `protected` for legacy images with an unknown exact role.
 A listed dependent can also have another installed provider for an alternative
 or capability. Installed packages with a matching `recommends` declaration
-appear separately under `Recommended by`.
+appear separately under `Recommended by`. For a dependency package, `why` also
+shows a shortest path of active requirements from a local request or signed
+profile root when one exists. It labels alternative requirements and counts
+matching installed providers.
 
 `list --intent` shows effective local requests separately from the roles in
 the applied signed profile. It reports `protected` for legacy profile
@@ -412,6 +415,23 @@ digest. Review the effective recipe before approving its digest for
 publication. A changed option produces a different recipe digest from
 the publisher's original, so an exact rebuild uses the publisher's
 archived values.
+
+### Debugging a recipe in its build environment
+
+```sh
+cps develop --toolchain-config toolchain.kdl --source-cache source-cache \
+    --workspace . hello.build.kdl
+cps develop --toolchain-config toolchain.kdl --source-cache source-cache \
+    --workspace . hello.build.kdl -- make check
+```
+
+The shell or command sees the same verified toolchain, pinned sources,
+build options, and offline sandbox as the recipe. It starts in writable
+scratch space by default. `--workspace` instead mounts the selected
+directory read-write at `/build/workspace` and starts there. The recipe
+script is available at `/recipe/build.sh` for explicit execution. Build
+outputs in `$DESTDIR` are temporary. Commands inherit the caller's standard
+streams and return their exit status.
 
 ### Building with several publishers
 

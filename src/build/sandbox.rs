@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs::File,
-    io::{self, PipeReader, Read, Seek, Write},
+    io::{self, IsTerminal, PipeReader, Read, Seek, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::Duration,
@@ -22,7 +23,7 @@ use super::{
     cgroup::{self, Cgroup},
 };
 
-fn filter() -> Result<File> {
+fn filter(terminal: bool) -> Result<File> {
     let mut rules = ScmpFilterContext::new(ScmpAction::Allow)?;
     let denied = ScmpAction::Errno(libc::EPERM);
     for syscall in ["socket", "socketpair"] {
@@ -53,6 +54,16 @@ fn filter() -> Result<File> {
             ScmpSyscall::from_name(syscall)?,
         )?;
     }
+    if terminal {
+        // The developer shell can share the user's controlling terminal.
+        for request in [libc::TIOCSTI, libc::TIOCLINUX] {
+            rules.add_rule_conditional(
+                denied,
+                ScmpSyscall::from_name("ioctl")?,
+                &[scmp_cmp!($arg1 & (u32::MAX as u64) == request as u64)],
+            )?;
+        }
+    }
     let mut file = tempfile::tempfile()?;
     rules.export_bpf(&file)?;
     file.rewind()?;
@@ -63,19 +74,27 @@ fn filter() -> Result<File> {
     Ok(file)
 }
 
+pub(super) enum Mode<'a> {
+    Build,
+    Develop {
+        workspace: Option<&'a Path>,
+        command: &'a [OsString],
+    },
+}
+
 pub(super) fn run(
-    toolchain: &Path,
-    sources: &Path,
-    script: &Path,
+    work: &Path,
     output: &Path,
     epoch: u32,
     options: &BTreeMap<String, String>,
     worker: &BuildWorker,
-) -> Result<()> {
+    mode: Mode<'_>,
+) -> Result<ExitStatus> {
+    let terminal = matches!(mode, Mode::Develop { .. }) && io::stdin().is_terminal();
     let group = worker.cgroup.as_ref().map(Cgroup::create).transpose()?;
     let enter = group.as_ref().map(Cgroup::processes).transpose()?;
     let killer = group.as_ref().map(Cgroup::killer).transpose()?;
-    let filter = filter().context("creating seccomp build policy")?;
+    let filter = filter(terminal).context("creating seccomp build policy")?;
     let mut command = Command::new("/usr/bin/bwrap");
     command
         .env_clear()
@@ -86,7 +105,6 @@ pub(super) fn run(
             "--cap-drop",
             "ALL",
             "--die-with-parent",
-            "--new-session",
             "--hostname",
             "cps-build",
             "--uid",
@@ -98,13 +116,13 @@ pub(super) fn run(
         ])
         .arg(filter.as_raw_fd().to_string())
         .arg("--ro-bind")
-        .arg(toolchain)
+        .arg(work.join("toolchain"))
         .arg("/")
         .arg("--ro-bind")
-        .arg(sources)
+        .arg(work.join("sources"))
         .arg("/sources")
         .arg("--ro-bind")
-        .arg(script)
+        .arg(work.join("build.sh"))
         .arg("/recipe/build.sh")
         .arg("--bind")
         .arg(output)
@@ -120,7 +138,23 @@ pub(super) fn run(
             .arg(size.to_string())
             .args(["--tmpfs", path]);
     }
-    command.args(["--dir", "/build/home", "--chdir", "/build"]);
+    command.args(["--dir", "/build/home"]);
+    if !terminal {
+        command.arg("--new-session");
+    }
+    if let Mode::Develop {
+        workspace: Some(workspace),
+        ..
+    } = &mode
+    {
+        command.args(["--bind"]).arg(workspace).args([
+            "/build/workspace",
+            "--chdir",
+            "/build/workspace",
+        ]);
+    } else {
+        command.args(["--chdir", "/build"]);
+    }
     let epoch = epoch.to_string();
     for (key, value) in [
         ("PATH", "/usr/bin:/bin"),
@@ -144,20 +178,42 @@ pub(super) fn run(
             .arg(format!("CPS_BUILD_{name}"))
             .arg(value);
     }
-    let (logs, writer) = io::pipe()?;
-    command
-        .args([
-            "--",
-            "/bin/sh",
-            "-eu",
-            "-c",
-            "umask 022; exec /bin/sh -eu /recipe/build.sh",
-        ])
-        .stdin(Stdio::null())
-        .stdout(writer.try_clone()?)
-        .stderr(writer);
-    // Only async-signal-safe system calls run here. Bubblewrap consumes the policy descriptor,
-    // and the recipe's standard streams are private pipes or null.
+    let logs = match mode {
+        Mode::Build => {
+            let (logs, writer) = io::pipe()?;
+            command
+                .args([
+                    "--",
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    "umask 022; exec /bin/sh -eu /recipe/build.sh",
+                ])
+                .stdin(Stdio::null())
+                .stdout(writer.try_clone()?)
+                .stderr(writer);
+            Some(logs)
+        }
+        Mode::Develop { command: args, .. } => {
+            if terminal && let Some(term) = std::env::var_os("TERM") {
+                command.args(["--setenv", "TERM"]).arg(term);
+            }
+            command.args([
+                "--",
+                "/bin/sh",
+                "-c",
+                "umask 022; exec \"$@\"",
+                "cps-develop",
+            ]);
+            if args.is_empty() {
+                command.args(["/bin/sh", "-i"]);
+            } else {
+                command.args(args);
+            }
+            None
+        }
+    };
+    // Only async-signal-safe system calls run here.
     let file_bytes = worker.file_bytes;
     unsafe {
         command.pre_exec(move || {
@@ -210,10 +266,10 @@ pub(super) fn run(
 
 fn monitor(
     mut child: Child,
-    mut logs: PipeReader,
+    logs: Option<PipeReader>,
     worker: &BuildWorker,
     killer: Option<File>,
-) -> Result<()> {
+) -> Result<ExitStatus> {
     let (finished, watchdog) =
         match start_watchdog(&child, Duration::from_secs(worker.timeout_secs), killer) {
             Ok(watchdog) => watchdog,
@@ -223,7 +279,9 @@ fn monitor(
                 return Err(error.context("starting build watchdog"));
             }
         };
-    let copied = relay_logs(&mut logs, &mut io::stderr().lock(), worker.log_bytes);
+    let copied = logs.map_or(Ok(()), |mut logs| {
+        relay_logs(&mut logs, &mut io::stderr().lock(), worker.log_bytes)
+    });
     if copied.is_err() {
         let _ = child.kill();
     }
@@ -238,9 +296,7 @@ fn monitor(
         worker.timeout_secs
     );
     copied.context("relaying build logs")?;
-    let status = status?;
-    ensure!(status.success(), "isolated build failed with {status}");
-    Ok(())
+    Ok(status?)
 }
 
 fn start_watchdog(

@@ -4,10 +4,12 @@ pub(crate) mod sources;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek},
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
+    process::ExitStatus,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -200,32 +202,7 @@ pub fn build_with_recipe_options(
         builder_signing_key.is_none() || check_reproducible,
         "builder signing requires --check-reproducible"
     );
-    ensure!(
-        !geteuid().is_root(),
-        "package builds require an unprivileged user"
-    );
-    ensure!(
-        matches!(std::env::consts::ARCH, "x86_64" | "aarch64"),
-        "the build sandbox supports x86_64 and aarch64"
-    );
-    let (recipe_bytes, recipe) = read_with_options(recipe_path, overrides)?;
-    ensure!(
-        recipe.arch == std::env::consts::ARCH,
-        "toolchain architecture {} does not match this build worker",
-        recipe.arch
-    );
-    let manifest_bytes = read_limited(
-        Root::open(parent(recipe_path))?.file(&recipe.manifest)?,
-        MANIFEST_LIMIT,
-    )?;
-    ensure!(
-        digest(&manifest_bytes) == recipe.manifest_digest,
-        "manifest digest mismatch for {}",
-        recipe.manifest
-    );
-    let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
-    manifest.validate(false)?;
-    manifest.check_architecture(&recipe.arch)?;
+    let (recipe_bytes, recipe, manifest_bytes, manifest) = checked_recipe(recipe_path, overrides)?;
     let paths = manifest.payload_paths();
 
     let destination = fs::canonicalize(parent(output))?;
@@ -236,21 +213,7 @@ pub fn build_with_recipe_options(
         Err(err) => return Err(err.into()),
     }
     let work = TempDir::new_in(&destination)?;
-    let inputs = work.path().join("sources");
-    fs::create_dir(&inputs)?;
-    stage_sources(
-        sources,
-        &inputs,
-        &recipe,
-        matches!(layout, SourceLayout::Cache),
-    )?;
-    let script = work.path().join("build.sh");
-    fs::write(&script, &recipe.script)?;
-    set_mode(&script, 0o444)?;
-    normalize(&script, recipe.epoch)?;
-    let toolchain = work.path().join("toolchain");
-    fs::create_dir(&toolchain)?;
-    let resolved_toolchain = prepare_toolchain(&toolchain, location, &recipe)?;
+    let resolved_toolchain = prepare_workspace(work.path(), sources, location, &recipe, layout)?;
 
     let stage = TempDir::new_in(&destination)?;
     let proto = stage.path().join("proto");
@@ -302,6 +265,101 @@ pub fn build_with_recipe_options(
     )?;
     parent.sync_all()?;
     Ok(manifest.id())
+}
+
+/// Run a shell or command with a recipe's verified build inputs.
+pub fn develop(
+    recipe_path: &Path,
+    location: BuildToolchain<'_>,
+    sources: (&Path, SourceLayout),
+    workspace: Option<&Path>,
+    command: &[OsString],
+    worker: &BuildWorker,
+    overrides: &BTreeMap<String, String>,
+) -> Result<ExitStatus> {
+    let (_, recipe, _, _) = checked_recipe(recipe_path, overrides)?;
+    let workspace = workspace.map(fs::canonicalize).transpose()?;
+    let work = TempDir::new()?;
+    if let Some(workspace) = &workspace {
+        ensure!(
+            workspace.is_dir(),
+            "development workspace must be a directory"
+        );
+        ensure!(
+            !fs::canonicalize(work.path())?.starts_with(workspace),
+            "choose a workspace that does not contain the sandbox staging directory"
+        );
+    }
+    prepare_workspace(work.path(), sources.0, location, &recipe, sources.1)?;
+    let output = TempDir::new_in(work.path())?;
+    sandbox::run(
+        work.path(),
+        output.path(),
+        recipe.epoch,
+        &recipe.options,
+        worker,
+        sandbox::Mode::Develop {
+            workspace: workspace.as_deref(),
+            command,
+        },
+    )
+}
+
+fn checked_recipe(
+    recipe_path: &Path,
+    overrides: &BTreeMap<String, String>,
+) -> Result<(Vec<u8>, BuildRecipe, Vec<u8>, crate::model::Manifest)> {
+    ensure!(
+        !geteuid().is_root(),
+        "package builds require an unprivileged user"
+    );
+    ensure!(
+        matches!(std::env::consts::ARCH, "x86_64" | "aarch64"),
+        "the build sandbox supports x86_64 and aarch64"
+    );
+    let (recipe_bytes, recipe) = read_with_options(recipe_path, overrides)?;
+    ensure!(
+        recipe.arch == std::env::consts::ARCH,
+        "toolchain architecture {} does not match this build worker",
+        recipe.arch
+    );
+    let manifest_bytes = read_limited(
+        Root::open(parent(recipe_path))?.file(&recipe.manifest)?,
+        MANIFEST_LIMIT,
+    )?;
+    ensure!(
+        digest(&manifest_bytes) == recipe.manifest_digest,
+        "manifest digest mismatch for {}",
+        recipe.manifest
+    );
+    let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
+    manifest.validate(false)?;
+    manifest.check_architecture(&recipe.arch)?;
+    Ok((recipe_bytes, recipe, manifest_bytes, manifest))
+}
+
+fn prepare_workspace(
+    work: &Path,
+    sources: &Path,
+    location: BuildToolchain<'_>,
+    recipe: &BuildRecipe,
+    layout: SourceLayout,
+) -> Result<Toolchain> {
+    let inputs = work.join("sources");
+    fs::create_dir(&inputs)?;
+    stage_sources(
+        sources,
+        &inputs,
+        recipe,
+        matches!(layout, SourceLayout::Cache),
+    )?;
+    let script = work.join("build.sh");
+    fs::write(&script, &recipe.script)?;
+    set_mode(&script, 0o444)?;
+    normalize(&script, recipe.epoch)?;
+    let toolchain = work.join("toolchain");
+    fs::create_dir(&toolchain)?;
+    prepare_toolchain(&toolchain, location, recipe)
 }
 
 fn parent(path: &Path) -> &Path {
@@ -724,15 +782,15 @@ fn run(
     proto: Option<&Path>,
 ) -> Result<BTreeMap<String, FileDigest>> {
     let output = TempDir::new_in(work)?;
-    sandbox::run(
-        &work.join("toolchain"),
-        &work.join("sources"),
-        &work.join("build.sh"),
+    let status = sandbox::run(
+        work,
         output.path(),
         recipe.epoch,
         &recipe.options,
         worker,
+        sandbox::Mode::Build,
     )?;
+    ensure!(status.success(), "isolated build failed with {status}");
     let epoch = recipe.epoch;
     let root = Root::open(output.path())?;
     let mut artifacts = BTreeMap::new();

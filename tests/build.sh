@@ -227,6 +227,35 @@ test ! -e wrong-architecture
 mv native-manifest.kdl manifest.kdl
 "$cps" source import --from sources --cache cache build.kdl
 "$cps" source fetch --cache cache build.kdl
+develop() {
+    "$cps" develop --repo repo --publisher canopa --trust-key public.der \
+        --source-cache cache "$@"
+}
+mkdir workspace
+develop --workspace workspace build.kdl -- /bin/sh -eu -c '
+    test "$PWD" = /build/workspace
+    test "$SOURCE_DATE_EPOCH" = 1700000000
+    test -z "${CPS_TEST_SECRET:-}"
+    test -r /recipe/build.sh
+    test ! -e "$DESTDIR/hello"
+    test ! -w "$CPS_SOURCES/input"
+    read -r input < "$CPS_SOURCES/input"
+    printf "%s" "$input" > result
+'
+cmp workspace/result <(tr -d '\n' < sources/input)
+if develop build.kdl -- /bin/sh -c 'exit 37'; then
+    echo 'Development command lost its exit status' >&2
+    exit 1
+else
+    test "$?" -eq 37
+fi
+if command -v script >/dev/null; then
+    printf '%s\n' 'printf "developer-%s\n" shell-ready' 'exit 0' |
+        CPS_TEST_DEVELOP="$cps" script -qec \
+        '"$CPS_TEST_DEVELOP" develop --repo repo --publisher canopa --trust-key public.der --source-cache cache build.kdl' \
+        /dev/null > develop-terminal.log
+    tr -d '\r' < develop-terminal.log | grep -Fx developer-shell-ready
+fi
 build_package --source-cache cache --builder-signing-key builder.der --check-reproducible --output first build.kdl
 (umask 077; build_package --sources sources --builder-signing-key builder.der --check-reproducible --output second build.kdl)
 diff -r first second
