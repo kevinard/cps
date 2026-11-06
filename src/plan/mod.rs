@@ -38,7 +38,7 @@ pub(crate) use rename::Renames;
 pub(crate) use resolve::{
     Candidates, Retention, check as check_dependencies, resolve as resolve_packages,
 };
-pub use update::HeldBackUpdate;
+pub use update::{HeldBackUpdate, PhasedUpdateDeferred};
 
 const CONFIG_UPDATES_DIR: &str = ".cps/config-updates";
 
@@ -163,6 +163,8 @@ pub struct Plan {
     prune_directories: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) track_profile_intent: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    force_phased_update: bool,
     pub(crate) catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
@@ -263,6 +265,7 @@ impl Plan {
             publisher_generation: settings.publisher_generation,
             prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
             track_profile_intent: false,
+            force_phased_update: false,
             catalog: None,
             catalogs: BTreeMap::new(),
             request,
@@ -292,6 +295,7 @@ impl Plan {
             base_image: self.image.clone(),
             base_revision: self.base_revision,
             request: self.request.clone(),
+            force_phased_update: self.force_phased_update,
             package_changes: self.package_changes.clone(),
             intent_changes: self.intent_changes.clone(),
             freeze_changes: self.freeze_changes.clone(),
@@ -315,6 +319,9 @@ impl Plan {
             "Image {} at revision {}",
             self.image, self.base_revision
         )];
+        if self.force_phased_update {
+            lines.push("Allow upgrade outside the phased rollout".into());
+        }
         for change in &self.package_changes {
             let name = change.publisher.as_ref().map_or_else(
                 || change.name.clone(),
@@ -534,7 +541,7 @@ impl Plan {
 }
 
 pub fn plan(path: &Path, request: Request) -> Result<Plan> {
-    plan_with_recommends(path, request, true)
+    plan_with_options(path, request, PlanOptions::default())
 }
 
 pub fn plan_with_recommends(
@@ -542,12 +549,43 @@ pub fn plan_with_recommends(
     request: Request,
     install_recommends: bool,
 ) -> Result<Plan> {
-    Ok(plan_image(path, request, install_recommends, None)?.0)
+    plan_with_options(
+        path,
+        request,
+        PlanOptions {
+            install_recommends,
+            ..PlanOptions::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlanOptions {
+    pub install_recommends: bool,
+    pub force_phased_update: bool,
+}
+
+impl Default for PlanOptions {
+    fn default() -> Self {
+        Self {
+            install_recommends: true,
+            force_phased_update: false,
+        }
+    }
+}
+
+pub fn plan_with_options(path: &Path, request: Request, options: PlanOptions) -> Result<Plan> {
+    Ok(plan_image(path, request, options, None)?.0)
 }
 
 pub(crate) fn inspect_update(path: &Path, held_back: &mut Vec<HeldBackUpdate>) -> Result<Plan> {
     held_back.clear();
-    let (plan, next, _) = plan_image(path, Request::Update, true, Some(held_back))?;
+    let (plan, next, _) = plan_image(
+        path,
+        Request::Update,
+        PlanOptions::default(),
+        Some(held_back),
+    )?;
     held_back.retain_mut(|update| {
         let Some(package) = next.installed.get(&update.name) else {
             return false;
@@ -562,13 +600,13 @@ pub(crate) fn inspect_update(path: &Path, held_back: &mut Vec<HeldBackUpdate>) -
 fn plan_image(
     path: &Path,
     request: Request,
-    install_recommends: bool,
+    options: PlanOptions,
     held_back: Option<&mut Vec<HeldBackUpdate>>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
-    let solver = if install_recommends
+    let solver = if options.install_recommends
         && matches!(
             request,
             Request::Install { .. }
@@ -581,7 +619,15 @@ fn plan_image(
     } else {
         SolverRevision::SatV1
     };
-    build_with_update_diagnostics(&image, state, request, None, Some(solver), held_back)
+    build_with_update_diagnostics(
+        &image,
+        state,
+        request,
+        None,
+        Some(solver),
+        options.force_phased_update,
+        held_back,
+    )
 }
 
 fn resolve_local<'a>(
@@ -660,7 +706,15 @@ pub(crate) fn build(
     saved: Option<&Plan>,
     solver: Option<SolverRevision>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
-    build_with_update_diagnostics(image, state, request, saved, solver, None)
+    build_with_update_diagnostics(
+        image,
+        state,
+        request,
+        saved,
+        solver,
+        saved.is_some_and(|plan| plan.force_phased_update),
+        None,
+    )
 }
 
 fn build_with_update_diagnostics(
@@ -669,9 +723,15 @@ fn build_with_update_diagnostics(
     request: Request,
     saved: Option<&Plan>,
     solver: Option<SolverRevision>,
+    force_phased_update: bool,
     held_back: Option<&mut Vec<HeldBackUpdate>>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let root = &image.root;
+    let updating = matches!(request, Request::Update | Request::UpdateProfile);
+    ensure!(
+        !force_phased_update || updating,
+        "--force-phased-update requires an update request"
+    );
     ensure!(
         state.settings.bootstrap_catalog.is_none() || matches!(request, Request::InstallProfile),
         "install the pinned bootstrap release with plan install-profile first"
@@ -810,8 +870,14 @@ fn build_with_update_diagnostics(
                 }
                 _ => BTreeMap::new(),
             };
-            let updating = matches!(request, Request::Update | Request::UpdateProfile);
-            catalogs = catalogs::load(image, &state, &requested, saved, updating)?;
+            catalogs = catalogs::load(
+                image,
+                &state,
+                &requested,
+                saved,
+                updating,
+                force_phased_update,
+            )?;
             update_profile |= saved.is_none()
                 && matches!(request, Request::Update)
                 && !state.installed.is_empty()
@@ -952,6 +1018,7 @@ fn build_with_update_diagnostics(
     )?;
     let mut plan = Plan {
         track_profile_intent,
+        force_phased_update,
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
         systemd: systemd::plan_actions(&state, &installed, &paths),

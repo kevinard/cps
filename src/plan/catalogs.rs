@@ -288,6 +288,7 @@ pub(super) fn load(
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     saved: Option<&Plan>,
     updating: bool,
+    force_phased_update: bool,
 ) -> Result<Catalogs> {
     let publishers = state.publishers.as_slice();
     let single = publishers.len() == 1;
@@ -329,6 +330,15 @@ pub(super) fn load(
         &state.settings,
         saved_pin(&publishers[0].name)?,
     )?;
+    if updating
+        && !force_phased_update
+        && let Some(profile) = &profile
+    {
+        let primary = profile
+            .pin(&publishers[0].name)
+            .context("missing primary profile pin")?;
+        super::update::check_rollout(image, state, primary, &profile.record)?;
+    }
     let mut catalogs = Catalogs::default();
     let mut snapshots = Vec::new();
     for publisher in publishers {

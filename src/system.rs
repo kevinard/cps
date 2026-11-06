@@ -13,7 +13,7 @@ use rustix::fs::{FlockOperation, flock};
 use serde::Serialize;
 
 use crate::{
-    BootEnvironment, PackageChange, Plan, Request,
+    BootEnvironment, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request,
     apply::{apply_live, resume_live},
     boot::{
         activate_btrfs_boot_environment, entry_id, stage_running_btrfs, with_running_environment,
@@ -24,7 +24,7 @@ use crate::{
     list_boot_environments,
     model::validate_publisher,
     plan::inspect_update,
-    plan_with_recommends,
+    plan_with_options,
     query::{InstallSource, SelectSource, select_install_sources},
     release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
 };
@@ -37,7 +37,7 @@ const ROOT: &str = "/";
 pub struct System {
     config: PathBuf,
     definition: ImageDefinition,
-    install_recommends: bool,
+    plan_options: PlanOptions,
 }
 
 pub struct Change {
@@ -50,6 +50,7 @@ pub struct Change {
 pub enum UpdateStatus {
     UpToDate,
     UpdatesAvailable,
+    Deferred,
     Blocked,
 }
 
@@ -58,6 +59,8 @@ pub struct UpdateReport {
     pub status: UpdateStatus,
     pub changes: Vec<PackageChange>,
     pub held_back: Vec<HeldBackUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phased_update: Option<PhasedUpdateDeferred>,
     pub blockers: Vec<String>,
     pub reboot_required: Option<bool>,
     pub reboot_reason: Option<String>,
@@ -65,6 +68,11 @@ pub struct UpdateReport {
 
 impl UpdateReport {
     fn from_plan(result: Result<Change>, held_back: Vec<HeldBackUpdate>) -> Self {
+        let phased_update = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<PhasedUpdateDeferred>())
+            .cloned();
         let (status, changes, blockers, reboot_reason) = match result {
             Ok(change) => {
                 let status = if !change.is_empty() {
@@ -81,6 +89,9 @@ impl UpdateReport {
                     change.boot_reason,
                 )
             }
+            Err(_) if phased_update.is_some() => {
+                (UpdateStatus::Deferred, Vec::new(), Vec::new(), None)
+            }
             Err(error) => (
                 UpdateStatus::Blocked,
                 Vec::new(),
@@ -92,6 +103,7 @@ impl UpdateReport {
             status,
             changes,
             held_back,
+            phased_update,
             blockers,
             reboot_required: (status != UpdateStatus::Blocked).then_some(reboot_reason.is_some()),
             reboot_reason,
@@ -138,12 +150,17 @@ impl System {
         Ok(Self {
             config: config.to_owned(),
             definition,
-            install_recommends: true,
+            plan_options: PlanOptions::default(),
         })
     }
 
     pub fn with_install_recommends(mut self, enabled: bool) -> Self {
-        self.install_recommends = enabled;
+        self.plan_options.install_recommends = enabled;
+        self
+    }
+
+    pub fn with_force_phased_update(mut self, enabled: bool) -> Self {
+        self.plan_options.force_phased_update = enabled;
         self
     }
 
@@ -231,7 +248,7 @@ impl System {
         let root = Path::new(ROOT);
         let plan = match held_back {
             Some(held_back) => inspect_update(root, held_back)?,
-            None => plan_with_recommends(root, request, self.install_recommends)?,
+            None => plan_with_options(root, request, self.plan_options)?,
         };
         Ok(Change::from_plan(plan, &self.definition.stage_packages))
     }
@@ -389,4 +406,28 @@ fn fresh(path: &Path) -> bool {
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age < Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_report_distinguishes_rollout_deferral_from_a_blocker() -> Result<()> {
+        let deferred = PhasedUpdateDeferred {
+            publisher: "canopa".into(),
+            profile: "desktop".into(),
+            catalog: "a".repeat(64),
+            percentage: 10,
+            cohort: 30,
+        };
+        let report = UpdateReport::from_plan(Err(deferred.clone().into()), Vec::new());
+        assert_eq!(report.status, UpdateStatus::Deferred);
+        assert!(report.blockers.is_empty());
+        assert_eq!(report.reboot_required, Some(false));
+        let json = serde_json::to_value(report)?;
+        assert_eq!(json["status"], "deferred");
+        assert_eq!(json["phased_update"], serde_json::to_value(deferred)?);
+        Ok(())
+    }
 }

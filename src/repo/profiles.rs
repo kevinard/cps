@@ -222,6 +222,7 @@ pub(super) fn check(
                 .collect(),
             elf_library_dirs: profile.elf_library_dirs.clone(),
             elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
+            rollout_percentage: profile.rollout_percentage,
         };
         let explicit = profile.upgrade_from.as_deref();
         let immediate = current_hash.filter(|hash| {

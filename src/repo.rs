@@ -84,6 +84,8 @@ pub(crate) struct ReleaseProfile {
     pub elf_library_dirs: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub elf_symbol_versions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_percentage: Option<u8>,
 }
 
 impl ReleaseProfile {
@@ -113,6 +115,12 @@ impl ReleaseProfile {
             self.composition.is_empty() || !self.roots.is_empty(),
             "signed profile {name} has a composition without roots"
         );
+        if let Some(percentage) = self.rollout_percentage {
+            ensure!(
+                percentage <= 100 && !self.composition.is_empty(),
+                "signed profile {name} requires a composition and a rollout percentage from 0 to 100"
+            );
+        }
         for (package, manifest) in &self.composition {
             validate_name(package)?;
             validate_digest(manifest)?;
@@ -2324,6 +2332,7 @@ mod tests {
                 composition: BTreeMap::new(),
                 elf_library_dirs: vec![],
                 elf_symbol_versions: false,
+                rollout_percentage: None,
             },
         );
         let previous_hash = digest(b"previous primary catalog");
@@ -2461,6 +2470,7 @@ mod tests {
                     composition: BTreeMap::new(),
                     elf_library_dirs: vec!["/usr/lib".to_owned()],
                     elf_symbol_versions: true,
+                    rollout_percentage: None,
                 },
             )]),
         };

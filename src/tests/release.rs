@@ -540,6 +540,7 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
         composition,
         elf_library_dirs: Vec::new(),
         elf_symbol_versions: false,
+        rollout_percentage: None,
     };
     let mut candidates = crate::plan::CandidateSet {
         packages: release.packages,
@@ -563,6 +564,159 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
     f.create()?;
     let error = plan(&f.root, Request::InstallProfile).unwrap_err();
     assert!(format!("{error:#}").contains("requires a configured signed release profile"));
+    Ok(())
+}
+
+#[test]
+fn phased_profile_updates_defer_widen_and_allow_a_saved_override() -> Result<()> {
+    use crate::{PhasedUpdateDeferred, PlanOptions, plan_with_options, stage_boot_environment};
+
+    let f = Fixture::new()?;
+    let companion = Fixture::new()?;
+    let mut pins = Vec::new();
+    for version in ["1.0.0-0", "2.0.0-0"] {
+        companion.package_as("seed", "library/runtime", version, String::new())?;
+        pins.push(fs::read_to_string(companion.repo.join("current"))?);
+        f.package(
+            "desktop/base",
+            version,
+            dependency("require", "library/runtime", version),
+        )?;
+    }
+    for name in ["test/one", "test/two"] {
+        f.package(name, "1.0.0-0", String::new())?;
+    }
+    let release = f._dir.path().join("refresh.kdl");
+    let publish_profile = |version: &str, pin: &str, percentage: u8| -> Result<String> {
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                r#"schema-version 1
+publisher "canopa" {{
+    builder-key "unused.der"
+    profile "desktop" architecture="x86_64" rollout-percentage={percentage} {{
+        package "desktop/base@{version}"
+        publisher "seed" catalog={:?} {{ repository {:?}; trust-key {:?}; }}
+    }}
+}}
+"#,
+                pin.trim(),
+                companion.repo,
+                companion.public,
+            ),
+        )?;
+        let base = fs::read_to_string(f.repo.join("current"))?;
+        fs::write(
+            &release,
+            format!(
+                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                base.trim()
+            ),
+        )?;
+        publish_release(&f.repo, &f.private, &release)
+    };
+    let baseline = publish_profile("1.0.0-0", &pins[0], 100)?;
+    assert!(publish_profile("2.0.0-0", &pins[1], 101).is_err());
+    assert_eq!(fs::read_to_string(f.repo.join("current"))?.trim(), baseline);
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            f.repo, f.public, companion.repo, companion.public,
+        ),
+    )?;
+    create_configured_image(&f.root, &config)?;
+    apply(&f.root, &plan(&f.root, Request::InstallProfile)?)?;
+
+    let paused = publish_profile("2.0.0-0", &pins[1], 0)?;
+    let deferred = |root: &Path| {
+        plan(root, Request::Update)
+            .unwrap_err()
+            .downcast::<PhasedUpdateDeferred>()
+    };
+    let initial = deferred(&f.root)?;
+    assert_eq!(initial.catalog, paused);
+    assert_eq!(initial.percentage, 0);
+    let boot_one = f._dir.path().join("boot-one");
+    let boot_two = f._dir.path().join("boot-two");
+    for (source, target, package) in [
+        (&f.root, &boot_one, "test/one"),
+        (&boot_one, &boot_two, "test/two"),
+    ] {
+        let local = plan(
+            source,
+            Request::Install {
+                packages: vec![package.into()],
+            },
+        )?;
+        stage_boot_environment(source, target, &local)?;
+    }
+    assert_eq!(deferred(&boot_two)?.cohort, initial.cohort);
+
+    let fresh = f._dir.path().join("fresh");
+    create_configured_image(&fresh, &config)?;
+    apply(&fresh, &plan(&fresh, Request::InstallProfile)?)?;
+    assert!(!plan(&fresh, Request::Update)?.has_changes());
+
+    let options = PlanOptions {
+        force_phased_update: true,
+        ..PlanOptions::default()
+    };
+    let packages = vec!["desktop/base".into()];
+    let freeze = plan(
+        &f.root,
+        Request::Freeze {
+            packages: packages.clone(),
+            reason: None,
+        },
+    )?;
+    apply(&f.root, &freeze)?;
+    let error = plan_with_options(&f.root, Request::Update, options).unwrap_err();
+    assert!(format!("{error:#}").contains("frozen at 1.0.0-0"));
+    let unfreeze = plan(&f.root, Request::Unfreeze { packages })?;
+    apply(&f.root, &unfreeze)?;
+
+    let forced = plan_with_options(&f.root, Request::Update, options)?;
+    let saved = serde_json::to_value(&forced)?;
+    let mut without_override = saved.clone();
+    without_override
+        .as_object_mut()
+        .unwrap()
+        .remove("force_phased_update");
+    assert!(
+        apply(&f.root, &serde_json::from_value(without_override)?)
+            .unwrap_err()
+            .downcast_ref::<PhasedUpdateDeferred>()
+            .is_some()
+    );
+    apply(&f.root, &serde_json::from_value(saved)?)?;
+    let history = crate::transaction_history(&f.root, 1)?;
+    assert!(history[0].details.as_ref().unwrap().force_phased_update);
+    assert!(!plan(&f.root, Request::Update)?.has_changes());
+
+    if initial.cohort > 0 {
+        publish_profile("2.0.0-0", &pins[1], initial.cohort)?;
+        assert_eq!(deferred(&boot_two)?.cohort, initial.cohort);
+    }
+    publish_profile("2.0.0-0", &pins[1], initial.cohort + 1)?;
+    apply(&boot_two, &plan(&boot_two, Request::Update)?)?;
+    for root in [&f.root, &boot_two, &fresh] {
+        let installed = list_packages(root, Scope::Installed)?;
+        for name in ["desktop/base", "library/runtime"] {
+            assert!(
+                installed
+                    .iter()
+                    .any(|row| row.name == name && row.id.ends_with("@2.0.0-0"))
+            );
+        }
+        assert!(verify(root)?.is_empty());
+    }
     Ok(())
 }
 

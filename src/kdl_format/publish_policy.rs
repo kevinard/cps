@@ -38,6 +38,7 @@ pub(crate) struct Profile {
     pub upgrade_from: Option<String>,
     pub companions: Vec<Companion>,
     pub elf_library_dirs: Vec<String>,
+    pub rollout_percentage: Option<u8>,
 }
 
 pub(crate) fn validate_elf_dirs(arch: &str, dirs: &[String]) -> Result<()> {
@@ -67,7 +68,12 @@ pub(crate) struct Companion {
 }
 
 fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Profile)> {
-    let fields = Fields::read(node, 1, &["architecture", "upgrade-from"], true)?;
+    let fields = Fields::read(
+        node,
+        1,
+        &["architecture", "upgrade-from", "rollout-percentage"],
+        true,
+    )?;
     let name = fields.string_arg(0)?;
     validate_name(&name)?;
     let arch = fields.required_string("architecture")?;
@@ -76,6 +82,11 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     if let Some(hash) = &upgrade_from {
         validate_digest(hash).context("invalid profile upgrade catalog digest")?;
     }
+    let rollout_percentage: Option<u8> = fields.integer("rollout-percentage")?;
+    ensure!(
+        rollout_percentage.is_none_or(|percentage| percentage <= 100),
+        "rollout-percentage must be between 0 and 100"
+    );
     let mut packages = BTreeMap::new();
     let mut facets = BTreeMap::new();
     let mut companions = Vec::new();
@@ -164,6 +175,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             upgrade_from,
             companions,
             elf_library_dirs,
+            rollout_percentage,
         },
     ))
 }

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use super::Image;
+use super::{Image, Settings};
 use crate::{
     model::{digest, is_uuid, validate_digest},
     plan::{FreezeChange, IntentChange, PackageChange, Request},
@@ -23,6 +23,8 @@ pub struct TransactionDetails {
     pub base_image: String,
     pub base_revision: u64,
     pub request: Request,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_phased_update: bool,
     pub package_changes: Vec<PackageChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_changes: Vec<IntentChange>,
@@ -73,6 +75,54 @@ fn checksum(plan: &str, revision: u64, data: &str) -> String {
     digest(format!("{plan}\n{revision}\n{data}").as_bytes())
 }
 
+fn checked_details(
+    plan: &str,
+    revision: u64,
+    data: &str,
+    hash: &str,
+) -> Result<TransactionDetails> {
+    ensure!(
+        checksum(plan, revision, data) == hash,
+        "transaction details digest mismatch for {plan}"
+    );
+    let details: TransactionDetails = serde_json::from_str(data)?;
+    let expected = if matches!(details.request, Request::ResolveConfig { .. }) {
+        Some(details.base_revision)
+    } else {
+        details.base_revision.checked_add(1)
+    };
+    ensure!(
+        expected == Some(revision) && is_uuid(&details.base_image),
+        "transaction details do not match the committed revision"
+    );
+    Ok(details)
+}
+
+impl Image {
+    pub(crate) fn rollout_identity(&self, settings: &Settings) -> Result<String> {
+        if has_details(&self.db)? {
+            // Boot environments inherit history but receive new image IDs.
+            let mut statement = self.db.prepare(
+                "SELECT h.plan, h.revision, d.data, d.sha256 FROM history h
+                 JOIN transaction_details d ON d.plan=h.plan ORDER BY h.rowid LIMIT 1",
+            )?;
+            if let Some(row) = statement.query([])?.next()? {
+                let plan: String = row.get(0)?;
+                let revision: u64 = row.get(1)?;
+                let data: String = row.get(2)?;
+                let hash: String = row.get(3)?;
+                validate_digest(&plan)?;
+                ensure!(
+                    revision <= settings.revision,
+                    "invalid rollout history revision"
+                );
+                return Ok(checked_details(&plan, revision, &data, &hash)?.base_image);
+            }
+        }
+        Ok(settings.id.clone())
+    }
+}
+
 fn read(root: &Path, plan: Option<&str>, limit: u32) -> Result<Vec<HistoryEntry>> {
     let image = Image::open_query(root)?;
     let settings = image.settings()?;
@@ -102,22 +152,8 @@ fn read(root: &Path, plan: Option<&str>, limit: u32) -> Result<Vec<HistoryEntry>
         let details = row
             .get::<_, Option<String>>(2)?
             .map(|data| -> Result<_> {
-                let expected: String = row.get(3)?;
-                ensure!(
-                    checksum(&plan_id, revision, &data) == expected,
-                    "transaction details digest mismatch for {plan_id}"
-                );
-                let details: TransactionDetails = serde_json::from_str(&data)?;
-                let expected = if matches!(details.request, Request::ResolveConfig { .. }) {
-                    Some(details.base_revision)
-                } else {
-                    details.base_revision.checked_add(1)
-                };
-                ensure!(
-                    expected == Some(revision) && is_uuid(&details.base_image),
-                    "transaction details do not match the committed revision"
-                );
-                Ok(details)
+                let hash: String = row.get(3)?;
+                checked_details(&plan_id, revision, &data, &hash)
             })
             .transpose()?;
         history.push(HistoryEntry {

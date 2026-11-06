@@ -16,8 +16,8 @@ use cps::query::{
 use cps::system::{self, System, UpdateStatus};
 use cps::{
     Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, MarkChoice,
-    PackageChange, Plan, Request, RootDeployment, SourceLayout, activate_boot_environment,
-    activate_boot_environment_on_disk, activate_btrfs_boot_environment,
+    PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, RootDeployment, SourceLayout,
+    activate_boot_environment, activate_boot_environment_on_disk, activate_btrfs_boot_environment,
     activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
     add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
     build_with_recipe_options, capture_boot_environment, create_configured_image, create_image,
@@ -26,7 +26,7 @@ use cps::{
     fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
     fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
-    list_publishers, list_withdrawals, plan_with_recommends, prefer_publisher,
+    list_publishers, list_withdrawals, plan_with_options, prefer_publisher,
     prepare_boot_environment, publish, publish_release_with_sources,
     publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
     remove_publisher, resume_transaction, rollback_boot_environment,
@@ -62,6 +62,9 @@ enum Command {
         /// Stage the transaction in a new Btrfs trial boot environment
         #[arg(long)]
         stage: bool,
+        /// Upgrade even if this image is outside the signed profile rollout
+        #[arg(long)]
+        force_phased_update: bool,
     },
     /// Check for upgrades and report any blockers or reboot requirement
     CheckUpdates {
@@ -790,7 +793,11 @@ enum PlanCommand {
         take: ConfigChoice,
     },
     /// Update the installed package set
-    Update,
+    Update {
+        /// Plan the upgrade even if this image is outside the signed profile rollout
+        #[arg(long)]
+        force_phased_update: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1106,15 +1113,31 @@ fn print_package_changes(changes: &[PackageChange]) {
     }
 }
 
-fn change_system(options: SystemOptions, request: Request, stage: bool) -> Result<()> {
-    let system =
-        System::load(&options.config)?.with_install_recommends(!options.no_install_recommends);
+fn change_system(
+    options: SystemOptions,
+    request: Request,
+    stage: bool,
+    force_phased_update: bool,
+) -> Result<()> {
+    let system = System::load(&options.config)?
+        .with_install_recommends(!options.no_install_recommends)
+        .with_force_phased_update(force_phased_update);
     let _lock = system.lock()?;
     let refresh = !options.no_refresh;
-    let mut change = if !options.yes && !options.dry_run && io::stdin().is_terminal() {
-        system.plan_with_source_selection(request, refresh, choose_install_source)?
+    let result = if !options.yes && !options.dry_run && io::stdin().is_terminal() {
+        system.plan_with_source_selection(request, refresh, choose_install_source)
     } else {
-        system.plan(request, refresh)?
+        system.plan(request, refresh)
+    };
+    let mut change = match result {
+        Ok(change) => change,
+        Err(error) => {
+            if let Some(deferred) = error.downcast_ref::<PhasedUpdateDeferred>() {
+                println!("{deferred}");
+                return Ok(());
+            }
+            return Err(error);
+        }
     };
     if stage {
         change = change.with_staging();
@@ -1164,6 +1187,9 @@ fn check_system_updates(config: &Path, refresh: bool, json: bool) -> Result<Exit
         if report.status == UpdateStatus::UpToDate {
             println!("Up to date.");
         }
+        if let Some(deferred) = &report.phased_update {
+            println!("{deferred}");
+        }
         print_package_changes(&report.changes);
         for update in &report.held_back {
             println!(
@@ -1193,8 +1219,12 @@ fn run(command: Command) -> Result<ExitCode> {
             options,
             stage,
             packages,
-        } => change_system(options, Request::Install { packages }, stage)?,
-        Command::Upgrade { options, stage } => change_system(options, Request::Update, stage)?,
+        } => change_system(options, Request::Install { packages }, stage, false)?,
+        Command::Upgrade {
+            options,
+            stage,
+            force_phased_update,
+        } => change_system(options, Request::Update, stage, force_phased_update)?,
         Command::CheckUpdates {
             config,
             json,
@@ -1203,9 +1233,11 @@ fn run(command: Command) -> Result<ExitCode> {
             return check_system_updates(&config, !no_refresh, json);
         }
         Command::Remove { options, packages } => {
-            change_system(options, Request::Remove { packages }, false)?
+            change_system(options, Request::Remove { packages }, false, false)?
         }
-        Command::Autoremove { options } => change_system(options, Request::Autoremove, false)?,
+        Command::Autoremove { options } => {
+            change_system(options, Request::Autoremove, false, false)?
+        }
         Command::Status { config } => {
             let system = System::load(&config)?;
             let (running, entries) = system.boot_status()?;
@@ -1947,6 +1979,12 @@ fn run(command: Command) -> Result<ExitCode> {
             no_install_recommends,
             request,
         } => {
+            let force_phased_update = matches!(
+                request,
+                PlanCommand::Update {
+                    force_phased_update: true
+                }
+            );
             let request = match request {
                 PlanCommand::Freeze { packages, reason } => Request::Freeze { packages, reason },
                 PlanCommand::Unfreeze { packages } => Request::Unfreeze { packages },
@@ -1961,9 +1999,16 @@ fn run(command: Command) -> Result<ExitCode> {
                 },
                 PlanCommand::Repair { packages } => Request::Repair { packages },
                 PlanCommand::ResolveConfig { path, take } => Request::ResolveConfig { path, take },
-                PlanCommand::Update => Request::Update,
+                PlanCommand::Update { .. } => Request::Update,
             };
-            let plan = plan_with_recommends(&root, request, !no_install_recommends)?;
+            let plan = plan_with_options(
+                &root,
+                request,
+                PlanOptions {
+                    install_recommends: !no_install_recommends,
+                    force_phased_update,
+                },
+            )?;
             save(&output, &plan).with_context(|| format!("saving {}", output.display()))?;
             println!("{}", plan.summary());
         }

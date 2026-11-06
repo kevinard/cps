@@ -30,7 +30,9 @@ It refreshes configured mirrors as `upgrade` does. Use `--no-refresh` to
 check the cached catalogs. It only plans the transaction, so the installed
 system and boot selection stay as they are while the mirror cache can advance.
 
-The JSON `status` is `up_to_date`, `updates_available`, or `blocked`.
+The JSON `status` is `up_to_date`, `updates_available`, `deferred`, or
+`blocked`. When a signed rollout defers an upgrade, `phased_update`
+identifies the profile, target catalog, rollout percentage, and image cohort.
 `changes` lists the planned package changes, including dependency installs
 and removals. `held_back` lists packages for which the current catalogs and
 profile offer a newer version than the plan selects. Each entry gives the
@@ -1541,6 +1543,48 @@ primary catalog and must match the companion digests signed in that catalog.
 Local history keeps those plans usable after a release advances. Offline
 installed-package queries, removal, and repair use committed image state.
 Upgrade CPS before using catalogs with signed release profile records.
+
+### Phased profile updates
+
+Set `rollout-percentage` on a profile in the publisher's release policy.
+The value is signed with the checked composition.
+
+```kdl
+profile "desktop" architecture="x86_64" rollout-percentage=10 {
+    package "desktop/base@2.0.0-0"
+}
+```
+
+An image outside the rollout defers the entire composition-changing upgrade,
+including the packages from pinned companion catalogs. A percentage of
+`0` pauses these upgrades and `100` makes the profile available to every
+cohort. Omitting the property also makes the profile available to everyone.
+New images can install a profile at any percentage. Mirror refreshes can
+continue while the package upgrade is deferred.
+
+CPS assigns a cohort from 0 to 99 using the image's original identity and the
+target profile's roots, manifest digests, and companion catalog pins.
+Boot environments inherit their source image's cohort for the same target.
+Images cloned from the same provisioned image share a cohort. Independently
+created images get separate identities by default.
+
+To widen the rollout, change the percentage and publish with
+`refresh-profiles=#true` using the current catalog as the release base.
+Keeping the same composition, roots, and companion pins keeps the same
+cohorts. If an earlier composition is still deployed, the publish policy's
+`upgrade-from` can also check the transition from that catalog.
+
+A deferred `plan update` reports the reason without saving a plan. Operators
+can override the gate explicitly.
+
+```sh
+sudo cps upgrade --force-phased-update
+cps plan --root image --output upgrade.json update --force-phased-update
+```
+
+The override is recorded in the saved plan and transaction history. The
+normal signature, dependency, and image checks still apply. Upgrade clients
+before publishing profiles that use `rollout-percentage`.
 
 ## Manifest and image behavior
 
