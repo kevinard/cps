@@ -2394,6 +2394,22 @@ fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
             f.file(COMPOSITOR, "overlapping actions", "0755", "arch=\"x86_64\"")?,
         ),
     )?;
+    let mut held_back = Vec::new();
+    let inspected = crate::plan::inspect_update(
+        &f.root,
+        crate::plan::UpdateDiagnostics {
+            held_back: &mut held_back,
+            explain: Some("desktop/app"),
+        },
+    )?;
+    assert!(!inspected.has_changes());
+    assert_eq!(held_back.len(), 1);
+    assert_eq!(held_back[0].available.to_string(), "4.0.0-0");
+    assert!(
+        held_back[0].reason.contains(COMPOSITOR),
+        "{}",
+        held_back[0].reason
+    );
     let update = plan(&f.root, Request::Update)?;
     apply(&f.root, &update)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compatible");

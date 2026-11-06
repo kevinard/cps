@@ -40,7 +40,12 @@ installed, newest available, and selected versions and the freeze reason
 when applicable. The selected version is `null` if planning fails.
 `blockers` contains errors that prevented a plan, such as a
 pending trial boot or an unsatisfiable release profile. A check can report
-both actionable changes and held-back packages.
+both actionable changes and held-back packages. Use
+`check-updates --explain library/libdisplay` to probe the newest held-back
+version of one package with the same catalog pins. The report includes
+the resulting solver or build-trust error, or indicates that the version
+fits when explicitly required. The probe leaves the normal upgrade plan
+as selected.
 
 `reboot_required` is a boolean for the actionable plan and `reboot_reason`
 explains a required reboot. Both fields are `null` when the upgrade is

@@ -582,13 +582,22 @@ pub fn plan_with_options(path: &Path, request: Request, options: PlanOptions) ->
     Ok(plan_image(path, request, options, None)?.0)
 }
 
-pub(crate) fn inspect_update(path: &Path, held_back: &mut Vec<HeldBackUpdate>) -> Result<Plan> {
+pub(crate) struct UpdateDiagnostics<'a> {
+    pub held_back: &'a mut Vec<HeldBackUpdate>,
+    pub explain: Option<&'a str>,
+}
+
+pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) -> Result<Plan> {
+    let UpdateDiagnostics { held_back, explain } = diagnostics;
     held_back.clear();
+    if let Some(name) = explain {
+        validate_name(name).context("invalid package name for --explain")?;
+    }
     let (plan, next, _) = plan_image(
         path,
         Request::Update,
         PlanOptions::default(),
-        Some(held_back),
+        Some(UpdateDiagnostics { held_back, explain }),
     )?;
     held_back.retain_mut(|update| {
         let Some(package) = next.installed.get(&update.name) else {
@@ -605,7 +614,7 @@ fn plan_image(
     path: &Path,
     request: Request,
     options: PlanOptions,
-    held_back: Option<&mut Vec<HeldBackUpdate>>,
+    diagnostics: Option<UpdateDiagnostics<'_>>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
@@ -630,7 +639,7 @@ fn plan_image(
         None,
         Some(solver),
         options.force_phased_update,
-        held_back,
+        diagnostics,
     )
 }
 
@@ -728,7 +737,7 @@ fn build_with_update_diagnostics(
     saved: Option<&Plan>,
     solver: Option<SolverRevision>,
     force_phased_update: bool,
-    held_back: Option<&mut Vec<HeldBackUpdate>>,
+    mut diagnostics: Option<UpdateDiagnostics<'_>>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let root = &image.root;
     let updating = matches!(request, Request::Update | Request::UpdateProfile);
@@ -902,9 +911,9 @@ fn build_with_update_diagnostics(
                     .profile
                     .as_ref()
                     .is_some_and(|profile| !profile.composition.is_empty());
-            if let Some(held_back) = held_back {
+            if let Some(diagnostics) = &mut diagnostics {
                 // Keep the known candidates available even if resolution fails.
-                *held_back = update::candidates(&state, &catalogs, update_profile);
+                *diagnostics.held_back = update::candidates(&state, &catalogs, update_profile);
             }
             let locked_profile = lock.is_some_and(|lock| lock.profile.is_some());
             track_profile_intent = locked_profile
@@ -922,6 +931,46 @@ fn build_with_update_diagnostics(
                 catalogs.profile.as_ref().filter(|_| update_profile),
             )?;
             let successors = catalogs.renames.requirements();
+            let select = |state: &State, requirements: &BTreeMap<&str, PackageSpec<'_>>| {
+                if update_profile {
+                    let profile = catalogs
+                        .profile
+                        .as_ref()
+                        .context("missing signed release profile")?;
+                    ensure!(
+                        !profile.composition.is_empty(),
+                        "signed release profile has no recorded composition"
+                    );
+                    catalogs.candidates.update_profile(
+                        &state.installed,
+                        profile,
+                        &state.settings.freezes,
+                        state
+                            .settings
+                            .profile_intent
+                            .as_ref()
+                            .filter(|_| track_profile_intent)
+                            .map(|intent| &intent.local),
+                        requirements,
+                        solver,
+                        |installed| composition_paths(&state.settings, installed, solver),
+                    )
+                } else {
+                    resolve_local(
+                        state,
+                        Candidates {
+                            packages: &catalogs.candidates.packages,
+                            obsoletions: &catalogs.candidates.obsoletions,
+                            freezes: &state.settings.freezes,
+                            profile_packages: &state.settings.profile_packages,
+                        },
+                        requirements,
+                        matches!(request, Request::Update),
+                        matches!(request, Request::ExactInstall { .. }),
+                        solver,
+                    )
+                }
+            };
             let (mut installed, paths) = if let Some(lock) = lock {
                 let mut installed = lock.replay(&catalogs.candidates.packages)?;
                 if let Some(profile) = &catalogs.profile {
@@ -964,44 +1013,36 @@ fn build_with_update_diagnostics(
                 freeze::check(&state.settings.freezes, &installed)?;
                 let paths = effective_paths(&state.settings, &installed)?;
                 (installed, paths)
-            } else if update_profile {
-                let profile = catalogs
-                    .profile
-                    .as_ref()
-                    .context("missing signed release profile")?;
-                ensure!(
-                    !profile.composition.is_empty(),
-                    "signed release profile has no recorded composition"
-                );
-                catalogs.candidates.update_profile(
-                    &state.installed,
-                    profile,
-                    &state.settings.freezes,
-                    state
-                        .settings
-                        .profile_intent
-                        .as_ref()
-                        .filter(|_| track_profile_intent)
-                        .map(|intent| &intent.local),
-                    &successors,
-                    solver,
-                    |installed| composition_paths(&state.settings, installed, solver),
-                )?
             } else {
-                resolve_local(
-                    &state,
-                    Candidates {
-                        packages: &catalogs.candidates.packages,
-                        obsoletions: &catalogs.candidates.obsoletions,
-                        freezes: &state.settings.freezes,
-                        profile_packages: &state.settings.profile_packages,
-                    },
-                    if updating { &successors } else { &requested },
-                    matches!(request, Request::Update),
-                    matches!(request, Request::ExactInstall { .. }),
-                    solver,
-                )?
+                select(&state, if updating { &successors } else { &requested })?
             };
+            if let Some(diagnostics) = diagnostics
+                && let Some(name) = diagnostics.explain
+                && !state.settings.freezes.contains_key(name)
+                && let Some(candidate) = diagnostics
+                    .held_back
+                    .iter_mut()
+                    .find(|update| update.name == name)
+                && installed
+                    .get(name)
+                    .is_some_and(|package| package.published.manifest.version < candidate.available)
+            {
+                let mut forced = successors.clone();
+                forced.insert(
+                    name,
+                    PackageSpec {
+                        publisher: Some(&candidate.publisher),
+                        name,
+                        version: Some(candidate.available),
+                    },
+                );
+                candidate.reason = match select(&state, &forced).and_then(|(installed, _)| {
+                    catalogs.verify_builds(image, &state, &installed)
+                }) {
+                    Ok(_) => "The newer version fits when explicitly required; the automatic upgrade selected another combination".into(),
+                    Err(error) => format!("{error:#}"),
+                };
+            }
             if let Some(intent) = &mut state.settings.profile_intent {
                 catalogs.renames.transfer_local(&mut intent.local);
             } else if !update_profile {

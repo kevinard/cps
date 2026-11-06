@@ -78,6 +78,9 @@ enum Command {
         /// Use the currently cached catalogs
         #[arg(long)]
         no_refresh: bool,
+        /// Probe the exact newer version of this held-back package
+        #[arg(long, value_name = "PACKAGE")]
+        explain: Option<String>,
     },
     /// Remove installed packages and stage changes that require a reboot
     Remove {
@@ -1360,8 +1363,13 @@ fn change_system(
     Ok(())
 }
 
-fn check_system_updates(config: &Path, refresh: bool, json: bool) -> Result<ExitCode> {
-    let report = System::check_updates(config, refresh);
+fn check_system_updates(
+    config: &Path,
+    refresh: bool,
+    json: bool,
+    explain: Option<&str>,
+) -> Result<ExitCode> {
+    let report = System::check_updates_with_explanation(config, refresh, explain);
     if json {
         let mut out = io::stdout().lock();
         serde_json::to_writer_pretty(&mut out, &report)?;
@@ -1412,8 +1420,9 @@ fn run(command: Command) -> Result<ExitCode> {
             config,
             json,
             no_refresh,
+            explain,
         } => {
-            return check_system_updates(&config, !no_refresh, json);
+            return check_system_updates(&config, !no_refresh, json, explain.as_deref());
         }
         Command::Remove { options, packages } => {
             change_system(options, Request::Remove { packages }, false, false)?

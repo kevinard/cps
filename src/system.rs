@@ -23,7 +23,7 @@ use crate::{
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
-    plan::inspect_update,
+    plan::{UpdateDiagnostics, inspect_update},
     plan_with_options,
     query::{InstallSource, SelectSource, select_install_sources},
     release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
@@ -239,11 +239,23 @@ impl System {
 
     /// Check the running system with the same refresh and planner as an upgrade.
     pub fn check_updates(config: &Path, refresh: bool) -> UpdateReport {
+        Self::check_updates_with_explanation(config, refresh, None)
+    }
+
+    pub fn check_updates_with_explanation(
+        config: &Path,
+        refresh: bool,
+        explain: Option<&str>,
+    ) -> UpdateReport {
         let mut held_back = Vec::new();
         let result = (|| {
             let system = Self::load(config)?;
             let _lock = system.lock()?;
-            system.plan_request(Request::Update, refresh, None, Some(&mut held_back))
+            let diagnostics = UpdateDiagnostics {
+                held_back: &mut held_back,
+                explain,
+            };
+            system.plan_request(Request::Update, refresh, None, Some(diagnostics))
         })();
         UpdateReport::from_plan(result, held_back)
     }
@@ -253,7 +265,7 @@ impl System {
         mut request: Request,
         refresh: bool,
         choose: Option<&mut SelectSource<'_>>,
-        held_back: Option<&mut Vec<HeldBackUpdate>>,
+        diagnostics: Option<UpdateDiagnostics<'_>>,
     ) -> Result<Change> {
         let uses_current_catalogs = matches!(request, Request::Install { .. } | Request::Update);
         ensure!(
@@ -269,8 +281,8 @@ impl System {
             select_install_sources(Path::new(ROOT), packages, choose)?;
         }
         let root = Path::new(ROOT);
-        let plan = match held_back {
-            Some(held_back) => inspect_update(root, held_back)?,
+        let plan = match diagnostics {
+            Some(diagnostics) => inspect_update(root, diagnostics)?,
             None => plan_with_options(root, request, self.plan_options)?,
         };
         Ok(Change::from_plan(plan, &self.definition.stage_packages))
