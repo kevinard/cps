@@ -241,6 +241,36 @@ Use the digest of the selected repository catalog, such as the digest recorded i
 
 `solver="sat-v1"` pins the toolchain selection algorithm. Recipes written before this setting was introduced retain the original resolver when the setting is absent.
 
+### Setting build options
+
+Declare each configurable option and its default inside the `build` block.
+A recipe that uses Make can pass compiler flags like this.
+
+```kdl
+option "CFLAGS" "-O2"
+script """
+make "CFLAGS=$CPS_BUILD_CFLAGS"
+make "CFLAGS=$CPS_BUILD_CFLAGS" DESTDIR="$DESTDIR" install
+"""
+```
+
+CPS exposes a declared option named `NAME` as `CPS_BUILD_NAME` inside the
+sandbox. Option names start with an uppercase ASCII letter and can also
+contain digits and underscores. The recipe decides how to use each value.
+Pass `--option NAME=VALUE` for each override.
+
+```sh
+cps build --toolchain-config toolchain.kdl --source-cache source-cache \
+    --output custom --check-reproducible --option 'CFLAGS=-O3 -g' hello.build.kdl
+```
+
+Both reproducibility runs use the same effective values. CPS saves them
+in `custom/build.kdl`, and any builder attestation signs that recipe's
+digest. Review the effective recipe before approving its digest for
+publication. A changed option produces a different recipe digest from
+the publisher's original, so an exact rebuild uses the publisher's
+archived values.
+
 ### Building with several publishers
 
 Use a toolchain block with publisher pins when a compiler and its dependencies

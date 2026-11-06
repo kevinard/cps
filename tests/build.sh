@@ -238,6 +238,24 @@ test ! -e first/proto/unlisted
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
 test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
 
+# Both sandbox runs and the signed recipe must use the selected build flags.
+recipe '    printf "%s\n" "$CPS_BUILD_CFLAGS" > "$DESTDIR/hello"' |
+    sed '/    script /i\    option "CFLAGS" "-O2"' > options.build.kdl
+CPS_BUILD_CFLAGS=from-host build_package --sources sources --output default-flags options.build.kdl
+test "$(cat default-flags/proto/hello)" = '-O2'
+flags='-O3 -g -DNAME=x=y'
+build_package --sources sources --option "CFLAGS=$flags" --check-reproducible \
+    --builder-signing-key builder.der --output custom-flags options.build.kdl
+test "$(cat custom-flags/proto/hello)" = "$flags"
+if "$cps" publish-bundle --repo options-repo --signing-key signing.der --builder-key builder-public.der \
+    --recipe-sha256 "$(sha options.build.kdl)" custom-flags > options.log 2>&1; then
+    echo 'The default recipe digest accepted a build with overridden flags' >&2
+    exit 1
+fi
+grep -F 'build recipe differs from the reviewed digest' options.log
+"$cps" publish-bundle --repo options-repo --signing-key signing.der --builder-key builder-public.der \
+    --recipe-sha256 "$(sha custom-flags/build.kdl)" custom-flags
+
 # Resolve the probe from a separately signed publisher and its shell from the
 # primary catalog. Each repository retains a newer, unusable probe as well.
 install -m755 probe proto/usr/bin/probe

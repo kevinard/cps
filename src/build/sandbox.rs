@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, PipeReader, Read, Seek, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
@@ -68,6 +69,7 @@ pub(super) fn run(
     script: &Path,
     output: &Path,
     epoch: u32,
+    options: &BTreeMap<String, String>,
     worker: &BuildWorker,
 ) -> Result<()> {
     let group = worker.cgroup.as_ref().map(Cgroup::create).transpose()?;
@@ -135,6 +137,12 @@ pub(super) fn run(
         ("DESTDIR", "/out"),
     ] {
         command.args(["--setenv", key, value]);
+    }
+    for (name, value) in options {
+        command
+            .arg("--setenv")
+            .arg(format!("CPS_BUILD_{name}"))
+            .arg(value);
     }
     let (logs, writer) = io::pipe()?;
     command

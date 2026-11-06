@@ -13,12 +13,12 @@ use cps::query::{
 };
 use cps::system::{self, System};
 use cps::{
-    Activation, BuildOptions, BuildSettings, BuildWitness, ConfigChoice, MarkChoice, Plan, Request,
-    RootDeployment, SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
-    activate_btrfs_boot_environment, activate_deployed_boot_environment,
-    activate_device_boot_environment, add_publisher_from_url, add_publisher_with_build_trust,
-    apply, archive_build_sources, audit_publisher_builds, build_with_toolchain_config,
-    build_with_worker, capture_boot_environment, create_configured_image, create_image,
+    Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, MarkChoice, Plan,
+    Request, RootDeployment, SourceLayout, activate_boot_environment,
+    activate_boot_environment_on_disk, activate_btrfs_boot_environment,
+    activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
+    add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
+    build_with_recipe_options, capture_boot_environment, create_configured_image, create_image,
     deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
     export_boot_environment, export_boot_environment_receipt, export_rebuild_inputs,
     fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
@@ -92,6 +92,9 @@ enum Command {
         worker_config: Option<PathBuf>,
         #[arg(long, requires = "check_reproducible")]
         builder_signing_key: Option<PathBuf>,
+        /// Override a build option declared in the recipe
+        #[arg(long = "option", value_name = "NAME=VALUE")]
+        recipe_options: Vec<String>,
         recipe: PathBuf,
     },
     /// Prepare a package manifest for review
@@ -1102,6 +1105,7 @@ fn run(command: Command) -> Result<ExitCode> {
             check_reproducible,
             worker_config,
             builder_signing_key,
+            recipe_options,
             recipe,
         } => {
             let input = source_cache
@@ -1118,39 +1122,44 @@ fn run(command: Command) -> Result<ExitCode> {
                 .map(read_worker_config)
                 .transpose()?
                 .unwrap_or_default();
-            let id = if let Some(config) = toolchain_config {
-                build_with_toolchain_config(
-                    &recipe,
-                    &config,
-                    BuildSettings {
-                        sources: input,
-                        output: &output,
-                        check_reproducible,
-                        builder_signing_key: builder_signing_key.as_deref(),
-                    },
-                    layout,
-                    &worker,
-                )?
+            let toolchain = if let Some(config) = toolchain_config.as_deref() {
+                BuildToolchain::Config(config)
             } else {
-                build_with_worker(
-                    &recipe,
-                    BuildOptions {
-                        repo: repo.as_deref().context("missing toolchain repository")?,
-                        publisher: publisher
-                            .as_deref()
-                            .context("missing toolchain publisher")?,
-                        trust_key: trust_key
-                            .as_deref()
-                            .context("missing toolchain trust key")?,
-                        sources: input,
-                        output: &output,
-                        check_reproducible,
-                        builder_signing_key: builder_signing_key.as_deref(),
-                    },
-                    layout,
-                    &worker,
-                )?
+                BuildToolchain::Single {
+                    repo: repo.as_deref().context("missing toolchain repository")?,
+                    publisher: publisher
+                        .as_deref()
+                        .context("missing toolchain publisher")?,
+                    trust_key: trust_key
+                        .as_deref()
+                        .context("missing toolchain trust key")?,
+                }
             };
+            let mut overrides = BTreeMap::new();
+            for option in recipe_options {
+                let (name, value) = option
+                    .split_once('=')
+                    .context("expected --option NAME=VALUE")?;
+                ensure!(
+                    overrides
+                        .insert(name.to_owned(), value.to_owned())
+                        .is_none(),
+                    "duplicate --option {name}"
+                );
+            }
+            let id = build_with_recipe_options(
+                &recipe,
+                toolchain,
+                BuildSettings {
+                    sources: input,
+                    output: &output,
+                    check_reproducible,
+                    builder_signing_key: builder_signing_key.as_deref(),
+                },
+                layout,
+                &worker,
+                &overrides,
+            )?;
             println!("Built {id} at {}", output.display());
         }
         Command::Manifest { command } => match command {

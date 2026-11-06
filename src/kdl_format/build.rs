@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use kdl::KdlDocument;
+use kdl::{KdlDocument, KdlValue};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -46,6 +46,7 @@ pub(crate) struct BuildRecipe {
     pub manifest: String,
     pub manifest_digest: String,
     pub sources: BTreeMap<String, Source>,
+    pub options: BTreeMap<String, String>,
     pub script: String,
 }
 
@@ -84,6 +85,57 @@ pub(crate) fn read(path: &Path) -> Result<(Vec<u8>, BuildRecipe)> {
     let recipe = parse(std::str::from_utf8(&bytes)?)
         .with_context(|| format!("parsing build recipe {}", path.display()))?;
     Ok((bytes, recipe))
+}
+
+pub(crate) fn read_with_options(
+    path: &Path,
+    overrides: &BTreeMap<String, String>,
+) -> Result<(Vec<u8>, BuildRecipe)> {
+    let (bytes, recipe) = read(path)?;
+    for (name, value) in overrides {
+        ensure!(
+            recipe.options.contains_key(name),
+            "build option {name:?} is not declared in the recipe"
+        );
+        check_option(name, value)?;
+    }
+    if overrides
+        .iter()
+        .all(|(name, value)| recipe.options.get(name) == Some(value))
+    {
+        return Ok((bytes, recipe));
+    }
+
+    let mut doc = document(std::str::from_utf8(&bytes)?)?;
+    let build = doc.get_mut("build").context("missing build node")?;
+    for node in build
+        .iter_children_mut()
+        .filter(|node| node.name().value() == "option")
+    {
+        let name = node
+            .get(0)
+            .and_then(KdlValue::as_string)
+            .context("missing build option name")?;
+        if let Some(value) = overrides
+            .get(name)
+            .filter(|value| recipe.options.get(name) != Some(value))
+        {
+            let entry = &mut node.entries_mut()[1];
+            let value = KdlValue::String(value.clone());
+            if let Some(format) = entry.format_mut() {
+                format.value_repr = value.to_string();
+            }
+            entry.set_value(value);
+        }
+    }
+    let text = doc.to_string();
+    ensure!(
+        text.len() as u64 <= RECIPE_LIMIT,
+        "effective build recipe exceeds the size limit"
+    );
+    // The sandbox and the attestation both use the effective document.
+    let effective = parse(&text).context("reading the effective build recipe")?;
+    Ok((text.into_bytes(), effective))
 }
 
 pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, PublisherConfig>> {
@@ -211,9 +263,20 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     );
 
     let mut sources = BTreeMap::new();
+    let mut options = BTreeMap::new();
     for node in children.nodes() {
         match node.name().value() {
             "toolchain" | "manifest" | "script" => {}
+            "option" => {
+                let fields = Fields::read(node, 2, &[], false)?;
+                let name = fields.string_arg(0)?;
+                let value = fields.string_arg(1)?;
+                check_option(&name, &value)?;
+                ensure!(
+                    options.insert(name.clone(), value).is_none(),
+                    "duplicate build option {name}"
+                );
+            }
             "source" => {
                 let fields = Fields::read(node, 1, &["sha256", "size", "url"], false)?;
                 let path = fields.string_arg(0)?;
@@ -266,10 +329,31 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         manifest,
         manifest_digest,
         sources,
+        options,
         script,
     };
     recipe.requested()?;
     Ok(recipe)
+}
+
+fn check_option(name: &str, value: &str) -> Result<()> {
+    ensure!(
+        name.len() <= 64
+            && name.starts_with(|c: char| c.is_ascii_uppercase())
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'),
+        "invalid build option name {name:?}; use uppercase ASCII letters, digits, and underscores"
+    );
+    ensure!(
+        !value.contains('\0'),
+        "build option {name} contains a NUL character"
+    );
+    ensure!(
+        value.len() <= 16 * 1024,
+        "build option {name} exceeds 16 KiB"
+    );
+    Ok(())
 }
 
 fn source_url(value: &str) -> Result<Url> {
@@ -288,6 +372,45 @@ fn source_url(value: &str) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_recipe_pins_option_overrides_and_preserves_default_bytes() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("example.build.kdl");
+        let recipe = format!(
+            r#"schema-version 1
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain "{digest}" {{ package "devel/base"; }}
+    manifest "nested/hello.kdl" sha256="{digest}"
+    option "CFLAGS" "-O2" // compiler flags
+    script "true"
+}}
+"#,
+            digest = "0".repeat(64),
+        );
+        std::fs::write(&path, &recipe)?;
+        let options = |name: &str, value: &str| BTreeMap::from([(name.into(), value.into())]);
+        let (bytes, parsed) = read_with_options(&path, &options("CFLAGS", "-O2"))?;
+        assert_eq!(bytes, recipe.as_bytes());
+        assert_eq!(parsed.options["CFLAGS"], "-O2");
+
+        let flags = "-O3 -DNAME=\"a b\" -DKEY=x=y\n\\literal";
+        let (bytes, effective) = read_with_options(&path, &options("CFLAGS", flags))?;
+        assert_eq!(effective.options["CFLAGS"], flags);
+        assert_eq!(effective.manifest, "nested/hello.kdl");
+        assert!(std::str::from_utf8(&bytes)?.contains("// compiler flags"));
+        assert_eq!(std::fs::read(&path)?, recipe.as_bytes());
+        assert_eq!(
+            parse(std::str::from_utf8(&bytes)?)?.options,
+            effective.options
+        );
+
+        assert!(read_with_options(&path, &options("RUSTFLAGS", "-g")).is_err());
+        assert!(read_with_options(&path, &options("CFLAGS", "\0")).is_err());
+        assert!(parse(&recipe.replace("CFLAGS", "CFLAGS=PATH")).is_err());
+        assert!(parse(&recipe.replace("script", "option \"CFLAGS\" \"-O0\"; script")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn source_urls_require_https_without_credentials() {

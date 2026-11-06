@@ -22,7 +22,10 @@ use crate::{
     image::{Installed, Managed, root::Root},
     kdl_format::{
         PublisherConfig,
-        build::{BuildRecipe, PublisherPin, ToolchainPins, read, read_toolchain_config},
+        build::{
+            BuildRecipe, PublisherPin, ToolchainPins, read, read_toolchain_config,
+            read_with_options,
+        },
         parse_manifest,
     },
     model::{FileDigest, Node, digest, digest_reader},
@@ -54,7 +57,7 @@ pub struct BuildSettings<'a> {
     pub builder_signing_key: Option<&'a Path>,
 }
 
-enum ToolchainLocation<'a> {
+pub enum BuildToolchain<'a> {
     Single {
         repo: &'a Path,
         publisher: &'a str,
@@ -141,9 +144,9 @@ pub fn build_with_worker(
     layout: SourceLayout,
     worker: &BuildWorker,
 ) -> Result<String> {
-    build_inner(
+    build_with_recipe_options(
         recipe_path,
-        ToolchainLocation::Single {
+        BuildToolchain::Single {
             repo: options.repo,
             publisher: options.publisher,
             trust_key: options.trust_key,
@@ -156,6 +159,7 @@ pub fn build_with_worker(
         },
         layout,
         worker,
+        &BTreeMap::new(),
     )
 }
 
@@ -167,21 +171,24 @@ pub fn build_with_toolchain_config(
     layout: SourceLayout,
     worker: &BuildWorker,
 ) -> Result<String> {
-    build_inner(
+    build_with_recipe_options(
         recipe_path,
-        ToolchainLocation::Config(config),
+        BuildToolchain::Config(config),
         settings,
         layout,
         worker,
+        &BTreeMap::new(),
     )
 }
 
-fn build_inner(
+/// Override named recipe options and record their effective values in the bundle.
+pub fn build_with_recipe_options(
     recipe_path: &Path,
-    location: ToolchainLocation<'_>,
+    location: BuildToolchain<'_>,
     settings: BuildSettings<'_>,
     layout: SourceLayout,
     worker: &BuildWorker,
+    overrides: &BTreeMap<String, String>,
 ) -> Result<String> {
     let BuildSettings {
         sources,
@@ -201,7 +208,7 @@ fn build_inner(
         matches!(std::env::consts::ARCH, "x86_64" | "aarch64"),
         "the build sandbox supports x86_64 and aarch64"
     );
-    let (recipe_bytes, recipe) = read(recipe_path)?;
+    let (recipe_bytes, recipe) = read_with_options(recipe_path, overrides)?;
     ensure!(
         recipe.arch == std::env::consts::ARCH,
         "toolchain architecture {} does not match this build worker",
@@ -248,9 +255,9 @@ fn build_inner(
     let stage = TempDir::new_in(&destination)?;
     let proto = stage.path().join("proto");
     fs::create_dir(&proto)?;
-    let artifacts = run(work.path(), recipe.epoch, worker, &paths, Some(&proto))?;
+    let artifacts = run(work.path(), &recipe, worker, &paths, Some(&proto))?;
     if check_reproducible {
-        let repeated = run(work.path(), recipe.epoch, worker, &paths, None)?;
+        let repeated = run(work.path(), &recipe, worker, &paths, None)?;
         for (path, hash) in &artifacts {
             ensure!(
                 repeated.get(path) == Some(hash),
@@ -399,12 +406,12 @@ impl ToolchainRepository {
 
 fn toolchain_repositories(
     pins: &ToolchainPins,
-    location: ToolchainLocation<'_>,
+    location: BuildToolchain<'_>,
 ) -> Result<Vec<ToolchainRepository>> {
     match (pins, location) {
         (
             ToolchainPins::Single(catalog),
-            ToolchainLocation::Single {
+            BuildToolchain::Single {
                 repo,
                 publisher,
                 trust_key,
@@ -422,7 +429,7 @@ fn toolchain_repositories(
                 build_trust: None,
             }])
         }
-        (ToolchainPins::Publishers(pins), ToolchainLocation::Config(config)) => {
+        (ToolchainPins::Publishers(pins), BuildToolchain::Config(config)) => {
             let mut config = read_toolchain_config(config)
                 .with_context(|| format!("loading toolchain configuration {}", config.display()))?;
             ensure!(
@@ -445,7 +452,7 @@ fn toolchain_repositories(
         (ToolchainPins::Publishers(_), _) => {
             bail!("pinned toolchain publishers require a toolchain configuration")
         }
-        (ToolchainPins::Single(catalog), ToolchainLocation::Config(config)) => {
+        (ToolchainPins::Single(catalog), BuildToolchain::Config(config)) => {
             let mut entries = read_toolchain_config(config)?;
             ensure!(
                 entries.len() == 1,
@@ -466,7 +473,7 @@ struct ResolvedToolchain {
 }
 
 fn resolve_toolchain(
-    location: ToolchainLocation<'_>,
+    location: BuildToolchain<'_>,
     recipe: &BuildRecipe,
 ) -> Result<ResolvedToolchain> {
     let repositories = toolchain_repositories(&recipe.toolchain, location)?;
@@ -550,7 +557,7 @@ pub(crate) fn verify_toolchain(
     recipe: &BuildRecipe,
     claimed: &Toolchain,
 ) -> Result<()> {
-    let selection = resolve_toolchain(ToolchainLocation::Config(config), recipe)?;
+    let selection = resolve_toolchain(BuildToolchain::Config(config), recipe)?;
     ensure!(
         &selection.evidence(&recipe.toolchain)? == claimed,
         "attested toolchain differs from the independently resolved toolchain"
@@ -561,7 +568,7 @@ pub(crate) fn verify_toolchain(
 /// Verify the pinned build selection and fetch only its required toolchain payloads.
 pub fn fetch_toolchain(recipe_path: &Path, config: &Path) -> Result<usize> {
     let (_, recipe) = read(recipe_path)?;
-    let selection = resolve_toolchain(ToolchainLocation::Config(config), &recipe)?;
+    let selection = resolve_toolchain(BuildToolchain::Config(config), &recipe)?;
     let mut required = BTreeMap::<_, BTreeMap<_, u64>>::new();
     for managed in selection.paths.values() {
         if let Node::File { sha256, size, .. } = &managed.node {
@@ -594,7 +601,7 @@ pub fn fetch_toolchain(recipe_path: &Path, config: &Path) -> Result<usize> {
 
 fn prepare_toolchain(
     path: &Path,
-    location: ToolchainLocation<'_>,
+    location: BuildToolchain<'_>,
     recipe: &BuildRecipe,
 ) -> Result<Toolchain> {
     let selection = resolve_toolchain(location, recipe)?;
@@ -710,7 +717,7 @@ impl ResolvedToolchain {
 
 fn run(
     work: &Path,
-    epoch: u32,
+    recipe: &BuildRecipe,
     worker: &BuildWorker,
     paths: &BTreeSet<&str>,
     proto: Option<&Path>,
@@ -721,9 +728,11 @@ fn run(
         &work.join("sources"),
         &work.join("build.sh"),
         output.path(),
-        epoch,
+        recipe.epoch,
+        &recipe.options,
         worker,
     )?;
+    let epoch = recipe.epoch;
     let root = Root::open(output.path())?;
     let mut artifacts = BTreeMap::new();
     let mut directories: BTreeSet<_> = proto.into_iter().map(Path::to_owned).collect();
