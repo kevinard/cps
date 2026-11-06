@@ -71,7 +71,9 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     test "$(cps autoremove --dry-run)" = 'Nothing to do.'
     if cps remove --dry-run test/cps-demo-service > /run/rejected 2>&1; then exit 1; fi
     $bb grep -F 'removal would break installed dependencies' /run/rejected
-    cps remove --dry-run test/cps-demo | $bb grep -Fx 'Remove cps://test/test/cps-demo 2.0.0-0'
+    demo_package=test/cps-demo
+    if [ -f /etc/cps-btrfs-trial-kernel ]; then demo_package=cps://test/test/cps-demo; fi
+    cps remove --dry-run test/cps-demo | $bb grep -Fx "Remove $demo_package 2.0.0-0"
     if cps remove test/cps-demo </dev/null > /run/rejected 2>&1; then exit 1; fi
     $bb grep -F 'use --yes to confirm' /run/rejected
     test "$(cps-demo)" = 2.0.0-0

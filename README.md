@@ -2066,6 +2066,9 @@ read-only capture intact, and checks failed and concurrent staging. It boots
 the staged Btrfs subvolume, the previous root, and the exported ext4 root.
 It uses the same `CPS_BIN`, `CPS_VM_QEMU`, `CPS_VM_QEMU_DATA`,
 `CPS_VM_KERNEL`, and `CPS_VM_BUSYBOX` overrides as the boot fixture.
+For native boot with a custom kernel, set `CPS_VM_KERNEL_RELEASE` to
+the guest kernel's release. Set `CPS_VM_FAT_BUILTIN=1` if the guest kernel
+has built-in VFAT and NLS support for the EFI partition.
 
 ### Activating Btrfs roots
 

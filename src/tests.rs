@@ -160,6 +160,76 @@ fn live_install_recovers_offline_and_preserves_boot_identity() -> Result<()> {
 }
 
 #[test]
+fn live_remove_recovers_offline_and_allows_autoremove() -> Result<()> {
+    use std::{collections::BTreeSet, panic};
+
+    use crate::{
+        apply::{apply_live, apply_to_image, resume_live},
+        image::{Image, root::Root},
+    };
+
+    let fixture = Fixture::new()?;
+    let app = "usr/bin/live-app";
+    let library = "usr/lib/live-library";
+    fixture.package(
+        "library/live",
+        "1.0.0-0",
+        fixture.file(library, "library", "0644", "")?,
+    )?;
+    fixture.package(
+        "apps/live",
+        "1.0.0-0",
+        fixture.file(app, "app", "0755", "")? + &dependency("require", "library/live", "1.0.0-0"),
+    )?;
+    fixture.create()?;
+    apply(
+        &fixture.root,
+        &plan(
+            &fixture.root,
+            Request::Install {
+                packages: vec!["apps/live".into()],
+            },
+        )?,
+    )?;
+    let before = Image::open_query(&fixture.root)?.settings()?;
+    let open = || {
+        Image::open_for_live_apply(
+            Root::open(&fixture.root)?,
+            &before.id,
+            before.boot_revision(),
+        )
+    };
+    fs::rename(&fixture.repo, fixture.repo.with_extension("offline"))?;
+    let remove = plan(
+        &fixture.root,
+        Request::Remove {
+            packages: vec!["apps/live".into()],
+        },
+    )?;
+    let policy = BTreeSet::new();
+    let live = open()?;
+    let interrupted = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        apply_to_image(live, &remove, Some(&policy), |write| {
+            if write.path == app {
+                panic!("interrupted live removal");
+            }
+        })
+    }));
+    assert!(interrupted.is_err());
+    assert!(!fixture.root.join(app).exists());
+    assert!(fixture.root.join(library).exists());
+    assert_eq!(resume_live(open()?)?, Some(before.revision + 1));
+
+    let cleanup = plan(&fixture.root, Request::Autoremove)?;
+    assert_eq!(apply_live(open()?, &cleanup, &policy)?, before.revision + 2);
+    assert!(!fixture.root.join(library).exists());
+    let after = Image::open_query(&fixture.root)?.settings()?;
+    assert_eq!(after.boot_revision(), before.boot_revision());
+    assert!(verify(&fixture.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     use std::collections::BTreeSet;
 

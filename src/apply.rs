@@ -407,7 +407,11 @@ fn check_live_plan(plan: &Plan, stage_packages: &BTreeSet<String>) -> Result<()>
     ensure!(
         matches!(
             plan.request,
-            Request::Install { .. } | Request::Update | Request::UpdateProfile
+            Request::Install { .. }
+                | Request::Update
+                | Request::UpdateProfile
+                | Request::Remove { .. }
+                | Request::Autoremove
         ),
         "this request cannot be applied live"
     );
