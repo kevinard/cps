@@ -56,11 +56,11 @@ fn filter(terminal: bool) -> Result<File> {
     }
     if terminal {
         // The developer shell can share the user's controlling terminal.
-        for request in [libc::TIOCSTI, libc::TIOCLINUX] {
+        for request in [libc::TIOCSTI as u32, libc::TIOCLINUX as u32] {
             rules.add_rule_conditional(
                 denied,
                 ScmpSyscall::from_name("ioctl")?,
-                &[scmp_cmp!($arg1 & (u32::MAX as u64) == request as u64)],
+                &[scmp_cmp!($arg1 & (u32::MAX as u64) == u64::from(request))],
             )?;
         }
     }

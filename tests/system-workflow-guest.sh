@@ -26,6 +26,11 @@ if [ "$version" = 2.0.0-0 ]; then
     systemctl is-active --quiet cps-boot-health.service
     systemctl is-active --quiet systemd-bless-boot.service
     echo 'CPS_VM_SYSTEM: staged upgrade booted with the live package'
+    loader_before=$($bb sha256sum /efi/loader/loader.conf)
+    cps boot-env rollback --esp /efi --btrfs-volume /volume --dry-run > /run/cps-rollback-preview
+    $bb grep -F 'Would select cps-' /run/cps-rollback-preview
+    $bb grep -F 'test/live-root:' /run/cps-rollback-preview
+    test "$($bb sha256sum /efi/loader/loader.conf)" = "$loader_before"
     cps boot-env rollback --esp /efi --btrfs-volume /volume
     $bb sync
     exec $bb reboot -f

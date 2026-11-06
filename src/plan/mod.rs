@@ -751,7 +751,7 @@ fn build_with_update_diagnostics(
                 request,
                 Request::InstallProfile | Request::InstallLock { .. }
             ),
-        "install the pinned bootstrap release with plan install-profile or plan install-lock first"
+        "install the pinned bootstrap release with plan install-profile first, or provision it with plan install-lock"
     );
     if let Request::Mark { choice, packages } = &request {
         let (installed, intent_changes) = intent::mark(image, &mut state, *choice, packages)?;

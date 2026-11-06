@@ -362,7 +362,12 @@ pub(super) fn load(
         let snapshot = if let Some(required) = signed {
             ensure!(
                 pin.is_none_or(|pin| pin == required.sha256),
-                "selected catalog for {} differs from the signed release profile",
+                "{} catalog for {} differs from the signed release profile",
+                if lock.is_some() {
+                    "image lock"
+                } else {
+                    "saved plan"
+                },
                 publisher.name
             );
             required.snapshot(&publisher.repo, &publisher.name, &publisher.key)
