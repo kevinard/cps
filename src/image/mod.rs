@@ -1,5 +1,6 @@
 mod builds;
 mod catalogs;
+pub(crate) mod diff;
 pub(crate) mod history;
 pub(crate) mod publishers;
 pub(crate) mod root;

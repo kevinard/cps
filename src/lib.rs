@@ -25,9 +25,9 @@ pub use boot::{
     activate_deployed_boot_environment, activate_device_boot_environment, capture_boot_environment,
     deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
     export_boot_environment, export_boot_environment_receipt, list_boot_environments,
-    list_boot_environments_on_disk, prepare_boot_environment, rollback_boot_environment,
-    rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, stage_boot_environment,
-    stage_btrfs_boot_environment,
+    list_boot_environments_on_disk, prepare_boot_environment, preview_btrfs_rollback,
+    rollback_boot_environment, rollback_boot_environment_on_disk, rollback_btrfs_boot_environment,
+    stage_boot_environment, stage_btrfs_boot_environment,
 };
 pub use build::{
     BuildOptions, BuildSettings, BuildToolchain, BuildWorker, SourceLayout, build,
@@ -36,6 +36,7 @@ pub use build::{
     sources::{fetch_sources, fetch_sources_with_local, import_sources},
 };
 pub use generate::{generate_manifest, generate_manifest_for_architecture, suggest_dependencies};
+pub use image::diff::{ImageChange, ImageDiff, ImageMetadata, ImagePackage, ImagePath, image_diff};
 pub use image::history::{
     HistoryEntry, TransactionDetails, transaction_details, transaction_history,
 };

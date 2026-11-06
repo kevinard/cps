@@ -3725,3 +3725,63 @@ mod release;
 
 mod freezes;
 mod modes;
+
+#[test]
+fn compares_independent_committed_roots_without_the_repository() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "demo/tool",
+        "1.0.0-0",
+        f.file("usr/bin/tool", "old", "0755", "")?,
+    )?;
+    f.create()?;
+    let install = |root: &Path| -> Result<()> {
+        apply(
+            root,
+            &plan(
+                root,
+                Request::Install {
+                    packages: vec!["demo/tool".into()],
+                },
+            )?,
+        )?;
+        Ok(())
+    };
+    install(&f.root)?;
+    f.package(
+        "demo/tool",
+        "2.0.0-0",
+        f.file("usr/bin/tool", "new", "0755", "")?,
+    )?;
+    let next = f.root.with_file_name("next");
+    create_image(
+        &next,
+        &f.repo,
+        "canopa",
+        &f.public,
+        "x86_64",
+        BTreeMap::new(),
+    )?;
+    install(&next)?;
+    fs::remove_dir_all(&f.repo)?;
+    fs::remove_file(next.join("usr/bin/tool"))?;
+
+    let diff = crate::image_diff(&f.root, &next, true)?;
+    assert_ne!(diff.before.id, diff.after.id);
+    assert_eq!(diff.packages.len(), 1);
+    let change = &diff.packages[0];
+    assert_eq!(change.name, "demo/tool");
+    assert_eq!(
+        change.before.as_ref().unwrap().version.to_string(),
+        "1.0.0-0"
+    );
+    assert_eq!(
+        change.after.as_ref().unwrap().version.to_string(),
+        "2.0.0-0"
+    );
+    let paths = diff.paths.unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].name, "usr/bin/tool");
+    assert!(crate::image_diff(&next, &next, false)?.packages.is_empty());
+    Ok(())
+}

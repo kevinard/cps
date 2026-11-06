@@ -35,7 +35,9 @@ use crate::{
 pub(crate) use btrfs::stage_running_btrfs;
 pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub(crate) use btrfs_boot::with_running_environment;
-pub use btrfs_boot::{activate_btrfs_boot_environment, rollback_btrfs_boot_environment};
+pub use btrfs_boot::{
+    activate_btrfs_boot_environment, preview_btrfs_rollback, rollback_btrfs_boot_environment,
+};
 pub use deploy::deploy_boot_environment;
 pub use esp::{
     activate_boot_environment_on_disk, deploy_and_activate_boot_environment,

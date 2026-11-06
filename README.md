@@ -2298,6 +2298,20 @@ supplies the partition mapping.
 
 The list marks the default configured on the ESP and shows each registered root's partition UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. Rollback selects the default environment's recorded parent unless an ID is supplied. Entries from earlier CPS versions use the previous known-good revision. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
+Compare two committed image states offline, including independently created roots.
+
+```sh
+cps image-diff base staged
+cps image-diff base staged --paths --json
+cps boot-env rollback --esp /efi --btrfs-volume /cps --dry-run
+```
+
+The diff reports changes to package identity, manifest digest, local requests,
+and signed profile roles. `--paths` adds changes to managed file actions and
+owners. It reads committed metadata. Use `cps verify` to check the files on
+disk. The Btrfs rollback preview compares the configured default with the
+selected known-good root and leaves the boot selection in place.
+
 ### Reusing a root slot
 
 After the trial becomes known-good, stage the next release from that

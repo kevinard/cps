@@ -169,6 +169,16 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Compare committed package state between two roots, offline
+    ImageDiff {
+        before: PathBuf,
+        after: PathBuf,
+        /// Include managed file actions and ownership
+        #[arg(long)]
+        paths: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialize an empty directory as an image
     ImageCreate {
         #[arg(long)]
@@ -852,6 +862,14 @@ enum BootCommand {
         /// Mounted Btrfs top-level volume for checking a subvolume root
         #[arg(long, requires = "esp", conflicts_with = "disk")]
         btrfs_volume: Option<PathBuf>,
+        /// Compare the configured default with the rollback root without changing boot selection
+        #[arg(long, requires = "btrfs_volume")]
+        dry_run: bool,
+        /// Include managed file actions and ownership in the preview
+        #[arg(long, requires = "dry_run")]
+        paths: bool,
+        #[arg(long, requires = "dry_run")]
+        json: bool,
         /// Environment ID. Defaults to the previous known-good environment.
         id: Option<String>,
     },
@@ -1096,6 +1114,74 @@ fn choose_install_source(package: &str, sources: &[cps::query::InstallSource]) -
         }
         eprintln!("Enter a number from 1 to {}.", sources.len());
     }
+}
+
+fn print_image_diff(diff: &cps::ImageDiff, json: bool) -> Result<()> {
+    if json {
+        serde_json::to_writer_pretty(io::stdout().lock(), diff)?;
+        println!();
+        return Ok(());
+    }
+    let describe = |entry: &cps::ImagePackage| {
+        format!(
+            "{}@{} [{}; local={}; profile={}]",
+            entry.publisher,
+            entry.version,
+            entry.manifest_sha256,
+            entry.requested,
+            entry.profile_role
+        )
+    };
+    println!(
+        "{} revision {} → {} revision {}",
+        diff.before.id, diff.before.revision, diff.after.id, diff.after.revision
+    );
+    if diff.before.architecture != diff.after.architecture {
+        println!(
+            "Architecture {} → {}",
+            diff.before.architecture, diff.after.architecture
+        );
+    }
+    if diff.before.profile != diff.after.profile {
+        println!(
+            "Profile {} → {}",
+            diff.before.profile.as_deref().unwrap_or("—"),
+            diff.after.profile.as_deref().unwrap_or("—")
+        );
+    }
+    if diff.before.facets != diff.after.facets {
+        println!(
+            "Facet overrides {:?} → {:?}",
+            diff.before.facets, diff.after.facets
+        );
+    }
+    if diff.packages.is_empty() {
+        println!("No package changes");
+    }
+    for change in &diff.packages {
+        let before = change
+            .before
+            .as_ref()
+            .map(describe)
+            .unwrap_or_else(|| "—".into());
+        let after = change
+            .after
+            .as_ref()
+            .map(describe)
+            .unwrap_or_else(|| "—".into());
+        println!("{}: {before} → {after}", change.name);
+    }
+    if let Some(paths) = &diff.paths {
+        for change in paths {
+            println!(
+                "/{}: {} → {}",
+                change.name,
+                serde_json::to_string(&change.before)?,
+                serde_json::to_string(&change.after)?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_package_changes(changes: &[PackageChange]) {
@@ -1711,6 +1797,14 @@ fn run(command: Command) -> Result<ExitCode> {
                 );
             }
         },
+        Command::ImageDiff {
+            before,
+            after,
+            paths,
+            json,
+        } => {
+            print_image_diff(&cps::image_diff(&before, &after, paths)?, json)?;
+        }
         Command::ImageCreate {
             root,
             config,
@@ -2159,8 +2253,32 @@ fn run(command: Command) -> Result<ExitCode> {
                 esp_partuuid,
                 output_disk,
                 btrfs_volume,
+                dry_run,
+                paths,
+                json,
                 id,
             } => {
+                if dry_run {
+                    let (target, diff) = cps::preview_btrfs_rollback(
+                        esp.as_deref().context("--dry-run requires --esp")?,
+                        btrfs_volume
+                            .as_deref()
+                            .context("--dry-run requires --btrfs-volume")?,
+                        id.as_deref(),
+                        paths,
+                    )?;
+                    if json {
+                        serde_json::to_writer_pretty(
+                            io::stdout().lock(),
+                            &serde_json::json!({"target": target, "diff": diff}),
+                        )?;
+                        println!();
+                    } else {
+                        println!("Would select {target} for the next boot");
+                        print_image_diff(&diff, false)?;
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
                 let id = match (
                     esp.as_deref(),
                     disk.as_deref(),

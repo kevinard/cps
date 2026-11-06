@@ -263,6 +263,12 @@ impl BtrfsVolume {
     }
 
     pub fn verify(&self, record: &BtrfsRecord, image_id: &str, revision: u64) -> Result<Image> {
+        let image = self.open_image(record, image_id, revision)?;
+        check_image_integrity(&image)?;
+        Ok(image)
+    }
+
+    pub fn open_image(&self, record: &BtrfsRecord, image_id: &str, revision: u64) -> Result<Image> {
         let root = self.open_registered(record, &super::entry_id(image_id, revision))?;
         let image = Image::open_query_root(root)?;
         let settings = image.settings()?;
@@ -270,7 +276,6 @@ impl BtrfsVolume {
             settings.id == image_id && settings.boot_revision() == revision,
             "Btrfs root image or revision differs from its boot entry"
         );
-        check_image_integrity(&image)?;
         Ok(image)
     }
 
@@ -344,6 +349,16 @@ pub fn rollback_btrfs_boot_environment(
 ) -> Result<String> {
     let volume = BtrfsVolume::open(volume)?;
     systemd_boot::rollback(esp, id, None, Some(&volume))
+}
+
+/// Preview rollback from the configured default without changing boot selection.
+pub fn preview_btrfs_rollback(
+    esp: &Path,
+    volume: &Path,
+    id: Option<&str>,
+    paths: bool,
+) -> Result<(String, crate::ImageDiff)> {
+    systemd_boot::preview_btrfs_rollback(esp, &BtrfsVolume::open(volume)?, id, paths)
 }
 
 pub(crate) fn with_running_environment<T>(

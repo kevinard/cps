@@ -21,7 +21,11 @@ use super::{
     entry_id, kernel, tree,
 };
 use crate::{
-    image::{Image, root::Root},
+    image::{
+        Image,
+        diff::{ImageDiff, diff_open_images},
+        root::Root,
+    },
     kdl_format::boot_export::ExportReceipt,
     model::{digest, digest_reader, is_uuid, validate_digest},
 };
@@ -91,23 +95,7 @@ pub(super) fn rollback(
     };
     let (policy, entries) = inventory(&esp)?;
     let policy = policy.context("no CPS boot environments registered")?;
-    let target = if let Some(id) = id {
-        find_known_good(&entries, id)?
-    } else {
-        let current = policy
-            .selected(&entries)
-            .context("no configured default CPS boot environment")?;
-        if let Some(parent) = &current.parent {
-            find_known_good(&entries, parent).context("the recorded parent is unavailable")?
-        } else {
-            // Entries made before CPS recorded their parent were activated
-            // from the newest known-good image at the time.
-            entries
-                .iter()
-                .find(|entry| entry.tries.is_none() && entry.revision < current.revision)
-                .context("no previous known-good boot environment")?
-        }
-    };
+    let target = rollback_target(&policy, &entries, id)?;
     verify_fallback_artifacts(&esp, &target.id, &target.description)?;
     let _root_lock = if let Some(record) = &target.btrfs {
         let volume = volume.context("use --btrfs-volume to verify this rollback root")?;
@@ -130,6 +118,57 @@ pub(super) fn rollback(
     }
     LoaderPolicy::pinned(&target.id).write(&esp.join("loader/loader.conf"))?;
     Ok(target.id.clone())
+}
+
+pub(super) fn preview_btrfs_rollback(
+    esp: &Path,
+    volume: &BtrfsVolume,
+    id: Option<&str>,
+    paths: bool,
+) -> Result<(String, ImageDiff)> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let lock = lock_esp(&esp, FlockOperation::LockShared)?;
+    let (policy, entries) = inventory(&esp)?;
+    let policy = policy.context("no CPS boot environments registered")?;
+    let current = policy
+        .selected(&entries)
+        .context("no configured default CPS boot environment")?;
+    let target = rollback_target(&policy, &entries, id)?;
+    let open = |entry: &BootEntry| -> Result<Image> {
+        let record = entry
+            .btrfs
+            .as_ref()
+            .context("expected a Btrfs boot entry")?;
+        volume.check_disk(&esp, &lock, &entry.partuuid)?;
+        let (image, revision) = policy::entry_identity(&entry.id)?;
+        volume.open_image(record, image, revision)
+    };
+    verify_fallback_artifacts(&esp, &target.id, &target.description)?;
+    let before = open(current).context("opening the configured default root")?;
+    let after = open(target).context("opening the rollback root")?;
+    check_image_integrity(&after)?;
+    Ok((target.id.clone(), diff_open_images(&before, &after, paths)?))
+}
+
+fn rollback_target<'a>(
+    policy: &LoaderPolicy,
+    entries: &'a [BootEntry],
+    id: Option<&str>,
+) -> Result<&'a BootEntry> {
+    if let Some(id) = id {
+        return find_known_good(entries, id);
+    }
+    let current = policy
+        .selected(entries)
+        .context("no configured default CPS boot environment")?;
+    if let Some(parent) = &current.parent {
+        return find_known_good(entries, parent).context("the recorded parent is unavailable");
+    }
+    // Legacy entries predate explicit parent records.
+    entries
+        .iter()
+        .find(|entry| entry.tries.is_none() && entry.revision < current.revision)
+        .context("no previous known-good boot environment")
 }
 
 fn find_known_good<'a>(entries: &'a [BootEntry], id: &str) -> Result<&'a BootEntry> {

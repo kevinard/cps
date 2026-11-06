@@ -136,7 +136,8 @@ pub(crate) fn select_install_sources(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileRole {
     Root,
     Dependency,
@@ -219,7 +220,10 @@ pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
 }
 
 fn read_intent(root: &Path) -> Result<(State, ProfileIntent)> {
-    let image = Image::open_query(root)?;
+    verified_intent(&Image::open_query(root)?)
+}
+
+pub(crate) fn verified_intent(image: &Image) -> Result<(State, ProfileIntent)> {
     image.require_clean()?;
     let state = image.state()?;
     image.verify_catalog_archives(&state)?;
@@ -228,7 +232,11 @@ fn read_intent(root: &Path) -> Result<(State, ProfileIntent)> {
     Ok((state, intent))
 }
 
-fn intent_row(state: &State, intent: &ProfileIntent, package: &Installed) -> PackageIntentRow {
+pub(crate) fn intent_row(
+    state: &State,
+    intent: &ProfileIntent,
+    package: &Installed,
+) -> PackageIntentRow {
     let manifest = &package.published.manifest;
     let name = &manifest.name;
     let profile = if !state.settings.profile_packages.contains_key(name) {
