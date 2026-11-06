@@ -23,8 +23,8 @@ use crate::{
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
-    plan,
     plan::inspect_update,
+    plan_with_recommends,
     query::{InstallSource, SelectSource, select_install_sources},
     release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
 };
@@ -37,6 +37,7 @@ const ROOT: &str = "/";
 pub struct System {
     config: PathBuf,
     definition: ImageDefinition,
+    install_recommends: bool,
 }
 
 pub struct Change {
@@ -137,7 +138,13 @@ impl System {
         Ok(Self {
             config: config.to_owned(),
             definition,
+            install_recommends: true,
         })
+    }
+
+    pub fn with_install_recommends(mut self, enabled: bool) -> Self {
+        self.install_recommends = enabled;
+        self
     }
 
     fn boot(&self) -> &BtrfsConfig {
@@ -224,7 +231,7 @@ impl System {
         let root = Path::new(ROOT);
         let plan = match held_back {
             Some(held_back) => inspect_update(root, held_back)?,
-            None => plan(root, request)?,
+            None => plan_with_recommends(root, request, self.install_recommends)?,
         };
         Ok(Change::from_plan(plan, &self.definition.stage_packages))
     }

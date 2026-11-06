@@ -182,8 +182,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
         match name {
-            "require" | "require-capability" | "incorporate" | "exclude" | "require-any"
-            | "conditional" => manifest
+            "require" | "require-capability" | "recommends" | "incorporate" | "exclude"
+            | "require-any" | "conditional" => manifest
                 .dependency
                 .push(parse_dependency(node).with_context(|| format!("{name} dependency"))?),
             "provides" => {
@@ -252,6 +252,7 @@ fn parse_dependency(node: &KdlNode) -> Result<Dependency> {
     let dependency = match node.name().value() {
         "require" => Dependency::Require(parse_target(node)?),
         "require-capability" => Dependency::RequireCapability(parse_target(node)?),
+        "recommends" => Dependency::Recommend(parse_target(node)?),
         "incorporate" => Dependency::Incorporate(parse_target(node)?),
         "exclude" => Dependency::Exclude(parse_target(node)?),
         "require-any" => {
@@ -396,6 +397,7 @@ pub fn manifest_text(manifest: &Manifest) -> String {
         children.push(match dependency {
             Dependency::Require(target) => target_node("require", target),
             Dependency::RequireCapability(target) => target_node("require-capability", target),
+            Dependency::Recommend(target) => target_node("recommends", target),
             Dependency::Incorporate(target) => target_node("incorporate", target),
             Dependency::Exclude(target) => target_node("exclude", target),
             Dependency::RequireAny { alternatives } => {

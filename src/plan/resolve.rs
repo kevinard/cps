@@ -16,6 +16,7 @@ pub(crate) struct Candidates<'a, P> {
     pub packages: P,
     pub obsoletions: &'a BTreeMap<String, Version>,
     pub freezes: &'a BTreeMap<String, FrozenPackage>,
+    pub profile_packages: &'a BTreeMap<String, String>,
 }
 
 pub(crate) enum Retention<'a> {
@@ -174,7 +175,13 @@ pub fn resolve<'a, T>(
         Ok((installed, composed))
     };
     let result = match solver {
-        Some(SolverRevision::SatV1) => sat::solve(&candidates, &wanted, installed, materialize),
+        Some(solver) => sat::solve(
+            &candidates,
+            &wanted,
+            installed,
+            (solver == SolverRevision::SatV2).then_some(available.profile_packages),
+            materialize,
+        ),
         None => {
             // Existing saved plans and pinned build recipes retain their original selection order.
             let mut selected = BTreeMap::new();
@@ -252,6 +259,7 @@ fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {
                 Dependency::Require(target) | Dependency::Incorporate(target) => (target, false),
                 Dependency::Exclude(target) => (target, true),
                 Dependency::RequireCapability(_)
+                | Dependency::Recommend(_)
                 | Dependency::RequireAny { .. }
                 | Dependency::Conditional { .. } => continue,
             };

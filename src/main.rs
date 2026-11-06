@@ -26,9 +26,10 @@ use cps::{
     fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
     fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
-    list_publishers, list_withdrawals, plan, prefer_publisher, prepare_boot_environment, publish,
-    publish_release_with_sources, publish_witnessed_bundle_with_sources, read_attestation,
-    read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
+    list_publishers, list_withdrawals, plan_with_recommends, prefer_publisher,
+    prepare_boot_environment, publish, publish_release_with_sources,
+    publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
+    remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
     set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
     stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
@@ -275,6 +276,9 @@ enum Command {
         root: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        /// Skip recommended packages when resolving the plan
+        #[arg(long, global = true)]
+        no_install_recommends: bool,
         #[command(subcommand)]
         request: PlanCommand,
     },
@@ -328,6 +332,9 @@ struct SystemOptions {
     /// Use the currently cached catalog
     #[arg(long)]
     no_refresh: bool,
+    /// Skip recommended packages when resolving the transaction
+    #[arg(long)]
+    no_install_recommends: bool,
 }
 
 #[derive(Subcommand)]
@@ -1100,7 +1107,8 @@ fn print_package_changes(changes: &[PackageChange]) {
 }
 
 fn change_system(options: SystemOptions, request: Request, stage: bool) -> Result<()> {
-    let system = System::load(&options.config)?;
+    let system =
+        System::load(&options.config)?.with_install_recommends(!options.no_install_recommends);
     let _lock = system.lock()?;
     let refresh = !options.no_refresh;
     let mut change = if !options.yes && !options.dry_run && io::stdin().is_terminal() {
@@ -1889,6 +1897,12 @@ fn run(command: Command) -> Result<ExitCode> {
             for dependent in explanation.dependents {
                 writeln!(out, "    {dependent}")?;
             }
+            if !explanation.recommenders.is_empty() {
+                writeln!(out, "  Recommended by")?;
+                for recommender in explanation.recommenders {
+                    writeln!(out, "    {recommender}")?;
+                }
+            }
         }
         Command::Config {
             command: ConfigCommand::List { root },
@@ -1930,6 +1944,7 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Plan {
             root,
             output,
+            no_install_recommends,
             request,
         } => {
             let request = match request {
@@ -1948,7 +1963,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::ResolveConfig { path, take } => Request::ResolveConfig { path, take },
                 PlanCommand::Update => Request::Update,
             };
-            let plan = plan(&root, request)?;
+            let plan = plan_with_recommends(&root, request, !no_install_recommends)?;
             save(&output, &plan).with_context(|| format!("saving {}", output.display()))?;
             println!("{}", plan.summary());
         }

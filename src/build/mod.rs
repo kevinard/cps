@@ -511,6 +511,7 @@ fn resolve_toolchain(
             packages: &candidates.packages,
             obsoletions: &candidates.obsoletions,
             freezes: &BTreeMap::new(),
+            profile_packages: &BTreeMap::new(),
         },
         &requested,
         false,

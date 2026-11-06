@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::{self, Display},
     time::{Duration, Instant},
 };
@@ -106,6 +106,7 @@ impl<'a> Universe<'a> {
                             )?;
                             dependencies.requirements.push(requirement.into());
                         }
+                        Dependency::Recommend(_) => {}
                         Dependency::Incorporate(target) => dependencies
                             .constrains
                             .push(universe.target(target, false)?),
@@ -145,6 +146,21 @@ impl<'a> Universe<'a> {
 
     fn package(&self, id: SolvableId) -> &'a Published {
         self.packages[self.pool.resolve_solvable(id).record].0
+    }
+
+    fn exact(&self, id: SolvableId) -> ConditionalRequirement {
+        let version = self.package(id).manifest.version;
+        let name = self.pool.resolve_solvable(id).name;
+        self.pool
+            .intern_version_set(
+                name,
+                Filter {
+                    expression: Some(format!("={version}")),
+                    constraint: VersionConstraint::exact(version),
+                    ..Filter::default()
+                },
+            )
+            .into()
     }
 
     fn target(&self, target: &DependencyTarget, exclude: bool) -> Result<VersionSetId> {
@@ -253,6 +269,7 @@ mod tests {
             &candidates,
             &BTreeSet::from(["system/chain-0000"]),
             &BTreeMap::new(),
+            None,
             Ok,
         )?;
         assert_eq!(selected.len(), COUNT);
@@ -404,11 +421,12 @@ pub(super) fn solve<'a, T>(
     candidates: &BTreeMap<&str, Vec<&'a Published>>,
     wanted: &BTreeSet<&str>,
     installed: &BTreeMap<String, Installed>,
+    recommendation_exclusions: Option<&BTreeMap<String, String>>,
     compose: impl Fn(BTreeMap<&'a str, &'a Published>) -> Result<T>,
 ) -> Result<T> {
     let deadline = Instant::now() + TIME_LIMIT;
     let universe = Universe::new(candidates, wanted, installed)?;
-    let requirements: Vec<_> = wanted
+    let mut requirements: Vec<_> = wanted
         .iter()
         .map(|&name| {
             let name = universe.pool.intern_package_name(name);
@@ -419,6 +437,99 @@ pub(super) fn solve<'a, T>(
         })
         .collect();
     let mut rejections = Rejections::default();
+    let (mut selected, mut composed) = select(
+        &universe,
+        &requirements,
+        &mut rejections,
+        deadline,
+        false,
+        &compose,
+    )?
+    .expect("required solve reports failure as an error");
+    let Some(excluded) = recommendation_exclusions else {
+        return Ok(composed);
+    };
+    if !selected.values().any(|&id| {
+        universe
+            .package(id)
+            .manifest
+            .dependency
+            .iter()
+            .any(|dependency| matches!(dependency, Dependency::Recommend(_)))
+    }) {
+        return Ok(composed);
+    }
+
+    // Lock the required solution and each accepted addition before trying the
+    // next recommendation. Recommendations can add a closure, never replace one.
+    requirements.clear();
+    let mut locked = BTreeSet::new();
+    let mut pending = VecDeque::new();
+    let mut attempted = BTreeSet::new();
+    'extend: loop {
+        for (&name, &id) in &selected {
+            if !locked.insert(name) {
+                continue;
+            }
+            requirements.push(universe.exact(id));
+            if excluded.contains_key(name) {
+                continue;
+            }
+            let old = installed.get(name).map(|entry| &entry.published.manifest);
+            for dependency in &universe.package(id).manifest.dependency {
+                let Dependency::Recommend(target) = dependency else {
+                    continue;
+                };
+                if old.is_some_and(|manifest| manifest.dependency.contains(dependency)) {
+                    // Respect prior omissions, but keep a matching installed
+                    // recommendation when recalculating the image closure.
+                    let Some(entry) = installed.get(&target.package) else {
+                        continue;
+                    };
+                    if !target.matches(entry.published.manifest.version)? {
+                        continue;
+                    }
+                }
+                pending.push_back(target);
+            }
+        }
+        while let Some(target) = pending.pop_front() {
+            let name = target.package.as_str();
+            if selected.contains_key(name)
+                || !candidates.contains_key(name)
+                || !attempted.insert((name, target.version.as_deref()))
+            {
+                continue;
+            }
+            requirements.push(universe.target(target, false)?.into());
+            let attempt = select(
+                &universe,
+                &requirements,
+                &mut rejections,
+                deadline,
+                true,
+                &compose,
+            )?;
+            requirements.pop();
+            if let Some(next) = attempt {
+                (selected, composed) = next;
+                continue 'extend;
+            }
+        }
+        return Ok(composed);
+    }
+}
+
+type Selection<'a> = BTreeMap<&'a str, SolvableId>;
+
+fn select<'a, T>(
+    universe: &Universe<'a>,
+    requirements: &[ConditionalRequirement],
+    rejections: &mut Rejections,
+    deadline: Instant,
+    optional: bool,
+    compose: &impl Fn(BTreeMap<&'a str, &'a Published>) -> Result<T>,
+) -> Result<Option<(Selection<'a>, T)>> {
     loop {
         ensure!(
             Instant::now() < deadline,
@@ -427,12 +538,13 @@ pub(super) fn solve<'a, T>(
         );
         let ids = {
             let mut solver = Solver::new(Provider {
-                universe: &universe,
-                rejections: &rejections,
+                universe,
+                rejections,
                 deadline,
             });
-            match solver.solve(Problem::new().requirements(requirements.clone())) {
+            match solver.solve(Problem::new().requirements(requirements.to_vec())) {
                 Ok(ids) => ids,
+                Err(UnsolvableOrCancelled::Unsolvable(_)) if optional => return Ok(None),
                 Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
                     bail!(
                         "cannot satisfy package constraints\n{}",
@@ -456,14 +568,17 @@ pub(super) fn solve<'a, T>(
             .map(|(&name, &id)| (name, universe.package(id)))
             .collect();
         match compose(manifests) {
-            Ok(composed) => return Ok(composed),
+            Ok(composed) => return Ok(Some((selected, composed))),
             Err(error) => {
                 let Some(conflict) = error.downcast_ref::<PathConflict>() else {
+                    if optional {
+                        return Ok(None);
+                    }
                     return Err(error);
                 };
                 // A path conflict rules out these exact candidates while preserving the rest
                 // of the version search. Most transactions need just one solve.
-                rejections.record(&universe, &selected, conflict)?;
+                rejections.record(universe, &selected, conflict)?;
             }
         }
     }

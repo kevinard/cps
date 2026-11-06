@@ -177,6 +177,7 @@ pub struct PackageExplanation {
     pub intent: PackageIntentRow,
     pub profile_name: Option<String>,
     pub dependents: Vec<String>,
+    pub recommenders: Vec<String>,
 }
 
 /// Explain the current local request, signed profile role, and direct dependents.
@@ -192,10 +193,28 @@ pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
         .map(str::to_owned);
     let mut dependents = installed_dependents(&state.installed, selector.name)?;
     dependents.retain(|id| id != &intent.id);
+    let mut recommenders = Vec::new();
+    let version = package.published.manifest.version;
+    for (name, entry) in &state.installed {
+        if name == selector.name {
+            continue;
+        }
+        let manifest = &entry.published.manifest;
+        for dependency in &manifest.dependency {
+            if let Dependency::Recommend(target) = dependency
+                && target.package == selector.name
+                && target.matches(version)?
+            {
+                recommenders.push(manifest.id());
+                break;
+            }
+        }
+    }
     Ok(PackageExplanation {
         intent,
         profile_name,
         dependents,
+        recommenders,
     })
 }
 
@@ -578,9 +597,10 @@ fn active_targets<'a>(
             }
             _ => &[],
         },
-        Dependency::RequireCapability(_) | Dependency::Incorporate(_) | Dependency::Exclude(_) => {
-            &[]
-        }
+        Dependency::RequireCapability(_)
+        | Dependency::Recommend(_)
+        | Dependency::Incorporate(_)
+        | Dependency::Exclude(_) => &[],
     })
 }
 

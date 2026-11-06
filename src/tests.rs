@@ -1741,6 +1741,125 @@ fn virtual_package_requirement_without_providers_can_backtrack() -> Result<()> {
 }
 
 #[test]
+fn recommendations_extend_required_plans_and_keep_installed_dependencies_offline() -> Result<()> {
+    use crate::query::{Scope, Status, explain_package, list_packages};
+
+    let f = Fixture::new()?;
+    f.package("library/core", "1.0.0-0", String::new())?;
+    f.package(
+        "library/core",
+        "2.0.0-0",
+        f.file(LIBRARY, "core", "0644", "")?,
+    )?;
+    f.package(
+        "extras/blocked",
+        "1.0.0-0",
+        dependency("require", "library/core", "1.0.0-0"),
+    )?;
+    f.package(
+        "extras/collision",
+        "1.0.0-0",
+        f.file(LIBRARY, "collision", "0644", "")?,
+    )?;
+    f.package("extras/syntax", "1.0.0-0", String::new())?;
+    f.package(
+        "extras/help",
+        "1.0.0-0",
+        "    recommends \"extras/syntax\"\n".into(),
+    )?;
+    f.package(
+        "apps/editor",
+        "1.0.0-0",
+        r#"    require "library/core"
+    recommends "extras/help" version=">=1.0.0-0"
+    recommends "extras/blocked"
+    recommends "extras/collision"
+    recommends "extras/missing"
+"#
+        .into(),
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/editor".into()],
+        },
+    )?;
+    apply(
+        &f.root,
+        &serde_json::from_str(&serde_json::to_string(&install)?)?,
+    )?;
+    assert_eq!(
+        list_packages(&f.root, Scope::Installed)?
+            .into_iter()
+            .map(|row| (row.name, row.status))
+            .collect::<Vec<_>>(),
+        [
+            ("apps/editor".into(), Status::Explicit),
+            ("extras/help".into(), Status::Dependency),
+            ("extras/syntax".into(), Status::Dependency),
+            ("library/core".into(), Status::Dependency),
+        ]
+    );
+    assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "core");
+
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    let help = explain_package(&f.root, "extras/help")?;
+    assert!(help.dependents.is_empty());
+    assert_eq!(help.recommenders, ["cps://canopa/apps/editor@1.0.0-0"]);
+    assert!(verify(&f.root)?.is_empty());
+    let cleanup = plan(&f.root, Request::Autoremove)?;
+    assert!(cleanup.package_changes().is_empty());
+
+    let removal = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec!["extras/help".into()],
+        },
+    )?;
+    apply(&f.root, &removal)?;
+    let cleanup = plan(&f.root, Request::Autoremove)?;
+    assert!(cleanup.summary().contains("Remove extras/syntax"));
+    apply(&f.root, &cleanup)?;
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn recommendations_can_be_skipped_and_upgrades_consider_new_recommendations() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("extras/old", "1.0.0-0", String::new())?;
+    f.package("extras/new", "1.0.0-0", String::new())?;
+    f.package("apps/other", "1.0.0-0", String::new())?;
+    let original = "    recommends \"extras/old\"\n";
+    f.package("apps/editor", "1.0.0-0", original.into())?;
+    f.create()?;
+    let install = |name: &str| Request::Install {
+        packages: vec![name.into()],
+    };
+    let minimal = crate::plan_with_recommends(&f.root, install("apps/editor"), false)?;
+    apply(
+        &f.root,
+        &serde_json::from_str(&serde_json::to_string(&minimal)?)?,
+    )?;
+    let other = plan(&f.root, install("apps/other"))?;
+    assert!(!other.summary().contains("extras/old"));
+    apply(&f.root, &other)?;
+
+    f.package(
+        "apps/editor",
+        "2.0.0-0",
+        original.to_owned() + "    recommends \"extras/new\"\n",
+    )?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(update.summary().contains("Install extras/new"));
+    assert!(!update.summary().contains("extras/old"));
+    apply(&f.root, &update)?;
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn conditional_dependency_tracks_the_selected_runtime_version() -> Result<()> {
     let f = Fixture::new()?;
     const RUNTIME: &str = "usr/lib/cps/runtime";

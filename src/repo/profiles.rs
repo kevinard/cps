@@ -434,11 +434,12 @@ fn compose<'a>(
             packages: catalogs.packages.iter().copied(),
             obsoletions: &catalogs.obsoletions,
             freezes: &BTreeMap::new(),
+            profile_packages: &BTreeMap::new(),
         },
         &requested,
         false,
         Retention::None,
-        Some(SolverRevision::SatV1),
+        Some(SolverRevision::SatV2),
         |installed| profile_paths(&profile.arch, &profile.facets, installed),
     )
 }
@@ -470,7 +471,7 @@ fn check_upgrade(
     profile: &ReleaseProfile,
     locked: bool,
 ) -> Result<Composition> {
-    let solver = Some(SolverRevision::SatV1);
+    let solver = Some(SolverRevision::SatV2);
     let compose = |installed: &_| profile_paths(&profile.architecture, &profile.facets, installed);
     let (after, new_paths) = if locked {
         catalogs.update_profile(
@@ -488,6 +489,7 @@ fn check_upgrade(
                 packages: catalogs.packages.iter().copied(),
                 obsoletions: &catalogs.obsoletions,
                 freezes: &BTreeMap::new(),
+                profile_packages: &BTreeMap::new(),
             },
             &BTreeMap::new(),
             true,

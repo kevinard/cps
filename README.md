@@ -337,7 +337,8 @@ effective explicit local request, its role in the applied signed profile,
 and its matching direct dependents together. Profile roles are `root`,
 `dependency`, or `protected` for legacy images with an unknown exact role.
 A listed dependent can also have another installed provider for an alternative
-or capability.
+or capability. Installed packages with a matching `recommends` declaration
+appear separately under `Recommended by`.
 
 `list --intent` shows effective local requests separately from the roles in
 the applied signed profile. It reports `protected` for legacy profile
@@ -1573,6 +1574,33 @@ it. Removing a provider requires another compatible installed provider if a
 consumer remains. Install a concrete provider by package name to select it
 explicitly. Use `solver="sat-v1"` if a build toolchain depends on a capability,
 and upgrade clients before publishing manifests that use these declarations.
+
+### Recommended packages
+
+Use `recommends` in a package manifest for a package that should usually be
+installed alongside it.
+
+```kdl
+recommends "desktop/editor-help" version=">=2.0.0-0"
+```
+
+CPS resolves required packages first, then tries recommendations without
+changing the selected versions. It skips unavailable recommendations and
+ones that conflict with the selected packages. Newly added recommendations
+are tried on upgrade. A previously skipped or removed recommendation stays
+omitted unless its declaration changes or another package pulls it in.
+
+Recommended packages are marked automatic unless explicitly requested.
+They can be removed without removing the recommending package. Offline
+`autoremove` keeps a compatible installed recommendation while its
+recommending package is kept. Existing `optional` declarations are advisory.
+
+Pass `--no-install-recommends` to `cps install`, `cps upgrade`, or `cps plan`
+to skip this step. Saved plans record the solver revision, so apply uses the
+same policy. A signed profile follows its published composition, which may
+include recommendations selected at publication. Build recipes can opt into
+recommendations with `solver="sat-v2"`. Upgrade clients before publishing
+manifests with `recommends` or applying saved plans that use `sat-v2`.
 
 ### Filesystem permissions
 

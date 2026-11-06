@@ -188,6 +188,7 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     let solver = match fields.string("solver")?.as_deref() {
         None => None,
         Some("sat-v1") => Some(SolverRevision::SatV1),
+        Some("sat-v2") => Some(SolverRevision::SatV2),
         Some(name) => bail!("unsupported toolchain solver {name:?}"),
     };
     let mut packages = BTreeSet::new();

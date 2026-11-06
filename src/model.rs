@@ -164,6 +164,7 @@ impl<'de> Deserialize<'de> for Version {
 pub enum Dependency {
     Require(DependencyTarget),
     RequireCapability(DependencyTarget),
+    Recommend(DependencyTarget),
     Incorporate(DependencyTarget),
     Exclude(DependencyTarget),
     RequireAny {
@@ -220,7 +221,9 @@ impl fmt::Display for DependencyTarget {
 impl Dependency {
     fn validate(&self) -> Result<()> {
         match self {
-            Self::Require(target) | Self::Exclude(target) => target.validate(),
+            Self::Require(target) | Self::Recommend(target) | Self::Exclude(target) => {
+                target.validate()
+            }
             Self::RequireCapability(target) => {
                 validate_capability(&target.package)?;
                 VersionConstraint::parse(target.version.as_deref())?;
@@ -262,6 +265,10 @@ impl Dependency {
 pub(crate) struct VersionConstraint(Vec<(&'static str, Version)>);
 
 impl VersionConstraint {
+    pub(crate) fn exact(version: Version) -> Self {
+        Self(vec![("=", version)])
+    }
+
     pub(crate) fn parse(constraint: Option<&str>) -> Result<Self> {
         let clauses = constraint
             .into_iter()

@@ -44,6 +44,7 @@ const CONFIG_UPDATES_DIR: &str = ".cps/config-updates";
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SolverRevision {
     SatV1,
+    SatV2,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -531,12 +532,20 @@ impl Plan {
 }
 
 pub fn plan(path: &Path, request: Request) -> Result<Plan> {
-    Ok(plan_image(path, request, None)?.0)
+    plan_with_recommends(path, request, true)
+}
+
+pub fn plan_with_recommends(
+    path: &Path,
+    request: Request,
+    install_recommends: bool,
+) -> Result<Plan> {
+    Ok(plan_image(path, request, install_recommends, None)?.0)
 }
 
 pub(crate) fn inspect_update(path: &Path, held_back: &mut Vec<HeldBackUpdate>) -> Result<Plan> {
     held_back.clear();
-    let (plan, next, _) = plan_image(path, Request::Update, Some(held_back))?;
+    let (plan, next, _) = plan_image(path, Request::Update, true, Some(held_back))?;
     held_back.retain_mut(|update| {
         let Some(package) = next.installed.get(&update.name) else {
             return false;
@@ -551,19 +560,26 @@ pub(crate) fn inspect_update(path: &Path, held_back: &mut Vec<HeldBackUpdate>) -
 fn plan_image(
     path: &Path,
     request: Request,
+    install_recommends: bool,
     held_back: Option<&mut Vec<HeldBackUpdate>>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
-    build_with_update_diagnostics(
-        &image,
-        state,
-        request,
-        None,
-        Some(SolverRevision::SatV1),
-        held_back,
-    )
+    let solver = if install_recommends
+        && matches!(
+            request,
+            Request::Install { .. }
+                | Request::ExactInstall { .. }
+                | Request::Update
+                | Request::UpdateProfile
+                | Request::Autoremove
+        ) {
+        SolverRevision::SatV2
+    } else {
+        SolverRevision::SatV1
+    };
+    build_with_update_diagnostics(&image, state, request, None, Some(solver), held_back)
 }
 
 fn resolve_local<'a>(
@@ -611,7 +627,7 @@ fn resolve_local<'a>(
             Retention::All
         },
         solver,
-        |installed| effective_paths(&state.settings, installed),
+        |installed| composition_paths(&state.settings, installed, solver),
     )?;
     state.settings.check_profile_packages(&installed)?;
     for name in state.settings.profile_packages.keys() {
@@ -621,6 +637,18 @@ fn resolve_local<'a>(
             .explicit = requested.contains_key(name.as_str()) || state.installed[name].explicit;
     }
     Ok((installed, paths))
+}
+
+fn composition_paths(
+    settings: &Settings,
+    installed: &BTreeMap<String, Installed>,
+    solver: Option<SolverRevision>,
+) -> Result<BTreeMap<String, Managed>> {
+    let paths = effective_paths(settings, installed)?;
+    if solver == Some(SolverRevision::SatV2) {
+        kernel::selected(installed, &paths)?;
+    }
+    Ok(paths)
 }
 
 pub(crate) fn build(
@@ -754,6 +782,7 @@ fn build_with_update_diagnostics(
                     packages: std::iter::empty(),
                     obsoletions: &BTreeMap::new(),
                     freezes: &state.settings.freezes,
+                    profile_packages: &state.settings.profile_packages,
                 },
                 &requested,
                 false,
@@ -832,7 +861,7 @@ fn build_with_update_diagnostics(
                         .filter(|_| track_profile_intent)
                         .map(|intent| &intent.local),
                     solver,
-                    |installed| effective_paths(&state.settings, installed),
+                    |installed| composition_paths(&state.settings, installed, solver),
                 )?
             } else {
                 resolve_local(
@@ -841,6 +870,7 @@ fn build_with_update_diagnostics(
                         packages: &catalogs.candidates.packages,
                         obsoletions: &catalogs.candidates.obsoletions,
                         freezes: &state.settings.freezes,
+                        profile_packages: &state.settings.profile_packages,
                     },
                     &requested,
                     matches!(request, Request::Update),

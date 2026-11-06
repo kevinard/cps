@@ -567,6 +567,57 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
 }
 
 #[test]
+fn signed_profiles_include_recommendations_in_the_published_composition() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("desktop/help", "1.0.0-0", String::new())?;
+    f.package(
+        "desktop/base",
+        "1.0.0-0",
+        "    recommends \"desktop/help\"\n".into(),
+    )?;
+    fs::write(
+        f.repo.join("publish-policy.kdl"),
+        r#"schema-version 1
+publisher "canopa" {
+    builder-key "unused.der"
+    profile "desktop" architecture="x86_64" {
+        package "desktop/base"
+    }
+}
+"#,
+    )?;
+    let release = f._dir.path().join("refresh.kdl");
+    let base = fs::read_to_string(f.repo.join("current"))?;
+    fs::write(
+        &release,
+        format!(
+            "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+            base.trim()
+        ),
+    )?;
+    publish_release(&f.repo, &f.private, &release)?;
+    let config = f._dir.path().join("image.kdl");
+    fs::write(
+        &config,
+        format!(
+            r#"schema-version 1
+architecture "x86_64"
+release-profile "desktop"
+publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+"#,
+            f.repo, f.public
+        ),
+    )?;
+    create_configured_image(&f.root, &config)?;
+    let install = crate::plan_with_recommends(&f.root, Request::InstallProfile, false)?;
+    apply(&f.root, &install)?;
+    let help = crate::query::explain_package(&f.root, "desktop/help")?;
+    assert_eq!(help.recommenders, ["cps://canopa/desktop/base@1.0.0-0"]);
+    assert!(help.profile_name.is_some());
+    Ok(())
+}
+
+#[test]
 fn local_transactions_preserve_the_applied_signed_composition() -> Result<()> {
     let f = Fixture::new()?;
     let seed = Fixture::new()?;

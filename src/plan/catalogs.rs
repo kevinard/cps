@@ -201,6 +201,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
                 packages,
                 obsoletions: &self.obsoletions,
                 freezes,
+                profile_packages: &profile.composition,
             },
             &requested,
             true,
