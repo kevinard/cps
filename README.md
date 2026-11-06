@@ -945,8 +945,10 @@ that save space and keeps the full payloads. Sign the entire export with TUF.
 During `cps upgrade` or `cps fetch`, CPS can use the old installed or cached
 file as a base. It checks the patch's TUF metadata and verifies the complete
 result against the signed package manifest. If a patch is unavailable,
-doesn't apply, or fails verification, CPS fetches the full file. Patch
-generation and application support files up to 64 MiB.
+doesn't apply, or fails verification, CPS fetches the full file. CPS
+streams files when generating and applying patches. When either version of
+a file exceeds 64 MiB, the export uses a v2 patch with 64-bit offsets and
+lengths. Older clients fetch the full file for these upgrades.
 
 When preparing a cache for an existing image, add `--image /path/to/image`
 to `repo sync`. CPS verifies the candidate against the installed publisher

@@ -912,14 +912,12 @@ async fn try_delta(
     hash: &str,
     length: u64,
 ) -> Result<()> {
-    ensure!(
-        base.length <= delta::FILE_LIMIT && length <= delta::FILE_LIMIT && base.hash != hash,
-        "file is outside the supported delta range"
-    );
+    ensure!(base.hash != hash, "delta base and result are identical");
     validate_digest(base.hash)?;
-    let name = delta::target_name(base.hash, hash);
+    let format = delta::Format::for_lengths(base.length, length);
+    let name = format.target_name(base.hash, hash);
     let (target_name, target) =
-        checked_target(verified, &name, delta::patch_limit(length), None, None)?;
+        checked_target(verified, &name, format.patch_limit(length), None, None)?;
     checked_target(
         verified,
         &format!("blobs/{hash}"),
@@ -927,15 +925,17 @@ async fn try_delta(
         Some(hash),
         Some(length),
     )?;
-    let base = Root::open(repo)?
+    let base_file = Root::open(repo)?
         .file(&format!("blobs/{}", base.hash))
-        .and_then(|file| delta::verified_bytes(file, base.hash, base.length))
-        .or_else(|_| delta::verified_bytes(image.file(base.path)?, base.hash, base.length))?;
+        .and_then(|file| delta::verified_file(file, base.hash, base.length))
+        .or_else(|_| delta::verified_file(image.file(base.path)?, base.hash, base.length))?;
     let parent = repo.join("blobs");
     let patch = download_target(verified, &name, &target_name, target, &parent).await?;
     let mut result = NamedTempFile::new_in(&parent)?;
     delta::reconstruct(
-        &base,
+        format,
+        &base_file,
+        base.length,
         std::io::BufReader::new(patch.reopen()?),
         &mut result,
         length,

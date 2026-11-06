@@ -5213,6 +5213,83 @@ fn tuf_delta_fetch_reconstructs_from_installed_files_and_falls_back() -> Result<
 }
 
 #[test]
+fn tuf_delta_fetch_upgrades_files_larger_than_64_mib() -> Result<()> {
+    use std::{fs::File, os::unix::fs::FileExt};
+
+    let f = Fixture::new()?;
+    let work = f._dir.path();
+    let size = 65 * 1024 * 1024;
+    let action = f.file(COMPOSITOR, "base", "0755", "")?;
+    let path = f.proto.join(COMPOSITOR);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(size)?;
+    let old_hash = crate::model::digest_reader(File::open(&path)?)?;
+    f.package("desktop/compositor", "1.0.0-0", action.clone())?;
+    let previous = fs::read_to_string(f.repo.join("current"))?
+        .trim()
+        .to_owned();
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+
+    let file = fs::OpenOptions::new().write(true).open(&path)?;
+    file.write_all_at(b"updated bytes", size / 2)?;
+    let new_hash = crate::model::digest_reader(File::open(&path)?)?;
+    f.package("desktop/compositor", "2.0.0-0", action)?;
+
+    let export = work.join("export");
+    mirror_release::export_with_deltas(
+        &f.repo,
+        "canopa",
+        &f.public,
+        &export,
+        &[],
+        false,
+        &[previous],
+    )?;
+    let delta_name = format!("delta-v2-{old_hash}-{new_hash}");
+    assert!(fs::metadata(export.join(delta_name))?.len() < 1024);
+    let anchor = work.join("root.json");
+    let key = work.join("tuf-key.der");
+    let mirror = work.join("mirror");
+    let cache = work.join("cache");
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_root(&anchor, &key, None)?;
+    sign_export(&export, &mirror, 1, fresh, &anchor, &key)?;
+    fs::remove_file(
+        mirror
+            .join("targets")
+            .join(format!("{new_hash}.blobs-{new_hash}")),
+    )?;
+    let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+    let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+    mirror_release::sync_index(
+        &cache,
+        &anchor,
+        metadata.as_str(),
+        targets.as_str(),
+        "canopa",
+        &f.public,
+    )?;
+    crate::set_publisher_repositories(&f.root, &[("canopa".to_owned(), cache)])?;
+    let upgrade = plan(&f.root, Request::Update)?;
+    fetch_plan(&f.root, &upgrade)?;
+    apply(&f.root, &upgrade)?;
+    assert_eq!(
+        crate::model::digest_reader(File::open(f.root.join(COMPOSITOR))?)?,
+        new_hash
+    );
+    Ok(())
+}
+
+#[test]
 fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
     let f = Fixture::new()?;
     let extras = Fixture::new()?;
