@@ -35,7 +35,7 @@ pub use build::{
     build_with_worker, fetch_toolchain,
     sources::{fetch_sources, fetch_sources_with_local, import_sources},
 };
-pub use generate::{generate_manifest, generate_manifest_for_architecture};
+pub use generate::{generate_manifest, generate_manifest_for_architecture, suggest_dependencies};
 pub use image::history::{
     HistoryEntry, TransactionDetails, transaction_details, transaction_history,
 };

@@ -168,6 +168,7 @@ fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
         image::{Image, root::Root},
         kdl_format::parse_manifest,
         query::package_manifest,
+        system::Change,
     };
 
     let fixture = Fixture::new()?;
@@ -206,7 +207,9 @@ fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     let policy = BTreeSet::new();
     let reason = "system/runtime declares requires-reboot in its manifest";
     let initial = install("apps/example")?;
-    assert_eq!(initial.boot_reason(&policy).as_deref(), Some(reason));
+    let automatic = Change::from_plan(initial.clone(), &policy);
+    assert_eq!(automatic.boot_reason(), Some(reason));
+    assert_eq!(automatic.with_staging().boot_reason(), Some(reason));
 
     let settings = Image::open_query(&fixture.root)?.settings()?;
     let live =
@@ -217,7 +220,15 @@ fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     assert!(crate::transaction_status(&fixture.root)?.pending.is_none());
 
     apply(&fixture.root, &initial)?;
-    assert!(install("apps/independent")?.boot_reason(&policy).is_none());
+    let empty = Change::from_plan(install("apps/example")?, &policy).with_staging();
+    assert!(empty.is_empty());
+    assert!(empty.boot_reason().is_none());
+    let ordinary = Change::from_plan(install("apps/independent")?, &policy);
+    assert!(ordinary.boot_reason().is_none());
+    assert_eq!(
+        ordinary.with_staging().boot_reason(),
+        Some("--stage was requested")
+    );
     let remove = plan(
         &fixture.root,
         Request::Remove {
@@ -1272,7 +1283,7 @@ fn marks_installed_package_requests_offline_without_touching_files() -> Result<(
 
     use crate::{
         MarkChoice,
-        query::{ProfileRole, list_package_intent},
+        query::{ProfileRole, explain_package, list_package_intent},
     };
 
     let f = Fixture::new()?;
@@ -1294,6 +1305,15 @@ fn marks_installed_package_requests_offline_without_touching_files() -> Result<(
     let inode = file.metadata()?.ino();
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
 
+    let explanation = explain_package(&f.root, runtime)?;
+    assert!(!explanation.intent.requested);
+    assert_eq!(explanation.intent.profile, ProfileRole::None);
+    assert_eq!(explanation.profile_name, None);
+    assert_eq!(
+        explanation.dependents,
+        ["cps://canopa/desktop/tool@1.0.0-0"]
+    );
+
     let mark = |choice, package: &str| {
         plan(
             &f.root,
@@ -1313,6 +1333,9 @@ fn marks_installed_package_requests_offline_without_touching_files() -> Result<(
     assert_eq!(crate::fetch_plan(&f.root, &promoted)?, 0);
     assert_eq!(apply(&f.root, &promoted)?, 2);
     assert_eq!(apply(&f.root, &promoted)?, 2);
+    let promoted_reason = explain_package(&f.root, "cps://canopa/library/runtime@1.0.0-0")?;
+    assert!(promoted_reason.intent.requested);
+    assert_eq!(promoted_reason.dependents, explanation.dependents);
     assert!(format!("{:#}", apply(&f.root, &stale).unwrap_err()).contains("stale plan"));
     let history = crate::transaction_details(&f.root, &promoted.id()?)?
         .details
@@ -1342,6 +1365,9 @@ fn marks_installed_package_requests_offline_without_touching_files() -> Result<(
     assert_eq!(file.metadata()?.ino(), inode);
     assert_eq!(fs::read_to_string(&file)?, "runtime");
     assert!(!list_package_intent(&f.root)?[0].requested);
+    let explanation = explain_package(&f.root, "library/runtime@1.0.0-0")?;
+    assert!(!explanation.intent.requested);
+    assert!(explanation.dependents.is_empty());
     apply(&f.root, &plan(&f.root, Request::Autoremove)?)?;
     assert!(!file.exists());
     Ok(())
@@ -1433,6 +1459,15 @@ fn autoremove_preserves_installed_roots_and_resumes_offline() -> Result<()> {
     assert!(cleanup.summary().contains("Remove library/right"));
     assert!(cleanup.summary().contains("Remove library/primary"));
     assert!(cleanup.summary().contains("Remove desktop/optional-plugin"));
+    let stage_packages = ["library/left".to_owned()].into_iter().collect();
+    assert_eq!(
+        cleanup.boot_reason(&stage_packages).as_deref(),
+        Some("library/left is configured for staged changes")
+    );
+    let staged = f._dir.path().join("staged-cleanup");
+    crate::stage_boot_environment(&f.root, &staged, &cleanup)?;
+    assert!(!staged.join(LIBRARY).exists());
+    assert!(f.root.join(LIBRARY).exists());
     interrupt_apply_at(
         &f.root,
         &f._dir.path().join("cleanup.json"),
@@ -1691,6 +1726,311 @@ fn queries_signed_catalog_and_committed_installs_independently() -> Result<()> {
     assert_eq!(list_packages(&f.root, Scope::Installed)?.len(), 2);
     let found = package_manifest(&f.root, "desktop/compositor", false)?;
     assert!(found.contains("version=\"1.0.0-0\"") && found.contains(COMPOSITOR));
+    Ok(())
+}
+
+#[test]
+fn queries_signed_package_descriptions_and_keeps_optional_dependencies_advisory() -> Result<()> {
+    use crate::{
+        kdl_format::{manifest_text, parse_manifest},
+        query::{Scope, list_packages, package_manifest},
+    };
+
+    let f = Fixture::new()?;
+    let summary = "A lightweight text editor";
+    let recipe = format!(
+        r#"schema-version 1
+package "apps/editor" publisher="canopa" version="1.0.0-0" summary="{summary}" {{
+    optional "apps/editor-spellcheck" version=">=1.0.0-0" description="Check spelling while typing"
+}}
+"#,
+    );
+    let manifest = parse_manifest(&recipe)?;
+    manifest.validate(false)?;
+    assert_eq!(parse_manifest(&manifest_text(&manifest))?, manifest);
+    for invalid in [
+        recipe.replace(summary, "  "),
+        recipe.replace(summary, r"first\nsecond"),
+        recipe.replace(">=1.0.0-0", "unknown"),
+        recipe.replace("Check spelling while typing", ""),
+    ] {
+        assert!(parse_manifest(&invalid)?.validate(false).is_err());
+    }
+    fs::write(&f.recipe, recipe)?;
+    publish(&f.repo, &f.proto, &f.recipe, &f.private)?;
+    f.create()?;
+    fs::rename(f.repo.join("manifests"), f.repo.join("saved-manifests"))?;
+    let available = list_packages(&f.root, Scope::Available)?;
+    assert_eq!(available[0].summary.as_deref(), Some(summary));
+    fs::rename(f.repo.join("saved-manifests"), f.repo.join("manifests"))?;
+    let available = package_manifest(&f.root, "apps/editor", true)?;
+    assert_eq!(parse_manifest(&available)?, manifest);
+
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/editor".into()],
+        },
+    )?;
+    assert_eq!(install.package_changes().len(), 1);
+    apply(&f.root, &install)?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    let installed = list_packages(&f.root, Scope::Installed)?;
+    assert_eq!(installed[0].summary.as_deref(), Some(summary));
+    assert_eq!(package_manifest(&f.root, "apps/editor", false)?, available);
+    Ok(())
+}
+
+#[test]
+fn searches_files_in_verified_available_manifests() -> Result<()> {
+    use crate::{
+        add_publisher,
+        query::{FileMatch, search_files},
+        repo::{read_key, snapshot},
+    };
+
+    let f = Fixture::new()?;
+    let extras = Fixture::new()?;
+    let backup = "usr/libexec/canopa-compositor";
+    let old = "usr/bin/old-compositor";
+    let foreign = "usr/sbin/canopa-compositor";
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(old, "old", "0755", "")?,
+    )?;
+    f.package(
+        "desktop/compositor",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "current", "0755", "arch=\"x86_64\"")?
+            + &f.file(backup, "backup", "0755", "")?
+            + &f.file(foreign, "foreign", "0755", "arch=\"aarch64\"")?
+            + &f.file(MANPAGE, "docs", "0644", "facet=\"doc.man\"")?,
+    )?;
+    extras.package_as(
+        "extras",
+        "desktop/compositor",
+        "1.0.0-0",
+        extras.file(COMPOSITOR, "alternative", "0755", "")?,
+    )?;
+    f.create()?;
+    add_publisher(&f.root, "extras", &extras.repo, &extras.public)?;
+    fs::remove_dir_all(f.repo.join("blobs"))?;
+    fs::remove_dir_all(extras.repo.join("blobs"))?;
+
+    let primary = "cps://canopa/desktop/compositor@2.0.0-0";
+    let secondary = "cps://extras/desktop/compositor@1.0.0-0";
+    let found = |package: &str, path: &str| FileMatch {
+        package: package.to_owned(),
+        path: path.to_owned(),
+    };
+    assert_eq!(
+        search_files(&f.root, "canopa-compositor")?,
+        [
+            found(primary, COMPOSITOR),
+            found(primary, backup),
+            found(secondary, COMPOSITOR)
+        ]
+    );
+    for path in [COMPOSITOR.to_owned(), format!("/{COMPOSITOR}")] {
+        assert_eq!(
+            search_files(&f.root, &path)?,
+            [found(primary, COMPOSITOR), found(secondary, COMPOSITOR)]
+        );
+    }
+    for term in [old, foreign, MANPAGE, "compositor", "Canopa-Compositor"] {
+        assert!(search_files(&f.root, term)?.is_empty(), "matched {term}");
+    }
+    assert!(search_files(&f.root, "../usr/bin/canopa-compositor").is_err());
+
+    let catalog = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
+    let package = catalog
+        .packages
+        .iter()
+        .find(|pkg| pkg.manifest.id() == primary)
+        .unwrap();
+    fs::write(f.repo.join("manifests").join(&package.sha256), b"tampered")?;
+    assert!(search_files(&f.root, COMPOSITOR).is_err());
+    Ok(())
+}
+
+#[test]
+fn queries_installed_path_ownership_offline() -> Result<()> {
+    use crate::query::{package_contents, path_owners};
+
+    let f = Fixture::new()?;
+    let uid = geteuid().as_raw();
+    let gid = getegid().as_raw();
+    let shared = format!("    dir \"usr/share\" mode=\"0755\" uid={uid} gid={gid}\n");
+    let link = "usr/lib/libdisplay-current.so";
+    f.package(
+        "library/libdisplay",
+        "1.0.0-0",
+        shared.clone() + &f.file(LIBRARY, "ABI 1", "0644", "")?,
+    )?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        shared
+            + &dependency("require", "library/libdisplay", "1.0.0-0")
+            + &f.file(COMPOSITOR, "installed", "0755", "")?
+            + &f.file(MANPAGE, "documentation", "0644", "facet=\"doc.man\"")?
+            + &f.file("usr/bin/other-arch", "foreign", "0755", "arch=\"aarch64\"")?
+            + &format!("    symlink {link:?} target=\"libdisplay.so\" uid={uid} gid={gid}\n"),
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    fs::remove_file(f.root.join(COMPOSITOR))?;
+
+    let compositor = "cps://canopa/desktop/compositor@1.0.0-0";
+    let library = "cps://canopa/library/libdisplay@1.0.0-0";
+    assert_eq!(path_owners(&f.root, "/usr/share")?, [compositor, library]);
+    assert_eq!(path_owners(&f.root, COMPOSITOR)?, [compositor]);
+    assert_eq!(path_owners(&f.root, link)?, [compositor]);
+    assert_eq!(path_owners(&f.root, LIBRARY)?, [library]);
+    for path in ["usr/lib", MANPAGE, "usr/bin/other-arch"] {
+        let error = path_owners(&f.root, path).unwrap_err();
+        assert!(error.to_string().contains("no installed package owns"));
+    }
+    assert!(path_owners(&f.root, "../usr/share").is_err());
+    for spec in [
+        "desktop/compositor",
+        "desktop/compositor@1.0.0-0",
+        compositor,
+    ] {
+        assert_eq!(
+            package_contents(&f.root, spec)?,
+            [COMPOSITOR, link, "usr/share"]
+        );
+    }
+    assert!(package_contents(&f.root, "desktop/compositor@2.0.0-0").is_err());
+    assert!(package_contents(&f.root, "cps://other/desktop/compositor").is_err());
+    Ok(())
+}
+
+#[test]
+fn queries_direct_dependencies_and_dependents_offline() -> Result<()> {
+    use crate::query::{direct_dependencies, explain_package, reverse_dependencies};
+
+    let f = Fixture::new()?;
+    let packages = [
+        ("library/display", ""),
+        ("library/backup", ""),
+        ("runtime/desktop", ""),
+        (
+            "desktop/session",
+            r#"    conditional "library/display" version="=1.0.0-0" when="runtime/desktop" when-version=">=1.0.0-0"
+"#,
+        ),
+        (
+            "desktop/direct",
+            r#"    require "library/display" version=">=1.0.0-0, <2.0.0-0"
+    conditional "library/display" when="runtime/desktop"
+"#,
+        ),
+        (
+            "desktop/alternate",
+            r#"    require-any {
+        package "library/display" version=">=2.0.0-0"
+        package "library/display" version="=1.0.0-0"
+        package "library/backup"
+    }
+"#,
+        ),
+        (
+            "desktop/versioned",
+            r#"    require-any {
+        package "library/display" version=">=2.0.0-0"
+        package "library/backup"
+    }
+    conditional "library/display" when="runtime/desktop" when-version=">=2.0.0-0"
+    conditional "library/display" when="runtime/missing"
+"#,
+        ),
+        (
+            "desktop/policy",
+            r#"    incorporate "library/display" version="=1.0.0-0"
+    exclude "library/display" version=">=2.0.0-0"
+"#,
+        ),
+        ("desktop/transitive", "    require \"desktop/direct\"\n"),
+    ];
+    for (name, dependencies) in packages {
+        f.package(name, "1.0.0-0", dependencies.into())?;
+    }
+    f.create()?;
+    let install = Request::Install {
+        packages: packages.map(|(name, _)| name.to_owned()).to_vec(),
+    };
+    apply(&f.root, &plan(&f.root, install)?)?;
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+
+    let backup = "cps://canopa/library/backup@1.0.0-0";
+    let display = "cps://canopa/library/display@1.0.0-0";
+    for spec in [
+        "desktop/alternate",
+        "desktop/alternate@1.0.0-0",
+        "cps://canopa/desktop/alternate",
+        "cps://canopa/desktop/alternate@1.0.0-0",
+    ] {
+        assert_eq!(direct_dependencies(&f.root, spec)?, [backup, display]);
+    }
+    assert_eq!(direct_dependencies(&f.root, "desktop/direct")?, [display]);
+    assert_eq!(direct_dependencies(&f.root, "desktop/session")?, [display]);
+    assert_eq!(direct_dependencies(&f.root, "desktop/versioned")?, [backup]);
+    assert_eq!(
+        direct_dependencies(&f.root, "desktop/transitive")?,
+        ["cps://canopa/desktop/direct@1.0.0-0"]
+    );
+    assert!(direct_dependencies(&f.root, "desktop/policy")?.is_empty());
+    assert!(direct_dependencies(&f.root, "runtime/desktop")?.is_empty());
+
+    for spec in ["library/display", "library/display@1.0.0-0", display] {
+        let expected = [
+            "cps://canopa/desktop/alternate@1.0.0-0",
+            "cps://canopa/desktop/direct@1.0.0-0",
+            "cps://canopa/desktop/session@1.0.0-0",
+        ];
+        assert_eq!(reverse_dependencies(&f.root, spec)?, expected);
+        let explanation = explain_package(&f.root, spec)?;
+        assert_eq!(explanation.intent.id, display);
+        assert!(explanation.intent.requested);
+        assert_eq!(explanation.dependents, expected);
+    }
+    assert_eq!(
+        reverse_dependencies(&f.root, "library/backup")?,
+        [
+            "cps://canopa/desktop/alternate@1.0.0-0",
+            "cps://canopa/desktop/versioned@1.0.0-0",
+        ]
+    );
+    assert!(reverse_dependencies(&f.root, "runtime/desktop")?.is_empty());
+    for spec in [
+        "runtime/missing",
+        "library/display@2.0.0-0",
+        "cps://other/library/display",
+    ] {
+        let expected = format!("package is not installed: {spec}");
+        assert_eq!(
+            direct_dependencies(&f.root, spec).unwrap_err().to_string(),
+            expected
+        );
+        assert_eq!(
+            reverse_dependencies(&f.root, spec).unwrap_err().to_string(),
+            expected
+        );
+        assert_eq!(
+            explain_package(&f.root, spec).unwrap_err().to_string(),
+            expected
+        );
+    }
     Ok(())
 }
 

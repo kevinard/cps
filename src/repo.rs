@@ -18,7 +18,7 @@ use crate::{
     kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
         FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, copy_payload, digest,
-        digest_reader, validate_digest, validate_name, validate_publisher,
+        digest_reader, validate_digest, validate_name, validate_publisher, validate_summary,
     },
     systemd::{self, Action as SystemdAction},
 };
@@ -31,7 +31,7 @@ const PUBLISH_RELEASE_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
 mod keys;
-mod profiles;
+pub(crate) mod profiles;
 mod rebuild;
 pub mod release;
 mod source_archive;
@@ -273,7 +273,7 @@ impl Catalog {
             entry.manifest_digest() == package.sha256,
             "installed manifest digest differs from the signed catalog"
         );
-        entry.check_architecture(&package.manifest)?;
+        entry.check_manifest(&package.manifest)?;
         Ok(attestation)
     }
 
@@ -572,23 +572,33 @@ impl Catalog {
 #[serde(untagged, deny_unknown_fields)]
 pub(crate) enum CatalogEntry {
     Portable(String),
-    Targeted {
+    Metadata {
         manifest: String,
-        architecture: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        architecture: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
 }
 
 impl CatalogEntry {
     pub(crate) fn manifest_digest(&self) -> &str {
         match self {
-            Self::Portable(manifest) | Self::Targeted { manifest, .. } => manifest,
+            Self::Portable(manifest) | Self::Metadata { manifest, .. } => manifest,
         }
     }
 
     fn architecture(&self) -> Option<&str> {
         match self {
             Self::Portable(_) => None,
-            Self::Targeted { architecture, .. } => Some(architecture),
+            Self::Metadata { architecture, .. } => architecture.as_deref(),
+        }
+    }
+
+    pub(crate) fn summary(&self) -> Option<&str> {
+        match self {
+            Self::Portable(_) => None,
+            Self::Metadata { summary, .. } => summary.as_deref(),
         }
     }
 
@@ -599,16 +609,30 @@ impl CatalogEntry {
 
     fn validate(&self) -> Result<()> {
         validate_digest(self.manifest_digest())?;
+        ensure!(
+            matches!(self, Self::Portable(_))
+                || self.architecture().is_some()
+                || self.summary().is_some(),
+            "catalog package metadata is empty"
+        );
         if let Some(architecture) = self.architecture() {
             validate_publisher(architecture).context("invalid catalog package architecture")?;
+        }
+        if let Some(summary) = self.summary() {
+            validate_summary(summary)?;
         }
         Ok(())
     }
 
-    fn check_architecture(&self, manifest: &Manifest) -> Result<()> {
+    fn check_manifest(&self, manifest: &Manifest) -> Result<()> {
         ensure!(
             self.architecture() == manifest.architecture.as_deref(),
             "catalog architecture differs from the manifest for {}",
+            manifest.id()
+        );
+        ensure!(
+            self.summary() == manifest.summary.as_deref(),
+            "catalog summary differs from the manifest for {}",
             manifest.id()
         );
         Ok(())
@@ -1333,7 +1357,7 @@ pub(crate) fn read_package(
         package.manifest.id() == id && package.manifest.publisher == publisher,
         "manifest identity mismatch for {id}"
     );
-    entry.check_architecture(&package.manifest)?;
+    entry.check_manifest(&package.manifest)?;
     Ok(package)
 }
 
@@ -1849,12 +1873,13 @@ fn stage_manifest(
             "manifest exceeds {MANIFEST_LIMIT} bytes"
         );
         let sha256 = store(repo, "manifests", document.as_bytes())?;
-        let entry = match manifest.architecture {
-            Some(architecture) => CatalogEntry::Targeted {
+        let entry = match (manifest.architecture, manifest.summary) {
+            (None, None) => CatalogEntry::Portable(sha256),
+            (architecture, summary) => CatalogEntry::Metadata {
                 manifest: sha256,
                 architecture,
+                summary,
             },
-            None => CatalogEntry::Portable(sha256),
         };
         catalog.entries.insert(id.clone(), entry);
         false
@@ -2224,11 +2249,14 @@ mod tests {
         let key =
             Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("generate key");
         let key = Ed25519KeyPair::from_pkcs8(key.as_ref()).expect("read generated key");
-        let legacy = br#"{"format":1,"publisher":"canopa","entries":{}}"#;
+        let portable = digest(b"portable");
+        let targeted = digest(b"targeted");
+        let legacy = format!(
+            r#"{{"format":1,"publisher":"canopa","entries":{{"cps://canopa/test/portable@1.0.0-0":"{portable}","cps://canopa/test/targeted@1.0.0-0":{{"manifest":"{targeted}","architecture":"x86_64"}}}}}}"#
+        );
         let signed = format!(
-            r#"{{"catalog":{},"signature":"{}"}}"#,
-            std::str::from_utf8(legacy)?,
-            hex::encode(key.sign(legacy).as_ref())
+            r#"{{"catalog":{legacy},"signature":"{}"}}"#,
+            hex::encode(key.sign(legacy.as_bytes()).as_ref())
         );
         let hash = store(repo.path(), "catalogs", signed.as_bytes())?;
         let read =

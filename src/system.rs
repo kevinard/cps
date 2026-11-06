@@ -1,6 +1,7 @@
 //! Everyday package operations on a running, registered Btrfs system.
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -9,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{FlockOperation, flock};
+use serde::Serialize;
 
 use crate::{
     BootEnvironment, PackageChange, Plan, Request,
@@ -22,9 +24,12 @@ use crate::{
     list_boot_environments,
     model::validate_publisher,
     plan,
+    plan::inspect_update,
     query::{InstallSource, SelectSource, select_install_sources},
     release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
 };
+
+pub use crate::plan::HeldBackUpdate;
 
 pub const CONFIG: &str = "/etc/cps/image.kdl";
 const ROOT: &str = "/";
@@ -39,7 +44,66 @@ pub struct Change {
     boot_reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateStatus {
+    UpToDate,
+    UpdatesAvailable,
+    Blocked,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateReport {
+    pub status: UpdateStatus,
+    pub changes: Vec<PackageChange>,
+    pub held_back: Vec<HeldBackUpdate>,
+    pub blockers: Vec<String>,
+    pub reboot_required: Option<bool>,
+    pub reboot_reason: Option<String>,
+}
+
+impl UpdateReport {
+    fn from_plan(result: Result<Change>, held_back: Vec<HeldBackUpdate>) -> Self {
+        let (status, changes, blockers, reboot_reason) = match result {
+            Ok(change) => {
+                let status = if !change.is_empty() {
+                    UpdateStatus::UpdatesAvailable
+                } else if held_back.is_empty() {
+                    UpdateStatus::UpToDate
+                } else {
+                    UpdateStatus::Blocked
+                };
+                (
+                    status,
+                    change.packages().to_vec(),
+                    Vec::new(),
+                    change.boot_reason,
+                )
+            }
+            Err(error) => (
+                UpdateStatus::Blocked,
+                Vec::new(),
+                vec![format!("{error:#}")],
+                None,
+            ),
+        };
+        Self {
+            status,
+            changes,
+            held_back,
+            blockers,
+            reboot_required: (status != UpdateStatus::Blocked).then_some(reboot_reason.is_some()),
+            reboot_reason,
+        }
+    }
+}
+
 impl Change {
+    pub(crate) fn from_plan(plan: Plan, stage_packages: &BTreeSet<String>) -> Self {
+        let boot_reason = plan.boot_reason(stage_packages);
+        Self { plan, boot_reason }
+    }
+
     pub fn is_empty(&self) -> bool {
         !self.plan.has_changes()
     }
@@ -50,6 +114,15 @@ impl Change {
 
     pub fn boot_reason(&self) -> Option<&str> {
         self.boot_reason.as_deref()
+    }
+
+    /// Route a nonempty change through the trial boot workflow.
+    pub fn with_staging(mut self) -> Self {
+        if !self.is_empty() {
+            self.boot_reason
+                .get_or_insert_with(|| "--stage was requested".into());
+        }
+        self
     }
 }
 
@@ -105,7 +178,7 @@ impl System {
     }
 
     pub fn plan(&self, request: Request, refresh: bool) -> Result<Change> {
-        self.plan_request(request, refresh, None)
+        self.plan_request(request, refresh, None, None)
     }
 
     pub fn plan_with_source_selection(
@@ -114,7 +187,18 @@ impl System {
         refresh: bool,
         mut choose: impl FnMut(&str, &[InstallSource]) -> Result<usize>,
     ) -> Result<Change> {
-        self.plan_request(request, refresh, Some(&mut choose))
+        self.plan_request(request, refresh, Some(&mut choose), None)
+    }
+
+    /// Check the running system with the same refresh and planner as an upgrade.
+    pub fn check_updates(config: &Path, refresh: bool) -> UpdateReport {
+        let mut held_back = Vec::new();
+        let result = (|| {
+            let system = Self::load(config)?;
+            let _lock = system.lock()?;
+            system.plan_request(Request::Update, refresh, None, Some(&mut held_back))
+        })();
+        UpdateReport::from_plan(result, held_back)
     }
 
     fn plan_request(
@@ -122,22 +206,27 @@ impl System {
         mut request: Request,
         refresh: bool,
         choose: Option<&mut SelectSource<'_>>,
+        held_back: Option<&mut Vec<HeldBackUpdate>>,
     ) -> Result<Change> {
-        let upgrade = matches!(request, Request::Update);
+        let uses_current_catalogs = matches!(request, Request::Install { .. } | Request::Update);
         ensure!(
-            upgrade || matches!(request, Request::Install { .. }),
-            "expected an install or upgrade request"
+            uses_current_catalogs
+                || matches!(request, Request::Remove { .. } | Request::Autoremove),
+            "expected an install, upgrade, remove, or autoremove request"
         );
         self.check_running()?;
-        if refresh {
-            self.refresh(upgrade)?;
+        if refresh && uses_current_catalogs {
+            self.refresh(matches!(request, Request::Update))?;
         }
         if let (Request::Install { packages }, Some(choose)) = (&mut request, choose) {
             select_install_sources(Path::new(ROOT), packages, choose)?;
         }
-        let plan = plan(Path::new(ROOT), request)?;
-        let boot_reason = plan.boot_reason(&self.definition.stage_packages);
-        Ok(Change { plan, boot_reason })
+        let root = Path::new(ROOT);
+        let plan = match held_back {
+            Some(held_back) => inspect_update(root, held_back)?,
+            None => plan(root, request)?,
+        };
+        Ok(Change::from_plan(plan, &self.definition.stage_packages))
     }
 
     pub fn apply(&self, change: &Change) -> Result<Option<String>> {

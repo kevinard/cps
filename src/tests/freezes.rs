@@ -100,7 +100,17 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
     )
     .unwrap_err();
     assert!(error.to_string().contains("is frozen at 1.0.0-0"));
-    let update = plan(&f.root, Request::Update)?;
+    let mut held_back = Vec::new();
+    let update = crate::plan::inspect_update(&f.root, &mut held_back)?;
+    assert_eq!(update, plan(&f.root, Request::Update)?);
+    assert_eq!(held_back.len(), 2);
+    assert_eq!(held_back[0].name, tool);
+    assert_eq!(held_back[0].available.to_string(), "3.0.0-0");
+    assert_eq!(held_back[0].selected.unwrap().to_string(), "2.0.0-0");
+    assert_eq!(held_back[1].name, runtime);
+    assert_eq!(held_back[1].available.to_string(), "2.0.0-0");
+    assert_eq!(held_back[1].selected.unwrap().to_string(), "1.0.0-0");
+    assert!(held_back[1].reason.contains("keep known-good graphics ABI"));
     interrupt_apply_at(
         &f.root,
         &f._dir.path().join("frozen-update.json"),
@@ -130,6 +140,10 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
     assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "runtime 1");
     assert_eq!(list_freezes(&f.root)?, freezes);
     assert!(verify(&f.root)?.is_empty());
+    fs::rename(f.repo.with_extension("offline"), &f.repo)?;
+    let blocked = crate::plan::inspect_update(&f.root, &mut held_back)?;
+    assert!(!blocked.has_changes());
+    assert_eq!(held_back.len(), 2);
     apply(
         &f.root,
         &plan(
@@ -140,8 +154,9 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         )?,
     )?;
     assert!(list_freezes(&f.root)?.is_empty());
-    fs::rename(f.repo.with_extension("offline"), &f.repo)?;
-    apply(&f.root, &plan(&f.root, Request::Update)?)?;
+    let update = crate::plan::inspect_update(&f.root, &mut held_back)?;
+    assert!(held_back.is_empty());
+    apply(&f.root, &update)?;
     assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "runtime 2");
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "tool 3");
     Ok(())
@@ -227,9 +242,18 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     };
     let base_id = crate::activate_boot_environment(&f.root, &esp, &activation)?;
     let freezes = list_freezes(&f.root)?;
+    let mut held_back = Vec::new();
+    assert!(!crate::plan::inspect_update(&f.root, &mut held_back)?.has_changes());
+    assert!(
+        held_back.is_empty(),
+        "versions outside the signed profile are inapplicable"
+    );
     publish_profile("2.0.0-0")?;
-    let error = plan(&f.root, Request::Update).unwrap_err();
+    let error = crate::plan::inspect_update(&f.root, &mut held_back).unwrap_err();
     assert!(format!("{error:#}").contains("validate desktop compatibility"));
+    assert_eq!(held_back.len(), 1);
+    assert_eq!(held_back[0].available.to_string(), "2.0.0-0");
+    assert_eq!(held_back[0].selected, None);
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "base 1");
     let keep = plan(&f.root, freeze(name.into()))?;
     let held_root = f._dir.path().join("held-root");

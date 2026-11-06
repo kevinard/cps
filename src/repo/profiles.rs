@@ -1,5 +1,5 @@
-mod elf;
-mod runtime;
+pub(crate) mod elf;
+pub(crate) mod runtime;
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},

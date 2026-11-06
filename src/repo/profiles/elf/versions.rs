@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use object::{elf, endian::Endian, read::Bytes};
 
-pub(in crate::repo::profiles) type Names = BTreeMap<String, u32>;
+pub(crate) type Names = BTreeMap<String, u32>;
 
 pub(super) struct Table<'a> {
     pub bytes: Bytes<'a>,

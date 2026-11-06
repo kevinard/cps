@@ -1,3 +1,7 @@
+mod dependencies;
+
+pub use dependencies::suggest_dependencies;
+
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     path::Path,
@@ -51,7 +55,9 @@ pub fn generate_manifest_for_architecture(
         name: name.to_owned(),
         version: version.parse()?,
         architecture: architecture.map(str::to_owned),
+        summary: None,
         dependency: Vec::new(),
+        optional_dependencies: Vec::new(),
         action: Vec::new(),
         systemd: Vec::new(),
         kernel: None,

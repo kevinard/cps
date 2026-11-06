@@ -728,6 +728,17 @@ impl Image {
             .transpose()
     }
 
+    pub(crate) fn managed_path(&self, path: &str) -> Result<Option<Managed>> {
+        let bytes: Option<String> = self
+            .db
+            .prepare_cached("SELECT data FROM paths WHERE path=?1")?
+            .query_row([path], |row| row.get(0))
+            .optional()?;
+        bytes
+            .map(|bytes| Ok(serde_json::from_str(&bytes)?))
+            .transpose()
+    }
+
     pub(crate) fn settings(&self) -> Result<Settings> {
         let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
         ensure!(

@@ -9,9 +9,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use crate::{
-    image::{Image, Installed, Publisher, Publishers, Settings},
+    image::{Image, Installed, ProfileIntent, Publisher, Publishers, Settings, State},
     kdl_format::manifest_text,
-    model::{PackageSpec, Version},
+    model::{Dependency, DependencyTarget, PackageSpec, Version, validate_path},
     repo::{CatalogEntry, CatalogPin, catalog_index, read_package},
 };
 
@@ -44,6 +44,7 @@ pub struct PackageRow {
     pub id: String,
     pub name: String,
     pub status: Status,
+    pub summary: Option<String>,
 }
 
 pub struct InstallSource {
@@ -163,32 +164,68 @@ pub struct PackageIntentRow {
 
 /// List effective local requests and roles in the applied profile, offline.
 pub fn list_package_intent(root: &Path) -> Result<Vec<PackageIntentRow>> {
+    let (state, intent) = read_intent(root)?;
+    Ok(state
+        .installed
+        .values()
+        .map(|package| intent_row(&state, &intent, package))
+        .collect())
+}
+
+#[derive(Debug)]
+pub struct PackageExplanation {
+    pub intent: PackageIntentRow,
+    pub profile_name: Option<String>,
+    pub dependents: Vec<String>,
+}
+
+/// Explain the current local request, signed profile role, and direct dependents.
+pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
+    let selector = PackageSpec::parse(spec)?;
+    let (state, intent) = read_intent(root)?;
+    let package = select_installed(&state.installed, selector, spec)?;
+    let intent = intent_row(&state, &intent, package);
+    let profile_name = state
+        .publishers
+        .release_profile()
+        .filter(|_| intent.profile != ProfileRole::None)
+        .map(str::to_owned);
+    let mut dependents = installed_dependents(&state.installed, selector.name)?;
+    dependents.retain(|id| id != &intent.id);
+    Ok(PackageExplanation {
+        intent,
+        profile_name,
+        dependents,
+    })
+}
+
+fn read_intent(root: &Path) -> Result<(State, ProfileIntent)> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let state = image.state()?;
     image.verify_catalog_archives(&state)?;
     let intent = image.profile_intent(&state)?;
-    state
-        .installed
-        .iter()
-        .map(|(name, package)| {
-            package.verify(name, &state.publishers)?;
-            let profile = if !state.settings.profile_packages.contains_key(name) {
-                ProfileRole::None
-            } else if intent.roots.contains(name) {
-                ProfileRole::Root
-            } else if intent.roots.is_empty() {
-                ProfileRole::Protected
-            } else {
-                ProfileRole::Dependency
-            };
-            Ok(PackageIntentRow {
-                id: package.published.manifest.id(),
-                requested: intent.local.contains(name),
-                profile,
-            })
-        })
-        .collect()
+    verify_installed(&state.installed, &state.publishers)?;
+    Ok((state, intent))
+}
+
+fn intent_row(state: &State, intent: &ProfileIntent, package: &Installed) -> PackageIntentRow {
+    let manifest = &package.published.manifest;
+    let name = &manifest.name;
+    let profile = if !state.settings.profile_packages.contains_key(name) {
+        ProfileRole::None
+    } else if intent.roots.contains(name) {
+        ProfileRole::Root
+    } else if intent.roots.is_empty() {
+        ProfileRole::Protected
+    } else {
+        ProfileRole::Dependency
+    };
+    PackageIntentRow {
+        id: manifest.id(),
+        requested: intent.local.contains(name),
+        profile,
+    }
 }
 
 /// Read explicitly configured facet values from the committed image.
@@ -241,10 +278,18 @@ fn available(
 
 fn installed(image: &Image, publishers: &Publishers) -> Result<BTreeMap<String, Installed>> {
     let installed = image.installed()?;
-    for (name, package) in &installed {
+    verify_installed(&installed, publishers)?;
+    Ok(installed)
+}
+
+fn verify_installed(
+    installed: &BTreeMap<String, Installed>,
+    publishers: &Publishers,
+) -> Result<()> {
+    for (name, package) in installed {
         package.verify(name, publishers)?;
     }
-    Ok(installed)
+    Ok(())
 }
 
 fn status(package: &Installed) -> Status {
@@ -262,12 +307,19 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
     let publishers = image.publishers()?;
     let installed = installed(&image, &publishers)?;
     if scope == Scope::Installed {
+        if installed
+            .values()
+            .any(|pkg| pkg.published.manifest.summary.is_some())
+        {
+            verify_installed_metadata(&image)?;
+        }
         return Ok(installed
             .into_iter()
             .map(|(name, package)| PackageRow {
                 id: package.published.manifest.id(),
                 name,
                 status: status(&package),
+                summary: package.published.manifest.summary,
             })
             .collect());
     }
@@ -309,9 +361,220 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
                 id: entry.id,
                 name: entry.name,
                 status,
+                summary: entry.entry.summary().map(str::to_owned),
             }
         })
         .collect())
+}
+
+fn verify_installed_metadata(image: &Image) -> Result<()> {
+    let state = image.state()?;
+    ensure!(
+        state.settings.catalog_archives,
+        "missing signed catalog archives for installed package metadata"
+    );
+    image.verify_catalog_archives(&state)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FileMatch {
+    pub package: String,
+    pub path: String,
+}
+
+/// Search the latest compatible package from each publisher by exact path or basename.
+pub fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
+    let by_path = term.contains('/');
+    let term = term.trim_start_matches('/');
+    validate_path(term)?;
+
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let publishers = image.publishers()?;
+    let settings = image.settings()?;
+    let pins = image.release_pins(&publishers, &settings)?;
+    let mut matches = Vec::new();
+    for publisher in publishers.as_slice() {
+        let (mut entries, _) = available(
+            &image,
+            &publishers,
+            &settings,
+            publisher,
+            pins.get(&publisher.name),
+        )?;
+        entries.dedup_by(|a, b| a.name == b.name);
+        for entry in entries {
+            let package = read_package(&publisher.repo, &publisher.name, &entry.id, &entry.entry)
+                .with_context(|| format!("reading manifest for {}", entry.id))?;
+            let paths = package
+                .manifest
+                .action
+                .iter()
+                .filter(|action| action.applies_to(&settings.arch, &settings.facets))
+                .map(|action| action.path())
+                .filter(|path| {
+                    if by_path {
+                        *path == term
+                    } else {
+                        path.rsplit('/').next() == Some(term)
+                    }
+                })
+                .collect::<BTreeSet<_>>();
+            matches.extend(paths.into_iter().map(|path| FileMatch {
+                package: entry.id.clone(),
+                path: path.to_owned(),
+            }));
+        }
+    }
+    Ok(matches)
+}
+
+/// Return the installed package IDs that own an exact image path.
+pub fn path_owners(root: &Path, path: &str) -> Result<Vec<String>> {
+    let relative = path.strip_prefix('/').unwrap_or(path);
+    validate_path(relative)?;
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let managed = image
+        .managed_path(relative)?
+        .filter(|entry| !entry.owners.is_empty())
+        .with_context(|| format!("no installed package owns {path:?}"))?;
+    let publishers = image.publishers()?;
+    managed
+        .owners
+        .into_iter()
+        .map(|name| {
+            let package = image
+                .installed_package(&name)?
+                .with_context(|| format!("path {path:?} has an uninstalled owner {name}"))?;
+            package.verify(&name, &publishers)?;
+            Ok(package.published.manifest.id())
+        })
+        .collect()
+}
+
+/// List the root-relative paths owned by an installed package.
+pub fn package_contents(root: &Path, spec: &str) -> Result<Vec<String>> {
+    let selector = PackageSpec::parse(spec)?;
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let package = image
+        .installed_package(selector.name)?
+        .filter(|package| matches_installed(package, selector))
+        .with_context(|| format!("package is not installed: {spec}"))?;
+    package.verify(selector.name, &image.publishers()?)?;
+    let paths = package
+        .published
+        .manifest
+        .action
+        .iter()
+        .map(|action| action.path())
+        .collect::<BTreeSet<_>>();
+    let mut owned = Vec::new();
+    for path in paths {
+        if image
+            .managed_path(path)?
+            .is_some_and(|entry| entry.owners.contains(selector.name))
+        {
+            owned.push(path.to_owned());
+        }
+    }
+    Ok(owned)
+}
+
+/// List installed package IDs that satisfy this package's direct requirements.
+pub fn direct_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
+    let (installed, name) = dependency_query(root, spec)?;
+    let mut dependencies = BTreeMap::new();
+    for dependency in &installed[name].published.manifest.dependency {
+        for target in active_targets(dependency, &installed)? {
+            if let Some(package) = installed.get(&target.package)
+                && target.matches(package.published.manifest.version)?
+            {
+                dependencies.insert(&target.package, &package.published.manifest);
+            }
+        }
+    }
+    Ok(dependencies
+        .values()
+        .map(|manifest| manifest.id())
+        .collect())
+}
+
+/// List installed package IDs with a direct requirement satisfied by this package.
+pub fn reverse_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
+    let (installed, name) = dependency_query(root, spec)?;
+    installed_dependents(&installed, name)
+}
+
+fn installed_dependents(
+    installed: &BTreeMap<String, Installed>,
+    name: &str,
+) -> Result<Vec<String>> {
+    let version = installed[name].published.manifest.version;
+    let mut dependents = Vec::new();
+    'packages: for package in installed.values() {
+        let manifest = &package.published.manifest;
+        for dependency in &manifest.dependency {
+            for target in active_targets(dependency, installed)? {
+                if target.package == name && target.matches(version)? {
+                    dependents.push(manifest.id());
+                    continue 'packages;
+                }
+            }
+        }
+    }
+    Ok(dependents)
+}
+
+fn dependency_query<'a>(
+    root: &Path,
+    spec: &'a str,
+) -> Result<(BTreeMap<String, Installed>, &'a str)> {
+    let selector = PackageSpec::parse(spec)?;
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let installed = installed(&image, &image.publishers()?)?;
+    select_installed(&installed, selector, spec)?;
+    Ok((installed, selector.name))
+}
+
+fn select_installed<'a>(
+    installed: &'a BTreeMap<String, Installed>,
+    selector: PackageSpec<'_>,
+    spec: &str,
+) -> Result<&'a Installed> {
+    installed
+        .get(selector.name)
+        .filter(|package| matches_installed(package, selector))
+        .with_context(|| format!("package is not installed: {spec}"))
+}
+
+fn active_targets<'a>(
+    dependency: &'a Dependency,
+    installed: &BTreeMap<String, Installed>,
+) -> Result<&'a [DependencyTarget]> {
+    Ok(match dependency {
+        Dependency::Require(target) => std::slice::from_ref(target),
+        Dependency::RequireAny { alternatives } => alternatives,
+        Dependency::Conditional { target, predicate } => match installed.get(&predicate.package) {
+            Some(package) if predicate.matches(package.published.manifest.version)? => {
+                std::slice::from_ref(target)
+            }
+            _ => &[],
+        },
+        Dependency::Incorporate(_) | Dependency::Exclude(_) => &[],
+    })
+}
+
+fn matches_installed(package: &Installed, selector: PackageSpec<'_>) -> bool {
+    let manifest = &package.published.manifest;
+    selector
+        .version
+        .is_none_or(|version| version == manifest.version)
+        && selector
+            .publisher
+            .is_none_or(|publisher| publisher == manifest.publisher)
 }
 
 /// Return the verified manifest for a package in KDL.
@@ -381,15 +644,12 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
         anyhow::bail!("package is absent from the signed catalog: {spec}")
     } else {
         installed
-            .filter(|entry| {
-                let manifest = &entry.published.manifest;
-                accepts(manifest.version)
-                    && selector
-                        .publisher
-                        .is_none_or(|name| name == manifest.publisher)
-            })
+            .filter(|package| matches_installed(package, selector))
             .with_context(|| format!("package is not installed: {spec}"))?
             .published
     };
+    if package.manifest.summary.is_some() || !package.manifest.optional_dependencies.is_empty() {
+        verify_installed_metadata(&image)?;
+    }
     Ok(manifest_text(&package.manifest))
 }

@@ -11,8 +11,8 @@ use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
     model::{
-        Action, Dependency, DependencyTarget, FORMAT, Manifest, NIL_UUID, is_uuid, validate_digest,
-        validate_name, validate_publisher,
+        Action, Dependency, DependencyTarget, FORMAT, Manifest, NIL_UUID, OptionalDependency,
+        is_uuid, validate_digest, validate_name, validate_publisher,
     },
     repo::read_limited,
     systemd::Action as SystemdAction,
@@ -146,7 +146,13 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let fields = Fields::read(
         package,
         1,
-        &["publisher", "version", "architecture", "requires-reboot"],
+        &[
+            "publisher",
+            "version",
+            "architecture",
+            "requires-reboot",
+            "summary",
+        ],
         true,
     )?;
     let mut manifest = Manifest {
@@ -155,7 +161,9 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         publisher: fields.required_string("publisher")?,
         version: fields.required_string("version")?.parse()?,
         architecture: fields.string("architecture")?,
+        summary: fields.string("summary")?,
         dependency: Vec::new(),
+        optional_dependencies: Vec::new(),
         action: Vec::new(),
         systemd: Vec::new(),
         kernel: None,
@@ -176,6 +184,16 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             "require" | "incorporate" | "exclude" | "require-any" | "conditional" => manifest
                 .dependency
                 .push(parse_dependency(node).with_context(|| format!("{name} dependency"))?),
+            "optional" => {
+                let fields = Fields::read(node, 1, &["version", "description"], false)?;
+                manifest.optional_dependencies.push(OptionalDependency {
+                    target: DependencyTarget {
+                        package: fields.string_arg(0)?,
+                        version: fields.string("version")?,
+                    },
+                    description: fields.required_string("description")?,
+                });
+            }
             "file" | "dir" | "symlink" | "hardlink" => manifest
                 .action
                 .push(parse_action(node).with_context(|| format!("{name} action"))?),
@@ -355,6 +373,9 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     if manifest.requires_reboot {
         package.insert("requires-reboot", true);
     }
+    if let Some(summary) = &manifest.summary {
+        package.insert("summary", summary.as_str());
+    }
     let children = package.ensure_children().nodes_mut();
     for dependency in &manifest.dependency {
         children.push(match dependency {
@@ -379,6 +400,11 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 node
             }
         });
+    }
+    for optional in &manifest.optional_dependencies {
+        let mut node = target_node("optional", &optional.target);
+        node.insert("description", optional.description.as_str());
+        children.push(node);
     }
     for action in &manifest.action {
         let mut node = KdlNode::new(match action {

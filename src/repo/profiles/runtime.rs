@@ -26,11 +26,7 @@ pub(super) fn check(
     if profile.elf_library_dirs.is_empty() {
         return Ok(());
     }
-    let machine = match profile.arch.as_str() {
-        "x86_64" => EM_X86_64,
-        "aarch64" => EM_AARCH64,
-        arch => bail!("unsupported architecture for ELF checking {arch}"),
-    };
+    let machine = machine(&profile.arch)?;
     let mut repositories = BTreeMap::from([(publisher, Root::open(repo)?)]);
     for companion in &profile.companions {
         repositories.insert(
@@ -90,43 +86,11 @@ pub(super) fn check(
             }
             let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
             let origin = format!("/{dir}");
-            let mut search = Vec::new();
-            if let Some(runpath) = &info.runpath {
-                for dir in runpath.split(':') {
-                    ensure!(search.len() < 64, "too many ELF runpath directories");
-                    search.push(expand_absolute(dir, &origin)?);
-                }
-            }
-            if info.use_default_dirs {
-                search.extend(profile.elf_library_dirs.iter().cloned());
-            }
+            let search = library_search(info, &origin, &profile.elf_library_dirs)?;
             for needed in &info.needed {
-                ensure!(!needed.is_empty(), "empty ELF dependency");
-                let target = if needed.contains('/') || needed.contains('$') {
-                    resolve(paths, &expand_absolute(needed, &origin)?)?
-                } else {
-                    let mut found = None;
-                    for dir in &search {
-                        let path = format!("{}/{needed}", dir.trim_end_matches('/'));
-                        if let Some(target) = resolve(paths, &path)? {
-                            found = Some(target);
-                            break;
-                        }
-                    }
-                    found
-                };
-                let target = target.with_context(|| format!("missing ELF dependency {needed}"))?;
-                let library = elf_at(target)
-                    .filter(|library| native(library, machine) && library.shared_object)
-                    .with_context(|| format!("incompatible ELF dependency {needed} at {target}"))?;
-                if let Some(versions) = info.required_versions.get(needed) {
-                    for (version, hash) in versions {
-                        ensure!(
-                            library.defined_versions.get(version) == Some(hash),
-                            "ELF dependency {needed} at {target} does not provide required version {version}"
-                        );
-                    }
-                }
+                let (target, _) = find_library(paths, needed, &origin, &search)?
+                    .with_context(|| format!("missing ELF dependency {needed}"))?;
+                check_library(info, machine, needed, target, elf_at(target))?;
             }
             Ok(())
         };
@@ -135,11 +99,74 @@ pub(super) fn check(
     Ok(())
 }
 
-fn native(info: &Elf, machine: u16) -> bool {
+pub(crate) fn find_library<'a>(
+    paths: &'a BTreeMap<String, Managed>,
+    needed: &str,
+    origin: &str,
+    search: &[String],
+) -> Result<Option<(&'a str, String)>> {
+    ensure!(!needed.is_empty(), "empty ELF dependency");
+    if needed.contains(['/', '$']) {
+        let path = expand_absolute(needed, origin)?;
+        return Ok(resolve(paths, &path)?.map(|target| (target, path)));
+    }
+    for dir in search {
+        let path = format!("{}/{needed}", dir.trim_end_matches('/'));
+        if let Some(target) = resolve(paths, &path)? {
+            return Ok(Some((target, path)));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn check_library(
+    consumer: &Elf,
+    machine: u16,
+    needed: &str,
+    target: &str,
+    library: Option<&Elf>,
+) -> Result<()> {
+    let library = library
+        .filter(|library| native(library, machine) && library.shared_object)
+        .with_context(|| format!("incompatible ELF dependency {needed} at {target}"))?;
+    if let Some(versions) = consumer.required_versions.get(needed) {
+        for (version, hash) in versions {
+            ensure!(
+                library.defined_versions.get(version) == Some(hash),
+                "ELF dependency {needed} at {target} does not provide required version {version}"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn machine(arch: &str) -> Result<u16> {
+    match arch {
+        "x86_64" => Ok(EM_X86_64),
+        "aarch64" => Ok(EM_AARCH64),
+        _ => bail!("unsupported architecture for ELF checking {arch}"),
+    }
+}
+
+pub(crate) fn native(info: &Elf, machine: u16) -> bool {
     info.native_64_le && info.machine == machine
 }
 
-fn expand_absolute(path: &str, origin: &str) -> Result<String> {
+pub(crate) fn library_search(info: &Elf, origin: &str, defaults: &[String]) -> Result<Vec<String>> {
+    let mut search = Vec::new();
+    if let Some(runpath) = &info.runpath {
+        for dir in runpath.split(':') {
+            ensure!(search.len() < 64, "too many ELF runpath directories");
+            search.push(expand_absolute(dir, origin)?);
+        }
+    }
+    if info.use_default_dirs {
+        search.extend(defaults.iter().cloned());
+    }
+    Ok(search)
+}
+
+pub(crate) fn expand_absolute(path: &str, origin: &str) -> Result<String> {
     let mut remaining = path;
     let mut expanded = String::new();
     while let Some((before, token)) = remaining.split_once('$') {
@@ -169,6 +196,30 @@ fn expand_absolute(path: &str, origin: &str) -> Result<String> {
 /// Resolve within the signed path map. Absolute symlink targets start at
 /// the image root, including the compatibility links in a merged /usr.
 fn resolve<'a>(paths: &'a BTreeMap<String, Managed>, absolute: &str) -> Result<Option<&'a str>> {
+    walk_path(absolute, |path| {
+        Ok(paths.get_key_value(path).and_then(|(name, entry)| {
+            let kind = match &entry.node {
+                Node::Dir { .. } => PathKind::Directory,
+                Node::File { .. } => PathKind::File(name),
+                Node::Hardlink { target } => PathKind::File(target),
+                Node::Symlink { target, .. } => PathKind::Symlink(target),
+                Node::Special => return None,
+            };
+            Some(kind)
+        }))
+    })
+}
+
+pub(crate) enum PathKind<'a> {
+    Directory,
+    File(&'a str),
+    Symlink(&'a str),
+}
+
+pub(crate) fn walk_path<'a>(
+    absolute: &str,
+    mut lookup: impl FnMut(&str) -> Result<Option<PathKind<'a>>>,
+) -> Result<Option<&'a str>> {
     ensure!(absolute.len() < PATH_LIMIT, "ELF path is too long");
     ensure!(
         absolute.starts_with('/'),
@@ -193,11 +244,11 @@ fn resolve<'a>(paths: &'a BTreeMap<String, Managed>, absolute: &str) -> Result<O
             _ => resolved.push(part),
         }
         let path = resolved.join("/");
-        let Some((name, file)) = paths.get_key_value(&path) else {
+        let Some(kind) = lookup(&path)? else {
             return Ok(None);
         };
-        match &file.node {
-            Node::Symlink { target, .. } => {
+        match kind {
+            PathKind::Symlink(target) => {
                 links += 1;
                 ensure!(links <= 40, "too many symlinks resolving {absolute:?}");
                 ensure!(target.len() < PATH_LIMIT, "ELF symlink target is too long");
@@ -213,9 +264,8 @@ fn resolve<'a>(paths: &'a BTreeMap<String, Managed>, absolute: &str) -> Result<O
                     pending.push_front(part);
                 }
             }
-            Node::Dir { .. } => {}
-            Node::Hardlink { target } if pending.is_empty() => return Ok(Some(target)),
-            Node::File { .. } if pending.is_empty() => return Ok(Some(name)),
+            PathKind::Directory => {}
+            PathKind::File(path) if pending.is_empty() => return Ok(Some(path)),
             _ => return Ok(None),
         }
     }

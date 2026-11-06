@@ -592,6 +592,8 @@ if [[ $native_boot == 1 ]]; then
         grep -Fx 'CPS_VM_SYSTEM: installed and upgraded in place, then staged the base upgrade' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: staged upgrade booted with the live package' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: rolled back to the base with the live package' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: staged autoremove booted with the dependency removed' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: forced install staged without changing the running root' uefi.log.clean
     else
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial blessed' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial default after reboot' uefi.log.clean

@@ -727,7 +727,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
 fn profile_updates_reconcile_defaults_and_keep_operator_roots() -> Result<()> {
     use crate::{
         MarkChoice,
-        query::{ProfileRole, list_package_intent},
+        query::{ProfileRole, explain_package, list_package_intent},
     };
 
     let f = Fixture::new()?;
@@ -859,6 +859,22 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
                 .any(|row| row.id == "cps://canopa/library/shared@1.0.0-0"
                     && !row.requested
                     && row.profile == ProfileRole::Dependency)
+        );
+        let profile_root = explain_package(root, "cps://canopa/desktop/optional")?;
+        assert_eq!(profile_root.intent.requested, requested);
+        assert_eq!(profile_root.intent.profile, ProfileRole::Root);
+        assert_eq!(profile_root.profile_name.as_deref(), Some("desktop"));
+        assert!(profile_root.dependents.is_empty());
+        let dependency = explain_package(root, shared)?;
+        assert!(!dependency.intent.requested);
+        assert_eq!(dependency.intent.profile, ProfileRole::Dependency);
+        assert_eq!(dependency.profile_name.as_deref(), Some("desktop"));
+        assert_eq!(
+            dependency.dependents,
+            [
+                "cps://canopa/desktop/addon@1.0.0-0",
+                "cps://canopa/desktop/base@1.0.0-0",
+            ]
         );
     }
     fs::rename(&offline, &f.repo)?;

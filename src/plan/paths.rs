@@ -93,10 +93,7 @@ pub(crate) fn select_paths(
         let publisher = &package.published.manifest.publisher;
         let mut selected = BTreeSet::new();
         for action in &package.published.manifest.action {
-            let (facet, action_arch) = action.selectors();
-            if facet.is_some_and(|key| !facets.get(key).copied().unwrap_or(true))
-                || action_arch.is_some_and(|action_arch| action_arch != arch)
-            {
+            if !action.applies_to(arch, facets) {
                 continue;
             }
             let path = action.path();

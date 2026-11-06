@@ -192,7 +192,7 @@ impl Root {
             .with_context(|| format!("inspecting {path}"))
     }
 
-    fn regular_entry(&self, path: &str) -> Result<Option<File>> {
+    pub(crate) fn regular_entry(&self, path: &str) -> Result<Option<File>> {
         validate_path(path)?;
         match self.open_relative(path, OFlags::PATH | OFlags::NOFOLLOW) {
             Ok(file) if file.metadata()?.is_file() => Ok(Some(file)),
@@ -206,6 +206,18 @@ impl Root {
             return Ok(false);
         };
         self.shares_inode(path, &file)
+    }
+
+    pub(crate) fn resolves_to_file(&self, path: &str, target: &str) -> Result<bool> {
+        let file: File = openat2(
+            &self.0,
+            path,
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV,
+        )?
+        .into();
+        self.shares_inode(target, &file)
     }
 
     pub(crate) fn shares_inode(&self, path: &str, target: &File) -> Result<bool> {

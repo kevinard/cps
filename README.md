@@ -13,6 +13,7 @@ fragment and use the package name from the result.
 sudo cps search htop
 sudo cps install apps/htop
 htop
+sudo cps check-updates --json
 sudo cps upgrade
 sudo cps status
 ```
@@ -23,6 +24,38 @@ them. Ordinary changes apply to the running system. Restart any open
 applications to use updated files. CPS reloads the systemd manager when
 system unit files change and queues restarts for active services owned
 by updated packages. New services follow the package's preset policy.
+
+`check-updates --json` runs the upgrade planner on the running system.
+It refreshes configured mirrors as `upgrade` does. Use `--no-refresh` to
+check the cached catalogs. It only plans the transaction, so the installed
+system and boot selection stay as they are while the mirror cache can advance.
+
+The JSON `status` is `up_to_date`, `updates_available`, or `blocked`.
+`changes` lists the planned package changes, including dependency installs
+and removals. `held_back` lists packages for which the current catalogs and
+profile offer a newer version than the plan selects. Each entry gives the
+installed, newest available, and selected versions and the freeze reason
+when applicable. The selected version is `null` if planning fails.
+`blockers` contains errors that prevented a plan, such as a
+pending trial boot or an unsatisfiable release profile. A check can report
+both actionable changes and held-back packages.
+
+`reboot_required` is a boolean for the actionable plan and `reboot_reason`
+explains a required reboot. Both fields are `null` when the upgrade is
+blocked. The command exits with status 0 for a successful check with or
+without updates, and status 1 if blocked. Refresh progress goes to stderr.
+
+```sh
+sudo cps remove --dry-run apps/htop
+sudo cps remove apps/htop
+sudo cps autoremove
+```
+
+`remove` checks that the remaining packages still have their required
+dependencies. `autoremove` removes dependencies that are no longer needed
+by explicitly installed packages or the signed release profile. Both use
+the same preview, confirmation, and reboot staging as `install`, and work
+offline from the installed package state.
 
 When a new package is available from several publishers, an interactive
 `install` shows a choice with the newest matching version from each.
@@ -37,6 +70,16 @@ CPS selects the new environment for a trial on the next reboot and
 keeps the current one as fallback. CPS reports when a reboot is needed
 and leaves the timing to you. Boot into the selected environment before
 making more package changes so the next boot includes all of your work.
+
+Pass `--stage` to `install` or `upgrade` to use the trial boot workflow
+for an ordinary package change. The running root keeps its current
+packages until you reboot into the trial. Combine `--stage` with
+`--dry-run` to preview the changes and reboot requirement.
+
+```sh
+sudo cps install --stage --yes apps/htop
+sudo cps upgrade --stage --dry-run
+```
 
 Package authors can mark packages for staging in the signed manifest.
 
@@ -54,8 +97,9 @@ package does not require staging. The flag defaults to false, and
 distribution `stage-package` rules and boot path checks still apply.
 
 Use `--dry-run` to review the proposed transaction, `--yes` to confirm it
-in a script, or `--no-refresh` to use the current cached catalog. Fetching
-uncached package files can still contact the mirror. With configured
+in a script, and `--no-refresh` on `install` or `upgrade` to use the
+current cached catalog. Fetching uncached package files can still contact
+the mirror. With configured
 mirrors, `upgrade` checks for updates and `install` reuses recently
 synchronized catalogs. `cps resume` completes an interrupted live
 transaction using the files saved in its journal. The explicit
@@ -165,6 +209,26 @@ installed permissions and ownership of files that are present. A repair that
 only fixes preserved configuration metadata works offline. Resolve path
 type conflicts involving directories or special files before retrying the plan.
 
+### Shared-library regressions
+
+On x86-64 and AArch64, applying an install or upgrade checks whether its
+managed ELF files would lose a compatible managed shared library that is
+available in the current image. The check follows the object's `DT_RUNPATH`
+or `DT_RPATH`, including `$ORIGIN`, then the applicable default directories
+`/usr/lib`, `/lib`, `/usr/lib64`, and `/lib64`. It follows managed links and
+checks ELF compatibility and required GNU version nodes.
+
+CPS checks after staging verified payloads and before recording the transaction
+or changing package files. A rejected transaction names each affected package,
+ELF path, and missing or incompatible library. The check works for saved
+plans, live updates, and staged upgrades. It models managed library resolution
+and reports regressions from a verified baseline. Unmanaged libraries, loader
+cache and environment settings, and runtime `dlopen` calls are outside its
+scope. Plans and dry runs can still be generated before payloads are available.
+
+Run `bash tests/elf-transactions.sh` to exercise an install that shadows a
+working library, an incompatible upgrade, and a compatible replacement.
+
 ## Generating a manifest from a prototype
 
 Stage an install into a private prototype tree, for example with `DESTDIR`,
@@ -187,6 +251,39 @@ directories. Review the manifest and add dependency, configuration, and
 systemd declarations before publishing. Publication derives the payload
 hashes and lengths. [IPS prototype manifest generation](https://docs.oracle.com/cd/E88353_01/html/E37839/pkgsend-1.html)
 
+### Suggesting runtime dependencies
+
+Review the generated manifest against the catalogs for the target image
+before publishing it.
+
+```sh
+cps manifest dependencies --proto proto --config image.kdl \
+    --catalog "canopa=$canopa_catalog_sha256" \
+    --catalog "extras=$extras_catalog_sha256" \
+    --library-dir /usr/lib --library-dir /lib64 tool.kdl
+```
+
+Supply one exact signed catalog digest per publisher in the image config.
+The command uses the configured local repositories or metadata caches,
+architecture, and facets. It considers the newest active version of each
+package name from the first eligible publisher. It reads the pinned
+catalogs even if the repositories have since advanced.
+
+The scan reads ELF interpreters and needed libraries, including search
+paths relative to `$ORIGIN`. For executable scripts it reads absolute
+shebangs, including `env NAME` and simple unquoted `env -S NAME ARGS`
+forms. Use repeated `--path-dir` options to set the target command search
+order for `env`. The default is `/usr/bin`, then `/bin`. Paths delivered
+by the prototype itself satisfy requirements locally.
+
+Standard output contains KDL `require` suggestions with exact versions,
+provider IDs, and the files that led to each suggestion. Review the lines
+alongside existing dependencies before copying them into the package
+block. Missing or ambiguous providers and unsupported inputs produce
+diagnostics and a nonzero exit status, with any resolved suggestions still
+printed. This is a direct path lookup against signed manifests. Use the
+release profile ELF check to validate the final composition and ABI.
+
 ## Finding and inspecting packages
 
 ```sh
@@ -194,11 +291,51 @@ cps list --root image
 cps list --root image --intent
 cps list --root image --available --all-versions
 cps search --root image hello
+cps search --root image --file hello
+cps search --root image --file /usr/share/cps-demo/hello
 cps info --root image demo/hello
 cps info --root image --available demo/hello@1.0.0-0
+cps owner --root image /usr/share/cps-demo/hello
+cps contents --root image demo/hello
+cps deps --root image demo/hello
+cps rdeps --root image demo/hello
+cps why --root image demo/hello
 ```
 
-`list` shows installed packages and their explicit or dependency status. With `--available` it shows the newest version of each package in the signed catalog. `search` matches package name fragments in that catalog, or in the installed set with `--installed`. `info` prints a verified manifest in KDL, including dependencies and file actions. It accepts a name, a name and version, or a full CPS package ID. Installed queries work offline. Available queries use the configured local repository or cache.
+`list` shows installed packages and their explicit or dependency status. With `--available` it shows the newest version of each package in the signed catalog. `search` matches name and summary fragments case-insensitively and shows the signed summary when present. Use `--installed` to search installed packages. `info` prints the verified manifest in KDL, including optional dependency descriptions, requirements, and file actions. It accepts a name, a name and version, or a full CPS package ID. Installed queries work offline. Available queries use the configured local repository or cache.
+
+`search --file` finds which available packages ship a file. Use an exact
+basename or a path within the image, with or without a leading slash. It
+prints the package ID and root-relative path for each match and exits with
+status 1 if none match. It checks the newest version of each package for the
+image's architecture in each publisher's verified catalog and honors the
+image's facets and signed profile catalog pins. The search uses cached or
+local manifests and works with an index-only mirror cache.
+
+`owner` prints one installed package ID per line for an exact path. Use
+`/usr/…` or `usr/…` to address a path within the selected image. Shared
+directories can have multiple owners. The command exits with an error
+for paths with no owner, including implicit parent directories.
+
+`contents` accepts the same installed package selectors as `info` and
+lists owned paths in sorted order, relative to the image root. Both
+commands use committed ownership records offline, so a locally deleted
+file still shows up and actions excluded by the image's facets or
+architecture are omitted.
+
+`deps` lists installed packages that satisfy the selected package's direct
+requirements. `rdeps` lists installed packages with a direct requirement the
+selected package satisfies. Both accept the same installed package selectors
+as `info` and work offline from the committed image. They include all
+matching installed `require-any` providers and conditional requirements whose
+predicate matches the installed image. Each match appears once as a package
+ID, sorted by package name. An empty result produces no output.
+
+`why` uses the same selectors and works offline. It shows the package's
+effective explicit local request, its role in the applied signed profile,
+and its matching direct dependents together. Profile roles are `root`,
+`dependency`, or `protected` for legacy images with an unknown exact role.
+A listed dependent can also have another installed `require-any` provider.
 
 `list --intent` shows effective local requests separately from the roles in
 the applied signed profile. It reports `protected` for legacy profile
@@ -1372,6 +1509,23 @@ Upgrade CPS before using catalogs with signed release profile records.
 
 ## Manifest and image behavior
 
+Set `summary` on the package node and add an `optional` node for each
+recommended add-on. Optional dependencies are advisory and can be installed
+separately. Their version constraints describe compatible add-on versions.
+
+```kdl
+schema-version 1
+package "apps/editor" publisher="canopa" version="1.0.0-0" summary="A lightweight text editor" {
+    optional "apps/editor-spellcheck" version=">=1.0.0-0" description="Check spelling while typing"
+}
+```
+
+Summaries and descriptions are single-line text, limited to 256 and 1024
+UTF-8 bytes respectively. The catalog signs the summary and the manifest
+digest, which covers the optional dependency descriptions. Publish a new
+package version to add this metadata to an existing package and update
+clients before publishing packages that use it.
+
 - Manifests and image configuration use KDL 2 and begin with `schema-version 1`. Paths in image configuration resolve relative to the configuration file. It also accepts `architecture "x86_64"` and `facet "doc.man" #false`. Convert old TOML recipes before publishing new versions. Existing JSON manifest objects stay readable under their original digests.
 - Set `architecture="x86_64"` on the `package` node for a package that targets one architecture, or pass `--architecture x86_64` to `manifest generate`. Only matching packages participate in dependency resolution and publisher ordering. The signed catalog and manifest must agree, and a source build and its attestation must declare the same target. Omit the package property for portable packages or manifests with per-action architecture selectors. Upgrade clients before publishing targeted packages. Package IDs are unique within a repository, so publishing the same name and version for two architectures requires separate repositories.
 - Versions have the numeric form `major.minor.patch-revision`. Inside a package block, declare dependencies as `require "library/libdisplay" version=">=1.0.0-0, <2.0.0-0"` or `incorporate "library/libdisplay" version="=1.0.0-0"`. Use `exclude "library/libdisplay" version=">=2.0.0-0"` to reject a range when the package is present. Omit the version to exclude every version of that package.
@@ -1797,6 +1951,8 @@ Set `CPS_VM_SYSTEM_COMMANDS=1` with `CPS_VM_BTRFS_BOOT=1` in
 `tests/boot-capture-vm.sh` to exercise the everyday commands. The guest
 installs a package live, upgrades its running service, boots a staged
 upgrade, and rolls back to the system with the live package still installed.
+It then removes the package live and boots a staged removal of its unused
+dependency with the repository unavailable.
 
 ### Reclaiming old Btrfs environments
 

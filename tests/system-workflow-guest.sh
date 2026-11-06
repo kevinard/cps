@@ -31,6 +31,24 @@ if [ "$version" = 2.0.0-0 ]; then
     exec $bb reboot -f
 fi
 test "$version" = 1.0.0-0
+if [ -f /volume/@captures/cli-autoremove ]; then
+    test ! -e /usr/bin/cps-demo
+    test ! -e /usr/bin/cps-demo-service
+    test -e /volume/@/usr/bin/cps-demo-service
+    cps verify --root /
+    systemctl is-active --quiet systemd-bless-boot.service
+    echo 'CPS_VM_SYSTEM: staged autoremove booted with the dependency removed'
+    $bb cp /repository/catalog-2.0.0-0 /repository/current
+    $bb sed -i '/^stage-package "test\/cps-demo-service"$/d' /etc/cps/image.kdl
+    cps install --no-refresh --dry-run test/cps-demo | $bb grep -Fx 'Changes will take effect on the running system.'
+    cps install --no-refresh --stage --yes test/cps-demo
+    test ! -e /usr/bin/cps-demo
+    test ! -e /usr/bin/cps-demo-service
+    cps status | $bb grep -F 'Reboot pending into '
+    echo 'CPS_VM_SYSTEM: forced install staged without changing the running root'
+    $bb sync
+    exec $bb poweroff -f
+fi
 if [ -f /etc/cps-btrfs-base-kernel ]; then
     test "$($bb uname -r)" = "$($bb cat /etc/cps-btrfs-base-kernel)"
     echo "CPS_VM_BTRFS_KERNEL: previous $($bb uname -r)"
@@ -40,20 +58,50 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     cps verify --root /
     cps status | $bb grep -Fx 'No reboot pending.'
     echo 'CPS_VM_SYSTEM: rolled back to the base with the live package'
+
+    # Removals must use installed state even when a configured mirror is unavailable.
+    $bb mv /repository/current /repository/offline-current
+    printf '%s\n' 'mirror "test" root="missing-tuf-root.json" metadata="file:///missing/metadata/" targets="file:///missing/targets/"' >> /etc/cps/image.kdl
+    before=$(cps boot-env list --esp /efi)
+    test "$(cps autoremove --dry-run)" = 'Nothing to do.'
+    if cps remove --dry-run test/cps-demo-service > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'removal would break installed dependencies' /run/rejected
+    cps remove --dry-run test/cps-demo | $bb grep -Fx 'Remove cps://test/test/cps-demo 2.0.0-0'
+    if cps remove test/cps-demo </dev/null > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'use --yes to confirm' /run/rejected
+    test "$(cps-demo)" = 2.0.0-0
+    cps remove --yes test/cps-demo
+    test ! -e /usr/bin/cps-demo
+    test -e /usr/bin/cps-demo-service
+    test "$(cps boot-env list --esp /efi)" = "$before"
+
+    printf '%s\n' 'stage-package "test/cps-demo-service"' >> /etc/cps/image.kdl
+    cps autoremove --dry-run | $bb grep -Fx 'A reboot will be required because test/cps-demo-service is configured for staged changes.'
+    test "$(cps boot-env list --esp /efi)" = "$before"
+    cps autoremove --yes
+    test -e /usr/bin/cps-demo-service
+    cps status | $bb grep -F 'Reboot pending into '
+    : > /volume/@captures/cli-autoremove
     $bb sync
-    exec $bb poweroff -f
+    exec $bb reboot -f
 fi
 
 $bb cp /repository/catalog-1.0.0-0 /repository/current
 cps search cps-demo | $bb grep -F 'test/cps-demo@'
 before=$(cps boot-env list --esp /efi)
 cps install --dry-run test/cps-demo
+cps install --stage --dry-run test/cps-demo | $bb grep -Fx 'A reboot will be required because --stage was requested.'
+test "$(cps boot-env list --esp /efi)" = "$before"
 test ! -e /usr/bin/cps-demo
 cps install --yes test/cps-demo
 test "$(cps-demo)" = 1.0.0-0
 test "$(cps boot-env list --esp /efi)" = "$before"
 systemctl start cps-demo.service
 verify_service 1.0.0-0
+report=$(cps check-updates --no-refresh --json)
+printf '%s\n' "$report" | $bb grep -F '"status": "up_to_date"'
+printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
+test "$(cps upgrade --stage --dry-run)" = 'Nothing to do.'
 
 # An upgrade staged before the live install must not lose the new package.
 . /etc/cps-btrfs-boot
@@ -62,12 +110,22 @@ if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volum
 $bb grep -F 'base changed after staging' /run/rejected
 
 $bb cp /repository/catalog-2.0.0-0 /repository/current
+report=$(cps check-updates --json)
+printf '%s\n' "$report" | $bb grep -F '"status": "updates_available"'
+printf '%s\n' "$report" | $bb grep -F '"name": "test/cps-demo"'
+printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
+cps upgrade --stage --dry-run | $bb grep -Fx 'A reboot will be required because --stage was requested.'
+test "$(cps boot-env list --esp /efi)" = "$before"
+test "$(cps-demo)" = 1.0.0-0
 cps upgrade --yes
 test "$(cps-demo)" = 2.0.0-0
 verify_service 2.0.0-0
 test "$(cps boot-env list --esp /efi)" = "$before"
 
 $bb cp /repository/catalog-base-upgrade /repository/current
+report=$(cps check-updates --json)
+printf '%s\n' "$report" | $bb grep -F '"reboot_required": true'
+test "$(cps boot-env list --esp /efi)" = "$before"
 if [ -f /etc/cps-btrfs-trial-kernel ]; then
     cps upgrade --dry-run | $bb grep -F 'changes the boot kernel or initramfs'
 else
@@ -76,6 +134,11 @@ fi
 cps upgrade --yes
 test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0
 cps status | $bb grep -F 'Reboot pending into '
+code=0
+report=$(cps check-updates --json) || code=$?
+test "$code" = 1
+printf '%s\n' "$report" | $bb grep -F '"status": "blocked"'
+printf '%s\n' "$report" | $bb grep -F 'a trial is pending'
 if cps install --yes test/cps-demo > /run/rejected 2>&1; then exit 1; fi
 $bb grep -F 'a trial is pending' /run/rejected
 : > /volume/@captures/cli-upgrade

@@ -174,6 +174,13 @@ pub struct DependencyTarget {
     pub version: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionalDependency {
+    pub target: DependencyTarget,
+    pub description: String,
+}
+
 impl DependencyTarget {
     pub fn matches(&self, version: Version) -> Result<bool> {
         Ok(VersionConstraint::parse(self.version.as_deref())?.matches(version))
@@ -377,7 +384,7 @@ pub(crate) fn copy_payload(source: &File, node: &Node, destination: &mut File) -
     Ok(())
 }
 
-fn parse_mode(mode: &str) -> Result<u32> {
+pub(crate) fn parse_mode(mode: &str) -> Result<u32> {
     ensure!(
         mode.len() == 4 && mode.bytes().all(|b| (b'0'..=b'7').contains(&b)),
         "expected a four-digit octal mode such as \"0755\" or \"1777\""
@@ -402,6 +409,12 @@ impl Action {
             | Self::Symlink { facet, arch, .. }
             | Self::Hardlink { facet, arch, .. } => (facet.as_deref(), arch.as_deref()),
         }
+    }
+
+    pub(crate) fn applies_to(&self, architecture: &str, facets: &BTreeMap<String, bool>) -> bool {
+        let (facet, arch) = self.selectors();
+        facet.is_none_or(|key| facets.get(key).copied().unwrap_or(true))
+            && arch.is_none_or(|target| target == architecture)
     }
 
     pub fn preserve(&self) -> bool {
@@ -558,8 +571,12 @@ pub struct Manifest {
     pub version: Version,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(default)]
     pub dependency: Vec<Dependency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_dependencies: Vec<OptionalDependency>,
     #[serde(default)]
     pub action: Vec<Action>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -568,6 +585,20 @@ pub struct Manifest {
     pub kernel: Option<crate::boot::kernel::Kernel>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_reboot: bool,
+}
+
+pub(crate) fn validate_summary(summary: &str) -> Result<()> {
+    validate_display_text(summary, 256, "package summary")
+}
+
+fn validate_display_text(value: &str, max_bytes: usize, label: &str) -> Result<()> {
+    ensure!(
+        value.len() <= max_bytes
+            && !value.trim().is_empty()
+            && !value.chars().any(char::is_control),
+        "{label} must be nonempty, at most {max_bytes} bytes, and free of control characters"
+    );
+    Ok(())
 }
 
 impl Manifest {
@@ -633,8 +664,22 @@ impl Manifest {
         if let Some(architecture) = &self.architecture {
             validate_publisher(architecture).context("invalid package architecture")?;
         }
+        if let Some(summary) = &self.summary {
+            validate_summary(summary)?;
+        }
         for dependency in &self.dependency {
             dependency.validate()?;
+        }
+        for optional in &self.optional_dependencies {
+            optional
+                .target
+                .validate()
+                .with_context(|| format!("optional dependency {}", optional.target.package))?;
+            validate_display_text(
+                &optional.description,
+                1024,
+                "optional dependency description",
+            )?;
         }
         let mut actions = BTreeMap::new();
         for action in &self.action {

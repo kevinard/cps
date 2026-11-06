@@ -1,3 +1,5 @@
+mod elf;
+
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs::{self, File},
@@ -347,6 +349,8 @@ pub(crate) fn apply_to_image(
     if let Some(revision) = image.applied(&id)? {
         return Ok(revision);
     }
+    let check_elf = elf::applies(plan, &state);
+    let previous_paths = (check_elf && live.is_none()).then(|| state.paths.clone());
     let current = live.map(|_| state.clone());
     let (checked, mut next, receipts) = check_plan(&image, state, plan)?;
     let stage = image.stage()?;
@@ -359,6 +363,13 @@ pub(crate) fn apply_to_image(
         AfterFiles::offline(&image.root, &checked)?
     };
     prepare(&image.root, &stage, &checked, &next)?;
+    if check_elf {
+        let previous = previous_paths
+            .as_ref()
+            .or_else(|| current.as_ref().map(|state| &state.paths))
+            .expect("ELF checking retained the previous paths");
+        elf::check(&image.root, &checked, previous, &next)?;
+    }
     let repo_backed = checked.catalog.is_some() || !checked.catalogs.is_empty();
     let journal = Box::new(Journal {
         id,

@@ -5,6 +5,7 @@ mod intent;
 mod paths;
 mod repair;
 mod resolve;
+mod update;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,6 +36,7 @@ pub(crate) use paths::{
 pub(crate) use resolve::{
     Candidates, Retention, check as check_dependencies, resolve as resolve_packages,
 };
+pub use update::HeldBackUpdate;
 
 const CONFIG_UPDATES_DIR: &str = ".cps/config-updates";
 
@@ -529,10 +531,39 @@ impl Plan {
 }
 
 pub fn plan(path: &Path, request: Request) -> Result<Plan> {
+    Ok(plan_image(path, request, None)?.0)
+}
+
+pub(crate) fn inspect_update(path: &Path, held_back: &mut Vec<HeldBackUpdate>) -> Result<Plan> {
+    held_back.clear();
+    let (plan, next, _) = plan_image(path, Request::Update, Some(held_back))?;
+    held_back.retain_mut(|update| {
+        let Some(package) = next.installed.get(&update.name) else {
+            return false;
+        };
+        let selected = package.published.manifest.version;
+        update.selected = Some(selected);
+        selected < update.available
+    });
+    Ok(plan)
+}
+
+fn plan_image(
+    path: &Path,
+    request: Request,
+    held_back: Option<&mut Vec<HeldBackUpdate>>,
+) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
-    Ok(build(&image, state, request, None, Some(SolverRevision::SatV1))?.0)
+    build_with_update_diagnostics(
+        &image,
+        state,
+        request,
+        None,
+        Some(SolverRevision::SatV1),
+        held_back,
+    )
 }
 
 fn resolve_local<'a>(
@@ -594,10 +625,21 @@ fn resolve_local<'a>(
 
 pub(crate) fn build(
     image: &Image,
+    state: State,
+    request: Request,
+    saved: Option<&Plan>,
+    solver: Option<SolverRevision>,
+) -> Result<(Plan, State, Vec<BuildReceipt>)> {
+    build_with_update_diagnostics(image, state, request, saved, solver, None)
+}
+
+fn build_with_update_diagnostics(
+    image: &Image,
     mut state: State,
     request: Request,
     saved: Option<&Plan>,
     solver: Option<SolverRevision>,
+    held_back: Option<&mut Vec<HeldBackUpdate>>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let root = &image.root;
     ensure!(
@@ -745,6 +787,10 @@ pub(crate) fn build(
                     .profile
                     .as_ref()
                     .is_some_and(|profile| !profile.composition.is_empty());
+            if let Some(held_back) = held_back {
+                // Keep the known candidates available even if resolution fails.
+                *held_back = update::candidates(&state, &catalogs, update_profile);
+            }
             track_profile_intent = saved.map_or(
                 update_profile
                     || (!requested.is_empty() && !state.settings.profile_packages.is_empty()),

@@ -23,8 +23,8 @@ const PATH_LIMIT: u64 = 4096;
 const DYNAMIC_LIMIT: u64 = 1024 * 1024;
 const STRINGS_LIMIT: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug)]
-pub(super) struct Elf {
+#[derive(Debug, PartialEq)]
+pub(crate) struct Elf {
     pub native_64_le: bool,
     pub machine: u16,
     pub interpreter: Option<String>,
@@ -36,7 +36,7 @@ pub(super) struct Elf {
     pub defined_versions: versions::Names,
 }
 
-pub(super) fn inspect(mut file: File, size: u64, hash: &str) -> Result<Option<Elf>> {
+pub(crate) fn inspect(mut file: File, size: u64, hash: &str) -> Result<Option<Elf>> {
     let before = file.metadata()?;
     ensure!(before.len() == size, "payload size differs from manifest");
     let mut magic = [0; 5];
@@ -47,16 +47,7 @@ pub(super) fn inspect(mut file: File, size: u64, hash: &str) -> Result<Option<El
         digest_reader(file.by_ref().take(size.saturating_add(1)))? == hash,
         "payload digest differs from manifest"
     );
-    let info = if magic[..4] == elf::ELFMAG {
-        let data = ReadCache::new(&mut file);
-        match magic[4] {
-            elf::ELFCLASS32 => parse::<elf::FileHeader32<Endianness>>(&data)?,
-            elf::ELFCLASS64 => parse::<elf::FileHeader64<Endianness>>(&data)?,
-            _ => bail!("unsupported ELF class"),
-        }
-    } else {
-        None
-    };
+    let info = inspect_header(&mut file, &magic[..prefix])?;
     let after = file.metadata()?;
     ensure!(
         (before.ctime(), before.ctime_nsec(), size)
@@ -64,6 +55,18 @@ pub(super) fn inspect(mut file: File, size: u64, hash: &str) -> Result<Option<El
         "payload changed during ELF inspection"
     );
     Ok(info)
+}
+
+pub(crate) fn inspect_header(file: &mut File, prefix: &[u8]) -> Result<Option<Elf>> {
+    if !prefix.starts_with(&elf::ELFMAG) {
+        return Ok(None);
+    }
+    let data = ReadCache::new(file);
+    match prefix.get(4).copied() {
+        Some(elf::ELFCLASS32) => parse::<elf::FileHeader32<Endianness>>(&data),
+        Some(elf::ELFCLASS64) => parse::<elf::FileHeader64<Endianness>>(&data),
+        _ => bail!("unsupported ELF class"),
+    }
 }
 
 fn parse<'a, E: FileHeader>(data: impl ReadRef<'a>) -> Result<Option<Elf>> {

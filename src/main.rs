@@ -9,12 +9,14 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use cps::query::{
-    PackageRow, Scope, list_facets, list_package_intent, list_packages, package_manifest,
+    PackageRow, Scope, direct_dependencies, explain_package, list_facets, list_package_intent,
+    list_packages, package_contents, package_manifest, path_owners, reverse_dependencies,
+    search_files,
 };
-use cps::system::{self, System};
+use cps::system::{self, System, UpdateStatus};
 use cps::{
-    Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, MarkChoice, Plan,
-    Request, RootDeployment, SourceLayout, activate_boot_environment,
+    Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, MarkChoice,
+    PackageChange, Plan, Request, RootDeployment, SourceLayout, activate_boot_environment,
     activate_boot_environment_on_disk, activate_btrfs_boot_environment,
     activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
     add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
@@ -29,8 +31,8 @@ use cps::{
     read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
     set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
-    stage_btrfs_boot_environment, transaction_details, transaction_history, transaction_status,
-    verify, verify_pristine, verify_rebuild, withdraw_package,
+    stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
+    transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -46,11 +48,40 @@ enum Command {
     Install {
         #[command(flatten)]
         options: SystemOptions,
+        /// Stage the transaction in a new Btrfs trial boot environment
+        #[arg(long)]
+        stage: bool,
         #[arg(required = true, value_name = "PACKAGE")]
         packages: Vec<String>,
     },
     /// Upgrade the system and stage changes that require a reboot
     Upgrade {
+        #[command(flatten)]
+        options: SystemOptions,
+        /// Stage the transaction in a new Btrfs trial boot environment
+        #[arg(long)]
+        stage: bool,
+    },
+    /// Check for upgrades and report any blockers or reboot requirement
+    CheckUpdates {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+        /// Report the result as JSON
+        #[arg(long)]
+        json: bool,
+        /// Use the currently cached catalogs
+        #[arg(long)]
+        no_refresh: bool,
+    },
+    /// Remove installed packages and stage changes that require a reboot
+    Remove {
+        #[command(flatten)]
+        options: SystemOptions,
+        #[arg(required = true, value_name = "PACKAGE")]
+        packages: Vec<String>,
+    },
+    /// Remove unused dependencies and stage changes that require a reboot
+    Autoremove {
         #[command(flatten)]
         options: SystemOptions,
     },
@@ -183,12 +214,15 @@ enum Command {
         #[arg(long, conflicts_with = "available")]
         intent: bool,
     },
-    /// Search package names in the signed catalog or installed image
+    /// Search for packages by name, summary, or a file they ship
     Search {
         #[arg(long, default_value = "/")]
         root: PathBuf,
         #[arg(long)]
         installed: bool,
+        /// Match an exact path or basename in the signed catalogs
+        #[arg(long, conflicts_with = "installed")]
+        file: bool,
         term: String,
     },
     /// Show an installed or available package's manifest in KDL
@@ -198,6 +232,41 @@ enum Command {
         #[arg(long)]
         available: bool,
         #[arg(value_name = "NAME[@VERSION]")]
+        package: String,
+    },
+    /// Show installed package IDs that own an exact image path, offline
+    Owner {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+        /// Absolute or root-relative path within the image
+        path: String,
+    },
+    /// List the paths owned by an installed package, offline
+    Contents {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+        #[arg(value_name = "PACKAGE")]
+        package: String,
+    },
+    /// List the installed packages that satisfy a package's direct requirements, offline
+    Deps {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+        #[arg(value_name = "PACKAGE")]
+        package: String,
+    },
+    /// List the installed packages that directly depend on a package, offline
+    Rdeps {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+        #[arg(value_name = "PACKAGE")]
+        package: String,
+    },
+    /// Explain why a package is installed, offline
+    Why {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+        #[arg(value_name = "PACKAGE")]
         package: String,
     },
     /// Preview and save a package transaction
@@ -299,6 +368,24 @@ enum ManifestCommand {
         #[arg(long, default_value_t = 0)]
         gid: u32,
         name: String,
+    },
+    /// Suggest runtime dependencies from ELF and shebangs using pinned local catalogs
+    Dependencies {
+        #[arg(long)]
+        proto: PathBuf,
+        /// Image configuration with target architecture, facets, and local publisher paths
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact signed catalog digest for each configured publisher
+        #[arg(long = "catalog", required = true, value_name = "PUBLISHER=SHA256")]
+        catalogs: Vec<String>,
+        /// Default ELF library directory in search order
+        #[arg(long = "library-dir", required = true, value_name = "PATH")]
+        library_dirs: Vec<String>,
+        /// Target PATH directory for env shebangs, in search order
+        #[arg(long = "path-dir", default_values = ["/usr/bin", "/bin"], value_name = "PATH")]
+        path_dirs: Vec<String>,
+        manifest: PathBuf,
     },
 }
 
@@ -949,11 +1036,24 @@ fn save(path: &Path, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-fn print_packages(rows: impl IntoIterator<Item = PackageRow>) -> Result<()> {
+fn print_packages(rows: impl IntoIterator<Item = PackageRow>, show_summary: bool) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    writeln!(out, "PACKAGE\tSTATE")?;
-    for row in rows {
-        writeln!(out, "{}\t{}", row.id, row.status)?;
+    if show_summary {
+        writeln!(out, "PACKAGE\tSTATE\tSUMMARY")?;
+        for row in rows {
+            writeln!(
+                out,
+                "{}\t{}\t{}",
+                row.id,
+                row.status,
+                row.summary.as_deref().unwrap_or("")
+            )?;
+        }
+    } else {
+        writeln!(out, "PACKAGE\tSTATE")?;
+        for row in rows {
+            writeln!(out, "{}\t{}", row.id, row.status)?;
+        }
     }
     Ok(())
 }
@@ -984,20 +1084,8 @@ fn choose_install_source(package: &str, sources: &[cps::query::InstallSource]) -
     }
 }
 
-fn change_system(options: SystemOptions, request: Request) -> Result<()> {
-    let system = System::load(&options.config)?;
-    let _lock = system.lock()?;
-    let refresh = !options.no_refresh;
-    let change = if !options.yes && !options.dry_run && io::stdin().is_terminal() {
-        system.plan_with_source_selection(request, refresh, choose_install_source)?
-    } else {
-        system.plan(request, refresh)?
-    };
-    if change.is_empty() {
-        println!("Nothing to do.");
-        return Ok(());
-    }
-    for package in change.packages() {
+fn print_package_changes(changes: &[PackageChange]) {
+    for package in changes {
         let name = package.publisher.as_ref().map_or_else(
             || package.name.clone(),
             |publisher| format!("cps://{publisher}/{}", package.name),
@@ -1009,6 +1097,25 @@ fn change_system(options: SystemOptions, request: Request) -> Result<()> {
             (None, None) => {}
         }
     }
+}
+
+fn change_system(options: SystemOptions, request: Request, stage: bool) -> Result<()> {
+    let system = System::load(&options.config)?;
+    let _lock = system.lock()?;
+    let refresh = !options.no_refresh;
+    let mut change = if !options.yes && !options.dry_run && io::stdin().is_terminal() {
+        system.plan_with_source_selection(request, refresh, choose_install_source)?
+    } else {
+        system.plan(request, refresh)?
+    };
+    if stage {
+        change = change.with_staging();
+    }
+    if change.is_empty() {
+        println!("Nothing to do.");
+        return Ok(());
+    }
+    print_package_changes(change.packages());
     if let Some(reason) = change.boot_reason() {
         println!("A reboot will be required because {reason}.");
     } else {
@@ -1039,12 +1146,58 @@ fn change_system(options: SystemOptions, request: Request) -> Result<()> {
     Ok(())
 }
 
+fn check_system_updates(config: &Path, refresh: bool, json: bool) -> Result<ExitCode> {
+    let report = System::check_updates(config, refresh);
+    if json {
+        let mut out = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &report)?;
+        writeln!(out)?;
+    } else {
+        if report.status == UpdateStatus::UpToDate {
+            println!("Up to date.");
+        }
+        print_package_changes(&report.changes);
+        for update in &report.held_back {
+            println!(
+                "Held back cps://{}/{} {} → {} ({})",
+                update.publisher, update.name, update.installed, update.available, update.reason
+            );
+        }
+        for blocker in &report.blockers {
+            eprintln!("cps: {blocker}");
+        }
+        if let Some(reason) = &report.reboot_reason {
+            println!("A reboot will be required because {reason}.");
+        } else if report.status == UpdateStatus::UpdatesAvailable {
+            println!("Changes can be applied to the running system.");
+        }
+    }
+    Ok(if report.status == UpdateStatus::Blocked {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 fn run(command: Command) -> Result<ExitCode> {
     match command {
-        Command::Install { options, packages } => {
-            change_system(options, Request::Install { packages })?
+        Command::Install {
+            options,
+            stage,
+            packages,
+        } => change_system(options, Request::Install { packages }, stage)?,
+        Command::Upgrade { options, stage } => change_system(options, Request::Update, stage)?,
+        Command::CheckUpdates {
+            config,
+            json,
+            no_refresh,
+        } => {
+            return check_system_updates(&config, !no_refresh, json);
         }
-        Command::Upgrade { options } => change_system(options, Request::Update)?,
+        Command::Remove { options, packages } => {
+            change_system(options, Request::Remove { packages }, false)?
+        }
+        Command::Autoremove { options } => change_system(options, Request::Autoremove, false)?,
         Command::Status { config } => {
             let system = System::load(&config)?;
             let (running, entries) = system.boot_status()?;
@@ -1185,6 +1338,30 @@ fn run(command: Command) -> Result<ExitCode> {
                     architecture.as_deref(),
                 )?;
                 std::io::stdout().lock().write_all(text.as_bytes())?;
+            }
+            ManifestCommand::Dependencies {
+                proto,
+                config,
+                catalogs,
+                library_dirs,
+                path_dirs,
+                manifest,
+            } => {
+                let (suggestions, diagnostics) = suggest_dependencies(
+                    &proto,
+                    &manifest,
+                    &config,
+                    &catalogs,
+                    &library_dirs,
+                    &path_dirs,
+                )?;
+                std::io::stdout().lock().write_all(suggestions.as_bytes())?;
+                if !diagnostics.is_empty() {
+                    for diagnostic in diagnostics {
+                        eprintln!("cps: {diagnostic}");
+                    }
+                    return Ok(ExitCode::FAILURE);
+                }
             }
         },
         Command::Publish {
@@ -1618,23 +1795,49 @@ fn run(command: Command) -> Result<ExitCode> {
                     (true, false) => Scope::Available,
                     _ => Scope::Installed,
                 };
-                print_packages(list_packages(&root, scope)?)?;
+                print_packages(list_packages(&root, scope)?, false)?;
+            }
+        }
+        Command::Search {
+            root,
+            file: true,
+            term,
+            ..
+        } => {
+            let matches = search_files(&root, &term)?;
+            ensure!(!matches.is_empty(), "no available package ships {term:?}");
+            let mut out = std::io::stdout().lock();
+            for matched in matches {
+                writeln!(out, "{}\t{}", matched.package, matched.path)?;
             }
         }
         Command::Search {
             root,
             installed,
+            file: false,
             term,
         } => {
-            let term = term.trim().to_ascii_lowercase();
-            ensure!(!term.is_empty(), "search requires a package name fragment");
+            let term = term.trim().to_lowercase();
+            ensure!(
+                !term.is_empty(),
+                "search requires a package name or summary fragment"
+            );
             let scope = if installed {
                 Scope::Installed
             } else {
                 Scope::Available
             };
             let packages = list_packages(&root, scope)?;
-            print_packages(packages.into_iter().filter(|row| row.name.contains(&term)))?;
+            print_packages(
+                packages.into_iter().filter(|row| {
+                    row.name.contains(&term)
+                        || row
+                            .summary
+                            .as_ref()
+                            .is_some_and(|summary| summary.to_lowercase().contains(&term))
+                }),
+                true,
+            )?;
         }
         Command::Info {
             root,
@@ -1643,6 +1846,49 @@ fn run(command: Command) -> Result<ExitCode> {
         } => {
             let manifest = package_manifest(&root, &package, available)?;
             std::io::stdout().lock().write_all(manifest.as_bytes())?;
+        }
+        Command::Owner { root, path } => {
+            let mut out = std::io::stdout().lock();
+            for owner in path_owners(&root, &path)? {
+                writeln!(out, "{owner}")?;
+            }
+        }
+        Command::Contents { root, package } => {
+            let mut out = std::io::stdout().lock();
+            for path in package_contents(&root, &package)? {
+                writeln!(out, "{path}")?;
+            }
+        }
+        Command::Deps { root, package } => {
+            let mut out = std::io::stdout().lock();
+            for dependency in direct_dependencies(&root, &package)? {
+                writeln!(out, "{dependency}")?;
+            }
+        }
+        Command::Rdeps { root, package } => {
+            let mut out = std::io::stdout().lock();
+            for dependent in reverse_dependencies(&root, &package)? {
+                writeln!(out, "{dependent}")?;
+            }
+        }
+        Command::Why { root, package } => {
+            let explanation = explain_package(&root, &package)?;
+            let intent = explanation.intent;
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{}", intent.id)?;
+            let request = if intent.requested { "yes" } else { "no" };
+            writeln!(out, "  Explicit local request\t{request}")?;
+            match explanation.profile_name {
+                Some(name) => writeln!(out, "  Signed profile\t{name} ({})", intent.profile)?,
+                None => writeln!(out, "  Signed profile\t(none)")?,
+            }
+            writeln!(out, "  Direct dependents")?;
+            if explanation.dependents.is_empty() {
+                writeln!(out, "    (none)")?;
+            }
+            for dependent in explanation.dependents {
+                writeln!(out, "    {dependent}")?;
+            }
         }
         Command::Config {
             command: ConfigCommand::List { root },
