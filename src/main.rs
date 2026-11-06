@@ -177,12 +177,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print a portable lock for an image's committed package composition
+    ImageLock {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+    },
     /// Initialize an empty directory as an image
     ImageCreate {
         #[arg(long)]
         root: PathBuf,
         #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_key", "arch", "facet"])]
         config: Option<PathBuf>,
+        /// Initialize with the publisher layout and bootstrap catalog of this lock
+        #[arg(long, requires = "config")]
+        lock: Option<PathBuf>,
         #[arg(long, required_unless_present = "config")]
         repo: Option<PathBuf>,
         #[arg(long, required_unless_present = "config")]
@@ -868,6 +876,8 @@ enum PlanCommand {
     },
     /// Install the configured signed release profile into an image with no packages
     InstallProfile,
+    /// Install an exact locked composition into a newly initialized image
+    InstallLock { lock: PathBuf },
     /// Change local request marks without installing or removing packages
     Mark {
         #[arg(value_enum)]
@@ -1879,18 +1889,26 @@ fn run(command: Command) -> Result<ExitCode> {
         } => {
             print_image_diff(&cps::image_diff(&before, &after, paths)?, json)?;
         }
+        Command::ImageLock { root } => {
+            serde_json::to_writer_pretty(io::stdout().lock(), &cps::capture_image_lock(&root)?)?;
+            println!();
+        }
         Command::ImageCreate {
             root,
             config,
+            lock,
             repo,
             publisher,
             trust_key,
             arch,
             facet,
         } => {
-            let id = match config {
-                Some(path) => create_configured_image(&root, &path)?,
-                None => create_image(
+            let id = match (config, lock) {
+                (Some(config), Some(lock)) => {
+                    cps::create_image_from_lock(&root, &config, &cps::read_image_lock(&lock)?)?
+                }
+                (Some(path), None) => create_configured_image(&root, &path)?,
+                (None, None) => create_image(
                     &root,
                     &repo.context("missing repository")?,
                     &publisher.context("missing publisher")?,
@@ -1898,6 +1916,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     arch.as_deref().unwrap_or(std::env::consts::ARCH),
                     parse_facets(facet)?,
                 )?,
+                (None, Some(_)) => anyhow::bail!("--lock requires --config"),
             };
             println!("Created image {id} at {}", root.display());
         }
@@ -2177,6 +2196,9 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::Install { packages } => Request::Install { packages },
                 PlanCommand::ExactInstall { packages } => Request::ExactInstall { packages },
                 PlanCommand::InstallProfile => Request::InstallProfile,
+                PlanCommand::InstallLock { lock } => Request::InstallLock {
+                    lock: Box::new(cps::read_image_lock(&lock)?),
+                },
                 PlanCommand::Mark { choice, packages } => Request::Mark { choice, packages },
                 PlanCommand::Remove { packages } => Request::Remove { packages },
                 PlanCommand::Autoremove => Request::Autoremove,

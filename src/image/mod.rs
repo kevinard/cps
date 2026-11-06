@@ -2,6 +2,7 @@ mod builds;
 mod catalogs;
 pub(crate) mod diff;
 pub(crate) mod history;
+pub(crate) mod lock;
 pub(crate) mod publishers;
 pub(crate) mod root;
 
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use self::root::Root;
 use crate::{
     attestation::BuildTrust,
-    kdl_format::{PublisherConfig, read_image_definition},
+    kdl_format::{ImageDefinition, PublisherConfig, read_image_definition},
     model::{FORMAT, Node, validate_digest, validate_name, validate_publisher},
     repo::{BuildReceipt, CatalogCheckpoint, Published, canonical_repo, catalog_index, read_key},
 };
@@ -472,26 +473,7 @@ pub fn create_image(
 
 pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
     let config = read_image_definition(config)?;
-    let publishers = config
-        .publishers
-        .iter()
-        .map(
-            |PublisherConfig {
-                 name,
-                 repository,
-                 trust_key,
-                 build_trust,
-             }| {
-                let mut publisher = Publisher::from_config(name, repository, trust_key)?;
-                publisher.build_trust = build_trust
-                    .as_ref()
-                    .map(|config| config.load(&publisher.key))
-                    .transpose()
-                    .with_context(|| format!("loading build trust for {name}"))?;
-                Ok(publisher)
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+    let publishers = configured_publishers(&config)?;
     let publishers = Publishers::new(publishers, config.release_profile)?;
     let profile = publishers.select_profile(
         &config.arch,
@@ -529,6 +511,29 @@ pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
         config.bootstrap_catalog,
         config.image_id,
     )
+}
+
+fn configured_publishers(config: &ImageDefinition) -> Result<Vec<Publisher>> {
+    config
+        .publishers
+        .iter()
+        .map(
+            |PublisherConfig {
+                 name,
+                 repository,
+                 trust_key,
+                 build_trust,
+             }| {
+                let mut publisher = Publisher::from_config(name, repository, trust_key)?;
+                publisher.build_trust = build_trust
+                    .as_ref()
+                    .map(|config| config.load(&publisher.key))
+                    .transpose()
+                    .with_context(|| format!("loading build trust for {name}"))?;
+                Ok(publisher)
+            },
+        )
+        .collect()
 }
 
 fn initialize(
@@ -803,7 +808,8 @@ impl Image {
                     signed_count: Some(_),
                     ..
                 }
-            ) || !settings.profile_packages.is_empty(),
+            ) || !settings.profile_packages.is_empty()
+                || (settings.revision == 0 && settings.bootstrap_catalog.is_some()),
             "local publishers require an installed signed profile composition"
         );
         for (publisher, checkpoint) in &settings.catalog_checkpoints {

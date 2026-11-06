@@ -1288,6 +1288,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         [base, "cps://extras/apps/editor", "cps://extras/apps/editor"]
     );
     apply(&main.root, &install(requests.into())?)?;
+    let locked = crate::capture_image_lock(&main.root)?;
     assert!(crate::remove_publisher(&main.root, "extras").is_err());
     assert!(install(vec![format!("cps://canopa/{editor}")]).is_err());
 
@@ -1317,6 +1318,40 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     assert_eq!(fs::read(main.repo.join("current"))?, primary_before);
     assert_eq!(fs::read(companion.repo.join("current"))?, companion_before);
     refresh("2.0.0-0")?;
+    let locked_config = work.join("locked-image.kdl");
+    fs::write(
+        &locked_config,
+        format!(
+            "{}publisher \"extras\" {{ repository {cache:?}; trust-key {:?}; }}\n",
+            fs::read_to_string(&config)?,
+            extras.public,
+        ),
+    )?;
+    let locked_root = work.join("locked-root");
+    crate::create_image_from_lock(&locked_root, &locked_config, &locked)?;
+    let request = Request::InstallLock {
+        lock: Box::new(locked.clone()),
+    };
+    let saved_lock_plan = plan(&locked_root, request.clone())?;
+    assert_eq!(saved_lock_plan.catalogs["seed"], pin.trim());
+
+    let mut altered = serde_json::to_value(&locked)?;
+    altered["packages"][editor]["manifest_sha256"] = serde_json::Value::String("0".repeat(64));
+    let bad = Request::InstallLock {
+        lock: Box::new(serde_json::from_value(altered)?),
+    };
+    assert!(
+        format!("{:#}", plan(&locked_root, bad).unwrap_err()).contains("exact manifest digest")
+    );
+    let saved_lock_plan = serde_json::from_slice(&serde_json::to_vec(&saved_lock_plan)?)?;
+    fetch_plan(&locked_root, &saved_lock_plan)?;
+    apply(&locked_root, &saved_lock_plan)?;
+    let diff = crate::image_diff(&main.root, &locked_root, true)?;
+    assert_ne!(diff.before.id, diff.after.id);
+    assert!(diff.packages.is_empty() && diff.paths.unwrap().is_empty());
+    assert_eq!(crate::capture_image_lock(&locked_root)?, locked);
+    assert!(plan(&locked_root, request).is_err());
+
     let upgrade = plan(&main.root, Request::Update)?;
     assert_eq!(upgrade.catalogs["seed"], pin.trim());
     let staged = main._dir.path().join("upgrade");

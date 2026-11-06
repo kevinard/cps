@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     boot::kernel::{self, Artifacts},
     image::{
-        Image, Installed, Managed, Settings, State, history::TransactionDetails,
-        publisher_generation_is_initial, root::Root,
+        Image, Installed, Managed, ProfileIntent, Settings, State, history::TransactionDetails,
+        lock::ImageLock, publisher_generation_is_initial, root::Root,
     },
     model::{FORMAT, Node, PackageSpec, digest, validate_name, validate_publisher},
     repo::{BuildReceipt, Published},
@@ -59,6 +59,9 @@ pub enum Request {
         packages: Vec<String>,
     },
     InstallProfile,
+    InstallLock {
+        lock: Box<ImageLock>,
+    },
     Mark {
         choice: MarkChoice,
         packages: Vec<String>,
@@ -94,6 +97,7 @@ impl Request {
             Self::Install { .. } => "install",
             Self::ExactInstall { .. } => "exact-install",
             Self::InstallProfile => "install-profile",
+            Self::InstallLock { .. } => "install-lock",
             Self::Mark { .. } => "mark",
             Self::Freeze { .. } => "freeze",
             Self::Unfreeze { .. } => "unfreeze",
@@ -733,8 +737,12 @@ fn build_with_update_diagnostics(
         "--force-phased-update requires an update request"
     );
     ensure!(
-        state.settings.bootstrap_catalog.is_none() || matches!(request, Request::InstallProfile),
-        "install the pinned bootstrap release with plan install-profile first"
+        state.settings.bootstrap_catalog.is_none()
+            || matches!(
+                request,
+                Request::InstallProfile | Request::InstallLock { .. }
+            ),
+        "install the pinned bootstrap release with plan install-profile or plan install-lock first"
     );
     if let Request::Mark { choice, packages } = &request {
         let (installed, intent_changes) = intent::mark(image, &mut state, *choice, packages)?;
@@ -853,6 +861,13 @@ fn build_with_update_diagnostics(
             )?
         }
         _ => {
+            let lock = match &request {
+                Request::InstallLock { lock } => {
+                    lock.check_target(&state)?;
+                    Some(lock.as_ref())
+                }
+                _ => None,
+            };
             let install_profile = matches!(request, Request::InstallProfile);
             if install_profile {
                 ensure!(
@@ -868,6 +883,7 @@ fn build_with_update_diagnostics(
                 Request::Install { packages } | Request::ExactInstall { packages } => {
                     catalogs::requested(&state, packages)?
                 }
+                Request::InstallLock { lock } => lock.selectors(),
                 _ => BTreeMap::new(),
             };
             catalogs = catalogs::load(
@@ -877,6 +893,7 @@ fn build_with_update_diagnostics(
                 saved,
                 updating,
                 force_phased_update,
+                lock,
             )?;
             update_profile |= saved.is_none()
                 && matches!(request, Request::Update)
@@ -889,11 +906,13 @@ fn build_with_update_diagnostics(
                 // Keep the known candidates available even if resolution fails.
                 *held_back = update::candidates(&state, &catalogs, update_profile);
             }
-            track_profile_intent = saved.map_or(
-                update_profile
-                    || (!requested.is_empty() && !state.settings.profile_packages.is_empty()),
-                |plan| plan.track_profile_intent,
-            );
+            let locked_profile = lock.is_some_and(|lock| lock.profile.is_some());
+            track_profile_intent = locked_profile
+                || saved.map_or(
+                    update_profile
+                        || (!requested.is_empty() && !state.settings.profile_packages.is_empty()),
+                    |plan| plan.track_profile_intent,
+                );
             if track_profile_intent && state.settings.profile_intent.is_none() {
                 state.settings.profile_intent = Some(image.reconstruct_profile_intent(&state)?);
             }
@@ -903,7 +922,36 @@ fn build_with_update_diagnostics(
                 catalogs.profile.as_ref().filter(|_| update_profile),
             )?;
             let successors = catalogs.renames.requirements();
-            let (mut installed, paths) = if install_profile {
+            let (mut installed, paths) = if let Some(lock) = lock {
+                let mut installed = lock.replay(&catalogs.candidates.packages)?;
+                if let Some(profile) = &catalogs.profile {
+                    ensure!(
+                        !profile.composition.is_empty(),
+                        "locked release profile has no signed composition"
+                    );
+                    state
+                        .settings
+                        .profile_packages
+                        .clone_from(&profile.composition);
+                    state.settings.check_profile_packages(&installed)?;
+                    let roots: BTreeSet<_> = profile.roots.keys().cloned().collect();
+                    for name in &roots {
+                        installed
+                            .get_mut(name)
+                            .context("locked image omits a signed profile root")?
+                            .explicit = true;
+                    }
+                    state.settings.profile_intent = Some(ProfileIntent {
+                        roots,
+                        local: lock.local_roots.clone(),
+                    });
+                }
+                resolve::check(&installed).context("checking dependencies of the locked image")?;
+                freeze::check(&state.settings.freezes, &installed)?;
+                let paths =
+                    composition_paths(&state.settings, &installed, Some(SolverRevision::SatV2))?;
+                (installed, paths)
+            } else if install_profile {
                 let profile = catalogs
                     .profile
                     .as_ref()
@@ -973,7 +1021,9 @@ fn build_with_update_diagnostics(
                 }
                 state.settings.check_profile_packages(&installed)?;
             }
-            if let Some(intent) = &mut state.settings.profile_intent {
+            if lock.is_none()
+                && let Some(intent) = &mut state.settings.profile_intent
+            {
                 if matches!(request, Request::ExactInstall { .. }) {
                     intent.local.clear();
                 }

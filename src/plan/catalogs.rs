@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use super::{Plan, Renames, Retention, SolverRevision, resolve};
 use crate::{
     attestation::BuildTrust,
-    image::{Image, Installed, Publisher, State},
+    image::{Image, Installed, Publisher, State, lock::ImageLock},
     model::{PackageSpec, Version},
     repo::{BuildEvidence, BuildReceipt, CatalogCheckpoint, Published, ReleaseProfile, snapshot},
 };
@@ -289,6 +289,7 @@ pub(super) fn load(
     saved: Option<&Plan>,
     updating: bool,
     force_phased_update: bool,
+    lock: Option<&ImageLock>,
 ) -> Result<Catalogs> {
     let publishers = state.publishers.as_slice();
     let single = publishers.len() == 1;
@@ -325,10 +326,22 @@ pub(super) fn load(
             }
         }
     };
+    let selected_pin = |publisher: &str| -> Result<Option<&str>> {
+        let saved_pin = saved_pin(publisher)?;
+        let Some(lock) = lock else {
+            return Ok(saved_pin);
+        };
+        let pin = lock.catalog(publisher)?;
+        ensure!(
+            saved_pin.is_none_or(|saved| saved == pin),
+            "saved plan catalog for {publisher} differs from the image lock"
+        );
+        Ok(Some(pin))
+    };
     let profile = image.select_profile(
         &state.publishers,
         &state.settings,
-        saved_pin(&publishers[0].name)?,
+        selected_pin(&publishers[0].name)?,
     )?;
     if updating
         && !force_phased_update
@@ -342,14 +355,14 @@ pub(super) fn load(
     let mut catalogs = Catalogs::default();
     let mut snapshots = Vec::new();
     for publisher in publishers {
-        let pin = saved_pin(&publisher.name)?;
+        let pin = selected_pin(&publisher.name)?;
         let signed = profile
             .as_ref()
             .and_then(|profile| profile.pin(&publisher.name));
         let snapshot = if let Some(required) = signed {
             ensure!(
-                saved.is_none() || pin == Some(required.sha256.as_str()),
-                "saved plan catalog for {} differs from the signed release profile",
+                pin.is_none_or(|pin| pin == required.sha256),
+                "selected catalog for {} differs from the signed release profile",
                 publisher.name
             );
             required.snapshot(&publisher.repo, &publisher.name, &publisher.key)

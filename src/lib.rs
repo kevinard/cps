@@ -40,6 +40,7 @@ pub use image::diff::{ImageChange, ImageDiff, ImageMetadata, ImagePackage, Image
 pub use image::history::{
     HistoryEntry, TransactionDetails, transaction_details, transaction_history,
 };
+pub use image::lock::{ImageLock, capture_image_lock, create_image_from_lock, read_image_lock};
 pub use image::publishers::{
     PublisherInfo, add_publisher, add_publisher_from_url, add_publisher_with_build_trust,
     audit_publisher_builds, list_publishers, prefer_publisher, remove_publisher,

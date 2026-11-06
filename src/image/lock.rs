@@ -1,0 +1,356 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    path::Path,
+};
+
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+
+use super::{Image, Installed, Publisher, Publishers, State, catalogs};
+use crate::{
+    model::{PackageSpec, Version, digest, validate_digest, validate_name, validate_publisher},
+    query::verified_intent,
+    repo::{CATALOG_LIMIT, Published, catalog_index, read_limited},
+};
+
+const LOCK_FORMAT: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageLock {
+    format: u32,
+    pub(crate) architecture: String,
+    pub(crate) facets: BTreeMap<String, bool>,
+    pub(crate) profile: Option<String>,
+    pub(crate) signed_publishers: usize,
+    pub(crate) publishers: Vec<LockedPublisher>,
+    pub(crate) local_roots: BTreeSet<String>,
+    packages: BTreeMap<String, LockedPackage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LockedPublisher {
+    pub name: String,
+    pub catalog: String,
+    key_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LockedPackage {
+    publisher: String,
+    version: Version,
+    manifest_sha256: String,
+}
+
+/// Capture the installed package composition and its signed catalog pins.
+pub fn capture_image_lock(root: &Path) -> Result<ImageLock> {
+    let image = Image::open_query(root)?;
+    let (state, intent) = verified_intent(&image)?;
+    ensure!(
+        state.settings.catalog_archives,
+        "image-lock requires an image with archived signed catalogs"
+    );
+    let profile = state.publishers.release_profile();
+    if profile.is_some() {
+        let applied = catalogs::read_profile(&image.db, &state)?
+            .context("missing archived release profile")?;
+        ensure!(
+            !applied.composition.is_empty()
+                && applied.composition == state.settings.profile_packages
+                && applied.roots.keys().eq(&intent.roots),
+            "the archived profile differs from the applied base; apply the signed profile update before locking"
+        );
+    }
+    let mut publishers = Vec::new();
+    for publisher in state.publishers.as_slice() {
+        let catalog = if let Some(point) = state.settings.catalog_checkpoints.get(&publisher.name) {
+            let archive = catalogs::read_checkpoint(&image.db, publisher, point)?;
+            for package in state.installed.values().map(|entry| &entry.published) {
+                let manifest = &package.manifest;
+                if manifest.publisher == publisher.name {
+                    ensure!(
+                        archive.is_active(&manifest.id()),
+                        "{} is withdrawn from the archived catalog",
+                        manifest.id()
+                    );
+                }
+            }
+            point.catalog.clone()
+        } else {
+            // Newly added, unused publishers have yet to acquire a checkpoint.
+            catalog_index(&publisher.repo, &publisher.name, &publisher.key, None)?
+                .checkpoint
+                .catalog
+        };
+        publishers.push(LockedPublisher {
+            name: publisher.name.clone(),
+            catalog,
+            key_sha256: digest(&publisher.key),
+        });
+    }
+    let packages = state
+        .installed
+        .into_iter()
+        .map(|(name, entry)| {
+            let Published {
+                manifest, sha256, ..
+            } = entry.published;
+            (
+                name,
+                LockedPackage {
+                    publisher: manifest.publisher,
+                    version: manifest.version,
+                    manifest_sha256: sha256,
+                },
+            )
+        })
+        .collect();
+    let lock = ImageLock {
+        format: LOCK_FORMAT,
+        architecture: state.settings.arch,
+        facets: state.settings.facets,
+        profile: profile.map(str::to_owned),
+        signed_publishers: state.publishers.signed_publishers().len(),
+        publishers,
+        local_roots: intent.local,
+        packages,
+    };
+    lock.validate()?;
+    Ok(lock)
+}
+
+pub fn read_image_lock(path: &Path) -> Result<ImageLock> {
+    let load = || -> Result<ImageLock> {
+        let bytes = read_limited(File::open(path)?, CATALOG_LIMIT)?;
+        let lock: ImageLock = serde_json::from_slice(&bytes)?;
+        lock.validate()?;
+        Ok(lock)
+    };
+    load().with_context(|| format!("reading image lock {}", path.display()))
+}
+
+impl ImageLock {
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(self.format == LOCK_FORMAT, "unsupported image lock format");
+        validate_publisher(&self.architecture).context("invalid locked architecture")?;
+        for facet in self.facets.keys() {
+            validate_publisher(facet).context("invalid locked facet")?;
+        }
+        if let Some(profile) = &self.profile {
+            validate_name(profile).context("invalid locked profile")?;
+            ensure!(
+                (1..=self.publishers.len()).contains(&self.signed_publishers),
+                "invalid signed publisher count in image lock"
+            );
+        } else {
+            ensure!(
+                self.signed_publishers == 0,
+                "image lock has signed publishers without a profile"
+            );
+        }
+        let mut names = BTreeSet::new();
+        for publisher in &self.publishers {
+            validate_publisher(&publisher.name)?;
+            validate_digest(&publisher.catalog)?;
+            validate_digest(&publisher.key_sha256)?;
+            ensure!(
+                names.insert(publisher.name.as_str()),
+                "duplicate locked publisher {}",
+                publisher.name
+            );
+        }
+        ensure!(!names.is_empty(), "image lock requires publishers");
+        for (name, package) in &self.packages {
+            validate_name(name)?;
+            validate_digest(&package.manifest_sha256)?;
+            ensure!(
+                names.contains(package.publisher.as_str()),
+                "unknown locked publisher for {name}"
+            );
+        }
+        ensure!(
+            self.local_roots
+                .iter()
+                .all(|name| self.packages.contains_key(name)),
+            "image lock contains a local request outside the package selection"
+        );
+        Ok(())
+    }
+
+    pub(super) fn check_configuration(
+        &self,
+        arch: &str,
+        facets: &BTreeMap<String, bool>,
+        profile: Option<&str>,
+        publishers: &[Publisher],
+    ) -> Result<()> {
+        ensure!(
+            arch == self.architecture
+                && facets == &self.facets
+                && profile == self.profile.as_deref(),
+            "architecture, facets or release profile differ from the image lock"
+        );
+        ensure!(
+            self.publishers
+                .iter()
+                .map(|p| p.name.as_str())
+                .eq(publishers.iter().map(|p| p.name.as_str())),
+            "configured publisher order differs from the image lock"
+        );
+        for (locked, publisher) in self.publishers.iter().zip(publishers) {
+            ensure!(
+                digest(&publisher.key) == locked.key_sha256,
+                "configured key differs from the image lock for {}",
+                publisher.name
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_target(&self, state: &State) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            state.settings.revision == 0 && state.installed.is_empty() && state.paths.is_empty(),
+            "install-lock requires a newly initialized image"
+        );
+        self.check_configuration(
+            &state.settings.arch,
+            &state.settings.facets,
+            state.publishers.release_profile(),
+            state.publishers.as_slice(),
+        )?;
+        ensure!(
+            state.publishers.signed_publishers().len() == self.signed_publishers,
+            "signed publisher order differs from the image lock; initialize with --lock"
+        );
+        if let Some(pin) = &state.settings.bootstrap_catalog {
+            ensure!(
+                self.catalog(&self.publishers[0].name)? == pin,
+                "bootstrap catalog differs from the image lock"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn catalog(&self, publisher: &str) -> Result<&str> {
+        self.publishers
+            .iter()
+            .find(|p| p.name == publisher)
+            .map(|p| p.catalog.as_str())
+            .with_context(|| format!("image lock has no catalog for {publisher}"))
+    }
+
+    pub(crate) fn selectors(&self) -> BTreeMap<&str, PackageSpec<'_>> {
+        self.packages
+            .iter()
+            .map(|(name, package)| {
+                (
+                    name.as_str(),
+                    PackageSpec {
+                        publisher: Some(&package.publisher),
+                        name,
+                        version: Some(package.version),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn replay(&self, candidates: &[Published]) -> Result<BTreeMap<String, Installed>> {
+        let mut selected = BTreeMap::new();
+        for candidate in candidates {
+            let manifest = &candidate.manifest;
+            let name = &manifest.name;
+            if self.packages.get(name).is_some_and(|locked| {
+                locked.version == manifest.version
+                    && locked.publisher == manifest.publisher
+                    && locked.manifest_sha256 == candidate.sha256
+            }) {
+                ensure!(
+                    selected
+                        .insert(
+                            name.clone(),
+                            Installed {
+                                published: candidate.clone(),
+                                explicit: self.local_roots.contains(name),
+                            }
+                        )
+                        .is_none(),
+                    "duplicate locked package {name}"
+                );
+            }
+        }
+        for name in self.packages.keys() {
+            ensure!(
+                selected.contains_key(name),
+                "locked package {name} is unavailable with its exact manifest digest"
+            );
+        }
+        Ok(selected)
+    }
+}
+
+/// Initialize a fresh root with the local trust configuration and locked profile.
+pub fn create_image_from_lock(path: &Path, config: &Path, lock: &ImageLock) -> Result<String> {
+    let config = crate::kdl_format::read_image_definition(config)?;
+    lock.validate()?;
+    ensure!(
+        config.image_id.is_none(),
+        "locked provisioning assigns a fresh image identity"
+    );
+    let publishers = super::configured_publishers(&config)?;
+    lock.check_configuration(
+        &config.arch,
+        &config.facets,
+        config.release_profile.as_deref(),
+        &publishers,
+    )?;
+    let bootstrap = lock
+        .profile
+        .as_ref()
+        .map(|_| lock.publishers[0].catalog.clone());
+    ensure!(
+        config.bootstrap_catalog.is_none() || config.bootstrap_catalog == bootstrap,
+        "configured bootstrap catalog differs from the image lock"
+    );
+    let publishers = if let Some(profile) = &lock.profile {
+        Publishers::Profiled {
+            release_profile: profile.clone(),
+            signed_count: (lock.signed_publishers != publishers.len())
+                .then_some(lock.signed_publishers),
+            publishers,
+        }
+    } else {
+        Publishers::new(publishers, None)?
+    };
+    publishers.validate()?;
+    if let Some(profile) =
+        publishers.select_profile(&config.arch, &config.facets, bootstrap.as_deref(), None)?
+    {
+        ensure!(
+            !profile.record.composition.is_empty(),
+            "locked release profile has no signed composition"
+        );
+        for publisher in publishers.signed_publishers() {
+            let pin = profile
+                .pin(&publisher.name)
+                .context("missing signed publisher pin")?;
+            ensure!(
+                lock.catalog(&publisher.name)? == pin.sha256,
+                "locked catalog for {} differs from the signed release profile",
+                publisher.name
+            );
+        }
+    }
+    super::initialize(
+        path,
+        publishers,
+        &config.arch,
+        config.facets,
+        bootstrap,
+        None,
+    )
+}

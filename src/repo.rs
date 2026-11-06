@@ -276,6 +276,10 @@ impl Catalog {
         Ok(())
     }
 
+    pub(crate) fn is_active(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
+    }
+
     pub(crate) fn check_installed(&self, package: &Published) -> Result<Option<&str>> {
         let (entry, attestation) = self
             .package_record(&package.manifest.id())

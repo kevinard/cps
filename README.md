@@ -1612,6 +1612,33 @@ The override is recorded in the saved plan and transaction history. The
 normal signature, dependency, and image checks still apply. Upgrade clients
 before publishing profiles that use `rollout-percentage`.
 
+### Provisioning the same composition on another machine
+
+```sh
+cps image-lock --root installed > desktop.lock.json
+cps image-create --root replica --config image.kdl --lock desktop.lock.json
+cps plan --root replica --output install.json install-lock desktop.lock.json
+cps fetch --root replica --plan install.json
+cps apply --root replica install.json
+cps image-diff installed replica
+```
+
+The lock records the exact package composition, publisher order and key
+fingerprints, catalog pins, architecture, facets, and local package
+requests. The replica gets a fresh image identity. The target's KDL
+configuration supplies its repository locations, trust keys, and build
+trust policies. Give it the locked architecture, facets, profile name,
+and publisher order, including any locally added publishers. Retain the
+pinned signed catalogs and their selected payloads in the configured
+repositories or caches.
+
+Capture a profiled image after its applied base matches its archived
+primary catalog. If a local install advanced that catalog to a different
+profile composition, apply the signed profile update before capturing.
+A lock can provision a fresh image from historical catalogs. Future
+updates use the installed image's usual catalog checkpoints and profile
+policy.
+
 ## Manifest and image behavior
 
 Set `summary` on the package node and add an `optional` node for each
