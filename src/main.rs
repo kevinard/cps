@@ -2023,6 +2023,24 @@ fn run(command: Command) -> Result<ExitCode> {
             for dependent in explanation.dependents {
                 writeln!(out, "    {dependent}")?;
             }
+            if let Some(path) = explanation.path {
+                let origin = match (path.root.requested, path.root.profile) {
+                    (true, cps::query::ProfileRole::Root) => {
+                        "local request and signed profile root"
+                    }
+                    (true, _) => "local request",
+                    (false, _) => "signed profile root",
+                };
+                writeln!(out, "  Dependency path from {origin}")?;
+                writeln!(out, "    {}", path.root.id)?;
+                for step in path.steps {
+                    write!(out, "    → {} ({})", step.provider, step.requirement)?;
+                    if step.matching_providers > 1 {
+                        write!(out, " [{} matching providers]", step.matching_providers)?;
+                    }
+                    writeln!(out)?;
+                }
+            }
             if !explanation.recommenders.is_empty() {
                 writeln!(out, "  Recommended by")?;
                 for recommender in explanation.recommenders {

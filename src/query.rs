@@ -1,7 +1,7 @@
 //! Read-only queries of committed image state and the configured signed catalog.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     path::Path,
 };
@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use crate::{
     image::{Image, Installed, ProfileIntent, Publisher, Publishers, Settings, State},
     kdl_format::manifest_text,
-    model::{Dependency, DependencyTarget, PackageSpec, Version, validate_path},
+    model::{Dependency, DependencyTarget, Manifest, PackageSpec, Version, validate_path},
     repo::{CatalogEntry, CatalogPin, catalog_index, read_package},
 };
 
@@ -179,6 +179,20 @@ pub struct PackageExplanation {
     pub profile_name: Option<String>,
     pub dependents: Vec<String>,
     pub recommenders: Vec<String>,
+    pub path: Option<DependencyPath>,
+}
+
+#[derive(Debug)]
+pub struct DependencyPath {
+    pub root: PackageIntentRow,
+    pub steps: Vec<DependencyStep>,
+}
+
+#[derive(Debug)]
+pub struct DependencyStep {
+    pub provider: String,
+    pub requirement: String,
+    pub matching_providers: usize,
 }
 
 /// Explain the current local request, signed profile role, and direct dependents.
@@ -186,6 +200,7 @@ pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
     let selector = PackageSpec::parse(spec)?;
     let (state, intent) = read_intent(root)?;
     let package = select_installed(&state.installed, selector, spec)?;
+    let path = required_path(&state, &intent, selector.name)?;
     let intent = intent_row(&state, &intent, package);
     let profile_name = state
         .publishers
@@ -216,7 +231,71 @@ pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
         profile_name,
         dependents,
         recommenders,
+        path,
     })
+}
+
+fn required_path(
+    state: &State,
+    intent: &ProfileIntent,
+    target: &str,
+) -> Result<Option<DependencyPath>> {
+    let is_root = |name: &str| intent.local.contains(name) || intent.roots.contains(name);
+    if is_root(target) {
+        return Ok(None);
+    }
+    let mut incoming = BTreeMap::<_, Vec<_>>::new();
+    for package in state.installed.values() {
+        let manifest = &package.published.manifest;
+        for dependency in &manifest.dependency {
+            let providers = matching_providers(dependency, &state.installed)?;
+            for provider in &providers {
+                incoming.entry(provider.name.as_str()).or_default().push((
+                    manifest.name.as_str(),
+                    dependency,
+                    providers.len(),
+                ));
+            }
+        }
+    }
+    let mut queue = VecDeque::from([target]);
+    let mut seen = BTreeSet::from([target]);
+    let mut next = BTreeMap::new();
+    while let Some(provider) = queue.pop_front() {
+        if is_root(provider) {
+            let root = intent_row(state, intent, &state.installed[provider]);
+            let mut steps = Vec::new();
+            let mut parent = provider;
+            while let Some(&(name, requirement, matching_providers)) = next.get(parent) {
+                steps.push(DependencyStep {
+                    provider: state.installed[name].published.manifest.id(),
+                    requirement: describe_requirement(requirement),
+                    matching_providers,
+                });
+                parent = name;
+            }
+            return Ok(Some(DependencyPath { root, steps }));
+        }
+        for &(parent, dependency, count) in incoming.get(provider).into_iter().flatten() {
+            if seen.insert(parent) {
+                next.insert(parent, (provider, dependency, count));
+                queue.push_back(parent);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn describe_requirement(dependency: &Dependency) -> String {
+    match dependency {
+        Dependency::Require(target) => format!("requires {target}"),
+        Dependency::RequireCapability(target) => format!("requires capability {target}"),
+        Dependency::RequireAny { .. } => "requires one of several alternatives".into(),
+        Dependency::Conditional { target, predicate } => {
+            format!("requires {target} when {predicate} is installed")
+        }
+        _ => unreachable!("only active requirements have matching providers"),
+    }
 }
 
 fn read_intent(root: &Path) -> Result<(State, ProfileIntent)> {
@@ -514,27 +593,39 @@ pub fn direct_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
     let (installed, name) = dependency_query(root, spec)?;
     let mut dependencies = BTreeMap::new();
     for dependency in &installed[name].published.manifest.dependency {
-        if let Dependency::RequireCapability(target) = dependency {
-            for package in installed.values() {
-                let manifest = &package.published.manifest;
-                if target.matches_capability(manifest)? {
-                    dependencies.insert(&manifest.name, manifest);
-                }
-            }
-            continue;
-        }
-        for target in active_targets(dependency, &installed)? {
-            if let Some(package) = installed.get(&target.package)
-                && target.matches(package.published.manifest.version)?
-            {
-                dependencies.insert(&target.package, &package.published.manifest);
-            }
+        for manifest in matching_providers(dependency, &installed)? {
+            dependencies.insert(&manifest.name, manifest);
         }
     }
     Ok(dependencies
         .values()
         .map(|manifest| manifest.id())
         .collect())
+}
+
+fn matching_providers<'a>(
+    dependency: &Dependency,
+    installed: &'a BTreeMap<String, Installed>,
+) -> Result<Vec<&'a Manifest>> {
+    let mut providers = BTreeMap::new();
+    if let Dependency::RequireCapability(target) = dependency {
+        for package in installed.values() {
+            let manifest = &package.published.manifest;
+            if target.matches_capability(manifest)? {
+                providers.insert(&manifest.name, manifest);
+            }
+        }
+    } else {
+        for target in active_targets(dependency, installed)? {
+            if let Some(package) = installed.get(&target.package)
+                && target.matches(package.published.manifest.version)?
+            {
+                let manifest = &package.published.manifest;
+                providers.insert(&manifest.name, manifest);
+            }
+        }
+    }
+    Ok(providers.into_values().collect())
 }
 
 /// List installed package IDs with a direct requirement satisfied by this package.

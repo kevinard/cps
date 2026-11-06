@@ -2307,6 +2307,44 @@ fn queries_direct_dependencies_and_dependents_offline() -> Result<()> {
             expected
         );
     }
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Mark {
+                choice: crate::MarkChoice::Automatic,
+                packages: vec!["library/display".into()],
+            },
+        )?,
+    )?;
+    let path = explain_package(&f.root, display)?.path.unwrap();
+    assert_eq!(path.root.id, "cps://canopa/desktop/alternate@1.0.0-0");
+    assert_eq!(path.steps[0].provider, display);
+    assert_eq!(path.steps[0].matching_providers, 2);
+    assert!(path.steps[0].requirement.contains("alternatives"));
+
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Mark {
+                choice: crate::MarkChoice::Automatic,
+                packages: vec![
+                    "desktop/alternate".into(),
+                    "desktop/direct".into(),
+                    "desktop/session".into(),
+                ],
+            },
+        )?,
+    )?;
+    let path = explain_package(&f.root, display)?.path.unwrap();
+    assert_eq!(path.root.id, "cps://canopa/desktop/transitive@1.0.0-0");
+    assert_eq!(path.steps.len(), 2);
+    assert_eq!(
+        path.steps[0].provider,
+        "cps://canopa/desktop/direct@1.0.0-0"
+    );
+    assert_eq!(path.steps[1].provider, display);
     Ok(())
 }
 
