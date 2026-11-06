@@ -1584,6 +1584,163 @@ fn requires_one_compatible_backend_and_checks_removal_offline() -> Result<()> {
 }
 
 #[test]
+fn virtual_packages_resolve_real_providers_and_preserve_dependencies_offline() -> Result<()> {
+    use crate::query::{direct_dependencies, explain_package, reverse_dependencies};
+
+    let f = Fixture::new()?;
+    let install = |root: &Path, names: &[&str]| {
+        plan(
+            root,
+            Request::Install {
+                packages: names.iter().map(|name| name.to_string()).collect(),
+            },
+        )
+    };
+    let remove_zeta = || Request::Remove {
+        packages: vec!["backend/zeta".into()],
+    };
+    let provider = "    provides \"cap/mail-transport\" version=\"2.0.0-0\"\n";
+    f.package("backend/alpha", "1.0.0-0", provider.into())?;
+    f.package(
+        "backend/alpha",
+        "2.0.0-0",
+        "    provides \"cap/mail-transport\" version=\"1.0.0-0\"\n".into(),
+    )?;
+    f.package("backend/zeta", "1.0.0-0", provider.into())?;
+    f.package(
+        "backend/unversioned",
+        "9.0.0-0",
+        "    provides \"cap/mail-transport\"\n".into(),
+    )?;
+    f.package("cap/mail-transport", "9.0.0-0", String::new())?;
+    f.package(
+        "apps/mail",
+        "1.0.0-0",
+        "    require-capability \"cap/mail-transport\" version=\">=2.0.0-0\"\n".into(),
+    )?;
+    f.package(
+        "apps/optional-mail",
+        "1.0.0-0",
+        "    require-capability \"cap/mail-transport\"\n".into(),
+    )?;
+    f.create()?;
+    let unversioned = install(&f.root, &["backend/unversioned", "cap/mail-transport"])?;
+    apply(&f.root, &unversioned)?;
+    let optional = install(&f.root, &["apps/optional-mail"])?;
+    apply(&f.root, &optional)?;
+    assert_eq!(
+        direct_dependencies(&f.root, "apps/optional-mail")?,
+        ["cps://canopa/backend/unversioned@9.0.0-0"]
+    );
+
+    let fresh = f._dir.path().join("fresh");
+    create_image(
+        &fresh,
+        &f.repo,
+        "canopa",
+        &f.public,
+        "x86_64",
+        BTreeMap::new(),
+    )?;
+    let resolved = install(&fresh, &["apps/mail"])?;
+    apply(&fresh, &resolved)?;
+    assert_eq!(
+        direct_dependencies(&fresh, "apps/mail")?,
+        ["cps://canopa/backend/alpha@1.0.0-0"]
+    );
+    apply(&fresh, &install(&fresh, &["backend/zeta"])?)?;
+    let cleanup = plan(&fresh, Request::Autoremove)?;
+    assert!(cleanup.summary().contains("Remove backend/alpha"));
+    apply(&fresh, &cleanup)?;
+
+    apply(&f.root, &install(&f.root, &["backend/zeta"])?)?;
+    let saved = install(&f.root, &["apps/mail"])?;
+    apply(
+        &f.root,
+        &serde_json::from_str(&serde_json::to_string(&saved)?)?,
+    )?;
+    assert_eq!(
+        direct_dependencies(&f.root, "apps/mail")?,
+        ["cps://canopa/backend/zeta@1.0.0-0"]
+    );
+    assert_eq!(
+        reverse_dependencies(&f.root, "backend/zeta")?,
+        [
+            "cps://canopa/apps/mail@1.0.0-0",
+            "cps://canopa/apps/optional-mail@1.0.0-0"
+        ]
+    );
+    assert_eq!(
+        explain_package(&f.root, "backend/zeta")?.dependents,
+        reverse_dependencies(&f.root, "backend/zeta")?
+    );
+    assert!(reverse_dependencies(&f.root, "cap/mail-transport")?.is_empty());
+
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    let error = format!("{:#}", plan(&f.root, remove_zeta()).unwrap_err());
+    assert!(
+        error.contains("missing a provider for capability cap/mail-transport"),
+        "{error}"
+    );
+    let mark = plan(
+        &f.root,
+        Request::Mark {
+            choice: crate::MarkChoice::Automatic,
+            packages: vec!["backend/zeta".into()],
+        },
+    )?;
+    apply(&f.root, &mark)?;
+    let cleanup = plan(&f.root, Request::Autoremove)?;
+    assert!(!cleanup.summary().contains("Remove backend/zeta"));
+    assert!(verify(&f.root)?.is_empty());
+
+    fs::rename(&offline, &f.repo)?;
+    apply(&f.root, &install(&f.root, &["backend/alpha@1.0.0-0"])?)?;
+    fs::rename(&f.repo, &offline)?;
+    apply(&f.root, &plan(&f.root, remove_zeta())?)?;
+    assert_eq!(
+        direct_dependencies(&f.root, "apps/mail")?,
+        ["cps://canopa/backend/alpha@1.0.0-0"]
+    );
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn virtual_package_requirement_without_providers_can_backtrack() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package("cap/display", "1.0.0-0", String::new())?;
+    f.package(
+        "apps/display",
+        "1.0.0-0",
+        "    require \"cap/display\"\n".into(),
+    )?;
+    f.package(
+        "apps/display",
+        "2.0.0-0",
+        "    require-capability \"cap/display\"\n".into(),
+    )?;
+    f.create()?;
+    let install = |name: &str| {
+        plan(
+            &f.root,
+            Request::Install {
+                packages: vec![name.into()],
+            },
+        )
+    };
+    let error = format!("{:#}", install("apps/display@2.0.0-0").unwrap_err());
+    assert!(error.contains("cap/display"), "{error}");
+    apply(&f.root, &install("apps/display")?)?;
+    assert_eq!(
+        crate::query::direct_dependencies(&f.root, "apps/display@1.0.0-0")?,
+        ["cps://canopa/cap/display@1.0.0-0"]
+    );
+    Ok(())
+}
+
+#[test]
 fn conditional_dependency_tracks_the_selected_runtime_version() -> Result<()> {
     let f = Fixture::new()?;
     const RUNTIME: &str = "usr/lib/cps/runtime";

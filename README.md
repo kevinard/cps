@@ -327,15 +327,17 @@ architecture are omitted.
 requirements. `rdeps` lists installed packages with a direct requirement the
 selected package satisfies. Both accept the same installed package selectors
 as `info` and work offline from the committed image. They include all
-matching installed `require-any` providers and conditional requirements whose
-predicate matches the installed image. Each match appears once as a package
-ID, sorted by package name. An empty result produces no output.
+matching installed providers for `require-any` and `require-capability`, and
+conditional requirements whose predicate matches the installed image. Each
+match appears once as a package ID, sorted by package name. An empty result
+produces no output.
 
 `why` uses the same selectors and works offline. It shows the package's
 effective explicit local request, its role in the applied signed profile,
 and its matching direct dependents together. Profile roles are `root`,
 `dependency`, or `protected` for legacy images with an unknown exact role.
-A listed dependent can also have another installed `require-any` provider.
+A listed dependent can also have another installed provider for an alternative
+or capability.
 
 `list --intent` shows effective local requests separately from the roles in
 the applied signed profile. It reports `protected` for legacy profile
@@ -1543,6 +1545,34 @@ candidates. It keeps the dependencies needed by that solution, including a
 compatible alternative and any conditional dependencies that apply. The
 plan and apply work offline. Use `plan mark explicit` to keep an installed
 dependency before planning cleanup.
+
+### Virtual packages
+
+A mail transport package can declare its capability in the manifest.
+
+```kdl
+provides "cap/mail-transport" version="2.0.0-0"
+```
+
+A consumer can require the capability by name.
+
+```kdl
+require-capability "cap/mail-transport" version=">=2.0.0-0"
+```
+
+Capability names begin with `cap/`. The version on `provides` describes the
+capability independently of the package version. A requirement with a version
+constraint needs a matching versioned provider. Omit the constraint to accept
+any declared version or an unversioned provider.
+
+CPS prefers compatible providers that the transaction already requests or
+retains, then compatible installed providers. Plans, profiles, and installed
+state record the concrete provider packages.
+Multiple providers can coexist if their package constraints and files allow
+it. Removing a provider requires another compatible installed provider if a
+consumer remains. Install a concrete provider by package name to select it
+explicitly. Use `solver="sat-v1"` if a build toolchain depends on a capability,
+and upgrade clients before publishing manifests that use these declarations.
 
 ### Filesystem permissions
 

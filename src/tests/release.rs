@@ -512,12 +512,17 @@ fn release_profiles_pin_latest_roots_and_use_image_facets() -> Result<()> {
 #[test]
 fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
     let f = Fixture::new()?;
-    f.package("library/runtime", "1.0.0-0", String::new())?;
-    f.package("library/runtime", "2.0.0-0", String::new())?;
+    for version in ["1.0.0-0", "2.0.0-0"] {
+        f.package(
+            "library/runtime",
+            version,
+            "    provides \"cap/desktop-runtime\"\n".into(),
+        )?;
+    }
     f.package(
         "desktop/compositor",
         "1.0.0-0",
-        "    require \"library/runtime\"\n".to_owned(),
+        "    require-capability \"cap/desktop-runtime\"\n".into(),
     )?;
     let release = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
     let version = "1.0.0-0".parse()?;
@@ -543,6 +548,10 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
     let installed = candidates.replay(&profile)?;
     let locked = &profile.composition["library/runtime"];
     assert_eq!(&installed["library/runtime"].published.sha256, locked);
+    let mut incomplete = profile.clone();
+    incomplete.composition.remove("library/runtime");
+    let error = candidates.replay(&incomplete).unwrap_err();
+    assert!(format!("{error:#}").contains("missing a provider for capability cap/desktop-runtime"));
     candidates
         .packages
         .retain(|package| &package.sha256 != locked);

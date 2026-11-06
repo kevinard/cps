@@ -8,13 +8,15 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem, SolvableId, Solver,
-    SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
+    HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem, Requirement,
+    SolvableId, Solver, SolverCache, StringId, UnsolvableOrCancelled, VersionSetId,
+    VersionSetUnionId,
     utils::{Pool, VersionSet},
 };
 
 use crate::{
-    model::{Dependency, DependencyTarget, Version, VersionConstraint},
+    image::Installed,
+    model::{Dependency, DependencyTarget, Manifest, Version, VersionConstraint},
     plan::paths::PathConflict,
     repo::Published,
 };
@@ -23,7 +25,18 @@ use crate::{
 struct Filter {
     expression: Option<String>,
     constraint: VersionConstraint,
+    capability: Option<String>,
     exclude: bool,
+}
+
+impl Filter {
+    fn matches(&self, manifest: &Manifest) -> bool {
+        let matches = match &self.capability {
+            Some(name) => manifest.provides_capability(name, &self.constraint),
+            None => self.constraint.matches(manifest.version),
+        };
+        matches != self.exclude
+    }
 }
 
 impl VersionSet for Filter {
@@ -50,13 +63,30 @@ struct Universe<'a> {
 impl<'a> Universe<'a> {
     fn new(
         candidates: &BTreeMap<&str, Vec<&'a Published>>,
-        retained: &BTreeMap<&str, Version>,
+        wanted: &BTreeSet<&str>,
+        installed: &BTreeMap<String, Installed>,
     ) -> Result<Self> {
         let mut universe = Self {
             pool: Pool::new(),
             candidates: BTreeMap::new(),
             packages: Vec::new(),
         };
+        let mut providers = BTreeMap::<_, BTreeSet<_>>::new();
+        for (&name, versions) in candidates {
+            for package in versions {
+                for capability in package.manifest.provides.keys() {
+                    providers
+                        .entry(capability.as_str())
+                        .or_default()
+                        .insert(name);
+                }
+            }
+        }
+        let retained = installed
+            .iter()
+            .filter(|(name, _)| wanted.contains(name.as_str()))
+            .map(|(name, entry)| (name.as_str(), entry.published.manifest.version))
+            .collect();
         for (&name, versions) in candidates {
             let name = universe.pool.intern_package_name(name);
             let mut solvables = Vec::with_capacity(versions.len());
@@ -67,6 +97,15 @@ impl<'a> Universe<'a> {
                         Dependency::Require(target) => dependencies
                             .requirements
                             .push(universe.target(target, false)?.into()),
+                        Dependency::RequireCapability(target) => {
+                            let requirement = universe.require_capability(
+                                target,
+                                providers.get(target.package.as_str()),
+                                wanted,
+                                installed,
+                            )?;
+                            dependencies.requirements.push(requirement.into());
+                        }
                         Dependency::Incorporate(target) => dependencies
                             .constrains
                             .push(universe.target(target, false)?),
@@ -74,7 +113,7 @@ impl<'a> Universe<'a> {
                             dependencies.constrains.push(universe.target(target, true)?)
                         }
                         Dependency::RequireAny { alternatives } => {
-                            let union = universe.alternatives(alternatives, retained)?;
+                            let union = universe.alternatives(alternatives, &retained)?;
                             dependencies.requirements.push(union.into());
                         }
                         Dependency::Conditional { target, predicate } => {
@@ -113,9 +152,47 @@ impl<'a> Universe<'a> {
         let filter = Filter {
             expression: target.version.clone(),
             constraint: VersionConstraint::parse(target.version.as_deref())?,
+            capability: None,
             exclude,
         };
         Ok(self.pool.intern_version_set(name, filter))
+    }
+
+    fn require_capability(
+        &self,
+        target: &DependencyTarget,
+        providers: Option<&BTreeSet<&str>>,
+        wanted: &BTreeSet<&str>,
+        installed: &BTreeMap<String, Installed>,
+    ) -> Result<Requirement> {
+        let filter = Filter {
+            expression: Some(format!("providing {target}")),
+            constraint: VersionConstraint::parse(target.version.as_deref())?,
+            capability: Some(target.package.clone()),
+            exclude: false,
+        };
+        let Some(providers) = providers else {
+            // An unsatisfied requirement lets the solver try another version of the consumer.
+            let missing = format!("capability {}", target.package);
+            let name = self.pool.intern_package_name(missing);
+            return Ok(self.pool.intern_version_set(name, filter).into());
+        };
+        let mut choices: Vec<_> = providers
+            .iter()
+            .map(|&name| {
+                let compatible = installed
+                    .get(name)
+                    .is_some_and(|entry| filter.matches(&entry.published.manifest));
+                (!wanted.contains(name), !compatible, name)
+            })
+            .collect();
+        choices.sort_unstable();
+        let mut sets = choices.into_iter().map(|(_, _, name)| {
+            let name = self.pool.intern_package_name(name);
+            self.pool.intern_version_set(name, filter.clone())
+        });
+        let first = sets.next().expect("a capability has at least one provider");
+        Ok(self.pool.intern_version_set_union(first, sets).into())
     }
 
     fn alternatives(
@@ -221,6 +298,7 @@ impl Rejections {
                 expression: Some(format!("{exact} ({conflict})")),
                 constraint: VersionConstraint::parse(Some(&exact))?,
                 exclude: true,
+                capability: None,
             };
             let name = universe.pool.resolve_solvable(b).name;
             let exclusion = universe.pool.intern_version_set(name, filter);
@@ -284,10 +362,7 @@ impl DependencyProvider for Provider<'_, '_> {
         candidates
             .iter()
             .copied()
-            .filter(|&id| {
-                let version = self.universe.package(id).manifest.version;
-                (filter.constraint.matches(version) != filter.exclude) != inverse
-            })
+            .filter(|&id| filter.matches(&self.universe.package(id).manifest) != inverse)
             .collect()
     }
 
@@ -328,11 +403,11 @@ impl DependencyProvider for Provider<'_, '_> {
 pub(super) fn solve<'a, T>(
     candidates: &BTreeMap<&str, Vec<&'a Published>>,
     wanted: &BTreeSet<&str>,
-    retained: &BTreeMap<&str, Version>,
+    installed: &BTreeMap<String, Installed>,
     compose: impl Fn(BTreeMap<&'a str, &'a Published>) -> Result<T>,
 ) -> Result<T> {
     let deadline = Instant::now() + TIME_LIMIT;
-    let universe = Universe::new(candidates, retained)?;
+    let universe = Universe::new(candidates, wanted, installed)?;
     let requirements: Vec<_> = wanted
         .iter()
         .map(|&name| {

@@ -57,6 +57,7 @@ pub fn generate_manifest_for_architecture(
         architecture: architecture.map(str::to_owned),
         summary: None,
         dependency: Vec::new(),
+        provides: BTreeMap::new(),
         optional_dependencies: Vec::new(),
         action: Vec::new(),
         systemd: Vec::new(),

@@ -163,6 +163,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         architecture: fields.string("architecture")?,
         summary: fields.string("summary")?,
         dependency: Vec::new(),
+        provides: BTreeMap::new(),
         optional_dependencies: Vec::new(),
         action: Vec::new(),
         systemd: Vec::new(),
@@ -181,9 +182,22 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     for node in package.children().into_iter().flat_map(KdlDocument::nodes) {
         let name = node.name().value();
         match name {
-            "require" | "incorporate" | "exclude" | "require-any" | "conditional" => manifest
+            "require" | "require-capability" | "incorporate" | "exclude" | "require-any"
+            | "conditional" => manifest
                 .dependency
                 .push(parse_dependency(node).with_context(|| format!("{name} dependency"))?),
+            "provides" => {
+                let fields = Fields::read(node, 1, &["version"], false)?;
+                let name = fields.string_arg(0)?;
+                let version = fields
+                    .string("version")?
+                    .map(|version| version.parse())
+                    .transpose()?;
+                ensure!(
+                    manifest.provides.insert(name.clone(), version).is_none(),
+                    "duplicate provided capability {name}"
+                );
+            }
             "optional" => {
                 let fields = Fields::read(node, 1, &["version", "description"], false)?;
                 manifest.optional_dependencies.push(OptionalDependency {
@@ -237,6 +251,7 @@ fn parse_target(node: &KdlNode) -> Result<DependencyTarget> {
 fn parse_dependency(node: &KdlNode) -> Result<Dependency> {
     let dependency = match node.name().value() {
         "require" => Dependency::Require(parse_target(node)?),
+        "require-capability" => Dependency::RequireCapability(parse_target(node)?),
         "incorporate" => Dependency::Incorporate(parse_target(node)?),
         "exclude" => Dependency::Exclude(parse_target(node)?),
         "require-any" => {
@@ -380,6 +395,7 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     for dependency in &manifest.dependency {
         children.push(match dependency {
             Dependency::Require(target) => target_node("require", target),
+            Dependency::RequireCapability(target) => target_node("require-capability", target),
             Dependency::Incorporate(target) => target_node("incorporate", target),
             Dependency::Exclude(target) => target_node("exclude", target),
             Dependency::RequireAny { alternatives } => {
@@ -400,6 +416,14 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 node
             }
         });
+    }
+    for (name, version) in &manifest.provides {
+        let mut node = KdlNode::new("provides");
+        node.push(name.as_str());
+        if let Some(version) = version {
+            node.insert("version", version.to_string());
+        }
+        children.push(node);
     }
     for optional in &manifest.optional_dependencies {
         let mut node = target_node("optional", &optional.target);
@@ -840,5 +864,37 @@ mod tests {
         "#;
         let error = parse_manifest(input).unwrap_err();
         assert!(format!("{error:#}").contains("duplicate file property uid"));
+    }
+
+    #[test]
+    fn capability_declarations_round_trip_and_reject_invalid_values() -> Result<()> {
+        let package = |body: &str| {
+            format!(
+                "schema-version 1\npackage \"test/example\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{body}\n}}"
+            )
+        };
+        let manifest = parse_manifest(&package(
+            r#"provides "cap/runtime" version="2.0.0-0"
+               provides "cap/helper"
+               require-capability "cap/runtime" version=">=1.0.0-0""#,
+        ))?;
+        manifest.validate(false)?;
+        assert_eq!(parse_manifest(&manifest_text(&manifest))?, manifest);
+
+        for body in [
+            r#"provides "cap/runtime"
+               provides "cap/runtime" version="2.0.0-0""#,
+            r#"provides "cap/runtime" version=">=1.0.0-0""#,
+            r#"provides "runtime""#,
+            r#"require-capability "runtime""#,
+        ] {
+            assert!(
+                parse_manifest(&package(body))
+                    .and_then(|manifest| manifest.validate(false))
+                    .is_err(),
+                "{body}"
+            );
+        }
+        Ok(())
     }
 }

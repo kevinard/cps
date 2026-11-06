@@ -8,7 +8,7 @@ use super::SolverRevision;
 use super::freeze::{self, FrozenPackage};
 use crate::{
     image::Installed,
-    model::{Dependency, DependencyTarget, PackageSpec, Version},
+    model::{Dependency, DependencyTarget, PackageSpec, Version, VersionConstraint},
     repo::Published,
 };
 
@@ -174,14 +174,7 @@ pub fn resolve<'a, T>(
         Ok((installed, composed))
     };
     let result = match solver {
-        Some(SolverRevision::SatV1) => {
-            let retained = installed
-                .iter()
-                .filter(|(name, _)| wanted.contains(name.as_str()))
-                .map(|(name, entry)| (name.as_str(), entry.published.manifest.version))
-                .collect();
-            sat::solve(&candidates, &wanted, &retained, materialize)
-        }
+        Some(SolverRevision::SatV1) => sat::solve(&candidates, &wanted, installed, materialize),
         None => {
             // Existing saved plans and pinned build recipes retain their original selection order.
             let mut selected = BTreeMap::new();
@@ -221,6 +214,7 @@ fn search<'a>(
                 .dependency
                 .iter()
                 .find_map(|dependency| match dependency {
+                    Dependency::RequireCapability(_) => Some("require-capability"),
                     Dependency::RequireAny { .. } => Some("require-any"),
                     Dependency::Conditional { .. } => Some("conditional"),
                     _ => None,
@@ -257,7 +251,9 @@ fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {
             let (target, exclude) = match dependency {
                 Dependency::Require(target) | Dependency::Incorporate(target) => (target, false),
                 Dependency::Exclude(target) => (target, true),
-                Dependency::RequireAny { .. } | Dependency::Conditional { .. } => continue,
+                Dependency::RequireCapability(_)
+                | Dependency::RequireAny { .. }
+                | Dependency::Conditional { .. } => continue,
             };
             if let Some(selected_target) = selected.get(target.package.as_str()) {
                 let verb = if exclude { "excludes" } else { "requires" };
@@ -289,6 +285,12 @@ pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
         .map(|(name, pkg)| (name.as_str(), &pkg.published))
         .collect();
     check_selected(&selected)?;
+    let mut capabilities = BTreeMap::<_, Vec<_>>::new();
+    for package in selected.values() {
+        for (name, &version) in &package.manifest.provides {
+            capabilities.entry(name.as_str()).or_default().push(version);
+        }
+    }
     for package in selected.values() {
         for dependency in &package.manifest.dependency {
             match dependency {
@@ -298,6 +300,18 @@ pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
                     package.manifest.id(),
                     target.package,
                 ),
+                Dependency::RequireCapability(target) => {
+                    let constraint = VersionConstraint::parse(target.version.as_deref())?;
+                    ensure!(
+                        capabilities
+                            .get(target.package.as_str())
+                            .is_some_and(|versions| versions
+                                .iter()
+                                .any(|&version| constraint.matches_provided(version))),
+                        "{} is missing a provider for capability {target}",
+                        package.manifest.id(),
+                    );
+                }
                 Dependency::RequireAny { alternatives } => {
                     let mut satisfied = false;
                     for target in alternatives {

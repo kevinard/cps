@@ -75,6 +75,13 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_capability(name: &str) -> Result<()> {
+    let suffix = name
+        .strip_prefix("cap/")
+        .context("capability names must begin with cap/")?;
+    validate_name(suffix).with_context(|| format!("invalid capability name {name:?}"))
+}
+
 pub fn validate_publisher(publisher: &str) -> Result<()> {
     ensure!(name_component(publisher), "invalid publisher {publisher:?}");
     Ok(())
@@ -156,6 +163,7 @@ impl<'de> Deserialize<'de> for Version {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Dependency {
     Require(DependencyTarget),
+    RequireCapability(DependencyTarget),
     Incorporate(DependencyTarget),
     Exclude(DependencyTarget),
     RequireAny {
@@ -186,6 +194,11 @@ impl DependencyTarget {
         Ok(VersionConstraint::parse(self.version.as_deref())?.matches(version))
     }
 
+    pub(crate) fn matches_capability(&self, manifest: &Manifest) -> Result<bool> {
+        let constraint = VersionConstraint::parse(self.version.as_deref())?;
+        Ok(manifest.provides_capability(&self.package, &constraint))
+    }
+
     fn validate(&self) -> Result<()> {
         validate_name(&self.package)?;
         VersionConstraint::parse(self.version.as_deref())?;
@@ -208,6 +221,11 @@ impl Dependency {
     fn validate(&self) -> Result<()> {
         match self {
             Self::Require(target) | Self::Exclude(target) => target.validate(),
+            Self::RequireCapability(target) => {
+                validate_capability(&target.package)?;
+                VersionConstraint::parse(target.version.as_deref())?;
+                Ok(())
+            }
             Self::Incorporate(target) => {
                 ensure!(
                     target.version.is_some(),
@@ -269,6 +287,10 @@ impl VersionConstraint {
             "<" => version < bound,
             _ => version == bound,
         })
+    }
+
+    pub(crate) fn matches_provided(&self, version: Option<Version>) -> bool {
+        version.map_or(self.0.is_empty(), |version| self.matches(version))
     }
 }
 
@@ -575,6 +597,8 @@ pub struct Manifest {
     pub summary: Option<String>,
     #[serde(default)]
     pub dependency: Vec<Dependency>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provides: BTreeMap<String, Option<Version>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub optional_dependencies: Vec<OptionalDependency>,
     #[serde(default)]
@@ -602,6 +626,12 @@ fn validate_display_text(value: &str, max_bytes: usize, label: &str) -> Result<(
 }
 
 impl Manifest {
+    pub(crate) fn provides_capability(&self, name: &str, constraint: &VersionConstraint) -> bool {
+        self.provides
+            .get(name)
+            .is_some_and(|&version| constraint.matches_provided(version))
+    }
+
     pub(crate) fn supports_architecture(&self, architecture: &str) -> bool {
         self.architecture
             .as_deref()
@@ -666,6 +696,9 @@ impl Manifest {
         }
         if let Some(summary) = &self.summary {
             validate_summary(summary)?;
+        }
+        for name in self.provides.keys() {
+            validate_capability(name)?;
         }
         for dependency in &self.dependency {
             dependency.validate()?;

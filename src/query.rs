@@ -487,6 +487,15 @@ pub fn direct_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
     let (installed, name) = dependency_query(root, spec)?;
     let mut dependencies = BTreeMap::new();
     for dependency in &installed[name].published.manifest.dependency {
+        if let Dependency::RequireCapability(target) = dependency {
+            for package in installed.values() {
+                let manifest = &package.published.manifest;
+                if target.matches_capability(manifest)? {
+                    dependencies.insert(&manifest.name, manifest);
+                }
+            }
+            continue;
+        }
         for target in active_targets(dependency, &installed)? {
             if let Some(package) = installed.get(&target.package)
                 && target.matches(package.published.manifest.version)?
@@ -511,13 +520,19 @@ fn installed_dependents(
     installed: &BTreeMap<String, Installed>,
     name: &str,
 ) -> Result<Vec<String>> {
-    let version = installed[name].published.manifest.version;
+    let provider = &installed[name].published.manifest;
     let mut dependents = Vec::new();
     'packages: for package in installed.values() {
         let manifest = &package.published.manifest;
         for dependency in &manifest.dependency {
+            if let Dependency::RequireCapability(target) = dependency
+                && target.matches_capability(provider)?
+            {
+                dependents.push(manifest.id());
+                continue 'packages;
+            }
             for target in active_targets(dependency, installed)? {
-                if target.package == name && target.matches(version)? {
+                if target.package == name && target.matches(provider.version)? {
                     dependents.push(manifest.id());
                     continue 'packages;
                 }
@@ -563,7 +578,9 @@ fn active_targets<'a>(
             }
             _ => &[],
         },
-        Dependency::Incorporate(_) | Dependency::Exclude(_) => &[],
+        Dependency::RequireCapability(_) | Dependency::Incorporate(_) | Dependency::Exclude(_) => {
+            &[]
+        }
     })
 }
 
