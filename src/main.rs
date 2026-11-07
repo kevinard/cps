@@ -620,6 +620,15 @@ fn parse_repository(value: &str) -> std::result::Result<(String, PathBuf), Strin
 
 #[derive(Subcommand)]
 enum RepoCommand {
+    /// Enable a catalog-signed index for available package file lookups
+    IndexFiles {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        signing_key: PathBuf,
+    },
     /// Authorize a new publisher signing key in a successor catalog
     RotateKey {
         #[arg(long)]
@@ -1659,6 +1668,16 @@ fn run(command: Command) -> Result<ExitCode> {
             );
         }
         Command::Repo { command } => match command {
+            RepoCommand::IndexFiles {
+                repo,
+                publisher,
+                signing_key,
+            } => {
+                println!(
+                    "Catalog {}",
+                    cps::enable_file_index(&repo, &publisher, &signing_key)?
+                );
+            }
             RepoCommand::RotateKey {
                 repo,
                 publisher,

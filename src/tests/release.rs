@@ -3349,12 +3349,14 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     )?;
     let unsigned_pin = fs::read_to_string(f.repo.join("current"))?;
     let (_, envelope) = attach_evidence(&f, unsigned_pin.trim(), &builder)?;
+    crate::enable_file_index(&f.repo, "canopa", &f.private)?;
     let first = sync(1)?;
     let old_catalog = fs::read_to_string(cache.join("current"))?.trim().to_owned();
     let installed = work.join("installed");
     for root in [&installed, &f.root] {
         create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
     }
+    assert_eq!(crate::query::search_files(&installed, COMPOSITOR)?.len(), 1);
     let request = Request::Install {
         packages: vec!["desktop/compositor".to_owned()],
     };

@@ -338,7 +338,13 @@ prints the package ID and root-relative path for each match and exits with
 status 1 if none match. It checks the newest version of each package for the
 image's architecture in each publisher's verified catalog and honors the
 image's facets and signed profile catalog pins. The search uses cached or
-local manifests and works with an index-only mirror cache.
+local manifests and works with an index-only mirror cache. Publishers can
+enable indexed lookups with `cps repo index-files --repo REPO --publisher NAME
+--signing-key KEY`. This publishes a successor catalog whose signature binds
+a basename index. Subsequent releases regenerate it. Searches open only
+candidate manifests and still check their file actions and digests. Mirror
+export and sync carry the index alongside the signed catalog. Upgrade
+clients before publishing a catalog with the index enabled.
 
 `owner` prints one installed package ID per line for an exact path. Use
 `/usr/…` or `usr/…` to address a path within the selected image. Shared

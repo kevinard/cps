@@ -82,7 +82,11 @@ pub(crate) fn select_install_sources(
     let settings = image.settings()?;
     let pins = image.release_pins(&publishers, &settings)?;
     for publisher in publishers.as_slice() {
-        let (catalog, obsolete) = available(
+        let AvailableCatalog {
+            packages: catalog,
+            obsoletions: obsolete,
+            ..
+        } = available(
             &image,
             &publishers,
             &settings,
@@ -348,13 +352,19 @@ struct AvailablePackage {
     entry: CatalogEntry,
 }
 
+struct AvailableCatalog {
+    packages: Vec<AvailablePackage>,
+    obsoletions: BTreeMap<String, Version>,
+    file_index: Option<String>,
+}
+
 fn available(
     image: &Image,
     publishers: &Publishers,
     settings: &Settings,
     publisher: &Publisher,
     pin: Option<&CatalogPin>,
-) -> Result<(Vec<AvailablePackage>, BTreeMap<String, Version>)> {
+) -> Result<AvailableCatalog> {
     let index = catalog_index(&publisher.repo, &publisher.name, &publisher.key, pin)?;
     image.check_catalog(publishers, settings, publisher, &index.checkpoint)?;
     let mut entries = Vec::new();
@@ -379,7 +389,11 @@ fn available(
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| b.version.cmp(&a.version)));
-    Ok((entries, index.obsoletions))
+    Ok(AvailableCatalog {
+        packages: entries,
+        obsoletions: index.obsoletions,
+        file_index: index.file_index,
+    })
 }
 
 fn installed(image: &Image, publishers: &Publishers) -> Result<BTreeMap<String, Installed>> {
@@ -434,7 +448,11 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
     let mut entries = Vec::new();
     let mut blocked = BTreeSet::new();
     for publisher in publishers.as_slice() {
-        let (mut catalog, obsoletions) = available(
+        let AvailableCatalog {
+            packages: mut catalog,
+            obsoletions,
+            ..
+        } = available(
             &image,
             &publishers,
             &settings,
@@ -501,7 +519,11 @@ pub fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
     let pins = image.release_pins(&publishers, &settings)?;
     let mut matches = Vec::new();
     for publisher in publishers.as_slice() {
-        let (mut entries, _) = available(
+        let AvailableCatalog {
+            packages: mut entries,
+            file_index,
+            ..
+        } = available(
             &image,
             &publishers,
             &settings,
@@ -509,6 +531,14 @@ pub fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
             pins.get(&publisher.name),
         )?;
         entries.dedup_by(|a, b| a.name == b.name);
+        if let Some(index) = file_index {
+            let index = crate::repo::read_file_index(&publisher.repo, &index)?;
+            let basename = term.rsplit('/').next().unwrap_or(term);
+            let Some(candidates) = index.get(basename) else {
+                continue;
+            };
+            entries.retain(|entry| candidates.contains(&entry.id));
+        }
         for entry in entries {
             let package = read_package(&publisher.repo, &publisher.name, &entry.id, &entry.entry)
                 .with_context(|| format!("reading manifest for {}", entry.id))?;
@@ -742,7 +772,11 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
             if source.is_some_and(|name| publisher.name != name) {
                 continue;
             }
-            let (entries, obsoletions) = available(
+            let AvailableCatalog {
+                packages: entries,
+                obsoletions,
+                ..
+            } = available(
                 &image,
                 &publishers,
                 &settings,

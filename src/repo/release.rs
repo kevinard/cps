@@ -26,10 +26,10 @@ use crate::{
 };
 
 use super::{
-    CATALOG_LIMIT, Catalog, CatalogEntry, CatalogPin, MANIFEST_LIMIT, Published, Root, Snapshot,
-    catalog_snapshot, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
-    read_current, read_key, read_limited, read_package, read_pointer, rebuild, source_archive,
-    write_atomic,
+    CATALOG_LIMIT, Catalog, CatalogEntry, CatalogPin, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
+    MANIFEST_LIMIT, Published, Root, Snapshot, catalog_snapshot, lock_repo, parse_current,
+    path_present, prepare_objects, read_catalog, read_current, read_key, read_limited,
+    read_package, read_pointer, rebuild, source_archive, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -1069,6 +1069,7 @@ async fn materialize(
     for pin in required.iter().filter(|pin| pin.sha256 == hash) {
         pin.check_lineage(&catalog, key)?;
     }
+    cache_file_index(verified, repo, &catalog).await?;
     let mut entries = BTreeMap::new();
     let mut attestations = BTreeSet::new();
     let mut rebuild_objects = BTreeMap::new();
@@ -1093,6 +1094,7 @@ async fn materialize(
             for required in required.iter().filter(|required| required.sha256 == pin) {
                 required.check_lineage(&previous, key)?;
             }
+            cache_file_index(verified, repo, &previous).await?;
             collect_rebuild_objects(&previous, &mut rebuild_objects, &mut attestations);
             entries.extend(previous.entries);
             attestations.extend(previous.attestations.into_values());
@@ -1126,6 +1128,7 @@ async fn materialize_archive(
 ) -> Result<StagedRelease> {
     fetch_object(verified, repo, "catalogs", hash, CATALOG_LIMIT, None).await?;
     let catalog = read_catalog(repo, hash, source.publisher, &source.key)?;
+    cache_file_index(verified, repo, &catalog).await?;
     let mut rebuild_objects = BTreeMap::new();
     let mut attestations = BTreeSet::new();
     collect_rebuild_objects(&catalog, &mut rebuild_objects, &mut attestations);
@@ -1144,6 +1147,21 @@ async fn materialize_archive(
         current: hash.to_owned(),
         retained: Vec::new(),
     })
+}
+
+async fn cache_file_index(verified: &Repository, repo: &Path, catalog: &Catalog) -> Result<()> {
+    if let Some(hash) = &catalog.file_index {
+        fetch_object(
+            verified,
+            repo,
+            FILE_INDEX_OBJECTS,
+            hash,
+            FILE_INDEX_LIMIT,
+            None,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn cache_rebuild_objects(
@@ -1594,6 +1612,16 @@ fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> 
         CATALOG_LIMIT,
         None,
     )?;
+    if let Some(hash) = &release.file_index {
+        export_object(
+            root,
+            output,
+            FILE_INDEX_OBJECTS,
+            hash,
+            FILE_INDEX_LIMIT,
+            None,
+        )?;
+    }
     for package in &release.packages {
         export_object(
             root,

@@ -2192,6 +2192,11 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
         "1.0.0-0",
         extras.file(COMPOSITOR, "alternative", "0755", "")?,
     )?;
+    f.package(
+        "tools/unrelated",
+        "1.0.0-0",
+        f.file("usr/bin/unrelated", "unrelated", "0755", "")?,
+    )?;
     f.create()?;
     add_publisher(&f.root, "extras", &extras.repo, &extras.public)?;
     fs::remove_dir_all(f.repo.join("blobs"))?;
@@ -2222,7 +2227,22 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
     }
     assert!(search_files(&f.root, "../usr/bin/canopa-compositor").is_err());
 
+    let index_catalog = crate::enable_file_index(&f.repo, "canopa", &f.private)?;
+    assert_eq!(
+        crate::enable_file_index(&f.repo, "canopa", &f.private)?,
+        index_catalog
+    );
     let catalog = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
+    let unrelated = catalog
+        .packages
+        .iter()
+        .find(|package| package.manifest.name == "tools/unrelated")
+        .unwrap();
+    fs::remove_file(f.repo.join("manifests").join(&unrelated.sha256))?;
+    assert_eq!(
+        search_files(&f.root, COMPOSITOR)?,
+        [found(primary, COMPOSITOR), found(secondary, COMPOSITOR)]
+    );
     let package = catalog
         .packages
         .iter()

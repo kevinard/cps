@@ -25,6 +25,8 @@ use crate::{
 
 pub(crate) const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
+const FILE_INDEX_OBJECTS: &str = "file-indexes";
+const FILE_INDEX_LIMIT: u64 = 64 * 1024 * 1024;
 const TMPFILES_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_RELEASE_LIMIT: u64 = 1024 * 1024;
@@ -44,6 +46,8 @@ pub(crate) struct Catalog {
     format: u32,
     publisher: String,
     entries: BTreeMap<String, CatalogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_index: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     attestations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -234,6 +238,7 @@ impl Catalog {
             format: FORMAT,
             publisher: publisher.to_owned(),
             entries: BTreeMap::new(),
+            file_index: None,
             attestations: BTreeMap::new(),
             attestations_required: false,
             toolchains_verified: false,
@@ -499,6 +504,10 @@ impl Catalog {
             previous_hash,
             &next.key_rotations,
         )?;
+        ensure!(
+            self.file_index.is_none() || next.file_index.is_some(),
+            "release drops the publisher's file index"
+        );
         ensure!(
             !self.attestations_required || next.attestations_required,
             "release disables the publisher's build evidence requirement"
@@ -829,6 +838,7 @@ pub struct Snapshot {
     pub packages: Vec<Published>,
     pub(crate) builds: BuildEvidence,
     build_inputs: BTreeMap<String, rebuild::Digests>,
+    file_index: Option<String>,
     withdrawals: BTreeMap<String, Withdrawal>,
     pub(crate) obsoletions: BTreeMap<String, Version>,
     pub(crate) rename_targets: BTreeMap<String, String>,
@@ -1208,6 +1218,11 @@ pub(crate) fn export_locked_repository(
     for (kind, hashes, limit) in [
         ("manifests", manifests, MANIFEST_LIMIT),
         (
+            FILE_INDEX_OBJECTS,
+            catalog.file_index.iter().map(String::as_str).collect(),
+            FILE_INDEX_LIMIT,
+        ),
+        (
             "attestations",
             attestations.into_iter().map(String::as_str).collect(),
             ATTESTATION_LIMIT,
@@ -1237,6 +1252,9 @@ fn decode_catalog(
     let signed: SignedCatalog = serde_json::from_slice(bytes)?;
     let catalog = signed.catalog;
     ensure!(catalog.format == FORMAT, "unsupported catalog format");
+    if let Some(hash) = &catalog.file_index {
+        validate_digest(hash).context("invalid file index digest")?;
+    }
     ensure!(
         catalog.publisher == publisher,
         "unexpected publisher {}",
@@ -1404,6 +1422,7 @@ fn catalog_snapshot(
         packages,
         builds,
         build_inputs: catalog.build_inputs,
+        file_index: catalog.file_index,
         withdrawals: catalog.withdrawals,
         obsoletions: catalog.obsoletions,
         rename_targets,
@@ -1414,6 +1433,7 @@ pub(crate) struct CatalogIndex {
     pub entries: BTreeMap<String, CatalogEntry>,
     pub obsoletions: BTreeMap<String, Version>,
     pub checkpoint: CatalogCheckpoint,
+    pub file_index: Option<String>,
 }
 
 pub(crate) fn catalog_index(
@@ -1426,6 +1446,7 @@ pub(crate) fn catalog_index(
     Ok(CatalogIndex {
         entries: catalog.entries,
         obsoletions: catalog.obsoletions,
+        file_index: catalog.file_index,
         checkpoint: CatalogCheckpoint {
             catalog: hash,
             sequence: catalog.sequence,
@@ -1596,6 +1617,7 @@ fn prepare_objects(repo: &Path) -> Result<()> {
         "manifests",
         "blobs",
         "attestations",
+        FILE_INDEX_OBJECTS,
         rebuild::OBJECTS,
     ] {
         if !path_present(&repo.join(dir))? {
@@ -2110,7 +2132,62 @@ fn stage_manifest(
     Ok(true)
 }
 
+type FileIndex = BTreeMap<String, BTreeSet<String>>;
+
+pub(crate) fn read_file_index(repo: &Path, hash: &str) -> Result<FileIndex> {
+    let bytes = read_object(repo, FILE_INDEX_OBJECTS, hash, FILE_INDEX_LIMIT)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Enable a signed file lookup index for this publisher's catalogs.
+pub fn enable_file_index(repo: &Path, publisher: &str, key: &Path) -> Result<String> {
+    validate_publisher(publisher)?;
+    let key = read_signing_key(key)?;
+    let _lock = lock_repo(repo)?;
+    let hash = publication_base(repo)?.context("repository has no catalog to index")?;
+    let mut catalog = publication_catalog(repo, publisher, &key, Some(&hash))?;
+    if let Some(index) = &catalog.file_index {
+        read_file_index(repo, index)?;
+        return Ok(hash);
+    }
+    prepare_objects(repo)?;
+    catalog.file_index = Some(store_file_index(repo, &catalog)?);
+    write_catalog_document(repo, catalog, &key)
+}
+
+fn store_file_index(repo: &Path, catalog: &Catalog) -> Result<String> {
+    let mut index = FileIndex::new();
+    for (id, entry) in &catalog.entries {
+        let package = read_package(repo, &catalog.publisher, id, entry)?;
+        for action in &package.manifest.action {
+            let path = action.path();
+            let basename = path.rsplit('/').next().unwrap_or(path);
+            index
+                .entry(basename.to_owned())
+                .or_default()
+                .insert(id.clone());
+        }
+    }
+    let bytes = serde_json::to_vec(&index)?;
+    ensure!(
+        bytes.len() as u64 <= FILE_INDEX_LIMIT,
+        "file index exceeds {FILE_INDEX_LIMIT} bytes"
+    );
+    store(repo, FILE_INDEX_OBJECTS, &bytes)
+}
+
 fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
+    if catalog.file_index.is_some() {
+        catalog.file_index = Some(store_file_index(repo, &catalog)?);
+    }
+    write_catalog_document(repo, catalog, key)
+}
+
+fn write_catalog_document(
+    repo: &Path,
+    mut catalog: Catalog,
+    key: &Ed25519KeyPair,
+) -> Result<String> {
     catalog.rename_targets()?;
     catalog.check_source_archives()?;
     catalog.sequence = Some(catalog.next_sequence()?);
@@ -2494,6 +2571,7 @@ mod tests {
             format: FORMAT,
             publisher: "canopa".to_owned(),
             entries: BTreeMap::from([(active.clone(), manifest.clone())]),
+            file_index: None,
             attestations: BTreeMap::from([(active.clone(), attestation.clone())]),
             attestations_required: true,
             toolchains_verified: true,

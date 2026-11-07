@@ -14,10 +14,10 @@ use crate::{
 };
 
 use super::{
-    ARCHIVE, ATTESTATION_LIMIT, CATALOG_LIMIT, Catalog, MANIFEST_LIMIT, Mirror, Published, Root,
-    cached_object, check_cache_origin, collect_rebuild_objects, fetch_repository_payloads,
-    lock_repo, open_state, path_present, prepare_objects, read_catalog, read_pointer, rebuild,
-    write_atomic,
+    ARCHIVE, ATTESTATION_LIMIT, CATALOG_LIMIT, Catalog, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
+    MANIFEST_LIMIT, Mirror, Published, Root, cached_object, check_cache_origin,
+    collect_rebuild_objects, fetch_repository_payloads, lock_repo, open_state, path_present,
+    prepare_objects, read_catalog, read_pointer, rebuild, write_atomic,
 };
 
 pub(crate) struct ArchiveCache {
@@ -59,6 +59,9 @@ impl ArchiveCache {
             .collect::<BTreeSet<_>>();
         for hash in manifests {
             self.copy_object(destination, "manifests", hash, MANIFEST_LIMIT)?;
+        }
+        if let Some(hash) = &self.catalog.file_index {
+            self.copy_object(destination, FILE_INDEX_OBJECTS, hash, FILE_INDEX_LIMIT)?;
         }
         let mut attestations = self.catalog.attestations.values().cloned().collect();
         let mut inputs = BTreeMap::new();
