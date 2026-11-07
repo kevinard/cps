@@ -2993,7 +2993,15 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
         f.file(COMPOSITOR, "later publication", "0755", "")?,
     )?;
     let saved = f._dir.path().join("upgrade.json");
+    let other = plan(&f.root, Request::Repair { packages: vec![] })?;
     interrupt_apply(&f.root, &saved, &upgrade)?;
+    let interrupted = crate::transaction_progress(&f.root, &upgrade, false)?;
+    assert_eq!(interrupted.phase, crate::TransactionPhase::Applying);
+    assert_eq!(interrupted.plan_id, upgrade.id()?);
+    assert_eq!(
+        crate::transaction_progress(&f.root, &other, false)?.phase,
+        crate::TransactionPhase::Blocked
+    );
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 2");
     assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "plugin 1");
     assert!(

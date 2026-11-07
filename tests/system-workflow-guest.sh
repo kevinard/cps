@@ -25,6 +25,9 @@ if [ "$version" = 2.0.0-0 ]; then
     cps verify --root /
     systemctl is-active --quiet cps-boot-health.service
     systemctl is-active --quiet systemd-bless-boot.service
+    progress=$(cps status --plan /volume/@captures/upgrade.json)
+    printf '%s\n' "$progress" | $bb grep -F '"phase": "booted_known_good"'
+    printf '%s\n' "$progress" | $bb grep -F "$($bb cat /volume/@captures/upgrade-plan-id)"
     echo 'CPS_VM_SYSTEM: staged upgrade booted with the live package'
     loader_before=$($bb sha256sum /efi/loader/loader.conf)
     cps boot-env rollback --esp /efi --btrfs-volume /volume --dry-run > /run/cps-rollback-preview
@@ -62,6 +65,7 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     test "$(cps-demo)" = 2.0.0-0
     cps verify --root /
     cps status | $bb grep -Fx 'No reboot pending.'
+    cps status --plan /volume/@captures/upgrade.json | $bb grep -F '"phase": "inactive_boot_environment"'
     echo 'CPS_VM_SYSTEM: rolled back to the base with the live package'
 
     # Removals must use installed state even when a configured mirror is unavailable.
@@ -100,7 +104,8 @@ cps install --dry-run test/cps-demo
 cps install --stage --dry-run test/cps-demo | $bb grep -Fx 'A reboot will be required because --stage was requested.'
 test "$(cps boot-env list --esp /efi)" = "$before"
 test ! -e /usr/bin/cps-demo
-cps install --yes test/cps-demo
+cps install --yes --save-plan /run/cps-install.json test/cps-demo
+cps status --plan /run/cps-install.json | $bb grep -F '"phase": "applied"'
 test "$(cps-demo)" = 1.0.0-0
 test "$(cps boot-env list --esp /efi)" = "$before"
 systemctl start cps-demo.service
@@ -108,9 +113,10 @@ verify_service 1.0.0-0
 printf 'damaged\n' > /usr/bin/cps-demo
 cps repair --dry-run --path /usr/bin/cps-demo | $bb grep -Fx 'Repair usr/bin/cps-demo'
 test "$($bb cat /usr/bin/cps-demo)" = damaged
-recovery=$(cps repair --yes --prepare-only --path /usr/bin/cps-demo)
+recovery=$(cps repair --yes --prepare-only --save-plan /run/cps-repair.json --path /usr/bin/cps-demo)
 recovery=$(printf '%s\n' "$recovery" | $bb sed -n 's/^Prepared recovery root //p')
 test -n "$recovery"
+cps status --plan /run/cps-repair.json | $bb grep -F '"phase": "prepared_for_boot"'
 test "$($bb cat /usr/bin/cps-demo)" = damaged
 test "$("$recovery/usr/bin/cps-demo")" = 1.0.0-0
 cps verify --root "$recovery"
@@ -153,7 +159,14 @@ if [ -f /etc/cps-btrfs-trial-kernel ]; then
 else
     cps upgrade --dry-run | $bb grep -F 'test/live-root declares requires-reboot in its manifest'
 fi
-cps upgrade --yes
+cps upgrade --dry-run --save-plan /volume/@captures/upgrade.json
+cps status --plan /volume/@captures/upgrade.json | $bb grep -F '"phase": "planned"'
+cps status --plan /volume/@captures/upgrade.json --validate | $bb grep -F '"phase": "payload_validated"'
+cps upgrade --yes --save-plan /volume/@captures/upgrade.json
+progress=$(cps status --plan /volume/@captures/upgrade.json)
+printf '%s\n' "$progress" | $bb grep -F '"phase": "staged_for_boot"'
+printf '%s\n' "$progress" | $bb sed -n 's/^ *"plan_id": "\([0-9a-f]*\)",$/\1/p' > /volume/@captures/upgrade-plan-id
+test -s /volume/@captures/upgrade-plan-id
 test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0
 cps status | $bb grep -F 'Reboot pending into '
 code=0

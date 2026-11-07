@@ -124,6 +124,12 @@ enum Command {
     Status {
         #[arg(long, default_value = system::CONFIG)]
         config: PathBuf,
+        /// Report progress for a saved plan as JSON
+        #[arg(long, value_name = "PLAN")]
+        plan: Option<PathBuf>,
+        /// Validate an unapplied plan against cached payloads
+        #[arg(long, requires = "plan")]
+        validate: bool,
     },
     /// Finish an interrupted live package transaction
     Resume {
@@ -516,6 +522,9 @@ struct SystemOptions {
     /// Skip recommended packages when resolving the transaction
     #[arg(long)]
     no_install_recommends: bool,
+    /// Save the exact transaction plan for progress reporting
+    #[arg(long, value_name = "PATH")]
+    save_plan: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -939,6 +948,15 @@ enum TransactionCommand {
     Status {
         #[arg(long)]
         root: PathBuf,
+    },
+    /// Report progress for a saved plan as JSON
+    Progress {
+        #[arg(long)]
+        root: PathBuf,
+        /// Validate an unapplied plan against cached payloads
+        #[arg(long)]
+        validate: bool,
+        plan: PathBuf,
     },
     /// Finish a journaled transaction using the files already staged in the image
     Resume {
@@ -1469,6 +1487,9 @@ fn change_system(
     if stage || prepare_only {
         change = change.with_staging();
     }
+    if let Some(path) = &options.save_plan {
+        save(path, change.saved_plan())?;
+    }
     if change.is_empty() {
         println!("Nothing to do.");
         return Ok(());
@@ -1626,8 +1647,17 @@ fn run(command: Command) -> Result<ExitCode> {
                 prepare_only,
             )?;
         }
-        Command::Status { config } => {
+        Command::Status {
+            config,
+            plan,
+            validate,
+        } => {
             let system = System::load(&config)?;
+            if let Some(path) = plan {
+                let progress = system.transaction_progress(&load_plan(&path)?, validate)?;
+                println!("{}", serde_json::to_string_pretty(&progress)?);
+                return Ok(ExitCode::SUCCESS);
+            }
             let (running, entries) = system.boot_status()?;
             let status = transaction_status(Path::new("/"))?;
             println!("Running {running}, package revision {}", status.revision);
@@ -2611,6 +2641,14 @@ fn run(command: Command) -> Result<ExitCode> {
             println!("Image revision {}", apply(&root, &saved)?);
         }
         Command::Transaction { command } => match command {
+            TransactionCommand::Progress {
+                root,
+                validate,
+                plan,
+            } => {
+                let progress = cps::transaction_progress(&root, &load_plan(&plan)?, validate)?;
+                println!("{}", serde_json::to_string_pretty(&progress)?);
+            }
             TransactionCommand::Status { root } => {
                 let status = transaction_status(&root)?;
                 if let Some(pending) = status.pending {

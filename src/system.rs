@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::{
     BootEnvironment, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, ReleaseAdvisory,
-    Request,
+    Request, TransactionPhase, TransactionProgress,
     apply::{apply_live, resume_live},
     boot::{
         activate_btrfs_boot_environment, entry_id, stage_running_btrfs, with_running_environment,
@@ -28,6 +28,7 @@ use crate::{
     query::{InstallSource, SelectSource, select_install_sources},
     release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
     systemd::LiveServices,
+    transaction_progress,
 };
 
 pub use crate::plan::HeldBackUpdate;
@@ -136,6 +137,10 @@ impl Change {
 
     pub fn packages(&self) -> &[PackageChange] {
         self.plan.package_changes()
+    }
+
+    pub fn saved_plan(&self) -> &Plan {
+        &self.plan
     }
 
     pub fn boot_reason(&self) -> Option<&str> {
@@ -430,6 +435,69 @@ impl System {
             entry_id(&settings.id, settings.boot_revision()),
             list_boot_environments(&self.boot().esp)?,
         ))
+    }
+
+    pub fn transaction_progress(&self, plan: &Plan, validate: bool) -> Result<TransactionProgress> {
+        let _lock = self.lock()?;
+        let boot = self.boot();
+        let (running, entries) = self.boot_status()?;
+        let plan_id = plan.id()?;
+        let staged = |image: &Image, phase| -> Result<Option<TransactionProgress>> {
+            let settings = image.settings()?;
+            let revision = settings.boot_revision();
+            let from_plan = settings.boot_parent.as_ref().is_some_and(|parent| {
+                parent.id == plan.image && parent.image_revision() == plan.base_revision
+            }) && plan.base_revision.checked_add(1) == Some(revision);
+            if !from_plan || image.applied(&plan_id)? != Some(revision) {
+                return Ok(None);
+            }
+            Ok(Some(TransactionProgress {
+                plan_id: plan_id.clone(),
+                phase,
+                revision,
+                boot_environment: Some(entry_id(&settings.id, revision)),
+            }))
+        };
+        let registered = crate::boot::with_registered_images(
+            &boot.volume,
+            &boot.esp,
+            &boot.activation.root_partuuid,
+            |images| {
+                for (id, image) in images {
+                    let Some(entry) = entries.iter().find(|entry| entry.id == *id) else {
+                        continue;
+                    };
+                    let phase = if *id == running {
+                        if entry.tries_left.is_some() {
+                            TransactionPhase::TrialBoot
+                        } else {
+                            TransactionPhase::BootedKnownGood
+                        }
+                    } else if entry.is_default {
+                        TransactionPhase::StagedForBoot
+                    } else {
+                        TransactionPhase::InactiveBootEnvironment
+                    };
+                    if let Some(progress) = staged(image, phase)? {
+                        return Ok(Some(progress));
+                    }
+                }
+                Ok(None)
+            },
+        )?;
+        if let Some(progress) = registered {
+            return Ok(progress);
+        }
+        let prepared = boot.environments.join(format!("upgrade-{plan_id}/root"));
+        if prepared.try_exists()?
+            && let Some(progress) = staged(
+                &Image::open_query(&prepared)?,
+                TransactionPhase::PreparedForBoot,
+            )?
+        {
+            return Ok(progress);
+        }
+        transaction_progress(Path::new(ROOT), plan, validate)
     }
 
     fn check_running(&self) -> Result<()> {

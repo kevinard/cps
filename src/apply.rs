@@ -15,7 +15,7 @@ use tempfile::NamedTempFile;
 use crate::{
     boot::kernel::Artifacts,
     image::{
-        Image, Managed, Publisher, State,
+        Image, Managed, Publisher, Settings, State,
         root::{ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
@@ -158,6 +158,32 @@ pub struct PendingTransaction {
     pub live: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionPhase {
+    Planned,
+    PayloadValidated,
+    Blocked,
+    Applying,
+    Applied,
+    Superseded,
+    PreparedForBoot,
+    StagedForBoot,
+    TrialBoot,
+    BootedKnownGood,
+    InactiveBootEnvironment,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransactionProgress {
+    pub plan_id: String,
+    pub phase: TransactionPhase,
+    /// Committed revision, or the recorded transaction revision if already applied.
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_environment: Option<String>,
+}
+
 pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
     let image = Image::open_query(path)?;
     let settings = image.settings()?;
@@ -183,6 +209,51 @@ pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
     Ok(TransactionStatus {
         revision: settings.revision,
         pending,
+    })
+}
+
+/// Report progress for the exact saved plan, optionally checking cached payloads now.
+pub fn transaction_progress(
+    path: &Path,
+    plan: &Plan,
+    validate: bool,
+) -> Result<TransactionProgress> {
+    let image = Image::open_query(path)?;
+    let settings = image.settings()?;
+    let plan_id = plan.id()?;
+    let (phase, revision) = if let Some(revision) = image.applied(&plan_id)? {
+        (TransactionPhase::Applied, revision)
+    } else {
+        ensure!(settings.id == plan.image, "plan targets a different image");
+        let status = match image.pending::<PendingRecord>()? {
+            Some(pending) => {
+                pending.recorded_plan()?;
+                let work = pending.work();
+                validate_digest(work.id)?;
+                ensure!(
+                    settings.id == work.next.settings.id,
+                    "pending transaction targets a different image"
+                );
+                if work.id == plan_id {
+                    TransactionPhase::Applying
+                } else {
+                    TransactionPhase::Blocked
+                }
+            }
+            None if check_plan_revision(&settings, plan).is_err() => TransactionPhase::Superseded,
+            None if validate => {
+                validate_in_image(&image, plan)?;
+                TransactionPhase::PayloadValidated
+            }
+            None => TransactionPhase::Planned,
+        };
+        (status, settings.revision)
+    };
+    Ok(TransactionProgress {
+        plan_id,
+        phase,
+        revision,
+        boot_environment: None,
     })
 }
 
@@ -218,7 +289,7 @@ pub fn fetch_plan_with_archives(
     if image.applied(&plan.id()?)?.is_some() {
         return Ok(0);
     }
-    check_plan_revision(&state, plan)?;
+    check_plan_revision(&state.settings, plan)?;
     let mut archives = BTreeMap::<_, Vec<_>>::new();
     for (name, path) in archive_caches {
         let publisher = state
@@ -288,7 +359,7 @@ fn check_plan(
     state: State,
     plan: &Plan,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
-    check_plan_revision(&state, plan)?;
+    check_plan_revision(&state.settings, plan)?;
     let (checked, next, receipts) =
         build(image, state, plan.request.clone(), Some(plan), plan.solver)?;
     ensure!(
@@ -298,19 +369,23 @@ fn check_plan(
     Ok((checked, next, receipts))
 }
 
-fn check_plan_revision(state: &State, plan: &Plan) -> Result<()> {
+fn check_plan_revision(settings: &Settings, plan: &Plan) -> Result<()> {
     ensure!(
-        plan.base_revision == state.settings.revision,
+        plan.base_revision == settings.revision,
         "stale plan for revision {}; image is at revision {}",
         plan.base_revision,
-        state.settings.revision
+        settings.revision
     );
-    plan.check_publisher_generation(&state.settings)
+    plan.check_publisher_generation(settings)
 }
 
 /// Check a saved plan against cached payloads using disposable image-local staging.
 pub fn validate_plan(path: &Path, plan: &Plan) -> Result<()> {
     let image = Image::open_query(path)?;
+    validate_in_image(&image, plan)
+}
+
+fn validate_in_image(image: &Image, plan: &Plan) -> Result<()> {
     image.require_clean()?;
     let state = image.state()?;
     ensure!(
@@ -318,7 +393,7 @@ pub fn validate_plan(path: &Path, plan: &Plan) -> Result<()> {
         "plan targets a different image"
     );
     let previous = elf::applies(plan, &state).then(|| state.paths.clone());
-    let (checked, next, _) = check_plan(&image, state, plan)?;
+    let (checked, next, _) = check_plan(image, state, plan)?;
     let parent = image.stage()?;
     let scratch = tempfile::tempdir_in(Root::fd_path(&parent))?;
     let stage = File::open(scratch.path())?;

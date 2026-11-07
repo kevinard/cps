@@ -136,6 +136,22 @@ entry keeps its identity while the package revision advances. Use the
 current CPS for managing and verifying those roots. Changes to the running
 root use the same verified, resumable package journal as image transactions.
 
+Pass `--save-plan PATH` to a system package command to record the exact plan
+it displays. This also works with `--dry-run`. Use
+`cps status --plan PATH` to follow its SHA-256 in JSON. For an offline
+image, use `cps transaction progress --root IMAGE PATH` with a saved plan.
+The report includes the phase, revision, and the boot environment when
+applicable. Use `--validate` to check cached payloads for a pending-free
+planned change. `payload_validated` describes the check made during that
+invocation. CPS rechecks the payloads at apply time.
+
+Live changes report `applied` once committed. A boot transaction can report
+`prepared_for_boot`, `staged_for_boot`, `trial_boot`, or
+`booted_known_good`. A registered result outside the running and selected
+roots reports `inactive_boot_environment`. The boot phases refer to the
+plan that created that environment. A later live change reports its own
+transaction phase.
+
 Use `cps repair --dry-run` to preview restoration of damaged managed files.
 Pass package names to narrow the repair or use `--path /usr/bin/example`
 to select specific paths. `cps revert /etc/example.conf` restores the
