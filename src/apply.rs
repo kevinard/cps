@@ -329,6 +329,31 @@ pub fn validate_plan(path: &Path, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_cached_payloads(plan: &Plan, state: &State) -> Result<()> {
+    let mut unavailable = Vec::new();
+    for (publisher, blobs) in payload_sources(&plan.writes, state)? {
+        for (hash, payload) in blobs {
+            let Node::File { size, .. } = payload.node else {
+                unreachable!("payloads contain only files");
+            };
+            if !crate::repo::release::cached_object(
+                &publisher.repo,
+                &format!("blobs/{hash}"),
+                hash,
+                *size,
+            )? {
+                unavailable.push(format!("{} {hash}", publisher.name));
+            }
+        }
+    }
+    ensure!(
+        unavailable.is_empty(),
+        "missing or damaged bundle payloads:\n{}",
+        unavailable.join("\n")
+    );
+    Ok(())
+}
+
 pub(crate) fn apply_with(path: &Path, plan: &Plan, after_write: impl FnMut(&Write)) -> Result<u64> {
     apply_to_image(Image::open_for_apply(path)?, plan, None, after_write)
 }

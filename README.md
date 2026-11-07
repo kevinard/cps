@@ -1679,9 +1679,11 @@ advisory "CPS-2026-01" package="library/runtime" affected="<2.0.0-0" summary="Ru
 
 `check-updates` reports matching advisories for installed packages,
 including when the target profile is deferred. The signed advisory reports
-the fixed version and any operator action. Publishers can carry advisories
-forward in later profiles while affected versions remain deployed. Upgrade
-clients before publishing profiles with advisories.
+the fixed version and any operator action. Later releases carry the advisory
+forward while the profile still contains the affected package from the
+same publisher. Publication rejects a new profile version that matches the
+affected range. Publishers can revise a notice by declaring it again for
+the same ID and package. Upgrade clients before publishing profiles with advisories.
 
 ### Running release promotion in CI
 
@@ -1778,6 +1780,9 @@ their manifest indexes, and the selected attestations and payloads. Its
 repositories supply the historical pins. The target configuration still
 supplies publisher keys and build trust. Keep the bundle at a stable path
 for offline repair, or configure regular repositories to resume updates.
+Before initializing the requested root, `image-create --bundle` replays
+the lock with the local trust policy and reports missing or damaged
+payloads from the bundle.
 
 ## Manifest and image behavior
 

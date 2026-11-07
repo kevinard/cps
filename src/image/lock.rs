@@ -399,7 +399,7 @@ impl ImageLock {
 /// Initialize a fresh root with the local trust configuration and locked profile.
 pub fn create_image_from_lock(path: &Path, config: &Path, lock: &ImageLock) -> Result<String> {
     let config = crate::kdl_format::read_image_definition(config)?;
-    create_locked(path, config, lock)
+    create_locked(path, config, lock, false)
 }
 
 /// Use the bundle's repositories with publisher keys and policy from local configuration.
@@ -410,10 +410,15 @@ pub fn create_image_from_bundle(path: &Path, config: &Path, bundle: &Path) -> Re
     for publisher in &mut config.publishers {
         publisher.repository = bundle.join(BUNDLE_REPOSITORIES).join(&publisher.name);
     }
-    create_locked(path, config, &lock)
+    create_locked(path, config, &lock, true)
 }
 
-fn create_locked(path: &Path, config: ImageDefinition, lock: &ImageLock) -> Result<String> {
+fn create_locked(
+    path: &Path,
+    config: ImageDefinition,
+    lock: &ImageLock,
+    preflight: bool,
+) -> Result<String> {
     lock.validate()?;
     ensure!(
         config.image_id.is_none(),
@@ -462,6 +467,27 @@ fn create_locked(path: &Path, config: ImageDefinition, lock: &ImageLock) -> Resu
                 publisher.name
             );
         }
+    }
+    if preflight {
+        let scratch = tempfile::tempdir()?;
+        super::initialize(
+            scratch.path(),
+            publishers.clone(),
+            &config.arch,
+            config.facets.clone(),
+            bootstrap.clone(),
+            None,
+        )?;
+        let (plan, state, _) = crate::plan::plan_image(
+            scratch.path(),
+            crate::Request::InstallLock {
+                lock: Box::new(lock.clone()),
+            },
+            crate::PlanOptions::default(),
+            None,
+        )
+        .context("checking the bundle's locked composition")?;
+        crate::apply::validate_cached_payloads(&plan, &state)?;
     }
     super::initialize(
         path,

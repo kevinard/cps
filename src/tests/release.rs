@@ -602,7 +602,7 @@ fn phased_profile_updates_defer_widen_and_allow_a_saved_override() -> Result<()>
     }
     let release = f._dir.path().join("refresh.kdl");
     let publish_profile = |version: &str, pin: &str, percentage: u8| -> Result<String> {
-        let advisory = if version == "2.0.0-0" {
+        let advisory = if version == "2.0.0-0" && percentage == 0 {
             r#"advisory "CPS-TEST-1" package="library/runtime" affected="<2.0.0-0" summary="Runtime security fix" action="Restart clients""#
         } else {
             ""
@@ -748,7 +748,16 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         publish_profile("2.0.0-0", &pins[1], initial.cohort)?;
         assert_eq!(deferred(&boot_two)?.cohort, initial.cohort);
     }
-    publish_profile("2.0.0-0", &pins[1], initial.cohort + 1)?;
+    let widened = publish_profile("2.0.0-0", &pins[1], initial.cohort + 1)?;
+    let (_, profile) = crate::repo::release_profile(
+        &f.repo,
+        "canopa",
+        &read_key(&f.public)?,
+        Some(&widened),
+        "desktop",
+    )?;
+    assert_eq!(profile.advisories.len(), 1);
+    assert_eq!(profile.advisories[0].id, "CPS-TEST-1");
     apply(&boot_two, &plan(&boot_two, Request::Update)?)?;
     for root in [&f.root, &boot_two, &fresh] {
         let installed = list_packages(root, Scope::Installed)?;
@@ -1400,6 +1409,17 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     let repo_offline = main.repo.with_extension("offline");
     fs::rename(&main.repo, &repo_offline)?;
     let bundled_root = work.join("bundled-root");
+    let blob = fs::read_dir(bundle.join("repositories/canopa/blobs"))?
+        .next()
+        .unwrap()?
+        .path();
+    let saved_blob = blob.with_extension("saved");
+    fs::rename(&blob, &saved_blob)?;
+    let error =
+        crate::create_image_from_bundle(&bundled_root, &locked_config, &bundle).unwrap_err();
+    assert!(format!("{error:#}").contains("missing or damaged bundle payloads"));
+    assert!(!bundled_root.exists());
+    fs::rename(&saved_blob, &blob)?;
     crate::create_image_from_bundle(&bundled_root, &locked_config, &bundle)?;
     let bundle_lock = crate::read_image_lock(&bundle.join("image.lock.json"))?;
     let bundled_plan = plan(

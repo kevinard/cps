@@ -638,7 +638,7 @@ pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) ->
     Ok(plan)
 }
 
-fn plan_image(
+pub(crate) fn plan_image(
     path: &Path,
     request: Request,
     options: PlanOptions,

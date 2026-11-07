@@ -223,38 +223,7 @@ pub(super) fn check(
             elf_library_dirs: profile.elf_library_dirs.clone(),
             elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
             rollout_percentage: profile.rollout_percentage,
-            advisories: profile
-                .advisories
-                .iter()
-                .map(|advisory| {
-                    let package = &target
-                        .get(&advisory.package)
-                        .with_context(|| {
-                            format!(
-                                "advisory {} package {} is absent from profile {name}",
-                                advisory.id, advisory.package
-                            )
-                        })?
-                        .published
-                        .manifest;
-                    ensure!(
-                        !VersionConstraint::parse(Some(&advisory.affected))?
-                            .matches(package.version),
-                        "advisory {} affects the selected version of {} in profile {name}",
-                        advisory.id,
-                        advisory.package
-                    );
-                    Ok(ReleaseAdvisory {
-                        id: advisory.id.clone(),
-                        package: advisory.package.clone(),
-                        publisher: package.publisher.clone(),
-                        affected: advisory.affected.clone(),
-                        fixed: package.version,
-                        summary: advisory.summary.clone(),
-                        action: advisory.action.clone(),
-                    })
-                })
-                .collect::<Result<_>>()?,
+            advisories: check_advisories(name, profile, previous, &target)?,
         };
         let explicit = profile.upgrade_from.as_deref();
         let immediate = current_hash.filter(|hash| {
@@ -345,6 +314,57 @@ pub(super) fn check(
         checked.insert(name.clone(), next);
     }
     Ok(checked)
+}
+
+fn check_advisories(
+    name: &str,
+    policy: &Profile,
+    previous: Option<&ReleaseProfile>,
+    target: &BTreeMap<String, Installed>,
+) -> Result<Vec<ReleaseAdvisory>> {
+    let mut advisories = BTreeMap::new();
+    for advisory in previous.into_iter().flat_map(|profile| &profile.advisories) {
+        if let Some(package) = target.get(&advisory.package)
+            && package.published.manifest.publisher == advisory.publisher
+        {
+            let mut advisory = advisory.clone();
+            advisory.fixed = package.published.manifest.version;
+            advisories.insert((advisory.id.clone(), advisory.package.clone()), advisory);
+        }
+    }
+    for advisory in &policy.advisories {
+        let package = &target
+            .get(&advisory.package)
+            .with_context(|| {
+                format!(
+                    "advisory {} package {} is absent from profile {name}",
+                    advisory.id, advisory.package
+                )
+            })?
+            .published
+            .manifest;
+        advisories.insert(
+            (advisory.id.clone(), advisory.package.clone()),
+            ReleaseAdvisory {
+                id: advisory.id.clone(),
+                package: advisory.package.clone(),
+                publisher: package.publisher.clone(),
+                affected: advisory.affected.clone(),
+                fixed: package.version,
+                summary: advisory.summary.clone(),
+                action: advisory.action.clone(),
+            },
+        );
+    }
+    for advisory in advisories.values() {
+        ensure!(
+            !VersionConstraint::parse(Some(&advisory.affected))?.matches(advisory.fixed),
+            "advisory {} affects the selected version of {} in profile {name}",
+            advisory.id,
+            advisory.package
+        );
+    }
+    Ok(advisories.into_values().collect())
 }
 
 fn baseline_image(

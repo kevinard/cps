@@ -1348,7 +1348,7 @@ fn checked_target<'a>(
     Ok((target_name, target))
 }
 
-fn cached_object(repo: &Path, name: &str, hash: &str, length: u64) -> Result<bool> {
+pub(crate) fn cached_object(repo: &Path, name: &str, hash: &str, length: u64) -> Result<bool> {
     if !path_present(&repo.join(name))? {
         return Ok(false);
     }
