@@ -54,6 +54,7 @@ pub fn generate_manifest_for_architecture(
         publisher: publisher.to_owned(),
         name: name.to_owned(),
         version: version.parse()?,
+        upstream_version: None,
         architecture: architecture.map(str::to_owned),
         summary: None,
         dependency: Vec::new(),

@@ -149,6 +149,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         &[
             "publisher",
             "version",
+            "upstream-version",
             "architecture",
             "requires-reboot",
             "summary",
@@ -160,6 +161,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         name: fields.string_arg(0)?,
         publisher: fields.required_string("publisher")?,
         version: fields.required_string("version")?.parse()?,
+        upstream_version: fields.string("upstream-version")?,
         architecture: fields.string("architecture")?,
         summary: fields.string("summary")?,
         dependency: Vec::new(),
@@ -398,6 +400,9 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     package.push(manifest.name.as_str());
     package.insert("publisher", manifest.publisher.as_str());
     package.insert("version", manifest.version.to_string());
+    if let Some(version) = &manifest.upstream_version {
+        package.insert("upstream-version", version.as_str());
+    }
     if let Some(architecture) = &manifest.architecture {
         package.insert("architecture", architecture.as_str());
     }

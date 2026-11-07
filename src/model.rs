@@ -606,6 +606,8 @@ pub struct Manifest {
     pub name: String,
     pub version: Version,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -707,6 +709,9 @@ impl Manifest {
         );
         validate_publisher(&self.publisher)?;
         validate_name(&self.name)?;
+        if let Some(version) = &self.upstream_version {
+            validate_display_text(version, 256, "upstream version")?;
+        }
         if let Some(architecture) = &self.architecture {
             validate_publisher(architecture).context("invalid package architecture")?;
         }
