@@ -335,14 +335,15 @@ impl ImageLock {
         &'a self,
         publisher: &'a str,
     ) -> impl Iterator<Item = (String, &'a str)> {
-        self.packages.iter().filter_map(move |(name, package)| {
-            (package.publisher == publisher).then(|| {
+        self.packages
+            .iter()
+            .filter(move |(_, package)| package.publisher == publisher)
+            .map(move |(name, package)| {
                 (
                     format!("cps://{publisher}/{name}@{}", package.version),
                     package.manifest_sha256.as_str(),
                 )
             })
-        })
     }
 
     pub(crate) fn selectors(&self) -> BTreeMap<&str, PackageSpec<'_>> {
