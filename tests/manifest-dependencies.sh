@@ -64,7 +64,7 @@ mv tools-repo/blobs tools-blobs
 suggest() {
     "$cps" manifest dependencies --proto app --config image.kdl \
         --catalog "runtime=$runtime_pin" --catalog "tools=$1" \
-        --library-dir /usr/lib --path-dir /usr/local/bin "$2"
+        --library-dir /usr/lib --path-dir /usr/local/bin "${@:2}"
 }
 suggest "$tools_pin" app.kdl > suggested.kdl
 test "$(grep -c '^require ' suggested.kdl)" = 2
@@ -75,6 +75,22 @@ grep -F 'ELF library "libcps-demo.so.1" (GNU versions ["CPS_DEMO_1.0"])' suggest
 grep -F '"usr/bin/shell-script" needs shebang interpreter "/bin/sh"' suggested.kdl
 grep -F '"usr/bin/env-script" needs env command "python3"' suggested.kdl
 grep -F '"usr/bin/python-script" needs env command "python3"' suggested.kdl
+
+if suggest "$tools_pin" --check app.kdl > missing-requires.kdl 2> requires.log; then
+    echo 'expected missing runtime requirements to fail the check' >&2
+    exit 1
+fi
+grep -F 'missing matching direct require for cps://runtime/demo/runtime@1.0.0-0' requires.log
+grep -F 'missing matching direct require for cps://tools/demo/python@1.0.0-0' requires.log
+sed '/^package .* {$/a\    require "demo/runtime" version=">=1.0.0-0, <2.0.0-0"\n    require "demo/python" version="=1.0.0-0"' app.kdl > declared.kdl
+suggest "$tools_pin" --check declared.kdl > checked.kdl
+test ! -s checked.kdl
+sed 's/=1.0.0-0"$/=2.0.0-0"/' declared.kdl > wrong-version.kdl
+if suggest "$tools_pin" --check wrong-version.kdl > missing-requires.kdl 2> requires.log; then
+    echo 'expected a mismatched runtime requirement to fail the check' >&2
+    exit 1
+fi
+grep -F 'missing matching direct require for cps://tools/demo/python@1.0.0-0' requires.log
 
 if suggest "$ambiguous_pin" app.kdl > partial.kdl 2> ambiguous.log; then
     echo 'expected an ambiguous provider' >&2
@@ -89,4 +105,4 @@ if suggest "$tools_pin" app.kdl > partial.kdl 2> missing.log; then
     exit 1
 fi
 grep -F '"/missing/interpreter": no provider in pinned catalogs' missing.log
-echo 'Verified offline dependency suggestions from ELF and shebangs'
+echo 'Verified offline dependency suggestions and direct requirement checks from ELF and shebangs'

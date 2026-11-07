@@ -500,6 +500,9 @@ enum ManifestCommand {
         /// Target PATH directory for env shebangs, in search order
         #[arg(long = "path-dir", default_values = ["/usr/bin", "/bin"], value_name = "PATH")]
         path_dirs: Vec<String>,
+        /// Fail when a detected external provider lacks a matching direct require
+        #[arg(long)]
+        check: bool,
         manifest: PathBuf,
     },
 }
@@ -1553,9 +1556,15 @@ fn run(command: Command) -> Result<ExitCode> {
                 catalogs,
                 library_dirs,
                 path_dirs,
+                check,
                 manifest,
             } => {
-                let (suggestions, diagnostics) = suggest_dependencies(
+                let inspect = if check {
+                    cps::check_manifest_dependencies
+                } else {
+                    suggest_dependencies
+                };
+                let (suggestions, diagnostics) = inspect(
                     &proto,
                     &manifest,
                     &config,

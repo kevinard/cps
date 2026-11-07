@@ -12,7 +12,10 @@ use crate::{
     kdl_format::{
         ImageDefinition, parse_manifest, publish_policy::validate_elf_dirs, read_image_definition,
     },
-    model::{Action, Manifest, PackageSpec, Version, parse_mode, validate_digest},
+    model::{
+        Action, Dependency, Manifest, PackageSpec, Version, VersionConstraint, parse_mode,
+        validate_digest,
+    },
     repo::{
         CatalogPin, MANIFEST_LIMIT, Published, catalog_index,
         profiles::{
@@ -33,6 +36,38 @@ pub fn suggest_dependencies(
     pins: &[String],
     library_dirs: &[String],
     path_dirs: &[String],
+) -> Result<(String, Vec<String>)> {
+    inspect_dependencies(
+        proto,
+        manifest,
+        config,
+        pins,
+        library_dirs,
+        path_dirs,
+        false,
+    )
+}
+
+/// Check that every detected external provider has a direct manifest requirement.
+pub fn check_manifest_dependencies(
+    proto: &Path,
+    manifest: &Path,
+    config: &Path,
+    pins: &[String],
+    library_dirs: &[String],
+    path_dirs: &[String],
+) -> Result<(String, Vec<String>)> {
+    inspect_dependencies(proto, manifest, config, pins, library_dirs, path_dirs, true)
+}
+
+fn inspect_dependencies(
+    proto: &Path,
+    manifest: &Path,
+    config: &Path,
+    pins: &[String],
+    library_dirs: &[String],
+    path_dirs: &[String],
+    check: bool,
 ) -> Result<(String, Vec<String>)> {
     let config = read_image_definition(config)?;
     let machine = machine(&config.arch)?;
@@ -97,6 +132,9 @@ pub fn suggest_dependencies(
             Ok(_) => {}
             Err(error) => report.diagnostics.push(format!("{path:?}: {error:#}")),
         }
+    }
+    if check {
+        report.check_requirements(&manifest)?;
     }
     Ok(report.finish())
 }
@@ -265,6 +303,39 @@ struct Report<'a> {
 }
 
 impl Report<'_> {
+    fn check_requirements(&mut self, manifest: &Manifest) -> Result<()> {
+        let declared = manifest
+            .dependency
+            .iter()
+            .filter_map(|dependency| match dependency {
+                Dependency::Require(target) => Some(target),
+                _ => None,
+            })
+            .map(|target| {
+                Ok((
+                    target.package.as_str(),
+                    VersionConstraint::parse(target.version.as_deref())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.suggestions.retain(|&package, reasons| {
+            let (name, version, _) = package;
+            if declared
+                .iter()
+                .any(|(target, range)| *target == name && range.matches(version))
+            {
+                return false;
+            }
+            self.diagnostics.push(format!(
+                "missing matching direct require for {} ({})",
+                package_id(package),
+                reasons.iter().next().expect("suggestion has a source")
+            ));
+            true
+        });
+        Ok(())
+    }
+
     fn require(
         &mut self,
         source: &str,

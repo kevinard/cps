@@ -293,6 +293,12 @@ diagnostics and a nonzero exit status, with any resolved suggestions still
 printed. This is a direct path lookup against signed manifests. Use the
 release profile ELF check to validate the final composition and ABI.
 
+Pass `--check` in package CI before publishing to require a matching direct
+`require` for every external provider found against the pinned catalogs.
+The command prints only missing requirements and fails for missing or ambiguous
+providers, unsupported inputs, and declared version ranges that exclude the
+detected provider. Use the ELF profile gate to test runtime ABI compatibility.
+
 ## Finding and inspecting packages
 
 ```sh

@@ -1,6 +1,6 @@
 mod dependencies;
 
-pub use dependencies::suggest_dependencies;
+pub use dependencies::{check_manifest_dependencies, suggest_dependencies};
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
