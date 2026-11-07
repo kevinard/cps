@@ -160,6 +160,78 @@ fn live_install_recovers_offline_and_preserves_boot_identity() -> Result<()> {
 }
 
 #[test]
+fn live_resume_repairs_unrelated_drift_in_the_pending_image() -> Result<()> {
+    use std::{collections::BTreeSet, os::unix::fs::MetadataExt, panic};
+
+    use crate::{
+        apply::{apply_to_image, repair_pending_live, resume_live},
+        image::{Image, root::Root},
+    };
+
+    let fixture = Fixture::new()?;
+    let unchanged = "usr/share/unchanged";
+    let alias = "usr/share/unchanged-alias";
+    let config = "etc/local.conf";
+    fixture.package(
+        "test/base",
+        "1.0.0-0",
+        fixture.file(unchanged, "original", "0644", "")?
+            + &format!("    hardlink {alias:?} target={unchanged:?}\n")
+            + &fixture.file(config, "default", "0644", " preserve=#true")?,
+    )?;
+    let installed = "usr/bin/new-app";
+    fixture.package(
+        "apps/new",
+        "1.0.0-0",
+        fixture.file(installed, "new", "0755", "")?,
+    )?;
+    fixture.create()?;
+    let install = |name: &str| {
+        plan(
+            &fixture.root,
+            Request::Install {
+                packages: vec![name.into()],
+            },
+        )
+    };
+    apply(&fixture.root, &install("test/base")?)?;
+    fs::write(fixture.root.join(config), "local edit")?;
+    let before = Image::open_query(&fixture.root)?.settings()?;
+    let open =
+        || Image::open_for_live_apply(Root::open(&fixture.root)?, &before.id, before.revision);
+    let install = install("apps/new")?;
+    let stage_packages = BTreeSet::new();
+    let interrupted = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        apply_to_image(open().unwrap(), &install, Some(&stage_packages), |write| {
+            if write.path == installed {
+                panic!("interrupted after publishing the new file");
+            }
+        })
+    }));
+    assert!(interrupted.is_err());
+    fs::write(fixture.root.join(unchanged), "damaged")?;
+    let error = resume_live(open()?).unwrap_err();
+    assert!(error.to_string().contains(unchanged));
+    assert!(
+        crate::transaction_status(&fixture.root)?
+            .pending
+            .unwrap()
+            .files_ready
+    );
+
+    assert_eq!(repair_pending_live(open()?, &stage_packages)?, Some(2));
+    assert_eq!(fs::read_to_string(fixture.root.join(installed))?, "new");
+    assert_eq!(fs::read_to_string(fixture.root.join(config))?, "local edit");
+    assert_eq!(fs::read_to_string(fixture.root.join(alias))?, "original");
+    assert_eq!(
+        fs::metadata(fixture.root.join(unchanged))?.ino(),
+        fs::metadata(fixture.root.join(alias))?.ino()
+    );
+    assert_eq!(repair_pending_live(open()?, &stage_packages)?, None);
+    Ok(())
+}
+
+#[test]
 fn system_plan_previews_live_service_effects() -> Result<()> {
     let fixture = Fixture::new()?;
     let path = "usr/lib/systemd/system/example.service";

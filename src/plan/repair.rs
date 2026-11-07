@@ -46,6 +46,15 @@ pub(super) fn writes(
             .collect()
     };
 
+    write_paths(root, state, paths, preserved)
+}
+
+pub(super) fn write_paths<'a>(
+    root: &Root,
+    state: &State,
+    paths: impl IntoIterator<Item = &'a str>,
+    preserved: &mut Vec<String>,
+) -> Result<BTreeMap<String, Write>> {
     let mut writes = BTreeMap::new();
     for path in paths {
         let managed = &state.paths[path];

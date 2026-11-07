@@ -239,27 +239,7 @@ impl Plan {
         }
         self.writes
             .iter()
-            .filter(|write| write.before != write.after || write.detach)
-            .find(|write| {
-                let path = Path::new(&write.path);
-                [
-                    "boot",
-                    "efi",
-                    "usr/lib/modules",
-                    "usr/lib/firmware",
-                    "usr/lib/kernel",
-                    "usr/lib/systemd/boot",
-                    "usr/lib/systemd/systemd",
-                    "usr/bin/cps",
-                    "etc/cps",
-                    "etc/fstab",
-                    "etc/crypttab",
-                ]
-                .iter()
-                .any(|prefix| path.starts_with(prefix))
-                    || write.path.starts_with("usr/lib/ld-linux")
-                    || write.path.starts_with("lib64/ld-linux")
-            })
+            .find(|write| write.boot_sensitive())
             .map(|write| format!("the transaction changes {}", write.path))
     }
 
@@ -1492,46 +1472,7 @@ fn build_with_update_diagnostics(
             },
         );
     }
-    // Replacing a regular file swaps its inode. Its aliases still refer to
-    // the old inode even when their actions have not changed.
-    for (path, managed) in &paths {
-        if let Node::Hardlink { target } = &managed.node
-            && writes.get(target).is_some_and(Write::replaces_file)
-            && !writes.contains_key(path)
-        {
-            let before = root.inspect(path)?;
-            ensure!(
-                !matches!(before, Some(Node::Dir { .. } | Node::Special)),
-                "path type conflict at {path}"
-            );
-            writes.insert(
-                path.clone(),
-                Write {
-                    path: path.clone(),
-                    before,
-                    after: Some(managed.node.clone()),
-                    detach: false,
-                    local_config: false,
-                    config_move: None,
-                },
-            );
-        }
-    }
-    for target in writes
-        .values()
-        .filter_map(Write::hardlink_target)
-        .collect::<BTreeSet<_>>()
-    {
-        if !writes.get(target).is_some_and(Write::replaces_file) {
-            let file = paths
-                .get(target)
-                .with_context(|| format!("missing hard link target {target}"))?;
-            root.checked_hardlink_target(target, &file.node)?;
-        }
-    }
-    plan.writes = writes.into_values().collect();
-    plan.writes
-        .sort_by(|a, b| a.order(&retired).cmp(&b.order(&retired)));
+    plan.writes = ordered_writes(root, &paths, writes, &retired)?;
     plan.payload_bytes = payloads(&plan.writes)
         .values()
         .try_fold(0_u64, |total, node| {
@@ -1568,7 +1509,83 @@ fn build_with_update_diagnostics(
     Ok((plan, state, receipts))
 }
 
+pub(crate) fn pending_repairs(root: &Root, state: &State) -> Result<Vec<Write>> {
+    let paths = state.paths.keys().map(String::as_str);
+    let writes = repair::write_paths(root, state, paths, &mut Vec::new())?;
+    ordered_writes(root, &state.paths, writes, &BTreeSet::new())
+}
+
+fn ordered_writes(
+    root: &Root,
+    paths: &BTreeMap<String, Managed>,
+    mut writes: BTreeMap<String, Write>,
+    retired: &BTreeSet<&str>,
+) -> Result<Vec<Write>> {
+    // Replacing a regular file swaps its inode. Its aliases still refer to
+    // the old inode even when their actions have not changed.
+    for (path, managed) in paths {
+        if let Node::Hardlink { target } = &managed.node
+            && writes.get(target).is_some_and(Write::replaces_file)
+            && !writes.contains_key(path)
+        {
+            let before = root.inspect(path)?;
+            ensure!(
+                !matches!(before, Some(Node::Dir { .. } | Node::Special)),
+                "path type conflict at {path}"
+            );
+            writes.insert(
+                path.clone(),
+                Write {
+                    path: path.clone(),
+                    before,
+                    after: Some(managed.node.clone()),
+                    detach: false,
+                    local_config: false,
+                    config_move: None,
+                },
+            );
+        }
+    }
+    for target in writes
+        .values()
+        .filter_map(Write::hardlink_target)
+        .collect::<BTreeSet<_>>()
+    {
+        if !writes.get(target).is_some_and(Write::replaces_file) {
+            let file = paths
+                .get(target)
+                .with_context(|| format!("missing hard link target {target}"))?;
+            root.checked_hardlink_target(target, &file.node)?;
+        }
+    }
+    let mut ordered: Vec<_> = writes.into_values().collect();
+    ordered.sort_by(|a, b| a.order(retired).cmp(&b.order(retired)));
+    Ok(ordered)
+}
+
 impl Write {
+    pub(crate) fn boot_sensitive(&self) -> bool {
+        let path = Path::new(&self.path);
+        (self.before != self.after || self.detach)
+            && ([
+                "boot",
+                "efi",
+                "usr/lib/modules",
+                "usr/lib/firmware",
+                "usr/lib/kernel",
+                "usr/lib/systemd/boot",
+                "usr/lib/systemd/systemd",
+                "usr/bin/cps",
+                "etc/cps",
+                "etc/fstab",
+                "etc/crypttab",
+            ]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+                || self.path.starts_with("usr/lib/ld-linux")
+                || self.path.starts_with("lib64/ld-linux"))
+    }
+
     pub(crate) fn removes_directory(&self) -> bool {
         self.after.is_none() && self.before.as_ref().is_some_and(Node::is_dir)
     }

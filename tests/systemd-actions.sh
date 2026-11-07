@@ -111,6 +111,21 @@ if grep -q "Offline systemd preset $existing" preview.log; then
     exit 1
 fi
 
+# An unrelated damaged file must stop validation and apply before journaling.
+unchanged=usr/lib/systemd/system/multi-user.target
+cp -a base drifted
+printf 'unrelated drift\n' > "drifted/$unchanged"
+for command in validate apply; do
+    if "$cps" "$command" --root drifted upgrade.json > drift.log 2>&1; then
+        echo "Expected $command to reject unrelated drift" >&2
+        exit 1
+    fi
+    grep -Fq "pre-existing drift at $unchanged" drift.log
+done
+test ! -e "drifted/usr/lib/systemd/system/$enabled"
+test ! -e drifted/etc/passwd
+"$cps" transaction status --root drifted | grep -Fx 'No pending transaction'
+
 "$cps" boot-env stage --source base --root staged upgrade.json
 "$cps" verify --root staged
 grep -q "^$user:x:$account_uid:$account_gid:" staged/etc/passwd
@@ -144,6 +159,37 @@ cp "base/etc/tmpfiles.d/$scope.conf" recover/etc/tmpfiles.d/
 "$cps" transaction status --root recover > recovery-status.log
 grep -Fq 'Offline actions pending' recovery-status.log
 grep -Fq 'Recover with transaction resume' recovery-status.log
+# A change after the file phase can still leave plain resume stuck. Explicit
+# repair uses the original journal and verifies the exact recovery payload.
+cp -a base repair-pending
+printf 'd /var/lib/%s-retry 0750 %s-missing - -\n' "$scope" "$user" > "repair-pending/etc/tmpfiles.d/$scope.conf"
+if "$cps" apply --root repair-pending upgrade.json > retry.log 2>&1; then
+    echo 'Expected tmpfiles to leave a pending transaction' >&2
+    exit 1
+fi
+grep -q 'offline systemd tmpfiles failed' retry.log
+cp "base/etc/tmpfiles.d/$scope.conf" repair-pending/etc/tmpfiles.d/
+printf 'drift after file writes\n' > "repair-pending/$unchanged"
+if "$cps" transaction resume --root repair-pending > drift.log 2>&1; then
+    echo 'Expected ordinary resume to reject the damaged image' >&2
+    exit 1
+fi
+grep -Fq "inconsistent image: $unchanged" drift.log
+hash=$(sha256sum "base/$unchanged" | cut -d' ' -f1)
+mv "repo/blobs/$hash" saved-blob
+printf 'corrupt payload\n' > "repo/blobs/$hash"
+if "$cps" transaction resume --root repair-pending --repair > drift.log 2>&1; then
+    echo 'Repair accepted a corrupt recovery payload' >&2
+    exit 1
+fi
+grep -Fxq 'drift after file writes' "repair-pending/$unchanged"
+mv -f saved-blob "repo/blobs/$hash"
+"$cps" transaction resume --root repair-pending --repair
+"$cps" transaction status --root repair-pending | grep -Fx 'No pending transaction'
+cmp "base/$unchanged" "repair-pending/$unchanged"
+grep -q "^$user:x:$account_uid:$account_gid:" repair-pending/etc/passwd
+"$cps" verify --root repair-pending
+
 rm upgrade.json
 mv repo repo-offline
 "$cps" transaction resume --root recover

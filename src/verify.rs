@@ -58,7 +58,7 @@ pub fn verify_selected(root: &Path, packages: &[String], paths: &[String]) -> Re
         })
         .collect::<Vec<_>>();
     selected.extend(targets);
-    check_state(&image.root, &state, false, Some(&selected))
+    check_state(&image.root, &state, false, |path| selected.contains(path))
 }
 
 pub(crate) fn selected_paths<'a>(
@@ -120,7 +120,7 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
 fn check_image(image: &Image, pristine: bool) -> Result<Vec<Finding>> {
     let state = image.state()?;
     image.verify_catalog_archives(&state)?;
-    check_state(&image.root, &state, pristine, None)
+    check_state(&image.root, &state, pristine, |_| true)
 }
 
 pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>> {
@@ -135,14 +135,24 @@ pub(crate) fn verify_state(
     state: &State,
     selected: Option<&BTreeSet<&str>>,
 ) -> Result<Vec<Finding>> {
-    check_state(root, state, false, selected)
+    check_state(root, state, false, |path| {
+        selected.is_none_or(|paths| paths.contains(path))
+    })
+}
+
+pub(crate) fn verify_unchanged(
+    root: &Root,
+    state: &State,
+    changed: &BTreeSet<&str>,
+) -> Result<Vec<Finding>> {
+    check_state(root, state, false, |path| !changed.contains(path))
 }
 
 fn check_state(
     root: &Root,
     state: &State,
     pristine: bool,
-    selected: Option<&BTreeSet<&str>>,
+    include: impl Fn(&str) -> bool,
 ) -> Result<Vec<Finding>> {
     crate::plan::freeze::check(&state.settings.freezes, &state.installed)?;
     let expected = manifest_paths(state)?;
@@ -160,7 +170,7 @@ fn check_state(
         });
     }
     for (path, managed) in &expected {
-        if selected.is_some_and(|paths| !paths.contains(path.as_str())) {
+        if !include(path) {
             continue;
         }
         validate_path(path)?;

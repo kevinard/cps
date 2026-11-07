@@ -109,7 +109,13 @@ current cached catalog. Fetching uncached package files can still contact
 the mirror. With configured
 mirrors, `upgrade` checks for updates and `install` reuses recently
 synchronized catalogs. `cps resume` completes an interrupted live
-transaction using the files saved in its journal. The explicit
+transaction using the files saved in its journal. If resume reports damage
+to managed files, use `sudo cps resume --repair`. For an offline image use
+`cps transaction resume --root IMAGE --repair`. These commands restore
+damaged paths in the pending package state from verified staged or cached
+payloads before retrying final actions. They keep local edits to preserved
+configuration. If a systemd helper still fails, correct its reported
+problem and resume again. The explicit
 `plan`, `fetch`, `apply`, and `boot-env` commands remain available for
 administering images and boot environments.
 

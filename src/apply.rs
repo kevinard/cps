@@ -19,14 +19,17 @@ use crate::{
         root::{ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
-    plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads},
+    plan::{
+        Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads,
+        pending_repairs,
+    },
     repo::{
         BuildReceipt, Published,
         release::{ArchiveCache, DeltaBase, fetch_payloads},
         stage_blob,
     },
     systemd::{self, Action as SystemdAction},
-    verify::{manifest_paths, verify_state},
+    verify::{manifest_paths, verify_state, verify_unchanged},
 };
 
 #[derive(Deserialize, Serialize)]
@@ -394,6 +397,7 @@ fn validate_in_image(image: &Image, plan: &Plan) -> Result<()> {
     );
     let previous = elf::applies(plan, &state).then(|| state.paths.clone());
     let (checked, next, _) = check_plan(image, state, plan)?;
+    check_drift(&image.root, &checked, &next)?;
     let parent = image.stage()?;
     let scratch = tempfile::tempdir_in(Root::fd_path(&parent))?;
     let stage = File::open(scratch.path())?;
@@ -464,6 +468,7 @@ pub(crate) fn apply_to_image(
             pending,
             Some(plan),
             live.is_some(),
+            None,
             after_write,
         );
     }
@@ -474,6 +479,7 @@ pub(crate) fn apply_to_image(
     let previous_paths = (check_elf && live.is_none()).then(|| state.paths.clone());
     let current = live.map(|_| state.clone());
     let (checked, mut next, receipts) = check_plan(&image, state, plan)?;
+    check_drift(&image.root, &checked, &next)?;
     let stage = image.stage()?;
     let after = if let (Some(stage_packages), Some(current)) = (live, &current) {
         check_live_plan(&checked, stage_packages)?;
@@ -505,23 +511,59 @@ pub(crate) fn apply_to_image(
         PendingRecord::Journaled { journaled: journal }
     };
     image.record_pending(&pending, pending.work().next, &receipts, repo_backed)?;
-    finish(&mut image, &stage, pending, None, after, after_write)
+    finish(&mut image, &stage, pending, None, after, None, after_write)
+}
+
+fn check_drift(root: &Root, plan: &Plan, next: &State) -> Result<()> {
+    if plan.is_recovery() || matches!(plan.request, Request::ResolveConfig { .. }) {
+        return Ok(());
+    }
+    let changed = plan
+        .writes
+        .iter()
+        .filter(|write| write.before != write.after || write.detach)
+        .map(|write| write.path.as_str())
+        .collect();
+    for finding in verify_unchanged(root, next, &changed)? {
+        ensure!(
+            !finding.is_error,
+            "pre-existing drift at {}; repair the image before applying the transaction",
+            finding.message
+        );
+    }
+    Ok(())
 }
 
 pub fn resume_transaction(path: &Path) -> Result<Option<u64>> {
-    resume_image(Image::open_for_apply(path)?, false)
+    resume_image(Image::open_for_apply(path)?, false, None)
+}
+
+/// Restore damaged managed paths from verified local payloads and resume.
+pub fn repair_pending_transaction(path: &Path) -> Result<Option<u64>> {
+    resume_image(Image::open_for_apply(path)?, false, Some(&BTreeSet::new()))
 }
 
 pub(crate) fn resume_live(image: Image) -> Result<Option<u64>> {
-    resume_image(image, true)
+    resume_image(image, true, None)
 }
 
-fn resume_image(mut image: Image, live: bool) -> Result<Option<u64>> {
+pub(crate) fn repair_pending_live(
+    image: Image,
+    stage_packages: &BTreeSet<String>,
+) -> Result<Option<u64>> {
+    resume_image(image, true, Some(stage_packages))
+}
+
+fn resume_image(
+    mut image: Image,
+    live: bool,
+    repair: Option<&BTreeSet<String>>,
+) -> Result<Option<u64>> {
     let state = image.state()?;
     let Some(pending) = image.pending::<PendingRecord>()? else {
         return Ok(None);
     };
-    resume_pending(&mut image, &state, pending, None, live, |_| {}).map(Some)
+    resume_pending(&mut image, &state, pending, None, live, repair, |_| {}).map(Some)
 }
 
 fn check_live_plan(plan: &Plan, stage_packages: &BTreeSet<String>) -> Result<()> {
@@ -551,6 +593,7 @@ fn resume_pending(
     pending: PendingRecord,
     saved: Option<&Plan>,
     live: bool,
+    repair: Option<&BTreeSet<String>>,
     after_write: impl FnMut(&Write),
 ) -> Result<u64> {
     ensure!(
@@ -598,7 +641,7 @@ fn resume_pending(
         "pending transaction has an invalid final phase"
     );
     let stage = image.stage()?;
-    finish(image, &stage, pending, saved, after, after_write)
+    finish(image, &stage, pending, saved, after, repair, after_write)
 }
 
 enum AfterFiles {
@@ -623,6 +666,7 @@ fn finish(
     mut pending: PendingRecord,
     saved: Option<&Plan>,
     after: AfterFiles,
+    repair: Option<&BTreeSet<String>>,
     mut after_write: impl FnMut(&Write),
 ) -> Result<u64> {
     let work = pending.work();
@@ -640,6 +684,15 @@ fn finish(
         }
     }
     let work = pending.work();
+    if let Some(stage_packages) = repair {
+        restore_pending_paths(
+            &image.root,
+            stage,
+            work.next,
+            pending.is_live(),
+            stage_packages,
+        )?;
+    }
     if !matches!(after, AfterFiles::None) {
         let path = match &after {
             AfterFiles::Offline(path) => path.as_path(),
@@ -669,7 +722,7 @@ fn finish(
         for finding in verify_state(&image.root, work.next, repaired.as_ref())? {
             ensure!(
                 !finding.is_error,
-                "{phase} actions left an inconsistent image: {}",
+                "{phase} actions left an inconsistent image: {}; try resuming with --repair",
                 finding.message
             );
         }
@@ -686,6 +739,42 @@ fn finish(
     };
     image.commit(work.id, work.next, &plan.transaction_details(work.next))?;
     Ok(revision)
+}
+
+fn restore_pending_paths(
+    root: &Root,
+    stage: &File,
+    next: &State,
+    live: bool,
+    stage_packages: &BTreeSet<String>,
+) -> Result<()> {
+    let writes = pending_repairs(root, next)?;
+    if live {
+        for write in &writes {
+            ensure!(
+                !write.boot_sensitive()
+                    && next.paths[&write.path].owners.is_disjoint(stage_packages),
+                "repair of {} requires a staged recovery root",
+                write.path
+            );
+        }
+    }
+    let dir = Root::fd_path(stage);
+    for (publisher, blobs) in payload_sources(&writes, next)? {
+        for (hash, payload) in blobs {
+            if checked_payload(root, payload.node).is_ok() {
+                continue;
+            }
+            let mut file = NamedTempFile::new_in(&dir)?;
+            stage_blob(&publisher.repo, payload.node, file.as_file_mut()).with_context(|| {
+                format!("restoring payload for {}", payload.package.manifest.id())
+            })?;
+            file.as_file().sync_all()?;
+            file.persist(dir.join(hash))?;
+        }
+    }
+    stage.sync_all()?;
+    write_files(root, stage, &writes, &next.paths, &mut |_| {})
 }
 
 fn write_files(

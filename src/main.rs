@@ -30,11 +30,12 @@ use cps::{
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
     list_publishers, list_withdrawals, plan_with_options, prefer_publisher,
     prepare_boot_environment, publish, publish_witnessed_bundle_with_sources, read_attestation,
-    read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
-    rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
-    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
-    stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
-    transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
+    read_worker_config, release, remove_publisher, repair_pending_transaction, resume_transaction,
+    rollback_boot_environment, rollback_boot_environment_on_disk, rollback_btrfs_boot_environment,
+    rotate_publisher_key, set_publisher_build_trust, set_publisher_repositories,
+    stage_boot_environment, stage_btrfs_boot_environment, suggest_dependencies,
+    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
+    verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -135,6 +136,9 @@ enum Command {
     Resume {
         #[arg(long, default_value = system::CONFIG)]
         config: PathBuf,
+        /// Restore damaged managed paths from verified local payloads before retrying final actions
+        #[arg(long)]
+        repair: bool,
     },
     /// Prepare pinned package sources for offline builds
     Source {
@@ -962,6 +966,9 @@ enum TransactionCommand {
     Resume {
         #[arg(long)]
         root: PathBuf,
+        /// Restore damaged managed paths from verified local payloads before retrying final actions
+        #[arg(long)]
+        repair: bool,
     },
     /// List completed transactions, most recent first
     History {
@@ -1681,10 +1688,15 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("No reboot pending.");
             }
         }
-        Command::Resume { config } => {
+        Command::Resume { config, repair } => {
             let system = System::load(&config)?;
             let _lock = system.lock()?;
-            if let Some(revision) = system.resume()? {
+            let revision = if repair {
+                system.resume_with_repair()?
+            } else {
+                system.resume()?
+            };
+            if let Some(revision) = revision {
                 println!("Recovered the live transaction at package revision {revision}.");
             } else {
                 println!("No pending transaction.");
@@ -2683,8 +2695,13 @@ fn run(command: Command) -> Result<ExitCode> {
                     println!("No pending transaction");
                 }
             }
-            TransactionCommand::Resume { root } => {
-                if let Some(revision) = resume_transaction(&root)? {
+            TransactionCommand::Resume { root, repair } => {
+                let revision = if repair {
+                    repair_pending_transaction(&root)?
+                } else {
+                    resume_transaction(&root)?
+                };
+                if let Some(revision) = revision {
                     println!("Image revision {revision}");
                 } else {
                     println!("No pending transaction");

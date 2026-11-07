@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::{
     BootEnvironment, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, ReleaseAdvisory,
     Request, TransactionPhase, TransactionProgress,
-    apply::{apply_live, resume_live},
+    apply::{apply_live, repair_pending_live, resume_live},
     boot::{
         activate_btrfs_boot_environment, entry_id, stage_running_btrfs, with_running_environment,
     },
@@ -420,12 +420,27 @@ impl System {
     }
 
     pub fn resume(&self) -> Result<Option<u64>> {
+        self.resume_transaction(false)
+    }
+
+    pub fn resume_with_repair(&self) -> Result<Option<u64>> {
+        self.resume_transaction(true)
+    }
+
+    fn resume_transaction(&self, repair: bool) -> Result<Option<u64>> {
         let boot = self.boot();
         with_running_environment(
             &boot.volume,
             &boot.esp,
             &boot.activation.root_partuuid,
-            |root, id, revision| resume_live(Image::open_for_live_apply(root, id, revision)?),
+            |root, id, revision| {
+                let image = Image::open_for_live_apply(root, id, revision)?;
+                if repair {
+                    repair_pending_live(image, &self.definition.stage_packages)
+                } else {
+                    resume_live(image)
+                }
+            },
         )
     }
 
