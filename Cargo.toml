@@ -29,6 +29,7 @@ resolvo = "0.12"
 tokio = { version = "1", features = ["rt"] }
 tough = "0.24"
 url = "2"
+zstd = { version = "0.13.3", default-features = false }
 
 [dev-dependencies]
 jiff = "0.2"

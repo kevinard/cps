@@ -38,6 +38,8 @@ const ROOT_LIMIT: u64 = 1024 * 1024;
 const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
 const ENDPOINTS_LIMIT: u64 = 8192;
 const PAYLOAD_DOWNLOADS: usize = 8;
+const PAYLOAD_ZSTD_LEVEL: i32 = 3;
+const PAYLOAD_ZSTD_WINDOW_LOG: u32 = 21;
 const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
 const PROFILE_BINDING: &str = "profile";
 const REFRESH_ROOT: &str = "refresh-root.json";
@@ -921,13 +923,11 @@ async fn try_delta(
     let name = format.target_name(base.hash, hash);
     let (target_name, target) =
         checked_target(verified, &name, format.patch_limit(length), None, None)?;
-    checked_target(
-        verified,
-        &format!("blobs/{hash}"),
-        length,
-        Some(hash),
-        Some(length),
-    )?;
+    let full = checked_payload_target(verified, hash, length)?;
+    ensure!(
+        target.length < full.metadata.length,
+        "delta is no smaller than the full payload"
+    );
     let base_file = Root::open(repo)?
         .file(&format!("blobs/{}", base.hash))
         .and_then(|file| delta::verified_file(file, base.hash, base.length))
@@ -960,10 +960,106 @@ async fn fetch_verified_payloads<'a>(
     blobs: impl IntoIterator<Item = (&'a str, u64)>,
 ) -> Result<()> {
     stream::iter(blobs)
-        .map(|(hash, length)| fetch_object(verified, repo, "blobs", hash, length, Some(length)))
+        .map(|(hash, length)| fetch_verified_payload(verified, repo, hash, length))
         .buffer_unordered(PAYLOAD_DOWNLOADS)
         .try_for_each(|()| async { Ok(()) })
         .await
+}
+
+struct PayloadTarget<'a> {
+    name: String,
+    tuf_name: TargetName,
+    metadata: &'a tough::schema::Target,
+    compressed: bool,
+}
+
+fn compressed_payload_name(hash: &str) -> String {
+    format!("blobs-{hash}.zst")
+}
+
+fn checked_payload_target<'a>(
+    verified: &'a Repository,
+    hash: &str,
+    length: u64,
+) -> Result<PayloadTarget<'a>> {
+    validate_digest(hash)?;
+    let name = compressed_payload_name(hash);
+    let tuf_name = TargetName::new(name.as_str())?;
+    if let Ok(metadata) = verified.targets().signed.find_target(&tuf_name, false) {
+        ensure!(
+            metadata.length > 0 && metadata.length < length,
+            "invalid signed length for {name}"
+        );
+        return Ok(PayloadTarget {
+            name,
+            tuf_name,
+            metadata,
+            compressed: true,
+        });
+    }
+
+    let name = format!("blobs/{hash}");
+    let (tuf_name, metadata) = checked_target(verified, &name, length, Some(hash), Some(length))?;
+    Ok(PayloadTarget {
+        name,
+        tuf_name,
+        metadata,
+        compressed: false,
+    })
+}
+
+async fn fetch_verified_payload(
+    verified: &Repository,
+    repo: &Path,
+    hash: &str,
+    length: u64,
+) -> Result<()> {
+    let target = checked_payload_target(verified, hash, length)?;
+    if cached_object(repo, &format!("blobs/{hash}"), hash, length)? {
+        return Ok(());
+    }
+    let parent = repo.join("blobs");
+    let file = download_target(
+        verified,
+        &target.name,
+        &target.tuf_name,
+        target.metadata,
+        &parent,
+    )
+    .await?;
+    let result = if target.compressed {
+        decompress_payload(file, &parent, hash, length)
+            .with_context(|| format!("decoding {}", target.name))?
+    } else {
+        file
+    };
+    result.persist(parent.join(hash))?;
+    File::open(&parent)?.sync_all()?;
+    Ok(())
+}
+
+fn decompress_payload(
+    mut compressed: NamedTempFile,
+    parent: &Path,
+    hash: &str,
+    length: u64,
+) -> Result<NamedTempFile> {
+    compressed.as_file_mut().rewind()?;
+    let mut decoder = zstd::stream::read::Decoder::new(compressed.as_file_mut())?;
+    decoder.window_log_max(PAYLOAD_ZSTD_WINDOW_LOG)?;
+    let mut result = NamedTempFile::new_in(parent)?;
+    let copied = std::io::copy(&mut decoder.by_ref().take(length), &mut result)?;
+    ensure!(
+        copied == length && decoder.read(&mut [0])? == 0,
+        "decompressed payload length mismatch for {hash}"
+    );
+    result.as_file_mut().rewind()?;
+    ensure!(
+        digest_reader(result.as_file_mut())? == hash,
+        "decompressed payload digest mismatch for {hash}"
+    );
+    result.as_file().sync_all()?;
+    Ok(result)
 }
 
 pub(super) fn fetch_source_archives(
@@ -1259,15 +1355,9 @@ async fn cache_objects(
     }
     for (sha256, length) in release_blobs(&packages)? {
         if full {
-            fetch_object(verified, repo, "blobs", sha256, length, Some(length)).await?;
+            fetch_verified_payload(verified, repo, sha256, length).await?;
         } else {
-            checked_target(
-                verified,
-                &format!("blobs/{sha256}"),
-                length,
-                Some(sha256),
-                Some(length),
-            )?;
+            checked_payload_target(verified, sha256, length)?;
         }
     }
     for sha256 in attestations {
@@ -1533,17 +1623,21 @@ fn export_targets(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let stage = TempDir::new_in(parent)?;
+    let mut blobs = BTreeMap::new();
     for pin in &retained {
         let previous = read_catalog(repo, pin, publisher, &key)?;
         previous
             .check_successor(&catalog, pin)
             .with_context(|| format!("checking retained catalog {pin} against current {hash}"))?;
         let release = catalog_snapshot(repo, previous, (*pin).to_owned(), &key)?;
-        export_catalog(&root, stage.path(), &release)?;
+        export_catalog(&root, stage.path(), &release, &mut blobs)?;
     }
     let include_sources = include_sources || catalog.source_archives_required;
     let release = catalog_snapshot(repo, catalog, hash.clone(), &key)?;
-    export_catalog(&root, stage.path(), &release)?;
+    export_catalog(&root, stage.path(), &release, &mut blobs)?;
+    for (hash, length) in blobs {
+        export_payload(&root, stage.path(), &hash, length)?;
+    }
     if !delta_from.is_empty() {
         let pins = retained_catalogs(delta_from.iter().map(String::as_str), &hash)
             .context("checking delta base catalog pins")?;
@@ -1605,7 +1699,12 @@ fn export_targets(
     Ok(hash)
 }
 
-fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> {
+fn export_catalog(
+    root: &Root,
+    output: &Path,
+    release: &Snapshot,
+    blobs: &mut BTreeMap<String, u64>,
+) -> Result<()> {
     export_object(
         root,
         output,
@@ -1635,7 +1734,8 @@ fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> 
         )?;
     }
     for (hash, length) in release_blobs(&release.packages)? {
-        export_object(root, output, "blobs", hash, length, Some(length))?;
+        let saved = blobs.entry(hash.to_owned()).or_insert(length);
+        ensure!(*saved == length, "conflicting payload lengths for {hash}");
     }
     for hash in release.builds.attestations.values() {
         export_object(root, output, "attestations", hash, ATTESTATION_LIMIT, None)?;
@@ -1644,6 +1744,28 @@ fn export_catalog(root: &Root, output: &Path, release: &Snapshot) -> Result<()> 
         for (hash, limit) in inputs.objects() {
             export_object(root, output, rebuild::OBJECTS, hash, limit, None)?;
         }
+    }
+    Ok(())
+}
+
+fn export_payload(root: &Root, output: &Path, hash: &str, length: u64) -> Result<()> {
+    export_object(root, output, "blobs", hash, length, Some(length))?;
+    let raw_path = output.join(format!("blobs-{hash}"));
+    let compressed_path = output.join(compressed_payload_name(hash));
+    let compressed = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&compressed_path)?;
+    let mut encoder = zstd::stream::write::Encoder::new(compressed, PAYLOAD_ZSTD_LEVEL)?;
+    encoder.window_log(PAYLOAD_ZSTD_WINDOW_LOG)?;
+    encoder.set_pledged_src_size(Some(length))?;
+    std::io::copy(&mut File::open(&raw_path)?, &mut encoder)?;
+    let compressed = encoder.finish()?;
+    if compressed.metadata()?.len() < length {
+        compressed.sync_all()?;
+        std::fs::remove_file(raw_path)?;
+    } else {
+        std::fs::remove_file(compressed_path)?;
     }
     Ok(())
 }

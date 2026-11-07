@@ -2346,6 +2346,14 @@ fn sign_export(
     )
 }
 
+fn signed_compressed_payload(export: &Path, mirror: &Path, hash: &str) -> Result<PathBuf> {
+    let name = format!("blobs-{hash}.zst");
+    let compressed_hash = crate::model::digest_reader(fs::File::open(export.join(&name))?)?;
+    Ok(mirror
+        .join("targets")
+        .join(format!("{compressed_hash}.{name}")))
+}
+
 #[test]
 fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -> Result<()> {
     let f = Fixture::new()?;
@@ -4630,12 +4638,12 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
 #[test]
 fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> Result<()> {
     let fixture = Fixture::new()?;
-    let payload = "pinned compiler";
+    let payload = "pinned compiler\n".repeat(4096);
     let path = "usr/bin/cc";
     fixture.package(
         "build/compiler",
         "1.0.0-0",
-        fixture.file(path, payload, "0755", "")?,
+        fixture.file(path, &payload, "0755", "")?,
     )?;
     let pointer = fixture.repo.join("current");
     let pin = fs::read_to_string(&pointer)?.trim().to_owned();
@@ -4687,6 +4695,11 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
         pin
     );
     assert_eq!(fs::read_to_string(targets.join("archive"))?.trim(), pin);
+    assert!(
+        targets
+            .join(format!("blobs-{}.zst", digest(payload.as_bytes())))
+            .is_file()
+    );
     assert!(!targets.join("current").exists());
     assert!(!targets.join(format!("catalogs-{live_pin}")).exists());
     assert!(
@@ -5828,10 +5841,9 @@ fn tuf_delta_fetch_reconstructs_from_installed_files_and_falls_back() -> Result<
     let delta_name = format!("delta-v1-{old_hash}-{new_hash}");
     let mut patch = fs::read(export.join(&delta_name))?;
     assert!(patch.len() < new.len() / 8);
-    let full_name = format!("{new_hash}.blobs-{new_hash}");
     let updated = work.join("updated-mirror");
     sign_export(&export, &updated, 2, fresh, &anchor, &key)?;
-    fs::remove_file(updated.join("targets").join(&full_name))?;
+    fs::remove_file(signed_compressed_payload(&export, &updated, &new_hash)?)?;
     sync(&updated)?;
     let upgrade = plan(&f.root, Request::Update)?;
     fetch_plan(&f.root, &upgrade)?;
@@ -5849,7 +5861,7 @@ fn tuf_delta_fetch_reconstructs_from_installed_files_and_falls_back() -> Result<
     fs::write(export.join(delta_name), patch)?;
     let fallback = work.join("fallback-mirror");
     sign_export(&export, &fallback, 3, fresh, &anchor, &key)?;
-    let full = fallback.join("targets").join(full_name);
+    let full = signed_compressed_payload(&export, &fallback, &new_hash)?;
     let offline = work.join("full-offline");
     fs::rename(&full, &offline)?;
     sync(&fallback)?;
@@ -5915,11 +5927,7 @@ fn tuf_delta_fetch_upgrades_files_larger_than_64_mib() -> Result<()> {
     let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
     sign_root(&anchor, &key, None)?;
     sign_export(&export, &mirror, 1, fresh, &anchor, &key)?;
-    fs::remove_file(
-        mirror
-            .join("targets")
-            .join(format!("{new_hash}.blobs-{new_hash}")),
-    )?;
+    fs::remove_file(signed_compressed_payload(&export, &mirror, &new_hash)?)?;
     let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
     let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
     mirror_release::sync_index(
@@ -5938,6 +5946,103 @@ fn tuf_delta_fetch_upgrades_files_larger_than_64_mib() -> Result<()> {
         crate::model::digest_reader(File::open(f.root.join(COMPOSITOR))?)?,
         new_hash
     );
+    Ok(())
+}
+
+#[test]
+fn tuf_full_sync_checks_compressed_payloads_before_caching() -> Result<()> {
+    let f = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let key = work.join("tuf-key.der");
+    let export = work.join("export");
+    let cache = work.join("cache");
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_root(&anchor, &key, None)?;
+    let program = "compressible data\n".repeat(160_000);
+    let hash = digest(program.as_bytes());
+    let small_hash = digest(b"short");
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, &program, "0755", "")? + &f.file(MANPAGE, "short", "0644", "")?,
+    )?;
+    let catalog = mirror_release::export(&f.repo, "canopa", &f.public, &export)?;
+    assert!(!export.join(format!("blobs-{hash}")).exists());
+    assert!(!export.join(format!("blobs-{small_hash}.zst")).exists());
+    assert_eq!(
+        fs::read(export.join(format!("blobs-{small_hash}")))?,
+        b"short"
+    );
+    let compressed_target = export.join(format!("blobs-{hash}.zst"));
+    let compressed = fs::read(&compressed_target)?;
+    assert!(compressed.len() < program.len() / 10);
+
+    let sync = |mirror: &Path| {
+        let metadata = Url::from_directory_path(mirror.join("metadata")).unwrap();
+        let targets = Url::from_directory_path(mirror.join("targets")).unwrap();
+        mirror_release::sync(
+            &cache,
+            &anchor,
+            metadata.as_str(),
+            targets.as_str(),
+            "canopa",
+            &f.public,
+        )
+    };
+    let good = work.join("good");
+    sign_export(&export, &good, 1, fresh, &anchor, &key)?;
+    let signed_target = signed_compressed_payload(&export, &good, &hash)?;
+    let cached = cache.join("blobs").join(&hash);
+    let mut damaged = compressed.clone();
+    damaged[0] ^= 1;
+    fs::write(&signed_target, damaged)?;
+    let error = sync(&good).unwrap_err();
+    assert!(format!("{error:#}").contains("Hash mismatch"), "{error:#}");
+    assert!(!cached.exists());
+    fs::write(&signed_target, &compressed)?;
+    assert_eq!(sync(&good)?, catalog);
+    assert_eq!(fs::read(&cached)?, program.as_bytes());
+    assert_eq!(fs::read(cache.join("blobs").join(small_hash))?, b"short");
+
+    // These compressed targets have valid TUF signatures. The manifest still
+    // controls which bytes may be written to the cache.
+    fs::write(&cached, b"damaged")?;
+    let wrong = vec![b'x'; program.len()];
+    let too_long = vec![b'x'; program.len() + 1];
+    for (version, name, bytes, expected) in [
+        (
+            2,
+            "wrong",
+            zstd::stream::encode_all(wrong.as_slice(), 3)?,
+            "decompressed payload digest mismatch",
+        ),
+        (
+            3,
+            "oversized",
+            zstd::stream::encode_all(too_long.as_slice(), 3)?,
+            "decompressed payload length mismatch",
+        ),
+        (
+            4,
+            "truncated",
+            compressed[..compressed.len() - 1].to_vec(),
+            "decoding",
+        ),
+    ] {
+        fs::write(&compressed_target, bytes)?;
+        let mirror = work.join(name);
+        sign_export(&export, &mirror, version, fresh, &anchor, &key)?;
+        let error = sync(&mirror).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(fs::read(&cached)?, b"damaged");
+    }
+
+    fs::write(&compressed_target, &compressed)?;
+    let repaired = work.join("repaired");
+    sign_export(&export, &repaired, 5, fresh, &anchor, &key)?;
+    assert_eq!(sync(&repaired)?, catalog);
+    assert_eq!(fs::read(&cached)?, program.as_bytes());
     Ok(())
 }
 

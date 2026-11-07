@@ -1177,6 +1177,13 @@ cps repo export --repo repo --publisher canopa --trust-key public.der --output r
 
 The export includes the catalog pointer, signed catalog, and the manifests and payloads for active packages. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
 
+Export compresses each distinct payload with Zstandard when the result is
+smaller. The mirror carries either `blobs-SHA256.zst` or `blobs-SHA256`,
+where `SHA256` identifies the original file. Sync and on-demand fetch verify
+the TUF target, then check the original length and digest against the signed
+manifest before caching the file. Upgrade clients before serving an export
+with compressed payloads.
+
 When a signed release profile still references an older companion catalog,
 include that digest in the companion mirror's export with
 `--retain-catalog SHA256`. Repeat the option for up to 32 historical catalogs.
@@ -1215,12 +1222,12 @@ The export compares new versions against the newest earlier version of the
 same package and architecture in each supplied catalog. It includes patches
 that save space and keeps the full payloads. Sign the entire export with TUF.
 During `cps upgrade` or `cps fetch`, CPS can use the old installed or cached
-file as a base. It checks the patch's TUF metadata and verifies the complete
-result against the signed package manifest. If a patch is unavailable,
-doesn't apply, or fails verification, CPS fetches the full file. CPS
-streams files when generating and applying patches. When either version of
-a file exceeds 64 MiB, the export uses a v2 patch with 64-bit offsets and
-lengths. Older clients fetch the full file for these upgrades.
+file as a base when the patch is smaller than the full mirror target.
+It checks the patch's TUF metadata and verifies the complete result against
+the signed package manifest. If the patch fails, CPS fetches the full
+target. CPS streams files when generating and applying patches. When either
+version of a file exceeds 64 MiB, the export uses a v2 patch with 64-bit
+offsets and lengths.
 
 When preparing a cache for an existing image, add `--image /path/to/image`
 to `repo sync`. CPS verifies the candidate against the installed publisher
