@@ -538,6 +538,7 @@ pub(super) fn profile_paths(
     let paths = select_paths(
         arch,
         facets,
+        &BTreeMap::new(),
         Node::Dir {
             mode: 0o755,
             uid: 0,

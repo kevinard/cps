@@ -32,7 +32,8 @@ pub use config::{ConfigChoice, ConfigUpdate, config_diff_inputs, list_config_upd
 pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
 pub use intent::{IntentChange, MarkChoice};
 pub(crate) use paths::{
-    check_directory, check_path_type, effective_paths, hardlink_groups, select_paths,
+    check_directory, check_path_type, choose_mediators, effective_paths, hardlink_groups,
+    mediator_offers, select_paths,
 };
 pub(crate) use rename::Renames;
 pub(crate) use resolve::{
@@ -80,6 +81,10 @@ pub enum Request {
     ChangeFacet {
         facets: BTreeMap<String, Option<bool>>,
     },
+    SetMediator {
+        group: String,
+        provider: Option<String>,
+    },
     Repair {
         packages: Vec<String>,
     },
@@ -110,6 +115,7 @@ impl Request {
             Self::Remove { .. } => "remove",
             Self::Autoremove => "autoremove",
             Self::ChangeFacet { .. } => "change-facet",
+            Self::SetMediator { .. } => "set-mediator",
             Self::Repair { .. } => "repair",
             Self::RepairPaths { .. } => "repair-paths",
             Self::Revert { .. } => "revert",
@@ -331,6 +337,12 @@ impl Plan {
             "Image {} at revision {}",
             self.image, self.base_revision
         )];
+        if let Request::SetMediator { group, provider } = &self.request {
+            lines.push(match provider {
+                Some(provider) => format!("Prefer {provider} for mediator {group}"),
+                None => format!("Use the default provider for mediator {group}"),
+            });
+        }
         if self.force_phased_update {
             lines.push("Allow upgrade outside the phased rollout".into());
         }
@@ -532,6 +544,22 @@ impl Plan {
             "pending package freezes differ from the verified plan"
         );
         freeze::check(&after.freezes, &next.installed)?;
+        let mut mediators = before.mediators.clone();
+        match &self.request {
+            Request::SetMediator { group, provider } => {
+                if let Some(provider) = provider {
+                    mediators.insert(group.clone(), provider.clone());
+                } else {
+                    mediators.remove(group);
+                }
+            }
+            Request::InstallLock { lock } => mediators.clone_from(&lock.mediators),
+            _ => {}
+        }
+        ensure!(
+            after.mediators == mediators,
+            "pending mediator preferences differ from the verified plan"
+        );
         Ok(())
     }
 
@@ -861,11 +889,43 @@ fn build_with_update_diagnostics(
             let paths = select_paths(
                 &state.settings.arch,
                 &settings,
+                &state.settings.mediators,
                 state.settings.directory(),
                 &state.installed,
             )?;
             next_facets = Some(settings);
             (state.installed.clone(), paths)
+        }
+        Request::SetMediator { group, provider } => {
+            validate_publisher(group).context("invalid mediator group")?;
+            image.verify_catalog_archives(&state)?;
+            ensure!(
+                crate::verify::manifest_paths(&state)? == state.paths,
+                "path ownership index differs from installed manifests"
+            );
+            if let Some(provider) = provider {
+                validate_name(provider)?;
+                ensure!(
+                    mediator_offers(
+                        &state.settings.arch,
+                        &state.settings.facets,
+                        &state.installed
+                    )
+                    .get(group.as_str())
+                    .is_some_and(|offers| offers.contains_key(provider.as_str())),
+                    "{provider} is not an installed provider for mediator {group}"
+                );
+                state
+                    .settings
+                    .mediators
+                    .insert(group.clone(), provider.clone());
+            } else {
+                state.settings.mediators.remove(group);
+            }
+            (
+                state.installed.clone(),
+                effective_paths(&state.settings, &state.installed)?,
+            )
         }
         Request::Repair { .. }
         | Request::RepairPaths { .. }
@@ -1032,6 +1092,7 @@ fn build_with_update_diagnostics(
             };
             let (mut installed, paths) = if let Some(lock) = lock {
                 let mut installed = lock.replay(&catalogs.candidates.packages)?;
+                state.settings.mediators.clone_from(&lock.mediators);
                 if let Some(profile) = &catalogs.profile {
                     ensure!(
                         !profile.composition.is_empty(),

@@ -237,6 +237,13 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
     },
+    /// Show preferred and active providers for mediated links
+    Mediator {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// List persistent package version freezes, offline
     Freeze {
         #[arg(long)]
@@ -935,6 +942,12 @@ enum TransactionCommand {
 
 #[derive(Subcommand)]
 enum PlanCommand {
+    /// Select a provider for a mediated link group or restore the default
+    SetMediator {
+        group: String,
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Freeze installed or explicitly named versions until they are unfrozen
     Freeze {
         #[arg(required = true, value_name = "NAME[@VERSION]")]
@@ -1349,6 +1362,12 @@ fn print_image_diff(diff: &cps::ImageDiff, json: bool) -> Result<()> {
         println!(
             "Facet overrides {:?} → {:?}",
             diff.before.facets, diff.after.facets
+        );
+    }
+    if diff.before.mediators != diff.after.mediators {
+        println!(
+            "Mediator preferences {:?} → {:?}",
+            diff.before.mediators, diff.after.mediators
         );
     }
     if diff.packages.is_empty() {
@@ -2445,6 +2464,27 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("{facet}\t{value}");
             }
         }
+        Command::Mediator { root, json } => {
+            let rows = cps::query::list_mediators(&root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("MEDIATOR\tPREFERRED\tSELECTED\tPROVIDERS");
+                for row in rows {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        row.group,
+                        row.preferred.as_deref().unwrap_or("-"),
+                        row.selected.as_deref().unwrap_or("-"),
+                        row.providers
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+        }
         Command::Freeze { root } => {
             println!("PACKAGE\tVERSION\tREASON");
             for (name, freeze) in list_freezes(&root)? {
@@ -2482,6 +2522,9 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::ChangeFacet { facets } => Request::ChangeFacet {
                     facets: parse_facet_changes(facets)?,
                 },
+                PlanCommand::SetMediator { group, provider } => {
+                    Request::SetMediator { group, provider }
+                }
                 PlanCommand::Repair { packages, paths } if paths.is_empty() => {
                     Request::Repair { packages }
                 }

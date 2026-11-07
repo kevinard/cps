@@ -28,6 +28,8 @@ pub struct ImageMetadata {
     pub architecture: String,
     pub profile: Option<String>,
     pub facets: BTreeMap<String, bool>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub mediators: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +86,7 @@ impl Snapshot {
                 architecture: state.settings.arch,
                 profile: state.publishers.release_profile().map(str::to_owned),
                 facets: state.settings.facets,
+                mediators: state.settings.mediators,
             },
             packages,
             paths: state

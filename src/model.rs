@@ -593,6 +593,13 @@ impl Action {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct MediatedLink {
+    pub group: String,
+    pub priority: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub format: u32,
     pub publisher: String,
@@ -610,6 +617,8 @@ pub struct Manifest {
     pub optional_dependencies: Vec<OptionalDependency>,
     #[serde(default)]
     pub action: Vec<Action>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mediated_links: BTreeMap<String, MediatedLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub systemd: Vec<crate::systemd::Action>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -760,6 +769,26 @@ impl Manifest {
             }
         }
         let mut systemd = BTreeSet::new();
+        let mut priorities = BTreeMap::new();
+        for (path, link) in &self.mediated_links {
+            validate_publisher(&link.group).context("invalid mediator group")?;
+            let mut actions = self
+                .action
+                .iter()
+                .filter(|action| action.path() == path)
+                .peekable();
+            ensure!(
+                actions.peek().is_some()
+                    && actions.all(|action| matches!(action, Action::Symlink { .. })),
+                "mediation requires a symlink action for {path}"
+            );
+            let priority = priorities.entry(&link.group).or_insert(link.priority);
+            ensure!(
+                *priority == link.priority,
+                "a package must use one priority for mediator {}",
+                link.group
+            );
+        }
         for effect in &self.systemd {
             effect.validate()?;
             ensure!(

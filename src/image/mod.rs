@@ -76,6 +76,8 @@ pub struct Settings {
     pub publisher_generation: u64,
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) mediators: BTreeMap<String, String>,
     pub uid: u32,
     pub gid: u32,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -592,6 +594,7 @@ fn initialize(
         publisher_generation: 0,
         arch: arch.to_owned(),
         facets,
+        mediators: BTreeMap::new(),
         uid: geteuid().as_raw(),
         gid: getegid().as_raw(),
         created_directories: BTreeSet::new(),

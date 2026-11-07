@@ -60,6 +60,7 @@ pub fn generate_manifest_for_architecture(
         provides: BTreeMap::new(),
         optional_dependencies: Vec::new(),
         action: Vec::new(),
+        mediated_links: BTreeMap::new(),
         systemd: Vec::new(),
         kernel: None,
         requires_reboot: false,

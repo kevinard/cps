@@ -29,6 +29,8 @@ pub struct ImageLock {
     format: u32,
     pub(crate) architecture: String,
     pub(crate) facets: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) mediators: BTreeMap<String, String>,
     pub(crate) profile: Option<String>,
     pub(crate) signed_publishers: usize,
     pub(crate) publishers: Vec<LockedPublisher>,
@@ -121,6 +123,7 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
         format: LOCK_FORMAT,
         architecture: state.settings.arch.clone(),
         facets: state.settings.facets.clone(),
+        mediators: state.settings.mediators.clone(),
         profile: profile.map(str::to_owned),
         signed_publishers: state.publishers.signed_publishers().len(),
         publishers,
@@ -213,6 +216,10 @@ impl ImageLock {
         validate_publisher(&self.architecture).context("invalid locked architecture")?;
         for facet in self.facets.keys() {
             validate_publisher(facet).context("invalid locked facet")?;
+        }
+        for (group, provider) in &self.mediators {
+            validate_publisher(group).context("invalid locked mediator group")?;
+            validate_name(provider).context("invalid locked mediator provider")?;
         }
         if let Some(profile) = &self.profile {
             validate_name(profile).context("invalid locked profile")?;

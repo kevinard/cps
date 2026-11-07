@@ -166,6 +166,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         provides: BTreeMap::new(),
         optional_dependencies: Vec::new(),
         action: Vec::new(),
+        mediated_links: BTreeMap::new(),
         systemd: Vec::new(),
         kernel: None,
         requires_reboot: fields
@@ -211,6 +212,19 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             "file" | "dir" | "symlink" | "hardlink" => manifest
                 .action
                 .push(parse_action(node).with_context(|| format!("{name} action"))?),
+            "mediate" => {
+                let fields = Fields::read(node, 1, &["group", "priority"], false)?;
+                let path = fields.string_arg(0)?;
+                let group = fields.required_string("group")?;
+                let priority = fields.integer("priority")?.unwrap_or(0);
+                ensure!(
+                    manifest
+                        .mediated_links
+                        .insert(path.clone(), crate::model::MediatedLink { group, priority })
+                        .is_none(),
+                    "duplicate mediation for {path}"
+                );
+            }
             "sysusers" | "tmpfiles" | "preset" | "hwdb" => {
                 let value = Fields::read(node, 1, &[], false)?.string_arg(0)?;
                 let action = match name {
@@ -431,6 +445,15 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     for optional in &manifest.optional_dependencies {
         let mut node = target_node("optional", &optional.target);
         node.insert("description", optional.description.as_str());
+        children.push(node);
+    }
+    for (path, link) in &manifest.mediated_links {
+        let mut node = KdlNode::new("mediate");
+        node.push(path.as_str());
+        node.insert("group", link.group.as_str());
+        if link.priority != 0 {
+            node.insert("priority", i128::from(link.priority));
+        }
         children.push(node);
     }
     for action in &manifest.action {

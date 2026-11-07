@@ -579,6 +579,7 @@ fn resolve_toolchain(
             select_paths(
                 &recipe.arch,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 Node::Dir {
                     mode: 0o755,
                     uid: 0,

@@ -29,6 +29,7 @@ pub(super) fn applies(plan: &Plan, state: &State) -> bool {
             | Request::Remove { .. }
             | Request::Autoremove
             | Request::ChangeFacet { .. }
+            | Request::SetMediator { .. }
             | Request::Update
             | Request::UpdateProfile
     ) && !state.paths.is_empty()

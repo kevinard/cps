@@ -346,6 +346,44 @@ pub fn list_facets(root: &Path) -> Result<BTreeMap<String, bool>> {
     Ok(image.settings()?.facets)
 }
 
+#[derive(Debug, Serialize)]
+pub struct MediatorRow {
+    pub group: String,
+    pub preferred: Option<String>,
+    pub selected: Option<String>,
+    pub providers: BTreeMap<String, i32>,
+}
+
+pub fn list_mediators(root: &Path) -> Result<Vec<MediatorRow>> {
+    let image = Image::open_query(root)?;
+    let (state, _) = verified_intent(&image)?;
+    let offers = crate::plan::mediator_offers(
+        &state.settings.arch,
+        &state.settings.facets,
+        &state.installed,
+    );
+    let winners = crate::plan::choose_mediators(&offers, &state.settings.mediators);
+    let groups: BTreeSet<_> = offers
+        .keys()
+        .copied()
+        .chain(state.settings.mediators.keys().map(String::as_str))
+        .collect();
+    Ok(groups
+        .into_iter()
+        .map(|group| MediatorRow {
+            group: group.to_owned(),
+            preferred: state.settings.mediators.get(group).cloned(),
+            selected: winners.get(group).map(|winner| (*winner).to_owned()),
+            providers: offers
+                .get(group)
+                .into_iter()
+                .flatten()
+                .map(|(&name, &priority)| (name.to_owned(), priority))
+                .collect(),
+        })
+        .collect())
+}
+
 struct AvailablePackage {
     id: String,
     name: String,

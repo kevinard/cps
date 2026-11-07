@@ -1833,6 +1833,32 @@ compatible alternative and any conditional dependencies that apply. The
 plan and apply work offline. Use `plan mark explicit` to keep an installed
 dependency before planning cleanup.
 
+### Mediated links
+
+Packages can offer competing implementations of a shared command while
+keeping their implementation binaries installed side by side. Mark the
+package's normal symlink action with a mediator group.
+
+```kdl
+symlink "usr/bin/editor" target="my-editor" uid=0 gid=0
+mediate "usr/bin/editor" group="editor" priority=20
+```
+
+Only the selected package contributes links for the group. A package can
+declare several links for the same group with one priority. CPS selects
+the highest priority by default, with package name breaking ties.
+
+```sh
+cps mediator --root image
+cps plan --root image --output editor.json set-mediator editor --provider editors/basic
+cps apply --root image editor.json
+```
+
+Omit `--provider` to restore automatic selection. Removing the preferred
+package makes the next provider active. The preference survives removal
+and becomes active again if the package returns. Image locks capture the
+preferences, and staged roots carry them through boot and rollback.
+
 ### Virtual packages
 
 A mail transport package can declare its capability in the manifest.

@@ -45,6 +45,7 @@ pub(crate) fn effective_paths(
     select_paths(
         &settings.arch,
         &settings.facets,
+        &settings.mediators,
         settings.directory(),
         installed,
     )
@@ -82,12 +83,16 @@ pub(crate) fn hardlink_groups(paths: &BTreeMap<String, Managed>) -> BTreeMap<&st
 pub(crate) fn select_paths(
     arch: &str,
     facets: &BTreeMap<String, bool>,
+    preferences: &BTreeMap<String, String>,
     implicit_directory: Node,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
+    let offers = mediator_offers(arch, facets, installed);
+    let winners = choose_mediators(&offers, preferences);
     let mut paths: BTreeMap<String, Managed> = BTreeMap::new();
     let mut sizes = BTreeMap::new();
     let mut config_names = BTreeMap::new();
+    let mut shared_paths = BTreeMap::<&str, (&str, &str)>::new();
     for (name, package) in installed {
         package.published.manifest.check_architecture(arch)?;
         let publisher = &package.published.manifest.publisher;
@@ -99,6 +104,17 @@ pub(crate) fn select_paths(
             let path = action.path();
             if !selected.insert(path) {
                 return Err(PathConflict::new(path, name, name).into());
+            }
+            if let Some(link) = package.published.manifest.mediated_links.get(path) {
+                if let Some(&(group, owner)) = shared_paths.get(path)
+                    && group != link.group
+                {
+                    return Err(PathConflict::new(path, owner, name).into());
+                }
+                shared_paths.entry(path).or_insert((&link.group, name));
+                if winners[link.group.as_str()] != name {
+                    continue;
+                }
             }
             let original_name = action.original_name();
             if action.preserve() {
@@ -171,6 +187,49 @@ pub(crate) fn select_paths(
         .collect();
     paths.extend(parents);
     Ok(paths)
+}
+
+pub(crate) fn mediator_offers<'a>(
+    arch: &str,
+    facets: &BTreeMap<String, bool>,
+    installed: &'a BTreeMap<String, Installed>,
+) -> BTreeMap<&'a str, BTreeMap<&'a str, i32>> {
+    let mut offers = BTreeMap::<_, BTreeMap<_, _>>::new();
+    for (name, package) in installed {
+        let manifest = &package.published.manifest;
+        if manifest.mediated_links.is_empty() {
+            continue;
+        }
+        for action in &manifest.action {
+            if action.applies_to(arch, facets)
+                && let Some(link) = manifest.mediated_links.get(action.path())
+            {
+                offers
+                    .entry(link.group.as_str())
+                    .or_default()
+                    .insert(name.as_str(), link.priority);
+            }
+        }
+    }
+    offers
+}
+
+pub(crate) fn choose_mediators<'a>(
+    offers: &BTreeMap<&'a str, BTreeMap<&'a str, i32>>,
+    preferences: &BTreeMap<String, String>,
+) -> BTreeMap<&'a str, &'a str> {
+    offers
+        .iter()
+        .filter_map(|(&group, offers)| {
+            let preferred = preferences.get(group).map(String::as_str);
+            offers
+                .iter()
+                .max_by_key(|&(&name, &priority)| {
+                    (Some(name) == preferred, priority, std::cmp::Reverse(name))
+                })
+                .map(|(&name, _)| (group, name))
+        })
+        .collect()
 }
 
 pub(super) fn config_name(package: &str, path: &str, original: Option<&str>) -> String {
