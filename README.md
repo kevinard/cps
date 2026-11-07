@@ -1664,6 +1664,24 @@ A lock can provision a fresh image from historical catalogs. Future
 updates use the installed image's usual catalog checkpoints and profile
 policy.
 
+For disconnected provisioning, export the lock together with the repository
+objects it needs. Populate the source caches with the selected package
+payloads before exporting.
+
+```sh
+cps image-lock --root installed --export desktop.bundle
+cps image-create --root replica --config image.kdl --bundle desktop.bundle
+cps plan --root replica --output install.json install-lock desktop.bundle/image.lock.json
+cps apply --root replica install.json
+```
+
+Export verifies every copied object and publishes the new directory only
+after the copy succeeds. The bundle contains the pinned signed catalogs,
+their manifest indexes, and the selected attestations and payloads. Its
+repositories supply the historical pins. The target configuration still
+supplies publisher keys and build trust. Keep the bundle at a stable path
+for offline repair, or configure regular repositories to resume updates.
+
 ## Manifest and image behavior
 
 Set `summary` on the package node and add an `optional` node for each

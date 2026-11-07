@@ -190,6 +190,9 @@ enum Command {
     ImageLock {
         #[arg(long, default_value = "/")]
         root: PathBuf,
+        /// Export the lock and its verified provisioning objects to a new directory
+        #[arg(long)]
+        export: Option<PathBuf>,
     },
     /// Initialize an empty directory as an image
     ImageCreate {
@@ -200,6 +203,9 @@ enum Command {
         /// Initialize with the publisher layout and bootstrap catalog of this lock
         #[arg(long, requires = "config")]
         lock: Option<PathBuf>,
+        /// Initialize from a portable image bundle using locally configured trust
+        #[arg(long, requires = "config", conflicts_with = "lock")]
+        bundle: Option<PathBuf>,
         #[arg(long, required_unless_present = "config")]
         repo: Option<PathBuf>,
         #[arg(long, required_unless_present = "config")]
@@ -1930,26 +1936,38 @@ fn run(command: Command) -> Result<ExitCode> {
         } => {
             print_image_diff(&cps::image_diff(&before, &after, paths)?, json)?;
         }
-        Command::ImageLock { root } => {
-            serde_json::to_writer_pretty(io::stdout().lock(), &cps::capture_image_lock(&root)?)?;
-            println!();
+        Command::ImageLock { root, export } => {
+            if let Some(output) = export {
+                cps::export_image_bundle(&root, &output)?;
+                println!("Exported image bundle to {}", output.display());
+            } else {
+                serde_json::to_writer_pretty(
+                    io::stdout().lock(),
+                    &cps::capture_image_lock(&root)?,
+                )?;
+                println!();
+            }
         }
         Command::ImageCreate {
             root,
             config,
             lock,
+            bundle,
             repo,
             publisher,
             trust_key,
             arch,
             facet,
         } => {
-            let id = match (config, lock) {
-                (Some(config), Some(lock)) => {
+            let id = match (config, lock, bundle) {
+                (Some(config), None, Some(bundle)) => {
+                    cps::create_image_from_bundle(&root, &config, &bundle)?
+                }
+                (Some(config), Some(lock), None) => {
                     cps::create_image_from_lock(&root, &config, &cps::read_image_lock(&lock)?)?
                 }
-                (Some(path), None) => create_configured_image(&root, &path)?,
-                (None, None) => create_image(
+                (Some(path), None, None) => create_configured_image(&root, &path)?,
+                (None, None, None) => create_image(
                     &root,
                     &repo.context("missing repository")?,
                     &publisher.context("missing publisher")?,
@@ -1957,7 +1975,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     arch.as_deref().unwrap_or(std::env::consts::ARCH),
                     parse_facets(facet)?,
                 )?,
-                (None, Some(_)) => anyhow::bail!("--lock requires --config"),
+                _ => anyhow::bail!("select either --lock or --bundle with --config"),
             };
             println!("Created image {id} at {}", root.display());
         }

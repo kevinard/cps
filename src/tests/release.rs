@@ -1350,6 +1350,28 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     assert_ne!(diff.before.id, diff.after.id);
     assert!(diff.packages.is_empty() && diff.paths.unwrap().is_empty());
     assert_eq!(crate::capture_image_lock(&locked_root)?, locked);
+    let bundle = work.join("bundle");
+    crate::export_image_bundle(&locked_root, &bundle)?;
+    assert!(crate::export_image_bundle(&locked_root, &bundle).is_err());
+    let repo_offline = main.repo.with_extension("offline");
+    fs::rename(&main.repo, &repo_offline)?;
+    let bundled_root = work.join("bundled-root");
+    crate::create_image_from_bundle(&bundled_root, &locked_config, &bundle)?;
+    let bundle_lock = crate::read_image_lock(&bundle.join("image.lock.json"))?;
+    let bundled_plan = plan(
+        &bundled_root,
+        Request::InstallLock {
+            lock: Box::new(bundle_lock),
+        },
+    )?;
+    apply(&bundled_root, &bundled_plan)?;
+    assert_eq!(crate::capture_image_lock(&bundled_root)?, locked);
+    assert!(
+        crate::image_diff(&locked_root, &bundled_root, true)?
+            .packages
+            .is_empty()
+    );
+    fs::rename(&repo_offline, &main.repo)?;
     assert!(plan(&locked_root, request).is_err());
 
     let upgrade = plan(&main.root, Request::Update)?;

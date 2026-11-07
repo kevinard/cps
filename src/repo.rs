@@ -1175,6 +1175,59 @@ pub(crate) fn catalog_bytes(repo: &Path, hash: &str) -> Result<Vec<u8>> {
     read_object(repo, "catalogs", hash, CATALOG_LIMIT)
 }
 
+pub(crate) fn export_locked_repository(
+    publisher: &crate::image::Publisher,
+    hash: &str,
+    packages: &[&Published],
+    blobs: &BTreeMap<&str, &Node>,
+    destination: &Path,
+) -> Result<()> {
+    let bytes = catalog_bytes(&publisher.repo, hash)?;
+    let catalog = decode_catalog(
+        &bytes,
+        hash,
+        &publisher.name,
+        keys::Trust::Anchor(&publisher.key),
+    )?;
+    fs::create_dir(destination)?;
+    prepare_objects(destination)?;
+    for package in packages {
+        catalog.check_installed(package)?;
+    }
+    // The planner reads the whole pinned index, but only the locked selection
+    // needs attestations and payloads to provision this image.
+    let manifests = catalog
+        .entries
+        .values()
+        .map(CatalogEntry::manifest_digest)
+        .collect::<BTreeSet<_>>();
+    let attestations = packages
+        .iter()
+        .filter_map(|package| catalog.attestations.get(&package.manifest.id()))
+        .collect::<BTreeSet<_>>();
+    for (kind, hashes, limit) in [
+        ("manifests", manifests, MANIFEST_LIMIT),
+        (
+            "attestations",
+            attestations.into_iter().map(String::as_str).collect(),
+            ATTESTATION_LIMIT,
+        ),
+    ] {
+        for digest in hashes {
+            let content = read_object(&publisher.repo, kind, digest, limit)?;
+            write_atomic(&destination.join(kind).join(digest), &content, true)?;
+        }
+    }
+    for (&digest, node) in blobs {
+        let mut file = File::create_new(destination.join("blobs").join(digest))?;
+        stage_blob(&publisher.repo, node, &mut file)?;
+        file.sync_all()?;
+    }
+    File::open(destination.join("blobs"))?.sync_all()?;
+    write_atomic(&destination.join("catalogs").join(hash), &bytes, true)?;
+    Ok(())
+}
+
 fn decode_catalog(
     bytes: &[u8],
     hash: &str,

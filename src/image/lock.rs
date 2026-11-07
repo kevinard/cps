@@ -1,20 +1,27 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
+    fs::{self, File},
+    io::Write,
     path::Path,
 };
 
 use anyhow::{Context, Result, ensure};
+use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 
 use super::{Image, Installed, Publisher, Publishers, State, catalogs};
 use crate::{
-    model::{PackageSpec, Version, digest, validate_digest, validate_name, validate_publisher},
+    kdl_format::ImageDefinition,
+    model::{
+        Node, PackageSpec, Version, digest, validate_digest, validate_name, validate_publisher,
+    },
     query::verified_intent,
-    repo::{CATALOG_LIMIT, Published, catalog_index, read_limited},
+    repo::{CATALOG_LIMIT, Published, catalog_index, export_locked_repository, read_limited},
 };
 
 const LOCK_FORMAT: u32 = 1;
+const BUNDLE_LOCK: &str = "image.lock.json";
+const BUNDLE_REPOSITORIES: &str = "repositories";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +55,11 @@ struct LockedPackage {
 /// Capture the installed package composition and its signed catalog pins.
 pub fn capture_image_lock(root: &Path) -> Result<ImageLock> {
     let image = Image::open_query(root)?;
-    let (state, intent) = verified_intent(&image)?;
+    capture(&image).map(|(lock, _)| lock)
+}
+
+fn capture(image: &Image) -> Result<(ImageLock, State)> {
+    let (state, intent) = verified_intent(image)?;
     ensure!(
         state.settings.catalog_archives,
         "image-lock requires an image with archived signed catalogs"
@@ -93,25 +104,23 @@ pub fn capture_image_lock(root: &Path) -> Result<ImageLock> {
     }
     let packages = state
         .installed
-        .into_iter()
+        .iter()
         .map(|(name, entry)| {
-            let Published {
-                manifest, sha256, ..
-            } = entry.published;
+            let manifest = &entry.published.manifest;
             (
-                name,
+                name.clone(),
                 LockedPackage {
-                    publisher: manifest.publisher,
+                    publisher: manifest.publisher.clone(),
                     version: manifest.version,
-                    manifest_sha256: sha256,
+                    manifest_sha256: entry.published.sha256.clone(),
                 },
             )
         })
         .collect();
     let lock = ImageLock {
         format: LOCK_FORMAT,
-        architecture: state.settings.arch,
-        facets: state.settings.facets,
+        architecture: state.settings.arch.clone(),
+        facets: state.settings.facets.clone(),
         profile: profile.map(str::to_owned),
         signed_publishers: state.publishers.signed_publishers().len(),
         publishers,
@@ -119,7 +128,73 @@ pub fn capture_image_lock(root: &Path) -> Result<ImageLock> {
         packages,
     };
     lock.validate()?;
-    Ok(lock)
+    Ok((lock, state))
+}
+
+/// Export the locked composition and the verified objects needed for offline provisioning.
+pub fn export_image_bundle(root: &Path, output: &Path) -> Result<()> {
+    let image = Image::open_query(root)?;
+    let (lock, state) = capture(&image)?;
+    ensure!(
+        crate::verify::manifest_paths(&state)? == state.paths,
+        "path ownership index differs from installed manifests"
+    );
+    let name = output.file_name().context("missing bundle output name")?;
+    let destination = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let stage = tempfile::tempdir_in(destination)?;
+    let repositories = stage.path().join(BUNDLE_REPOSITORIES);
+    fs::create_dir(&repositories)?;
+
+    let mut payloads = BTreeMap::<_, BTreeMap<&str, &Node>>::new();
+    for managed in state.paths.values() {
+        if let Node::File { sha256, size, .. } = &managed.node {
+            let owner = managed
+                .owners
+                .first()
+                .context("managed file has no package owner")?;
+            let publisher = state.installed[owner].published.manifest.publisher.as_str();
+            let blobs = payloads.entry(publisher).or_default();
+            if let Some(Node::File { size: previous, .. }) = blobs.insert(sha256, &managed.node) {
+                ensure!(previous == size, "conflicting payload lengths for {sha256}");
+            }
+        }
+    }
+    for publisher in state.publishers.as_slice() {
+        let name = publisher.name.as_str();
+        let packages = state
+            .installed
+            .values()
+            .map(|entry| &entry.published)
+            .filter(|package| package.manifest.publisher == name)
+            .collect::<Vec<_>>();
+        export_locked_repository(
+            publisher,
+            lock.catalog(name)?,
+            &packages,
+            &payloads.remove(name).unwrap_or_default(),
+            &repositories.join(name),
+        )
+        .with_context(|| format!("exporting locked repository {name}"))?;
+    }
+    File::open(&repositories)?.sync_all()?;
+    let mut file = File::create_new(stage.path().join(BUNDLE_LOCK))?;
+    serde_json::to_writer_pretty(&mut file, &lock)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    File::open(stage.path())?.sync_all()?;
+    let parent = File::open(destination)?;
+    renameat_with(
+        &parent,
+        stage.path().file_name().context("missing staging name")?,
+        &parent,
+        name,
+        RenameFlags::NOREPLACE,
+    )?;
+    parent.sync_all()?;
+    Ok(())
 }
 
 pub fn read_image_lock(path: &Path) -> Result<ImageLock> {
@@ -296,6 +371,21 @@ impl ImageLock {
 /// Initialize a fresh root with the local trust configuration and locked profile.
 pub fn create_image_from_lock(path: &Path, config: &Path, lock: &ImageLock) -> Result<String> {
     let config = crate::kdl_format::read_image_definition(config)?;
+    create_locked(path, config, lock)
+}
+
+/// Use the bundle's repositories with publisher keys and policy from local configuration.
+pub fn create_image_from_bundle(path: &Path, config: &Path, bundle: &Path) -> Result<String> {
+    let mut config = crate::kdl_format::read_image_definition(config)?;
+    let bundle = fs::canonicalize(bundle)?;
+    let lock = read_image_lock(&bundle.join(BUNDLE_LOCK))?;
+    for publisher in &mut config.publishers {
+        publisher.repository = bundle.join(BUNDLE_REPOSITORIES).join(&publisher.name);
+    }
+    create_locked(path, config, &lock)
+}
+
+fn create_locked(path: &Path, config: ImageDefinition, lock: &ImageLock) -> Result<String> {
     lock.validate()?;
     ensure!(
         config.image_id.is_none(),
