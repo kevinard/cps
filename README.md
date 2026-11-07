@@ -890,6 +890,10 @@ Once a profile has a signed composition, CPS checks an upgrade from the
 current release before publishing its successor. Set
 `upgrade-from="<signed catalog SHA-256>"` to check an additional historical
 release, or to provide a baseline before the first composition is signed.
+For a fleet with several supported deployed releases, add one
+`upgrade-from "<catalog SHA-256>"` child per historical composition inside
+the profile block. Each child requires a signed composition for that profile
+and uses its recorded companion pins. The current release is still checked.
 New signed profiles record the exact versions of the requested roots and
 the manifest digest of every package in the checked composition. When
 the baseline has the same named profile, CPS

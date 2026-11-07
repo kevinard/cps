@@ -227,12 +227,22 @@ pub(super) fn check(
         let explicit = profile.upgrade_from.as_deref();
         let immediate = current_hash.filter(|hash| {
             Some(*hash) != explicit
+                && !profile
+                    .signed_baselines
+                    .iter()
+                    .any(|baseline| baseline == hash)
                 && previous.is_some_and(|profile| !profile.composition.is_empty())
         });
-        for (hash, explicit) in explicit
-            .map(|hash| (hash, true))
+        for (hash, explicit, require_signed_composition) in explicit
+            .map(|hash| (hash, true, false))
             .into_iter()
-            .chain(immediate.map(|hash| (hash, false)))
+            .chain(
+                profile
+                    .signed_baselines
+                    .iter()
+                    .map(|hash| (hash.as_str(), false, true)),
+            )
+            .chain(immediate.map(|hash| (hash, false, false)))
         {
             (|| {
                 let (baseline, baseline_packages) = match baselines.entry(hash) {
@@ -244,6 +254,11 @@ pub(super) fn check(
                     }
                 };
                 let historical = baseline.release_profiles.get(name);
+                ensure!(
+                    !require_signed_composition
+                        || historical.is_some_and(|profile| !profile.composition.is_empty()),
+                    "baseline catalog has no signed composition for profile {name}"
+                );
                 let (before, old_paths) = baseline_image(
                     baseline,
                     baseline_packages,

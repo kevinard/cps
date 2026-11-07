@@ -36,6 +36,7 @@ pub(crate) struct Profile {
     pub facets: BTreeMap<String, bool>,
     pub packages: BTreeMap<String, Option<Version>>,
     pub upgrade_from: Option<String>,
+    pub signed_baselines: Vec<String>,
     pub companions: Vec<Companion>,
     pub elf_library_dirs: Vec<String>,
     pub rollout_percentage: Option<u8>,
@@ -91,9 +92,20 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     let mut facets = BTreeMap::new();
     let mut companions = Vec::new();
     let mut elf_library_dirs = Vec::new();
+    let mut signed_baselines = Vec::new();
+    let mut baselines = upgrade_from.iter().cloned().collect::<BTreeSet<_>>();
     let mut names = BTreeSet::from([publisher.to_owned()]);
     for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
         match child.name().value() {
+            "upgrade-from" => {
+                let hash = Fields::read(child, 1, &[], false)?.string_arg(0)?;
+                validate_digest(&hash).context("invalid profile upgrade catalog digest")?;
+                ensure!(
+                    baselines.insert(hash.clone()),
+                    "duplicate upgrade baseline {hash}"
+                );
+                signed_baselines.push(hash);
+            }
             "publisher" => {
                 let fields = Fields::read(child, 1, &["catalog", "upgrade-from"], true)?;
                 let name = fields.string_arg(0)?;
@@ -173,6 +185,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             facets,
             packages,
             upgrade_from,
+            signed_baselines,
             companions,
             elf_library_dirs,
             rollout_percentage,

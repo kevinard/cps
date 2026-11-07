@@ -1924,11 +1924,34 @@ publisher "seed" {{
     let latest_pin = fs::read_to_string(seed.repo.join("current"))?;
     write_policy("1.0.0-0", &latest_pin, "", "")?;
     let next = publish_release(&f.repo, &f.private, &retire_newer)?;
-    write_policy("1.0.0-0", &latest_pin, &older, "")?;
     fs::write(
         &refresh,
         format!("schema-version 1\nrelease \"canopa\" base={next:?} refresh-profiles=#true\n"),
     )?;
+    let matrix = fs::read_to_string(&policy)?.replace(
+        "        package \"desktop/compositor@1.0.0-0\"",
+        &format!(
+            "        upgrade-from {:?}\n        upgrade-from {next:?}\n        package \"desktop/compositor@1.0.0-0\"",
+            signed_base.trim(),
+        ),
+    );
+    fs::write(&policy, &matrix)?;
+    assert_eq!(publish_release(&f.repo, &f.private, &refresh)?, next);
+    fs::write(
+        &policy,
+        matrix.replace(
+            &format!("upgrade-from {next:?}"),
+            &format!("upgrade-from {:?}", unsigned_base.trim()),
+        ),
+    )?;
+    let error = publish_release(&f.repo, &f.private, &refresh).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("baseline catalog has no signed composition"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read_to_string(&pointer)?.trim(), next);
+
+    write_policy("1.0.0-0", &latest_pin, &older, "")?;
     let error = publish_release(&f.repo, &f.private, &refresh).unwrap_err();
     assert!(
         format!("{error:#}").contains(&format!("checking upgrade from {}", unsigned_base.trim())),
