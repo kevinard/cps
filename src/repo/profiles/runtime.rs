@@ -9,12 +9,13 @@ use object::elf::{EM_AARCH64, EM_X86_64};
 use crate::{
     image::{Installed, Managed, root::Root},
     kdl_format::publish_policy::Profile,
-    model::Node,
+    model::{Dependency, Node},
 };
 
 use super::elf::{self, Elf};
 
 const PATH_LIMIT: usize = 4096;
+pub(crate) const DEFAULT_LIBRARY_DIRS: [&str; 4] = ["/usr/lib", "/lib", "/usr/lib64", "/lib64"];
 
 pub(super) fn check(
     repo: &Path,
@@ -56,7 +57,55 @@ pub(super) fn check(
         }
         files.insert(path.as_str(), key);
     }
-    let elf_at = |path| files.get(path).and_then(|key| payloads[key].as_ref());
+    let elf_at = |path: &str| files.get(path).and_then(|key| payloads[key].as_ref());
+    check_paths(
+        paths,
+        machine,
+        &profile.elf_library_dirs,
+        elf_at,
+        |source, provider| {
+            if profile.elf_require_declarations {
+                check_declared_provider(installed, paths, source, provider)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn audit_installed(
+    root: &Root,
+    paths: &BTreeMap<String, Managed>,
+    arch: &str,
+    library_dirs: &[String],
+) -> Result<()> {
+    let mut files = BTreeMap::new();
+    for (path, managed) in paths {
+        if let Node::File { sha256, size, .. } = &managed.node
+            && !managed.preserve
+        {
+            let inspected = elf::inspect(root.file(path)?, *size, sha256)
+                .with_context(|| format!("inspecting installed file {path}"))?;
+            if let Some(inspected) = inspected {
+                files.insert(path.as_str(), inspected);
+            }
+        }
+    }
+    check_paths(
+        paths,
+        machine(arch)?,
+        library_dirs,
+        |path| files.get(path),
+        |_, _| Ok(()),
+    )
+}
+
+fn check_paths<'a>(
+    paths: &BTreeMap<String, Managed>,
+    machine: u16,
+    library_dirs: &[String],
+    elf_at: impl Fn(&str) -> Option<&'a Elf>,
+    dependency: impl Fn(&str, &str) -> Result<()>,
+) -> Result<()> {
     for (path, managed) in paths {
         let source = match &managed.node {
             Node::File { .. } => path,
@@ -81,20 +130,56 @@ pub(super) fn check(
                     compatible_interpreter(&paths[target].node, elf_at(target), machine),
                     "incompatible ELF interpreter {interpreter}"
                 );
+                dependency(path, target)?;
             }
             let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
             let origin = format!("/{dir}");
-            let search = library_search(info, &origin, &profile.elf_library_dirs)?;
+            let search = library_search(info, &origin, library_dirs)?;
             for needed in &info.needed {
                 let (target, _) = find_library(paths, needed, &origin, &search)?
                     .with_context(|| format!("missing ELF dependency {needed}"))?;
                 check_library(info, machine, needed, target, elf_at(target))?;
+                dependency(path, target)?;
             }
             Ok(())
         };
         check().with_context(|| format!("checking ELF runtime for {path}"))?;
     }
     Ok(())
+}
+
+fn check_declared_provider(
+    installed: &BTreeMap<String, Installed>,
+    paths: &BTreeMap<String, Managed>,
+    source: &str,
+    target: &str,
+) -> Result<()> {
+    let consumer = paths[source]
+        .owners
+        .first()
+        .context("missing ELF consumer owner")?;
+    let provider = paths[target]
+        .owners
+        .first()
+        .context("missing ELF provider owner")?;
+    if consumer == provider {
+        return Ok(());
+    }
+    let consumer = &installed[consumer].published.manifest;
+    let provider = &installed[provider].published.manifest;
+    for dependency in &consumer.dependency {
+        if let Dependency::Require(requirement) = dependency
+            && requirement.package == provider.name
+            && requirement.matches(provider.version)?
+        {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "{} needs a direct require for {} via {target}",
+        consumer.id(),
+        provider.id()
+    )
 }
 
 pub(crate) fn find_library<'a>(

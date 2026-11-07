@@ -222,6 +222,7 @@ pub(super) fn check(
                 .collect(),
             elf_library_dirs: profile.elf_library_dirs.clone(),
             elf_symbol_versions: !profile.elf_library_dirs.is_empty(),
+            elf_require_declarations: profile.elf_require_declarations,
             rollout_percentage: profile.rollout_percentage,
             advisories: check_advisories(name, profile, previous, &target)?,
         };

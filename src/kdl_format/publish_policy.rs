@@ -39,6 +39,7 @@ pub(crate) struct Profile {
     pub signed_baselines: Vec<String>,
     pub companions: Vec<Companion>,
     pub elf_library_dirs: Vec<String>,
+    pub elf_require_declarations: bool,
     pub rollout_percentage: Option<u8>,
     pub advisories: Vec<ProfileAdvisory>,
 }
@@ -101,6 +102,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     let mut facets = BTreeMap::new();
     let mut companions = Vec::new();
     let mut elf_library_dirs = Vec::new();
+    let mut elf_require_declarations = false;
     let mut signed_baselines = Vec::new();
     let mut advisories = BTreeMap::new();
     let mut baselines = upgrade_from.iter().cloned().collect::<BTreeSet<_>>();
@@ -212,7 +214,17 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             }
             "elf-check" => {
                 ensure!(elf_library_dirs.is_empty(), "duplicate elf-check block");
-                Fields::read(child, 0, &[], true)?;
+                let fields = Fields::read(child, 0, &["require-declarations"], true)?;
+                elf_require_declarations = fields
+                    .properties
+                    .get("require-declarations")
+                    .map(|value| {
+                        value
+                            .as_bool()
+                            .context("require-declarations must be #true or #false")
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
                 let directories = child
                     .children()
                     .context("elf-check requires a library-dir block")?;
@@ -242,6 +254,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             signed_baselines,
             companions,
             elf_library_dirs,
+            elf_require_declarations,
             rollout_percentage,
             advisories: advisories.into_values().collect(),
         },

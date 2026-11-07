@@ -247,6 +247,12 @@ cached payloads, filesystem metadata support, and ELF regressions before
 apply. Validation uses disposable staging and leaves the image revision and
 journal untouched. Apply repeats the checks against the current image.
 
+`cps verify --root image --runtime` also audits the installed managed ELF
+closure without a baseline. It checks the interpreter and shared libraries
+for immutable managed ELF consumers, using the default search directories
+or the ordered `--library-dir` arguments. It reports already missing
+dependencies and works without the repository.
+
 Run `bash tests/elf-transactions.sh` to exercise an install that shadows a
 working library, an incompatible upgrade, removals, a facet change, and a
 compatible replacement.
@@ -974,6 +980,12 @@ section headers removed. The selected library must define each non-weak
 required version with its recorded name and hash. Symbol-by-symbol
 relocation, libraries loaded with `dlopen`, inherited search paths, and
 loader state from the running system are outside its scope.
+
+Set `require-declarations=#true` on the `elf-check` block to also require
+a matching direct `require` for each external package supplying a managed
+ELF interpreter or shared library. The publisher checks the actual provider
+in the signed composition. This requirement carries forward to later
+catalogs for the profile.
 
 The gate applies to the fresh composition and the result of a checked
 upgrade. The signed profile records its library directories and version
@@ -2260,6 +2272,32 @@ subvolume metadata, and rollback to the previous root.
 Add `CPS_VM_BTRFS_HEALTH_FAIL=1` to change a managed file's metadata at
 trial boot and verify that two unblessed attempts fall back to the original
 subvolume.
+
+Distributions can extend the blessing gate with a systemd drop-in for
+`cps-boot-health.service`. For example, install the following at
+`/etc/systemd/system/cps-boot-health.service.d/readiness.conf` in the image.
+
+```ini
+[Unit]
+Wants=canopa-app.service
+After=canopa-app.service
+
+[Service]
+ExecStartPost=/usr/local/libexec/canopa-check-readiness
+TimeoutStartSec=90s
+```
+
+The readiness command runs after package verification. Give it a bounded
+probe of the service itself, and return nonzero if the service cannot
+serve requests. Systemd treats a failing post-start command as a failed
+health service, so the trial stays unblessed. The VM fixture's
+`CPS_VM_BTRFS_HEALTH_FAIL=readiness` mode exercises a healthy package image
+whose readiness probe fails on both trial boots.
+
+Boot rollback selects the previous root and its package state. Data mounted
+from a sibling subvolume, another device, or a network service has its own
+lifecycle. Keep shared state compatible with the previous system until the
+trial is accepted, or coordinate its backup and restore with the application.
 
 Run `tests/boot-profile-btrfs-vm.sh` to test a native Btrfs root assembled
 entirely through a signed release profile. Set `CPS_VM_CPS_FIXTURE`,

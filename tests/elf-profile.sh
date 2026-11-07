@@ -38,6 +38,9 @@ package "demo/app" publisher="canopa" version="1.0.0-0" {
 }
 MANIFEST
 "$cps" publish --repo repo --proto app --signing-key canopa.der app.kdl
+sed 's/version="1.0.0-0"/version="2.0.0-0"/; s/require "demo\/runtime"/require-any { package "demo\/runtime"; package "demo\/unused"; }/' \
+    app.kdl > indirect.kdl
+"$cps" publish --repo repo --proto app --signing-key canopa.der indirect.kdl
 base=$(cat repo/current)
 
 publish_runtime() {
@@ -51,8 +54,8 @@ schema-version 1
 publisher "canopa" {
     builder-key "../runtime-public.der"
     profile "desktop" architecture="$arch" {
-        package "demo/app"
-        elf-check {
+        package "demo/app@1.0.0-0"
+        elf-check require-declarations=#true {
             library-dir "/usr/lib"
         }
         publisher "runtime" catalog="$(cat companion/current)" {
@@ -99,8 +102,13 @@ cp -- "$library_blob" saved-library
 printf x | dd of="$library_blob" bs=1 seek=0 conv=notrunc status=none
 reject_refresh 'payload digest differs from manifest'
 mv -- saved-library "$library_blob"
+sed -i 's/demo\/app@1.0.0-0/demo\/app@2.0.0-0/' repo/publish-policy.kdl
+reject_refresh 'needs a direct require for cps://runtime/demo/runtime@3.0.0-0'
+write_policy
 refresh
 base=$(cat repo/current)
+sed -i 's/ require-declarations=#true//' repo/publish-policy.kdl
+reject_refresh 'release drops ELF dependency declaration checking'
 
 mv runtime/usr/lib/demo/libcps-demo.so.1 runtime/usr/lib/demo/old-link
 printf 'not an ELF library\n' > runtime/usr/lib/demo/libcps-demo.so.1
@@ -121,7 +129,7 @@ objcopy --strip-section-headers runtime/usr/lib/demo/libcps-demo.so.1.0
 publish_runtime 6.0.0-0
 write_policy
 reject_refresh 'does not provide required version CPS_DEMO_2.0'
-sed -i '/elf-check {/,/        }/d' repo/publish-policy.kdl
+sed -i '/elf-check .*{/,/        }/d' repo/publish-policy.kdl
 reject_refresh 'release drops ELF checking for signed profile desktop'
 
 cat > image.kdl <<CONFIG
@@ -140,6 +148,6 @@ CONFIG
 "$cps" image-create --root image --config image.kdl
 "$cps" plan --root image --output install.json install-profile
 "$cps" apply --root image install.json
-"$cps" verify --root image --pristine
+"$cps" verify --root image --pristine --runtime
 test -L image/usr/lib/demo/libcps-demo.so.1
 echo 'Verified the signed ELF profile with a merged /usr and a companion publisher'

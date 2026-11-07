@@ -10,6 +10,7 @@ use crate::{
     image::{Image, Managed, State, root::Root},
     model::{Node, PackageSpec, validate_path},
     plan::{check_dependencies, effective_paths, hardlink_groups},
+    repo::profiles::runtime::{self, DEFAULT_LIBRARY_DIRS},
 };
 
 #[derive(Debug)]
@@ -20,6 +21,27 @@ pub struct Finding {
 
 pub fn verify(path: &Path) -> Result<Vec<Finding>> {
     verify_image(&Image::open_query(path)?)
+}
+
+/// Audit the entire installed managed ELF closure without executing its binaries.
+pub fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
+    let image = Image::open_query(path)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    image.verify_catalog_archives(&state)?;
+    let paths = manifest_paths(&state)?;
+    ensure!(
+        paths == state.paths,
+        "path ownership index differs from installed manifests"
+    );
+    let defaults = DEFAULT_LIBRARY_DIRS.map(str::to_owned);
+    let library_dirs = if library_dirs.is_empty() {
+        &defaults[..]
+    } else {
+        library_dirs
+    };
+    crate::kdl_format::publish_policy::validate_elf_dirs(&state.settings.arch, library_dirs)?;
+    runtime::audit_installed(&image.root, &paths, &state.settings.arch, library_dirs)
 }
 
 pub fn verify_selected(root: &Path, packages: &[String], paths: &[String]) -> Result<Vec<Finding>> {

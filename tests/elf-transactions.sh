@@ -115,6 +115,11 @@ test ! -e staged
 rm -- drifted/usr/lib/libcps-abi.so.1
 "$cps" plan --root drifted --output drifted.json update
 "$cps" apply --root drifted drifted.json
+if "$cps" verify --root drifted --runtime > rejected.log 2>&1; then
+    echo 'Runtime audit accepted an image without a required library' >&2
+    exit 1
+fi
+grep -F 'missing ELF dependency libcps-abi.so.1' rejected.log
 
 rm -- runtime/usr/lib/libcps-abi.so.2
 printf 'int answer(void) { return 43; }\n' > library.c

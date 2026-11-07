@@ -553,6 +553,7 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
         composition,
         elf_library_dirs: Vec::new(),
         elf_symbol_versions: false,
+        elf_require_declarations: false,
         rollout_percentage: None,
         advisories: Vec::new(),
     };

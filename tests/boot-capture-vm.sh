@@ -17,6 +17,10 @@ destroy=${CPS_VM_BTRFS_DESTROY:-0}
 destroy_failed=${CPS_VM_BTRFS_DESTROY_FAILED:-0}
 staged_transactions=${CPS_VM_STAGED_TRANSACTIONS:-0}
 system_commands=${CPS_VM_SYSTEM_COMMANDS:-0}
+if [[ $health_fail != 0 && $health_fail != 1 && $health_fail != readiness ]]; then
+    echo 'CPS_VM_BTRFS_HEALTH_FAIL must be 0, 1, or readiness' >&2
+    exit 2
+fi
 if [[ $system_commands == 1 && ( $native_boot != 1 || $health_fail != 0 || $destroy != 0 || $destroy_failed != 0 || $staged_transactions != 0 ) ]]; then
     echo 'CPS_VM_SYSTEM_COMMANDS requires a successful native trial' >&2
     exit 2
@@ -181,7 +185,22 @@ root_device=/dev/vda2
 root_uuid=$root_uuid
 GUEST
     root_device=/dev/vda2
-    if [[ $health_fail == 1 ]]; then touch "$root/etc/cps-btrfs-fail-health"; fi
+    if [[ $health_fail != 0 ]]; then
+        printf '%s\n' "$health_fail" > "$root/etc/cps-btrfs-fail-health"
+    fi
+    if [[ $health_fail == readiness ]]; then
+        mkdir -p "$root/etc/systemd/system/cps-boot-health.service.d"
+        cat > "$root/etc/systemd/system/cps-boot-health.service.d/readiness.conf" <<'UNIT'
+[Service]
+ExecStartPost=/usr/local/libexec/cps-test-readiness
+UNIT
+        cat > "$root/usr/local/libexec/cps-test-readiness" <<'GUEST'
+#!/bin/sh
+bb=/bin/busybox
+test "$($bb cat /etc/cps-capture-version)" != "$($bb cat /etc/cps-btrfs-trial-version)"
+GUEST
+        chmod 0755 "$root/usr/local/libexec/cps-test-readiness"
+    fi
     cat > "$root/init-systemd" <<'GUEST'
 #!/bin/sh
 set -eu
@@ -198,7 +217,8 @@ mount -t tmpfs tmpfs /tmp
 while read -r module name; do insmod "$module"; done < "/vm-modules/$($bb uname -r)/load"
 mount -t vfat /dev/vda1 /efi
 mount -t btrfs -o subvolid=5 /dev/vda2 /volume
-if [ -f /etc/cps-btrfs-fail-health ] && [ "$($bb cat /etc/cps-capture-version)" = "$($bb cat /etc/cps-btrfs-trial-version)" ]; then
+if [ -f /etc/cps-btrfs-fail-health ] && [ "$($bb cat /etc/cps-btrfs-fail-health)" = 1 ] &&
+    [ "$($bb cat /etc/cps-capture-version)" = "$($bb cat /etc/cps-btrfs-trial-version)" ]; then
     $bb chmod 0600 /volume/@captures/trial/root/etc/cps-capture-version
 fi
 flags=
@@ -240,8 +260,13 @@ if [ -f /etc/cps-btrfs-trial-kernel ]; then
     fi
 fi
 if [ "$version" = "$trial_version" ] && [ -f /etc/cps-btrfs-fail-health ]; then
-    if cps verify --root / > /run/rejected 2>&1; then exit 1; fi
-    $bb grep -F 'etc/cps-capture-version' /run/rejected
+    if [ "$($bb cat /etc/cps-btrfs-fail-health)" = readiness ]; then
+        cps verify --root /
+        echo 'CPS_VM_BTRFS_BOOT: image verified but readiness failed'
+    else
+        if cps verify --root / > /run/rejected 2>&1; then exit 1; fi
+        $bb grep -F 'etc/cps-capture-version' /run/rejected
+    fi
     systemctl is-failed --quiet cps-boot-health.service
     if systemctl is-active --quiet systemd-bless-boot.service; then exit 1; fi
     echo 'CPS_VM_BTRFS_BOOT: trial health failed without blessing'
@@ -582,9 +607,12 @@ if [[ $native_boot == 1 ]]; then
         grep -Fx 'CPS_VM_BTRFS_DESTROY: staged another trial from the blessed root' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_DESTROY: retired old root and artifacts after retry' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_DESTROY: previous root booted after cleanup' uefi.log.clean
-    elif [[ $health_fail == 1 ]]; then
+    elif [[ $health_fail != 0 ]]; then
         test "$(grep -Fxc 'CPS_VM_BTRFS_BOOT: trial health failed without blessing' uefi.log.clean)" = 2
         grep -Fx 'CPS_VM_BTRFS_BOOT: previous root after exhausted trial' uefi.log.clean
+        if [[ $health_fail == readiness ]]; then
+            test "$(grep -Fxc 'CPS_VM_BTRFS_BOOT: image verified but readiness failed' uefi.log.clean)" = 2
+        fi
         if [[ $destroy_failed == 1 ]]; then
             grep -Fx 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed' uefi.log.clean
         fi

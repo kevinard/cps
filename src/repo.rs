@@ -88,6 +88,8 @@ pub(crate) struct ReleaseProfile {
     pub elf_library_dirs: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub elf_symbol_versions: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub elf_require_declarations: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -618,6 +620,10 @@ impl Catalog {
                 ensure!(
                     !profile.elf_symbol_versions || next.elf_symbol_versions,
                     "release drops ELF symbol version checking for signed profile {name}"
+                );
+                ensure!(
+                    !profile.elf_require_declarations || next.elf_require_declarations,
+                    "release drops ELF dependency declaration checking for signed profile {name}"
                 );
             }
             if !profile.roots.is_empty() {
@@ -1291,8 +1297,9 @@ fn decode_catalog(
         validate_name(name).context("invalid signed profile name")?;
         validate_publisher(&profile.architecture).context("invalid signed profile architecture")?;
         ensure!(
-            !profile.elf_symbol_versions || !profile.elf_library_dirs.is_empty(),
-            "ELF symbol version checking requires library directories"
+            !(profile.elf_symbol_versions || profile.elf_require_declarations)
+                || !profile.elf_library_dirs.is_empty(),
+            "ELF checking policy requires library directories"
         );
         if !profile.elf_library_dirs.is_empty() {
             publish_policy::validate_elf_dirs(&profile.architecture, &profile.elf_library_dirs)?;
@@ -2567,6 +2574,7 @@ mod tests {
                 composition: BTreeMap::new(),
                 elf_library_dirs: vec![],
                 elf_symbol_versions: false,
+                elf_require_declarations: false,
                 rollout_percentage: None,
                 advisories: Vec::new(),
             },
@@ -2707,6 +2715,7 @@ mod tests {
                     composition: BTreeMap::new(),
                     elf_library_dirs: vec!["/usr/lib".to_owned()],
                     elf_symbol_versions: true,
+                    elf_require_declarations: false,
                     rollout_percentage: None,
                     advisories: Vec::new(),
                 },

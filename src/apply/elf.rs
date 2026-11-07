@@ -15,8 +15,8 @@ use crate::{
     repo::profiles::{
         elf::{self, Elf},
         runtime::{
-            check_library, compatible_interpreter, find_library, library_search, machine, native,
-            resolve,
+            DEFAULT_LIBRARY_DIRS, check_library, compatible_interpreter, find_library,
+            library_search, machine, native, resolve,
         },
     },
 };
@@ -44,7 +44,7 @@ pub(super) fn check(
     next: &State,
 ) -> Result<()> {
     let machine = machine(&next.settings.arch)?;
-    let defaults = ["/usr/lib", "/lib", "/usr/lib64", "/lib64"].map(str::to_owned);
+    let defaults = DEFAULT_LIBRARY_DIRS.map(str::to_owned);
     let mut before = Files {
         root,
         stage,

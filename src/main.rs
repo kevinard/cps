@@ -372,6 +372,11 @@ enum Command {
         /// Limit file verification to this managed path
         #[arg(long = "path", value_name = "PATH")]
         paths: Vec<String>,
+        /// Audit the installed managed ELF interpreter and shared-library closure
+        #[arg(long, conflicts_with_all = ["packages", "paths"])]
+        runtime: bool,
+        #[arg(long = "library-dir", requires = "runtime", value_name = "PATH")]
+        library_dirs: Vec<String>,
     },
     /// Manage systemd-boot environments
     BootEnv {
@@ -2576,6 +2581,8 @@ fn run(command: Command) -> Result<ExitCode> {
             pristine,
             packages,
             paths,
+            runtime,
+            library_dirs,
         } => {
             let findings = if pristine {
                 verify_pristine(&root)?
@@ -2593,6 +2600,10 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             if findings.iter().any(|finding| finding.is_error) {
                 return Ok(ExitCode::FAILURE);
+            }
+            if runtime {
+                cps::verify_elf_runtime(&root, &library_dirs)?;
+                println!("Managed ELF runtime verified");
             }
             if packages.is_empty() && paths.is_empty() {
                 println!("Image verified");
