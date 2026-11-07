@@ -472,7 +472,43 @@ pub fn create_image(
 }
 
 pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
-    let config = read_image_definition(config)?;
+    create_configured_image_at(path, config, None, None)
+}
+
+/// Initialize a configured image at an explicit historical or candidate catalog.
+pub fn create_configured_image_at(
+    path: &Path,
+    config: &Path,
+    catalog: Option<&str>,
+    primary_repo: Option<&Path>,
+) -> Result<String> {
+    let mut config = read_image_definition(config)?;
+    if let Some(repo) = primary_repo {
+        ensure!(
+            catalog.is_some(),
+            "a repository override requires an explicit bootstrap catalog"
+        );
+        config
+            .publishers
+            .first_mut()
+            .context("missing primary publisher")?
+            .repository = repo.to_owned();
+    }
+    if let Some(catalog) = catalog {
+        crate::model::validate_digest(catalog)?;
+        ensure!(
+            config.release_profile.is_some(),
+            "a bootstrap catalog requires a release profile"
+        );
+        ensure!(
+            config
+                .bootstrap_catalog
+                .as_deref()
+                .is_none_or(|configured| configured == catalog),
+            "explicit bootstrap catalog differs from the image configuration"
+        );
+        config.bootstrap_catalog = Some(catalog.to_owned());
+    }
     let publishers = configured_publishers(&config)?;
     let publishers = Publishers::new(publishers, config.release_profile)?;
     let profile = publishers.select_profile(

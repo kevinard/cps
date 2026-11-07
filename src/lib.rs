@@ -52,7 +52,7 @@ pub use image::publishers::{
     audit_publisher_builds, list_publishers, prefer_publisher, remove_publisher,
     set_publisher_build_trust, set_publisher_repositories,
 };
-pub use image::{create_configured_image, create_image};
+pub use image::{create_configured_image, create_configured_image_at, create_image};
 pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{
@@ -65,7 +65,8 @@ pub use repo::{
     enable_file_index, export_rebuild_inputs, fetch_build_sources, list_obsoletions,
     list_withdrawals, publish, publish_bundle, publish_release, publish_release_with_mode,
     publish_release_with_sources, publish_witnessed_bundle, publish_witnessed_bundle_with_sources,
-    read_attestation, release, rotate_publisher_key, verify_rebuild, withdraw_package,
+    read_attestation, release, rotate_publisher_key, verify_rebuild, widen_rollout,
+    withdraw_package,
 };
 pub use verify::{Finding, verify, verify_pristine, verify_selected};
 

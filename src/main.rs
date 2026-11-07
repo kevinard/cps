@@ -22,7 +22,7 @@ use cps::{
     activate_boot_environment, activate_boot_environment_on_disk, activate_btrfs_boot_environment,
     activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
     add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
-    build_with_recipe_options, capture_boot_environment, create_configured_image, create_image,
+    build_with_recipe_options, capture_boot_environment, create_image,
     deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
     export_boot_environment, export_boot_environment_receipt, export_rebuild_inputs,
     fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
@@ -205,6 +205,12 @@ enum Command {
         /// Initialize from a portable image bundle using locally configured trust
         #[arg(long, requires = "config", conflicts_with = "lock")]
         bundle: Option<PathBuf>,
+        /// Bootstrap the configured release profile from this exact signed catalog
+        #[arg(long, requires = "config", conflicts_with_all = ["lock", "bundle"])]
+        bootstrap_catalog: Option<String>,
+        /// Use this primary repository when bootstrapping a pinned release profile
+        #[arg(long, requires = "bootstrap_catalog")]
+        primary_repo: Option<PathBuf>,
         #[arg(long, required_unless_present = "config")]
         repo: Option<PathBuf>,
         #[arg(long, required_unless_present = "config")]
@@ -630,6 +636,21 @@ fn parse_repository(value: &str) -> std::result::Result<(String, PathBuf), Strin
 
 #[derive(Subcommand)]
 enum RepoCommand {
+    /// Widen one profile's rollout on the exact current catalog
+    WidenRollout {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        percentage: u8,
+    },
     /// Enable a catalog-signed index for available package file lookups
     IndexFiles {
         #[arg(long)]
@@ -1701,6 +1722,24 @@ fn run(command: Command) -> Result<ExitCode> {
             );
         }
         Command::Repo { command } => match command {
+            RepoCommand::WidenRollout {
+                repo,
+                publisher,
+                signing_key,
+                base,
+                profile,
+                percentage,
+            } => {
+                let hash = cps::widen_rollout(
+                    &repo,
+                    &publisher,
+                    &signing_key,
+                    &base,
+                    &profile,
+                    percentage,
+                )?;
+                println!("Published catalog {hash}");
+            }
             RepoCommand::IndexFiles {
                 repo,
                 publisher,
@@ -2039,6 +2078,8 @@ fn run(command: Command) -> Result<ExitCode> {
             config,
             lock,
             bundle,
+            bootstrap_catalog,
+            primary_repo,
             repo,
             publisher,
             trust_key,
@@ -2052,7 +2093,12 @@ fn run(command: Command) -> Result<ExitCode> {
                 (Some(config), Some(lock), None) => {
                     cps::create_image_from_lock(&root, &config, &cps::read_image_lock(&lock)?)?
                 }
-                (Some(path), None, None) => create_configured_image(&root, &path)?,
+                (Some(path), None, None) => cps::create_configured_image_at(
+                    &root,
+                    &path,
+                    bootstrap_catalog.as_deref(),
+                    primary_repo.as_deref(),
+                )?,
                 (None, None, None) => create_image(
                     &root,
                     &repo.context("missing repository")?,

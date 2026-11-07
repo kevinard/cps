@@ -2202,6 +2202,46 @@ pub fn enable_file_index(repo: &Path, publisher: &str, key: &Path) -> Result<Str
     write_catalog_document(repo, catalog, &key, ReleaseMode::Publish)
 }
 
+/// Widen an admitted composition's rollout while retaining every other release field.
+pub fn widen_rollout(
+    repo: &Path,
+    publisher: &str,
+    key: &Path,
+    base: &str,
+    profile: &str,
+    percentage: u8,
+) -> Result<String> {
+    validate_publisher(publisher)?;
+    validate_name(profile)?;
+    validate_digest(base)?;
+    ensure!(
+        percentage <= 100,
+        "rollout percentage must be between 0 and 100"
+    );
+    let key = read_signing_key(key)?;
+    let _lock = lock_repo(repo)?;
+    let current = publication_base(repo)?.context("repository has no release to widen")?;
+    ensure!(
+        current == base,
+        "rollout base is stale: expected {base}, current is {current}"
+    );
+    let mut catalog = publication_catalog(repo, publisher, &key, Some(&current))?;
+    let profile = catalog
+        .release_profiles
+        .get_mut(profile)
+        .context("unknown release profile")?;
+    let previous = profile
+        .rollout_percentage
+        .context("profile has no phased rollout")?;
+    ensure!(
+        percentage > previous,
+        "rollout must increase from {previous}%"
+    );
+    profile.rollout_percentage = Some(percentage);
+    // The package entries are unchanged, so any signed file index remains valid.
+    write_catalog_document(repo, catalog, &key, ReleaseMode::Publish)
+}
+
 fn store_file_index(repo: &Path, catalog: &Catalog) -> Result<String> {
     let mut index = FileIndex::new();
     for (id, entry) in &catalog.entries {

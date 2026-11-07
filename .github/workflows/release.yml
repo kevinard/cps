@@ -1,0 +1,71 @@
+name: Release promotion and rollout
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Release operation
+        type: choice
+        options:
+          - promote
+          - widen
+          - deploy-current
+        required: true
+      request:
+        description: Release request directory name for promote
+        type: string
+      catalog:
+        description: Expected current catalog SHA-256 for widen or deploy-current
+        type: string
+      profile:
+        description: Signed release profile for widen
+        type: string
+      percentage:
+        description: New percentage for widen
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cps-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, cps-release]
+    environment: cps-release
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build and test the release tool
+        run: |
+          cargo build --locked --offline --release
+          cargo test --locked --offline
+          CPS_BIN="$GITHUB_WORKSPACE/target/release/cps" bash tests/release-ci.sh
+      - name: Rehearse, promote, or widen
+        env:
+          CPS_RELEASE_REPO: ${{ vars.CPS_RELEASE_REPO }}
+          CPS_RELEASE_PUBLISHER: ${{ vars.CPS_RELEASE_PUBLISHER }}
+          CPS_RELEASE_INPUTS: ${{ vars.CPS_RELEASE_INPUTS }}
+          CPS_RELEASE_SOURCE_CACHE: ${{ vars.CPS_RELEASE_SOURCE_CACHE }}
+          CPS_RELEASE_VM_GATE: ${{ vars.CPS_RELEASE_VM_GATE }}
+          CPS_RELEASE_ROLLOUT_GATE: ${{ vars.CPS_RELEASE_ROLLOUT_GATE }}
+          CPS_RELEASE_DEPLOY: ${{ vars.CPS_RELEASE_DEPLOY }}
+          CPS_RELEASE_SIGNING_KEY: ${{ secrets.CPS_RELEASE_SIGNING_KEY_PATH }}
+          CPS_OPERATION: ${{ inputs.operation }}
+          CPS_REQUEST: ${{ inputs.request }}
+          CPS_CATALOG: ${{ inputs.catalog }}
+          CPS_PROFILE: ${{ inputs.profile }}
+          CPS_PERCENTAGE: ${{ inputs.percentage }}
+        run: |
+          export CPS_BIN="$GITHUB_WORKSPACE/target/release/cps"
+          case "$CPS_OPERATION" in
+            promote) bash ci/release.sh promote "$CPS_REQUEST" ;;
+            widen) bash ci/release.sh widen "$CPS_CATALOG" "$CPS_PROFILE" "$CPS_PERCENTAGE" ;;
+            deploy-current) bash ci/release.sh deploy-current "$CPS_CATALOG" ;;
+            *) exit 2 ;;
+          esac

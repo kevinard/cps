@@ -1683,6 +1683,57 @@ the fixed version and any operator action. Publishers can carry advisories
 forward in later profiles while affected versions remain deployed. Upgrade
 clients before publishing profiles with advisories.
 
+### Running release promotion in CI
+
+The GitHub Actions release workflow runs on a dedicated, trusted Linux
+runner labeled `cps-release` and uses the `cps-release` environment. Restrict
+the environment and runner to the protected `main` branch. Install the CPS
+build dependencies, populate the locked Cargo dependency cache, and install
+GNU coreutils and `jq` on the runner.
+
+Configure the environment variables below as absolute runner paths unless
+the value is a publisher name. Put the local path of the protected publisher
+key in the environment secret `CPS_RELEASE_SIGNING_KEY_PATH`.
+
+| Variable | Value |
+| --- | --- |
+| `CPS_RELEASE_REPO` | Writable publishing repository |
+| `CPS_RELEASE_PUBLISHER` | Publisher name |
+| `CPS_RELEASE_INPUTS` | Trusted parent directory of release requests |
+| `CPS_RELEASE_SOURCE_CACHE` | Optional source cache for release build bundles |
+| `CPS_RELEASE_VM_GATE` | Executable that boots and smoke-tests an actual rehearsed root |
+| `CPS_RELEASE_ROLLOUT_GATE` | Executable that checks health of the deployed cohort |
+| `CPS_RELEASE_DEPLOY` | Executable that deploys the signed catalog to the serving mirror |
+
+Each request contains `release.kdl` and a `cases/` directory. Each named
+case contains an `image.kdl` using trusted publisher keys and the intended
+profile and architecture. Add a `baselines` file with one additional
+historical catalog digest per line. An optional executable
+`before-upgrade` receives the CPS binary, baseline root, baseline digest,
+and candidate digest. Use it to install representative third-party
+software or prepare service state. The runner rehearses each profile's
+fresh install and upgrade from the current signed profile, plus the
+specified historical baselines. List every supported historical composition
+in the relevant cases. Each rehearsal checks the applied catalog pin and
+calls the VM gate with mode (`fresh` or `upgrade`), profile, candidate
+digest, baseline digest, resulting root, and previous root. The last two
+baseline arguments are empty for a fresh install.
+
+Dispatch `promote` with a request name. A failed rehearsal leaves the
+publishing pointer in place. Dispatch `widen` with the deployed catalog
+digest, profile, and new percentage. It calls the rollout gate with the
+repository, publisher, digest, profile, and percentage before signing a
+successor. Widening changes only the signed rollout percentage and
+catalog sequence. The existing cohort assignment stays stable.
+
+The deployment adapter receives the repository, publisher, and exact
+catalog digest. It should check the digest before exporting and signing
+TUF targets, publish the new timestamp last, and safely accept retries.
+If mirror deployment fails after local promotion, dispatch
+`deploy-current` with the current digest to retry that deployment.
+`bash tests/release-ci.sh` exercises the workflow with a local repository
+and test adapters.
+
 ### Provisioning the same composition on another machine
 
 ```sh
