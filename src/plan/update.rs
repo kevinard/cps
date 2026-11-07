@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use super::{catalogs::Catalogs, freeze};
 use crate::{
     image::{Image, State},
-    model::Version,
-    repo::{CatalogPin, ReleaseProfile},
+    model::{Version, VersionConstraint},
+    repo::{CatalogPin, ReleaseAdvisory, ReleaseProfile},
 };
 
 /// The signed target profile is outside this image's rollout cohort.
@@ -19,6 +19,29 @@ pub struct PhasedUpdateDeferred {
     pub catalog: String,
     pub percentage: u8,
     pub cohort: u8,
+}
+
+pub(super) struct Rollout<'a> {
+    pub force: bool,
+    pub advisories: Option<&'a mut Vec<ReleaseAdvisory>>,
+}
+
+pub(super) fn matching_advisories(
+    state: &State,
+    profile: &ReleaseProfile,
+) -> Result<Vec<ReleaseAdvisory>> {
+    let mut matching = Vec::new();
+    for advisory in &profile.advisories {
+        if let Some(installed) = state.installed.get(&advisory.package) {
+            let manifest = &installed.published.manifest;
+            if manifest.publisher == advisory.publisher
+                && VersionConstraint::parse(Some(&advisory.affected))?.matches(manifest.version)
+            {
+                matching.push(advisory.clone());
+            }
+        }
+    }
+    Ok(matching)
 }
 
 impl fmt::Display for PhasedUpdateDeferred {

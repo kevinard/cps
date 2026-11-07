@@ -90,6 +90,21 @@ pub(crate) struct ReleaseProfile {
     pub elf_symbol_versions: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_percentage: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<ReleaseAdvisory>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseAdvisory {
+    pub id: String,
+    pub package: String,
+    pub publisher: String,
+    pub affected: String,
+    pub fixed: Version,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 impl ReleaseProfile {
@@ -2467,6 +2482,7 @@ mod tests {
                 elf_library_dirs: vec![],
                 elf_symbol_versions: false,
                 rollout_percentage: None,
+                advisories: Vec::new(),
             },
         );
         let previous_hash = digest(b"previous primary catalog");
@@ -2606,6 +2622,7 @@ mod tests {
                     elf_library_dirs: vec!["/usr/lib".to_owned()],
                     elf_symbol_versions: true,
                     rollout_percentage: None,
+                    advisories: Vec::new(),
                 },
             )]),
         };

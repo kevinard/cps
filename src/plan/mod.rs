@@ -23,7 +23,7 @@ use crate::{
         lock::ImageLock, publisher_generation_is_initial, root::Root,
     },
     model::{FORMAT, Node, PackageSpec, digest, validate_name, validate_publisher},
-    repo::{BuildReceipt, Published},
+    repo::{BuildReceipt, Published, ReleaseAdvisory},
     systemd::{self, Action as SystemdAction},
 };
 
@@ -601,11 +601,19 @@ pub fn plan_with_options(path: &Path, request: Request, options: PlanOptions) ->
 pub(crate) struct UpdateDiagnostics<'a> {
     pub held_back: &'a mut Vec<HeldBackUpdate>,
     pub explain: Option<&'a str>,
+    pub advisories: Option<&'a mut Vec<ReleaseAdvisory>>,
 }
 
 pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) -> Result<Plan> {
-    let UpdateDiagnostics { held_back, explain } = diagnostics;
+    let UpdateDiagnostics {
+        held_back,
+        explain,
+        mut advisories,
+    } = diagnostics;
     held_back.clear();
+    if let Some(advisories) = &mut advisories {
+        advisories.clear();
+    }
     if let Some(name) = explain {
         validate_name(name).context("invalid package name for --explain")?;
     }
@@ -613,7 +621,11 @@ pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) ->
         path,
         Request::Update,
         PlanOptions::default(),
-        Some(UpdateDiagnostics { held_back, explain }),
+        Some(UpdateDiagnostics {
+            held_back,
+            explain,
+            advisories,
+        }),
     )?;
     held_back.retain_mut(|update| {
         let Some(package) = next.installed.get(&update.name) else {
@@ -943,7 +955,12 @@ fn build_with_update_diagnostics(
                 &requested,
                 saved,
                 updating,
-                force_phased_update,
+                update::Rollout {
+                    force: force_phased_update,
+                    advisories: diagnostics
+                        .as_mut()
+                        .and_then(|report| report.advisories.as_deref_mut()),
+                },
                 lock,
             )?;
             update_profile |= saved.is_none()

@@ -1438,6 +1438,20 @@ fn check_system_updates(
         if let Some(deferred) = &report.phased_update {
             println!("{deferred}");
         }
+        for advisory in &report.advisories {
+            println!(
+                "{} affects cps://{}/{} {}. Fixed in {}. {}",
+                advisory.id,
+                advisory.publisher,
+                advisory.package,
+                advisory.affected,
+                advisory.fixed,
+                advisory.summary
+            );
+            if let Some(action) = &advisory.action {
+                println!("Operator action for {}. {action}", advisory.id);
+            }
+        }
         print_package_changes(&report.changes);
         for update in &report.held_back {
             println!(

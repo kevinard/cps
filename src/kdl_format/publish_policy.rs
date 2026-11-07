@@ -40,6 +40,15 @@ pub(crate) struct Profile {
     pub companions: Vec<Companion>,
     pub elf_library_dirs: Vec<String>,
     pub rollout_percentage: Option<u8>,
+    pub advisories: Vec<ProfileAdvisory>,
+}
+
+pub(crate) struct ProfileAdvisory {
+    pub id: String,
+    pub package: String,
+    pub affected: String,
+    pub summary: String,
+    pub action: Option<String>,
 }
 
 pub(crate) fn validate_elf_dirs(arch: &str, dirs: &[String]) -> Result<()> {
@@ -93,10 +102,55 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     let mut companions = Vec::new();
     let mut elf_library_dirs = Vec::new();
     let mut signed_baselines = Vec::new();
+    let mut advisories = BTreeMap::new();
     let mut baselines = upgrade_from.iter().cloned().collect::<BTreeSet<_>>();
     let mut names = BTreeSet::from([publisher.to_owned()]);
     for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
         match child.name().value() {
+            "advisory" => {
+                let fields = Fields::read(
+                    child,
+                    1,
+                    &["package", "affected", "summary", "action"],
+                    false,
+                )?;
+                let id = fields.string_arg(0)?;
+                ensure!(
+                    !id.is_empty()
+                        && id.len() <= 64
+                        && id
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)),
+                    "invalid advisory ID {id:?}"
+                );
+                let package = fields.required_string("package")?;
+                validate_name(&package)?;
+                let affected = fields.required_string("affected")?;
+                crate::model::validate_summary(&affected).context("invalid advisory range")?;
+                crate::model::VersionConstraint::parse(Some(&affected))?;
+                let summary = fields.required_string("summary")?;
+                crate::model::validate_summary(&summary).context("invalid advisory summary")?;
+                let action = fields.string("action")?;
+                if let Some(action) = &action {
+                    crate::model::validate_summary(action)
+                        .context("invalid advisory operator action")?;
+                }
+                ensure!(
+                    advisories
+                        .insert(
+                            (id.clone(), package.clone()),
+                            ProfileAdvisory {
+                                id,
+                                package,
+                                affected,
+                                summary,
+                                action
+                            }
+                        )
+                        .is_none(),
+                    "duplicate advisory for the same package"
+                );
+            }
             "upgrade-from" => {
                 let hash = Fields::read(child, 1, &[], false)?.string_arg(0)?;
                 validate_digest(&hash).context("invalid profile upgrade catalog digest")?;
@@ -189,6 +243,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             companions,
             elf_library_dirs,
             rollout_percentage,
+            advisories: advisories.into_values().collect(),
         },
     ))
 }

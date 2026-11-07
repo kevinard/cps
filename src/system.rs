@@ -13,7 +13,8 @@ use rustix::fs::{FlockOperation, flock};
 use serde::Serialize;
 
 use crate::{
-    BootEnvironment, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request,
+    BootEnvironment, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, ReleaseAdvisory,
+    Request,
     apply::{apply_live, resume_live},
     boot::{
         activate_btrfs_boot_environment, entry_id, stage_running_btrfs, with_running_environment,
@@ -60,6 +61,8 @@ pub struct UpdateReport {
     pub status: UpdateStatus,
     pub changes: Vec<PackageChange>,
     pub held_back: Vec<HeldBackUpdate>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<ReleaseAdvisory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phased_update: Option<PhasedUpdateDeferred>,
     pub blockers: Vec<String>,
@@ -68,7 +71,11 @@ pub struct UpdateReport {
 }
 
 impl UpdateReport {
-    fn from_plan(result: Result<Change>, held_back: Vec<HeldBackUpdate>) -> Self {
+    fn from_plan(
+        result: Result<Change>,
+        held_back: Vec<HeldBackUpdate>,
+        advisories: Vec<ReleaseAdvisory>,
+    ) -> Self {
         let phased_update = result
             .as_ref()
             .err()
@@ -104,6 +111,7 @@ impl UpdateReport {
             status,
             changes,
             held_back,
+            advisories,
             phased_update,
             blockers,
             reboot_required: (status != UpdateStatus::Blocked).then_some(reboot_reason.is_some()),
@@ -280,16 +288,18 @@ impl System {
         explain: Option<&str>,
     ) -> UpdateReport {
         let mut held_back = Vec::new();
+        let mut advisories = Vec::new();
         let result = (|| {
             let system = Self::load(config)?;
             let _lock = system.lock()?;
             let diagnostics = UpdateDiagnostics {
                 held_back: &mut held_back,
                 explain,
+                advisories: Some(&mut advisories),
             };
             system.plan_request(Request::Update, refresh, None, Some(diagnostics))
         })();
-        UpdateReport::from_plan(result, held_back)
+        UpdateReport::from_plan(result, held_back, advisories)
     }
 
     fn plan_request(
@@ -491,7 +501,7 @@ mod tests {
             percentage: 10,
             cohort: 30,
         };
-        let report = UpdateReport::from_plan(Err(deferred.clone().into()), Vec::new());
+        let report = UpdateReport::from_plan(Err(deferred.clone().into()), Vec::new(), Vec::new());
         assert_eq!(report.status, UpdateStatus::Deferred);
         assert!(report.blockers.is_empty());
         assert_eq!(report.reboot_required, Some(false));

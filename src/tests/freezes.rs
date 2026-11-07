@@ -106,6 +106,7 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         crate::plan::UpdateDiagnostics {
             held_back: &mut held_back,
             explain: None,
+            advisories: None,
         },
     )?;
     assert_eq!(update, plan(&f.root, Request::Update)?);
@@ -152,6 +153,7 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         crate::plan::UpdateDiagnostics {
             held_back: &mut held_back,
             explain: None,
+            advisories: None,
         },
     )?;
     assert!(!blocked.has_changes());
@@ -171,6 +173,7 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         crate::plan::UpdateDiagnostics {
             held_back: &mut held_back,
             explain: None,
+            advisories: None,
         },
     )?;
     assert!(held_back.is_empty());
@@ -266,7 +269,8 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
             &f.root,
             crate::plan::UpdateDiagnostics {
                 held_back: &mut held_back,
-                explain: None
+                explain: None,
+                advisories: None,
             }
         )?
         .has_changes()
@@ -281,6 +285,7 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
         crate::plan::UpdateDiagnostics {
             held_back: &mut held_back,
             explain: None,
+            advisories: None,
         },
     )
     .unwrap_err();

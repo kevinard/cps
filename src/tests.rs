@@ -2523,6 +2523,7 @@ fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
         crate::plan::UpdateDiagnostics {
             held_back: &mut held_back,
             explain: Some("desktop/app"),
+            advisories: None,
         },
     )?;
     assert!(!inspected.has_changes());

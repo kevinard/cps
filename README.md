@@ -1653,6 +1653,20 @@ The override is recorded in the saved plan and transaction history. The
 normal signature, dependency, and image checks still apply. Upgrade clients
 before publishing profiles that use `rollout-percentage`.
 
+Attach an advisory to the profile that contains the fix. The publisher
+checks that the package is in the selected composition and that its
+selected version falls outside the affected range.
+
+```kdl
+advisory "CPS-2026-01" package="library/runtime" affected="<2.0.0-0" summary="Runtime security fix" action="Restart dependent applications"
+```
+
+`check-updates` reports matching advisories for installed packages,
+including when the target profile is deferred. The signed advisory reports
+the fixed version and any operator action. Publishers can carry advisories
+forward in later profiles while affected versions remain deployed. Upgrade
+clients before publishing profiles with advisories.
+
 ### Provisioning the same composition on another machine
 
 ```sh

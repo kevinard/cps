@@ -541,6 +541,7 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
         elf_library_dirs: Vec::new(),
         elf_symbol_versions: false,
         rollout_percentage: None,
+        advisories: Vec::new(),
     };
     let mut candidates = crate::plan::CandidateSet {
         packages: release.packages,
@@ -588,6 +589,11 @@ fn phased_profile_updates_defer_widen_and_allow_a_saved_override() -> Result<()>
     }
     let release = f._dir.path().join("refresh.kdl");
     let publish_profile = |version: &str, pin: &str, percentage: u8| -> Result<String> {
+        let advisory = if version == "2.0.0-0" {
+            r#"advisory "CPS-TEST-1" package="library/runtime" affected="<2.0.0-0" summary="Runtime security fix" action="Restart clients""#
+        } else {
+            ""
+        };
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
@@ -596,6 +602,7 @@ publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" rollout-percentage={percentage} {{
         package "desktop/base@{version}"
+        {advisory}
         publisher "seed" catalog={:?} {{ repository {:?}; trust-key {:?}; }}
     }}
 }}
@@ -643,6 +650,21 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     let initial = deferred(&f.root)?;
     assert_eq!(initial.catalog, paused);
     assert_eq!(initial.percentage, 0);
+    let mut advisories = Vec::new();
+    let mut held_back = Vec::new();
+    let error = crate::plan::inspect_update(
+        &f.root,
+        crate::plan::UpdateDiagnostics {
+            held_back: &mut held_back,
+            explain: None,
+            advisories: Some(&mut advisories),
+        },
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<PhasedUpdateDeferred>().is_some());
+    assert_eq!(advisories.len(), 1);
+    assert_eq!(advisories[0].publisher, "seed");
+    assert_eq!(advisories[0].fixed.to_string(), "2.0.0-0");
     let boot_one = f._dir.path().join("boot-one");
     let boot_two = f._dir.path().join("boot-two");
     for (source, target, package) in [
@@ -663,6 +685,15 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     create_configured_image(&fresh, &config)?;
     apply(&fresh, &plan(&fresh, Request::InstallProfile)?)?;
     assert!(!plan(&fresh, Request::Update)?.has_changes());
+    crate::plan::inspect_update(
+        &fresh,
+        crate::plan::UpdateDiagnostics {
+            held_back: &mut held_back,
+            explain: None,
+            advisories: Some(&mut advisories),
+        },
+    )?;
+    assert!(advisories.is_empty());
 
     let options = PlanOptions {
         force_phased_update: true,
