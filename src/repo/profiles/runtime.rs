@@ -78,9 +78,7 @@ pub(super) fn check(
                 let target = resolve(paths, interpreter)?
                     .with_context(|| format!("missing ELF interpreter {interpreter}"))?;
                 ensure!(
-                    elf_at(target).is_some_and(
-                        |loader| native(loader, machine) && loader.interpreter.is_none()
-                    ) && matches!(paths[target].node, Node::File { mode, .. } if mode & 0o111 != 0),
+                    compatible_interpreter(&paths[target].node, elf_at(target), machine),
                     "incompatible ELF interpreter {interpreter}"
                 );
             }
@@ -193,9 +191,17 @@ pub(crate) fn expand_absolute(path: &str, origin: &str) -> Result<String> {
     Ok(expanded)
 }
 
+pub(crate) fn compatible_interpreter(node: &Node, elf: Option<&Elf>, machine: u16) -> bool {
+    matches!(node, Node::File { mode, .. } if mode & 0o111 != 0)
+        && elf.is_some_and(|loader| native(loader, machine) && loader.interpreter.is_none())
+}
+
 /// Resolve within the signed path map. Absolute symlink targets start at
 /// the image root, including the compatibility links in a merged /usr.
-fn resolve<'a>(paths: &'a BTreeMap<String, Managed>, absolute: &str) -> Result<Option<&'a str>> {
+pub(crate) fn resolve<'a>(
+    paths: &'a BTreeMap<String, Managed>,
+    absolute: &str,
+) -> Result<Option<&'a str>> {
     walk_path(absolute, |path| {
         Ok(paths.get_key_value(path).and_then(|(name, entry)| {
             let kind = match &entry.node {

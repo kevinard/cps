@@ -10,7 +10,7 @@ cd -- "$work"
 arch=$(uname -m)
 uid=$(id -u)
 gid=$(id -g)
-mkdir -p runtime/usr/lib app/usr/bin shadow/usr/override
+mkdir -p runtime/usr/lib app/usr/bin shadow/usr/override loader/usr/lib
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
 openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 
@@ -30,7 +30,7 @@ publish() {
 install_base() {
     "$cps" image-create --root "$1" --repo repo --publisher canopa --trust-key public.der \
         --arch "$arch"
-    "$cps" plan --root "$1" --output base.json install demo/app demo/runtime@1.0.0-0
+    "$cps" plan --root "$1" --output base.json install demo/app demo/loader demo/runtime@1.0.0-0
     "$cps" apply --root "$1" base.json
 }
 reject() {
@@ -46,9 +46,12 @@ reject() {
 
 library libcps-abi.so.1 good.map runtime/usr/lib/libcps-abi.so.1.0
 ln -s libcps-abi.so.1.0 runtime/usr/lib/libcps-abi.so.1
-cc -pie -nostdlib -Wl,-e,_start -Wl,-rpath,'$ORIGIN/../override' \
+cp runtime/usr/lib/libcps-abi.so.1.0 loader/usr/lib/cps-test-loader
+chmod 0755 loader/usr/lib/cps-test-loader
+cc -pie -nostdlib -Wl,-e,_start,--dynamic-linker,/usr/lib/cps-test-loader -Wl,-rpath,'$ORIGIN/../override' \
     -o app/usr/bin/demo app.c runtime/usr/lib/libcps-abi.so.1.0
 publish app 1.0.0-0 demo/app
+publish loader 1.0.0-0 demo/loader
 publish runtime 1.0.0-0 demo/runtime
 install_base image
 install_base drifted
@@ -56,6 +59,8 @@ install_base drifted
 missing='missing ELF dependency libcps-abi.so.1 previously provided at usr/lib/libcps-abi.so.1.0'
 "$cps" plan --root image --output remove.json remove demo/runtime
 reject remove.json "$missing"
+"$cps" plan --root image --output loader.json remove demo/loader
+reject loader.json 'missing ELF interpreter /usr/lib/cps-test-loader previously provided at usr/lib/cps-test-loader'
 
 "$cps" plan --root image --output mark.json mark automatic demo/runtime
 "$cps" apply --root image mark.json

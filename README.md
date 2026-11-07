@@ -228,8 +228,8 @@ package payload and clears any pending vendor proposal for that path.
 
 On x86-64 and AArch64, applying an install, upgrade, removal, autoremove,
 or facet change checks whether any managed ELF file in the resulting image
-would lose a compatible managed shared library that works in the current
-image. The check follows the object's `DT_RUNPATH`
+would lose a compatible managed ELF interpreter or shared library that works
+in the current image. For libraries, the check follows the object's `DT_RUNPATH`
 or `DT_RPATH`, including `$ORIGIN`, then the applicable default directories
 `/usr/lib`, `/lib`, `/usr/lib64`, and `/lib64`. It follows managed links and
 checks ELF compatibility and required GNU version nodes.

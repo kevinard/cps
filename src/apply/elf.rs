@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::Read,
+    os::unix::fs::MetadataExt,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -13,7 +14,10 @@ use crate::{
     plan::{Plan, Request},
     repo::profiles::{
         elf::{self, Elf},
-        runtime::{check_library, find_library, library_search, machine, native},
+        runtime::{
+            check_library, compatible_interpreter, find_library, library_search, machine, native,
+            resolve,
+        },
     },
 };
 
@@ -70,18 +74,24 @@ pub(super) fn check(
         let Ok(Some(consumer)) = after.scan(source) else {
             continue;
         };
-        if consumer.needed.is_empty() || !native(&consumer, machine) {
+        if !native(&consumer, machine) {
             continue;
+        }
+        let mut failures = Vec::new();
+        if let Some(interpreter) = &consumer.interpreter {
+            failures.extend(interpreter_regression(
+                &mut before,
+                &mut after,
+                interpreter,
+                machine,
+            ));
         }
         let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
         let origin = format!("/{dir}");
-        let Ok(search) = library_search(&consumer, &origin, &defaults) else {
-            continue;
-        };
-        let failures: Vec<_> = consumer
-            .needed
-            .iter()
-            .filter_map(|needed| {
+        if !consumer.needed.is_empty()
+            && let Ok(search) = library_search(&consumer, &origin, &defaults)
+        {
+            failures.extend(consumer.needed.iter().filter_map(|needed| {
                 regression(
                     &mut before,
                     &mut after,
@@ -91,8 +101,8 @@ pub(super) fn check(
                     &origin,
                     &search,
                 )
-            })
-            .collect();
+            }));
+        }
         if !failures.is_empty()
             && after
                 .verified(source)
@@ -114,6 +124,39 @@ pub(super) fn check(
         broken.join("\n")
     );
     Ok(())
+}
+
+fn interpreter_regression(
+    before: &mut Files<'_>,
+    after: &mut Files<'_>,
+    interpreter: &str,
+    machine: u16,
+) -> Option<String> {
+    let old = resolve(before.paths, interpreter).ok()??;
+    let new = resolve(after.paths, interpreter).ok()?;
+    let old_node = &before.paths[old].node;
+    if new.is_some_and(|new| new == old && &after.paths[new].node == old_node)
+        || !before.root.resolves_to_file(interpreter, old).ok()?
+        || before
+            .root
+            .regular_entry(old)
+            .ok()??
+            .metadata()
+            .ok()?
+            .mode()
+            & 0o111
+            == 0
+        || !compatible_interpreter(old_node, before.verified(old)?, machine)
+    {
+        return None;
+    }
+    let Some(new) = new else {
+        return Some(format!(
+            "missing ELF interpreter {interpreter} previously provided at {old}"
+        ));
+    };
+    (!compatible_interpreter(&after.paths[new].node, after.verified(new)?, machine))
+        .then(|| format!("incompatible ELF interpreter {interpreter} at {new}"))
 }
 
 fn regression(
