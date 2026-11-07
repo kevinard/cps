@@ -63,7 +63,7 @@ pub use repo::{
     publish_release_with_sources, publish_witnessed_bundle, publish_witnessed_bundle_with_sources,
     read_attestation, release, rotate_publisher_key, verify_rebuild, withdraw_package,
 };
-pub use verify::{Finding, verify, verify_pristine};
+pub use verify::{Finding, verify, verify_pristine, verify_selected};
 
 #[cfg(test)]
 mod tests;

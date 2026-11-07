@@ -3739,6 +3739,16 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
         .collect();
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains(LIBRARY));
+    assert!(
+        crate::verify_selected(
+            &f.root,
+            &["cps://canopa/desktop/compositor@1.0.0-0".into()],
+            &[],
+        )?
+        .iter()
+        .all(|finding| !finding.is_error)
+    );
+    assert!(crate::verify_selected(&f.root, &[], &[format!("/{LIBRARY}")])?[0].is_error);
 
     fs::remove_file(f.root.join(COMPOSITOR))?;
     fs::create_dir(f.root.join(COMPOSITOR))?;
@@ -3762,6 +3772,36 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     fs::rename(&offline, &f.repo)?;
     assert_eq!(apply(&f.root, &all)?, 3);
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+
+    fs::write(f.root.join(COMPOSITOR), "damaged again")?;
+    fs::write(f.root.join(LIBRARY), "other drift")?;
+    let repair_path = plan(
+        &f.root,
+        Request::RepairPaths {
+            paths: vec![format!("/{COMPOSITOR}")],
+        },
+    )?;
+    assert_eq!(apply(&f.root, &repair_path)?, 4);
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 1");
+    assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "other drift");
+    let revert = plan(
+        &f.root,
+        Request::Revert {
+            paths: vec![CONFIG.into(), REMOVED_CONFIG.into()],
+        },
+    )?;
+    assert_eq!(apply(&f.root, &revert)?, 5);
+    assert_eq!(fs::read_to_string(f.root.join(CONFIG))?, "vendor config");
+    assert_eq!(fs::read_to_string(f.root.join(REMOVED_CONFIG))?, "optional");
+    assert!(
+        plan(
+            &f.root,
+            Request::Revert {
+                paths: vec![COMPOSITOR.into()]
+            }
+        )
+        .is_err()
+    );
     Ok(())
 }
 

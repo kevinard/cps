@@ -1,11 +1,14 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rustix::fs::FileType;
 
 use crate::{
     image::{Image, Managed, State, root::Root},
-    model::{Node, validate_path},
+    model::{Node, PackageSpec, validate_path},
     plan::{check_dependencies, effective_paths, hardlink_groups},
 };
 
@@ -17,6 +20,64 @@ pub struct Finding {
 
 pub fn verify(path: &Path) -> Result<Vec<Finding>> {
     verify_image(&Image::open_query(path)?)
+}
+
+pub fn verify_selected(root: &Path, packages: &[String], paths: &[String]) -> Result<Vec<Finding>> {
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    image.verify_catalog_archives(&state)?;
+    let mut selected = selected_paths(&state, packages, paths)?;
+    let targets = selected
+        .iter()
+        .filter_map(|&path| match &state.paths[path].node {
+            Node::Hardlink { target } => Some(target.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    selected.extend(targets);
+    check_state(&image.root, &state, false, Some(&selected))
+}
+
+pub(crate) fn selected_paths<'a>(
+    state: &'a State,
+    packages: &[String],
+    paths: &[String],
+) -> Result<BTreeSet<&'a str>> {
+    let mut selected = BTreeSet::new();
+    for path in paths {
+        let path = path.strip_prefix('/').unwrap_or(path);
+        validate_path(path)?;
+        let (path, _) = state
+            .paths
+            .get_key_value(path)
+            .with_context(|| format!("path is not managed: {path}"))?;
+        selected.insert(path.as_str());
+    }
+    for package in packages {
+        let selector = PackageSpec::parse(package)?;
+        let installed = state
+            .installed
+            .get(selector.name)
+            .with_context(|| format!("package is not installed: {package}"))?;
+        let manifest = &installed.published.manifest;
+        ensure!(
+            selector
+                .publisher
+                .is_none_or(|publisher| publisher == manifest.publisher)
+                && selector
+                    .version
+                    .is_none_or(|version| version == manifest.version),
+            "package is not installed: {package}"
+        );
+        selected.extend(state.paths.iter().filter_map(|(path, managed)| {
+            managed
+                .owners
+                .contains(selector.name)
+                .then_some(path.as_str())
+        }));
+    }
+    Ok(selected)
 }
 
 pub fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
@@ -37,7 +98,7 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
 fn check_image(image: &Image, pristine: bool) -> Result<Vec<Finding>> {
     let state = image.state()?;
     image.verify_catalog_archives(&state)?;
-    check_state(&image.root, &state, pristine)
+    check_state(&image.root, &state, pristine, None)
 }
 
 pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>> {
@@ -48,10 +109,15 @@ pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>>
 }
 
 pub(crate) fn verify_state(root: &Root, state: &State) -> Result<Vec<Finding>> {
-    check_state(root, state, false)
+    check_state(root, state, false, None)
 }
 
-fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding>> {
+fn check_state(
+    root: &Root,
+    state: &State,
+    pristine: bool,
+    selected: Option<&BTreeSet<&str>>,
+) -> Result<Vec<Finding>> {
     crate::plan::freeze::check(&state.settings.freezes, &state.installed)?;
     let expected = manifest_paths(state)?;
     let mut findings = Vec::new();
@@ -68,6 +134,9 @@ fn check_state(root: &Root, state: &State, pristine: bool) -> Result<Vec<Finding
         });
     }
     for (path, managed) in &expected {
+        if selected.is_some_and(|paths| !paths.contains(path.as_str())) {
+            continue;
+        }
         validate_path(path)?;
         if let Node::Hardlink { target } = &managed.node {
             let message = match root.hardlink_matches(path, target) {

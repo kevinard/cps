@@ -83,6 +83,12 @@ pub enum Request {
     Repair {
         packages: Vec<String>,
     },
+    RepairPaths {
+        paths: Vec<String>,
+    },
+    Revert {
+        paths: Vec<String>,
+    },
     ResolveConfig {
         path: String,
         take: ConfigChoice,
@@ -105,6 +111,8 @@ impl Request {
             Self::Autoremove => "autoremove",
             Self::ChangeFacet { .. } => "change-facet",
             Self::Repair { .. } => "repair",
+            Self::RepairPaths { .. } => "repair-paths",
+            Self::Revert { .. } => "revert",
             Self::ResolveConfig { .. } => "resolve-config",
             Self::Update => "update",
             Self::UpdateProfile => "update-profile",
@@ -422,9 +430,17 @@ impl Plan {
                 )),
             }
         }
-        if matches!(self.request, Request::Repair { .. }) {
+        if matches!(
+            self.request,
+            Request::Repair { .. } | Request::RepairPaths { .. }
+        ) {
             for write in &self.writes {
                 lines.push(format!("Repair {}", write.path));
+            }
+        }
+        if matches!(self.request, Request::Revert { .. }) {
+            for write in &self.writes {
+                lines.push(format!("Restore vendor configuration {}", write.path));
             }
         }
         for write in self.writes.iter().filter(|write| write.removes_directory()) {
@@ -816,7 +832,10 @@ fn build_with_update_diagnostics(
             next_facets = Some(settings);
             (state.installed.clone(), paths)
         }
-        Request::Repair { .. } | Request::ResolveConfig { .. } => {
+        Request::Repair { .. }
+        | Request::RepairPaths { .. }
+        | Request::Revert { .. }
+        | Request::ResolveConfig { .. } => {
             let paths = crate::verify::manifest_paths(&state)?;
             ensure!(
                 paths == state.paths,
@@ -1159,7 +1178,20 @@ fn build_with_update_diagnostics(
 
     let mut writes = match &plan.request {
         Request::Repair { packages } => {
-            repair::writes(root, &state, packages, &mut plan.preserved)?
+            repair::writes(root, &state, packages, &[], &mut plan.preserved)?
+        }
+        Request::RepairPaths { paths } => {
+            ensure!(!paths.is_empty(), "path repair requires at least one path");
+            repair::writes(root, &state, &[], paths, &mut plan.preserved)?
+        }
+        Request::Revert { paths: requested } => {
+            ensure!(!requested.is_empty(), "revert requires at least one path");
+            let selected = crate::verify::selected_paths(&state, &[], requested)?;
+            let selected = selected
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            repair::revert(root, &mut state.settings, &paths, &selected)?
         }
         Request::ResolveConfig { path, take } => {
             let (revision, write) =

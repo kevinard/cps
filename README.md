@@ -78,7 +78,7 @@ keeps the current one as fallback. CPS reports when a reboot is needed
 and leaves the timing to you. Boot into the selected environment before
 making more package changes so the next boot includes all of your work.
 
-Pass `--stage` to `install` or `upgrade` to use the trial boot workflow
+Pass `--stage` to `install`, `upgrade`, `remove`, or `autoremove` to use the trial boot workflow
 for an ordinary package change. The running root keeps its current
 packages until you reboot into the trial. Combine `--stage` with
 `--dry-run` to preview the changes and reboot requirement.
@@ -215,6 +215,14 @@ edits and deletions on files declared with `preserve=#true` and restores the
 installed permissions and ownership of files that are present. A repair that
 only fixes preserved configuration metadata works offline. Resolve path
 type conflicts involving directories or special files before retrying the plan.
+
+Use `verify --package NAME` or `verify --path /path` to limit on-disk
+checks to the selected managed files while still authenticating image
+metadata. Use `plan repair --path /path` for an exact path and any necessary
+parent directories or hard links. To intentionally replace an edited or
+removed preserved file with the defaults from its installed package, use
+`plan revert /path` and apply the saved plan. Revert uses the installed
+package payload and clears any pending vendor proposal for that path.
 
 ### Shared-library regressions
 

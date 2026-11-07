@@ -86,6 +86,9 @@ enum Command {
     Remove {
         #[command(flatten)]
         options: SystemOptions,
+        /// Stage the transaction in a new Btrfs trial boot environment
+        #[arg(long)]
+        stage: bool,
         #[arg(required = true, value_name = "PACKAGE")]
         packages: Vec<String>,
     },
@@ -93,6 +96,9 @@ enum Command {
     Autoremove {
         #[command(flatten)]
         options: SystemOptions,
+        /// Stage the transaction in a new Btrfs trial boot environment
+        #[arg(long)]
+        stage: bool,
     },
     /// Show an interrupted change or a system waiting for reboot
     Status {
@@ -330,8 +336,14 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
         /// Require an inactive root with pristine package paths and no unmanaged entries
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["packages", "paths"])]
         pristine: bool,
+        /// Limit file verification to the installed package
+        #[arg(long = "package", value_name = "PACKAGE")]
+        packages: Vec<String>,
+        /// Limit file verification to this managed path
+        #[arg(long = "path", value_name = "PATH")]
+        paths: Vec<String>,
     },
     /// Manage systemd-boot environments
     BootEnv {
@@ -897,7 +909,16 @@ enum PlanCommand {
         packages: Vec<String>,
     },
     /// Restore damaged paths from the installed package versions
-    Repair { packages: Vec<String> },
+    Repair {
+        #[arg(long = "path", value_name = "PATH", conflicts_with = "packages")]
+        paths: Vec<String>,
+        packages: Vec<String>,
+    },
+    /// Restore installed vendor defaults for the specified preserved files
+    Revert {
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
     /// Review a pending configuration update
     ResolveConfig {
         /// Path relative to the image root
@@ -1427,11 +1448,13 @@ fn run(command: Command) -> Result<ExitCode> {
         } => {
             return check_system_updates(&config, !no_refresh, json, explain.as_deref());
         }
-        Command::Remove { options, packages } => {
-            change_system(options, Request::Remove { packages }, false, false)?
-        }
-        Command::Autoremove { options } => {
-            change_system(options, Request::Autoremove, false, false)?
+        Command::Remove {
+            options,
+            stage,
+            packages,
+        } => change_system(options, Request::Remove { packages }, stage, false)?,
+        Command::Autoremove { options, stage } => {
+            change_system(options, Request::Autoremove, stage, false)?
         }
         Command::Status { config } => {
             let system = System::load(&config)?;
@@ -2223,7 +2246,11 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::ChangeFacet { facets } => Request::ChangeFacet {
                     facets: parse_facet_changes(facets)?,
                 },
-                PlanCommand::Repair { packages } => Request::Repair { packages },
+                PlanCommand::Repair { packages, paths } if paths.is_empty() => {
+                    Request::Repair { packages }
+                }
+                PlanCommand::Repair { paths, .. } => Request::RepairPaths { paths },
+                PlanCommand::Revert { paths } => Request::Revert { paths },
                 PlanCommand::ResolveConfig { path, take } => Request::ResolveConfig { path, take },
                 PlanCommand::Update { .. } => Request::Update,
             };
@@ -2309,9 +2336,16 @@ fn run(command: Command) -> Result<ExitCode> {
             let count = fetch_plan_with_archives(&root, &saved, &archive_caches)?;
             println!("Verified {count} plan payloads");
         }
-        Command::Verify { root, pristine } => {
+        Command::Verify {
+            root,
+            pristine,
+            packages,
+            paths,
+        } => {
             let findings = if pristine {
                 verify_pristine(&root)?
+            } else if !packages.is_empty() || !paths.is_empty() {
+                cps::verify_selected(&root, &packages, &paths)?
             } else {
                 verify(&root)?
             };
@@ -2325,7 +2359,11 @@ fn run(command: Command) -> Result<ExitCode> {
             if findings.iter().any(|finding| finding.is_error) {
                 return Ok(ExitCode::FAILURE);
             }
-            println!("Image verified");
+            if packages.is_empty() && paths.is_empty() {
+                println!("Image verified");
+            } else {
+                println!("Selected paths verified");
+            }
         }
         Command::BootEnv { command } => match command {
             BootCommand::List {
