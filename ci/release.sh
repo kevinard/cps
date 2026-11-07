@@ -26,9 +26,36 @@ catalog_from_output() {
 }
 
 deploy_catalog() {
+    local marker
     [[ $(current) == "$1" ]] || fail 'The repository advanced before deployment'
-    env -u CPS_RELEASE_SIGNING_KEY "$deploy" "$repo" "$publisher" "$1"
+    env -u CPS_RELEASE_SIGNING_KEY "$deploy" "$repo" "$publisher" "$1" || return
+    [[ $(current) == "$1" ]] || fail 'The repository advanced during deployment'
+    marker=$(mktemp "$repo/.ci-deployed.XXXXXX")
+    if ! { printf '%s\n' "$1" > "$marker" && mv -T -- "$marker" "$repo/.ci-deployed-catalog"; }; then
+        rm -f -- "$marker"
+        fail 'Cannot record the deployed catalog'
+    fi
     printf 'Deployed catalog %s\n' "$1"
+}
+
+widen_catalog() {
+    local base=$1 profile=$2 percentage=$3 key gate message hash
+    key=${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}
+    gate=${CPS_RELEASE_ROLLOUT_GATE:?Set CPS_RELEASE_ROLLOUT_GATE to the cohort health adapter}
+    [[ $gate = /* && -x $gate ]] || fail 'Use an absolute executable path for the rollout gate'
+    [[ $(current) == "$base" ]] || fail 'The requested rollout catalog is stale'
+    if env -u CPS_RELEASE_SIGNING_KEY "$gate" "$repo" "$publisher" "$base" "$profile" "$percentage"; then
+        :
+    elif [[ $? == 75 && ${4:-} == defer ]]; then
+        printf 'Waiting for rollout health at catalog %s\n' "$base"
+        return 0
+    else
+        fail 'Rollout health gate failed'
+    fi
+    message=$("$cps" repo widen-rollout --repo "$repo" --publisher "$publisher" \
+        --signing-key "$key" --base "$base" --profile "$profile" --percentage "$percentage") || return
+    hash=$(catalog_from_output "$message" Published) || return
+    deploy_catalog "$hash"
 }
 
 case ${1:-} in
@@ -60,18 +87,50 @@ case ${1:-} in
     widen)
         [[ $# == 4 ]] && digest "$2" && [[ $4 =~ ^(100|[1-9][0-9]?)$ ]] ||
             fail 'Expected widen CURRENT_SHA256 PROFILE PERCENTAGE'
-        key=${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}
-        gate=${CPS_RELEASE_ROLLOUT_GATE:?Set CPS_RELEASE_ROLLOUT_GATE to the cohort health adapter}
-        [[ $gate = /* && -x $gate ]] || fail 'Use an absolute executable path for the rollout gate'
-        [[ $(current) == "$2" ]] || fail 'The requested rollout catalog is stale'
-        env -u CPS_RELEASE_SIGNING_KEY "$gate" "$repo" "$publisher" "$2" "$3" "$4"
-        message=$("$cps" repo widen-rollout --repo "$repo" --publisher "$publisher" \
-            --signing-key "$key" --base "$2" --profile "$3" --percentage "$4")
-        deploy_catalog "$(catalog_from_output "$message" Published)"
+        widen_catalog "$2" "$3" "$4"
+        ;;
+    advance)
+        [[ $# == 1 ]] || fail 'Expected advance'
+        policy=${CPS_RELEASE_ROLLOUT_PLAN:?Set CPS_RELEASE_ROLLOUT_PLAN to the approved JSON policy}
+        [[ $policy = /* && -f $policy ]] || fail 'Use an absolute path to an existing rollout policy'
+        rules=$(jq -ce 'select(
+            (.catalog | test("^[0-9a-f]{64}$")) and (.profile | type == "string" and length > 0)
+            and (.percentages | type == "array" and length >= 2
+                and all(.[]; type == "number" and floor == . and . >= 0 and . <= 100)
+                and . == unique)
+        )' "$policy")
+        initial=$(jq -r '.catalog' <<< "$rules")
+        profile=$(jq -r '.profile' <<< "$rules")
+        base=$(current)
+        digest "$base" || fail 'Invalid current catalog'
+        for hash in "$initial" "$base"; do
+            printf '%s  %s\n' "$hash" "$repo/catalogs/$hash" | sha256sum --check --status ||
+                fail "Cannot verify catalog $hash"
+        done
+        jq -es --arg profile "$profile" '
+            def stable: .catalog | del(.sequence, .release_profiles[$profile].rollout_percentage);
+            (.[0] | stable) == (.[1] | stable)
+        ' "$repo/catalogs/$initial" "$repo/catalogs/$base" >/dev/null ||
+            fail 'Current catalog is outside the approved rollout'
+        previous=$(jq -er --arg profile "$profile" '.catalog.release_profiles[$profile].rollout_percentage' \
+            "$repo/catalogs/$base")
+        first=$(jq -er --arg profile "$profile" '.catalog.release_profiles[$profile].rollout_percentage' \
+            "$repo/catalogs/$initial")
+        next=$(jq -er --argjson first "$first" --argjson previous "$previous" '
+            .percentages | select(.[0] == $first) | index($previous) as $step
+            | select($step != null) | .[$step + 1] // "complete"
+        ' <<< "$rules") || fail 'Catalog rollout percentage is outside the approved steps'
+        if [[ ! -f $repo/.ci-deployed-catalog || $(cat "$repo/.ci-deployed-catalog") != "$base" ]]; then
+            deploy_catalog "$base"
+        elif [[ $next == complete ]]; then
+            printf 'Rollout policy complete at catalog %s\n' "$base"
+        else
+            widen_catalog "$base" "$profile" "$next" defer
+        fi
         ;;
     deploy-current)
         [[ $# == 2 ]] && digest "$2" || fail 'Expected deploy-current CURRENT_SHA256'
         deploy_catalog "$2"
         ;;
-    *) fail 'Expected promote, widen, or deploy-current' ;;
+    *) fail 'Expected promote, widen, advance, or deploy-current' ;;
 esac

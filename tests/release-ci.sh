@@ -9,6 +9,7 @@ export CPS_RELEASE_REPO=$work/repo CPS_RELEASE_PUBLISHER=canopa
 export CPS_RELEASE_INPUTS=$work/requests CPS_RELEASE_SIGNING_KEY=$work/key.der
 export CPS_RELEASE_VM_GATE=$work/vm-gate CPS_RELEASE_ROLLOUT_GATE=$work/rollout-gate
 export CPS_RELEASE_DEPLOY=$work/deploy CPS_TEST_LOG=$work/checks
+export CPS_RELEASE_ROLLOUT_PLAN=$work/rollout.json
 openssl genpkey -algorithm ED25519 -outform DER -out key.der
 openssl pkey -inform DER -in key.der -pubout -outform DER -out public.der
 mkdir -p proto/usr/share requests/next/cases/desktop
@@ -52,14 +53,17 @@ GATE
 cat > "$CPS_RELEASE_ROLLOUT_GATE" <<'GATE'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -z ${CPS_RELEASE_SIGNING_KEY:-} && $3 == "$(cat "$1/current")" && $4 == desktop && $5 == 50 ]]
+[[ -z ${CPS_RELEASE_SIGNING_KEY:-} && $3 == "$(cat "$1/current")" && $4 == desktop ]]
+[[ $5 == 50 || $5 == 100 ]]
 [[ ${CPS_TEST_FAIL_GATE:-} != rollout ]]
+if [[ ${CPS_TEST_FAIL_GATE:-} == waiting ]]; then exit 75; fi
 printf 'health %s\n' "$3" >> "$CPS_TEST_LOG"
 GATE
 cat > "$CPS_RELEASE_DEPLOY" <<'DEPLOY'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ -z ${CPS_RELEASE_SIGNING_KEY:-} && $3 == "$(cat "$1/current")" ]]
+[[ ${CPS_TEST_FAIL_GATE:-} != deploy ]]
 printf 'deploy %s\n' "$3" >> "$CPS_TEST_LOG"
 DEPLOY
 chmod +x "$CPS_RELEASE_VM_GATE" "$CPS_RELEASE_ROLLOUT_GATE" "$CPS_RELEASE_DEPLOY"
@@ -88,4 +92,20 @@ diff -u <(jq '.catalog | del(.sequence, .release_profiles.desktop.rollout_percen
     <(jq '.catalog | del(.sequence, .release_profiles.desktop.rollout_percentage)' "repo/catalogs/$widened")
 ! release widen "$candidate" desktop 50
 release deploy-current "$widened"
+printf '{"catalog":"%s","profile":"desktop","percentages":[0,50,100]}\n' "$candidate" > "$CPS_RELEASE_ROLLOUT_PLAN"
+CPS_TEST_FAIL_GATE=waiting release advance
+[[ $(cat repo/current) == "$widened" ]]
+if CPS_TEST_FAIL_GATE=deploy release advance; then
+    echo 'A failed deployment was reported as successful' >&2
+    exit 1
+fi
+complete=$(cat repo/current)
+jq -e '.catalog.release_profiles.desktop.rollout_percentage == 100' "repo/catalogs/$complete"
+[[ $(cat repo/.ci-deployed-catalog) == "$widened" ]]
+CPS_TEST_FAIL_GATE=rollout release advance
+[[ $(cat repo/.ci-deployed-catalog) == "$complete" ]]
+release advance
+test "$(grep -Fc "deploy $complete" "$CPS_TEST_LOG")" = 1
+printf '{"catalog":"%s","profile":"desktop","percentages":[0,50,100]}\n' "$base" > "$CPS_RELEASE_ROLLOUT_PLAN"
+! release advance
 echo 'Verified digest-pinned promotion, deployment retry, and health-gated rollout'

@@ -1761,6 +1761,7 @@ key in the environment secret `CPS_RELEASE_SIGNING_KEY_PATH`.
 | `CPS_RELEASE_SOURCE_CACHE` | Optional source cache for release build bundles |
 | `CPS_RELEASE_VM_GATE` | Executable that boots and smoke-tests an actual rehearsed root |
 | `CPS_RELEASE_ROLLOUT_GATE` | Executable that checks health of the deployed cohort |
+| `CPS_RELEASE_ROLLOUT_PLAN` | JSON policy for scheduled rollout advancement |
 | `CPS_RELEASE_DEPLOY` | Executable that deploys the signed catalog to the serving mirror |
 
 Each request contains `release.kdl` and a `cases/` directory. Each named
@@ -1774,8 +1775,8 @@ fresh install and upgrade from the current signed profile, plus the
 specified historical baselines. List every supported historical composition
 in the relevant cases. Each rehearsal checks the applied catalog pin and
 calls the VM gate with mode (`fresh` or `upgrade`), profile, candidate
-digest, baseline digest, resulting root, and previous root. The last two
-baseline arguments are empty for a fresh install.
+digest, baseline digest, resulting root, and previous root. The baseline
+digest and previous root are empty for a fresh install.
 
 Dispatch `promote` with a request name. A failed rehearsal leaves the
 publishing pointer in place. Dispatch `widen` with the deployed catalog
@@ -1784,9 +1785,23 @@ repository, publisher, digest, profile, and percentage before signing a
 successor. Widening changes only the signed rollout percentage and
 catalog sequence. The existing cohort assignment stays stable.
 
+For scheduled advancement, set the repository variable
+`CPS_RELEASE_AUTOROLLOUT=true` and configure a protected runner policy file.
+Set `catalog` to the initial promoted digest, `profile` to its profile name,
+and `percentages` to increasing approved steps beginning at the signed
+initial percentage. For example, a release admitted at 10 percent can use
+`"percentages": [10, 25, 50, 100]`. The workflow checks twice an hour
+and can also be dispatched with `advance`. Each run can widen by one step.
+The health adapter must confirm the serving mirror exposes the requested
+digest and check the cohort's health. Exit 75 to wait for more observations
+or a longer soak. Any other nonzero exit fails the run.
+
 The deployment adapter receives the repository, publisher, and exact
 catalog digest. It should check the digest before exporting and signing
 TUF targets, publish the new timestamp last, and safely accept retries.
+The workflow records successful deployment in `.ci-deployed-catalog`
+in the publishing repository. If the approved current digest has not
+been recorded, a scheduled run retries its deployment before widening.
 If mirror deployment fails after local promotion, dispatch
 `deploy-current` with the current digest to retry that deployment.
 `bash tests/release-ci.sh` exercises the workflow with a local repository

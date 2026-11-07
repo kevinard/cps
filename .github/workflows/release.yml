@@ -1,6 +1,8 @@
 name: Release promotion and rollout
 
 on:
+  schedule:
+    - cron: '17,47 * * * *'
   workflow_dispatch:
     inputs:
       operation:
@@ -9,6 +11,7 @@ on:
         options:
           - promote
           - widen
+          - advance
           - deploy-current
         required: true
       request:
@@ -33,7 +36,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name != 'schedule' || vars.CPS_RELEASE_AUTOROLLOUT == 'true')
     runs-on: [self-hosted, linux, cps-release]
     environment: cps-release
     timeout-minutes: 180
@@ -54,9 +57,10 @@ jobs:
           CPS_RELEASE_SOURCE_CACHE: ${{ vars.CPS_RELEASE_SOURCE_CACHE }}
           CPS_RELEASE_VM_GATE: ${{ vars.CPS_RELEASE_VM_GATE }}
           CPS_RELEASE_ROLLOUT_GATE: ${{ vars.CPS_RELEASE_ROLLOUT_GATE }}
+          CPS_RELEASE_ROLLOUT_PLAN: ${{ vars.CPS_RELEASE_ROLLOUT_PLAN }}
           CPS_RELEASE_DEPLOY: ${{ vars.CPS_RELEASE_DEPLOY }}
           CPS_RELEASE_SIGNING_KEY: ${{ secrets.CPS_RELEASE_SIGNING_KEY_PATH }}
-          CPS_OPERATION: ${{ inputs.operation }}
+          CPS_OPERATION: ${{ github.event_name == 'schedule' && 'advance' || inputs.operation }}
           CPS_REQUEST: ${{ inputs.request }}
           CPS_CATALOG: ${{ inputs.catalog }}
           CPS_PROFILE: ${{ inputs.profile }}
@@ -66,6 +70,7 @@ jobs:
           case "$CPS_OPERATION" in
             promote) bash ci/release.sh promote "$CPS_REQUEST" ;;
             widen) bash ci/release.sh widen "$CPS_CATALOG" "$CPS_PROFILE" "$CPS_PERCENTAGE" ;;
+            advance) bash ci/release.sh advance ;;
             deploy-current) bash ci/release.sh deploy-current "$CPS_CATALOG" ;;
             *) exit 2 ;;
           esac
