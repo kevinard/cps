@@ -268,6 +268,17 @@ enum Command {
         #[arg(value_name = "NAME[@VERSION]")]
         package: String,
     },
+    /// Show package candidates, publisher order, and image constraints
+    Policy {
+        #[arg(long, default_value = "/")]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Try planning an install of this selector without changing the image
+        #[arg(long)]
+        probe: bool,
+        package: String,
+    },
     /// Show installed package IDs that own an exact image path, offline
     Owner {
         #[arg(long, default_value = "/")]
@@ -2199,6 +2210,63 @@ fn run(command: Command) -> Result<ExitCode> {
                 }),
                 true,
             )?;
+        }
+        Command::Policy {
+            root,
+            json,
+            probe,
+            package,
+        } => {
+            let policy = cps::query::package_policy(&root, &package, probe)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&policy)?);
+            } else {
+                println!("Package {}", policy.package);
+                if let Some(installed) = &policy.installed {
+                    println!("Installed {installed}");
+                }
+                if let Some(publisher) = &policy.preferred_publisher {
+                    println!("Preferred publisher {publisher}");
+                }
+                if let Some(freeze) = &policy.freeze {
+                    println!(
+                        "Frozen at {} {}",
+                        freeze.version,
+                        freeze.reason.as_deref().unwrap_or("")
+                    );
+                }
+                if let Some(profile) = &policy.profile {
+                    println!("Release profile {profile}");
+                    if let Some(manifest) = &policy.applied_manifest {
+                        println!("Applied profile manifest {manifest}");
+                    }
+                    if let Some(manifest) = &policy.target_manifest {
+                        println!("Target profile manifest {manifest}");
+                    }
+                }
+                for publisher in policy.publishers {
+                    println!("Publisher {} catalog {}", publisher.name, publisher.catalog);
+                    if publisher.requires_build_trust {
+                        println!("  Requires build trust");
+                    }
+                    if let Some(cutoff) = publisher.obsoleted_through {
+                        println!("  Obsoleted through {cutoff}");
+                    }
+                    for candidate in publisher.candidates {
+                        println!("  {} {}", candidate.id, candidate.manifest);
+                    }
+                }
+                if let Some(probe) = policy.install_probe {
+                    match probe {
+                        cps::query::InstallProbe::Solved { plan } => {
+                            println!("Install probe solved\n{plan}")
+                        }
+                        cps::query::InstallProbe::Blocked { reason } => {
+                            println!("Install probe blocked\n{reason}")
+                        }
+                    }
+                }
+            }
         }
         Command::Info {
             root,

@@ -323,6 +323,7 @@ cps search --root image --file hello
 cps search --root image --file /usr/share/cps-demo/hello
 cps info --root image demo/hello
 cps info --root image --available demo/hello@1.0.0-0
+cps policy --root image --probe demo/hello@1.0.0-0
 cps owner --root image /usr/share/cps-demo/hello
 cps contents --root image demo/hello
 cps deps --root image demo/hello
@@ -331,6 +332,13 @@ cps why --root image demo/hello
 ```
 
 `list` shows installed packages and their explicit or dependency status. With `--available` it shows the newest version of each package in the signed catalog. `search` matches name and summary fragments case-insensitively and shows the signed summary when present. Use `--installed` to search installed packages. `info` prints the verified manifest in KDL, including optional dependency descriptions, requirements, and file actions. It accepts a name, a name and version, or a full CPS package ID. Installed queries work offline. Available queries use the configured local repository or cache.
+
+`policy` lists candidate versions in publisher order with their verified
+catalog pins, the preferred source, active freeze, signed profile manifests,
+and whether each source requires build trust. Use `--json` for scripting.
+`--probe` runs the normal install planner for the exact selector and
+reports its result. Use `check-updates --explain` for a probe in the
+system upgrade context.
 
 `search --file` finds which available packages ship a file. Use an exact
 basename or a path within the image, with or without a leading slash. It

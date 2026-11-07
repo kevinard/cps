@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 
 use crate::{
     image::{Image, Installed, ProfileIntent, Publisher, Publishers, Settings, State},
@@ -356,6 +357,7 @@ struct AvailableCatalog {
     packages: Vec<AvailablePackage>,
     obsoletions: BTreeMap<String, Version>,
     file_index: Option<String>,
+    catalog: String,
 }
 
 fn available(
@@ -393,6 +395,109 @@ fn available(
         packages: entries,
         obsoletions: index.obsoletions,
         file_index: index.file_index,
+        catalog: index.checkpoint.catalog,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackagePolicy {
+    pub package: String,
+    pub installed: Option<String>,
+    pub preferred_publisher: Option<String>,
+    pub freeze: Option<crate::FrozenPackage>,
+    pub profile: Option<String>,
+    pub applied_manifest: Option<String>,
+    pub target_manifest: Option<String>,
+    pub publishers: Vec<PolicyPublisher>,
+    pub install_probe: Option<InstallProbe>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PolicyPublisher {
+    pub name: String,
+    pub catalog: String,
+    pub obsoleted_through: Option<Version>,
+    pub requires_build_trust: bool,
+    pub candidates: Vec<PolicyCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PolicyCandidate {
+    pub id: String,
+    pub manifest: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum InstallProbe {
+    Solved { plan: String },
+    Blocked { reason: String },
+}
+
+/// Inspect candidate sources and image policy without refreshing catalogs.
+pub fn package_policy(root: &Path, spec: &str, probe: bool) -> Result<PackagePolicy> {
+    let selector = PackageSpec::parse(spec)?;
+    let image = Image::open_query(root)?;
+    let (state, _) = verified_intent(&image)?;
+    let profile = image.select_profile(&state.publishers, &state.settings, None)?;
+    let installed = state.installed.get(selector.name);
+    let mut preferred = installed
+        .map(|package| package.published.manifest.publisher.clone())
+        .or_else(|| selector.publisher.map(str::to_owned));
+    let mut publishers = Vec::new();
+    for publisher in state.publishers.as_slice() {
+        let pin = profile
+            .as_ref()
+            .and_then(|profile| profile.pin(&publisher.name));
+        let available = available(&image, &state.publishers, &state.settings, publisher, pin)?;
+        let obsoleted_through = available.obsoletions.get(selector.name).copied();
+        let candidates: Vec<_> = available
+            .packages
+            .into_iter()
+            .filter(|entry| entry.name == selector.name)
+            .map(|entry| PolicyCandidate {
+                id: entry.id,
+                manifest: entry.entry.manifest_digest().to_owned(),
+            })
+            .collect();
+        if preferred.is_none() && (!candidates.is_empty() || obsoleted_through.is_some()) {
+            preferred = Some(publisher.name.clone());
+        }
+        publishers.push(PolicyPublisher {
+            name: publisher.name.clone(),
+            catalog: available.catalog,
+            candidates,
+            obsoleted_through,
+            requires_build_trust: publisher.build_trust.is_some()
+                || pin.is_some_and(|pin| pin.build_trust.is_some()),
+        });
+    }
+    let install_probe = probe.then(|| {
+        match crate::plan(
+            root,
+            crate::Request::Install {
+                packages: vec![spec.to_owned()],
+            },
+        ) {
+            Ok(plan) => InstallProbe::Solved {
+                plan: plan.summary(),
+            },
+            Err(error) => InstallProbe::Blocked {
+                reason: format!("{error:#}"),
+            },
+        }
+    });
+    Ok(PackagePolicy {
+        package: spec.to_owned(),
+        installed: installed.map(|package| package.published.manifest.id()),
+        preferred_publisher: preferred,
+        freeze: state.settings.freezes.get(selector.name).cloned(),
+        profile: state.publishers.release_profile().map(str::to_owned),
+        applied_manifest: state.settings.profile_packages.get(selector.name).cloned(),
+        target_manifest: profile
+            .and_then(|profile| profile.record.composition.get(selector.name).cloned()),
+        publishers,
+        install_probe,
     })
 }
 

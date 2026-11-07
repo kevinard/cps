@@ -100,6 +100,14 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
     )
     .unwrap_err();
     assert!(error.to_string().contains("is frozen at 1.0.0-0"));
+    let policy = crate::query::package_policy(&f.root, &format!("{runtime}@2.0.0-0"), true)?;
+    assert_eq!(policy.preferred_publisher.as_deref(), Some("canopa"));
+    assert_eq!(policy.freeze.unwrap().version.to_string(), "1.0.0-0");
+    assert_eq!(policy.publishers[0].candidates.len(), 2);
+    assert!(matches!(
+        policy.install_probe,
+        Some(crate::query::InstallProbe::Blocked { reason }) if reason.contains("keep known-good graphics ABI")
+    ));
     let mut held_back = Vec::new();
     let update = crate::plan::inspect_update(
         &f.root,
