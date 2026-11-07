@@ -332,6 +332,22 @@ detected provider. Use the ELF profile gate to test runtime ABI compatibility.
 
 ## Finding and inspecting packages
 
+To measure catalog operations on a disposable, signed repository, run:
+
+```sh
+cargo build --locked --bin cps --example tuf-fixture
+python3 tests/benchmark-catalog.py --packages 1000 --versions 2 --closure 128
+```
+
+The benchmark emits JSON wall-clock timings. It publishes version history,
+installs and upgrades a dependency closure with conflicting alternatives,
+verifies the installed root, and compares file lookup before and after
+publishing a signed index. It also measures TUF export and metadata refresh
+into empty and existing caches using a local mirror. The package count,
+version history, and closure size are configurable. Use release binaries
+via `--cps` and `--tuf-fixture` for production measurements. The runner uses
+the local filesystem and does not flush the operating system's file cache.
+
 ```sh
 cps list --root image
 cps list --root image --intent
