@@ -843,6 +843,12 @@ enum ConfigCommand {
         #[arg(long)]
         root: PathBuf,
     },
+    /// Compare a preserved configuration file with its verified pending vendor copy
+    Diff {
+        #[arg(long)]
+        root: PathBuf,
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1369,6 +1375,9 @@ fn change_system(
         return Ok(());
     }
     print_package_changes(change.packages());
+    for effect in change.service_effects() {
+        println!("{effect}");
+    }
     if let Some(reason) = change.boot_reason() {
         println!("A reboot will be required because {reason}.");
     } else {
@@ -2205,6 +2214,30 @@ fn run(command: Command) -> Result<ExitCode> {
                     writeln!(out, "    {recommender}")?;
                 }
             }
+        }
+        Command::Config {
+            command: ConfigCommand::Diff { root, path },
+        } => {
+            let dir = tempfile::tempdir()?;
+            let local = dir.path().join("local");
+            let vendor = dir.path().join("vendor");
+            cps::config_diff_inputs(
+                &root,
+                &path,
+                &mut File::create_new(&local)?,
+                &mut File::create_new(&vendor)?,
+            )?;
+            let status = std::process::Command::new("/usr/bin/diff")
+                .args(["-u", "--label", "local", "--label", "vendor", "--"])
+                .arg(local)
+                .arg(vendor)
+                .status()
+                .context("running /usr/bin/diff")?;
+            return match status.code() {
+                Some(0) => Ok(ExitCode::SUCCESS),
+                Some(1) => Ok(ExitCode::FAILURE),
+                _ => anyhow::bail!("configuration diff failed with {status}"),
+            };
         }
         Command::Config {
             command: ConfigCommand::List { root },

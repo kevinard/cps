@@ -261,6 +261,26 @@ pub(crate) struct LiveServices {
 }
 
 impl LiveServices {
+    pub(crate) fn preview(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !self.stop.is_empty() {
+            lines.push(format!(
+                "Stop active services matching {}",
+                self.stop.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if self.reload {
+            lines.push("Reload the systemd manager".into());
+        }
+        if !self.restart.is_empty() {
+            lines.push(format!(
+                "Restart active services matching {}",
+                self.restart.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        lines
+    }
+
     pub(crate) fn plan(plan: &Plan, current: &State, next: &State) -> Self {
         let changed = plan
             .package_changes()

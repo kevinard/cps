@@ -23,10 +23,10 @@ use crate::{
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
-    plan::{UpdateDiagnostics, inspect_update},
-    plan_with_options,
+    plan::{UpdateDiagnostics, inspect_update, plan_system},
     query::{InstallSource, SelectSource, select_install_sources},
     release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
+    systemd::LiveServices,
 };
 
 pub use crate::plan::HeldBackUpdate;
@@ -43,6 +43,7 @@ pub struct System {
 pub struct Change {
     plan: Plan,
     boot_reason: Option<String>,
+    live_services: Option<LiveServices>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -114,7 +115,11 @@ impl UpdateReport {
 impl Change {
     pub(crate) fn from_plan(plan: Plan, stage_packages: &BTreeSet<String>) -> Self {
         let boot_reason = plan.boot_reason(stage_packages);
-        Self { plan, boot_reason }
+        Self {
+            plan,
+            boot_reason,
+            live_services: None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -127,6 +132,21 @@ impl Change {
 
     pub fn boot_reason(&self) -> Option<&str> {
         self.boot_reason.as_deref()
+    }
+
+    pub fn service_effects(&self) -> Vec<String> {
+        let mut effects = self
+            .plan
+            .systemd
+            .iter()
+            .map(|action| format!("Run systemd {} for {}", action.kind(), action.name()))
+            .collect::<Vec<_>>();
+        if self.boot_reason.is_none()
+            && let Some(services) = &self.live_services
+        {
+            effects.extend(services.preview());
+        }
+        effects
     }
 
     /// Route a nonempty change through the trial boot workflow.
@@ -281,11 +301,14 @@ impl System {
             select_install_sources(Path::new(ROOT), packages, choose)?;
         }
         let root = Path::new(ROOT);
-        let plan = match diagnostics {
-            Some(diagnostics) => inspect_update(root, diagnostics)?,
-            None => plan_with_options(root, request, self.plan_options)?,
-        };
-        Ok(Change::from_plan(plan, &self.definition.stage_packages))
+        if let Some(diagnostics) = diagnostics {
+            let plan = inspect_update(root, diagnostics)?;
+            return Ok(Change::from_plan(plan, &self.definition.stage_packages));
+        }
+        let (plan, services) = plan_system(root, request, self.plan_options)?;
+        let mut change = Change::from_plan(plan, &self.definition.stage_packages);
+        change.live_services = Some(services);
+        Ok(change)
     }
 
     pub fn apply(&self, change: &Change) -> Result<Option<String>> {

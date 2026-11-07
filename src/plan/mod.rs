@@ -28,7 +28,7 @@ use crate::{
 };
 
 pub(crate) use catalogs::{CandidateSet, claim_source};
-pub use config::{ConfigChoice, ConfigUpdate, list_config_updates};
+pub use config::{ConfigChoice, ConfigUpdate, config_diff_inputs, list_config_updates};
 pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
 pub use intent::{IntentChange, MarkChoice};
 pub(crate) use paths::{
@@ -635,6 +635,29 @@ fn plan_image(
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
+    plan_with_state(&image, state, request, options, diagnostics)
+}
+
+pub(crate) fn plan_system(
+    path: &Path,
+    request: Request,
+    options: PlanOptions,
+) -> Result<(Plan, crate::systemd::LiveServices)> {
+    let image = Image::open_query(path)?;
+    image.require_clean()?;
+    let before = image.state()?;
+    let (plan, after, _) = plan_with_state(&image, before.clone(), request, options, None)?;
+    let services = crate::systemd::LiveServices::plan(&plan, &before, &after);
+    Ok((plan, services))
+}
+
+fn plan_with_state(
+    image: &Image,
+    state: State,
+    request: Request,
+    options: PlanOptions,
+    diagnostics: Option<UpdateDiagnostics<'_>>,
+) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let solver = if options.install_recommends
         && matches!(
             request,
@@ -649,7 +672,7 @@ fn plan_image(
         SolverRevision::SatV1
     };
     build_with_update_diagnostics(
-        &image,
+        image,
         state,
         request,
         None,

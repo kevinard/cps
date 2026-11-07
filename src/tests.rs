@@ -160,6 +160,39 @@ fn live_install_recovers_offline_and_preserves_boot_identity() -> Result<()> {
 }
 
 #[test]
+fn system_plan_previews_live_service_effects() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let path = "usr/lib/systemd/system/example.service";
+    let install = Request::Install {
+        packages: vec!["service/example".into()],
+    };
+    fixture.package(
+        "service/example",
+        "1.0.0-0",
+        fixture.file(path, "[Service]\nExecStart=/usr/bin/example\n", "0644", "")?,
+    )?;
+    fixture.create()?;
+    let initial = plan(&fixture.root, install)?;
+    apply(&fixture.root, &initial)?;
+    let (remove, services) = crate::plan::plan_system(
+        &fixture.root,
+        Request::Remove {
+            packages: vec!["service/example".into()],
+        },
+        crate::PlanOptions::default(),
+    )?;
+    assert_eq!(
+        services.preview(),
+        [
+            "Stop active services matching example.service",
+            "Reload the systemd manager"
+        ],
+    );
+    assert!(remove.has_changes() && fixture.root.join(path).exists());
+    Ok(())
+}
+
+#[test]
 fn live_remove_recovers_offline_and_allows_autoremove() -> Result<()> {
     use std::{collections::BTreeSet, panic};
 
@@ -3142,6 +3175,22 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
     let accept = plan(&staged, review(CONFIG, ConfigChoice::Vendor))?;
     fs::write(&vendor_copy, "tampered")?;
     assert!(!list_config_updates(&staged)?[0].vendor_available);
+    let local_input = f._dir.path().join("local-input");
+    let vendor_input = f._dir.path().join("vendor-input");
+    let diff_inputs = || {
+        crate::config_diff_inputs(
+            &staged,
+            CONFIG,
+            &mut fs::File::create(&local_input)?,
+            &mut fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&vendor_input)?,
+        )
+    };
+    assert!(diff_inputs().is_err());
     assert!(
         apply(&staged, &accept)
             .unwrap_err()
@@ -3149,6 +3198,9 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
             .contains("differs from its installed manifest")
     );
     fs::write(&vendor_copy, "vendor version two")?;
+    diff_inputs()?;
+    assert_eq!(fs::read_to_string(&local_input)?, "administrator edit");
+    assert_eq!(fs::read_to_string(&vendor_input)?, "vendor version two");
     fs::write(staged.join(CONFIG), "edited after review")?;
     assert!(
         apply(&staged, &accept)

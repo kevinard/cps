@@ -57,8 +57,8 @@ pub use kdl_format::worker::read_worker_config;
 pub use kdl_format::{ImageConfig, read_image_config};
 pub use plan::{
     ConfigChoice, ConfigUpdate, FreezeChange, FrozenPackage, IntentChange, MarkChoice,
-    PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, list_config_updates,
-    list_freezes, plan, plan_with_options, plan_with_recommends,
+    PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, config_diff_inputs,
+    list_config_updates, list_freezes, plan, plan_with_options, plan_with_recommends,
 };
 pub use repo::{
     BuildAudit, BuildWitness, archive_build_sources, export_rebuild_inputs, fetch_build_sources,

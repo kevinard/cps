@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File},
     path::Path,
 };
 
@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     image::{DormantConfig, Image, Installed, Managed, Settings, State, root::Root},
-    model::{Node, validate_path},
+    model::{Node, copy_payload, validate_path},
     verify::manifest_paths,
 };
 
@@ -56,6 +56,43 @@ pub fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
             }
         })
         .collect())
+}
+
+/// Copy the local and verified vendor inputs for a pending configuration diff.
+/// Both outputs must be empty and the vendor output must be readable for hashing.
+pub fn config_diff_inputs(
+    root: &Path,
+    path: &str,
+    local: &mut File,
+    vendor: &mut File,
+) -> Result<()> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    validate_path(path)?;
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    image.verify_catalog_archives(&state)?;
+    let paths = manifest_paths(&state)?;
+    ensure!(
+        paths == state.paths,
+        "path ownership index differs from installed manifests"
+    );
+    let revision = updates(&image.root, &state.settings, &paths)?
+        .get(path)
+        .copied()
+        .with_context(|| format!("no pending configuration update for {path}"))?;
+    let copy = vendor_copy(revision, path);
+    copy_payload(&image.root.file(&copy)?, &paths[path].node, vendor)
+        .with_context(|| format!("checking staged vendor configuration {copy}"))?;
+    if let Some(entry) = image.root.regular_entry(path)? {
+        std::io::copy(&mut File::open(Root::fd_path(&entry))?, local)?;
+    } else {
+        ensure!(
+            image.root.inspect(path)?.is_none(),
+            "unexpected file type at {path}"
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn resolve(

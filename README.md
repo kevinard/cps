@@ -18,8 +18,8 @@ sudo cps upgrade
 sudo cps status
 ```
 
-`install` and `upgrade` select dependencies, preview the package changes
-and their activation mode, and ask once before downloading and applying
+`install` and `upgrade` select dependencies, preview the package changes,
+service actions, and activation mode, and ask once before downloading and applying
 them. Ordinary changes apply to the running system. Restart any open
 applications to use updated files. CPS reloads the systemd manager when
 system unit files change and queues restarts for active services owned
@@ -1904,10 +1904,15 @@ Then save and apply a review plan on the inactive root.
 
 ```sh
 cps config list --root staged
+cps config diff --root staged /etc/canopa/session/preferences.conf
 cps plan --root staged --output config-review.json \
     resolve-config etc/canopa/compositor.conf --take vendor
 cps apply --root staged config-review.json
 ```
+
+`config diff` compares local contents with the authenticated pending vendor
+copy using `/usr/bin/diff`. It returns status 1 for differences and treats a
+locally removed file as empty.
 
 `--take vendor` replaces the local file with the staged defaults and
 restores a file that was locally removed. CPS checks the copy against the
