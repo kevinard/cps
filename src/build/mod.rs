@@ -1,6 +1,8 @@
 pub(crate) mod cgroup;
 mod sandbox;
+mod snapshot;
 pub(crate) mod sources;
+pub use snapshot::{GitSnapshotRef, prepare_git_snapshot, prepare_git_snapshot_ref};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -323,6 +325,14 @@ fn checked_recipe(
         "toolchain architecture {} does not match this build worker",
         recipe.arch
     );
+    let (manifest_bytes, manifest) = read_recipe_manifest(recipe_path, &recipe)?;
+    Ok((recipe_bytes, recipe, manifest_bytes, manifest))
+}
+
+fn read_recipe_manifest(
+    recipe_path: &Path,
+    recipe: &BuildRecipe,
+) -> Result<(Vec<u8>, crate::model::Manifest)> {
     let manifest_bytes = read_limited(
         Root::open(parent(recipe_path))?.file(&recipe.manifest)?,
         MANIFEST_LIMIT,
@@ -335,7 +345,7 @@ fn checked_recipe(
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
     manifest.validate(false)?;
     manifest.check_architecture(&recipe.arch)?;
-    Ok((recipe_bytes, recipe, manifest_bytes, manifest))
+    Ok((manifest_bytes, manifest))
 }
 
 fn prepare_workspace(

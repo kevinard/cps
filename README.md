@@ -634,6 +634,43 @@ the same cache offline. Builds read the cache offline and verify each input
 again before staging it under its recipe path. The `--sources` build option
 accepts a directory laid out by recipe path.
 
+### Preparing a snapshot from Git
+
+Use `cps source git-snapshot` to build from a branch, tag, or commit.
+Supply a build recipe with its normal manifest and toolchain pins. The
+template manifest can use `version="0.0.0-0"` as a placeholder. Write the script to unpack
+`$CPS_SOURCES/git.tar` before building.
+
+```sh
+cps source git-snapshot --git-repo https://git.example.org/hello.git --branch main \
+    --repo packages --trust-key publisher.der --output snapshot hello.build.kdl
+cps source fetch --from snapshot/sources --cache source-cache snapshot/build.kdl
+```
+
+Pass exactly one of `--branch main`, `--tag v1.2.0`, or
+`--commit <full SHA-1 or SHA-256>`. A remote must allow fetching the
+requested commit by SHA. Both lightweight and annotated tags resolve to
+their commit.
+
+The command writes a tar archive of the resolved commit to
+`snapshot/sources/git.tar`. It records `branch@commit`, `tag:NAME@commit`,
+or the full commit ID in `snapshot/manifest.kdl` and pins the new manifest
+and archive by SHA-256 in `snapshot/build.kdl`. Git submodule contents need
+separate source pins. Use the generated recipe and cache with the usual
+build and publication commands.
+
+When the tag name is a valid CPS version after removing an optional
+lowercase `v`, CPS uses that version directly. For example, `v1.2.0`
+becomes `1.2.0`, and `1.3.0-rc.1` keeps its spelling. The manifest still
+records the original tag and resolved commit.
+
+Branches, commit SHAs, and other tags reserve increasing versions in the
+`0.0.0-N` series. CPS accounts for published and withdrawn versions in that
+series independently of numbered releases. A release such as `1.2.0` sorts
+above these snapshots in automatic version selection. Concurrent preparations
+for the same package fetch and reserve in order. Repeating the latest snapshot
+preparation with the same inputs reuses its version while it remains eligible.
+
 ### Building and publishing with signed evidence
 
 ```sh
@@ -1891,8 +1928,9 @@ clients before publishing packages that use it.
 
 - Manifests and image configuration use KDL 2 and begin with `schema-version 1`. Paths in image configuration resolve relative to the configuration file. It also accepts `architecture "x86_64"` and `facet "doc.man" #false`. Convert old TOML recipes before publishing new versions. Existing JSON manifest objects stay readable under their original digests.
 - Set `architecture="x86_64"` on the `package` node for a package that targets one architecture, or pass `--architecture x86_64` to `manifest generate`. Only matching packages participate in dependency resolution and publisher ordering. The signed catalog and manifest must agree, and a source build and its attestation must declare the same target. Omit the package property for portable packages or manifests with per-action architecture selectors. Upgrade clients before publishing targeted packages. Package IDs are unique within a repository, so publishing the same name and version for two architectures requires separate repositories.
-- Versions have the numeric form `major.minor.patch-revision`. Inside a package block, declare dependencies as `require "library/libdisplay" version=">=1.0.0-0, <2.0.0-0"` or `incorporate "library/libdisplay" version="=1.0.0-0"`. Use `exclude "library/libdisplay" version=">=2.0.0-0"` to reject a range when the package is present. Omit the version to exclude every version of that package.
-- Set `upstream-version="1:1.3.2-4"` on an imported package to retain its original label. The signed manifest preserves the label and `cps info` displays it. The package ID, dependency constraints, and ordering still use the numeric CPS version. Importers must assign increasing CPS versions when upstream ordering depends on epochs, prereleases, or other qualifiers. The package identity fixture covers numeric versions, distro suffixes, VCS snapshots, epochs, and architecture selection.
+- Inside a package block, declare dependencies as `require "library/libdisplay" version=">=1.0.0-0, <2.0.0-0"` or `incorporate "library/libdisplay" version="=1.0.0-0"`. Use `exclude "library/libdisplay" version=">=2.0.0-0"` to reject a range when the package is present. Omit the version to exclude every version of that package.
+- Package versions accept a digit-led release with ASCII letters and digits and single `.`, `+`, `_`, `~`, or `-` separators. An optional numeric epoch precedes `:`. A final dash followed by a number or dotted numbers specifies the packaging revision. Versions such as `1:1.3.2-4`, `262.1-1`, `7.2.14.arch1-1`, and `2.44+r50+g1848099f063e-1` can be used directly in package IDs and constraints. Upgrade clients before publishing versions that use the expanded syntax.
+- CPS compares epoch, release, and revision in that order. Omitted epochs and revisions default to zero for comparison. Digit runs compare numerically, so `rc10` follows `rc2`. In the release, `~` and `-` sort before the end of the string, so `3.0.0~rc1-1` sorts before `3.0.0-1`. Other characters sort in ASCII order. CPS breaks ties by the original spelling, which is preserved in package IDs and used for exact matching. Use `upstream-version` to preserve a separate upstream label in the signed manifest when it differs from the package version.
 - Use a `require-any` block with two or more `package` entries when interchangeable providers can satisfy a dependency. Each alternative accepts the same `version` constraints as `require`. The solver prefers a compatible installed provider that the transaction will retain. Offline removal checks that a compatible provider remains installed. [IPS dependency types](https://docs.oracle.com/cd/E53394_01/html/E54820/dependtypes.html)
 - `conditional "desktop/plugin" version="=2.0.0-0" when="runtime/desktop" when-version=">=2.0.0-0"` requires the plugin when the resulting image includes a matching runtime. Omit `when-version` to match any installed version of the runtime. The predicate alone leaves the runtime optional.
 - New plans use Resolvo to resolve compatible versions and report incompatible requirements. When selected file actions collide, CPS excludes the conflicting version or pair of versions and retries. Directory sharing still requires identical metadata. SAT resolution has a 60-second time limit. Saved plans record their solver version so apply can verify the same selection against the pinned catalog. Plans created before solver versioning retain their original behavior. [Resolvo](https://github.com/prefix-dev/resolvo)
@@ -2035,7 +2073,7 @@ cps plan --root image --output unfreeze.json unfreeze library/libdisplay
 cps apply --root image unfreeze.json
 ```
 
-A freeze constrains the complete `major.minor.patch-revision` version during
+A freeze constrains the exact package version during
 installs, dependency resolution, and updates. Other packages can still advance
 when their dependencies allow it. A conflicting signed profile update fails
 with the freeze's reason; it cannot silently lift the constraint. Freezes
@@ -2048,7 +2086,7 @@ that is not installed. For an installed package, an explicit version must
 match the installed version. Publisher selectors check the selected installed
 package, while the stored constraint applies to the package name and version.
 This follows [IPS package freezes](https://docs.oracle.com/cd/E26502_01/html/E28984/gilfr.html)
-with CPS's complete numeric versions.
+with CPS's exact package versions.
 
 Run `tests/package-freezes.sh` for the CLI workflow. It also accepts
 `CPS_TEST_BINARY` for a packaged executable and `CPS_TEST_PREVIOUS_BINARY`

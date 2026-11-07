@@ -197,7 +197,7 @@ pub(super) fn check(
             profile
                 .packages
                 .iter()
-                .map(|(name, version)| (name.as_str(), *version)),
+                .map(|(name, version)| (name.as_str(), version.as_ref())),
         )
         .with_context(|| format!("checking release profile {name}"))?;
         check_companion_builds(&companions, &target)
@@ -210,7 +210,12 @@ pub(super) fn check(
             roots: profile
                 .packages
                 .keys()
-                .map(|name| (name.clone(), target[name].published.manifest.version))
+                .map(|name| {
+                    (
+                        name.clone(),
+                        target[name].published.manifest.version.clone(),
+                    )
+                })
                 .collect(),
             composition: target
                 .iter()
@@ -329,7 +334,7 @@ fn check_advisories(
             && package.published.manifest.publisher == advisory.publisher
         {
             let mut advisory = advisory.clone();
-            advisory.fixed = package.published.manifest.version;
+            advisory.fixed = package.published.manifest.version.clone();
             advisories.insert((advisory.id.clone(), advisory.package.clone()), advisory);
         }
     }
@@ -351,7 +356,7 @@ fn check_advisories(
                 package: advisory.package.clone(),
                 publisher: package.publisher.clone(),
                 affected: advisory.affected.clone(),
-                fixed: package.version,
+                fixed: package.version.clone(),
                 summary: advisory.summary.clone(),
                 action: advisory.action.clone(),
             },
@@ -359,7 +364,7 @@ fn check_advisories(
     }
     for advisory in advisories.values() {
         ensure!(
-            !VersionConstraint::parse(Some(&advisory.affected))?.matches(advisory.fixed),
+            !VersionConstraint::parse(Some(&advisory.affected))?.matches(&advisory.fixed),
             "advisory {} affects the selected version of {} in profile {name}",
             advisory.id,
             advisory.package
@@ -411,7 +416,7 @@ fn baseline_image(
         Some(historical) => historical
             .roots
             .iter()
-            .map(|(name, version)| (name.as_str(), Some(*version)))
+            .map(|(name, version)| (name.as_str(), Some(version)))
             .collect::<Vec<_>>(),
         None => profile
             .packages
@@ -482,14 +487,14 @@ fn load_packages(repo: &Path, catalog: &Catalog) -> Result<Vec<Published>> {
 
 fn newest_versions<'a>(
     packages: impl IntoIterator<Item = &'a Published>,
-) -> BTreeMap<&'a str, Version> {
-    let mut newest = BTreeMap::<&str, Version>::new();
+) -> BTreeMap<&'a str, &'a Version> {
+    let mut newest = BTreeMap::<&str, &Version>::new();
     for package in packages {
         let manifest = &package.manifest;
         newest
             .entry(&manifest.name)
-            .and_modify(|version| *version = (*version).max(manifest.version))
-            .or_insert(manifest.version);
+            .and_modify(|version| *version = (*version).max(&manifest.version))
+            .or_insert(&manifest.version);
     }
     newest
 }
@@ -497,7 +502,7 @@ fn newest_versions<'a>(
 fn compose<'a>(
     catalogs: &CandidateSet<&Published>,
     profile: &Profile,
-    roots: impl IntoIterator<Item = (&'a str, Option<Version>)>,
+    roots: impl IntoIterator<Item = (&'a str, Option<&'a Version>)>,
 ) -> Result<Composition> {
     let newest = newest_versions(catalogs.packages.iter().copied());
     let mut requested = BTreeMap::new();
@@ -510,7 +515,7 @@ fn compose<'a>(
             PackageSpec {
                 publisher: None,
                 name,
-                version: Some(version),
+                version: Some(version.clone()),
             },
         );
     }

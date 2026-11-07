@@ -187,7 +187,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
                 PackageSpec {
                     publisher: Some(&manifest.publisher),
                     name,
-                    version: Some(manifest.version),
+                    version: Some(manifest.version.clone()),
                 },
             );
         }
@@ -229,7 +229,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
     ) {
         for (name, cutoff) in obsoletions {
             if claim_source(sources, publisher, name) {
-                self.obsoletions.insert(name.clone(), *cutoff);
+                self.obsoletions.insert(name.clone(), cutoff.clone());
             }
         }
     }
@@ -272,7 +272,7 @@ pub(super) fn requested<'a>(
                 );
             }
         }
-        let previous = requested.insert(spec.name, spec);
+        let previous = requested.insert(spec.name, spec.clone());
         ensure!(
             previous.is_none_or(|previous| previous == spec),
             "conflicting selectors for {}",
@@ -401,12 +401,12 @@ pub(super) fn load(
             .candidates
             .add_obsoletions(&mut sources, &publisher.name, &snapshot.obsoletions);
         for spec in requested.values() {
-            if let Some(version) = spec.version
+            if let Some(version) = &spec.version
                 && sources.get(spec.name) == Some(&publisher.name.as_str())
                 && snapshot
                     .obsoletions
                     .get(spec.name)
-                    .is_none_or(|cutoff| version > *cutoff)
+                    .is_none_or(|cutoff| version > cutoff)
             {
                 let id = format!("cps://{}/{}@{version}", publisher.name, spec.name);
                 ensure!(!snapshot.is_withdrawn(&id), "{id} was withdrawn");

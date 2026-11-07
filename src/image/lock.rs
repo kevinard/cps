@@ -113,7 +113,7 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
                 name.clone(),
                 LockedPackage {
                     publisher: manifest.publisher.clone(),
-                    version: manifest.version,
+                    version: manifest.version.clone(),
                     manifest_sha256: entry.published.sha256.clone(),
                 },
             )
@@ -362,7 +362,7 @@ impl ImageLock {
                     PackageSpec {
                         publisher: Some(&package.publisher),
                         name,
-                        version: Some(package.version),
+                        version: Some(package.version.clone()),
                     },
                 )
             })

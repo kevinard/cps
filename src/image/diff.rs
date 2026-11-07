@@ -71,7 +71,7 @@ impl Snapshot {
                     name.clone(),
                     ImagePackage {
                         publisher: published.manifest.publisher.clone(),
-                        version: published.manifest.version,
+                        version: published.manifest.version.clone(),
                         manifest_sha256: published.sha256.clone(),
                         requested: row.requested,
                         profile_role: row.profile,

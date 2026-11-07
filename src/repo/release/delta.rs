@@ -107,7 +107,7 @@ pub(super) fn export(
         by_package
             .entry((manifest.name.as_str(), manifest.architecture.as_deref()))
             .or_default()
-            .insert(manifest.version, manifest);
+            .insert(&manifest.version, manifest);
     }
     for package in &current.packages {
         let manifest = &package.manifest;
@@ -119,7 +119,7 @@ pub(super) fn export(
         if versions.contains_key(&manifest.version) {
             continue;
         }
-        let Some((_, base)) = versions.range(..manifest.version).next_back() else {
+        let Some((_, base)) = versions.range::<&_, _>(..&manifest.version).next_back() else {
             continue;
         };
         let files = |action: &Action| {

@@ -170,7 +170,7 @@ fn check_declared_provider(
     for dependency in &consumer.dependency {
         if let Dependency::Require(requirement) = dependency
             && requirement.package == provider.name
-            && requirement.matches(provider.version)?
+            && requirement.matches(&provider.version)?
         {
             return Ok(());
         }

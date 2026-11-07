@@ -97,7 +97,10 @@ pub(crate) fn select_install_sources(
         for (spec, sources) in choices.values_mut() {
             let matching = catalog.iter().find(|entry| {
                 entry.name == spec.name
-                    && spec.version.is_none_or(|version| version == entry.version)
+                    && spec
+                        .version
+                        .as_ref()
+                        .is_none_or(|version| version == &entry.version)
                     && obsolete
                         .get(spec.name)
                         .is_none_or(|cutoff| entry.version > *cutoff)
@@ -125,6 +128,7 @@ pub(crate) fn select_install_sources(
         let source = sources.get(index).context("invalid publisher selection")?;
         let version = spec
             .version
+            .as_ref()
             .map(|version| format!("@{version}"))
             .unwrap_or_default();
         selected.insert(
@@ -204,7 +208,7 @@ pub struct DependencyStep {
 pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
     let selector = PackageSpec::parse(spec)?;
     let (state, intent) = read_intent(root)?;
-    let package = select_installed(&state.installed, selector, spec)?;
+    let package = select_installed(&state.installed, &selector, spec)?;
     let path = required_path(&state, &intent, selector.name)?;
     let intent = intent_row(&state, &intent, package);
     let profile_name = state
@@ -215,7 +219,7 @@ pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
     let mut dependents = installed_dependents(&state.installed, selector.name)?;
     dependents.retain(|id| id != &intent.id);
     let mut recommenders = Vec::new();
-    let version = package.published.manifest.version;
+    let version = &package.published.manifest.version;
     for (name, entry) in &state.installed {
         if name == selector.name {
             continue;
@@ -488,7 +492,7 @@ pub fn package_policy(root: &Path, spec: &str, probe: bool) -> Result<PackagePol
             .as_ref()
             .and_then(|profile| profile.pin(&publisher.name));
         let available = available(&image, &state.publishers, &state.settings, publisher, pin)?;
-        let obsoleted_through = available.obsoletions.get(selector.name).copied();
+        let obsoleted_through = available.obsoletions.get(selector.name).cloned();
         let candidates: Vec<_> = available
             .packages
             .into_iter()
@@ -739,7 +743,7 @@ pub fn package_contents(root: &Path, spec: &str) -> Result<Vec<String>> {
     image.require_clean()?;
     let package = image
         .installed_package(selector.name)?
-        .filter(|package| matches_installed(package, selector))
+        .filter(|package| matches_installed(package, &selector))
         .with_context(|| format!("package is not installed: {spec}"))?;
     package.verify(selector.name, &image.publishers()?)?;
     let paths = package
@@ -791,7 +795,7 @@ fn matching_providers<'a>(
     } else {
         for target in active_targets(dependency, installed)? {
             if let Some(package) = installed.get(&target.package)
-                && target.matches(package.published.manifest.version)?
+                && target.matches(&package.published.manifest.version)?
             {
                 let manifest = &package.published.manifest;
                 providers.insert(&manifest.name, manifest);
@@ -823,7 +827,7 @@ fn installed_dependents(
                 continue 'packages;
             }
             for target in active_targets(dependency, installed)? {
-                if target.package == name && target.matches(provider.version)? {
+                if target.package == name && target.matches(&provider.version)? {
                     dependents.push(manifest.id());
                     continue 'packages;
                 }
@@ -841,13 +845,13 @@ fn dependency_query<'a>(
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let installed = installed(&image, &image.publishers()?)?;
-    select_installed(&installed, selector, spec)?;
+    select_installed(&installed, &selector, spec)?;
     Ok((installed, selector.name))
 }
 
 fn select_installed<'a>(
     installed: &'a BTreeMap<String, Installed>,
-    selector: PackageSpec<'_>,
+    selector: &PackageSpec<'_>,
     spec: &str,
 ) -> Result<&'a Installed> {
     installed
@@ -864,7 +868,7 @@ fn active_targets<'a>(
         Dependency::Require(target) => std::slice::from_ref(target),
         Dependency::RequireAny { alternatives } => alternatives,
         Dependency::Conditional { target, predicate } => match installed.get(&predicate.package) {
-            Some(package) if predicate.matches(package.published.manifest.version)? => {
+            Some(package) if predicate.matches(&package.published.manifest.version)? => {
                 std::slice::from_ref(target)
             }
             _ => &[],
@@ -876,11 +880,12 @@ fn active_targets<'a>(
     })
 }
 
-fn matches_installed(package: &Installed, selector: PackageSpec<'_>) -> bool {
+fn matches_installed(package: &Installed, selector: &PackageSpec<'_>) -> bool {
     let manifest = &package.published.manifest;
     selector
         .version
-        .is_none_or(|version| version == manifest.version)
+        .as_ref()
+        .is_none_or(|version| version == &manifest.version)
         && selector
             .publisher
             .is_none_or(|publisher| publisher == manifest.publisher)
@@ -902,7 +907,12 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
     if let Some(package) = &installed {
         package.verify(selector.name, &publishers)?;
     }
-    let accepts = |version| selector.version.is_none_or(|wanted| wanted == version);
+    let accepts = |version: &Version| {
+        selector
+            .version
+            .as_ref()
+            .is_none_or(|wanted| wanted == version)
+    };
     let package = if from_catalog {
         let settings = image.settings()?;
         let pins = image.release_pins(&publishers, &settings)?;
@@ -934,7 +944,8 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
                 ensure!(
                     selector
                         .version
-                        .map_or_else(|| named.peek().is_some(), |version| version > *cutoff),
+                        .as_ref()
+                        .map_or_else(|| named.peek().is_some(), |version| version > cutoff),
                     "{} is obsolete through {cutoff} for {}",
                     selector.name,
                     publisher.name,
@@ -942,7 +953,7 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
             }
             if named.peek().is_some() || obsoletions.contains_key(selector.name) {
                 let entry = named
-                    .find(|entry| accepts(entry.version))
+                    .find(|entry| accepts(&entry.version))
                     .with_context(|| {
                         format!(
                             "package is absent from the signed catalog for {}: {spec}",
@@ -957,7 +968,7 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
         anyhow::bail!("package is absent from the signed catalog: {spec}")
     } else {
         installed
-            .filter(|package| matches_installed(package, selector))
+            .filter(|package| matches_installed(package, &selector))
             .with_context(|| format!("package is not installed: {spec}"))?
             .published
     };

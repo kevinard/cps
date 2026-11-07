@@ -121,10 +121,16 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
     assert_eq!(held_back.len(), 2);
     assert_eq!(held_back[0].name, tool);
     assert_eq!(held_back[0].available.to_string(), "3.0.0-0");
-    assert_eq!(held_back[0].selected.unwrap().to_string(), "2.0.0-0");
+    assert_eq!(
+        held_back[0].selected.as_ref().unwrap().to_string(),
+        "2.0.0-0"
+    );
     assert_eq!(held_back[1].name, runtime);
     assert_eq!(held_back[1].available.to_string(), "2.0.0-0");
-    assert_eq!(held_back[1].selected.unwrap().to_string(), "1.0.0-0");
+    assert_eq!(
+        held_back[1].selected.as_ref().unwrap().to_string(),
+        "1.0.0-0"
+    );
     assert!(held_back[1].reason.contains("keep known-good graphics ABI"));
     interrupt_apply_at(
         &f.root,

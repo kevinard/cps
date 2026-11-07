@@ -646,9 +646,9 @@ pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) ->
         let Some(package) = next.installed.get(&update.name) else {
             return false;
         };
-        let selected = package.published.manifest.version;
-        update.selected = Some(selected);
-        selected < update.available
+        let selected = &package.published.manifest.version;
+        update.selected = Some(selected.clone());
+        selected < &update.available
     });
     Ok(plan)
 }
@@ -723,8 +723,8 @@ fn resolve_local<'a>(
         ensure!(
             requested
                 .get(name.as_str())
-                .and_then(|spec| spec.version)
-                .is_none_or(|version| version == manifest.version),
+                .and_then(|spec| spec.version.as_ref())
+                .is_none_or(|version| version == &manifest.version),
             "{name} is protected by the installed signed profile; apply a signed profile update to change it"
         );
         ensure!(
@@ -739,7 +739,7 @@ fn resolve_local<'a>(
             PackageSpec {
                 publisher: Some(&manifest.publisher),
                 name,
-                version: Some(manifest.version),
+                version: Some(manifest.version.clone()),
             },
         );
     }
@@ -952,7 +952,7 @@ fn build_with_update_diagnostics(
                         PackageSpec {
                             publisher: Some(&manifest.publisher),
                             name,
-                            version: Some(manifest.version),
+                            version: Some(manifest.version.clone()),
                         },
                     )
                 })
@@ -1141,7 +1141,7 @@ fn build_with_update_diagnostics(
                     PackageSpec {
                         publisher: Some(&candidate.publisher),
                         name,
-                        version: Some(candidate.available),
+                        version: Some(candidate.available.clone()),
                     },
                 );
                 candidate.reason = match select(&state, &forced).and_then(|(installed, _)| {

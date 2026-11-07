@@ -17,25 +17,26 @@ use cps::query::{
 };
 use cps::system::{self, System, UpdateStatus};
 use cps::{
-    Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, MarkChoice,
-    PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, RootDeployment, SourceLayout,
-    activate_boot_environment, activate_boot_environment_on_disk, activate_btrfs_boot_environment,
-    activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
-    add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
-    build_with_recipe_options, capture_boot_environment, create_image,
-    deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
-    export_boot_environment, export_boot_environment_receipt, export_rebuild_inputs,
-    fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
-    fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
+    Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, GitSnapshotRef,
+    MarkChoice, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, RootDeployment,
+    SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
+    activate_btrfs_boot_environment, activate_deployed_boot_environment,
+    activate_device_boot_environment, add_publisher_from_url, add_publisher_with_build_trust,
+    apply, archive_build_sources, audit_publisher_builds, build_with_recipe_options,
+    capture_boot_environment, create_image, deploy_and_activate_boot_environment,
+    deploy_boot_environment, destroy_btrfs_boot_environment, export_boot_environment,
+    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources,
+    fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
+    generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
     list_publishers, list_withdrawals, plan_with_options, prefer_publisher,
-    prepare_boot_environment, publish, publish_witnessed_bundle_with_sources, read_attestation,
-    read_worker_config, release, remove_publisher, repair_pending_transaction, resume_transaction,
-    rollback_boot_environment, rollback_boot_environment_on_disk, rollback_btrfs_boot_environment,
-    rotate_publisher_key, set_publisher_build_trust, set_publisher_repositories,
-    stage_boot_environment, stage_btrfs_boot_environment, suggest_dependencies,
-    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
-    verify_rebuild, withdraw_package,
+    prepare_boot_environment, prepare_git_snapshot_ref, publish,
+    publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
+    remove_publisher, repair_pending_transaction, resume_transaction, rollback_boot_environment,
+    rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
+    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
+    stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
+    transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -533,6 +534,33 @@ struct SystemOptions {
 
 #[derive(Subcommand)]
 enum SourceCommand {
+    /// Pin a Git branch, tag, or commit and prepare a versioned build recipe
+    #[command(group(clap::ArgGroup::new("git_ref").required(true).args(["branch", "tag", "commit"])))]
+    GitSnapshot {
+        /// Local Git repository path or remote Git URL
+        #[arg(long)]
+        git_repo: OsString,
+        /// Branch name in the Git repository
+        #[arg(long)]
+        branch: Option<String>,
+        /// Tag name in the Git repository
+        #[arg(long)]
+        tag: Option<String>,
+        /// Full SHA-1 or SHA-256 commit ID
+        #[arg(long)]
+        commit: Option<String>,
+        /// Local CPS repository used to allocate snapshot versions
+        #[arg(long)]
+        repo: PathBuf,
+        /// Ed25519 DER public key for the package publisher
+        #[arg(long)]
+        trust_key: PathBuf,
+        /// New directory for the pinned recipe, manifest, and archive
+        #[arg(long)]
+        output: PathBuf,
+        /// Build recipe template with a pinned package manifest
+        recipe: PathBuf,
+    },
     /// Download missing sources over HTTPS and verify their pins
     Fetch {
         #[arg(long)]
@@ -1702,24 +1730,48 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("No pending transaction.");
             }
         }
-        Command::Source { command } => {
-            let count = match command {
-                SourceCommand::Fetch {
-                    cache,
-                    from,
-                    recipe,
-                } => match from {
+        Command::Source { command } => match command {
+            SourceCommand::GitSnapshot {
+                git_repo,
+                branch,
+                tag,
+                commit,
+                repo,
+                trust_key,
+                output,
+                recipe,
+            } => {
+                let source = match (branch.as_deref(), tag.as_deref(), commit.as_deref()) {
+                    (Some(branch), None, None) => GitSnapshotRef::Branch(branch),
+                    (None, Some(tag), None) => GitSnapshotRef::Tag(tag),
+                    (None, None, Some(commit)) => GitSnapshotRef::Commit(commit),
+                    _ => unreachable!("clap requires exactly one Git selector"),
+                };
+                let (package, commit) = prepare_git_snapshot_ref(
+                    &recipe, &git_repo, source, &repo, &trust_key, &output,
+                )?;
+                println!("Prepared {package} from {}", source.provenance(&commit));
+            }
+            SourceCommand::Fetch {
+                cache,
+                from,
+                recipe,
+            } => {
+                let count = match from {
                     Some(from) => fetch_sources_with_local(&recipe, &cache, &from)?,
                     None => fetch_sources(&recipe, &cache)?,
-                },
-                SourceCommand::Import {
-                    cache,
-                    from,
-                    recipe,
-                } => import_sources(&recipe, &cache, &from)?,
-            };
-            println!("Verified {count} pinned source(s) in the cache");
-        }
+                };
+                println!("Verified {count} pinned source(s) in the cache");
+            }
+            SourceCommand::Import {
+                cache,
+                from,
+                recipe,
+            } => {
+                let count = import_sources(&recipe, &cache, &from)?;
+                println!("Verified {count} pinned source(s) in the cache");
+            }
+        },
         Command::Build {
             inputs,
             output,

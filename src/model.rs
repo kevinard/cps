@@ -1,9 +1,9 @@
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
     io::{self, Read, Seek},
-    str::FromStr,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::file_caps::FileCapabilities;
+
+mod version;
+
+pub use version::Version;
 
 pub const FORMAT: u32 = 1;
 
@@ -87,7 +91,7 @@ pub fn validate_publisher(publisher: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PackageSpec<'a> {
     pub publisher: Option<&'a str>,
     pub name: &'a str,
@@ -114,48 +118,6 @@ impl<'a> PackageSpec<'a> {
             name,
             version,
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Version([u32; 4]);
-
-impl FromStr for Version {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        let (upstream, revision) = value
-            .split_once('-')
-            .context("expected major.minor.patch-revision")?;
-        let parts: Vec<_> = upstream.split('.').chain([revision]).collect();
-        ensure!(parts.len() == 4, "expected major.minor.patch-revision");
-        let mut numbers = [0; 4];
-        for (part, number) in parts.into_iter().zip(&mut numbers) {
-            *number = part.parse().context("invalid numeric version component")?;
-            ensure!(part == number.to_string(), "noncanonical version {value:?}");
-        }
-        Ok(Self(numbers))
-    }
-}
-
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [major, minor, patch, revision] = self.0;
-        write!(f, "{major}.{minor}.{patch}-{revision}")
-    }
-}
-
-impl Serialize for Version {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for Version {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -191,8 +153,8 @@ pub struct OptionalDependency {
 }
 
 impl DependencyTarget {
-    pub fn matches(&self, version: Version) -> Result<bool> {
-        Ok(VersionConstraint::parse(self.version.as_deref())?.matches(version))
+    pub fn matches(&self, version: impl Borrow<Version>) -> Result<bool> {
+        Ok(VersionConstraint::parse(self.version.as_deref())?.matches(version.borrow()))
     }
 
     pub(crate) fn matches_capability(&self, manifest: &Manifest) -> Result<bool> {
@@ -286,8 +248,8 @@ impl VersionConstraint {
             .map(Self)
     }
 
-    pub(crate) fn matches(&self, version: Version) -> bool {
-        self.0.iter().all(|&(operator, bound)| match operator {
+    pub(crate) fn matches(&self, version: &Version) -> bool {
+        self.0.iter().all(|(operator, bound)| match *operator {
             ">=" => version >= bound,
             "<=" => version <= bound,
             ">" => version > bound,
@@ -296,7 +258,7 @@ impl VersionConstraint {
         })
     }
 
-    pub(crate) fn matches_provided(&self, version: Option<Version>) -> bool {
+    pub(crate) fn matches_provided(&self, version: Option<&Version>) -> bool {
         version.map_or(self.0.is_empty(), |version| self.matches(version))
     }
 }
@@ -647,7 +609,7 @@ impl Manifest {
     pub(crate) fn provides_capability(&self, name: &str, constraint: &VersionConstraint) -> bool {
         self.provides
             .get(name)
-            .is_some_and(|&version| constraint.matches_provided(version))
+            .is_some_and(|version| constraint.matches_provided(version.as_ref()))
     }
 
     pub(crate) fn supports_architecture(&self, architecture: &str) -> bool {

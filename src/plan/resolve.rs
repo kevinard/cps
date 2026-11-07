@@ -47,7 +47,9 @@ pub fn resolve<'a, T>(
     for (name, spec) in requested {
         if let Some(frozen) = available.freezes.get(*name) {
             ensure!(
-                spec.version.is_none_or(|version| version == frozen.version),
+                spec.version
+                    .as_ref()
+                    .is_none_or(|version| version == &frozen.version),
                 "{name} is frozen at {}{}; use plan unfreeze before changing its version",
                 frozen.version,
                 freeze::reason_suffix(frozen)
@@ -79,12 +81,12 @@ pub fn resolve<'a, T>(
             continue;
         }
         let spec = requested.get(manifest.name.as_str());
-        let pinned = spec.and_then(|spec| spec.version);
+        let pinned = spec.and_then(|spec| spec.version.as_ref());
         let previous = installed.get(&manifest.name);
         if let Some(previous) = previous {
             let old = &previous.published.manifest;
             if old.publisher != manifest.publisher
-                || (old.version > manifest.version && pinned != Some(manifest.version))
+                || (old.version > manifest.version && pinned != Some(&manifest.version))
             {
                 continue;
             }
@@ -97,7 +99,7 @@ pub fn resolve<'a, T>(
         if spec.is_some_and(|spec| {
             spec.publisher
                 .is_some_and(|publisher| publisher != manifest.publisher)
-                || pinned.is_some_and(|version| version != manifest.version)
+                || pinned.is_some_and(|version| version != &manifest.version)
         }) {
             continue;
         }
@@ -112,7 +114,7 @@ pub fn resolve<'a, T>(
         versions.sort_by_key(|pkg| {
             (
                 prefer_current && current == Some(&pkg.sha256),
-                pkg.manifest.version,
+                &pkg.manifest.version,
             )
         });
         versions.reverse();
@@ -121,15 +123,15 @@ pub fn resolve<'a, T>(
     for spec in requested.values() {
         if let Some(cutoff) = available.obsoletions.get(spec.name) {
             ensure!(
-                spec.version.map_or_else(
+                spec.version.as_ref().map_or_else(
                     || candidates.contains_key(spec.name),
-                    |version| version > *cutoff
+                    |version| version > cutoff
                 ),
                 "{} is obsolete through {cutoff}",
                 spec.name
             );
         }
-        if let Some(version) = spec.version {
+        if let Some(version) = &spec.version {
             ensure!(
                 candidates.contains_key(spec.name),
                 "no eligible version for {}@{version}",
@@ -266,7 +268,7 @@ fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {
             if let Some(selected_target) = selected.get(target.package.as_str()) {
                 let verb = if exclude { "excludes" } else { "requires" };
                 ensure!(
-                    target.matches(selected_target.manifest.version)? != exclude,
+                    target.matches(&selected_target.manifest.version)? != exclude,
                     "{} {verb} {target}, but selected {}",
                     package.manifest.id(),
                     selected_target.manifest.id()
@@ -282,7 +284,7 @@ fn selected_matches(
     target: &DependencyTarget,
 ) -> Result<bool> {
     match selected.get(target.package.as_str()) {
-        Some(package) => target.matches(package.manifest.version),
+        Some(package) => target.matches(&package.manifest.version),
         None => Ok(false),
     }
 }
@@ -295,7 +297,7 @@ pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
     check_selected(&selected)?;
     let mut capabilities = BTreeMap::<_, Vec<_>>::new();
     for package in selected.values() {
-        for (name, &version) in &package.manifest.provides {
+        for (name, version) in &package.manifest.provides {
             capabilities.entry(name.as_str()).or_default().push(version);
         }
     }
@@ -315,7 +317,7 @@ pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
                             .get(target.package.as_str())
                             .is_some_and(|versions| versions
                                 .iter()
-                                .any(|&version| constraint.matches_provided(version))),
+                                .any(|version| constraint.matches_provided(version.as_ref()))),
                         "{} is missing a provider for capability {target}",
                         package.manifest.id(),
                     );

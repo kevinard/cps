@@ -97,7 +97,7 @@ pub(super) fn changes(
                 );
             }
         }
-        let previous = selectors.insert(spec.name, spec);
+        let previous = selectors.insert(spec.name, spec.clone());
         ensure!(
             previous.is_none_or(|previous| previous == spec),
             "conflicting selectors for {}",
@@ -109,8 +109,8 @@ pub(super) fn changes(
             let installed = state
                 .installed
                 .get(name)
-                .map(|package| package.published.manifest.version);
-            let version = spec.version.or(installed).with_context(|| {
+                .map(|package| &package.published.manifest.version);
+            let version = spec.version.as_ref().or(installed).with_context(|| {
                 format!("{name} is not installed; specify the version to freeze")
             })?;
             ensure!(
@@ -120,7 +120,7 @@ pub(super) fn changes(
             next.insert(
                 name.to_owned(),
                 FrozenPackage {
-                    version,
+                    version: version.clone(),
                     reason: reason.clone(),
                 },
             );
@@ -129,7 +129,9 @@ pub(super) fn changes(
                 .get(name)
                 .with_context(|| format!("package is not frozen: {name}"))?;
             ensure!(
-                spec.version.is_none_or(|version| version == freeze.version),
+                spec.version
+                    .as_ref()
+                    .is_none_or(|version| version == &freeze.version),
                 "frozen package does not match the requested version: {name}"
             );
             next.remove(name);

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use kdl::{KdlDocument, KdlValue};
+use kdl::{KdlDocument, KdlNode, KdlValue};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -63,10 +63,10 @@ impl BuildRecipe {
                     "requested toolchain publisher {name} is not pinned"
                 );
             }
+            let name = spec.name;
             ensure!(
-                requested.insert(spec.name, spec).is_none(),
-                "multiple selectors for toolchain package {}",
-                spec.name
+                requested.insert(name, spec).is_none(),
+                "multiple selectors for toolchain package {name}"
             );
         }
         Ok(requested)
@@ -136,6 +136,40 @@ pub(crate) fn read_with_options(
     // The sandbox and the attestation both use the effective document.
     let effective = parse(&text).context("reading the effective build recipe")?;
     Ok((text.into_bytes(), effective))
+}
+
+pub(crate) fn snapshot_recipe(
+    template: &[u8],
+    manifest_sha256: &str,
+    archive_name: &str,
+    archive: &FileDigest,
+) -> Result<String> {
+    let mut doc = document(std::str::from_utf8(template)?)?;
+    let build = doc.get_mut("build").context("missing build node")?;
+    let children = build.ensure_children().nodes_mut();
+    children.retain(|node| {
+        node.name().value() != "source"
+            || node.get(0).and_then(KdlValue::as_string) != Some(archive_name)
+    });
+    let manifest = children
+        .iter_mut()
+        .find(|node| node.name().value() == "manifest")
+        .context("missing manifest node")?;
+    manifest.entries_mut().clear();
+    manifest.push("manifest.kdl");
+    manifest.insert("sha256", manifest_sha256);
+    let mut source = KdlNode::new("source");
+    source.push(archive_name);
+    source.insert("size", i128::from(archive.size));
+    source.insert("sha256", archive.sha256.as_str());
+    children.push(source);
+    let text = doc.to_string();
+    ensure!(
+        text.len() as u64 <= RECIPE_LIMIT,
+        "snapshot build recipe exceeds the size limit"
+    );
+    parse(&text).context("validating the snapshot build recipe")?;
+    Ok(text)
 }
 
 pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, PublisherConfig>> {

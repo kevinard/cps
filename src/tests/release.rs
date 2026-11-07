@@ -119,7 +119,7 @@ fn publisher_independently_checks_the_signed_toolchain_closure() -> Result<()> {
             .unwrap();
         PinnedPackage {
             publisher: published.manifest.publisher.clone(),
-            version: published.manifest.version,
+            version: published.manifest.version.clone(),
             sha256: published.sha256.clone(),
         }
     };

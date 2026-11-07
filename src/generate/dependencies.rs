@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-type Package<'a> = (&'a str, Version, &'a str);
+type Package<'a> = (&'a str, &'a Version, &'a str);
 
 /// Generate reviewable KDL require lines and diagnostics using only local inputs.
 pub fn suggest_dependencies(
@@ -179,7 +179,9 @@ fn load_providers(
             {
                 continue;
             }
-            let best = latest.entry(spec.name).or_insert((version, id, entry));
+            let best = latest
+                .entry(spec.name)
+                .or_insert_with(|| (version.clone(), id, entry));
             if version > best.0 {
                 *best = (version, id, entry);
             }
@@ -211,7 +213,7 @@ impl<'a> Paths<'a> {
     fn add(&mut self, manifest: &'a Manifest, local: bool, config: &ImageDefinition) -> Result<()> {
         let package = (!local).then_some((
             manifest.name.as_str(),
-            manifest.version,
+            &manifest.version,
             manifest.publisher.as_str(),
         ));
         for action in &manifest.action {

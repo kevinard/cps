@@ -33,7 +33,7 @@ impl Filter {
     fn matches(&self, manifest: &Manifest) -> bool {
         let matches = match &self.capability {
             Some(name) => manifest.provides_capability(name, &self.constraint),
-            None => self.constraint.matches(manifest.version),
+            None => self.constraint.matches(&manifest.version),
         };
         matches != self.exclude
     }
@@ -85,7 +85,7 @@ impl<'a> Universe<'a> {
         let retained = installed
             .iter()
             .filter(|(name, _)| wanted.contains(name.as_str()))
-            .map(|(name, entry)| (name.as_str(), entry.published.manifest.version))
+            .map(|(name, entry)| (name.as_str(), &entry.published.manifest.version))
             .collect();
         for (&name, versions) in candidates {
             let name = universe.pool.intern_package_name(name);
@@ -149,14 +149,14 @@ impl<'a> Universe<'a> {
     }
 
     fn exact(&self, id: SolvableId) -> ConditionalRequirement {
-        let version = self.package(id).manifest.version;
+        let version = &self.package(id).manifest.version;
         let name = self.pool.resolve_solvable(id).name;
         self.pool
             .intern_version_set(
                 name,
                 Filter {
                     expression: Some(format!("={version}")),
-                    constraint: VersionConstraint::exact(version),
+                    constraint: VersionConstraint::exact(version.clone()),
                     ..Filter::default()
                 },
             )
@@ -214,7 +214,7 @@ impl<'a> Universe<'a> {
     fn alternatives(
         &self,
         targets: &[DependencyTarget],
-        retained: &BTreeMap<&str, Version>,
+        retained: &BTreeMap<&str, &Version>,
     ) -> Result<VersionSetUnionId> {
         let mut choices = Vec::with_capacity(targets.len());
         for target in targets {
@@ -309,7 +309,7 @@ impl Rejections {
                 self.pairs.insert((a.min(b), a.max(b))),
                 "solver selected a rejected candidate pair"
             );
-            let version = universe.package(b).manifest.version;
+            let version = &universe.package(b).manifest.version;
             let exact = format!("={version}");
             let filter = Filter {
                 expression: Some(format!("{exact} ({conflict})")),
@@ -336,7 +336,7 @@ impl Interner for Provider<'_, '_> {
     type SolvableId = SolvableId;
 
     fn display_solvable(&self, id: SolvableId) -> impl Display + '_ {
-        self.universe.package(id).manifest.version
+        &self.universe.package(id).manifest.version
     }
 
     fn display_name(&self, id: NameId) -> impl Display + '_ {
@@ -486,7 +486,7 @@ pub(super) fn solve<'a, T>(
                     let Some(entry) = installed.get(&target.package) else {
                         continue;
                     };
-                    if !target.matches(entry.published.manifest.version)? {
+                    if !target.matches(&entry.published.manifest.version)? {
                         continue;
                     }
                 }

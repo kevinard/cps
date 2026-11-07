@@ -35,7 +35,7 @@ pub(super) fn matching_advisories(
         if let Some(installed) = state.installed.get(&advisory.package) {
             let manifest = &installed.published.manifest;
             if manifest.publisher == advisory.publisher
-                && VersionConstraint::parse(Some(&advisory.affected))?.matches(manifest.version)
+                && VersionConstraint::parse(Some(&advisory.affected))?.matches(&manifest.version)
             {
                 matching.push(advisory.clone());
             }
@@ -142,8 +142,8 @@ pub(super) fn candidates(
                 .get(&manifest.name)
                 .is_none_or(|digest| digest == &package.sha256)
         {
-            let version = latest.entry(&manifest.name).or_insert(manifest.version);
-            *version = (*version).max(manifest.version);
+            let version = latest.entry(&manifest.name).or_insert(&manifest.version);
+            *version = (*version).max(&manifest.version);
         }
     }
     latest
@@ -161,8 +161,8 @@ pub(super) fn candidates(
             HeldBackUpdate {
                 name: name.clone(),
                 publisher: manifest.publisher.clone(),
-                installed: manifest.version,
-                available,
+                installed: manifest.version.clone(),
+                available: available.clone(),
                 selected: None,
                 reason,
             }

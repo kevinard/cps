@@ -31,9 +31,9 @@ pub use boot::{
     stage_boot_environment, stage_btrfs_boot_environment,
 };
 pub use build::{
-    BuildOptions, BuildSettings, BuildToolchain, BuildWorker, SourceLayout, build,
+    BuildOptions, BuildSettings, BuildToolchain, BuildWorker, GitSnapshotRef, SourceLayout, build,
     build_cached_package, build_package, build_with_recipe_options, build_with_toolchain_config,
-    build_with_worker, develop, fetch_toolchain,
+    build_with_worker, develop, fetch_toolchain, prepare_git_snapshot, prepare_git_snapshot_ref,
     sources::{fetch_sources, fetch_sources_with_local, import_sources},
 };
 pub use generate::{

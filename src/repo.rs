@@ -32,11 +32,13 @@ const PUBLISH_POLICY_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_RELEASE_LIMIT: u64 = 1024 * 1024;
 const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
+mod git_snapshots;
 mod keys;
 pub(crate) mod profiles;
 mod rebuild;
 pub mod release;
 mod source_archive;
+pub(crate) use git_snapshots::{assign_git_version, lock_snapshot_series};
 pub use rebuild::{export_rebuild_inputs, verify_rebuild};
 pub use source_archive::{archive_build_sources, fetch_build_sources};
 
@@ -431,7 +433,7 @@ impl Catalog {
                 spec.name
             );
             ensure!(
-                self.obsoletions.get(spec.name).copied() == spec.version,
+                self.obsoletions.get(spec.name) == spec.version.as_ref(),
                 "cannot change the signed rename cutoff for {}",
                 spec.name
             );
@@ -1614,8 +1616,12 @@ fn store(repo: &Path, kind: &str, bytes: &[u8]) -> Result<String> {
 fn lock_repo(repo: &Path) -> Result<File> {
     fs::create_dir_all(repo)?;
     Root::open(repo)?;
+    lock_file(&repo.join("publish.lock"))
+}
+
+fn lock_file(path: &Path) -> Result<File> {
     let lock = File::from(open(
-        repo.join("publish.lock"),
+        path,
         OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )?);
