@@ -241,6 +241,11 @@ plans, live updates, and staged upgrades. It models managed library resolution
 and reports regressions from a verified baseline. Unmanaged libraries, loader
 cache and environment settings, and runtime `dlopen` calls are outside its
 scope. Plans and dry runs can still be generated before payloads are available.
+Use `cps fetch --root image --plan upgrade.json` followed by
+`cps validate --root image upgrade.json` to check a saved plan and its
+cached payloads, filesystem metadata support, and ELF regressions before
+apply. Validation uses disposable staging and leaves the image revision and
+journal untouched. Apply repeats the checks against the current image.
 
 Run `bash tests/elf-transactions.sh` to exercise an install that shadows a
 working library, an incompatible upgrade, removals, a facet change, and a

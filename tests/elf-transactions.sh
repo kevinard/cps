@@ -84,6 +84,12 @@ grep -F "$missing" rejected.log
 library libcps-abi.so.1 bad.map shadow/usr/override/libcps-abi.so.1
 publish shadow 1.0.0-0 demo/shadow
 "$cps" plan --root image --output shadow.json install demo/shadow
+if "$cps" validate --root image shadow.json > rejected.log 2>&1; then
+    echo 'Validation accepted a transaction that shadows a working library' >&2
+    exit 1
+fi
+grep -F 'does not provide required version CPS_ABI_1' rejected.log
+"$cps" transaction status --root image | grep -Fx 'No pending transaction'
 reject shadow.json 'ELF dependency libcps-abi.so.1 at usr/override/libcps-abi.so.1 does not provide required version CPS_ABI_1'
 test ! -e image/usr/override/libcps-abi.so.1
 
@@ -111,6 +117,8 @@ library libcps-abi.so.1 good.map runtime/usr/lib/libcps-abi.so.1.1
 ln -s libcps-abi.so.1.1 runtime/usr/lib/libcps-abi.so.1
 publish runtime 3.0.0-0 demo/runtime
 "$cps" plan --root image --output compatible.json update
+"$cps" validate --root image compatible.json
+test "$(readlink image/usr/lib/libcps-abi.so.1)" = libcps-abi.so.1.0
 "$cps" apply --root image compatible.json
 test "$(readlink image/usr/lib/libcps-abi.so.1)" = libcps-abi.so.1.1
 "$cps" verify --root image --pristine

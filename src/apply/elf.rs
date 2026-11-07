@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use rustix::fs::{Mode, OFlags, openat};
 
 use crate::{
     image::{Managed, State, root::Root},
@@ -33,6 +34,7 @@ pub(super) fn applies(plan: &Plan, state: &State) -> bool {
 
 pub(super) fn check(
     root: &Root,
+    stage: &File,
     plan: &Plan,
     previous: &BTreeMap<String, Managed>,
     next: &State,
@@ -41,12 +43,14 @@ pub(super) fn check(
     let defaults = ["/usr/lib", "/lib", "/usr/lib64", "/lib64"].map(str::to_owned);
     let mut before = Files {
         root,
+        stage,
         paths: previous,
         staged: BTreeSet::new(),
         inspected: BTreeMap::new(),
     };
     let mut after = Files {
         root,
+        stage,
         paths: &next.paths,
         staged: plan
             .writes
@@ -144,6 +148,7 @@ fn regression(
 
 struct Files<'a> {
     root: &'a Root,
+    stage: &'a File,
     paths: &'a BTreeMap<String, Managed>,
     staged: BTreeSet<&'a str>,
     inspected: BTreeMap<&'a str, Result<Option<Elf>>>,
@@ -159,15 +164,17 @@ impl<'a> Files<'a> {
             !managed.preserve,
             "ELF inspection requires managed contents"
         );
-        let staged;
-        let path = if self.staged.contains(path) {
-            staged = format!(".cps/stage/{sha256}");
-            &staged
+        let file = if self.staged.contains(path) {
+            File::from(openat(
+                self.stage,
+                sha256.as_str(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?)
         } else {
-            path
+            let entry = self.root.regular_entry(path)?.context("missing ELF file")?;
+            File::open(Root::fd_path(&entry))?
         };
-        let entry = self.root.regular_entry(path)?.context("missing ELF file")?;
-        let file = File::open(Root::fd_path(&entry))?;
         Ok((file, *size, sha256))
     }
 

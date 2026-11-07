@@ -308,6 +308,27 @@ fn check_plan_revision(state: &State, plan: &Plan) -> Result<()> {
     plan.check_publisher_generation(&state.settings)
 }
 
+/// Check a saved plan against cached payloads using disposable image-local staging.
+pub fn validate_plan(path: &Path, plan: &Plan) -> Result<()> {
+    let image = Image::open_query(path)?;
+    image.require_clean()?;
+    let state = image.state()?;
+    ensure!(
+        plan.image == state.settings.id,
+        "plan targets a different image"
+    );
+    let previous = elf::applies(plan, &state).then(|| state.paths.clone());
+    let (checked, next, _) = check_plan(&image, state, plan)?;
+    let parent = image.stage()?;
+    let scratch = tempfile::tempdir_in(Root::fd_path(&parent))?;
+    let stage = File::open(scratch.path())?;
+    prepare(&image.root, &stage, &checked, &next)?;
+    if let Some(previous) = &previous {
+        elf::check(&image.root, &stage, &checked, previous, &next)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_with(path: &Path, plan: &Plan, after_write: impl FnMut(&Write)) -> Result<u64> {
     apply_to_image(Image::open_for_apply(path)?, plan, None, after_write)
 }
@@ -368,7 +389,7 @@ pub(crate) fn apply_to_image(
             .as_ref()
             .or_else(|| current.as_ref().map(|state| &state.paths))
             .expect("ELF checking retained the previous paths");
-        elf::check(&image.root, &checked, previous, &next)?;
+        elf::check(&image.root, &stage, &checked, previous, &next)?;
     }
     let repo_backed = checked.catalog.is_some() || !checked.catalogs.is_empty();
     let journal = Box::new(Journal {

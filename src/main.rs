@@ -326,6 +326,12 @@ enum Command {
         #[arg(long = "archive-cache", value_name = "PUBLISHER=PATH", value_parser = parse_repository)]
         archive_caches: Vec<(String, PathBuf)>,
     },
+    /// Validate a saved plan against cached payloads before applying it
+    Validate {
+        #[arg(long)]
+        root: PathBuf,
+        plan: PathBuf,
+    },
     /// Apply or resume a saved plan
     Apply {
         #[arg(long)]
@@ -2353,6 +2359,10 @@ fn run(command: Command) -> Result<ExitCode> {
             let saved = load_plan(&plan)?;
             let count = fetch_plan_with_archives(&root, &saved, &archive_caches)?;
             println!("Verified {count} plan payloads");
+        }
+        Command::Validate { root, plan } => {
+            cps::validate_plan(&root, &load_plan(&plan)?)?;
+            println!("Plan validated against cached payloads");
         }
         Command::Verify {
             root,
