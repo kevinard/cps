@@ -318,6 +318,33 @@ impl ImageLock {
             .with_context(|| format!("image lock has no catalog for {publisher}"))
     }
 
+    pub(crate) fn retained_catalog(&self, publisher: &str, key: &[u8]) -> Result<&str> {
+        let pin = self
+            .publishers
+            .iter()
+            .find(|pin| pin.name == publisher)
+            .with_context(|| format!("image lock has no publisher {publisher}"))?;
+        ensure!(
+            pin.key_sha256 == digest(key),
+            "image lock uses a different key for {publisher}"
+        );
+        Ok(&pin.catalog)
+    }
+
+    pub(crate) fn pinned_packages<'a>(
+        &'a self,
+        publisher: &'a str,
+    ) -> impl Iterator<Item = (String, &'a str)> {
+        self.packages.iter().filter_map(move |(name, package)| {
+            (package.publisher == publisher).then(|| {
+                (
+                    format!("cps://{publisher}/{name}@{}", package.version),
+                    package.manifest_sha256.as_str(),
+                )
+            })
+        })
+    }
+
     pub(crate) fn selectors(&self) -> BTreeMap<&str, PackageSpec<'_>> {
         self.packages
             .iter()

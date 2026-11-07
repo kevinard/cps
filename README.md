@@ -1302,6 +1302,11 @@ catalogs needed by builds or releases. Supply the references for each cache
 you prune. Catalogs, manifests, build evidence, and replay checkpoints stay
 available.
 
+Use `--keep-lock image.lock.json` to retain the locked packages' payloads
+for that cache's publisher without retaining every payload in the pinned
+catalog. CPS checks the lock's publisher key, catalog, and manifest digests
+before pruning.
+
 Each new publication or withdrawal advances a sequence signed by the CPS
 publisher. Sync remembers the newest authenticated catalog even if downloading
 its payloads fails. It rejects older publisher sequences and different catalogs

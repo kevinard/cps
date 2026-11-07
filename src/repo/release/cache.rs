@@ -9,6 +9,7 @@ use rustix::fs::{AtFlags, unlinkat};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    ImageLock,
     image::Image,
     plan::{Plan, payloads},
     repo::read_package,
@@ -210,7 +211,19 @@ pub fn prune_payloads(
     keep: CacheRetention<'_>,
     apply: bool,
 ) -> Result<PruneReport> {
-    prune_with_registered_roots(repo, publisher, trust_key, keep, &[], apply)
+    prune_payloads_with_locks(repo, publisher, trust_key, keep, &[], apply)
+}
+
+/// Also keep payloads from the exact selected packages in saved image locks.
+pub fn prune_payloads_with_locks(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    keep: CacheRetention<'_>,
+    locks: &[ImageLock],
+    apply: bool,
+) -> Result<PruneReport> {
+    prune_with_registered_roots(repo, publisher, trust_key, keep, &[], locks, apply)
 }
 
 pub(crate) fn prune_with_registered_roots(
@@ -219,6 +232,7 @@ pub(crate) fn prune_with_registered_roots(
     trust_key: &Path,
     keep: CacheRetention<'_>,
     registered: &[(String, Image)],
+    locks: &[ImageLock],
     apply: bool,
 ) -> Result<PruneReport> {
     validate_publisher(publisher)?;
@@ -317,6 +331,23 @@ pub(crate) fn prune_with_registered_roots(
         for hash in payloads(&plan.writes).into_keys() {
             validate_digest(hash)?;
             live.insert(hash.to_owned());
+        }
+    }
+    for lock in locks {
+        let hash = lock.retained_catalog(publisher, &key)?;
+        let catalog = read_catalog(&repo, hash, publisher, &key)
+            .with_context(|| format!("reading locked catalog {hash}"))?;
+        for (id, manifest) in lock.pinned_packages(publisher) {
+            let entry = catalog
+                .entries
+                .get(&id)
+                .with_context(|| format!("locked package {id} is absent from catalog {hash}"))?;
+            ensure!(
+                entry.manifest_digest() == manifest,
+                "locked manifest differs for {id}"
+            );
+            let package = read_package(&repo, publisher, &id, entry)?;
+            live.extend(release_blobs([&package])?.into_keys().map(str::to_owned));
         }
     }
     for hash in catalogs {

@@ -219,6 +219,18 @@ impl System {
         keep: crate::release::CacheRetention<'_>,
         apply: bool,
     ) -> Result<crate::release::PruneReport> {
+        self.prune_cache_with_locks(repo, publisher, key, keep, &[], apply)
+    }
+
+    pub fn prune_cache_with_locks(
+        &self,
+        repo: &Path,
+        publisher: &str,
+        key: &Path,
+        keep: crate::release::CacheRetention<'_>,
+        locks: &[crate::ImageLock],
+        apply: bool,
+    ) -> Result<crate::release::PruneReport> {
         let _lock = self.lock()?;
         let boot = self.boot();
         crate::boot::with_registered_images(
@@ -227,7 +239,7 @@ impl System {
             &boot.activation.root_partuuid,
             |images| {
                 crate::release::prune_with_registered_roots(
-                    repo, publisher, key, keep, images, apply,
+                    repo, publisher, key, keep, images, locks, apply,
                 )
             },
         )

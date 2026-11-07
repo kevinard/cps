@@ -836,6 +836,9 @@ enum RepoCommand {
         /// Keep payloads used by this saved plan
         #[arg(long = "keep-plan")]
         plans: Vec<PathBuf>,
+        /// Keep the locked packages and payloads for this publisher
+        #[arg(long = "keep-lock")]
+        locks: Vec<PathBuf>,
         /// Retain the roots registered in this installed system's boot configuration
         #[arg(long)]
         system_config: Option<PathBuf>,
@@ -1923,6 +1926,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 catalogs,
                 images,
                 plans,
+                locks,
                 system_config,
                 apply,
             } => {
@@ -1930,16 +1934,23 @@ fn run(command: Command) -> Result<ExitCode> {
                     .iter()
                     .map(|path| load_plan(path))
                     .collect::<Result<Vec<_>>>()?;
+                let locks = locks
+                    .iter()
+                    .map(|path| cps::read_image_lock(path))
+                    .collect::<Result<Vec<_>>>()?;
                 let keep = release::CacheRetention {
                     catalogs: &catalogs,
                     images: &images,
                     plans: &plans,
                 };
                 let report = if let Some(config) = system_config {
-                    System::load(&config)?
-                        .prune_cache(&repo, &publisher, &trust_key, keep, apply)?
+                    System::load(&config)?.prune_cache_with_locks(
+                        &repo, &publisher, &trust_key, keep, &locks, apply,
+                    )?
                 } else {
-                    release::prune_payloads(&repo, &publisher, &trust_key, keep, apply)?
+                    release::prune_payloads_with_locks(
+                        &repo, &publisher, &trust_key, keep, &locks, apply,
+                    )?
                 };
                 for root in &report.registered_roots {
                     print!(

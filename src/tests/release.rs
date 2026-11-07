@@ -3362,6 +3362,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     };
     let saved = plan(&f.root, request.clone())?;
     apply(&installed, &plan(&installed, request.clone())?)?;
+    let saved_lock = crate::capture_image_lock(&installed)?;
     let pending = work.join("pending-image");
     let pending_config = work.join("pending-image.kdl");
     fs::write(
@@ -3409,6 +3410,19 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     let report = prune(&[], &[], &[], false)?;
     assert_eq!(report.bytes, 14);
     assert!(report.blobs.iter().any(|(hash, _)| hash == &old_blob));
+    let report = mirror_release::prune_payloads_with_locks(
+        &cache,
+        "canopa",
+        &f.public,
+        mirror_release::CacheRetention {
+            catalogs: &[],
+            images: &[],
+            plans: &[],
+        },
+        &[saved_lock],
+        false,
+    )?;
+    assert_eq!(report.blobs, [(orphan.clone(), 6)]);
     assert!(blob_dir.join(&old_blob).exists() && blob_dir.join(&orphan).exists());
     let report = mirror_release::prune_with_registered_roots(
         &cache,
@@ -3423,6 +3437,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
             "fallback".into(),
             crate::image::Image::open_query(&installed)?,
         )],
+        &[],
         false,
     )?;
     assert_eq!(report.blobs, [(orphan.clone(), 6)]);
