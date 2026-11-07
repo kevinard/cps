@@ -7,7 +7,8 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
 mkdir -p bin proto/usr/lib/udev/hwdb.d
-printf '#!/usr/bin/env bash\necho update >> %q\nexec %q "$@"\n' "$work/actions" "$tool" > bin/systemd-hwdb
+printf '#!/usr/bin/env bash\necho update >> %q\n[[ ! -e %q ]] || exit 42\nexec %q "$@"\n' \
+    "$work/actions" "$work/fail" "$tool" > bin/systemd-hwdb
 chmod +x bin/systemd-hwdb
 export PATH="$work/bin:$PATH"
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
@@ -32,8 +33,19 @@ test "$(wc -l < actions)" -eq 1
 "$tool" --root=image query test:cps:first-device | rg -Fx 'CPS_TEST=first'
 "$tool" --root=image query test:cps:second-device | rg -Fx 'CPS_TEST=second'
 "$cps" plan --root image --output remove.json remove test/first test/second
-"$cps" apply --root image remove.json
+touch fail
+if "$cps" apply --root image remove.json; then
+    echo 'expected the hardware database helper to fail' >&2
+    exit 1
+fi
 test "$(wc -l < actions)" -eq 2
+test ! -e image/usr/lib/udev/hwdb.d/first.hwdb
+test ! -e image/usr/lib/udev/hwdb.d/second.hwdb
+"$cps" transaction status --root image | rg -Fx 'Offline actions pending'
+rm fail
+mv repo offline
+"$cps" transaction resume --root image
+test "$(wc -l < actions)" -eq 3
 test ! -e image/etc/udev/hwdb.bin
 "$cps" verify --root image
-echo 'Verified one hardware database rebuild per transaction, including removal'
+echo 'Verified coalesced hardware database rebuilds, removal, and offline journal retry'

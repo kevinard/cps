@@ -482,6 +482,18 @@ if [ -f /etc/cps-btrfs-boot ]; then
     btrfs subvolume delete /captures/protected-trial/root /captures/protected/root
     $bb rmdir /captures/protected-trial /captures/protected
     before=$(sha256sum /efi/loader/loader.conf)
+    entries_before=$(cps boot-env list --esp /efi)
+    if $bb dd if=/dev/zero of=/efi/cps-space-test bs=1M > /tmp/full 2>&1; then exit 1; fi
+    $bb grep -F 'No space left on device' /tmp/full
+    $bb sync
+    if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume \
+        --esp /efi --root-partuuid "$root_uuid" --options "$boot_options" > /tmp/full 2>&1; then exit 1; fi
+    $bb grep -F 'No space left on device' /tmp/full
+    test "$(sha256sum /efi/loader/loader.conf)" = "$before"
+    test "$(cps boot-env list --esp /efi)" = "$entries_before"
+    $bb rm /efi/cps-space-test
+    $bb sync
+    echo 'CPS_VM_BTRFS_BOOT: full ESP left the known-good entry selected'
     if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume/@ \
         --esp /efi --root-partuuid "$root_uuid" > /tmp/rejected 2>&1; then exit 1; fi
     $bb grep -F 'top-level subvolume' /tmp/rejected
@@ -510,6 +522,7 @@ if [ -f /etc/cps-btrfs-boot ]; then
     $bb grep -F 'registered Btrfs root' /tmp/rejected
     test "$(sha256sum /volume/@captures/trial/root/.cps/state.sqlite)" = "$staged_state"
     cps boot-env list --esp /efi
+    echo 'CPS_VM_BTRFS_BOOT: retried trial activation after freeing ESP space'
     umount /efi
     umount /volume
 fi
@@ -584,6 +597,10 @@ run capture.log "$root_drive" "root=$root_device rootfstype=btrfs rootflags=subv
     -drive if=virtio,format=raw,file=scratch.ext4
 grep -Fx 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root' capture.log.clean
 if [[ $native_boot == 1 ]]; then
+    if [[ $system_commands == 0 ]]; then
+        grep -Fx 'CPS_VM_BTRFS_BOOT: full ESP left the known-good entry selected' capture.log.clean
+        grep -Fx 'CPS_VM_BTRFS_BOOT: retried trial activation after freeing ESP space' capture.log.clean
+    fi
     cp "${CPS_VM_OVMF_VARS:?Set CPS_VM_OVMF_VARS}" vars.fd
     uefi_timeout=180
     if [[ $destroy == 1 ]]; then uefi_timeout=300; fi

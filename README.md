@@ -162,7 +162,9 @@ payload digests. Use `cps resume` if a live repair is interrupted.
 Use `cps repair --prepare-only` to build and verify a recovery root from the
 running root. CPS also takes this route for a repair or revert that touches
 boot-sensitive files. The command prints the prepared root's path and leaves
-boot selection alone. Trial activation requires a separate verified fallback.
+boot selection alone. During trial activation CPS verifies the staged
+root's recorded parent as the fallback. If the parent is damaged, the
+prepared root is available for offline recovery.
 
 ## Build and try it
 
@@ -2362,7 +2364,9 @@ Set `CPS_VM_BTRFS_BOOT=1` on `tests/boot-capture-vm.sh`, provide
 `CPS_VM_SYSTEMD_BOOT` EFI binary, and use the installed systemd runtime.
 This mode tests activation, a transaction waiting while registration
 completes, blessing, the trial's default on reboot, rejection of altered
-subvolume metadata, and rollback to the previous root.
+subvolume metadata, and rollback to the previous root. It also fills the
+EFI partition, checks that a failed activation keeps the known-good boot
+selection, and retries activation after freeing space.
 Add `CPS_VM_BTRFS_HEALTH_FAIL=1` to change a managed file's metadata at
 trial boot and verify that two unblessed attempts fall back to the original
 subvolume.
