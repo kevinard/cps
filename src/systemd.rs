@@ -27,6 +27,7 @@ pub(crate) enum Action {
     Sysusers(String),
     Tmpfiles(String),
     Preset(String),
+    Hwdb(String),
 }
 
 impl Action {
@@ -35,28 +36,33 @@ impl Action {
             Self::Sysusers(_) => "sysusers",
             Self::Tmpfiles(_) => "tmpfiles",
             Self::Preset(_) => "preset",
+            Self::Hwdb(_) => "hwdb",
         }
     }
 
     pub fn name(&self) -> &str {
         match self {
-            Self::Sysusers(name) | Self::Tmpfiles(name) | Self::Preset(name) => name,
+            Self::Sysusers(name) | Self::Tmpfiles(name) | Self::Preset(name) | Self::Hwdb(name) => {
+                name
+            }
         }
     }
 
     pub fn path(&self) -> String {
         let directory = match self {
-            Self::Sysusers(_) => "sysusers.d",
-            Self::Tmpfiles(_) => "tmpfiles.d",
-            Self::Preset(_) => "systemd/system",
+            Self::Sysusers(_) => "usr/lib/sysusers.d",
+            Self::Tmpfiles(_) => "usr/lib/tmpfiles.d",
+            Self::Preset(_) => "usr/lib/systemd/system",
+            Self::Hwdb(_) => "usr/lib/udev/hwdb.d",
         };
-        format!("usr/lib/{directory}/{}", self.name())
+        format!("{directory}/{}", self.name())
     }
 
     pub fn validate(&self) -> Result<()> {
         let name = self.name();
         let valid_suffix = match self {
             Self::Sysusers(_) | Self::Tmpfiles(_) => name.ends_with(".conf"),
+            Self::Hwdb(_) => name.ends_with(".hwdb"),
             Self::Preset(_) => name.rsplit_once('.').is_some_and(|(_, suffix)| {
                 matches!(
                     suffix,
@@ -92,15 +98,21 @@ pub(crate) fn plan_actions(
     paths: &BTreeMap<String, Managed>,
 ) -> Vec<Action> {
     let previous = active_actions(&state.installed, &state.paths);
-    active_actions(installed, paths)
-        .into_iter()
-        .filter_map(|(action, input)| {
+    let next = active_actions(installed, paths);
+    next.iter()
+        .filter_map(|(&action, &input)| {
             let changed = match action {
                 Action::Preset(_) => !state.paths.contains_key(&action.path()),
                 _ => previous.get(action) != Some(&input),
             };
             changed.then(|| action.clone())
         })
+        .chain(
+            previous
+                .keys()
+                .filter(|action| matches!(action, Action::Hwdb(_)) && !next.contains_key(*action))
+                .map(|&action| action.clone()),
+        )
         .collect()
 }
 
@@ -144,10 +156,21 @@ pub(crate) fn run(
     let runtime = live.then(|| Root::open(Path::new("/run"))).transpose()?;
     let mut sysusers = Vec::new();
     let mut presets = Vec::new();
+    let mut rebuild_hwdb = false;
     let mut rules = tempfile::tempfile_in(path.join(".cps/stage"))?;
     for action in actions {
         action.validate()?;
         let vendor_path = action.path();
+        if matches!(action, Action::Hwdb(_)) {
+            rebuild_hwdb = true;
+            if !state.paths.contains_key(&vendor_path) {
+                ensure!(
+                    root.inspect(&vendor_path)?.is_none(),
+                    "removed hardware database input remains at {vendor_path}"
+                );
+                continue;
+            }
+        }
         let input = state
             .paths
             .get(&vendor_path)
@@ -171,6 +194,7 @@ pub(crate) fn run(
                     presets.push(unit);
                 }
             }
+            Action::Hwdb(_) => {}
         }
     }
 
@@ -206,6 +230,30 @@ pub(crate) fn run(
                 .args(["--no-reload", "--preset-mode=enable-only", "preset", "--"])
                 .args(presets),
             "presets",
+            live,
+        )?;
+    }
+    if rebuild_hwdb {
+        ensure!(
+            !state.paths.contains_key("etc/udev/hwdb.bin"),
+            "the generated hardware database must not be package-owned"
+        );
+        for directory in ["etc", "etc/udev"] {
+            if root.inspect(directory)?.is_some() {
+                root.dir(directory)
+                    .with_context(|| format!("opening hardware database directory {directory}"))?;
+            }
+        }
+        ensure!(
+            matches!(
+                root.inspect("etc/udev/hwdb.bin")?,
+                None | Some(Node::File { .. })
+            ),
+            "unexpected file type at the generated hardware database"
+        );
+        run_tool(
+            command("systemd-hwdb", path).args(["--strict", "update"]),
+            "hwdb",
             live,
         )?;
     }

@@ -2076,6 +2076,14 @@ CPS shows the actions in the plan and invokes the host's systemd tools with the 
 
 Presets apply the image's own enablement policy to newly installed units. CPS preserves existing enablement and unit overrides, including masks. The preset step only writes enablement links in the image. [systemd presets](https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html)
 
+`hwdb "90-device.hwdb"` declares an input to the hardware database.
+Deliver the corresponding immutable file under `usr/lib/udev/hwdb.d`
+in the same package. CPS queues the rebuild when an active input is added,
+changed, or removed. Multiple changed inputs run one
+`systemd-hwdb --strict update` against the target root after file writes.
+It can run again when an interrupted transaction resumes. The generated
+`etc/udev/hwdb.bin` belongs to the system rather than a package.
+
 Run `cargo build` followed by [`tests/systemd-actions.sh`](tests/systemd-actions.sh) to exercise the real helpers against a staged root. The test also checks recovery from a failed tmpfiles step after sysusers has run.
 
 ## Boot environments

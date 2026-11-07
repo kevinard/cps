@@ -211,11 +211,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             "file" | "dir" | "symlink" | "hardlink" => manifest
                 .action
                 .push(parse_action(node).with_context(|| format!("{name} action"))?),
-            "sysusers" | "tmpfiles" | "preset" => {
+            "sysusers" | "tmpfiles" | "preset" | "hwdb" => {
                 let value = Fields::read(node, 1, &[], false)?.string_arg(0)?;
                 let action = match name {
                     "sysusers" => SystemdAction::Sysusers(value),
                     "tmpfiles" => SystemdAction::Tmpfiles(value),
+                    "hwdb" => SystemdAction::Hwdb(value),
                     _ => SystemdAction::Preset(value),
                 };
                 manifest.systemd.push(action);
