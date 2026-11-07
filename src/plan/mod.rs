@@ -206,6 +206,13 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub(crate) fn is_recovery(&self) -> bool {
+        matches!(
+            self.request,
+            Request::Repair { .. } | Request::RepairPaths { .. } | Request::Revert { .. }
+        )
+    }
+
     pub(crate) fn boot_reason(&self, stage_packages: &BTreeSet<String>) -> Option<String> {
         if self.kernel_install.is_some() {
             return Some("the transaction changes the boot kernel or initramfs".into());
@@ -931,6 +938,7 @@ fn build_with_update_diagnostics(
         | Request::RepairPaths { .. }
         | Request::Revert { .. }
         | Request::ResolveConfig { .. } => {
+            image.verify_catalog_archives(&state)?;
             let paths = crate::verify::manifest_paths(&state)?;
             ensure!(
                 paths == state.paths,

@@ -458,6 +458,9 @@ fn check_live_plan(plan: &Plan, stage_packages: &BTreeSet<String>) -> Result<()>
                 | Request::UpdateProfile
                 | Request::Remove { .. }
                 | Request::Autoremove
+                | Request::Repair { .. }
+                | Request::RepairPaths { .. }
+                | Request::Revert { .. }
         ),
         "this request cannot be applied live"
     );
@@ -581,7 +584,14 @@ fn finish(
             kernel.prepare(&image.root, path, &work.next.settings.id)?;
         }
         let phase = if pending.is_live() { "live" } else { "offline" };
-        for finding in verify_state(&image.root, work.next)? {
+        let repaired = matches!(&pending, PendingRecord::Live { live } if live.plan.is_recovery())
+            .then(|| {
+                work.writes
+                    .iter()
+                    .map(|write| write.path.as_str())
+                    .collect()
+            });
+        for finding in verify_state(&image.root, work.next, repaired.as_ref())? {
             ensure!(
                 !finding.is_error,
                 "{phase} actions left an inconsistent image: {}",

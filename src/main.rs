@@ -99,6 +99,27 @@ enum Command {
         #[arg(long)]
         stage: bool,
     },
+    /// Restore damaged managed files on the running system
+    Repair {
+        #[command(flatten)]
+        options: SystemOptions,
+        /// Prepare a verified recovery root for separate activation
+        #[arg(long)]
+        prepare_only: bool,
+        #[arg(long = "path", value_name = "PATH", conflicts_with = "packages")]
+        paths: Vec<String>,
+        packages: Vec<String>,
+    },
+    /// Restore vendor defaults for preserved configuration on the running system
+    Revert {
+        #[command(flatten)]
+        options: SystemOptions,
+        /// Prepare a verified recovery root for separate activation
+        #[arg(long)]
+        prepare_only: bool,
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
     /// Show an interrupted change or a system waiting for reboot
     Status {
         #[arg(long, default_value = system::CONFIG)]
@@ -1419,7 +1440,12 @@ fn change_system(
     request: Request,
     stage: bool,
     force_phased_update: bool,
+    prepare_only: bool,
 ) -> Result<()> {
+    let recovery = matches!(
+        request,
+        Request::Repair { .. } | Request::RepairPaths { .. } | Request::Revert { .. }
+    );
     let system = System::load(&options.config)?
         .with_install_recommends(!options.no_install_recommends)
         .with_force_phased_update(force_phased_update);
@@ -1440,18 +1466,25 @@ fn change_system(
             return Err(error);
         }
     };
-    if stage {
+    if stage || prepare_only {
         change = change.with_staging();
     }
     if change.is_empty() {
         println!("Nothing to do.");
         return Ok(());
     }
-    print_package_changes(change.packages());
+    if recovery {
+        println!("{}", change.summary());
+    } else {
+        print_package_changes(change.packages());
+    }
     for effect in change.service_effects() {
         println!("{effect}");
     }
-    if let Some(reason) = change.boot_reason() {
+    let prepare_recovery = recovery && change.boot_reason().is_some();
+    if prepare_recovery {
+        println!("CPS will prepare a verified recovery root for separate activation.");
+    } else if let Some(reason) = change.boot_reason() {
         println!("A reboot will be required because {reason}.");
     } else {
         println!("Changes will take effect on the running system.");
@@ -1473,7 +1506,10 @@ fn change_system(
             return Ok(());
         }
     }
-    if let Some(id) = system.apply(&change)? {
+    if prepare_recovery {
+        let root = system.prepare_recovery(&change)?;
+        println!("Prepared recovery root {}", root.display());
+    } else if let Some(id) = system.apply(&change)? {
         println!("Prepared {id}. Reboot when ready to use the new system.");
     } else {
         println!("Changes are available now.");
@@ -1542,12 +1578,12 @@ fn run(command: Command) -> Result<ExitCode> {
             options,
             stage,
             packages,
-        } => change_system(options, Request::Install { packages }, stage, false)?,
+        } => change_system(options, Request::Install { packages }, stage, false, false)?,
         Command::Upgrade {
             options,
             stage,
             force_phased_update,
-        } => change_system(options, Request::Update, stage, force_phased_update)?,
+        } => change_system(options, Request::Update, stage, force_phased_update, false)?,
         Command::CheckUpdates {
             config,
             json,
@@ -1560,9 +1596,35 @@ fn run(command: Command) -> Result<ExitCode> {
             options,
             stage,
             packages,
-        } => change_system(options, Request::Remove { packages }, stage, false)?,
+        } => change_system(options, Request::Remove { packages }, stage, false, false)?,
         Command::Autoremove { options, stage } => {
-            change_system(options, Request::Autoremove, stage, false)?
+            change_system(options, Request::Autoremove, stage, false, false)?
+        }
+        Command::Repair {
+            options,
+            prepare_only,
+            paths,
+            packages,
+        } => {
+            let request = if paths.is_empty() {
+                Request::Repair { packages }
+            } else {
+                Request::RepairPaths { paths }
+            };
+            change_system(options, request, false, false, prepare_only)?;
+        }
+        Command::Revert {
+            options,
+            prepare_only,
+            paths,
+        } => {
+            change_system(
+                options,
+                Request::Revert { paths },
+                false,
+                false,
+                prepare_only,
+            )?;
         }
         Command::Status { config } => {
             let system = System::load(&config)?;

@@ -617,6 +617,7 @@ if [[ $native_boot == 1 ]]; then
             grep -Fx 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed' uefi.log.clean
         fi
     elif [[ $system_commands == 1 ]]; then
+        grep -Fx 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: installed and upgraded in place, then staged the base upgrade' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: staged upgrade booted with the live package' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: rolled back to the base with the live package' uefi.log.clean

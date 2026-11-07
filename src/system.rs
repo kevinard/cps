@@ -157,6 +157,10 @@ impl Change {
         effects
     }
 
+    pub fn summary(&self) -> String {
+        self.plan.summary()
+    }
+
     /// Route a nonempty change through the trial boot workflow.
     pub fn with_staging(mut self) -> Self {
         if !self.is_empty() {
@@ -312,8 +316,15 @@ impl System {
         let uses_current_catalogs = matches!(request, Request::Install { .. } | Request::Update);
         ensure!(
             uses_current_catalogs
-                || matches!(request, Request::Remove { .. } | Request::Autoremove),
-            "expected an install, upgrade, remove, or autoremove request"
+                || matches!(
+                    request,
+                    Request::Remove { .. }
+                        | Request::Autoremove
+                        | Request::Repair { .. }
+                        | Request::RepairPaths { .. }
+                        | Request::Revert { .. }
+                ),
+            "unsupported system package request"
         );
         self.check_running()?;
         if refresh && uses_current_catalogs {
@@ -353,6 +364,28 @@ impl System {
             return Ok(None);
         }
 
+        let root = self.stage_change(change)?;
+        let id = activate_btrfs_boot_environment(&root, &boot.volume, &boot.esp, &boot.activation)
+            .with_context(|| {
+                format!("activating the prepared environment at {}", root.display())
+            })?;
+        Ok(Some(id))
+    }
+
+    /// Stage a recovery plan and verify the result before returning its root.
+    pub fn prepare_recovery(&self, change: &Change) -> Result<PathBuf> {
+        ensure!(
+            change.plan.is_recovery(),
+            "expected a repair or revert plan"
+        );
+        self.check_running()?;
+        fetch_plan(Path::new(ROOT), &change.plan)
+            .context("fetching the approved repair payloads")?;
+        self.stage_change(change)
+    }
+
+    fn stage_change(&self, change: &Change) -> Result<PathBuf> {
+        let boot = self.boot();
         let plan_id = change.plan.id()?;
         let output = boot.environments.join(format!("upgrade-{plan_id}"));
         let root = output.join("root");
@@ -368,14 +401,17 @@ impl System {
                     && staged.applied(&plan_id)? == Some(settings.revision),
                 "existing staged environment does not match the approved transaction"
             );
+            for finding in crate::verify::verify_image(&staged)? {
+                ensure!(
+                    !finding.is_error,
+                    "prepared environment verification failed: {}",
+                    finding.message
+                );
+            }
         } else {
             stage_running_btrfs(&output, &change.plan)?;
         }
-        let id = activate_btrfs_boot_environment(&root, &boot.volume, &boot.esp, &boot.activation)
-            .with_context(|| {
-                format!("activating the prepared environment at {}", root.display())
-            })?;
-        Ok(Some(id))
+        Ok(root)
     }
 
     pub fn resume(&self) -> Result<Option<u64>> {

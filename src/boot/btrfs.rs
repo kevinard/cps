@@ -127,7 +127,11 @@ fn snapshot_environment(
             "captured image identity or revision changed"
         );
         check_snapshot_tree(&captured.root)?;
-        check_image_integrity(&captured).context("verifying the captured root")?;
+        if from_running && plan.is_some_and(Plan::is_recovery) {
+            captured.verify_catalog_archives(&captured.state()?)?;
+        } else {
+            check_image_integrity(&captured).context("verifying the captured root")?;
+        }
         drop(captured);
         let id = if let Some(plan) = plan {
             super::btrfs_boot::clear_registration(&Root::open(&scratch.path().join("root"))?)?;

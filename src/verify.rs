@@ -130,8 +130,12 @@ pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>>
     effective_paths(&state.settings, &state.installed)
 }
 
-pub(crate) fn verify_state(root: &Root, state: &State) -> Result<Vec<Finding>> {
-    check_state(root, state, false, None)
+pub(crate) fn verify_state(
+    root: &Root,
+    state: &State,
+    selected: Option<&BTreeSet<&str>>,
+) -> Result<Vec<Finding>> {
+    check_state(root, state, false, selected)
 }
 
 fn check_state(

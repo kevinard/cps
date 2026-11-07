@@ -136,6 +136,18 @@ entry keeps its identity while the package revision advances. Use the
 current CPS for managing and verifying those roots. Changes to the running
 root use the same verified, resumable package journal as image transactions.
 
+Use `cps repair --dry-run` to preview restoration of damaged managed files.
+Pass package names to narrow the repair or use `--path /usr/bin/example`
+to select specific paths. `cps revert /etc/example.conf` restores the
+installed package's default configuration and clears the pending vendor
+proposal for that file. Both commands use the installed manifests and exact
+payload digests. Use `cps resume` if a live repair is interrupted.
+
+Use `cps repair --prepare-only` to build and verify a recovery root from the
+running root. CPS also takes this route for a repair or revert that touches
+boot-sensitive files. The command prints the prepared root's path and leaves
+boot selection alone. Trial activation requires a separate verified fallback.
+
 ## Build and try it
 
 Build with `cargo build --locked`. CPS needs Linux with `openat2` and `/proc`, plus the SQLite and libseccomp development libraries. The example uses OpenSSL to generate a local Ed25519 signing key. Run it as your regular user, with package UID and GID matching that user.

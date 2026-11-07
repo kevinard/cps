@@ -105,6 +105,21 @@ test "$(cps-demo)" = 1.0.0-0
 test "$(cps boot-env list --esp /efi)" = "$before"
 systemctl start cps-demo.service
 verify_service 1.0.0-0
+printf 'damaged\n' > /usr/bin/cps-demo
+cps repair --dry-run --path /usr/bin/cps-demo | $bb grep -Fx 'Repair usr/bin/cps-demo'
+test "$($bb cat /usr/bin/cps-demo)" = damaged
+recovery=$(cps repair --yes --prepare-only --path /usr/bin/cps-demo)
+recovery=$(printf '%s\n' "$recovery" | $bb sed -n 's/^Prepared recovery root //p')
+test -n "$recovery"
+test "$($bb cat /usr/bin/cps-demo)" = damaged
+test "$("$recovery/usr/bin/cps-demo")" = 1.0.0-0
+cps verify --root "$recovery"
+btrfs subvolume delete "$recovery"
+$bb rmdir "${recovery%/root}"
+cps repair --yes --path /usr/bin/cps-demo
+test "$(cps-demo)" = 1.0.0-0
+test "$(cps boot-env list --esp /efi)" = "$before"
+echo 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image'
 report=$(cps check-updates --no-refresh --json)
 printf '%s\n' "$report" | $bb grep -F '"status": "up_to_date"'
 printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
