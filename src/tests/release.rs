@@ -260,10 +260,23 @@ fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
     assert!(format!("{error:#}").contains("duplicate release action"));
 
     write("cps://canopa/test/two@1.0.0-0")?;
-    let committed = publish_release(&f.repo, &f.private, &release)?;
+    let publish =
+        |mode| crate::publish_release_with_mode(&f.repo, &f.private, &release, None, mode);
+    let prepared = publish(crate::ReleaseMode::Prepare)?;
+    assert_eq!(fs::read_to_string(&pointer)?, base);
+    let key = read_key(&f.public)?;
+    assert!(
+        snapshot(&f.repo, "canopa", &key, Some(&prepared))?
+            .packages
+            .is_empty()
+    );
+    let wrong = "0".repeat(64);
+    assert!(publish(crate::ReleaseMode::RequireCandidate(&wrong)).is_err());
+    assert_eq!(fs::read_to_string(&pointer)?, base);
+    let committed = publish(crate::ReleaseMode::RequireCandidate(&prepared))?;
+    assert_eq!(committed, prepared);
     assert_eq!(fs::read_to_string(&pointer)?.trim(), committed);
     assert_eq!(list_withdrawals(&f.repo, "canopa", &f.public)?.len(), 2);
-    let key = read_key(&f.public)?;
     assert!(snapshot(&f.repo, "canopa", &key, None)?.packages.is_empty());
     assert_eq!(
         snapshot(&f.repo, "canopa", &key, Some(base.trim()))?

@@ -1847,6 +1847,36 @@ pub fn publish_release_with_sources(
     document: &Path,
     source_cache: Option<&Path>,
 ) -> Result<String> {
+    publish_release_with_mode(repo, key, document, source_cache, ReleaseMode::Publish)
+}
+
+#[derive(Clone, Copy)]
+pub enum ReleaseMode<'a> {
+    Publish,
+    Prepare,
+    RequireCandidate(&'a str),
+}
+
+impl ReleaseMode<'_> {
+    fn check(self, hash: &str) -> Result<()> {
+        if let Self::RequireCandidate(expected) = self {
+            validate_digest(expected)?;
+            ensure!(
+                expected == hash,
+                "release candidate differs from tested catalog {expected}: got {hash}"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn publish_release_with_mode(
+    repo: &Path,
+    key: &Path,
+    document: &Path,
+    source_cache: Option<&Path>,
+    mode: ReleaseMode<'_>,
+) -> Result<String> {
     let bytes = read_limited(File::open(document)?, PUBLISH_RELEASE_LIMIT)?;
     let release = publish_release::parse(std::str::from_utf8(&bytes)?)
         .with_context(|| format!("reading release {}", document.display()))?;
@@ -1935,10 +1965,12 @@ pub fn publish_release_with_sources(
             key.public_key().as_ref(),
         )?;
         if previous.is_none_or(|profiles| profiles != catalog.release_profiles) {
-            return write_catalog(repo, catalog, &key);
+            return save_catalog(repo, catalog, &key, mode);
         }
     }
-    current.context("empty release has no published catalog")
+    let hash = current.context("empty release has no published catalog")?;
+    mode.check(&hash)?;
+    Ok(hash)
 }
 
 fn publication_base(repo: &Path) -> Result<Option<String>> {
@@ -2167,7 +2199,7 @@ pub fn enable_file_index(repo: &Path, publisher: &str, key: &Path) -> Result<Str
     }
     prepare_objects(repo)?;
     catalog.file_index = Some(store_file_index(repo, &catalog)?);
-    write_catalog_document(repo, catalog, &key)
+    write_catalog_document(repo, catalog, &key, ReleaseMode::Publish)
 }
 
 fn store_file_index(repo: &Path, catalog: &Catalog) -> Result<String> {
@@ -2191,17 +2223,27 @@ fn store_file_index(repo: &Path, catalog: &Catalog) -> Result<String> {
     store(repo, FILE_INDEX_OBJECTS, &bytes)
 }
 
-fn write_catalog(repo: &Path, mut catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
+fn write_catalog(repo: &Path, catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
+    save_catalog(repo, catalog, key, ReleaseMode::Publish)
+}
+
+fn save_catalog(
+    repo: &Path,
+    mut catalog: Catalog,
+    key: &Ed25519KeyPair,
+    mode: ReleaseMode<'_>,
+) -> Result<String> {
     if catalog.file_index.is_some() {
         catalog.file_index = Some(store_file_index(repo, &catalog)?);
     }
-    write_catalog_document(repo, catalog, key)
+    write_catalog_document(repo, catalog, key, mode)
 }
 
 fn write_catalog_document(
     repo: &Path,
     mut catalog: Catalog,
     key: &Ed25519KeyPair,
+    mode: ReleaseMode<'_>,
 ) -> Result<String> {
     catalog.rename_targets()?;
     catalog.check_source_archives()?;
@@ -2220,9 +2262,13 @@ fn write_catalog_document(
         signed.len() as u64 <= CATALOG_LIMIT,
         "catalog exceeds {CATALOG_LIMIT} bytes"
     );
-    let hash = store(repo, "catalogs", &signed)?;
+    let hash = digest(&signed);
+    mode.check(&hash)?;
+    write_atomic(&repo.join("catalogs").join(&hash), &signed, true)?;
     File::open(repo)?.sync_all()?;
-    write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)?;
+    if !matches!(mode, ReleaseMode::Prepare) {
+        write_atomic(&repo.join("current"), format!("{hash}\n").as_bytes(), false)?;
+    }
     Ok(hash)
 }
 

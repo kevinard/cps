@@ -913,6 +913,14 @@ For a fleet with several supported deployed releases, add one
 `upgrade-from "<catalog SHA-256>"` child per historical composition inside
 the profile block. Each child requires a signed composition for that profile
 and uses its recorded companion pins. The current release is still checked.
+
+Use `repo publish-release --prepare` to stage the signed candidate and its
+objects while keeping the current catalog pointer on the previous release.
+Test the candidate digest in a private repository used by your upgrade and
+boot checks. Then rerun publication with `--expect-catalog SHA256` to
+advance the pointer only if the release base is still current and the
+recomputed catalog equals the tested digest.
+
 New signed profiles record the exact versions of the requested roots and
 the manifest digest of every package in the checked composition. When
 the baseline has the same named profile, CPS

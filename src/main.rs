@@ -29,9 +29,8 @@ use cps::{
     fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
     list_publishers, list_withdrawals, plan_with_options, prefer_publisher,
-    prepare_boot_environment, publish, publish_release_with_sources,
-    publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
-    remove_publisher, resume_transaction, rollback_boot_environment,
+    prepare_boot_environment, publish, publish_witnessed_bundle_with_sources, read_attestation,
+    read_worker_config, release, remove_publisher, resume_transaction, rollback_boot_environment,
     rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
     set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
     stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
@@ -660,6 +659,12 @@ enum RepoCommand {
         /// Cache of verified source files to include in the publication
         #[arg(long)]
         source_cache: Option<PathBuf>,
+        /// Store the signed candidate without advancing the current catalog
+        #[arg(long, conflicts_with = "expect_catalog")]
+        prepare: bool,
+        /// Publish only if the candidate equals this previously tested catalog
+        #[arg(long, value_name = "SHA256")]
+        expect_catalog: Option<String>,
         release: PathBuf,
     },
     /// Print the signed build evidence for a full package ID
@@ -1720,16 +1725,27 @@ fn run(command: Command) -> Result<ExitCode> {
                 repo,
                 signing_key,
                 source_cache,
+                prepare,
+                expect_catalog,
                 release,
             } => {
+                let mode = if prepare {
+                    cps::ReleaseMode::Prepare
+                } else if let Some(hash) = &expect_catalog {
+                    cps::ReleaseMode::RequireCandidate(hash)
+                } else {
+                    cps::ReleaseMode::Publish
+                };
+                let hash = cps::publish_release_with_mode(
+                    &repo,
+                    &signing_key,
+                    &release,
+                    source_cache.as_deref(),
+                    mode,
+                )?;
                 println!(
-                    "Published catalog {}",
-                    publish_release_with_sources(
-                        &repo,
-                        &signing_key,
-                        &release,
-                        source_cache.as_deref()
-                    )?
+                    "{} catalog {hash}",
+                    if prepare { "Prepared" } else { "Published" }
                 );
             }
             RepoCommand::Attestation {
