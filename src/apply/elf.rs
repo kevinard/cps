@@ -21,6 +21,9 @@ pub(super) fn applies(plan: &Plan, state: &State) -> bool {
         plan.request,
         Request::Install { .. }
             | Request::ExactInstall { .. }
+            | Request::Remove { .. }
+            | Request::Autoremove
+            | Request::ChangeFacet { .. }
             | Request::Update
             | Request::UpdateProfile
     ) && !state.paths.is_empty()

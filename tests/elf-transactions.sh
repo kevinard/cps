@@ -53,6 +53,34 @@ publish runtime 1.0.0-0 demo/runtime
 install_base image
 install_base drifted
 
+missing='missing ELF dependency libcps-abi.so.1 previously provided at usr/lib/libcps-abi.so.1.0'
+"$cps" plan --root image --output remove.json remove demo/runtime
+reject remove.json "$missing"
+
+"$cps" plan --root image --output mark.json mark automatic demo/runtime
+"$cps" apply --root image mark.json
+"$cps" plan --root image --output autoremove.json autoremove
+reject autoremove.json "$missing"
+
+install_base facet_image
+"$cps" manifest generate --proto runtime --publisher canopa --version 1.1.0-0 \
+    --uid "$uid" --gid "$gid" demo/runtime |
+    sed '/^    symlink /s/$/ facet="runtime.library"/' > generated.kdl
+"$cps" publish --repo repo --proto runtime --signing-key private.der generated.kdl
+"$cps" plan --root facet_image --output facet-provider.json install demo/runtime@1.1.0-0
+"$cps" apply --root facet_image facet-provider.json
+"$cps" plan --root facet_image --output facet.json change-facet runtime.library=false
+if "$cps" apply --root facet_image facet.json > rejected.log 2>&1; then
+    echo 'Disabling a facet removed the working managed library' >&2
+    exit 1
+fi
+grep -F "$missing" rejected.log
+"$cps" transaction status --root facet_image | grep -Fx 'No pending transaction'
+
+"$cps" plan --root facet_image --output remove-both.json remove demo/runtime demo/app
+"$cps" apply --root facet_image remove-both.json
+"$cps" verify --root facet_image --pristine
+
 library libcps-abi.so.1 bad.map shadow/usr/override/libcps-abi.so.1
 publish shadow 1.0.0-0 demo/shadow
 "$cps" plan --root image --output shadow.json install demo/shadow
@@ -63,7 +91,7 @@ rm -- runtime/usr/lib/libcps-abi.so.1{,.0}
 library libcps-abi.so.2 good.map runtime/usr/lib/libcps-abi.so.2
 publish runtime 2.0.0-0 demo/runtime
 "$cps" plan --root image --output upgrade.json update
-reject upgrade.json 'missing ELF dependency libcps-abi.so.1 previously provided at usr/lib/libcps-abi.so.1.0'
+reject upgrade.json "$missing"
 test ! -e image/usr/lib/libcps-abi.so.2
 if "$cps" boot-env stage --source image --root staged upgrade.json > rejected.log 2>&1; then
     echo 'Staging accepted a transaction that breaks the managed library' >&2

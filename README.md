@@ -218,9 +218,10 @@ type conflicts involving directories or special files before retrying the plan.
 
 ### Shared-library regressions
 
-On x86-64 and AArch64, applying an install or upgrade checks whether its
-managed ELF files would lose a compatible managed shared library that is
-available in the current image. The check follows the object's `DT_RUNPATH`
+On x86-64 and AArch64, applying an install, upgrade, removal, autoremove,
+or facet change checks whether any managed ELF file in the resulting image
+would lose a compatible managed shared library that works in the current
+image. The check follows the object's `DT_RUNPATH`
 or `DT_RPATH`, including `$ORIGIN`, then the applicable default directories
 `/usr/lib`, `/lib`, `/usr/lib64`, and `/lib64`. It follows managed links and
 checks ELF compatibility and required GNU version nodes.
@@ -234,7 +235,8 @@ cache and environment settings, and runtime `dlopen` calls are outside its
 scope. Plans and dry runs can still be generated before payloads are available.
 
 Run `bash tests/elf-transactions.sh` to exercise an install that shadows a
-working library, an incompatible upgrade, and a compatible replacement.
+working library, an incompatible upgrade, removals, a facet change, and a
+compatible replacement.
 
 ## Generating a manifest from a prototype
 
