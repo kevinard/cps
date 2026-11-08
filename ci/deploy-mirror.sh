@@ -23,7 +23,7 @@ signing=()
 for role in targets snapshot timestamp; do
     key=$(realpath -e -- "$keys/$role.pem")
     [[ -f $key && $key != "$mirror/"* ]] || fail "Invalid private key for $role"
-    signing+=(--key "$key")
+    signing+=("--$role-key" "$key")
 done
 
 # Serialize updates to this origin and hold the approved catalog stable until publication.
@@ -56,7 +56,7 @@ consider_version() {
 if [[ -f $timestamp ]]; then
     consider_version "$(jq -er '.signed.version' "$timestamp")"
 fi
-for file in "$metadata"/*.{snapshot,targets}.json; do
+for file in "$metadata"/*.{snapshot,targets}.json "$metadata"/*.objects-?.json; do
     filename=${file##*/}
     consider_version "${filename%%.*}"
 done
@@ -121,11 +121,9 @@ fi
 
 release_expiry=$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')
 timestamp_expiry=$(date -u -d '+7 days' '+%Y-%m-%dT%H:%M:%SZ')
-tuftool create --root "$stage/root.json" "${signing[@]}" --add-targets "$stage/export" \
-    --targets-version "$version" --targets-expires "$release_expiry" \
-    --snapshot-version "$version" --snapshot-expires "$release_expiry" \
-    --timestamp-version "$version" --timestamp-expires "$timestamp_expiry" \
-    --outdir "$stage/signed"
+"$cps" repo sign-export --root "$stage/root.json" "${signing[@]}" \
+    --version "$version" --release-expires "$release_expiry" --timestamp-expires "$timestamp_expiry" \
+    --output "$stage/signed" "$stage/export"
 cp -- "$stage/roots/"*.root.json "$stage/signed/metadata/"
 
 # Use an open directory so local verification works with spaces in the staging path.
@@ -151,7 +149,7 @@ publish_immutable() {
         [[ -f $destination && ! -L $destination ]] && cmp -s -- "$source" "$destination" ||
             fail "Conflicting mirror object $destination"
     else
-        # Tuftool links to its input targets. Serve copies that outlive the staging directory.
+        # Serve immutable copies that outlive the staging directory.
         install -m 0644 -- "$source" "$stage/next"
         ln -T -- "$stage/next" "$destination"
         rm -- "$stage/next"
@@ -160,6 +158,9 @@ publish_immutable() {
 
 for file in "$stage/signed/targets/"*; do
     publish_immutable "$file" "$targets/${file##*/}"
+done
+for file in "$stage/signed/metadata/$version".objects-?.json; do
+    publish_immutable "$file" "$metadata/${file##*/}"
 done
 for filename in "$version.targets.json" "$version.snapshot.json"; do
     publish_immutable "$stage/signed/metadata/$filename" "$metadata/$filename"

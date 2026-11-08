@@ -32,14 +32,20 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.operation == 'promote'
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: preflight
     permissions:
       contents: write
     if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
+      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+      ((github.event_name == 'workflow_dispatch' &&
+        (inputs.operation != 'promote' || needs.preflight.result == 'success')) ||
        (github.event.schedule == '17,47 * * * *' && vars.CPS_RELEASE_AUTOROLLOUT == 'true') ||
-       (github.event.schedule == '23 4 * * *' && vars.CPS_MIRROR_DIR != '' && vars.CPS_RELEASE_DEPLOY == ''))
+       (github.event.schedule == '23 4 * * *' && vars.CPS_MIRROR_DIR != '' && vars.CPS_RELEASE_DEPLOY == '')) }}
     concurrency:
       group: cps-release
       cancel-in-progress: false

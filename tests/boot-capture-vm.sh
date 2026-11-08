@@ -110,6 +110,7 @@ if [[ $system_commands == 1 ]]; then
     mkdir -p app/usr/bin service/usr/{bin,lib/systemd/system}
     cat > service/usr/lib/systemd/system/cps-demo.service <<'UNIT'
 [Service]
+ExecStartPre=/bin/busybox test ! -e /run/cps-demo-fail
 ExecStart=/usr/bin/cps-demo-service
 UNIT
     for version in 1.0.0-0 2.0.0-0; do
@@ -686,6 +687,7 @@ if [[ $native_boot == 1 ]]; then
         grep -Fx 'CPS_VM_GIT: rollback restored the tracked commit and payload' uefi.log.clean
     elif [[ $system_commands == 1 ]]; then
         grep -Fx 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: resumed a failed live restart after reboot' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: installed and upgraded in place, then staged the base upgrade' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: staged upgrade booted with the live package' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: rolled back to the base with the live package' uefi.log.clean

@@ -3,6 +3,7 @@ set -euo pipefail
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cps=$(realpath -- "${CPS_TEST_BINARY:-"$project/target/debug/cps"}")
+baseline=$(realpath -- "${CPS_TEST_PREVIOUS_BINARY:-$cps}")
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
@@ -20,10 +21,9 @@ package "test/$name" publisher="test" version="1.0.0-0" {
 MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der package.kdl
 done
-for root in image other; do
-    "$cps" image-create --root "$root" --repo repo --publisher test --trust-key public.der
-done
-"$cps" plan --root image --output one.json install test/one
+"$baseline" image-create --root image --repo repo --publisher test --trust-key public.der
+"$cps" image-create --root other --repo repo --publisher test --trust-key public.der
+"$baseline" plan --root image --output one.json install test/one
 "$cps" plan --root image --output two.json install test/two
 
 progress() {

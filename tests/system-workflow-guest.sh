@@ -97,55 +97,68 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     exec $bb reboot -f
 fi
 
-$bb cp /repository/catalog-1.0.0-0 /repository/current
-cps search cps-demo | $bb grep -F 'test/cps-demo@'
+if [ ! -f /volume/@captures/live-upgrade.json ]; then
+    $bb cp /repository/catalog-1.0.0-0 /repository/current
+    cps search cps-demo | $bb grep -F 'test/cps-demo@'
+    before=$(cps boot-env list --esp /efi)
+    cps install --dry-run test/cps-demo
+    cps install --stage --dry-run test/cps-demo | $bb grep -Fx 'A reboot will be required because --stage was requested.'
+    test "$(cps boot-env list --esp /efi)" = "$before"
+    test ! -e /usr/bin/cps-demo
+    cps install --yes --save-plan /run/cps-install.json test/cps-demo
+    cps status --plan /run/cps-install.json | $bb grep -F '"phase": "applied"'
+    test "$(cps-demo)" = 1.0.0-0
+    test "$(cps boot-env list --esp /efi)" = "$before"
+    systemctl start cps-demo.service
+    verify_service 1.0.0-0
+    printf 'damaged\n' > /usr/bin/cps-demo
+    cps repair --dry-run --path /usr/bin/cps-demo | $bb grep -Fx 'Repair usr/bin/cps-demo'
+    test "$($bb cat /usr/bin/cps-demo)" = damaged
+    recovery=$(cps repair --yes --prepare-only --save-plan /run/cps-repair.json --path /usr/bin/cps-demo)
+    recovery=$(printf '%s\n' "$recovery" | $bb sed -n 's/^Prepared recovery root //p')
+    test -n "$recovery"
+    cps status --plan /run/cps-repair.json | $bb grep -F '"phase": "prepared_for_boot"'
+    test "$($bb cat /usr/bin/cps-demo)" = damaged
+    test "$("$recovery/usr/bin/cps-demo")" = 1.0.0-0
+    cps verify --root "$recovery"
+    btrfs subvolume delete "$recovery"
+    $bb rmdir "${recovery%/root}"
+    cps repair --yes --path /usr/bin/cps-demo
+    test "$(cps-demo)" = 1.0.0-0
+    test "$(cps boot-env list --esp /efi)" = "$before"
+    echo 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image'
+    report=$(cps check-updates --no-refresh --json)
+    printf '%s\n' "$report" | $bb grep -F '"status": "up_to_date"'
+    printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
+    test "$(cps upgrade --stage --dry-run)" = 'Nothing to do.'
+
+    # An upgrade staged before the live install must not lose the new package.
+    . /etc/cps-btrfs-boot
+    if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume \
+        --esp /efi --root-partuuid "$root_uuid" > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'base changed after staging' /run/rejected
+
+    $bb cp /repository/catalog-2.0.0-0 /repository/current
+    report=$(cps check-updates --json)
+    printf '%s\n' "$report" | $bb grep -F '"status": "updates_available"'
+    printf '%s\n' "$report" | $bb grep -F '"name": "test/cps-demo"'
+    printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
+    cps upgrade --stage --dry-run | $bb grep -Fx 'A reboot will be required because --stage was requested.'
+    test "$(cps boot-env list --esp /efi)" = "$before"
+    test "$(cps-demo)" = 1.0.0-0
+    cps upgrade --dry-run --save-plan /volume/@captures/live-upgrade.json
+    $bb sync
+    : > /run/cps-demo-fail
+    if cps upgrade --yes > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'live systemd restart failed' /run/rejected
+    cps status --plan /volume/@captures/live-upgrade.json | $bb grep -F '"phase": "applying"'
+    if systemctl is-active --quiet cps-demo.service; then exit 1; fi
+    exec $bb reboot -nf
+fi
 before=$(cps boot-env list --esp /efi)
-cps install --dry-run test/cps-demo
-cps install --stage --dry-run test/cps-demo | $bb grep -Fx 'A reboot will be required because --stage was requested.'
-test "$(cps boot-env list --esp /efi)" = "$before"
-test ! -e /usr/bin/cps-demo
-cps install --yes --save-plan /run/cps-install.json test/cps-demo
-cps status --plan /run/cps-install.json | $bb grep -F '"phase": "applied"'
-test "$(cps-demo)" = 1.0.0-0
-test "$(cps boot-env list --esp /efi)" = "$before"
-systemctl start cps-demo.service
-verify_service 1.0.0-0
-printf 'damaged\n' > /usr/bin/cps-demo
-cps repair --dry-run --path /usr/bin/cps-demo | $bb grep -Fx 'Repair usr/bin/cps-demo'
-test "$($bb cat /usr/bin/cps-demo)" = damaged
-recovery=$(cps repair --yes --prepare-only --save-plan /run/cps-repair.json --path /usr/bin/cps-demo)
-recovery=$(printf '%s\n' "$recovery" | $bb sed -n 's/^Prepared recovery root //p')
-test -n "$recovery"
-cps status --plan /run/cps-repair.json | $bb grep -F '"phase": "prepared_for_boot"'
-test "$($bb cat /usr/bin/cps-demo)" = damaged
-test "$("$recovery/usr/bin/cps-demo")" = 1.0.0-0
-cps verify --root "$recovery"
-btrfs subvolume delete "$recovery"
-$bb rmdir "${recovery%/root}"
-cps repair --yes --path /usr/bin/cps-demo
-test "$(cps-demo)" = 1.0.0-0
-test "$(cps boot-env list --esp /efi)" = "$before"
-echo 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image'
-report=$(cps check-updates --no-refresh --json)
-printf '%s\n' "$report" | $bb grep -F '"status": "up_to_date"'
-printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
-test "$(cps upgrade --stage --dry-run)" = 'Nothing to do.'
-
-# An upgrade staged before the live install must not lose the new package.
-. /etc/cps-btrfs-boot
-if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume \
-    --esp /efi --root-partuuid "$root_uuid" > /run/rejected 2>&1; then exit 1; fi
-$bb grep -F 'base changed after staging' /run/rejected
-
-$bb cp /repository/catalog-2.0.0-0 /repository/current
-report=$(cps check-updates --json)
-printf '%s\n' "$report" | $bb grep -F '"status": "updates_available"'
-printf '%s\n' "$report" | $bb grep -F '"name": "test/cps-demo"'
-printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
-cps upgrade --stage --dry-run | $bb grep -Fx 'A reboot will be required because --stage was requested.'
-test "$(cps boot-env list --esp /efi)" = "$before"
-test "$(cps-demo)" = 1.0.0-0
-cps upgrade --yes
+cps resume
+cps status --plan /volume/@captures/live-upgrade.json | $bb grep -F '"phase": "applied"'
+echo 'CPS_VM_SYSTEM: resumed a failed live restart after reboot'
 test "$(cps-demo)" = 2.0.0-0
 verify_service 2.0.0-0
 test "$(cps boot-env list --esp /efi)" = "$before"

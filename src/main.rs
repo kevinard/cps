@@ -740,6 +740,26 @@ enum RepoCommand {
         #[arg(long)]
         percentage: u8,
     },
+    /// Sign an exported mirror with sharded TUF targets metadata
+    SignExport {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        targets_key: PathBuf,
+        #[arg(long)]
+        snapshot_key: PathBuf,
+        #[arg(long)]
+        timestamp_key: PathBuf,
+        #[arg(long)]
+        version: std::num::NonZeroU64,
+        #[arg(long)]
+        release_expires: String,
+        #[arg(long)]
+        timestamp_expires: String,
+        #[arg(long)]
+        output: PathBuf,
+        export: PathBuf,
+    },
     /// Enable a catalog-signed index for available package file lookups
     IndexFiles {
         #[arg(long)]
@@ -2220,6 +2240,27 @@ fn run(command: Command) -> Result<ExitCode> {
                 };
                 println!("Exported {hash}");
             }
+            RepoCommand::SignExport {
+                root,
+                targets_key,
+                snapshot_key,
+                timestamp_key,
+                version,
+                release_expires,
+                timestamp_expires,
+                output,
+                export,
+            } => release::sign_export(release::SignExport {
+                root: &root,
+                export: &export,
+                output: &output,
+                targets_key: &targets_key,
+                snapshot_key: &snapshot_key,
+                timestamp_key: &timestamp_key,
+                version,
+                release_expires: &release_expires,
+                timestamp_expires: &timestamp_expires,
+            })?,
             RepoCommand::Sync {
                 repo,
                 root,

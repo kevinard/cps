@@ -1,19 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Seek, Write},
+    io::{Seek, Write as _},
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     image::{Installed, Managed, State, root::Root},
     model::Node,
-    plan::Plan,
+    plan::{Plan, Write},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -305,10 +308,94 @@ fn tmpfiles_config(root: &Root, runtime: Option<&Root>, name: &str) -> Result<Op
     bail!("missing tmpfiles configuration {name}")
 }
 
+/// Discard links to retired vendor units and links left by older CPS versions
+/// before applying a preset for a newly installed unit.
+pub(crate) fn clean_enablement(
+    root: &Root,
+    writes: &[Write],
+    actions: &[Action],
+    paths: &BTreeMap<String, Managed>,
+    files_ready: bool,
+) -> Result<()> {
+    let mut targets = writes
+        .iter()
+        .filter(|write| {
+            write.after.is_none() && write.before.as_ref().is_some_and(|node| !node.is_dir())
+        })
+        .filter_map(|write| {
+            let name = write.path.strip_prefix("usr/lib/systemd/system/")?;
+            let preset = Action::Preset(name.to_owned());
+            preset.validate().ok().map(|()| format!("/{}", write.path))
+        })
+        .collect::<BTreeSet<_>>();
+    if !files_ready {
+        targets.extend(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Preset(_)))
+                .map(|action| format!("/{}", action.path())),
+        );
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let directory = "etc/systemd/system";
+    let units = match root.dir(directory) {
+        Ok(units) => units,
+        Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error).context("opening persistent systemd enablement"),
+    };
+    let remove_link = |path: &str| -> Result<()> {
+        if !paths.contains_key(path)
+            && let Some(Node::Symlink { target, .. }) = root.inspect(path)?
+            && targets.contains(&target)
+        {
+            root.remove_file(path)?;
+        }
+        Ok(())
+    };
+    for entry in fs::read_dir(Root::fd_path(&units))? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let path = format!("{directory}/{name}");
+        let kind = entry.file_type()?;
+        if kind.is_symlink() && !targets.contains(&format!("/usr/lib/systemd/system/{name}")) {
+            // A same-name entry here is a local unit override.
+            remove_link(&path)?;
+        } else if kind.is_dir()
+            && [".wants", ".requires", ".upholds"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+        {
+            let dependencies = root.dir(&path)?;
+            for link in fs::read_dir(Root::fd_path(&dependencies))? {
+                let link = link?;
+                if link.file_type()?.is_symlink()
+                    && let Ok(name) = link.file_name().into_string()
+                {
+                    remove_link(&format!("{path}/{name}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct LiveServices {
     reload: bool,
     restart: BTreeSet<String>,
     stop: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveJobs {
+    reload: bool,
+    restart: Vec<String>,
+    stop: Vec<String>,
 }
 
 impl LiveServices {
@@ -377,7 +464,12 @@ impl LiveServices {
         services
     }
 
-    pub(crate) fn run(&self) -> Result<()> {
+    pub(crate) fn active_jobs(&self) -> Result<LiveJobs> {
+        let mut jobs = LiveJobs {
+            reload: self.reload,
+            stop: Vec::new(),
+            restart: Vec::new(),
+        };
         if !self.restart.is_empty() || !self.stop.is_empty() {
             let output = live_systemctl()
                 .args([
@@ -396,42 +488,62 @@ impl LiveServices {
                 output.status
             );
             let units = std::str::from_utf8(&output.stdout)?;
-            let mut stop = Vec::new();
-            let mut restart = Vec::new();
             for unit in units
                 .lines()
                 .filter_map(|line| line.split_ascii_whitespace().next())
+                .filter(|name| service_name(name))
             {
                 if matches_service(&self.stop, unit) {
-                    stop.push(unit);
+                    jobs.stop.push(unit.to_owned());
                 } else if matches_service(&self.restart, unit) {
-                    restart.push(unit);
+                    jobs.restart.push(unit.to_owned());
                 }
             }
-            if !stop.is_empty() {
-                run_tool(
-                    live_systemctl()
-                        .args(["--no-block", "stop", "--"])
-                        .args(stop),
-                    "stop",
-                    true,
-                )?;
-            }
-            if self.reload {
-                run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload", true)?;
-            }
-            if !restart.is_empty() {
-                run_tool(
-                    live_systemctl()
-                        .args(["--no-block", "try-restart", "--"])
-                        .args(&restart),
-                    "restart",
-                    true,
-                )?;
-                println!("Restart scheduled for {}.", restart.join(", "));
-            }
-        } else if self.reload {
-            run_tool(live_systemctl().arg("daemon-reload"), "daemon-reload", true)?;
+        }
+        Ok(jobs)
+    }
+
+    pub(crate) fn check_jobs(&self, jobs: &LiveJobs) -> Result<()> {
+        ensure!(
+            self.reload == jobs.reload
+                && jobs
+                    .stop
+                    .iter()
+                    .all(|unit| service_name(unit) && matches_service(&self.stop, unit))
+                && jobs
+                    .restart
+                    .iter()
+                    .all(|unit| service_name(unit) && matches_service(&self.restart, unit)),
+            "pending systemd jobs differ from the transaction"
+        );
+        Ok(())
+    }
+}
+
+impl LiveJobs {
+    pub(crate) fn stop_removed_units(&mut self) -> Result<bool> {
+        if self.stop.is_empty() {
+            return Ok(false);
+        }
+        run_live_job(
+            live_systemctl().args(["stop", "--"]).args(&self.stop),
+            "stop",
+        )?;
+        self.stop.clear();
+        Ok(true)
+    }
+
+    pub(crate) fn run(&self) -> Result<()> {
+        if self.reload {
+            run_live_job(live_systemctl().arg("daemon-reload"), "daemon-reload")?;
+        }
+        if !self.restart.is_empty() {
+            // These units were active before writing files. A failed restart
+            // may leave them inactive, so a retry must still attempt to start them.
+            run_live_job(
+                live_systemctl().args(["restart", "--"]).args(&self.restart),
+                "restart",
+            )?;
         }
         Ok(())
     }
@@ -465,6 +577,32 @@ fn live_systemctl() -> Command {
         .args(["--system", "--no-pager"])
         .stdin(Stdio::null());
     command
+}
+
+fn run_live_job(command: &mut Command, action: &str) -> Result<()> {
+    const TIMEOUT: Duration = Duration::from_secs(120);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running systemd {action}"))?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            ensure!(
+                status.success(),
+                "live systemd {action} failed with {status}"
+            );
+            return Ok(());
+        }
+        if started.elapsed() >= TIMEOUT {
+            let _ = child.kill();
+            child.wait()?;
+            bail!(
+                "live systemd {action} did not finish within {} seconds",
+                TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn command(program: &str, root: &Path) -> Command {

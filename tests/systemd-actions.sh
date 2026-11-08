@@ -213,6 +213,24 @@ test "$(sha256sum /etc/passwd /etc/group)" = "$host_accounts"
 echo 'Verified sysusers, tmpfiles, and presets only changed the staged root'
 
 mv repo-offline repo
+# A retired vendor unit must lose links created by its preset. Older images
+# may still contain the dangling link, which must not override a new preset.
+"$cps" plan --root staged --output remove.json remove test/systemd-actions
+"$cps" apply --root staged remove.json
+test ! -e "staged/usr/lib/systemd/system/$enabled"
+test ! -L "staged/$wants/$enabled"
+test "$(readlink "staged/etc/systemd/system/$masked")" = /dev/null
+"$cps" image-create --root legacy --repo repo --publisher canopa --trust-key public.der
+mkdir -p "legacy/$wants" legacy/etc/systemd/system-preset
+ln -s "/usr/lib/systemd/system/$enabled" "legacy/$wants/$enabled"
+ln -s /dev/null "legacy/etc/systemd/system/$masked"
+printf 'disable %s\n' "$enabled" > legacy/etc/systemd/system-preset/00-local.preset
+"$cps" plan --root legacy --output reinstall.json install test/systemd-actions
+"$cps" apply --root legacy reinstall.json
+test ! -L "legacy/$wants/$enabled"
+test "$(readlink "legacy/etc/systemd/system/$masked")" = /dev/null
+"$cps" verify --root legacy
+
 facet_rule="$scope-facet.conf"
 printf 'd /var/lib/%s-facet 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$facet_rule"
 cat > package.kdl <<MANIFEST

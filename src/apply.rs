@@ -40,6 +40,8 @@ struct Journal {
     state_sha256: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     files_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_jobs: Option<systemd::LiveJobs>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -486,7 +488,7 @@ pub(crate) fn apply_to_image(
         check_live_plan(&checked, stage_packages)?;
         next.settings.boot_revision = Some(current.settings.boot_revision());
         next.settings.format = next.publishers.image_format(&next.settings);
-        AfterFiles::Live(systemd::LiveServices::plan(&checked, current, &next))
+        AfterFiles::Live(systemd::LiveServices::plan(&checked, current, &next).active_jobs()?)
     } else {
         AfterFiles::offline(&image.root, &checked)?
     };
@@ -505,6 +507,10 @@ pub(crate) fn apply_to_image(
         state_sha256: state_digest(&next)?,
         next,
         files_ready: false,
+        live_jobs: match &after {
+            AfterFiles::Live(jobs) => Some(jobs.clone()),
+            _ => None,
+        },
     });
     let pending = if live.is_some() {
         PendingRecord::Live { live: journal }
@@ -592,7 +598,7 @@ fn check_live_plan(plan: &Plan, stage_packages: &BTreeSet<String>) -> Result<()>
 fn resume_pending(
     image: &mut Image,
     state: &State,
-    pending: PendingRecord,
+    mut pending: PendingRecord,
     saved: Option<&Plan>,
     live: bool,
     repair: Option<&BTreeSet<String>>,
@@ -632,9 +638,15 @@ fn resume_pending(
     image
         .verify_catalog_archives(work.next)
         .context("verifying catalog archives for the pending transaction")?;
-    let after = if live {
+    let after = if let PendingRecord::Live { live: journal } = &pending {
         check_live_plan(plan, &BTreeSet::new())?;
-        AfterFiles::Live(systemd::LiveServices::plan(plan, state, work.next))
+        let services = systemd::LiveServices::plan(plan, state, work.next);
+        if let Some(jobs) = &journal.live_jobs {
+            services.check_jobs(jobs)?;
+            AfterFiles::Live(jobs.clone())
+        } else {
+            AfterFiles::Live(services.active_jobs()?)
+        }
     } else {
         AfterFiles::offline(&image.root, plan)?
     };
@@ -642,6 +654,12 @@ fn resume_pending(
         !work.files_ready || !matches!(after, AfterFiles::None),
         "pending transaction has an invalid final phase"
     );
+    if let (AfterFiles::Live(jobs), PendingRecord::Live { live: journal }) = (&after, &mut pending)
+        && journal.live_jobs.is_none()
+    {
+        journal.live_jobs = Some(jobs.clone());
+        image.update_pending(&pending)?;
+    }
     let stage = image.stage()?;
     finish(image, &stage, pending, saved, after, repair, after_write)
 }
@@ -649,7 +667,7 @@ fn resume_pending(
 enum AfterFiles {
     None,
     Offline(PathBuf),
-    Live(systemd::LiveServices),
+    Live(systemd::LiveJobs),
 }
 
 impl AfterFiles {
@@ -667,10 +685,18 @@ fn finish(
     stage: &Root,
     mut pending: PendingRecord,
     saved: Option<&Plan>,
-    after: AfterFiles,
+    mut after: AfterFiles,
     repair: Option<&BTreeSet<String>>,
     mut after_write: impl FnMut(&Write),
 ) -> Result<u64> {
+    // ExecStop can need the very files that this transaction will remove.
+    if let (AfterFiles::Live(jobs), PendingRecord::Live { live: journal }) =
+        (&mut after, &mut pending)
+        && jobs.stop_removed_units()?
+    {
+        journal.live_jobs = Some(jobs.clone());
+        image.update_pending(&pending)?;
+    }
     let work = pending.work();
     if !work.files_ready {
         write_files(
@@ -680,10 +706,17 @@ fn finish(
             &work.next.paths,
             &mut after_write,
         )?;
-        if !matches!(after, AfterFiles::None) {
-            pending.mark_files_ready();
-            image.update_pending(&pending)?;
-        }
+    }
+    systemd::clean_enablement(
+        &image.root,
+        work.writes,
+        work.systemd,
+        &work.next.paths,
+        work.files_ready,
+    )?;
+    if !work.files_ready && !matches!(after, AfterFiles::None) {
+        pending.mark_files_ready();
+        image.update_pending(&pending)?;
     }
     let work = pending.work();
     if let Some(stage_packages) = repair {

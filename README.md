@@ -21,9 +21,12 @@ sudo cps status
 `install` and `upgrade` select dependencies, preview the package changes,
 service actions, and activation mode, and ask once before downloading and applying
 them. Ordinary changes apply to the running system. Restart any open
-applications to use updated files. CPS reloads the systemd manager when
-system unit files change and queues restarts for active services owned
-by updated packages. New services follow the package's preset policy.
+applications to use updated files. CPS stops active services before
+removing their files, reloads the systemd manager when unit files change,
+and restarts affected active services. CPS waits for systemd's job results
+before committing. A failed job or a job that takes longer than two minutes
+leaves the transaction pending. Use `cps resume` after correcting the cause.
+New services follow the image's preset policy.
 
 `check-updates --json` runs the upgrade planner on the running system.
 It refreshes configured mirrors as `upgrade` does. Use `--no-refresh` to
@@ -627,7 +630,7 @@ repository, protected package repository, and runtime seed repository. Set
 VM fixture installs the exact protected CPS, trust, and Git build packages and their dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
-to package revision `0.1.0-38`. Use the current host and guest CPS to assemble
+to package revision `0.1.0-39`. Use the current host and guest CPS to assemble
 and boot images with protected profiles.
 
 ### Preparing a source cache
@@ -1325,6 +1328,11 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 
 Full sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and downloads the complete release. A failed download leaves the previous cache available. Sync can repair a damaged cache object when the mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can work offline once the required metadata and payloads are cached.
 
+Sync downloads missing manifests, attestations, and rebuild metadata in
+bounded parallel batches. The bundled deployment adapter signs mirror
+objects in 16 delegated targets roles. CPS applies the 16 MiB download limit
+to each role and can refresh an existing cache from a sharded mirror.
+
 For smaller upgrade downloads, include byte-level patches when exporting a
 mirror release. Pass `--delta-from` with a previously signed catalog digest
 that your users are likely to have installed. Repeat the option for other
@@ -1904,6 +1912,13 @@ the same ID and package. Upgrade clients before publishing profiles with advisor
 
 ### Running release promotion in CI
 
+The package and boot test workflow runs on pull requests and pushes to
+`main`. It applies a plan saved by the previous revision, deploys and
+syncs a signed mirror, and exercises EFI boot, Btrfs trial rollback, and
+live transaction recovery after a forced reboot without a filesystem sync
+in QEMU. Release promotion requires the same checks to pass before it
+starts on the signing runner.
+
 The GitHub Actions release workflow runs on a dedicated, trusted Linux
 runner labeled `cps-release` and uses the `cps-release` environment. Restrict
 the environment and runner to the protected `main` branch. Install the CPS
@@ -1972,8 +1987,9 @@ and test adapters.
 
 ### Serving a basic HTTPS mirror
 
-Install [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool),
-`jq`, and `flock` on the release runner. Provision an existing, writable
+Install `jq` and `flock` on the release runner. Use
+[`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool) on the
+key provisioning machine to create and rotate the TUF root. Provision an existing, writable
 directory for this publisher and serve it with a static HTTPS server. The
 adapter stages files in the parent directory, which must also be writable
 and on the same filesystem. Point the server at the mirror directory.
@@ -2467,7 +2483,11 @@ package "service/example" publisher="canopa" version="1.0.0-0" {
 
 CPS shows the actions in the plan and invokes the host's systemd tools with the inactive image as their alternate root. It installs the package files first, then provisions accounts, creates state, and applies presets. New or changed sysusers and tmpfiles declarations are processed by name, with target-local replacements and masks taking precedence. For example, a tmpfiles rule of `d /var/lib/example 0750 example example -` can use the account created earlier in the same transaction. Offline tmpfiles supports `d`, `f`, and `L` creation rules. Boot-only rules and paths under `/dev`, `/proc`, `/run`, and `/sys` are deferred to boot. [systemd-tmpfiles](https://www.freedesktop.org/software/systemd/man/latest/systemd-tmpfiles.html)
 
-Presets apply the image's own enablement policy to newly installed units. CPS preserves existing enablement and unit overrides, including masks. The preset step only writes enablement links in the image. [systemd presets](https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html)
+Presets apply the image's enablement policy to newly installed units.
+CPS preserves enablement during upgrades and honors local unit overrides
+and masks. When a vendor unit is removed, CPS cleans persistent enablement
+links that point directly to it. It also clears stale links to newly installed
+vendor units before applying their presets. [systemd presets](https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html)
 
 `hwdb "90-device.hwdb"` declares an input to the hardware database.
 Deliver the corresponding immutable file under `usr/lib/udev/hwdb.d`

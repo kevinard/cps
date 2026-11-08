@@ -39,6 +39,7 @@ const PUBLISHER_NAME_TARGET: &str = "publisher";
 const PUBLISHER_KEY_TARGET: &str = "publisher.der";
 const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
 const ENDPOINTS_LIMIT: u64 = 8192;
+const METADATA_DOWNLOADS: usize = 8;
 const PAYLOAD_DOWNLOADS: usize = 8;
 const PAYLOAD_ZSTD_LEVEL: i32 = 3;
 const PAYLOAD_ZSTD_WINDOW_LOG: u32 = 21;
@@ -49,6 +50,9 @@ const ARCHIVE: &str = "archive";
 const RETAINED: &str = "retained";
 const MAX_RETAINED: usize = 32;
 const RETAINED_LIMIT: u64 = (65 * MAX_RETAINED) as u64;
+
+mod sign;
+pub use sign::{SignExport, sign_export};
 const CHECKPOINT_FILES: [(&str, u64); 4] = [
     ("root.json", ROOT_LIMIT),
     ("timestamp.json", ROOT_LIMIT),
@@ -1200,8 +1204,8 @@ async fn materialize(
     if verified
         .targets()
         .signed
-        .targets
-        .contains_key(&TargetName::new(RETAINED)?)
+        .find_target(&TargetName::new(RETAINED)?, false)
+        .is_ok()
     {
         let file = download(verified, RETAINED, repo, RETAINED_LIMIT, None, None)
             .await?
@@ -1293,9 +1297,13 @@ async fn cache_rebuild_objects(
     catalog: &Catalog,
     rebuild_objects: BTreeMap<String, u64>,
 ) -> Result<()> {
-    for (hash, limit) in rebuild_objects {
-        fetch_object(verified, repo, rebuild::OBJECTS, &hash, limit, None).await?;
-    }
+    stream::iter(rebuild_objects)
+        .map(|(hash, limit)| async move {
+            fetch_object(verified, repo, rebuild::OBJECTS, &hash, limit, None).await
+        })
+        .buffer_unordered(METADATA_DOWNLOADS)
+        .try_for_each(|()| async { Ok(()) })
+        .await?;
     if catalog.source_archives_required {
         let mut recipes = BTreeSet::new();
         for inputs in catalog.build_inputs.values() {
@@ -1365,19 +1373,22 @@ async fn cache_objects(
     attestations: BTreeSet<String>,
     full: bool,
 ) -> Result<()> {
-    let mut packages = Vec::with_capacity(entries.len());
-    for (id, entry) in entries {
-        fetch_object(
-            verified,
-            repo,
-            "manifests",
-            entry.manifest_digest(),
-            MANIFEST_LIMIT,
-            None,
-        )
+    let packages: Vec<_> = stream::iter(entries)
+        .map(|(id, entry)| async move {
+            fetch_object(
+                verified,
+                repo,
+                "manifests",
+                entry.manifest_digest(),
+                MANIFEST_LIMIT,
+                None,
+            )
+            .await?;
+            read_package(repo, publisher, &id, &entry)
+        })
+        .buffer_unordered(METADATA_DOWNLOADS)
+        .try_collect()
         .await?;
-        packages.push(read_package(repo, publisher, &id, &entry)?);
-    }
     for (sha256, length) in release_blobs(&packages)? {
         if full {
             fetch_verified_payload(verified, repo, sha256, length).await?;
@@ -1385,18 +1396,21 @@ async fn cache_objects(
             checked_payload_target(verified, sha256, length)?;
         }
     }
-    for sha256 in attestations {
-        fetch_object(
-            verified,
-            repo,
-            "attestations",
-            &sha256,
-            ATTESTATION_LIMIT,
-            None,
-        )
-        .await?;
-    }
-    Ok(())
+    stream::iter(attestations)
+        .map(|sha256| async move {
+            fetch_object(
+                verified,
+                repo,
+                "attestations",
+                &sha256,
+                ATTESTATION_LIMIT,
+                None,
+            )
+            .await
+        })
+        .buffer_unordered(METADATA_DOWNLOADS)
+        .try_for_each(|()| async { Ok(()) })
+        .await
 }
 
 fn release_blobs<'a>(

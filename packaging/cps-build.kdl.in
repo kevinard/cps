@@ -24,5 +24,6 @@ build architecture="@ARCH@" epoch=@EPOCH@ {
     cargo build --frozen --release --jobs 2 --bin cps
     install -Dm755 target/release/cps "$DESTDIR/usr/bin/cps"
     install -Dm644 packaging/systemd/cps-boot-health.service "$DESTDIR/usr/lib/systemd/system/cps-boot-health.service"
+    install -Dm644 LICENSE "$DESTDIR/usr/share/licenses/cps/LICENSE"
     """
 }
