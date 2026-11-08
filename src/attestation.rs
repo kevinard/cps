@@ -14,22 +14,17 @@ use serde::{Deserialize, Serialize};
 use crate::{
     image::root::Root,
     kdl_format::{
-        build::{BuildRecipe, PublisherPin, RECIPE_LIMIT, ToolchainPins, parse},
+        build::{BuildRecipe, PublisherPin, RECIPE_LIMIT, parse},
         manifest_text, parse_manifest,
     },
-    model::{
-        Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name,
-        validate_publisher,
-    },
+    model::{Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name},
     repo::{MANIFEST_LIMIT, read_key, read_limited},
 };
 
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_BUILDERS: usize = 16;
 const STATEMENT: &str = "https://in-toto.io/Statement/v1";
-const LEGACY_PREDICATE: &str = "urn:canopa:cps:build-provenance:v1";
-const PINNED_PREDICATE: &str = "urn:canopa:cps:build-provenance:v2";
-const PUBLISHED_PREDICATE: &str = "urn:canopa:cps:build-provenance:v3";
+const PUBLISHED_PREDICATE: &str = "urn:canopa:cps:published-build-provenance:v1";
 const PUBLISHED_MANIFEST: &str = "published-manifest.kdl";
 const MEDIA_TYPE: &str = "application/vnd.in-toto+json";
 
@@ -100,10 +95,6 @@ impl BuildTrust {
             self.minimum_builders
         );
         let statement = parse_statement(&payload)?;
-        ensure!(
-            statement.predicate_type == PUBLISHED_PREDICATE,
-            "build trust requires version 3 build evidence"
-        );
         ensure!(
             statement.predicate.package == manifest.id() && statement.predicate.identical_runs == 2,
             "build attestation does not match the package or the reproducibility requirement"
@@ -212,24 +203,8 @@ struct Predicate {
 }
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Toolchain {
-    Legacy(LegacyToolchain),
-    Pinned(PinnedToolchain),
-}
-
-#[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LegacyToolchain {
-    pub publisher: String,
-    pub key_sha256: String,
-    pub catalog_sha256: String,
-    pub package_manifests: BTreeMap<String, String>,
-}
-
-#[derive(Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PinnedToolchain {
+pub(crate) struct Toolchain {
     pub publishers: Vec<PublisherPin>,
     pub package_manifests: BTreeMap<String, PinnedPackage>,
 }
@@ -243,64 +218,33 @@ pub(crate) struct PinnedPackage {
 }
 
 impl Toolchain {
-    fn predicate_type(&self) -> &'static str {
-        match self {
-            Self::Legacy(_) => LEGACY_PREDICATE,
-            Self::Pinned(_) => PINNED_PREDICATE,
-        }
-    }
-
     fn verify(&self, recipe: &BuildRecipe) -> Result<()> {
-        match (self, &recipe.toolchain) {
-            (Self::Legacy(chain), ToolchainPins::Single(catalog)) => {
-                ensure!(
-                    &chain.catalog_sha256 == catalog,
-                    "build attestation does not match the pinned toolchain catalog"
-                );
-                validate_publisher(&chain.publisher)?;
-                validate_digest(&chain.key_sha256)?;
-                for (name, hash) in &chain.package_manifests {
-                    validate_name(name)?;
-                    validate_digest(hash)?;
-                }
-                ensure!(
-                    recipe
-                        .packages
-                        .iter()
-                        .all(|name| chain.package_manifests.contains_key(name)),
-                    "build attestation omits a requested toolchain package"
-                );
-            }
-            (Self::Pinned(chain), ToolchainPins::Publishers(pins)) => {
-                ensure!(
-                    &chain.publishers == pins,
-                    "build attestation does not match the pinned toolchain publishers"
-                );
-                for (name, package) in &chain.package_manifests {
-                    validate_name(name)?;
-                    validate_digest(&package.sha256)?;
-                    ensure!(
-                        pins.iter().any(|pin| pin.name == package.publisher),
-                        "toolchain package {name} claims an unpinned publisher"
-                    );
-                }
-                for (name, spec) in recipe.requested()? {
-                    let package = chain.package_manifests.get(name).with_context(|| {
-                        format!("build attestation omits toolchain package {name}")
-                    })?;
-                    ensure!(
-                        spec.publisher
-                            .is_none_or(|publisher| package.publisher == publisher)
-                            && spec
-                                .version
-                                .is_none_or(|version| package.version == version),
-                        "build attestation claims a different selection for toolchain package {name}"
-                    );
-                }
-            }
-            _ => anyhow::bail!(
-                "build attestation uses a different kind of toolchain pin than the recipe"
-            ),
+        let pins = &recipe.toolchain;
+        ensure!(
+            &self.publishers == pins,
+            "build attestation does not match the pinned toolchain publishers"
+        );
+        for (name, package) in &self.package_manifests {
+            validate_name(name)?;
+            validate_digest(&package.sha256)?;
+            ensure!(
+                pins.iter().any(|pin| pin.name == package.publisher),
+                "toolchain package {name} claims an unpinned publisher"
+            );
+        }
+        for (name, spec) in recipe.requested()? {
+            let package = self
+                .package_manifests
+                .get(name)
+                .with_context(|| format!("build attestation omits toolchain package {name}"))?;
+            ensure!(
+                spec.publisher
+                    .is_none_or(|publisher| package.publisher == publisher)
+                    && spec
+                        .version
+                        .is_none_or(|version| package.version == version),
+                "build attestation claims a different selection for toolchain package {name}"
+            );
         }
         Ok(())
     }
@@ -315,7 +259,7 @@ pub(crate) struct VerifiedBuild {
     pub recipe_document: Vec<u8>,
     pub manifest_document: Vec<u8>,
     pub toolchain: Toolchain,
-    pub published_manifest: Option<FileDigest>,
+    pub published_manifest: FileDigest,
 }
 
 impl VerifiedBuild {
@@ -492,7 +436,6 @@ pub(crate) fn verify_bundle(
     let bytes = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
     let (payload, signature) = verify_envelope(&bytes, builder_key)?;
     let statement = parse_statement(&payload)?;
-    let covers_published = statement.predicate_type == PUBLISHED_PREDICATE;
     let predicate = statement.predicate;
     let recipe_bytes = read_limited(bundle.file("build.kdl")?, RECIPE_LIMIT)?;
     ensure!(
@@ -516,12 +459,8 @@ pub(crate) fn verify_bundle(
         "build attestation names a different package"
     );
 
-    let (artifacts, published_manifest) = claimed_artifacts(
-        &manifest,
-        manifest_digest,
-        statement.subject,
-        covers_published,
-    )?;
+    let (artifacts, published_manifest) =
+        claimed_artifacts(&manifest, manifest_digest, statement.subject)?;
     Ok((
         manifest,
         VerifiedBuild {
@@ -553,8 +492,7 @@ fn claimed_artifacts(
     manifest: &Manifest,
     manifest_digest: FileDigest,
     claimed: Vec<Subject>,
-    covers_published: bool,
-) -> Result<(BTreeMap<String, FileDigest>, Option<FileDigest>)> {
+) -> Result<(BTreeMap<String, FileDigest>, FileDigest)> {
     let mut subjects = subjects(claimed)?;
     ensure!(
         subjects.remove("manifest.kdl") == Some(manifest_digest),
@@ -567,16 +505,11 @@ fn claimed_artifacts(
             .with_context(|| format!("build attestation omits output {path}"))?;
         artifacts.insert(path.to_owned(), file);
     }
-    let published_manifest = if covers_published {
-        let expected = published_manifest_digest(manifest, &artifacts)?;
-        ensure!(
-            subjects.remove(PUBLISHED_MANIFEST).as_ref() == Some(&expected),
-            "build attestation does not cover the exact published manifest"
-        );
-        Some(expected)
-    } else {
-        None
-    };
+    let published_manifest = published_manifest_digest(manifest, &artifacts)?;
+    ensure!(
+        subjects.remove(PUBLISHED_MANIFEST).as_ref() == Some(&published_manifest),
+        "build attestation does not cover the exact published manifest"
+    );
     ensure!(
         subjects.is_empty(),
         "build attestation contains undeclared outputs"
@@ -621,10 +554,6 @@ pub(crate) fn verify_rebuild_inputs(
     let (payload, signatures) = decode_envelope(envelope)?;
     let statement = parse_statement(&payload)?;
     ensure!(
-        statement.predicate_type == PUBLISHED_PREDICATE,
-        "rebuild verification requires version 3 build evidence"
-    );
-    ensure!(
         statement.predicate.package == id,
         "admitted build names a different package"
     );
@@ -646,10 +575,9 @@ pub(crate) fn verify_rebuild_inputs(
         manifest.id() == id,
         "rebuild manifest names a different package"
     );
-    let (artifacts, published) =
-        claimed_artifacts(&manifest, manifest_digest, statement.subject, true)?;
+    let (artifacts, published) = claimed_artifacts(&manifest, manifest_digest, statement.subject)?;
     ensure!(
-        published.is_some_and(|file| file.sha256 == published_hash),
+        published.sha256 == published_hash,
         "admitted build does not match the catalog manifest for {id}"
     );
     Ok(RebuildEvidence {
@@ -668,9 +596,7 @@ fn parse_statement(payload: &[u8]) -> Result<Statement> {
         "noncanonical CPS build statement"
     );
     ensure!(
-        statement.statement_type == STATEMENT
-            && (statement.predicate_type == PUBLISHED_PREDICATE
-                || statement.predicate_type == statement.predicate.toolchain.predicate_type()),
+        statement.statement_type == STATEMENT && statement.predicate_type == PUBLISHED_PREDICATE,
         "unexpected build attestation statement type"
     );
     Ok(statement)
@@ -701,12 +627,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_older_predicates_even_with_a_valid_builder_signature() -> Result<()> {
+        let hash = digest(b"recipe input");
+        let recipe_bytes = format!(
+            r#"schema-version 1 kind="build-recipe"
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain solver="sat-v2" {{
+        publisher "seed" catalog="{hash}" key-sha256="{hash}"
+        package "build/compiler"
+    }}
+    manifest "manifest.kdl" sha256="{hash}"
+    script "true"
+}}
+"#
+        );
+        let manifest_bytes = b"schema-version 1 kind=\"package-manifest\"\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
+        let recipe = parse(&recipe_bytes)?;
+        let manifest = parse_manifest(std::str::from_utf8(manifest_bytes)?)?;
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let bytes = sign(
+            &key,
+            &manifest,
+            manifest_bytes,
+            &recipe,
+            recipe_bytes.as_bytes(),
+            Toolchain {
+                publishers: recipe.toolchain.clone(),
+                package_manifests: BTreeMap::from([(
+                    "build/compiler".into(),
+                    PinnedPackage {
+                        publisher: "seed".into(),
+                        version: "1.0.0-0".parse()?,
+                        sha256: hash,
+                    },
+                )]),
+            },
+            &BTreeMap::new(),
+        )?;
+        let (payload, _) = verify_envelope(&bytes, key.public_key().as_ref())?;
+        let mut statement = parse_statement(&payload)?;
+        assert_eq!(
+            statement.predicate_type,
+            "urn:canopa:cps:published-build-provenance:v1"
+        );
+        for old in [
+            "urn:canopa:cps:build-provenance:v1",
+            "urn:canopa:cps:build-provenance:v2",
+            "urn:canopa:cps:build-provenance:v3",
+        ] {
+            statement.predicate_type = old.into();
+            let payload = serde_json::to_vec(&statement)?;
+            let signature = key.sign(&pae(&payload));
+            let bytes = envelope(&payload, [("builder", signature.as_ref())])?;
+            let (payload, _) = verify_envelope(&bytes, key.public_key().as_ref())?;
+            assert!(parse_statement(&payload).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn publisher_pins_and_selected_roots_are_bound_to_the_recipe() -> Result<()> {
         let hash = "a".repeat(64);
         let recipe = parse(&format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
-    toolchain solver="sat-v1" {{
+    toolchain solver="sat-v2" {{
         publisher "seed" catalog="{hash}" key-sha256="{hash}"
         publisher "tools" catalog="{hash}" key-sha256="{hash}"
         package "cps://tools/build/compiler@1.0.0-0"
@@ -716,21 +702,17 @@ build architecture="x86_64" epoch=1700000000 {{
 }}
 "#
         ))?;
-        let ToolchainPins::Publishers(pins) = &recipe.toolchain else {
-            panic!("expected publisher pins");
-        };
-        let chain = |publishers, publisher: &str, version: &str| {
-            Toolchain::Pinned(PinnedToolchain {
-                publishers,
-                package_manifests: BTreeMap::from([(
-                    "build/compiler".to_owned(),
-                    PinnedPackage {
-                        publisher: publisher.to_owned(),
-                        version: version.parse().unwrap(),
-                        sha256: hash.clone(),
-                    },
-                )]),
-            })
+        let pins = &recipe.toolchain;
+        let chain = |publishers, publisher: &str, version: &str| Toolchain {
+            publishers,
+            package_manifests: BTreeMap::from([(
+                "build/compiler".to_owned(),
+                PinnedPackage {
+                    publisher: publisher.to_owned(),
+                    version: version.parse().unwrap(),
+                    sha256: hash.clone(),
+                },
+            )]),
         };
         chain(pins.clone(), "tools", "1.0.0-0").verify(&recipe)?;
         let mut modified = pins.clone();

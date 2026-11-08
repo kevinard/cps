@@ -31,7 +31,7 @@ pub(super) fn mark(
         "path ownership index differs from installed manifests"
     );
     image.verify_catalog_archives(state)?;
-    let mut intent = image.profile_intent(state)?;
+    let mut intent = Image::profile_intent(state);
     let mut installed = state.installed.clone();
     let mut changes = Vec::new();
     for (name, spec) in requested(state, packages)? {
@@ -58,14 +58,7 @@ pub(super) fn mark(
             });
         }
     }
-    // An overlap cannot be represented by the combined explicit bit. Keep
-    // already recorded intent, including when the applied roots were unknown.
-    if !changes.is_empty()
-        && !state.settings.profile_packages.is_empty()
-        && (state.settings.profile_intent.is_some()
-            || intent.roots.is_empty()
-            || !intent.roots.is_disjoint(&intent.local))
-    {
+    if state.settings.profile_intent.is_some() {
         state.settings.profile_intent = Some(intent);
     }
     state.settings.check_profile_intent(&installed)?;

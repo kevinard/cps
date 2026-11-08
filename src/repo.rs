@@ -17,13 +17,14 @@ use crate::{
     image::root::Root,
     kdl_format::{manifest_text, parse_manifest, publish_policy, publish_release},
     model::{
-        FORMAT, FileDigest, Manifest, Node, PackageSpec, Version, copy_payload, digest,
-        digest_reader, validate_digest, validate_name, validate_publisher, validate_summary,
+        FileDigest, Manifest, Node, PackageSpec, Version, copy_payload, digest, digest_reader,
+        validate_digest, validate_name, validate_publisher, validate_summary,
     },
     systemd::{self, Action as SystemdAction},
 };
 
 pub(crate) const CATALOG_LIMIT: u64 = 64 * 1024 * 1024;
+const CATALOG_FORMAT: u32 = 1;
 pub(crate) const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const FILE_INDEX_OBJECTS: &str = "file-indexes";
 const FILE_INDEX_LIMIT: u64 = 64 * 1024 * 1024;
@@ -62,8 +63,7 @@ pub(crate) struct Catalog {
     source_archives_required: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     withdrawals: BTreeMap<String, Withdrawal>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sequence: Option<NonZeroU64>,
+    sequence: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     profiles_required: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -82,9 +82,7 @@ pub(crate) struct ReleaseProfile {
     pub architecture: String,
     pub facets: BTreeMap<String, bool>,
     pub companions: Vec<CatalogPin>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roots: BTreeMap<String, Version>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub composition: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elf_library_dirs: Vec<String>,
@@ -135,13 +133,13 @@ impl ReleaseProfile {
 
     fn validate_composition(&self, name: &str, catalog: &Catalog) -> Result<()> {
         ensure!(
-            self.composition.is_empty() || !self.roots.is_empty(),
-            "signed profile {name} has a composition without roots"
+            !self.composition.is_empty() && !self.roots.is_empty(),
+            "signed profile {name} requires a recorded composition and roots"
         );
         if let Some(percentage) = self.rollout_percentage {
             ensure!(
-                percentage <= 100 && !self.composition.is_empty(),
-                "signed profile {name} requires a composition and a rollout percentage from 0 to 100"
+                percentage <= 100,
+                "signed profile {name} requires a rollout percentage from 0 to 100"
             );
         }
         for (package, manifest) in &self.composition {
@@ -159,9 +157,7 @@ impl ReleaseProfile {
                 "signed profile {name} has an incompatible architecture for root {root}@{version}"
             );
             ensure!(
-                self.composition.is_empty()
-                    || self.composition.get(root).map(String::as_str)
-                        == Some(entry.manifest_digest()),
+                self.composition.get(root).map(String::as_str) == Some(entry.manifest_digest()),
                 "signed profile {name} has a different manifest for root {root}@{version}"
             );
         }
@@ -191,7 +187,7 @@ impl CatalogLineage {
     fn new(key: &[u8], catalog: &Catalog) -> Self {
         Self {
             anchor_sha256: digest(key),
-            sequence: catalog.sequence.map_or(0, NonZeroU64::get),
+            sequence: catalog.sequence,
         }
     }
 }
@@ -254,7 +250,7 @@ impl Catalog {
 
     fn empty(publisher: &str) -> Self {
         Self {
-            format: FORMAT,
+            format: CATALOG_FORMAT,
             publisher: publisher.to_owned(),
             entries: BTreeMap::new(),
             file_index: None,
@@ -264,7 +260,7 @@ impl Catalog {
             build_inputs: BTreeMap::new(),
             source_archives_required: false,
             withdrawals: BTreeMap::new(),
-            sequence: None,
+            sequence: 0,
             profiles_required: false,
             obsoletions: BTreeMap::new(),
             renames: BTreeMap::new(),
@@ -709,9 +705,14 @@ impl Catalog {
         Ok(())
     }
 
+    fn signing_message(&self) -> Result<Vec<u8>> {
+        let mut message = b"cps signed catalog v1\n".to_vec();
+        serde_json::to_writer(&mut message, self)?;
+        Ok(message)
+    }
+
     fn next_sequence(&self) -> Result<NonZeroU64> {
         self.sequence
-            .map_or(0, NonZeroU64::get)
             .checked_add(1)
             .and_then(NonZeroU64::new)
             .context("publisher catalog sequence exhausted")
@@ -809,25 +810,18 @@ struct SignedCatalog {
 pub struct Published {
     pub sha256: String,
     pub manifest: Manifest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    document: Option<String>,
+    document: String,
 }
 
 impl Published {
     pub fn verify(&self) -> Result<()> {
         self.manifest.validate(true)?;
-        let bytes = if let Some(document) = &self.document {
-            ensure!(
-                parse_manifest(document)? == self.manifest,
-                "stored manifest does not match its KDL document"
-            );
-            document.as_bytes().to_vec()
-        } else {
-            // Existing images and catalogs contain canonical JSON manifests.
-            serde_json::to_vec(&self.manifest)?
-        };
         ensure!(
-            digest(&bytes) == self.sha256,
+            parse_manifest(&self.document)? == self.manifest,
+            "stored manifest does not match its KDL document"
+        );
+        ensure!(
+            digest(self.document.as_bytes()) == self.sha256,
             "installed manifest digest mismatch for {}",
             self.manifest.id()
         );
@@ -837,17 +831,8 @@ impl Published {
 
 fn load_manifest(repo: &Path, sha256: String) -> Result<Published> {
     let bytes = read_object(repo, "manifests", &sha256, MANIFEST_LIMIT)?;
-    let (manifest, document) = if bytes.starts_with(b"{") {
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
-        ensure!(
-            serde_json::to_vec(&manifest)? == bytes,
-            "noncanonical legacy manifest {sha256}"
-        );
-        (manifest, None)
-    } else {
-        let document = String::from_utf8(bytes)?;
-        (parse_manifest(&document)?, Some(document))
-    };
+    let document = String::from_utf8(bytes)?;
+    let manifest = parse_manifest(&document)?;
     manifest.validate(true)?;
     Ok(Published {
         sha256,
@@ -877,7 +862,7 @@ pub(crate) struct BuildEvidence {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CatalogCheckpoint {
     pub(crate) catalog: String,
-    sequence: Option<NonZeroU64>,
+    sequence: u64,
     rotations: Vec<keys::Rotation>,
 }
 
@@ -911,13 +896,11 @@ impl CatalogCheckpoint {
     }
 }
 
-fn check_catalog_sequence(previous: Option<NonZeroU64>, next: Option<NonZeroU64>) -> Result<()> {
-    if let Some(previous) = previous {
-        ensure!(
-            next.is_some_and(|sequence| sequence > previous),
-            "publisher catalog rollback or fork after sequence {previous}"
-        );
-    }
+fn check_catalog_sequence(previous: u64, next: u64) -> Result<()> {
+    ensure!(
+        next > previous,
+        "publisher catalog rollback or fork after sequence {previous}"
+    );
     Ok(())
 }
 
@@ -1057,17 +1040,13 @@ fn verify_repository_attestation(
 }
 
 fn verify_package_attestation(bytes: &[u8], trust: &BuildTrust, package: &Published) -> Result<()> {
-    let document = package
-        .document
-        .as_ref()
-        .context("build trust requires a published KDL manifest")?;
     trust
         .verify(
             bytes,
             &package.manifest,
             FileDigest {
                 sha256: package.sha256.clone(),
-                size: document.len() as u64,
+                size: package.document.len() as u64,
             },
         )
         .with_context(|| format!("verifying build evidence for {}", package.manifest.id()))
@@ -1199,7 +1178,12 @@ fn read_object(repo: &Path, kind: &str, hash: &str, limit: u64) -> Result<Vec<u8
     Ok(bytes)
 }
 
-fn read_catalog(repo: &Path, hash: &str, publisher: &str, key: &[u8]) -> Result<Catalog> {
+pub(crate) fn read_catalog(
+    repo: &Path,
+    hash: &str,
+    publisher: &str,
+    key: &[u8],
+) -> Result<Catalog> {
     read_catalog_with_key(repo, hash, publisher, keys::Trust::Anchor(key))
 }
 
@@ -1283,7 +1267,11 @@ fn decode_catalog(
 ) -> Result<Catalog> {
     let signed: SignedCatalog = serde_json::from_slice(bytes)?;
     let catalog = signed.catalog;
-    ensure!(catalog.format == FORMAT, "unsupported catalog format");
+    ensure!(
+        catalog.format == CATALOG_FORMAT,
+        "unsupported catalog format"
+    );
+    ensure!(catalog.sequence > 0, "invalid publisher catalog sequence");
     if let Some(hash) = &catalog.file_index {
         validate_digest(hash).context("invalid file index digest")?;
     }
@@ -1294,10 +1282,7 @@ fn decode_catalog(
     );
     let signer = keys::signer(publisher, catalog.sequence, &catalog.key_rotations, trust)?;
     UnparsedPublicKey::new(&ED25519, signer)
-        .verify(
-            &serde_json::to_vec(&catalog)?,
-            &hex::decode(signed.signature)?,
-        )
+        .verify(&catalog.signing_message()?, &hex::decode(signed.signature)?)
         .map_err(|_| anyhow::anyhow!("invalid signature on catalog {hash}"))?;
     ensure!(
         catalog.release_profiles.is_empty() || catalog.profiles_required,
@@ -1323,9 +1308,12 @@ fn decode_catalog(
         for pin in &profile.companions {
             validate_publisher(&pin.publisher)?;
             validate_digest(&pin.sha256)?;
-            if let Some(lineage) = &pin.lineage {
-                validate_digest(&lineage.anchor_sha256)?;
-            }
+            let lineage = pin
+                .lineage
+                .as_ref()
+                .context("missing signed companion lineage")?;
+            validate_digest(&lineage.anchor_sha256)?;
+            ensure!(lineage.sequence > 0, "invalid signed companion sequence");
             ensure!(
                 publishers.insert(pin.publisher.as_str()),
                 "duplicate publisher {} in signed profile {name}",
@@ -1529,28 +1517,6 @@ pub(crate) fn decode_archived_catalog(
 ) -> Result<Catalog> {
     ensure!(digest(bytes) == hash, "archived catalog digest mismatch");
     decode_catalog(bytes, hash, publisher, keys::Trust::Anchor(key))
-}
-
-pub(crate) fn check_catalog_successor(
-    repo: &Path,
-    publisher: &str,
-    key: &[u8],
-    previous_hash: &str,
-    archived: Option<&[u8]>,
-    next_hash: &str,
-) -> Result<()> {
-    let previous = if let Some(bytes) = archived {
-        decode_archived_catalog(bytes, previous_hash, publisher, key)?
-    } else {
-        validate_digest(previous_hash)?;
-        if !path_present(&repo.join("catalogs").join(previous_hash))? {
-            // Images created by older clients may only have a compact checkpoint.
-            return Ok(());
-        }
-        read_catalog(repo, previous_hash, publisher, key)?
-    };
-    let next = read_catalog(repo, next_hash, publisher, key)?;
-    previous.check_successor(&next, previous_hash)
 }
 
 pub(crate) fn take_profile(
@@ -2157,12 +2123,10 @@ fn stage_manifest(
         false
     };
     if let Some(evidence) = evidence {
-        if let Some(manifest) = &evidence.published_manifest {
-            ensure!(
-                catalog.entries[&id].manifest_digest() == manifest.sha256,
-                "build attestation names a different published manifest for {id}"
-            );
-        }
+        ensure!(
+            catalog.entries[&id].manifest_digest() == evidence.published_manifest.sha256,
+            "build attestation names a different published manifest for {id}"
+        );
         let envelope = evidence.envelope()?;
         let hash = digest(&envelope);
         let added_attestation = if let Some(previous) = catalog.attestations.get(&id) {
@@ -2203,9 +2167,24 @@ fn stage_manifest(
 
 type FileIndex = BTreeMap<String, BTreeSet<String>>;
 
+const FILE_INDEX_FORMAT: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FileIndexDocument {
+    format: u32,
+    entries: FileIndex,
+}
+
 pub(crate) fn read_file_index(repo: &Path, hash: &str) -> Result<FileIndex> {
     let bytes = read_object(repo, FILE_INDEX_OBJECTS, hash, FILE_INDEX_LIMIT)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    let document: FileIndexDocument = serde_json::from_slice(&bytes)?;
+    ensure!(
+        document.format == FILE_INDEX_FORMAT,
+        "unsupported file index format {}",
+        document.format
+    );
+    Ok(document.entries)
 }
 
 /// Enable a signed file lookup index for this publisher's catalogs.
@@ -2277,7 +2256,10 @@ fn store_file_index(repo: &Path, catalog: &Catalog) -> Result<String> {
                 .insert(id.clone());
         }
     }
-    let bytes = serde_json::to_vec(&index)?;
+    let bytes = serde_json::to_vec(&FileIndexDocument {
+        format: FILE_INDEX_FORMAT,
+        entries: index,
+    })?;
     ensure!(
         bytes.len() as u64 <= FILE_INDEX_LIMIT,
         "file index exceeds {FILE_INDEX_LIMIT} bytes"
@@ -2309,7 +2291,7 @@ fn write_catalog_document(
 ) -> Result<String> {
     catalog.rename_targets()?;
     catalog.check_source_archives()?;
-    catalog.sequence = Some(catalog.next_sequence()?);
+    catalog.sequence = catalog.next_sequence()?.get();
     let signer = keys::signer(
         &catalog.publisher,
         catalog.sequence,
@@ -2317,7 +2299,7 @@ fn write_catalog_document(
         keys::Trust::Current(key.public_key().as_ref()),
     )?;
     catalog.validate_profile_build_trust(&signer)?;
-    let signature = hex::encode(key.sign(&serde_json::to_vec(&catalog)?).as_ref());
+    let signature = hex::encode(key.sign(&catalog.signing_message()?).as_ref());
     let signed = SignedCatalog { catalog, signature };
     let signed = serde_json::to_vec(&signed)?;
     ensure!(
@@ -2362,14 +2344,6 @@ impl PublicationPolicy {
             build.builders().len() >= self.minimum_builders,
             "publish policy requires {} distinct build signers",
             self.minimum_builders
-        );
-        ensure!(
-            !self.verify_toolchains || build.published_manifest.is_some(),
-            "toolchain verification policy requires version 3 build evidence"
-        );
-        ensure!(
-            !self.archive_build_inputs || build.published_manifest.is_some(),
-            "archiving rebuild inputs requires version 3 build evidence"
         );
         if let Some(config) = &approval.toolchain_config {
             crate::build::verify_toolchain(config, &build.recipe, &build.toolchain)
@@ -2578,7 +2552,7 @@ mod tests {
 
         let mut previous = Catalog::empty("canopa");
         previous.profiles_required = true;
-        previous.sequence = NonZeroU64::new(1);
+        previous.sequence = 1;
         previous.release_profiles.insert(
             "desktop".to_owned(),
             ReleaseProfile {
@@ -2596,7 +2570,7 @@ mod tests {
         );
         let previous_hash = digest(b"previous primary catalog");
         let mut next = previous.clone();
-        next.sequence = NonZeroU64::new(2);
+        next.sequence = 2;
         previous.check_successor(&next, &previous_hash)?;
         let changed_pin = |update: CatalogPin, expected: &str| {
             let mut successor = next.clone();
@@ -2628,7 +2602,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_catalog_signatures_and_first_sequence() -> Result<()> {
+    fn signed_catalog_version_one_requires_its_signing_prefix_and_sequence() -> Result<()> {
         let repo = tempfile::tempdir()?;
         prepare_objects(repo.path())?;
         let key =
@@ -2646,16 +2620,24 @@ mod tests {
         let hash = store(repo.path(), "catalogs", signed.as_bytes())?;
         let read =
             |hash: &str| read_catalog(repo.path(), hash, "canopa", key.public_key().as_ref());
-        let previous = read(&hash)?;
-        assert!(previous.sequence.is_none());
-        write_catalog(repo.path(), previous.clone(), &key)?;
-        let next = read(&read_current(repo.path())?)?;
-        assert_eq!(next.sequence, NonZeroU64::new(1));
-        previous.check_successor(&next, &hash)?;
-        assert!(
-            next.check_successor(&previous, &read_current(repo.path())?)
-                .is_err()
-        );
+        assert!(read(&hash).is_err());
+
+        let current = write_catalog(repo.path(), Catalog::empty("canopa"), &key)?;
+        let bytes = catalog_bytes(repo.path(), &current)?;
+        let mut signed: SignedCatalog = serde_json::from_slice(&bytes)?;
+        assert_eq!(signed.catalog.format, 1);
+        assert_eq!(read(&current)?.sequence, 1);
+        let body = serde_json::to_vec(&signed.catalog)?;
+        let mut message = b"cps signed catalog v1\n".to_vec();
+        message.extend_from_slice(&body);
+        UnparsedPublicKey::new(&ED25519, key.public_key())
+            .verify(&message, &hex::decode(&signed.signature)?)
+            .unwrap();
+
+        signed.signature = hex::encode(key.sign(&body).as_ref());
+        let hash = store(repo.path(), "catalogs", &serde_json::to_vec(&signed)?)?;
+        let error = read(&hash).unwrap_err();
+        assert!(format!("{error:#}").contains("invalid signature on catalog"));
         Ok(())
     }
 
@@ -2670,10 +2652,10 @@ mod tests {
                 .insert(id.to_owned(), CatalogEntry::Portable(digest(id.as_bytes())));
         }
         previous.rename("cps://canopa/apps/old@2.0.0-0", "apps/new".into())?;
-        previous.sequence = NonZeroU64::new(1);
+        previous.sequence = 1;
         let base = digest(b"previous catalog");
         let mut next = previous.clone();
-        next.sequence = NonZeroU64::new(2);
+        next.sequence = 2;
         next.withdraw(new)?;
         assert_eq!(next.rename_targets()?["apps/old"], "apps/new");
         previous.check_successor(&next, &base)?;
@@ -2693,7 +2675,7 @@ mod tests {
         let manifest = CatalogEntry::Portable(digest(b"active manifest"));
         let attestation = digest(b"build evidence");
         let previous = Catalog {
-            format: FORMAT,
+            format: CATALOG_FORMAT,
             publisher: "canopa".to_owned(),
             entries: BTreeMap::from([(active.clone(), manifest.clone())]),
             file_index: None,
@@ -2715,7 +2697,7 @@ mod tests {
                     attestation: Some(digest(b"withdrawn build evidence")),
                 },
             )]),
-            sequence: NonZeroU64::new(1),
+            sequence: 1,
             profiles_required: true,
             obsoletions: BTreeMap::from([("desktop/retired".to_owned(), "2.0.0-0".parse()?)]),
             renames: BTreeMap::new(),
@@ -2737,7 +2719,7 @@ mod tests {
             )]),
         };
         let mut next = previous.clone();
-        next.sequence = NonZeroU64::new(3);
+        next.sequence = 3;
         previous.check_successor(&next, &base)?;
 
         let inputs = next.build_inputs.remove(&active).unwrap();
@@ -2875,16 +2857,17 @@ mod tests {
     }
 
     #[test]
-    fn old_json_manifest_keeps_its_digest() -> Result<()> {
+    fn rejects_old_json_manifests() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::create_dir(repo.path().join("manifests"))?;
         let bytes = br#"{"format":1,"publisher":"canopa","name":"test/legacy","version":"1.0.0-0","dependency":[{"kind":"require","package":"library/one","version":null},{"kind":"incorporate","package":"library/two","version":"=1.0.0-0"}],"action":[]}"#;
         let hash = store(repo.path(), "manifests", bytes)?;
-        let manifest = load_manifest(repo.path(), hash.clone())?;
-        assert_eq!(manifest.sha256, hash);
-        assert!(manifest.document.is_none());
-        // The old installed record has no KDL document and verifies offline.
-        let manifest: Published = serde_json::from_slice(&serde_json::to_vec(&manifest)?)?;
-        manifest.verify()
+        assert!(load_manifest(repo.path(), hash.clone()).is_err());
+        let old_record = serde_json::json!({
+            "sha256": hash,
+            "manifest": serde_json::from_slice::<Manifest>(bytes)?,
+        });
+        assert!(serde_json::from_value::<Published>(old_record).is_err());
+        Ok(())
     }
 }

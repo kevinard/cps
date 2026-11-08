@@ -1,6 +1,7 @@
-schema-version 1
+schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1789400270 {
-    toolchain "@CATALOG_SHA256@" solver="sat-v1" {
+    toolchain solver="sat-v2" {
+        publisher "seed" catalog="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
         package "build/native-gnu"
     }
     manifest "coreutils.kdl" sha256="@MANIFEST_SHA256@"

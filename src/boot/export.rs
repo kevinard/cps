@@ -207,7 +207,7 @@ fn export(
                 image: uuid.clone(),
                 revision: state.settings.revision,
                 state_sha256: digest_reader(image.state_dir.file("state.sqlite")?)?,
-                tree_sha256: Some(tree_sha256),
+                tree_sha256,
                 bytes,
                 sha256: digest_reader(checked)?,
             }

@@ -41,13 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 2
           persist-credentials: false
       - name: Build the pinned test environment
         run: docker build --target transactions -t cps-ci ci
       - name: Build and test
         run: |
-          git worktree add --detach "$RUNNER_TEMP/cps-previous" HEAD^1
           mkdir -p "$RUNNER_TEMP/cps-cargo"
           run_ci() {
             docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
@@ -56,11 +54,11 @@ jobs:
           }
           run_ci cps-ci bash -euc '
             cargo fetch --locked
-            cargo fetch --locked --manifest-path "$RUNNER_TEMP/cps-previous/Cargo.toml"
           '
           run_ci --network none cps-ci bash -euc '
               cargo test --frozen --all-targets
               cargo build --frozen --bin cps --example tuf-fixture
+              python3 docs/reference/generate-man.py --cps target/debug/cps --check
               export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
               export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
               for test in package-identity elf-transactions systemd-actions hwdb-trigger mediators \
@@ -68,10 +66,7 @@ jobs:
                 bash "tests/$test.sh"
               done
               bash tests/boot-deploy.sh --esp
-              cargo build --frozen --manifest-path "$RUNNER_TEMP/cps-previous/Cargo.toml" \
-                --target-dir "$RUNNER_TEMP/cps-previous-target" --bin cps
-              CPS_TEST_PREVIOUS_BINARY="$RUNNER_TEMP/cps-previous-target/debug/cps" \
-                bash tests/transaction-progress.sh
+              bash tests/transaction-progress.sh
             '
 
   boot:

@@ -71,7 +71,7 @@ impl Fixture {
         actions: String,
     ) -> Result<()> {
         let manifest = format!(
-            "schema-version 1\npackage {name:?} publisher={publisher:?} version={version:?} {{\n{actions}}}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage {name:?} publisher={publisher:?} version={version:?} {{\n{actions}}}\n"
         );
         fs::write(&self.recipe, manifest)?;
         publish(&self.repo, &self.proto, &self.recipe, &self.private)?;
@@ -408,7 +408,7 @@ fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     let path = "usr/lib/libexample.so.1";
     let file = fixture.file(path, "version one", "0644", "")?;
     let manifest = format!(
-        "schema-version 1\npackage {runtime:?} publisher=\"canopa\" version=\"1.0.0-0\" requires-reboot=#true {{\n{file}}}\n"
+        "schema-version 1 kind=\"package-manifest\"\npackage {runtime:?} publisher=\"canopa\" version=\"1.0.0-0\" requires-reboot=#true {{\n{file}}}\n"
     );
     assert!(parse_manifest(&manifest.replace("#true", "\"true\"")).is_err());
     fs::write(&fixture.recipe, manifest)?;
@@ -490,7 +490,7 @@ fn manifest_capabilities_require_a_protected_executable() -> Result<()> {
     use crate::kdl_format::{manifest_text, parse_manifest};
     let package = |metadata| {
         parse_manifest(&format!(
-            "schema-version 1\npackage \"test/caps\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n    file \"bin/probe\" capabilities=\"cap_net_raw=ep\" {metadata}\n}}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage \"test/caps\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n    file \"bin/probe\" capabilities=\"cap_net_raw=ep\" {metadata}\n}}\n"
         ))
     };
     for metadata in [
@@ -640,7 +640,7 @@ fn hardlink_targets_must_be_immutable_files_owned_by_the_same_package() -> Resul
 
     let parse = |actions: &str| {
         parse_manifest(&format!(
-            "schema-version 1\npackage \"test/hardlinks\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}\n}}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage \"test/hardlinks\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}\n}}\n"
         ))
     };
     let file = "file \"usr/bin/tool\" mode=\"0755\" uid=0 gid=0";
@@ -904,7 +904,7 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
     let config = primary._dir.path().join("image.kdl");
     let definition = |extra_key: &Path| {
         format!(
-            "schema-version 1\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
+            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
              publisher \"extras\" {{\n    repository {:?}\n    trust-key {:?}\n}}\n",
             extra.repo, extra_key,
         )
@@ -972,7 +972,6 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
         "extras"
     );
     let saved = plan_for(install("desktop/plugin"))?;
-    assert_eq!(saved.catalog, None);
     assert_eq!(
         saved
             .catalogs
@@ -1281,7 +1280,7 @@ fn builder_policy_changes_are_atomic_and_wait_for_transaction_recovery() -> Resu
     fs::write(
         &policy,
         format!(
-            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            "schema-version 1 kind=\"build-trust\"\nbuild-trust {{ builder-key {:?}; }}\n",
             worker.public
         ),
     )?;
@@ -1353,7 +1352,7 @@ fn builder_policy_changes_are_atomic_and_wait_for_transaction_recovery() -> Resu
 fn build_receipts_survive_offline_transaction_recovery_and_follow_installed_packages() -> Result<()>
 {
     use crate::{
-        attestation::{LegacyToolchain, Toolchain, sign},
+        attestation::{PinnedPackage, Toolchain, sign},
         audit_publisher_builds,
         kdl_format::{build, parse_manifest},
         model::FileDigest,
@@ -1368,14 +1367,15 @@ fn build_receipts_survive_offline_transaction_recovery_and_follow_installed_pack
     let bytes = "guarded executable";
     let action = f.file(COMPOSITOR, bytes, "0755", "")?;
     let manifest = format!(
-        "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{action}}}\n"
+        "schema-version 1 kind=\"package-manifest\"\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{action}}}\n"
     );
     fs::write(&f.recipe, &manifest)?;
     let pin = digest(b"test toolchain catalog");
+    let key_hash = digest(b"test toolchain key");
     let recipe = format!(
-        r#"schema-version 1
+        r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
-    toolchain "{pin}" {{ package "build/shell"; }}
+    toolchain solver="sat-v2" {{ publisher "seed" catalog="{pin}" key-sha256="{key_hash}"; package "build/shell"; }}
     manifest "manifest.kdl" sha256="{}"
     script "true"
 }}
@@ -1383,17 +1383,23 @@ build architecture="x86_64" epoch=1700000000 {{
         digest(manifest.as_bytes())
     );
     fs::write(bundle.join("build.kdl"), &recipe)?;
-    let toolchain = Toolchain::Legacy(LegacyToolchain {
-        publisher: "seed".into(),
-        key_sha256: digest(b"test toolchain key"),
-        catalog_sha256: pin,
-        package_manifests: BTreeMap::from([("build/shell".into(), digest(b"test shell"))]),
-    });
+    let recipe_model = build::parse(&recipe)?;
+    let toolchain = Toolchain {
+        publishers: recipe_model.toolchain.clone(),
+        package_manifests: BTreeMap::from([(
+            "build/shell".into(),
+            PinnedPackage {
+                publisher: "seed".into(),
+                version: "1.0.0-0".parse()?,
+                sha256: digest(b"test shell"),
+            },
+        )]),
+    };
     let evidence = sign(
         &read_signing_key(&worker.private)?,
         &parse_manifest(&manifest)?,
         manifest.as_bytes(),
-        &build::parse(&recipe)?,
+        &recipe_model,
         recipe.as_bytes(),
         toolchain,
         &BTreeMap::from([(
@@ -1418,7 +1424,7 @@ build architecture="x86_64" epoch=1700000000 {{
     fs::write(
         &policy,
         format!(
-            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            "schema-version 1 kind=\"build-trust\"\nbuild-trust {{ builder-key {:?}; }}\n",
             worker.public
         ),
     )?;
@@ -1523,7 +1529,7 @@ fn solver_honors_exclusions_and_explains_impossible_requests() -> Result<()> {
 }
 
 #[test]
-fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
+fn rejects_old_plans_and_applies_current_plans_with_their_pinned_catalog() -> Result<()> {
     let f = Fixture::new()?;
     f.package(
         "desktop/app",
@@ -1531,25 +1537,35 @@ fn applies_legacy_plan_with_its_pinned_catalog() -> Result<()> {
         f.file(COMPOSITOR, "old", "0755", "")?,
     )?;
     f.create()?;
-    let legacy = {
-        let image = crate::image::Image::open(&f.root, false)?;
-        let request = Request::Install {
+    let saved = plan(
+        &f.root,
+        Request::Install {
             packages: vec!["desktop/app".into()],
-        };
-        crate::plan::build(&image, image.state()?, request, None, None)?.0
-    };
-    let saved = serde_json::to_vec(&legacy)?;
+        },
+    )?;
+    let current = serde_json::to_value(&saved)?;
+    assert_eq!(current["format"], 1);
+    let mut old = current.clone();
+    old.as_object_mut().unwrap().remove("install_recommends");
+    assert!(serde_json::from_value::<Plan>(old.clone()).is_err());
+    let catalogs = old.as_object_mut().unwrap().remove("catalogs").unwrap();
+    old["catalog"] = catalogs["canopa"].clone();
+    old["solver"] = "sat-v2".into();
+    assert!(serde_json::from_value::<Plan>(old).is_err());
+    let mut development = current.clone();
+    development["format"] = 2.into();
+    let development: Plan = serde_json::from_value(development)?;
     assert!(
-        serde_json::from_slice::<serde_json::Value>(&saved)?
-            .get("solver")
-            .is_none()
+        format!("{:#}", apply(&f.root, &development).unwrap_err())
+            .contains("unsupported plan format")
     );
+
     f.package(
         "desktop/app",
         "2.0.0-0",
         f.file(COMPOSITOR, "new", "0755", "")?,
     )?;
-    apply(&f.root, &serde_json::from_slice(&saved)?)?;
+    apply(&f.root, &serde_json::from_value(current)?)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
     Ok(())
 }
@@ -1614,9 +1630,7 @@ fn marks_installed_package_requests_offline_without_touching_files() -> Result<(
     assert!(promoted_reason.intent.requested);
     assert_eq!(promoted_reason.dependents, explanation.dependents);
     assert!(format!("{:#}", apply(&f.root, &stale).unwrap_err()).contains("stale plan"));
-    let history = crate::transaction_details(&f.root, &promoted.id()?)?
-        .details
-        .unwrap();
+    let history = crate::transaction_details(&f.root, &promoted.id()?)?.details;
     assert_eq!(history.intent_changes, promoted.intent_changes);
     assert!(history.package_changes.is_empty());
     assert_eq!(history.planned_path_changes, 0);
@@ -1821,7 +1835,15 @@ fn requires_one_compatible_backend_and_checks_removal_offline() -> Result<()> {
         "2.0.0-0",
         f.file(ALPHA, "alpha v2", "0644", "")?,
     )?;
-    apply(&f.root, &plan(&f.root, install(&["desktop/app"]))?)?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Install {
+                packages: vec!["desktop/app".into()],
+            },
+        )?,
+    )?;
     assert!(
         !f.root.join(ALPHA).exists(),
         "an installed backend already satisfies the dependency"
@@ -2292,7 +2314,7 @@ fn queries_signed_package_descriptions_and_keeps_optional_dependencies_advisory(
     let f = Fixture::new()?;
     let summary = "A lightweight text editor";
     let recipe = format!(
-        r#"schema-version 1
+        r#"schema-version 1 kind="package-manifest"
 package "apps/editor" publisher="canopa" version="1.0.0-0" summary="{summary}" {{
     optional "apps/editor-spellcheck" version=">=1.0.0-0" description="Check spelling while typing"
 }}
@@ -2406,6 +2428,17 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
         crate::enable_file_index(&f.repo, "canopa", &f.private)?,
         index_catalog
     );
+    let index_dir = f.repo.join("file-indexes");
+    let bytes = fs::read(fs::read_dir(&index_dir)?.next().unwrap()?.path())?;
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(document["format"], 1);
+    let unversioned = document["entries"].to_string();
+    document["format"] = 2.into();
+    for invalid in [unversioned, document.to_string()] {
+        let hash = digest(invalid.as_bytes());
+        fs::write(index_dir.join(&hash), invalid)?;
+        assert!(crate::repo::read_file_index(&f.repo, &hash).is_err());
+    }
     let catalog = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
     let unrelated = catalog
         .packages
@@ -2799,7 +2832,7 @@ fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Resul
             .contains("Reset facet doc.man to its default")
     );
     assert!(enable.summary().contains(&format!("Add {MANPAGE}")));
-    assert!(enable.catalog.is_none() && enable.catalogs.is_empty());
+    assert!(enable.catalogs.is_empty());
     let staged = f._dir.path().join("staged");
     crate::stage_boot_environment(&f.root, &staged, &enable)?;
     assert!(!f.root.join(MANPAGE).exists());
@@ -3030,7 +3063,7 @@ fn restores_disabled_config_proposals_and_moves_local_edits_after_upgrade() -> R
 }
 
 #[test]
-fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
+fn rejects_development_journals_and_verifies_completed_transactions() -> Result<()> {
     let f = Fixture::new()?;
     f.package(
         "desktop/compositor",
@@ -3046,7 +3079,7 @@ fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
     )?;
     interrupt_apply_at(
         &f.root,
-        &f._dir.path().join("legacy-plan.json"),
+        &f._dir.path().join("plan.json"),
         &install,
         COMPOSITOR,
     )?;
@@ -3055,45 +3088,47 @@ fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let journal: serde_json::Value = serde_json::from_str(&journal)?;
     let record = &journal["journaled"];
+    assert_eq!(record["format"], 1);
     let legacy = serde_json::json!({"archived": {
         "id": record["id"], "writes": record["plan"]["writes"], "next": record["next"]
     }});
+    let mut unversioned = journal.clone();
+    unversioned["journaled"]
+        .as_object_mut()
+        .unwrap()
+        .remove("format");
+    let mut wrong_version = journal.clone();
+    wrong_version["journaled"]["format"] = 2.into();
+    for rejected in [legacy, unversioned, wrong_version] {
+        let data = rejected.to_string();
+        db.execute("UPDATE pending SET data=?1 WHERE id=1", [&data])?;
+        assert!(crate::transaction_status(&f.root).is_err());
+        assert!(crate::transaction_progress(&f.root, &install, false).is_err());
+        assert!(crate::resume_transaction(&f.root).is_err());
+        assert!(apply(&f.root, &install).is_err());
+        let saved: String =
+            db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
+        assert_eq!(saved, data);
+        assert_eq!(
+            crate::image::Image::open_query(&f.root)?
+                .settings()?
+                .revision,
+            0
+        );
+    }
     db.execute(
         "UPDATE pending SET data=?1 WHERE id=1",
-        [legacy.to_string()],
-    )?;
-    let status = crate::transaction_status(&f.root)?;
-    assert!(status.pending.unwrap().plan_summary.is_none());
-    let error = crate::resume_transaction(&f.root).unwrap_err();
-    assert!(error.to_string().contains("requires its saved plan"));
-    db.execute(
-        "UPDATE pending SET data=json_set(data, '$.archived.writes[0].path', 'wrong') WHERE id=1",
-        [],
-    )?;
-    let error = apply(&f.root, &install).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("pending actions differ from the verified plan")
-    );
-    db.execute(
-        "UPDATE pending SET data=?1 WHERE id=1",
-        [legacy.to_string()],
+        [journal.to_string()],
     )?;
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
     assert_eq!(apply(&f.root, &install)?, 1);
     assert!(verify(&f.root)?.is_empty());
     let install_id = install.id()?;
-    assert!(
+    assert_eq!(
         crate::transaction_details(&f.root, &install_id)?
             .details
-            .is_some()
-    );
-    db.execute("DROP TABLE transaction_details", [])?;
-    assert!(
-        crate::transaction_details(&f.root, &install_id)?
-            .details
-            .is_none()
+            .request,
+        install.request,
     );
     let remove = plan(
         &f.root,
@@ -3106,10 +3141,20 @@ fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].plan_id, remove.id()?);
     assert_eq!(entries[1].plan_id, install_id);
-    assert!(entries[1].details.is_none());
     assert_eq!(crate::transaction_history(&f.root, 1)?.len(), 1);
     assert!(crate::transaction_history(&f.root, 0).is_err());
     assert!(crate::transaction_details(&f.root, &digest(b"unknown")).is_err());
+    let data: String = db.query_row(
+        "SELECT data FROM transaction_details WHERE plan=?1",
+        [&install_id],
+        |row| row.get(0),
+    )?;
+    let unversioned = digest(format!("{install_id}\n1\n{data}").as_bytes());
+    db.execute(
+        "UPDATE transaction_details SET sha256=?1 WHERE plan=?2",
+        (&unversioned, &install_id),
+    )?;
+    assert!(crate::transaction_details(&f.root, &install_id).is_err());
     db.execute(
         "UPDATE transaction_details SET data='{}' WHERE plan=?1",
         [remove.id()?],
@@ -3120,6 +3165,11 @@ fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
             .to_string()
             .contains("transaction details digest mismatch")
     );
+    db.execute(
+        "DELETE FROM transaction_details WHERE plan=?1",
+        [&install_id],
+    )?;
+    assert!(crate::transaction_details(&f.root, &install_id).is_err());
     Ok(())
 }
 
@@ -3529,15 +3579,15 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
             (1, initial.id()?)
         ]
     );
-    let restored = history[0].details.as_ref().unwrap();
+    let restored = &history[0].details;
     assert_eq!(restored.base_image, original.id);
     assert_eq!(restored.base_revision, 2);
     assert_eq!(restored.request, review(RESTORE, ConfigChoice::Vendor));
-    let upgraded = history[3].details.as_ref().unwrap();
+    let upgraded = &history[3].details;
     assert_eq!(upgraded.base_image, upgrade.image);
     assert_eq!(
         upgraded.catalogs["canopa"],
-        upgrade.catalog.as_ref().unwrap().as_str()
+        upgrade.catalogs["canopa"].as_str()
     );
     assert_eq!(upgraded.package_changes[0].from.as_deref(), Some("1.0.0-0"));
     assert_eq!(upgraded.package_changes[0].to.as_deref(), Some("2.0.0-0"));
@@ -3743,7 +3793,7 @@ fn configuration_move_identities_are_unique_within_a_publisher() -> Result<()> {
     fs::write(
         &config,
         format!(
-            "schema-version 1\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
+            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
              publisher \"extras\" {{\n    repository {:?}\n    trust-key {:?}\n}}\n",
             extra.repo, extra.public,
         ),
@@ -3783,70 +3833,35 @@ fn configuration_move_identities_are_unique_within_a_publisher() -> Result<()> {
 }
 
 #[test]
-fn imports_legacy_config_proposals_without_reopening_dismissed_updates() -> Result<()> {
-    use crate::{ConfigChoice, list_config_updates};
-
+fn rejects_the_old_image_state_layout_and_format() -> Result<()> {
     let f = Fixture::new()?;
-    let package = |version: &str, defaults: &str| {
-        f.package(
-            "desktop/settings",
-            version,
-            f.file(CONFIG, defaults, "0644", "preserve=#true")?,
-        )
-    };
-    package("1.0.0-0", "vendor version one")?;
-    let config = f._dir.path().join("legacy.kdl");
+    let config = f._dir.path().join("image.kdl");
     fs::write(
         &config,
-        "schema-version 1\nimage-state \"legacy\"\npublisher \"canopa\" {\n repository \"repo\"\n trust-key \"public.der\"\n}\n",
+        "schema-version 1 kind=\"image-config\"\nimage-state \"legacy\"\npublisher \"canopa\" {\n repository \"repo\"\n trust-key \"public.der\"\n}\n",
     )?;
-    crate::create_configured_image(&f.root, &config)?;
-    let initial = plan(
-        &f.root,
-        Request::Install {
-            packages: vec!["desktop/settings".into()],
-        },
-    )?;
-    apply(&f.root, &initial)?;
-    fs::write(f.root.join(CONFIG), "administrator edit")?;
-    for (version, defaults) in [("2.0.0-0", "vendor two"), ("3.0.0-0", "vendor three")] {
-        package(version, defaults)?;
-        apply(&f.root, &plan(&f.root, Request::Update)?)?;
-    }
-    {
-        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
-        let text = db.query_row("SELECT data FROM image WHERE id=1", [], |row| {
-            row.get::<_, String>(0)
-        })?;
-        let mut settings: serde_json::Value = serde_json::from_str(&text)?;
-        assert!(settings.get("state_layout").is_none());
-        settings.as_object_mut().unwrap().remove("config_updates");
-        db.execute(
-            "UPDATE image SET data=?1 WHERE id=1",
-            [settings.to_string()],
-        )?;
-    }
-    let updates = list_config_updates(&f.root)?;
-    assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].revision, 3);
-    assert!(updates[0].vendor_copy.starts_with(".cps/config-updates/"));
-    let keep = plan(
-        &f.root,
-        Request::ResolveConfig {
-            path: CONFIG.into(),
-            take: ConfigChoice::Local,
-        },
-    )?;
-    assert_eq!(apply(&f.root, &keep)?, 3);
-    assert!(list_config_updates(&f.root)?.is_empty());
+    f.package("test/pkg", "1.0.0-0", String::new())?;
+    assert!(crate::create_configured_image(&f.root, &config).is_err());
+    f.create()?;
+    let state_dir = f.root.join("var/lib/cps/image");
     assert_eq!(
-        fs::read_to_string(f.root.join(CONFIG))?,
-        "administrator edit"
+        crate::image::Image::open_query(&f.root)?.settings()?.format,
+        1
     );
-    assert_eq!(
-        fs::read_to_string(f.root.join(&updates[0].vendor_copy))?,
-        "vendor three"
-    );
+    assert!(verify(&f.root)?.is_empty());
+    let db = rusqlite::Connection::open(state_dir.join("state.sqlite"))?;
+    db.execute("UPDATE image SET data=json_set(data, '$.format', 13)", [])?;
+    let error = verify(&f.root).unwrap_err();
+    assert!(format!("{error:#}").contains("unsupported image format"));
+    db.execute("UPDATE image SET data=json_set(data, '$.format', 1)", [])?;
+    db.pragma_update(None, "application_id", 0)?;
+    drop(db);
+    let Err(error) = crate::list_publishers(&f.root) else {
+        panic!("accepted a development image database without an application ID");
+    };
+    assert!(format!("{error:#}").contains("unsupported image database layout"));
+    fs::rename(state_dir, f.root.join(".cps"))?;
+    assert!(verify(&f.root).is_err());
     Ok(())
 }
 
@@ -3922,11 +3937,6 @@ fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> 
     let request = Request::Remove {
         packages: vec!["test/prune".into()],
     };
-    let legacy = {
-        let image = crate::image::Image::open(&f.root, false)?;
-        crate::plan::build(&image, image.state()?, request.clone(), None, None)?.0
-    };
-    assert!(!legacy.summary().contains("Prune if empty"));
     let removal = plan(&f.root, request)?;
     assert!(removal.summary().contains("Prune if empty opt/example"));
     assert!(!removal.summary().contains("Prune if empty opt/shared"));
@@ -4008,7 +4018,7 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
         packages: vec!["desktop/compositor".into()],
     };
     let repair = plan(&f.root, request.clone())?;
-    assert_eq!(repair.catalog, None);
+    assert!(repair.catalogs.is_empty());
     let summary = repair.summary();
     for path in [COMPOSITOR, PLUGIN, LINK, "usr/lib/canopa"] {
         assert!(summary.contains(&format!("Repair {path}")));
@@ -4202,7 +4212,6 @@ fn exact_install_and_remove_offline() -> Result<()> {
             packages: vec!["app/example".into(), "library/example".into()],
         },
     )?;
-    assert!(remove.catalog.is_none());
     apply(&f.root, &remove)?;
     assert!(!f.root.join(LIB).exists() && !f.root.join(APP).exists());
     assert!(verify(&f.root)?.is_empty());

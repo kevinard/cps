@@ -5,16 +5,11 @@ use rusqlite::{Connection, Transaction};
 
 use super::{Image, ProfileIntent, Publisher, Publishers, Settings, State};
 use crate::repo::{
-    CATALOG_LIMIT, Catalog, CatalogCheckpoint, ReleaseProfile, catalog_bytes,
-    check_catalog_successor, decode_archived_catalog, take_profile,
+    CATALOG_LIMIT, Catalog, CatalogCheckpoint, ReleaseProfile, catalog_bytes, read_catalog,
+    take_profile,
 };
 
 pub(super) fn save(tx: &Transaction<'_>, state: &State) -> Result<()> {
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS catalog_archives (
-            publisher TEXT PRIMARY KEY, catalog BLOB NOT NULL
-         )",
-    )?;
     let mut insert = tx.prepare(
         "INSERT INTO catalog_archives VALUES (?1, ?2)
          ON CONFLICT(publisher) DO UPDATE SET catalog=excluded.catalog
@@ -55,18 +50,6 @@ fn read(db: &Connection, publisher: &str) -> Result<Vec<u8>> {
     bytes.context("archived catalog exceeds size limit")
 }
 
-fn read_legacy(db: &Connection) -> Result<Vec<u8>> {
-    let bytes: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT CASE WHEN length(CAST(catalog AS BLOB)) <= ?1 THEN catalog END
-             FROM build_profile WHERE id=1",
-            [CATALOG_LIMIT],
-            |row| row.get(0),
-        )
-        .context("reading the archived profile catalog")?;
-    bytes.context("archived profile catalog exceeds size limit")
-}
-
 pub(super) fn read_checkpoint(
     db: &Connection,
     publisher: &Publisher,
@@ -81,24 +64,9 @@ pub(super) fn read_checkpoint(
 fn read_primary<'a>(db: &Connection, state: &'a State) -> Result<Option<(Catalog, &'a str)>> {
     let primary = &state.publishers.as_slice()[0];
     let point = state.settings.catalog_checkpoints.get(&primary.name);
-    if state.settings.catalog_archives {
-        let point = point.context("missing archived primary catalog checkpoint")?;
-        return Ok(Some((read_checkpoint(db, primary, point)?, &point.catalog)));
-    }
-    let Some(hash) = &state.settings.archived_profile_catalog else {
-        return Ok(None);
-    };
-    let bytes = read_legacy(db)?;
-    let catalog = if let Some(point) = point {
-        ensure!(
-            point.catalog == *hash,
-            "archived primary catalog digest differs from its checkpoint"
-        );
-        point.read_archive(&bytes, &primary.name, &primary.key)?
-    } else {
-        decode_archived_catalog(&bytes, hash, &primary.name, &primary.key)?
-    };
-    Ok(Some((catalog, hash)))
+    point
+        .map(|point| Ok((read_checkpoint(db, primary, point)?, point.catalog.as_str())))
+        .transpose()
 }
 
 fn profile(catalog: &mut Catalog, hash: &str, name: &str, state: &State) -> Result<ReleaseProfile> {
@@ -133,9 +101,6 @@ pub(super) fn read_applied<'a>(
         && state.publishers.as_slice()[0].name == publisher.name
     {
         return read_primary(db, state);
-    }
-    if !state.settings.catalog_archives {
-        return Ok(None);
     }
     let point = state.settings.catalog_checkpoints.get(&publisher.name);
     let Some(point) = point else {
@@ -178,9 +143,6 @@ pub(super) fn verify(db: &Connection, state: &State) -> Result<()> {
     } else {
         None
     };
-    if !state.settings.catalog_archives {
-        return Ok(());
-    }
     for package in state.installed.values() {
         let publisher = &package.published.manifest.publisher;
         ensure!(
@@ -214,9 +176,6 @@ pub(super) fn verify(db: &Connection, state: &State) -> Result<()> {
 }
 
 pub(super) fn retain(tx: &Transaction<'_>, settings: &Settings) -> Result<()> {
-    if !settings.catalog_archives {
-        return Ok(());
-    }
     let mut select = tx.prepare("SELECT publisher FROM catalog_archives")?;
     let names = select
         .query_map([], |row| row.get::<_, String>(0))?
@@ -231,37 +190,20 @@ pub(super) fn retain(tx: &Transaction<'_>, settings: &Settings) -> Result<()> {
 }
 
 impl Image {
-    pub(crate) fn profile_intent(&self, state: &State) -> Result<ProfileIntent> {
-        match &state.settings.profile_intent {
-            Some(intent) => Ok(intent.clone()),
-            None => self.reconstruct_profile_intent(state),
-        }
-    }
-
-    pub(crate) fn reconstruct_profile_intent(&self, state: &State) -> Result<ProfileIntent> {
-        // The archive can have advanced during a local install. Only use its
-        // roots to classify explicit marks if it describes the applied set.
-        let roots: BTreeSet<_> = if state.settings.profile_packages.is_empty() {
-            BTreeSet::new()
-        } else {
-            read_profile(&self.db, state)?
-                .filter(|profile| {
-                    profile.composition == state.settings.profile_packages
-                        && profile
-                            .roots
-                            .keys()
-                            .all(|name| state.installed[name].explicit)
-                })
-                .map(|profile| profile.roots.into_keys().collect())
-                .unwrap_or_default()
-        };
-        let local = state
-            .installed
-            .iter()
-            .filter(|(name, package)| package.explicit && !roots.contains(*name))
-            .map(|(name, _)| name.clone())
-            .collect();
-        Ok(ProfileIntent { roots, local })
+    pub(crate) fn profile_intent(state: &State) -> ProfileIntent {
+        state
+            .settings
+            .profile_intent
+            .clone()
+            .unwrap_or_else(|| ProfileIntent {
+                roots: BTreeSet::new(),
+                local: state
+                    .installed
+                    .iter()
+                    .filter(|(_, package)| package.explicit)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            })
     }
 
     pub(crate) fn check_repository_candidate(
@@ -273,34 +215,12 @@ impl Image {
     ) -> Result<()> {
         let settings = &state.settings;
         settings.check_catalog(&publisher.name, checkpoint)?;
-        let point = settings.catalog_checkpoints.get(&publisher.name);
-        let legacy = settings
-            .archived_profile_catalog
-            .as_deref()
-            .filter(|_| state.publishers.as_slice()[0].name == publisher.name);
-        let Some(previous_hash) = legacy.or(point.map(|point| point.catalog.as_str())) else {
-            return Ok(());
-        };
-        if previous_hash == checkpoint.catalog {
-            return Ok(());
+        if let Some(point) = settings.catalog_checkpoints.get(&publisher.name)
+            && point.catalog != checkpoint.catalog
+        {
+            read_checkpoint(&self.db, publisher, point)?.check_successor(next, &point.catalog)?;
         }
-        let previous = if let Some(point) = point.filter(|_| settings.catalog_archives) {
-            read_checkpoint(&self.db, publisher, point)?
-        } else if legacy.is_some() {
-            let bytes = read_legacy(&self.db)?;
-            decode_archived_catalog(&bytes, previous_hash, &publisher.name, &publisher.key)?
-        } else {
-            let bytes = catalog_bytes(&publisher.repo, previous_hash).with_context(|| {
-                format!(
-                    "replacement cache requires the last applied catalog {previous_hash} for {}",
-                    publisher.name
-                )
-            })?;
-            point
-                .context("missing installed checkpoint")?
-                .read_archive(&bytes, &publisher.name, &publisher.key)?
-        };
-        previous.check_successor(next, previous_hash)
+        Ok(())
     }
 
     pub(crate) fn check_catalog(
@@ -316,7 +236,7 @@ impl Image {
             return Ok(());
         }
         settings.check_catalog(&publisher.name, next)?;
-        self.check_catalog_transition(settings, publisher, &next.catalog, None)
+        self.check_catalog_transition(settings, publisher, &next.catalog)
     }
 
     pub(super) fn check_catalog_transition(
@@ -324,26 +244,18 @@ impl Image {
         settings: &Settings,
         publisher: &Publisher,
         next: &str,
-        legacy_profile: Option<&str>,
     ) -> Result<()> {
-        let checkpoint = settings.catalog_checkpoints.get(&publisher.name);
-        let previous = legacy_profile.or(checkpoint.map(|point| point.catalog.as_str()));
-        let Some(previous) = previous.filter(|hash| *hash != next) else {
+        let Some(point) = settings
+            .catalog_checkpoints
+            .get(&publisher.name)
+            .filter(|point| point.catalog != next)
+        else {
             return Ok(());
         };
-        let archived = if settings.catalog_archives {
-            Some(read(&self.db, &publisher.name)?)
-        } else {
-            legacy_profile.map(|_| read_legacy(&self.db)).transpose()?
-        };
-        check_catalog_successor(
-            &publisher.repo,
-            &publisher.name,
-            &publisher.key,
-            previous,
-            archived.as_deref(),
-            next,
-        )
-        .with_context(|| format!("checking catalog successor for {}", publisher.name))
+        let previous = read_checkpoint(&self.db, publisher, point)?;
+        let next = read_catalog(&publisher.repo, next, &publisher.name, &publisher.key)?;
+        previous
+            .check_successor(&next, &point.catalog)
+            .with_context(|| format!("checking catalog successor for {}", publisher.name))
     }
 }

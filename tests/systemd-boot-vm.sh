@@ -109,11 +109,8 @@ if [[ -n $cps_fixture ]]; then
     $systemd_guest || { echo 'CPS_VM_CPS_FIXTURE requires a systemd guest' >&2; exit 2; }
     cps_fixture=$(realpath -- "$cps_fixture")
     fixture_publisher=vm-test
-    case $cps_version in
-        0.1.0-1) sqlite_version=3.54.1-0; seccomp_version=2.6.1-0; systemd_version=262.1.0-0 ;;
-        0.1.0-[2-9]|0.1.0-[1-9][0-9]) sqlite_version=3.54.1-1; seccomp_version=2.6.1-1 ;;
-        *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
-    esac
+    sqlite_version=3.54.1-1
+    seccomp_version=2.6.1-1
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
     if [[ -f "$cps_fixture/canopa-trust.kdl" ]]; then
         trust_version=$(sed -n 's/^package "system\/canopa-trust" .* version="\([^"]*\)".*/\1/p' \
@@ -149,16 +146,13 @@ if [[ ${CPS_VM_RELEASE_PROFILE:-0} == 1 ]]; then
         exit 2
     }
     profiled=true
-    case $cps_version in
-        0.1.0-[3-9]|0.1.0-[1-9][0-9]) signed_cps_builds=true ;;
-    esac
-    case $cps_version in
-        0.1.0-[5-9]|0.1.0-[1-9][0-9]) protected_profiles=true ;;
-    esac
-    if (( ${cps_version##*-} >= 16 )); then package_intent=true; fi
-    if (( ${cps_version##*-} >= 35 )); then package_freezes=true; base_revision=2; fi
+    signed_cps_builds=true
+    protected_profiles=true
+    package_intent=true
+    package_freezes=true
+    base_revision=2
 fi
-if [[ $staged_transactions == 1 ]] && { ! $profiled || (( ${cps_version##*-} < 37 )) || [[ $device_activation != 0 || $recycle != 0 ]]; }; then
+if [[ $staged_transactions == 1 ]] && { ! $profiled || [[ $device_activation != 0 || $recycle != 0 ]]; }; then
     echo 'CPS_VM_STAGED_TRANSACTIONS requires a current signed profile without device activation or slot reuse' >&2
     exit 2
 fi
@@ -186,11 +180,7 @@ if [[ -n $util_linux_fixture ]]; then
     util_linux_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$util_linux_fixture/util-linux.kdl")
     case $util_linux_version in 2.42.4-0|2.42.4-1) ;; *) echo 'Unsupported util-linux fixture' >&2; exit 2 ;; esac
     util_linux_package=cps://canopa-util-linux/system/util-linux@$util_linux_version
-    if [[ $cps_version == 0.1.0-1 ]]; then
-        systemd_version=262.1.0-2
-    else
-        systemd_version=262.1.0-4
-    fi
+    systemd_version=262.1.0-4
     if [[ $util_linux_version == 2.42.4-1 ]]; then systemd_version=262.1.0-5; fi
     "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
         --trust-key "$util_linux_fixture/release-public.der" "$util_linux_package" >/dev/null
@@ -284,7 +274,7 @@ publish_state() {
     fi
     printf '%s\n' "$state" > proto/etc/cps-vm-state
     cat > manifest.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/boot-state" publisher="$fixture_publisher" version="$version" {
     file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
     hardlink "etc/cps-vm-boot-state" target="etc/cps-vm-state"
@@ -304,7 +294,7 @@ publish_kernel() {
     printf '%s\n' "$release" > initrd-tree/cps-initrd-release
     (cd initrd-tree && printf 'cps-initrd-release\n' | cpio --quiet -o -H newc) > "proto/$modules/initrd"
     cat > kernel.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/kernel" publisher="$fixture_publisher" version="$version" {
     file "$modules/vmlinuz" mode="0644" uid=$(id -u) gid=$(id -g)
     file "$modules/initrd" mode="0644" uid=$(id -u) gid=$(id -g)
@@ -319,7 +309,7 @@ publish_extra_marker() {
     openssl pkey -inform DER -in extras-private.der -pubout -outform DER -out extras-public.der
     printf 'extras\n' > proto/etc/cps-vm-extra-marker
     cat > extra-marker.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/extra-marker" publisher="extras" version="1.0.0-0" {
     file "etc/cps-vm-extra-marker" mode="0644" uid=$(id -u) gid=$(id -g)
 }
@@ -368,7 +358,7 @@ publish_vm_mirror() {
 refresh_vm_profile() {
     local name repository key
     {
-        printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
+        printf 'schema-version 1 kind="publish-policy"\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
         printf '    profile "boot" architecture="%s" {\n        package "test/boot-stack"\n' "$(uname -m)"
         if [[ ${1:-} == base ]]; then printf '        package "test/previous-default"\n'; fi
         printf '        facet "devel" #false\n'
@@ -382,7 +372,7 @@ refresh_vm_profile() {
         done < <(profile_companions)
         printf '    }\n}\n'
     } > profile-repo/publish-policy.kdl
-    printf 'schema-version 1\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
         "$(cat profile-repo/current)" > profile-release.kdl
     "$cps" repo publish-release --repo profile-repo --signing-key profile-private.der profile-release.kdl
 }
@@ -390,7 +380,7 @@ refresh_vm_profile() {
 if [[ $mode == rollback ]]; then
     printf 'legacy\n' > proto/etc/cps-vm-legacy-marker
     cat > legacy-marker.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/legacy-marker" publisher="$fixture_publisher" version="1.0.0-0" {
     file "etc/cps-vm-legacy-marker" mode="0644" uid=$(id -u) gid=$(id -g)
 }
@@ -544,7 +534,7 @@ if $profiled; then
     openssl genpkey -algorithm ED25519 -outform DER -out profile-private.der
     openssl pkey -inform DER -in profile-private.der -pubout -outform DER -out profile-public.der
     cat > boot-stack.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
     require "test/boot-state"
     require "test/boot-runtime"
@@ -561,7 +551,7 @@ MANIFEST
     "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der boot-stack.kdl
     printf 'previous default\n' > proto/etc/cps-vm-previous-default
     cat > previous-default.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/previous-default" publisher="vm-profile" version="1.0.0-0" {
     file "etc/cps-vm-previous-default" mode="0644" uid=$(id -u) gid=$(id -g)
 }
@@ -576,7 +566,7 @@ MANIFEST
         cp mirrors/vm-profile/metadata/timestamp.json base-tuf-timestamp.json
     fi
     {
-        printf 'schema-version 1\nfacet "devel" #false\n'
+        printf 'schema-version 1 kind="image-config"\nfacet "devel" #false\n'
         if [[ $reprovision == 1 ]]; then
             printf 'image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"\n'
             printf 'release-profile "boot" bootstrap-catalog="%s"\n' "$(cat profile-repo/current)"
@@ -595,7 +585,7 @@ MANIFEST
     } > image.kdl
 else
     cat > image.kdl <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 facet "devel" #false
 publisher "$fixture_publisher" {
     repository "repo"
@@ -604,17 +594,12 @@ publisher "$fixture_publisher" {
 CONFIG
     if [[ $mode == facet-change ]]; then printf 'facet "doc.man" #false\n' >> image.kdl; fi
 fi
-if [[ -n $cps_fixture && -d "$cps_fixture/image/.cps" &&
-      $("$cps" image-create --help) == *image-state* ]]; then
-    printf 'image-state "legacy"\n' >> image.kdl
-fi
 if [[ $tuf_mirrors == 1 ]]; then
     "$cps" repo sync-profile --config image.kdl --index-only
     test -z "$(find mirror-cache -path '*/blobs/*' -type f -print -quit)"
 fi
 "$cps" image-create --root base --config image.kdl
 state_dir=var/lib/cps/image
-if [[ -d base/.cps ]]; then state_dir=.cps; fi
 if ! $profiled && [[ -n $cps_fixture ]]; then
     "$cps" publisher add --root base --repo "$cps_fixture/repo" \
         --trust-key "$cps_fixture/release-public.der" canopa
@@ -760,7 +745,7 @@ if [[ $mode == rollback ]]; then
         retire_kernel="    obsolete \"cps://$fixture_publisher/system/kernel@2.0.0-0\""
     fi
     cat > retirement.kdl <<RELEASE
-schema-version 1
+schema-version 1 kind="publish-release"
 release "$fixture_publisher" base="$(cat repo/current)" {
     obsolete "cps://$fixture_publisher/test/legacy-marker@2.0.0-0"
 $retire_kernel

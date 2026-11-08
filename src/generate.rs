@@ -14,7 +14,7 @@ use crate::{
     file_caps::FileCapabilities,
     image::root::Root,
     kdl_format::manifest_text,
-    model::{Action, FORMAT, Manifest, validate_name, validate_publisher},
+    model::{Action, MANIFEST_FORMAT, Manifest, validate_name, validate_publisher},
     repo::MANIFEST_LIMIT,
 };
 
@@ -50,7 +50,7 @@ pub fn generate_manifest_for_architecture(
     validate_publisher(publisher)?;
     ensure!(uid != u32::MAX && gid != u32::MAX, "invalid owner");
     let mut manifest = Manifest {
-        format: FORMAT,
+        format: MANIFEST_FORMAT,
         publisher: publisher.to_owned(),
         name: name.to_owned(),
         version: version.parse()?,

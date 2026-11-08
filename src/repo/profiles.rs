@@ -14,8 +14,8 @@ use crate::{
     kdl_format::publish_policy::{Companion, Profile},
     model::{Node, PackageSpec, Version, VersionConstraint},
     plan::{
-        CandidateSet, Candidates, Renames, Retention, SolverRevision, check_directory,
-        check_path_type, resolve_packages, select_paths,
+        CandidateSet, Candidates, Renames, Retention, check_directory, check_path_type,
+        resolve_packages, select_paths,
     },
 };
 
@@ -68,11 +68,6 @@ impl<'a> CompanionCatalogs<'a> {
                             previous.sha256, config.name
                         )
                     })?;
-                ensure!(
-                    catalog.sequence.is_some(),
-                    "new companion catalog for {} has no sequence",
-                    config.name
-                );
                 baseline
                     .check_successor(&catalog, &previous.sha256)
                     .with_context(|| {
@@ -238,7 +233,7 @@ pub(super) fn check(
                     .signed_baselines
                     .iter()
                     .any(|baseline| baseline == hash)
-                && previous.is_some_and(|profile| !profile.composition.is_empty())
+                && previous.is_some()
         });
         for (hash, explicit, require_signed_composition) in explicit
             .map(|hash| (hash, true, false))
@@ -262,8 +257,7 @@ pub(super) fn check(
                 };
                 let historical = baseline.release_profiles.get(name);
                 ensure!(
-                    !require_signed_composition
-                        || historical.is_some_and(|profile| !profile.composition.is_empty()),
+                    !require_signed_composition || historical.is_some(),
                     "baseline catalog has no signed composition for profile {name}"
                 );
                 let (before, old_paths) = baseline_image(
@@ -412,7 +406,7 @@ fn baseline_image(
                 snapshot.as_ref().unwrap_or(&companion.current),
             )
         });
-    let roots = match historical.filter(|profile| !profile.roots.is_empty()) {
+    let roots = match historical {
         Some(historical) => historical
             .roots
             .iter()
@@ -429,7 +423,7 @@ fn baseline_image(
         .map(|(name, _)| ((*name).to_owned(), catalog.publisher.as_str()))
         .collect();
     let baseline = candidates(catalog, packages, &profile.arch, snapshots, sources);
-    if let Some(historical) = historical.filter(|profile| !profile.composition.is_empty()) {
+    if let Some(historical) = historical {
         let installed = baseline
             .replay(historical)
             .context("replaying the baseline image")?;
@@ -530,7 +524,7 @@ fn compose<'a>(
         &requested,
         false,
         Retention::None,
-        Some(SolverRevision::SatV2),
+        true,
         |installed| profile_paths(&profile.arch, &profile.facets, installed),
     )
 }
@@ -564,7 +558,6 @@ fn check_upgrade(
     locked: bool,
     renames: &Renames,
 ) -> Result<Composition> {
-    let solver = Some(SolverRevision::SatV2);
     let compose = |installed: &_| profile_paths(&profile.architecture, &profile.facets, installed);
     let successors = renames.requirements();
     let (after, new_paths) = if locked {
@@ -575,7 +568,7 @@ fn check_upgrade(
             &BTreeMap::new(),
             Some(&BTreeSet::new()),
             &successors,
-            solver,
+            true,
             compose,
         )?
     } else {
@@ -590,7 +583,7 @@ fn check_upgrade(
             &successors,
             true,
             Retention::All,
-            solver,
+            true,
             compose,
         )?;
         for name in profile.roots.keys() {

@@ -49,6 +49,7 @@ sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/$manifest" > kernel.kdl
 kernel_version=$(awk -F 'version="' '/^package / {split($2, version, "\""); print version[1]}' kernel.kdl)
 test -n "$kernel_version"
 sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
+    -e "s/@KEY_SHA256@/$(tail -c 32 -- toolchain-public.der | sha256sum | cut -d' ' -f1)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha kernel.kdl)/g" \
     -e "s/@CONFIG_SHA256@/$(sha "$work/inputs/vm.config")/g" \
     -e "s/@CONFIG_SIZE@/$(wc -c < "$work/inputs/vm.config")/g" \
@@ -63,7 +64,7 @@ mkdir repo
 cp builder-public.der repo/
 reviewed=$(sha build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa-kernel" {
     builder-key "builder-public.der"
     approve "system/kernel-qemu" version="$kernel_version" sha256="$reviewed"

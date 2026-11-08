@@ -36,6 +36,7 @@ bash "$project/tests/seed-native-c.sh" "$work/native-c" --busybox
 
 sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/busybox/$manifest" > busybox.kdl
 sed -e "s/@ARCH@/$(uname -m)/g" -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
+    -e "s/@KEY_SHA256@/$(tail -c 32 -- toolchain-public.der | sha256sum | cut -d' ' -f1)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha busybox.kdl)/g" \
     -e "s|@BUSYBOX_PATH@|$binary|g" \
     "$project/packaging/busybox/build.kdl.in" > build.kdl
@@ -56,7 +57,7 @@ mkdir repo
 cp builder-public.der repo/
 recipe_sha256=$(sha build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa-bootstrap" {
     builder-key "builder-public.der"
     approve "system/busybox" version="$version" sha256="$recipe_sha256"

@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="build-recipe"
 build architecture="@ARCH@" epoch=1782864000 {
 @TOOLCHAIN@
     manifest "libseccomp.kdl" sha256="@MANIFEST_SHA256@"

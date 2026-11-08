@@ -31,7 +31,7 @@ cc -pie -nostdlib -Wl,-e,_start,--dynamic-linker,/lib64/cps-loader.so \
 objcopy --strip-section-headers app/usr/bin/demo
 objcopy --strip-section-headers runtime/usr/lib/demo/libcps-demo.so.1.0
 cat > app.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "demo/app" publisher="canopa" version="1.0.0-0" {
     require "demo/runtime"
     file "usr/bin/demo" mode="0755" uid=$uid gid=$gid
@@ -50,7 +50,7 @@ publish_runtime() {
 }
 write_policy() {
     cat > repo/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa" {
     builder-key "../runtime-public.der"
     profile "desktop" architecture="$arch" {
@@ -68,7 +68,7 @@ POLICY
 }
 refresh() {
     cat > refresh.kdl <<RELEASE
-schema-version 1
+schema-version 1 kind="publish-release"
 release "canopa" base="$base" refresh-profiles=#true
 RELEASE
     "$cps" repo publish-release --repo repo --signing-key canopa.der refresh.kdl
@@ -133,7 +133,7 @@ sed -i '/elf-check .*{/,/        }/d' repo/publish-policy.kdl
 reject_refresh 'release drops ELF checking for signed profile desktop'
 
 cat > image.kdl <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 architecture "$arch"
 release-profile "desktop"
 publisher "canopa" {

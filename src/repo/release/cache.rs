@@ -25,10 +25,12 @@ use super::{
 const RETENTION: &str = "retention";
 const PROFILE_PINS: &str = "profile-pins";
 const PROFILE_PINS_LIMIT: u64 = 16 * 1024;
+const PROFILE_PINS_FORMAT: u32 = 1;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProfilePins {
+    format: u32,
     primary_cache: PathBuf,
     previous: Option<ProfileSelection>,
     next: ProfileSelection,
@@ -49,6 +51,11 @@ impl ProfilePins {
     fn read(directory: &Root, name: &str) -> Result<Self> {
         let bytes = read_limited(directory.file(name)?, PROFILE_PINS_LIMIT)?;
         let pins: Self = serde_json::from_slice(&bytes)?;
+        ensure!(
+            pins.format == PROFILE_PINS_FORMAT,
+            "unsupported profile retention format {}",
+            pins.format
+        );
         ensure!(
             pins.primary_cache.is_absolute(),
             "invalid primary cache path"
@@ -117,6 +124,7 @@ pub(super) fn record_profile_pins<'a>(
         None
     };
     let pins = ProfilePins {
+        format: PROFILE_PINS_FORMAT,
         primary_cache: primary_cache.to_owned(),
         previous,
         next: ProfileSelection {
@@ -567,11 +575,12 @@ mod tests {
         let old = digest(b"old pin");
         let new = digest(b"new pin");
         let bootstrap = digest(b"bootstrap pin");
+        let binding = digest(b"primary binding");
         fs::write(primary.join("current"), format!("{old_primary}\n"))?;
         fs::write(other.join("current"), format!("{other_primary}\n"))?;
         record_profile_pins(
             &companion,
-            &digest(b"primary binding"),
+            &binding,
             &primary,
             Some((&old_primary, Some(&old))),
             &new_primary,
@@ -590,6 +599,17 @@ mod tests {
             keep_profile_pins(&Root::open(&state)?, &mut catalogs)?;
             Ok(catalogs)
         };
+        let path = state.join(PROFILE_PINS).join(&binding);
+        let bytes = fs::read(&path)?;
+        let mut invalid: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(invalid["format"], 1);
+        invalid.as_object_mut().unwrap().remove("format");
+        fs::write(&path, serde_json::to_vec(&invalid)?)?;
+        assert!(retained().is_err());
+        invalid["format"] = 2.into();
+        fs::write(&path, serde_json::to_vec(&invalid)?)?;
+        assert!(retained().is_err());
+        fs::write(&path, bytes)?;
         assert_eq!(
             retained()?,
             BTreeSet::from([old.clone(), bootstrap.clone()])

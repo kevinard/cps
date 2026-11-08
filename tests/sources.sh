@@ -70,9 +70,10 @@ printf abc > expected
 digest=$(sha256sum expected | cut -d' ' -f1)
 recipe() {
     cat <<RECIPE
-schema-version 1
+schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {
-    toolchain "$digest" {
+    toolchain solver="sat-v2" {
+        publisher "seed" catalog="$digest" key-sha256="$digest"
         package "build/base"
     }
     manifest "manifest.kdl" sha256="$digest"

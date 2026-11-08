@@ -4,7 +4,6 @@ set -euo pipefail
 umask 022
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cps=$(realpath -- "${CPS_TEST_BINARY:-$project/target/debug/cps}")
-previous=${CPS_TEST_PREVIOUS_BINARY:-}
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
@@ -14,7 +13,7 @@ openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 publish() {
     printf '%s\n' "$1" > proto/usr/share/cps-test/version
     cat > manifest.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/tool" publisher="canopa" version="$1" {
     file "usr/share/cps-test/version" mode="0644" uid=$(id -u) gid=$(id -g)
 }
@@ -30,13 +29,6 @@ mv repo offline-repo
 "$cps" apply --root image freeze.json
 "$cps" freeze --root image | tee frozen.txt
 grep -F $'test/tool\t1.0.0-0\t"Validate tool compatibility"' frozen.txt
-if [[ -n $previous ]]; then
-    if "$previous" verify --root image > previous.log 2>&1; then
-        echo 'An earlier client accepted an image with unenforced freezes' >&2
-        exit 1
-    fi
-    grep -F 'unsupported image format' previous.log
-fi
 mv offline-repo repo
 publish 2.0.0-0
 "$cps" plan --root image --output held-update.json update

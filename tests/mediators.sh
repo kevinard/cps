@@ -15,7 +15,7 @@ publish() {
     ln -s "editor-$name" "$name/usr/bin/editor"
     ln -s "editor-$name" "$name/usr/bin/edit"
     cat > package.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "editors/$name" publisher="canopa" version="1.0.0-0" {
     file "usr/bin/editor-$name" mode="0755" uid=$(id -u) gid=$(id -g)
     symlink "usr/bin/editor" target="editor-$name" uid=$(id -u) gid=$(id -g)
@@ -35,7 +35,7 @@ assert_links() {
 publish basic 10
 publish advanced 20
 cat > image.kdl <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 publisher "canopa" { repository "repo"; trust-key "public.der"; }
 CONFIG
 "$cps" image-create --root image --config image.kdl

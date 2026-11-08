@@ -240,9 +240,6 @@ enum Command {
         export: Option<PathBuf>,
     },
     /// Initialize an empty directory as an image
-    #[command(
-        long_about = "Initialize an empty directory as an image. With --config, use image-state \"legacy\" to provision an image for older CPS clients."
-    )]
     ImageCreate {
         #[arg(long)]
         root: PathBuf,
@@ -434,7 +431,7 @@ enum Command {
         #[arg(long = "library-dir", requires = "runtime", value_name = "PATH")]
         library_dirs: Vec<String>,
     },
-    /// Manage systemd-boot environments
+    /// Stage, activate, and manage boot environments
     BootEnv {
         #[command(subcommand)]
         command: BootCommand,
@@ -2971,11 +2968,7 @@ fn run(command: Command) -> Result<ExitCode> {
             TransactionCommand::Status { root } => {
                 let status = transaction_status(&root)?;
                 if let Some(pending) = status.pending {
-                    if let Some(summary) = &pending.plan_summary {
-                        println!("{summary}");
-                    } else {
-                        println!("Image revision {}", status.revision);
-                    }
+                    println!("{}", pending.plan_summary);
                     println!(
                         "Pending plan {} targets revision {}",
                         pending.plan_id, pending.target_revision
@@ -2992,10 +2985,8 @@ fn run(command: Command) -> Result<ExitCode> {
                     );
                     if pending.live {
                         println!("Recover with cps resume");
-                    } else if pending.plan_summary.is_some() {
-                        println!("Recover with transaction resume");
                     } else {
-                        println!("Recover with apply and the original saved plan");
+                        println!("Recover with transaction resume");
                     }
                 } else {
                     println!("Image revision {}", status.revision);
@@ -3018,10 +3009,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 let history = transaction_history(&root, limit)?;
                 println!("REVISION\tPLAN\tOPERATION");
                 for entry in history {
-                    let operation = entry
-                        .details
-                        .as_ref()
-                        .map_or("legacy", |details| details.request.operation());
+                    let operation = entry.details.request.operation();
                     println!("{}\t{}\t{operation}", entry.revision, entry.plan_id);
                 }
             }

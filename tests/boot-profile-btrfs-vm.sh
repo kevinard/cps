@@ -51,7 +51,7 @@ mv repos/canopa-kernel original-kernel-repo
 mkdir repos/canopa-kernel
 cp "$next_kernel_fixture/builder-public.der" canopa-kernel-next-builder.der
 {
-    printf 'schema-version 1\npublisher "canopa-kernel" {\n'
+    printf 'schema-version 1 kind="publish-policy"\npublisher "canopa-kernel" {\n'
     printf '    builder-key "../../canopa-kernel-builder.der"\n    builder-key "../../canopa-kernel-next-builder.der"\n'
     for fixture in "$kernel_fixture" "$next_kernel_fixture"; do
         package=$(cat "$fixture/kernel-package")
@@ -114,7 +114,7 @@ systemd_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$systemd_fi
 kernel_package=$(cat "$kernel_fixture/kernel-package")
 publish_stack() {
     cat > stack.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/btrfs-stack" publisher="vm-profile" version="$1" {
     require "test/desktop" version="=$1"
     require "test/btrfs-harness"
@@ -133,7 +133,7 @@ next_kernel_package=$(cat "$next_kernel_fixture/kernel-package")
 publish_stack 2.0.0-0 "${next_kernel_package##*@}"
 refresh_profile() {
     {
-        printf 'schema-version 1\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
+        printf 'schema-version 1 kind="publish-policy"\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
         printf '    profile "boot" architecture="%s" {\n        package "test/btrfs-stack@%s"\n        facet "devel" #false\n' "$(uname -m)" "$1"
         for publisher in "${publishers[@]}"; do
             printf '        publisher "%s" catalog="%s" {\n' "$publisher" "$(cat "repos/$publisher/current")"
@@ -149,13 +149,13 @@ refresh_profile() {
         done
         printf '    }\n}\n'
     } > repos/vm-profile/publish-policy.kdl
-    printf 'schema-version 1\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
         "$(cat repos/vm-profile/current)" > release.kdl
     "$cps" repo publish-release --repo repos/vm-profile --signing-key vm-profile-private.der release.kdl
 }
 refresh_profile 1.0.0-0
 {
-    printf 'schema-version 1\nfacet "devel" #false\nrelease-profile "boot"\n'
+    printf 'schema-version 1 kind="image-config"\nfacet "devel" #false\nrelease-profile "boot"\n'
     for publisher in vm-profile "${publishers[@]}"; do
         printf 'publisher "%s" { repository "repos/%s"; trust-key "%s-public.der"; }\n' "$publisher" "$publisher" "$publisher"
     done

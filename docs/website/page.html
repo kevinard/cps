@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Canopa Package System user manual, setup guides, and command reference.">
+  <title>$title · CPS Manual</title>
+  <link rel="stylesheet" href="$style">
+  <script src="$index" defer></script>
+  <script src="$script" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="topbar">
+    <div class="bar-inner">
+      <a class="brand" href="$home"><span class="mark">CPS</span><span>Documentation</span></a>
+      <div class="search" role="search" hidden>
+        <label class="visually-hidden" for="search">Search documentation</label>
+        <input id="search" type="search" placeholder="Search documentation" aria-controls="search-results" autocomplete="off">
+        <div id="search-results" class="results" hidden></div>
+        <p id="search-status" class="visually-hidden" role="status"></p>
+      </div>
+      <a class="repository" href="$repository">Source <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+  <div class="layout">
+    <div class="sidebar">
+      <details id="navigation" open>
+        <summary>Browse documentation</summary>
+        <nav aria-label="Documentation">
+          $navigation
+        </nav>
+      </details>
+    </div>
+    <main id="main" tabindex="-1">
+      <details class="compact-outline">
+        <summary>On this page</summary>
+        $outline
+      </details>
+      <p class="section">$section</p>
+      <article>
+        $content
+      </article>
+    </main>
+    <aside class="outline">
+      <nav aria-label="On this page">
+        <p>On this page</p>
+        $outline
+      </nav>
+    </aside>
+  </div>
+</body>
+</html>

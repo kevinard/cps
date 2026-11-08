@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use tempfile::NamedTempFile;
 
-use super::{canonical_partuuid, read_regular};
+use super::{INITRD_HASH, LINUX_HASH, canonical_partuuid, read_regular};
 use crate::{
     boot::{btrfs_boot::BtrfsRecord, uki},
     model::validate_digest,
@@ -16,6 +16,8 @@ use crate::{
 const OPTIONS: &str = "timeout 0\neditor no\nauto-entries no\nauto-firmware no\n";
 const AUTO: &str = "default cps-*.conf\n";
 pub(super) const MAX_ENTRY_BYTES: usize = 64 * 1024;
+pub(super) const ENTRY_FORMAT_FIELD: &str = "# cps-boot-entry-version ";
+pub(super) const ENTRY_FORMAT: &str = "1";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum LoaderPolicy {
@@ -315,6 +317,10 @@ pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= MAX_ENTRY_BYTES, "boot entry exceeds 64 KiB");
     let description = String::from_utf8(bytes)?;
+    ensure!(
+        field(&description, ENTRY_FORMAT_FIELD)? == Some(ENTRY_FORMAT),
+        "unsupported CPS boot entry format for {id}"
+    );
     let title = boot_field(&description, "title")?
         .context("CPS boot entry has no title")?
         .to_owned();
@@ -340,7 +346,23 @@ pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
             "booting by Btrfs filesystem UUID requires an initramfs"
         );
     }
+    if uki.is_none() {
+        let linux = field(&description, LINUX_HASH)?.context("missing boot kernel digest")?;
+        validate_digest(linux)?;
+        let initrd = field(&description, INITRD_HASH)?;
+        ensure!(
+            initrd.is_some() == boot_field(&description, "initrd")?.is_some(),
+            "incomplete boot artifact digests in entry {id}"
+        );
+        if let Some(initrd) = initrd {
+            validate_digest(initrd)?;
+        }
+    }
     let parent = field(&description, "# cps-parent ")?;
+    ensure!(
+        tries.is_none() || parent.is_some(),
+        "counted boot entry has no recorded parent"
+    );
     if let Some(parent) = parent {
         check_parent(parent, id).with_context(|| format!("invalid parent for {id}"))?;
     }
@@ -411,7 +433,9 @@ pub(super) fn directory_exists(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootRoot, BtrfsRecord, boot_field, check_parent, read_entry};
+    use super::{
+        BootRoot, BtrfsRecord, INITRD_HASH, LINUX_HASH, boot_field, check_parent, read_entry,
+    };
 
     #[test]
     fn boot_parent_precedes_a_distinct_staged_image_after_several_transactions()
@@ -464,7 +488,11 @@ mod tests {
         };
         let file = tempfile::NamedTempFile::new()?;
         let name = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2+2";
-        let header = "title Canopa\nsort-key cps\nversion 2\n";
+        let header = format!(
+            "title Canopa\nsort-key cps\nversion 2\n# cps-boot-entry-version 1\n# cps-parent cps-51c2d73c-f68f-4cc7-98b0-6efbbc03c785-1\n{LINUX_HASH}{}\n{INITRD_HASH}{}\n",
+            "a".repeat(64),
+            "b".repeat(64),
+        );
         let initrd = "initrd /EFI/cps/trial/initramfs.img\n";
         let options = format!(
             "options root=UUID={} rootfstype=btrfs rootflags=subvolid=277 rd.luks.name={}=root rw\n",
@@ -483,6 +511,7 @@ mod tests {
                 &format!("root=UUID={}", record.uuid),
             ),
             entry.replace(initrd, ""),
+            entry.replace(&format!("{LINUX_HASH}{}\n", "a".repeat(64)), ""),
             entry.replace(&identity, ""),
             entry.replace(" rw", " root=/dev/mapper/root rw"),
         ] {
@@ -502,7 +531,7 @@ mod tests {
         let id = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
         let file = tempfile::NamedTempFile::new()?;
         let entry = format!(
-            "title Canopa\nsort-key cps\nversion 2\nuki /EFI/cps/{id}/uki.efi\n{}{}\n{}root=UUID={} rootfstype=btrfs rootflags=subvolid=277 rw\n{}",
+            "title Canopa\nsort-key cps\nversion 2\n# cps-boot-entry-version 1\n# cps-parent cps-51c2d73c-f68f-4cc7-98b0-6efbbc03c785-1\nuki /EFI/cps/{id}/uki.efi\n{}{}\n{}root=UUID={} rootfstype=btrfs rootflags=subvolid=277 rw\n{}",
             super::uki::HASH,
             "a".repeat(64),
             super::uki::CMDLINE,

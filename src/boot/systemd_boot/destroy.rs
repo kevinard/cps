@@ -133,7 +133,7 @@ pub fn destroy_btrfs_boot_environment(
     let _image_lock = root
         .as_ref()
         .map(|root| -> Result<File> {
-            let (_, state) = root.open_image_state()?;
+            let state = root.open_image_state()?;
             let lock = state.file("lock")?;
             flock(&lock, FlockOperation::NonBlockingLockExclusive)
                 .context("the Btrfs root is busy with another CPS operation")?;
@@ -463,8 +463,11 @@ mod tests {
         fs::create_dir_all(&directory)?;
         let id = entry(2, None, None).id;
         let marker = directory.join(format!("{id}+0-2{SUFFIX}"));
-        let text = "title Canopa\nsort-key cps\nversion 2\n# cps-btrfs-fsid 11111111-1111-4111-8111-111111111111\n# cps-btrfs-uuid 22222222-2222-4222-8222-222222222222\n# cps-btrfs-subvolid 277\n# cps-btrfs-path @environments/trial/root\noptions root=PARTUUID=7adff456-af50-498f-b39a-dcf87cb4a7c1 rootfstype=btrfs rootflags=subvolid=277\n";
-        fs::write(&marker, text)?;
+        let text = format!(
+            "title Canopa\nsort-key cps\nversion 2\n# cps-boot-entry-version 1\n# cps-parent cps-51c2d73c-f68f-4cc7-98b0-6efbbc03c785-1\n# cps-linux-sha256 {}\n# cps-btrfs-fsid 11111111-1111-4111-8111-111111111111\n# cps-btrfs-uuid 22222222-2222-4222-8222-222222222222\n# cps-btrfs-subvolid 277\n# cps-btrfs-path @environments/trial/root\noptions root=PARTUUID=7adff456-af50-498f-b39a-dcf87cb4a7c1 rootfstype=btrfs rootflags=subvolid=277\n",
+            "a".repeat(64)
+        );
+        fs::write(&marker, &text)?;
         let records = pending(temp.path())?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, id);

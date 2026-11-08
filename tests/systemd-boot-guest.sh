@@ -166,7 +166,6 @@ fi
 mount -t ext4 /dev/vdd /installed-copy
 : > /installed-copy/.write-probe
 state_dir=var/lib/cps/image
-if [ -d /installed-copy/.cps ]; then state_dir=.cps; fi
 before=$("$bb" sha256sum "/installed-copy/$state_dir/state.sqlite")
 if cps apply --root /installed-copy /scratch/upgrade.json > /tmp/rejected 2>&1; then
     echo 'CPS_VM_DEVICE: applied a plan to a deployed root'
@@ -218,8 +217,13 @@ reject 'root payload size must match' "$@" --replace "$base_id" --root-image /ba
 test -f "$old"
 test ! -e "$marker"
 if [ "$mode" = resume ]; then
-    # Recreate the durable state after retirement and an interrupted root write.
     printf '%s\n' "$base_id" > "$marker"
+    reject 'unsupported CPS slot retirement format' "$@" --replace "$base_id" --root-image /staged.ext4
+    printf 'cps slot retirement v2\n%s\n' "$base_id" > "$marker"
+    reject 'unsupported CPS slot retirement format' "$@" --replace "$base_id" --root-image /staged.ext4
+    test -f "$old"
+    # Recreate the durable state after retirement and an interrupted root write.
+    printf 'cps slot retirement v1\n%s\n' "$base_id" > "$marker"
     /bin/busybox rm "$old"
     /bin/busybox sync
     /bin/busybox dd if=/dev/zero of=/dev/vda2 bs=1M count=1 conv=fsync
@@ -329,7 +333,7 @@ C
         flags=
         if [[ $version == 1 ]]; then flags='capabilities="cap_net_raw=ep"'; fi
         cat > cap.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/raw-probe" publisher="captest" version="$version.0.0-0" {
     file "bin/raw-probe" mode="0755" uid=0 gid=0 $flags
     hardlink "bin/raw-probe-alias" target="bin/raw-probe"

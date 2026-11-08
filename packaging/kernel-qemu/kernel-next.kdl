@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/kernel-qemu" publisher="canopa-kernel" version="6.12.115-2" {
     file "usr/lib/modules/6.12.115-cps-vm-next/vmlinuz" mode="0644" uid=0 gid=0 arch="x86_64"
     file "usr/lib/modules/6.12.115-cps-vm-next/config" mode="0644" uid=0 gid=0 arch="x86_64"

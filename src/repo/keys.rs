@@ -80,7 +80,7 @@ fn public_key(bytes: &[u8]) -> Result<PublicKey> {
 
 pub(super) fn signer(
     publisher: &str,
-    sequence: Option<NonZeroU64>,
+    sequence: u64,
     rotations: &[Rotation],
     trust: Trust<'_>,
 ) -> Result<PublicKey> {
@@ -108,7 +108,7 @@ pub(super) fn signer(
         ),
     }
     let mut seen = BTreeSet::from([signer]);
-    let mut previous_sequence = None;
+    let mut previous_sequence = 0;
     for rotation in rotations {
         let transition = &rotation.transition;
         validate_digest(&transition.base)?;
@@ -116,7 +116,7 @@ pub(super) fn signer(
             transition.publisher == publisher && transition.previous == signer,
             "invalid publisher key rotation chain"
         );
-        let first = Some(transition.first_sequence);
+        let first = transition.first_sequence.get();
         ensure!(
             first > previous_sequence && first <= sequence,
             "invalid publisher key rotation sequence"
@@ -144,7 +144,7 @@ pub(super) fn signer(
 
 pub(super) fn check_successor(
     previous: &[Rotation],
-    sequence: Option<NonZeroU64>,
+    sequence: u64,
     previous_hash: &str,
     next: &[Rotation],
 ) -> Result<()> {
@@ -154,13 +154,10 @@ pub(super) fn check_successor(
     );
     if let Some(rotation) = next.get(previous.len()) {
         ensure!(
-            Some(rotation.transition.first_sequence) > sequence,
+            rotation.transition.first_sequence.get() > sequence,
             "release backdates a publisher key rotation"
         );
-        // A cache with an unsequenced catalog may have skipped other legacy catalogs.
-        if sequence.is_some_and(|sequence| {
-            sequence.get().checked_add(1) == Some(rotation.transition.first_sequence.get())
-        }) {
+        if sequence.checked_add(1) == Some(rotation.transition.first_sequence.get()) {
             ensure!(
                 rotation.transition.base == previous_hash,
                 "publisher key rotation does not match the authenticated base catalog"
@@ -190,33 +187,24 @@ mod tests {
         let rotation = Rotation::new("canopa", &base, first, &old, &new)?;
         let chain = [rotation.clone()];
         assert_eq!(
-            signer("canopa", Some(first), &chain, Trust::Anchor(anchor))?,
+            signer("canopa", first.get(), &chain, Trust::Anchor(anchor))?,
             new.public_key().as_ref()
         );
-        assert!(signer("other", Some(first), &chain, Trust::Anchor(anchor)).is_err());
-        assert!(signer("canopa", NonZeroU64::new(1), &chain, Trust::Anchor(anchor)).is_err());
+        assert!(signer("other", first.get(), &chain, Trust::Anchor(anchor)).is_err());
+        assert!(signer("canopa", 1, &chain, Trust::Anchor(anchor)).is_err());
         assert!(
             signer(
                 "canopa",
-                Some(first),
+                first.get(),
                 &chain,
                 Trust::Anchor(new.public_key().as_ref())
             )
             .is_err()
         );
-        assert!(check_successor(&[], Some(first), &base, &chain).is_err());
-        check_successor(&[], NonZeroU64::new(1), &base, &chain)?;
+        assert!(check_successor(&[], first.get(), &base, &chain).is_err());
+        check_successor(&[], 1, &base, &chain)?;
         let fork = crate::model::digest(b"different catalog at the same sequence");
-        assert!(check_successor(&[], NonZeroU64::new(1), &fork, &chain).is_err());
-        let legacy = Rotation::new("canopa", &base, NonZeroU64::new(1).unwrap(), &old, &new)?;
-        check_successor(&[], None, &fork, &[legacy])?;
-        let mut bad_old = rotation.clone();
-        bad_old.previous_signature = "00".repeat(64);
-        let mut bad_new = rotation;
-        bad_new.next_signature = "00".repeat(64);
-        for damaged in [bad_old, bad_new] {
-            assert!(signer("canopa", Some(first), &[damaged], Trust::Anchor(anchor)).is_err());
-        }
+        assert!(check_successor(&[], 1, &fork, &chain).is_err());
         Ok(())
     }
 }

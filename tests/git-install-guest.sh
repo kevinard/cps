@@ -43,7 +43,6 @@ fi
 
 $bb cp /repository/catalog-1.0.0-0 /repository/current
 ! $bb grep -Fq git-toolchain-config /etc/cps/image.kdl
-catalog=$($bb cat /usr/share/cps/git-build/repo/current)
 write_repo() {
     directory=$1
     package=$2
@@ -51,7 +50,7 @@ write_repo() {
     $bb mkdir "$directory"
     git -C "$directory" init --quiet --initial-branch=main --template=
     $bb cat > "$directory/cps.kdl" <<KDL
-schema-version 1
+schema-version 1 kind="git-package"
 package "test/git-$package" version="1.0.0-0" {
     file "usr/share/git-$package" mode="0644" uid=0 gid=0
 }
@@ -68,7 +67,7 @@ KDL
     git -C "$directory" -c user.name='CPS Test' -c user.email=test@example.invalid commit -qm initial
 }
 write_repo "$tracked" tracked 'toolchain "default"'
-write_repo "$pinned" pinned "toolchain \"$catalog\" { package \"build/base-tools\"; }"
+write_repo "$pinned" pinned "$($bb sed '1d' /usr/share/cps/git-build/toolchain.default.kdl)"
 old=$(git -C "$tracked" rev-parse HEAD)
 fixed=$(git -C "$pinned" rev-parse HEAD)
 echo "$old" > "$work/git-old"

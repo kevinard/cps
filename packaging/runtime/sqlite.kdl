@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/sqlite" publisher="canopa" version="3.54.1-1" {
     require "system/elf-runtime"
     file "usr/lib/libsqlite3.so.0" mode="0755" uid=0 gid=0

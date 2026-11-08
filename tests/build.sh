@@ -10,6 +10,7 @@ cd "$work"
 uid=$(id -u)
 gid=$(id -g)
 arch=$(uname -m)
+fingerprint() { tail -c 32 -- "$1" | sha256sum | cut -d' ' -f1; }
 mkdir -p proto sources
 openssl genpkey -algorithm ED25519 -outform DER -out signing.der
 openssl pkey -inform DER -in signing.der -pubout -outform DER -out public.der
@@ -139,7 +140,7 @@ add_file() {
 
 shell=$(command -v bash)
 {
-    printf 'schema-version 1\npackage "build/shell" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
+    printf 'schema-version 1 kind="package-manifest"\npackage "build/shell" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
     add_file "$shell" bin/sh
     interpreter=$(readelf -l "$shell" | sed -n 's/^.*Requesting program interpreter: \([^]]*\)].*$/\1/p')
     test -n "$interpreter"
@@ -152,7 +153,7 @@ shell=$(command -v bash)
 "$cps" publish --repo repo --proto proto --signing-key signing.der shell.kdl
 
 {
-    printf 'schema-version 1\npackage "build/probe" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
+    printf 'schema-version 1 kind="package-manifest"\npackage "build/probe" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
     printf '    require "build/shell" version="=1.0.0-0"\n'
     install -D -m755 probe proto/usr/bin/probe
     printf '    file "usr/bin/probe" mode="0755" uid=0 gid=0 capabilities="cap_net_raw=ep"\n'
@@ -170,7 +171,7 @@ sed 's/version="1.0.0-0" {/version="2.0.0-0" {/' probe.kdl > newer.kdl
 printf 'hello from pinned input\n' > sources/input
 printf 'outside\n' > host-only
 cat > manifest.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "demo/hello" publisher="canopa" version="1.0.0-0" architecture="$arch" {
     file "hello" mode="0644" uid=$uid gid=$gid
     hardlink "hello-alias" target="hello"
@@ -179,9 +180,10 @@ MANIFEST
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 recipe() {
     cat <<RECIPE
-schema-version 1
+schema-version 1 kind="build-recipe"
 build architecture="$arch" epoch=1700000000 {
-    toolchain "$catalog" solver="sat-v1" {
+    toolchain solver="sat-v2" {
+        publisher "canopa" catalog="$catalog" key-sha256="$(fingerprint public.der)"
         package "build/probe"
     }
     manifest "manifest.kdl" sha256="$(sha manifest.kdl)"
@@ -297,12 +299,9 @@ printf 'wrong companion executable\n' > proto/usr/bin/probe
 sed 's/version="1.0.0-0" {/version="2.0.0-0" {/' tools-probe.kdl > tools-newer.kdl
 "$cps" publish --repo tools-repo --proto proto --signing-key other.der tools-newer.kdl
 "$cps" repo withdraw --repo tools-repo --signing-key other.der cps://tools/build/probe@1.0.0-0
-fingerprint() { tail -c 32 -- "$1" | sha256sum | cut -d' ' -f1; }
-awk -v primary="$catalog" -v companion="$tools_catalog" \
-    -v primary_key="$(fingerprint public.der)" -v companion_key="$(fingerprint other-public.der)" '
-    /^    toolchain / {
-        print "    toolchain solver=\"sat-v1\" {"
-        printf "        publisher \"canopa\" catalog=\"%s\" key-sha256=\"%s\"\n", primary, primary_key
+awk -v companion="$tools_catalog" -v companion_key="$(fingerprint other-public.der)" '
+    /^        publisher "canopa" / {
+        print
         printf "        publisher \"tools\" catalog=\"%s\" key-sha256=\"%s\"\n", companion, companion_key
         next
     }
@@ -313,7 +312,7 @@ awk -v primary="$catalog" -v companion="$tools_catalog" \
     {print}
 ' build.kdl > multi-build.kdl
 cat > toolchain.kdl <<'CONFIG'
-schema-version 1
+schema-version 1 kind="toolchain-config"
 publisher "tools" {
     repository "tools-repo"
     trust-key "other-public.der"
@@ -342,7 +341,7 @@ import sys
 
 with open("multi-evidence.json") as f:
     evidence = json.loads(base64.b64decode(json.load(f)["payload"]))
-assert evidence["predicateType"] == "urn:canopa:cps:build-provenance:v3"
+assert evidence["predicateType"] == "urn:canopa:cps:published-build-provenance:v1"
 toolchain = evidence["predicate"]["toolchain"]
 assert [(p["name"], p["catalog_sha256"]) for p in toolchain["publishers"]] == [
     ("canopa", sys.argv[1]), ("tools", sys.argv[2])
@@ -370,7 +369,7 @@ grep -F 'no build attestation for cps://tools/build/probe@1.0.0-0' rejected-mult
 test ! -e rejected-multi
 
 cat > limits.kdl <<'KDL'
-schema-version 1
+schema-version 1 kind="build-worker"
 worker timeout-seconds=2 scratch-bytes=1048576 file-bytes=4096 output-bytes=4 log-bytes=128
 KDL
 recipe '    probe limits
@@ -404,7 +403,7 @@ fi
 if [[ -n ${CPS_TEST_CGROUP_ROOT:-} ]]; then
     cgroup_config() {
         cat <<CGROUP
-schema-version 1
+schema-version 1 kind="build-worker"
 worker timeout-seconds=$1 {
     cgroup "$2" cpu-percent=50 memory-bytes=67108864 tasks=16
 }
@@ -494,7 +493,7 @@ reviewed=$(sha build.kdl)
 mkdir release
 cp builder-public.der release/
 cat > review-toolchain.kdl <<'CONFIG'
-schema-version 1
+schema-version 1 kind="toolchain-config"
 publisher "canopa" {
     repository "repo"
     trust-key "public.der"
@@ -502,7 +501,7 @@ publisher "canopa" {
 CONFIG
 write_policy() {
     cat > release/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa" verify-toolchains=#true archive-build-inputs=#true require-source-archives=#true {
     builder-key "builder-public.der"
     approve "demo/hello" version="1.0.0-0" sha256="$1" toolchain-config="../review-toolchain.kdl"
@@ -628,7 +627,7 @@ openssl pkeyutl -verify -pubin -keyform DER -inkey builder-public.der -rawin -in
 mkdir witnessed
 cp builder-public.der other-public.der witnessed/
 cat > witnessed/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa" minimum-builders=2 {
     builder-key "builder-public.der"
     builder-key "other-public.der"
@@ -680,7 +679,7 @@ test ! -e targets/builder-public.der
 protected_image() {
     local repo=$1 root=$2
     cat > protected-image.kdl <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 publisher "canopa" {
     repository "$repo"
     trust-key "public.der"
@@ -720,7 +719,7 @@ def rewritten_repo(name, rewrite):
     current = (repo / 'current').read_text().strip()
     catalog = json.loads((repo / 'catalogs' / current).read_bytes())['catalog']
     rewrite(repo, catalog)
-    Path('catalog-to-sign').write_bytes(encode(catalog))
+    Path('catalog-to-sign').write_bytes(b'cps signed catalog v1\n' + encode(catalog))
     signature = subprocess.check_output([
         'openssl', 'pkeyutl', '-sign', '-rawin', '-keyform', 'DER', '-inkey',
         'signing.der', '-in', 'catalog-to-sign',
@@ -776,7 +775,7 @@ test image/hello -ef image/hello-alias
 test "$(cat image/hello-alias)" = 'hello from pinned input 1700000000'
 
 cat > trust.kdl <<'POLICY'
-schema-version 1
+schema-version 1 kind="build-trust"
 build-trust minimum-builders=2 {
     builder-key "builder-public.der"
     builder-key "other-public.der"
@@ -814,7 +813,7 @@ rotated_catalog=$(cat witnessed/current)
 # Build the coordinated upgrade with signatures for both trust policies.
 printf 'hello from pinned input\n' > sources/input
 cat > manifest.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "demo/hello" publisher="canopa" version="2.0.0-0" architecture="$arch" {
     require "library/platform" version="=1.0.0-0"
     file "hello" mode="0644" uid=$uid gid=$gid
@@ -828,7 +827,7 @@ build_package --sources sources --builder-signing-key replacement-builder.der --
 build_package --sources sources --builder-signing-key signing.der --check-reproducible --output hello2-retired hello2.kdl
 
 cat > manifest.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "library/platform" publisher="canopa" version="1.0.0-0" {
     file "platform" mode="0644" uid=$uid gid=$gid
 }
@@ -843,7 +842,7 @@ platform_reviewed=$(sha platform.kdl)
 cp public.der witnessed/retired-publisher.der
 cp replacement-public.der witnessed/
 cat > witnessed/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa" minimum-builders=2 {
     builder-key "builder-public.der"
     builder-key "other-public.der"
@@ -865,7 +864,7 @@ expect_failure 'checking release profile base' "$cps" publish-bundle \
 test "$(cat witnessed/current)" = "$rotated_catalog"
 
 cat > wave.kdl <<WAVE
-schema-version 1
+schema-version 1 kind="publish-release"
 release "canopa" base="$rotated_catalog" {
     obsolete "cps://canopa/demo/hello@1.1.0-0"
     bundle "cps://canopa/demo/hello@2.0.0-0" path="hello2-a" builder-key="builder-public.der" recipe-sha256="$hello2_reviewed" {
@@ -941,13 +940,13 @@ mv witnessed-offline witnessed
 openssl genpkey -algorithm ED25519 -outform DER -out desktop.der
 openssl pkey -inform DER -in desktop.der -pubout -outform DER -out desktop-public.der
 cat > desktop.kdl <<'MANIFEST'
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "desktop/base" publisher="desktop" version="1.0.0-0" {
     require "demo/hello"
 }
 MANIFEST
 cat > unchecked.kdl <<'MANIFEST'
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "demo/unchecked" publisher="canopa" version="1.0.0-0" {}
 MANIFEST
 "$cps" publish --repo desktop-repo --proto first/proto --signing-key desktop.der desktop.kdl
@@ -959,7 +958,7 @@ unattested=$(cat profile-companion/current)
 profile_policy() {
     local companion=$1 primary_baseline=${2:-} companion_baseline=${3:-}
     cat > desktop-repo/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "desktop" {
     builder-key "../builder-public.der"
     profile "desktop" architecture="$arch" $primary_baseline {
@@ -977,7 +976,7 @@ publisher "desktop" {
 POLICY
 }
 refresh_desktop() {
-    printf 'schema-version 1\nrelease "desktop" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "desktop" base="%s" refresh-profiles=#true\n' \
         "$desktop_base" > desktop-refresh.kdl
     "$cps" repo publish-release --repo desktop-repo --signing-key desktop.der desktop-refresh.kdl
 }
@@ -1012,7 +1011,7 @@ expect_failure 'release drops companion build trust for canopa' refresh_desktop
 test "$(cat desktop-repo/current)" = "$desktop_base"
 
 cat > desktop-image.kdl <<'CONFIG'
-schema-version 1
+schema-version 1 kind="image-config"
 release-profile "desktop"
 publisher "desktop" {
     repository "desktop-repo"

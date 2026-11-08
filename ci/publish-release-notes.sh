@@ -30,7 +30,8 @@ cp -- "$key" "$stage/publisher.der"
 cp -- "$mirror/publisher.json" "$stage/publisher.json"
 descriptor=$stage/publisher.json
 [[ $(stat -c %s -- "$descriptor") -le 2097152 ]] || fail 'Deployed publisher.json exceeds the CPS size limit'
-jq -e --arg publisher "$publisher" '.schema_version == 1 and .publisher == $publisher' "$descriptor" >/dev/null ||
+jq -e --arg publisher "$publisher" \
+    '.schema_version == 1 and .kind == "publisher-bootstrap" and .publisher == $publisher' "$descriptor" >/dev/null ||
     fail 'The deployed descriptor names a different publisher or schema'
 jq -er '.tuf_root' "$descriptor" | base64 -d | cmp -s -- "$stage/root.json" - ||
     fail 'The deployed descriptor has a different TUF root'

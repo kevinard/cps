@@ -95,9 +95,9 @@ fi
 
 toolchain_input=(--repo toolchain --publisher seed --trust-key toolchain-public.der)
 if $configured; then
-    printf 'schema-version 1\n' > toolchain.kdl
+    printf 'schema-version 1 kind="toolchain-config"\n' > toolchain.kdl
     pins="$work/toolchain-recipe"
-    printf '    toolchain solver="sat-v1" {\n' > "$pins"
+    printf '    toolchain solver="sat-v2" {\n' > "$pins"
     roots=(cps://seed/build/native-systemd@1.0.0-0 "$seccomp_package")
     append_toolchain_publisher "$pins" toolchain.kdl seed toolchain toolchain-public.der
     if [[ -n $util_linux ]]; then
@@ -111,7 +111,8 @@ if $configured; then
     toolchain_input=(--toolchain-config toolchain.kdl)
 else
     cat > "$work/toolchain-recipe" <<TOOLCHAIN
-    toolchain "$(cat toolchain/current)" solver="sat-v1" {
+    toolchain solver="sat-v2" {
+        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(tail -c 32 -- toolchain-public.der | sha256sum | cut -d' ' -f1)"
         package "build/native-systemd"
     }
 TOOLCHAIN
@@ -151,7 +152,7 @@ mkdir repo
 cp builder-public.der repo/
 reviewed=$(sha build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa-systemd" {
     builder-key "builder-public.der"
     approve "system/systemd-vm" version="$systemd_version" sha256="$reviewed"

@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="build-recipe"
 build architecture="@ARCH@" epoch=@EPOCH@ {
 @TOOLCHAIN@
     manifest "cps.kdl" sha256="@MANIFEST_SHA256@"

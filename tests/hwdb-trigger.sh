@@ -18,7 +18,7 @@ for name in first second; do
     path="usr/lib/udev/hwdb.d/$name.hwdb"
     printf 'test:cps:%s*\n CPS_TEST=%s\n' "$name" "$name" > "proto/$path"
     cat > manifest.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/$name" publisher="canopa" version="1.0.0-0" {
     file "$path" mode="0644" uid=$(id -u) gid=$(id -g)
     hwdb "$name.hwdb"

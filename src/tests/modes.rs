@@ -7,7 +7,7 @@ fn special_modes_require_protected_executables_and_meaningful_directory_bits() -
     use crate::kdl_format::{manifest_text, parse_manifest};
     let package = |action: &str| {
         parse_manifest(&format!(
-            "schema-version 1\npackage \"test/modes\" publisher=\"canopa\" version=\"1.0.0-0\" {{ {action}; }}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage \"test/modes\" publisher=\"canopa\" version=\"1.0.0-0\" {{ {action}; }}\n"
         ))
     };
     for action in [

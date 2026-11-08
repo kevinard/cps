@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_entries_have_no_btrfs_record() -> anyhow::Result<()> {
+    fn ext4_entries_have_no_btrfs_record() -> anyhow::Result<()> {
         assert!(BtrfsRecord::parse("title Canopa\n", "root=PARTUUID=old")?.is_none());
         assert!(BtrfsRecord::parse("# cps-btrfs-subvolid 277\n", "").is_err());
         Ok(())

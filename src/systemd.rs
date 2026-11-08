@@ -160,7 +160,7 @@ pub(crate) fn run(
     let mut sysusers = Vec::new();
     let mut presets = Vec::new();
     let mut rebuild_hwdb = false;
-    let state_path = state.settings.state_layout.directory();
+    let state_path = crate::image::STATE_DIRECTORY;
     let mut rules = tempfile::tempfile_in(path.join(state_path).join("stage"))?;
     for action in actions {
         action.validate()?;
@@ -308,16 +308,13 @@ fn tmpfiles_config(root: &Root, runtime: Option<&Root>, name: &str) -> Result<Op
     bail!("missing tmpfiles configuration {name}")
 }
 
-/// Discard links to retired vendor units and links left by older CPS versions
-/// before applying a preset for a newly installed unit.
+/// Discard links to retired vendor units.
 pub(crate) fn clean_enablement(
     root: &Root,
     writes: &[Write],
-    actions: &[Action],
     paths: &BTreeMap<String, Managed>,
-    files_ready: bool,
 ) -> Result<()> {
-    let mut targets = writes
+    let targets = writes
         .iter()
         .filter(|write| {
             write.after.is_none() && write.before.as_ref().is_some_and(|node| !node.is_dir())
@@ -328,14 +325,6 @@ pub(crate) fn clean_enablement(
             preset.validate().ok().map(|()| format!("/{}", write.path))
         })
         .collect::<BTreeSet<_>>();
-    if !files_ready {
-        targets.extend(
-            actions
-                .iter()
-                .filter(|action| matches!(action, Action::Preset(_)))
-                .map(|action| format!("/{}", action.path())),
-        );
-    }
     if targets.is_empty() {
         return Ok(());
     }

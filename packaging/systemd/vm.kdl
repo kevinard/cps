@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/systemd-vm" publisher="canopa-systemd" version="262.1.0-0" {
     require "system/elf-runtime"
     require "system/libseccomp" version=">=2.6.1-0"

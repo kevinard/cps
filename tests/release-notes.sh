@@ -20,7 +20,7 @@ openssl genpkey -algorithm ED25519 -outform DER -out publisher-private.der
 openssl pkey -inform DER -in publisher-private.der -pubout -outform DER -out publisher.der
 ssh-keygen -q -t ed25519 -N '' -f "$CPS_RELEASE_NOTES_SIGNING_KEY"
 jq -n --rawfile root root.json --arg key "$(base64 -w0 publisher.der)" \
-    '{schema_version: 1, publisher: "canopa", tuf_root: ($root | @base64), trust_key: $key}' > publisher.json
+    '{schema_version: 1, kind: "publisher-bootstrap", publisher: "canopa", tuf_root: ($root | @base64), trust_key: $key}' > publisher.json
 cp publisher.json mirror/publisher.json
 
 cat > bin/gh <<'GITHUB'
@@ -61,6 +61,13 @@ GITHUB
 chmod +x bin/gh
 export PATH="$work/bin:$PATH"
 publish_notes() { bash "$project/ci/publish-release-notes.sh" canopa "$catalog"; }
+
+jq 'del(.kind)' publisher.json > mirror/publisher.json
+if publish_notes; then
+    echo 'Signed notes for a publisher descriptor without its kind' >&2
+    exit 1
+fi
+[[ ! -e github/draft ]]
 
 for field in tuf_root trust_key; do
     jq --arg field "$field" '.[$field] = "WA=="' publisher.json > mirror/publisher.json

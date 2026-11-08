@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/libseccomp" publisher="canopa" version="2.6.1-1" {
     require "system/elf-runtime"
     file "usr/lib/libseccomp.so.2" mode="0755" uid=0 gid=0

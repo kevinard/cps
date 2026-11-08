@@ -12,7 +12,7 @@ use tuf::sign_root;
 
 use super::*;
 use crate::{
-    attestation::{self, LegacyToolchain, Toolchain},
+    attestation::{self, PinnedPackage, Toolchain},
     create_configured_image, fetch_plan, fetch_plan_with_archives, fetch_toolchain,
     kdl_format::{build, parse_manifest},
     list_obsoletions, list_withdrawals,
@@ -33,30 +33,35 @@ fn attach_evidence(
     fs::create_dir_all(bundle.join("proto/usr/bin"))?;
     let manifest_bytes = fs::read(&fixture.recipe)?;
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
+    let key = read_key(&fixture.public)?;
+    let key_hash = digest(&key);
+    let publisher = &manifest.publisher;
     let recipe = format!(
-        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
-         toolchain \"{catalog}\" {{\n package \"desktop/compositor\"\n }}\n\
+        "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
+         toolchain solver=\"sat-v2\" {{\n publisher \"{publisher}\" catalog=\"{catalog}\" key-sha256=\"{key_hash}\"\n package \"desktop/compositor\"\n }}\n\
          manifest \"manifest.kdl\" sha256=\"{}\"\n script \"true\"\n}}\n",
         digest(&manifest_bytes),
     );
-    let key = read_key(&fixture.public)?;
     let release = snapshot(&fixture.repo, &manifest.publisher, &key, Some(catalog))?;
     let payload = fs::read(fixture.proto.join(COMPOSITOR))?;
+    let recipe_model = build::parse(&recipe)?;
     let envelope = attestation::sign(
         &read_signing_key(&builder.private)?,
         &manifest,
         &manifest_bytes,
-        &build::parse(&recipe)?,
+        &recipe_model,
         recipe.as_bytes(),
-        Toolchain::Legacy(LegacyToolchain {
-            publisher: manifest.publisher.clone(),
-            key_sha256: digest(&key),
-            catalog_sha256: release.sha256,
+        Toolchain {
+            publishers: recipe_model.toolchain.clone(),
             package_manifests: BTreeMap::from([(
                 "desktop/compositor".to_owned(),
-                release.packages[0].sha256.clone(),
+                PinnedPackage {
+                    publisher: publisher.clone(),
+                    version: release.packages[0].manifest.version.clone(),
+                    sha256: release.packages[0].sha256.clone(),
+                },
             )]),
-        }),
+        },
         &BTreeMap::from([(
             COMPOSITOR.to_owned(),
             FileDigest {
@@ -81,7 +86,6 @@ fn attach_evidence(
 
 #[test]
 fn publisher_independently_checks_the_signed_toolchain_closure() -> Result<()> {
-    use crate::attestation::{PinnedPackage, PinnedToolchain};
     use crate::kdl_format::build::PublisherPin;
 
     let f = Fixture::new()?;
@@ -129,7 +133,7 @@ fn publisher_independently_checks_the_signed_toolchain_closure() -> Result<()> {
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="toolchain-config"
 publisher "seed" {{ repository {:?}; trust-key {:?}; }}
 publisher "tools" {{ repository {:?}; trust-key {:?}; }}
 "#,
@@ -139,10 +143,10 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
     let bundle = f._dir.path().join("bundle");
     fs::create_dir_all(bundle.join("proto"))?;
     let manifest =
-        b"schema-version 1\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
+        b"schema-version 1 kind=\"package-manifest\"\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
     fs::write(bundle.join("manifest.kdl"), manifest)?;
     let mut recipe =
-        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {\n    toolchain solver=\"sat-v1\" {\n"
+        "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {\n    toolchain solver=\"sat-v2\" {\n"
             .to_owned();
     for (pin, _) in &sources {
         recipe.push_str(&format!(
@@ -168,10 +172,10 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
             manifest,
             &build::parse(&recipe)?,
             recipe.as_bytes(),
-            Toolchain::Pinned(PinnedToolchain {
+            Toolchain {
                 publishers: sources.iter().map(|(pin, _)| pin.clone()).collect(),
                 package_manifests,
-            }),
+            },
             &BTreeMap::new(),
         )?;
         fs::write(bundle.join("attestation.json"), envelope)?;
@@ -186,7 +190,7 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
         fs::write(
             &policy,
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" verify-toolchains={setting} {{
     builder-key {:?}
     approve "test/compiled" version="1.0.0-0" sha256="{reviewed}" toolchain-config="../toolchain.kdl"
@@ -203,7 +207,7 @@ publisher "canopa" verify-toolchains={setting} {{
     fs::write(
         &release,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="publish-release"
 release "canopa" base="empty" {{
     bundle "cps://canopa/test/compiled@1.0.0-0" path="bundle" builder-key="builder.der" recipe-sha256="{reviewed}"
 }}
@@ -246,7 +250,7 @@ fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} {{\n    withdraw \"cps://canopa/test/one@1.0.0-0\"\n    withdraw {second:?}\n}}\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} {{\n    withdraw \"cps://canopa/test/one@1.0.0-0\"\n    withdraw {second:?}\n}}\n",
                 base.trim(),
             ),
         )
@@ -347,7 +351,7 @@ fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> 
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"unused.der\"\n{}{}\n}}\n",
+                "schema-version 1 kind=\"publish-policy\"\npublisher \"canopa\" {{\n    builder-key \"unused.der\"\n{}{}\n}}\n",
                 profile("x86_64", "desktop/session"),
                 profile("aarch64", arm_root),
             ),
@@ -356,7 +360,7 @@ fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> 
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 base.trim(),
             ),
         )?;
@@ -400,7 +404,7 @@ fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> 
         fs::write(
             &config,
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="image-config"
 architecture "{arch}"
 release-profile "{arch}"
 publisher "canopa" {{ repository "canopa"; trust-key {:?}; }}
@@ -449,7 +453,7 @@ fn bundle_cannot_claim_a_different_architecture_than_its_build() -> Result<()> {
     fs::write(
         &f.recipe,
         format!(
-            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" architecture=\"aarch64\" {{\n{action}}}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" architecture=\"aarch64\" {{\n{action}}}\n"
         ),
     )?;
     publish(&f.repo, &f.proto, &f.recipe, &f.private)?;
@@ -503,7 +507,7 @@ fn release_profiles_pin_latest_roots_and_use_image_facets() -> Result<()> {
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"builder.der\"\n    profile \"desktop\" architecture=\"x86_64\" {{\n        package {root:?}\n        package \"desktop/manual\"\n        facet \"doc.man\" #{docs}\n    }}\n}}\n",
+                "schema-version 1 kind=\"publish-policy\"\npublisher \"canopa\" {{\n    builder-key \"builder.der\"\n    profile \"desktop\" architecture=\"x86_64\" {{\n        package {root:?}\n        package \"desktop/manual\"\n        facet \"doc.man\" #{docs}\n    }}\n}}\n",
             ),
         )
     };
@@ -613,7 +617,7 @@ fn phased_profile_updates_defer_widen_and_allow_a_saved_override() -> Result<()>
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" rollout-percentage={percentage} {{
@@ -632,7 +636,7 @@ publisher "canopa" {{
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 base.trim()
             ),
         )?;
@@ -645,7 +649,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
@@ -746,7 +750,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     );
     apply(&f.root, &serde_json::from_value(saved)?)?;
     let history = crate::transaction_history(&f.root, 1)?;
-    assert!(history[0].details.as_ref().unwrap().force_phased_update);
+    assert!(history[0].details.force_phased_update);
     assert!(!plan(&f.root, Request::Update)?.has_changes());
 
     if initial.cohort > 0 {
@@ -789,7 +793,7 @@ fn signed_profiles_include_recommendations_in_the_published_composition() -> Res
     )?;
     fs::write(
         f.repo.join("publish-policy.kdl"),
-        r#"schema-version 1
+        r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {
@@ -803,7 +807,7 @@ publisher "canopa" {
     fs::write(
         &release,
         format!(
-            "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
             base.trim()
         ),
     )?;
@@ -812,7 +816,7 @@ publisher "canopa" {
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
@@ -867,7 +871,7 @@ fn local_transactions_preserve_the_applied_signed_composition() -> Result<()> {
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {{
@@ -890,7 +894,7 @@ publisher "canopa" {{
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 base.trim(),
             ),
         )?;
@@ -902,7 +906,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
@@ -966,23 +970,6 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
 
     fs::rename(&offline, &f.repo)?;
     let upgrade = plan(&f.root, Request::Update)?;
-    // Replaying a saved update from before profile reconciliation must keep its
-    // original selection, including a dependency the new profile dropped.
-    let mut legacy = upgrade.clone();
-    legacy.track_profile_intent = false;
-    let image = crate::image::Image::open_query(&f.root)?;
-    let legacy = crate::plan::build(
-        &image,
-        image.state()?,
-        legacy.request.clone(),
-        Some(&legacy),
-        legacy.solver,
-    )?
-    .0;
-    drop(image);
-    let legacy_staged = f._dir.path().join("legacy-staged");
-    crate::stage_boot_environment(&f.root, &legacy_staged, &legacy)?;
-    package_manifest(&legacy_staged, "library/z", false)?;
     let staged = f._dir.path().join("staged");
     crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "next");
@@ -1041,7 +1028,7 @@ fn profile_updates_reconcile_defaults_and_keep_operator_roots() -> Result<()> {
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {{
@@ -1057,7 +1044,7 @@ publisher "canopa" {{
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 base.trim()
             ),
         )?;
@@ -1072,7 +1059,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
@@ -1256,7 +1243,7 @@ fn url_publishers_refresh_and_offer_choices_without_replacing_the_signed_profile
         fs::write(
             main.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {{
@@ -1275,7 +1262,7 @@ publisher "canopa" {{
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 current.trim()
             ),
         )?;
@@ -1287,7 +1274,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
@@ -1404,6 +1391,22 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     assert_eq!(saved_lock_plan.catalogs["seed"], pin.trim());
 
     let mut altered = serde_json::to_value(&locked)?;
+    assert_eq!(altered["format"], 1);
+    assert_eq!(altered["kind"], "image-lock");
+    let lock_file = work.join("test.lock.json");
+    let mut untyped = altered.clone();
+    untyped.as_object_mut().unwrap().remove("kind");
+    fs::write(&lock_file, serde_json::to_vec(&untyped)?)?;
+    let error = crate::read_image_lock(&lock_file).unwrap_err();
+    assert!(format!("{error:#}").contains("missing field `kind`"));
+    let mut wrong_version = altered.clone();
+    wrong_version["format"] = 2.into();
+    fs::write(&lock_file, serde_json::to_vec(&wrong_version)?)?;
+    let error = crate::read_image_lock(&lock_file).unwrap_err();
+    assert!(format!("{error:#}").contains("unsupported image lock format"));
+    fs::write(&lock_file, serde_json::to_vec(&altered)?)?;
+    assert_eq!(crate::read_image_lock(&lock_file)?, locked);
+
     altered["packages"][editor]["manifest_sha256"] = serde_json::Value::String("0".repeat(64));
     let bad = Request::InstallLock {
         lock: Box::new(serde_json::from_value(altered)?),
@@ -1577,7 +1580,7 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"builder.der\"\n    profile \"desktop\" architecture=\"x86_64\" upgrade-from={:?} {{\n        package {root:?}\n    }}\n}}\n",
+                "schema-version 1 kind=\"publish-policy\"\npublisher \"canopa\" {{\n    builder-key \"builder.der\"\n    profile \"desktop\" architecture=\"x86_64\" upgrade-from={:?} {{\n        package {root:?}\n    }}\n}}\n",
                 baseline.trim(),
             ),
         )
@@ -1611,7 +1614,7 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
     fs::write(
         &release,
         format!(
-            "schema-version 1\nrelease \"canopa\" base={:?} {{\n    obsolete \"cps://canopa/library/legacy@2.0.0-0\"\n}}\n",
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} {{\n    obsolete \"cps://canopa/library/legacy@2.0.0-0\"\n}}\n",
             old.trim(),
         ),
     )?;
@@ -1670,7 +1673,7 @@ fn signed_renames_upgrade_in_one_transaction_and_preserve_install_intent() -> Re
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} {{\n{actions}\n}}\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} {{\n{actions}\n}}\n",
                 current.trim()
             ),
         )?;
@@ -1791,7 +1794,7 @@ fn signed_profile_renames_require_the_successor_and_keep_local_marks_separate() 
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                "schema-version 1\npublisher \"canopa\" {{\n    builder-key \"unused.der\"\n    profile \"desktop\" architecture=\"x86_64\" {{ package {name:?}; }}\n}}\n"
+                "schema-version 1 kind=\"publish-policy\"\npublisher \"canopa\" {{\n    builder-key \"unused.der\"\n    profile \"desktop\" architecture=\"x86_64\" {{ package {name:?}; }}\n}}\n"
             ),
         )?;
         Ok(())
@@ -1802,7 +1805,7 @@ fn signed_profile_renames_require_the_successor_and_keep_local_marks_separate() 
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true {{\n{actions}\n}}\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true {{\n{actions}\n}}\n",
                 current.trim()
             ),
         )?;
@@ -1814,7 +1817,7 @@ fn signed_profile_renames_require_the_successor_and_keep_local_marks_separate() 
     fs::write(
         &config,
         format!(
-            "schema-version 1\nrelease-profile \"desktop\"\npublisher \"canopa\" {{ repository {:?}; trust-key {:?}; }}\n",
+            "schema-version 1 kind=\"image-config\"\nrelease-profile \"desktop\"\npublisher \"canopa\" {{ repository {:?}; trust-key {:?}; }}\n",
             f.repo, f.public
         ),
     )?;
@@ -1901,7 +1904,7 @@ fn upgrade_profile_reuses_signed_baseline_roots_and_companions() -> Result<()> {
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "builder.der"
     profile "desktop" architecture="x86_64" {base} {{
@@ -1929,7 +1932,7 @@ publisher "canopa" {{
     fs::write(
         &refresh,
         format!(
-            "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
             signed_base.trim()
         ),
     )?;
@@ -1958,7 +1961,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{
@@ -2005,19 +2008,6 @@ publisher "seed" {{
             .contains("signed profile would downgrade cps://canopa/desktop/compositor@2.0.0-0"),
         "{error:#}"
     );
-    let legacy = {
-        let image = crate::image::Image::open(&newer_root, false)?;
-        crate::plan::build(
-            &image,
-            image.state()?,
-            Request::Update,
-            Some(&manual),
-            manual.solver,
-        )?
-        .0
-    };
-    assert_eq!(legacy.request, Request::Update);
-    apply(&newer_root, &legacy)?;
     package_manifest(
         &newer_root,
         "cps://canopa/desktop/compositor@2.0.0-0",
@@ -2064,7 +2054,7 @@ publisher "seed" {{
     fs::write(
         &retire_newer,
         format!(
-            "schema-version 1\nrelease \"canopa\" base={:?} {{\n    withdraw \"cps://canopa/desktop/compositor@2.0.0-0\"\n}}\n",
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} {{\n    withdraw \"cps://canopa/desktop/compositor@2.0.0-0\"\n}}\n",
             signed_base.trim()
         ),
     )?;
@@ -2090,7 +2080,9 @@ publisher "seed" {{
     let next = publish_release(&f.repo, &f.private, &retire_newer)?;
     fs::write(
         &refresh,
-        format!("schema-version 1\nrelease \"canopa\" base={next:?} refresh-profiles=#true\n"),
+        format!(
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={next:?} refresh-profiles=#true\n"
+        ),
     )?;
     let matrix = fs::read_to_string(&policy)?.replace(
         "        package \"desktop/compositor@1.0.0-0\"",
@@ -2175,7 +2167,7 @@ fn release_profiles_pin_and_authenticate_sticky_companion_publishers() -> Result
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "builder.der"
     profile "desktop" architecture="x86_64" upgrade-from={:?} {{
@@ -2251,7 +2243,7 @@ fn profiled_image_follows_signed_catalog_set_and_recovers_saved_plans() -> Resul
         fs::write(
             &path,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 base.trim()
             ),
         )?;
@@ -2267,7 +2259,7 @@ fn profiled_image_follows_signed_catalog_set_and_recovers_saved_plans() -> Resul
         fs::write(
             &config,
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="image-config"
 architecture {arch:?}
 release-profile "desktop"
 publisher "canopa" {{
@@ -2287,7 +2279,7 @@ publisher "seed" {{
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "builder.der"
     profile "desktop" architecture="x86_64" {{
@@ -2441,15 +2433,16 @@ fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -
     let bytes = b"deterministic build output";
     let source_bytes = b"pinned source bytes";
     let source_hash = digest(source_bytes);
-    let manifest = br#"schema-version 1
+    let manifest = br#"schema-version 1 kind="package-manifest"
 // Reviewed bytes and layout
 package "test/rebuild" publisher="canopa" version="1.0.0-0" {
     file "usr/share/cps/reference" mode="0644" uid=0 gid=0
 }
 "#;
-    let catalog = digest(b"legacy pinned toolchain");
+    let catalog = digest(b"pinned toolchain");
+    let key_hash = digest(&read_key(&f.public)?);
     let recipe = format!(
-        "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain \"{catalog}\" {{ package \"build/tool\"; }}\n    manifest \"build.kdl/nested/manifest.kdl\" sha256=\"{}\"\n    source \"input\" sha256=\"{source_hash}\" size={}\n    script \"true\"\n}}\n",
+        "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain solver=\"sat-v2\" {{ publisher \"seed\" catalog=\"{catalog}\" key-sha256=\"{key_hash}\"; package \"build/tool\"; }}\n    manifest \"build.kdl/nested/manifest.kdl\" sha256=\"{}\"\n    source \"input\" sha256=\"{source_hash}\" size={}\n    script \"true\"\n}}\n",
         digest(manifest),
         source_bytes.len(),
     );
@@ -2465,12 +2458,17 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
         manifest,
         &build::parse(&recipe)?,
         recipe.as_bytes(),
-        Toolchain::Legacy(LegacyToolchain {
-            publisher: "seed".into(),
-            key_sha256: digest(&read_key(&f.public)?),
-            catalog_sha256: catalog,
-            package_manifests: BTreeMap::from([("build/tool".into(), digest(b"tool"))]),
-        }),
+        Toolchain {
+            publishers: build::parse(&recipe)?.toolchain,
+            package_manifests: BTreeMap::from([(
+                "build/tool".into(),
+                PinnedPackage {
+                    publisher: "seed".into(),
+                    version: "1.0.0-0".parse()?,
+                    sha256: digest(b"tool"),
+                },
+            )]),
+        },
         &BTreeMap::from([(
             output.into(),
             FileDigest {
@@ -2485,7 +2483,7 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" archive-build-inputs={archive} {{
     builder-key {:?}
     approve "test/rebuild" version="1.0.0-0" sha256="{reviewed}"
@@ -2665,7 +2663,7 @@ publisher "canopa" archive-build-inputs={archive} {{
     fs::write(
         &release,
         format!(
-            "schema-version 1\nrelease \"canopa\" base=\"empty\" {{\n\
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base=\"empty\" {{\n\
          bundle {id:?} path=\"bundle\" builder-key=\"builder.der\" recipe-sha256={reviewed:?}\n}}\n"
         ),
     )?;
@@ -2911,7 +2909,7 @@ fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -
     fs::write(
         f.repo.join("publish-policy.kdl"),
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "builder.der"
     profile "desktop" architecture="x86_64" {{
@@ -2947,7 +2945,7 @@ publisher "canopa" {{
         fs::write(
             &config,
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 facet "devel" #false
@@ -3067,7 +3065,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     fs::write(
         &refresh,
         format!(
-            "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
             first.trim()
         ),
     )?;
@@ -3635,7 +3633,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     fs::write(
         &pending_config,
         format!(
-            "schema-version 1\npublisher \"canopa\" {{\n repository {cache:?}\n trust-key {:?}\n build-trust {{ builder-key {:?}; }}\n}}\n",
+            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n repository {cache:?}\n trust-key {:?}\n build-trust {{ builder-key {:?}; }}\n}}\n",
             f.public, builder.public,
         ),
     )?;
@@ -3803,7 +3801,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     fs::write(
         &f.recipe,
         format!(
-            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}}}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}}}\n"
         ),
     )?;
     publish(&fork, &f.proto, &f.recipe, &f.private)?;
@@ -3980,7 +3978,7 @@ fn image_rejects_catalog_replay_and_retired_signer_forks_without_cache_history()
     fs::write(
         &f.recipe,
         format!(
-            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"2.0.0-0\" {{\n{update}}}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"2.0.0-0\" {{\n{update}}}\n"
         ),
     )?;
     publish(&f.repo, &f.proto, &f.recipe, &rotated_key.private)?;
@@ -4008,7 +4006,7 @@ fn profiled_image_rejects_higher_sequence_forks_without_cache_history() -> Resul
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {{
@@ -4039,7 +4037,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
@@ -4061,21 +4059,6 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     set_policy(elf)?;
     retire("fork-three")?;
     let resurrection = fs::read_to_string(&current)?;
-    {
-        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
-        db.execute(
-            "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'), '$.format', 5)
-             WHERE id=1",
-            [],
-        )?;
-        let error = plan(&f.root, Request::Update).unwrap_err();
-        assert!(format!("{error:#}").contains("release drops or changes the withdrawal"));
-        db.execute(
-            "UPDATE image SET data=json_set(data, '$.catalog_archives', json('true'), '$.format', 6)
-             WHERE id=1",
-            [],
-        )?;
-    }
     fs::remove_file(f.repo.join("catalogs").join(applied.trim()))?;
 
     for (fork, reason) in [
@@ -4109,7 +4092,9 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
             assert!(format!("{error:#}").contains(reason), "{error:#}");
         }
         let mut changed = good_plan.clone();
-        changed.catalog = Some(fork.trim().to_owned());
+        changed
+            .catalogs
+            .insert("canopa".into(), fork.trim().to_owned());
         let error = fetch_plan(&f.root, &changed).unwrap_err();
         assert!(format!("{error:#}").contains(reason), "{error:#}");
         let error = apply(&f.root, &changed).unwrap_err();
@@ -4156,7 +4141,7 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
     assert_eq!(pending.plan_id, plan.id()?);
     assert_eq!(pending.target_revision, 2);
     assert!(!pending.files_ready);
-    assert_eq!(pending.plan_summary, Some(plan.summary()));
+    assert_eq!(pending.plan_summary, plan.summary());
     let journal: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     for (field, reason) in [
@@ -4266,7 +4251,7 @@ fn standalone_and_companion_publishers_keep_withdrawals_after_cache_replacement(
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {{
@@ -4288,7 +4273,7 @@ publisher "canopa" {{
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 base.trim(),
             ),
         )?;
@@ -4305,7 +4290,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
@@ -4521,7 +4506,7 @@ fn check_guarded_sync(
     let config = work.join("guarded-sync.kdl");
     let sync_profile = |primary_mirror: &Path, seed_mirror: &Path| -> Result<String> {
         let mut document =
-            "schema-version 1\narchitecture \"x86_64\"\nrelease-profile \"desktop\"\n".to_owned();
+            "schema-version 1 kind=\"image-config\"\narchitecture \"x86_64\"\nrelease-profile \"desktop\"\n".to_owned();
         for (name, repo, key, mirror) in [
             ("canopa", &primary_cache, &primary.public, primary_mirror),
             ("seed", &seed_cache, &seed.public, seed_mirror),
@@ -4572,90 +4557,6 @@ fn check_guarded_sync(
     assert_eq!(fs::read_to_string(seed_cache.join("current"))?, good[1]);
     fs::write(primary_pointer, primary_fork)?;
     fs::write(seed_pointer, seed_fork)?;
-    Ok(())
-}
-
-#[test]
-fn legacy_cache_relocation_requires_the_applied_catalog() -> Result<()> {
-    let f = Fixture::new()?;
-    f.package("test/pkg", "1.0.0-0", String::new())?;
-    f.create()?;
-    let install = plan(
-        &f.root,
-        Request::Install {
-            packages: vec!["test/pkg".into()],
-        },
-    )?;
-    apply(&f.root, &install)?;
-    let applied = fs::read_to_string(f.repo.join("current"))?;
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
-    db.execute(
-        "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'), '$.format', 4) WHERE id=1",
-        [],
-    )?;
-    db.execute("DROP TABLE catalog_archives", [])?;
-
-    f.package("test/pkg", "2.0.0-0", String::new())?;
-    let work = f._dir.path();
-    let anchor = work.join("root.json");
-    let tuf_key = work.join("tuf-key.der");
-    sign_root(&anchor, &tuf_key, None)?;
-    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
-    let cache = work.join("guarded-cache");
-    let sync = |mirror: &Path| {
-        mirror_release::sync_with_options(
-            &cache,
-            &anchor,
-            Url::from_directory_path(mirror.join("metadata"))
-                .unwrap()
-                .as_str(),
-            Url::from_directory_path(mirror.join("targets"))
-                .unwrap()
-                .as_str(),
-            "canopa",
-            &f.public,
-            mirror_release::SyncOptions {
-                index_only: true,
-                image: Some(&f.root),
-            },
-        )
-    };
-    let mirror = work.join("without-predecessor");
-    sign_release(&f, &mirror, 1, fresh, &anchor, &tuf_key)?;
-    let error = sync(&mirror).unwrap_err();
-    assert!(format!("{error:#}").contains("fetching last applied catalog"));
-    assert!(!cache.join("current").exists());
-    assert!(!cache.join(".tuf/catalog").exists());
-    let export = work.join("export-with-predecessor");
-    let current = mirror_release::export_with_retained(
-        &f.repo,
-        "canopa",
-        &f.public,
-        &export,
-        &[applied.trim().to_owned()],
-    )?;
-    let mirror = work.join("with-predecessor");
-    sign_export(&export, &mirror, 2, fresh, &anchor, &tuf_key)?;
-    assert_eq!(sync(&mirror)?, current);
-    assert!(cache.join("catalogs").join(applied.trim()).is_file());
-
-    let replacement = f.repo.with_extension("replacement");
-    fs::rename(&f.repo, &replacement)?;
-    let predecessor = replacement.join("catalogs").join(applied.trim());
-    let bytes = fs::read(&predecessor)?;
-    fs::remove_file(&predecessor)?;
-    let locations = [("canopa".into(), replacement)];
-    let error = crate::set_publisher_repositories(&f.root, &locations).unwrap_err();
-    assert!(format!("{error:#}").contains("replacement cache requires the last applied catalog"));
-    assert_eq!(crate::list_publishers(&f.root)?[0].repository, f.repo);
-    fs::write(predecessor, bytes)?;
-    crate::set_publisher_repositories(&f.root, &locations)?;
-    apply(&f.root, &plan(&f.root, Request::Update)?)?;
-    assert!(verify(&f.root)?.is_empty());
-    assert_eq!(
-        crate::list_publishers(&f.root)?[0].repository,
-        locations[0].1
-    );
     Ok(())
 }
 
@@ -4770,8 +4671,8 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
     fs::write(
         &recipe,
         format!(
-            "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
-         toolchain solver=\"sat-v1\" {{\n\
+            "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
+         toolchain solver=\"sat-v2\" {{\n\
          publisher \"canopa\" catalog={primary_pin:?} key-sha256={:?}\n\
          publisher \"tools\" catalog={tools_pin:?} key-sha256={:?}\n\
          package \"cps://tools/build/compiler@1.0.0-0\"\n }}\n\
@@ -4786,7 +4687,7 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
         fs::write(
             &config,
             format!(
-                "schema-version 1\n\
+                "schema-version 1 kind=\"toolchain-config\"\n\
              publisher \"canopa\" {{ repository {primary_cache:?}; trust-key {:?}; }}\n\
              publisher \"tools\" {{ repository {tools_cache:?}; trust-key {:?}; {policy} }}\n",
                 primary.public, tools.public,
@@ -4961,9 +4862,10 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
     fs::write(
         &recipe,
         format!(
-            "schema-version 1\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
-         toolchain {pin:?} {{ package \"build/compiler\"; }}\n\
+            "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
+         toolchain solver=\"sat-v2\" {{ publisher \"canopa\" catalog={pin:?} key-sha256={:?}; package \"build/compiler\"; }}\n\
          manifest \"manifest.kdl\" sha256={:?}\n script \"exit 1\"\n}}\n",
+            digest(&read_key(&fixture.public)?),
             digest(b"reviewed manifest"),
         ),
     )?;
@@ -4971,7 +4873,7 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
     fs::write(
         &config,
         format!(
-            "schema-version 1\npublisher \"canopa\" {{ repository {archive_cache:?}; trust-key {:?}; }}\n",
+            "schema-version 1 kind=\"toolchain-config\"\npublisher \"canopa\" {{ repository {archive_cache:?}; trust-key {:?}; }}\n",
             fixture.public,
         ),
     )?;
@@ -5073,7 +4975,7 @@ fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Resu
     fs::write(
         &f.recipe,
         format!(
-            "schema-version 1\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"2.0.0-0\" {{\n{actions}}}\n"
+            "schema-version 1 kind=\"package-manifest\"\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"2.0.0-0\" {{\n{actions}}}\n"
         ),
     )?;
     publish(&f.repo, &f.proto, &f.recipe, &second_key.private)?;
@@ -5201,7 +5103,7 @@ fn tuf_obsoletion_removes_only_when_dependencies_allow_and_preserves_history() -
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={base:?} {{\n    obsolete {id:?}\n}}\n"
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={base:?} {{\n    obsolete {id:?}\n}}\n"
             ),
         )?;
         publish_release(&f.repo, &f.private, &release)
@@ -5323,7 +5225,7 @@ fn offline_build_audit_requires_the_catalog_admitted_attestation() -> Result<()>
     fs::write(
         &policy,
         format!(
-            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            "schema-version 1 kind=\"build-trust\"\nbuild-trust {{ builder-key {:?}; }}\n",
             builder.public
         ),
     )?;
@@ -5392,7 +5294,7 @@ fn signed_build_trust_checks_retained_companion_packages() -> Result<()> {
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "builder.der"
     profile "desktop" architecture="x86_64" {{
@@ -5413,7 +5315,7 @@ publisher "canopa" {{
         fs::write(
             &release,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 base.trim(),
             ),
         )?;
@@ -5424,7 +5326,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{
@@ -5547,7 +5449,7 @@ publisher "seed" {{
     fs::write(
         &local_policy,
         format!(
-            "schema-version 1\nbuild-trust {{ builder-key {:?}; }}\n",
+            "schema-version 1 kind=\"build-trust\"\nbuild-trust {{ builder-key {:?}; }}\n",
             other_builder.public,
         ),
     )?;
@@ -5568,21 +5470,6 @@ publisher "seed" {{
         panic!("audit accepted a different signed profile catalog");
     };
     assert!(format!("{error:#}").contains("archived catalog digest mismatch"));
-    assert_eq!(
-        db.execute(
-            "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives', '$.profile_intent'),
-             '$.build_profile_catalog', ?1, '$.format', 5) WHERE id=1",
-            [first],
-        )?,
-        1,
-    );
-    let Err(error) = crate::audit_publisher_builds(&f.root, "seed") else {
-        panic!("audit accepted a signed policy from before the catalog checkpoint");
-    };
-    assert!(
-        format!("{error:#}")
-            .contains("archived profile differs from the installed primary catalog")
-    );
     Ok(())
 }
 
@@ -5737,8 +5624,38 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
     fs::write(&timestamp, timestamp_bytes)?;
     assert_eq!(refresh(&rotated)?, upgraded); // The client retained the rotated root.
 
-    fs::remove_file(cache.join(".tuf/origin"))?;
-    assert!(refresh(&rotated).is_err());
+    let origin = cache.join(".tuf/origin");
+    let current = fs::read(cache.join("current"))?;
+    let checkpoint = fs::read(cache.join(".tuf/trusted/timestamp.json"))?;
+    let record = fs::read_to_string(&origin)?;
+    let unversioned = record.strip_prefix("cps mirror cache v1\n").unwrap();
+    let wrong_version = record.replacen("v1", "v2", 1);
+    for invalid in [unversioned, &wrong_version] {
+        fs::write(&origin, invalid)?;
+        let error = refresh(&rotated).unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported TUF cache format"));
+        let error = mirror_release::prune_payloads(
+            &cache,
+            "canopa",
+            &f.public,
+            mirror_release::CacheRetention::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported TUF cache format"));
+        assert_eq!(fs::read_to_string(&origin)?, invalid);
+        assert_eq!(fs::read(cache.join("current"))?, current);
+        assert_eq!(
+            fs::read(cache.join(".tuf/trusted/timestamp.json"))?,
+            checkpoint
+        );
+    }
+    fs::remove_file(&origin)?;
+    let error = refresh(&rotated).unwrap_err();
+    assert!(format!("{error:#}").contains("missing its trust configuration"));
+    assert!(!origin.exists());
+    fs::write(&origin, record)?;
+    assert_eq!(refresh(&rotated)?, upgraded);
     Ok(())
 }
 
@@ -5948,7 +5865,11 @@ fn tuf_cache_remembers_a_newer_publisher_catalog_after_a_failed_download() -> Re
 
     assert_eq!(refresh("first")?, first.trim());
     let checkpoint = cache.join(".tuf/catalog");
-    fs::remove_file(&checkpoint)?; // Upgrade an existing cache without a publisher checkpoint.
+    fs::remove_file(&checkpoint)?;
+    let error = refresh("second").unwrap_err();
+    assert!(format!("{error:#}").contains("missing its publisher catalog checkpoint"));
+    assert!(!checkpoint.exists());
+    fs::write(&checkpoint, &first)?;
     let blob = digest(b"new");
     fs::write(
         work.join("second/targets")
@@ -6038,7 +5959,7 @@ fn tuf_delta_fetch_reconstructs_from_installed_files_and_falls_back() -> Result<
         false,
         &[previous],
     )?;
-    let delta_name = format!("delta-v1-{old_hash}-{new_hash}");
+    let delta_name = format!("payload-delta-v1-{old_hash}-{new_hash}");
     let mut patch = fs::read(export.join(&delta_name))?;
     assert!(patch.len() < new.len() / 8);
     let updated = work.join("updated-mirror");
@@ -6118,7 +6039,7 @@ fn tuf_delta_fetch_upgrades_files_larger_than_64_mib() -> Result<()> {
         false,
         &[previous],
     )?;
-    let delta_name = format!("delta-v2-{old_hash}-{new_hash}");
+    let delta_name = format!("payload-delta-v1-{old_hash}-{new_hash}");
     assert!(fs::metadata(export.join(delta_name))?.len() < 1024);
     let anchor = work.join("root.json");
     let key = work.join("tuf-key.der");

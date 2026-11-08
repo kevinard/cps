@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1792187472 {
 @TOOLCHAIN@
     manifest "systemd.kdl" sha256="@MANIFEST_SHA256@"

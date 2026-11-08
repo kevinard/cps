@@ -70,7 +70,7 @@ pub(super) fn save_audit(
         "build audit receipts must share a signed catalog"
     );
     let point = settings.catalog_checkpoints.get(&publisher.name);
-    if !settings.catalog_archives || point.is_none_or(|point| point.catalog != hash) {
+    if point.is_none_or(|point| point.catalog != hash) {
         let bytes = catalog_bytes(&publisher.repo, hash)?;
         let catalog = decode_archived_catalog(&bytes, hash, &publisher.name, &publisher.key)?;
         if let Some((previous, previous_hash)) = admission_catalog(tx, publisher)?
@@ -80,7 +80,7 @@ pub(super) fn save_audit(
                 .check_successor(&catalog, &previous_hash)
                 .context("checking build admission catalog succession")?;
         }
-        if let Some(point) = point.filter(|_| settings.catalog_archives) {
+        if let Some(point) = point {
             catalogs::read_checkpoint(tx, publisher, point)?
                 .check_successor(&catalog, &point.catalog)
                 .context("checking build admission against the applied catalog")?;

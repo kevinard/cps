@@ -21,7 +21,7 @@ pub fn read_worker_config(path: &Path) -> Result<BuildWorker> {
 
 fn parse(text: &str) -> Result<BuildWorker> {
     let doc = document(text)?;
-    schema(&doc)?;
+    schema(&doc, "build-worker")?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and worker nodes"

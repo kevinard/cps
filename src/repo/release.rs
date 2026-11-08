@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{DirBuilder, File, OpenOptions},
+    fs::{File, OpenOptions, Permissions},
     io::{Read, Seek, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
 };
 
@@ -43,6 +43,7 @@ const METADATA_DOWNLOADS: usize = 8;
 const PAYLOAD_DOWNLOADS: usize = 8;
 const PAYLOAD_ZSTD_LEVEL: i32 = 3;
 const PAYLOAD_ZSTD_WINDOW_LOG: u32 = 21;
+const CACHE_FORMAT: &str = "cps mirror cache v1\n";
 const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
 const PROFILE_BINDING: &str = "profile";
 const REFRESH_ROOT: &str = "refresh-root.json";
@@ -214,6 +215,15 @@ fn open_state(repo: &Path) -> Result<Root> {
     ensure!(
         permissions.uid() == geteuid().as_raw() && permissions.mode() & 0o077 == 0,
         "TUF state directory must be private to the sync account"
+    );
+    let mut version = [0; CACHE_FORMAT.len()];
+    root.file("origin")
+        .context("TUF cache is missing its trust configuration")?
+        .read_exact(&mut version)
+        .context("reading TUF cache format")?;
+    ensure!(
+        version == CACHE_FORMAT.as_bytes(),
+        "unsupported TUF cache format"
     );
     Ok(root)
 }
@@ -546,21 +556,6 @@ impl ImageGuard {
         Ok(publisher)
     }
 
-    fn legacy_predecessor(&self, publisher: &str, candidate: &str) -> Option<&str> {
-        let settings = &self.state.settings;
-        if settings.catalog_archives
-            || (settings.archived_profile_catalog.is_some()
-                && self.state.publishers.as_slice()[0].name == publisher)
-        {
-            return None;
-        }
-        settings
-            .catalog_checkpoints
-            .get(publisher)
-            .map(|point| point.catalog.as_str())
-            .filter(|hash| *hash != candidate)
-    }
-
     fn check(
         &self,
         repo: &Path,
@@ -684,16 +679,35 @@ fn initialize_cache(
         ..
     } = source;
     let state = repo.join(".tuf");
-    let origin = format!("{}\n{publisher}\n{}\n", digest(anchor), hex::encode(key));
+    let origin = format!(
+        "{CACHE_FORMAT}{}\n{publisher}\n{}\n",
+        digest(anchor),
+        hex::encode(key)
+    );
     let published = path_present(&repo.join("current"))?;
     if !path_present(&state)? {
         ensure!(!published, "TUF sync requires a new repository cache");
-        DirBuilder::new().mode(0o700).create(&state)?;
-        File::open(repo)?.sync_all()?;
+        let next = tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir_in(repo)?;
+        write_atomic(&next.path().join("origin"), origin.as_bytes(), true)?;
+        if let SyncSelection::Archive(pin) = selection {
+            write_atomic(
+                &next.path().join(ARCHIVE),
+                format!("{pin}\n").as_bytes(),
+                true,
+            )?;
+        }
+        let parent = File::open(repo)?;
+        let name = next
+            .path()
+            .file_name()
+            .context("missing cache staging name")?;
+        renameat_with(&parent, name, &parent, ".tuf", RenameFlags::NOREPLACE)?;
+        parent.sync_all()?;
     }
     let directory = open_state(repo)?;
     let trusted_exists = path_present(&state.join("trusted"))?;
-    let has_origin = path_present(&state.join("origin"))?;
     let ready = published || path_present(&state.join("endpoints"))?;
     let archive = path_present(&state.join(ARCHIVE))?;
     match selection {
@@ -702,22 +716,14 @@ fn initialize_cache(
             "archive cache requires repo sync --archive-catalog"
         ),
         SyncSelection::Archive(pin) => {
-            ensure!(!published, "archive sync requires a dedicated cache");
-            if archive {
-                ensure!(
-                    read_pointer(&state, ARCHIVE)? == *pin,
-                    "archive cache is bound to a different catalog"
-                );
-            } else {
-                ensure!(
-                    !ready
-                        && !has_origin
-                        && !trusted_exists
-                        && !path_present(&state.join(PROFILE_BINDING))?,
-                    "archive sync requires a dedicated cache"
-                );
-                write_atomic(&state.join(ARCHIVE), format!("{pin}\n").as_bytes(), true)?;
-            }
+            ensure!(
+                archive && !published,
+                "archive sync requires a dedicated cache"
+            );
+            ensure!(
+                read_pointer(&state, ARCHIVE)? == *pin,
+                "archive cache is bound to a different catalog"
+            );
         }
     }
     if path_present(&state.join(PROFILE_BINDING))? {
@@ -733,21 +739,17 @@ fn initialize_cache(
             "TUF cache is bound to a different release profile or companion cache set"
         );
     }
-    if has_origin {
-        ensure!(
-            read_limited(directory.file("origin")?, origin.len() as u64)? == origin.as_bytes(),
-            "TUF cache was initialized with a different trust root or publisher"
-        );
-    } else {
-        ensure!(
-            !ready && !trusted_exists,
-            "TUF cache is missing its trust configuration"
-        );
-        write_atomic(&state.join("origin"), origin.as_bytes(), true)?;
-    }
+    ensure!(
+        read_limited(directory.file("origin")?, origin.len() as u64)? == origin.as_bytes(),
+        "TUF cache was initialized with a different trust root or publisher"
+    );
     ensure!(
         !ready || trusted_exists,
         "TUF cache is missing its trusted metadata"
+    );
+    ensure!(
+        !published || path_present(&repo.join(PUBLISHER_CHECKPOINT))?,
+        "TUF cache is missing its publisher catalog checkpoint"
     );
     Ok(directory)
 }
@@ -971,10 +973,9 @@ async fn try_delta(
 ) -> Result<()> {
     ensure!(base.hash != hash, "delta base and result are identical");
     validate_digest(base.hash)?;
-    let format = delta::Format::for_lengths(base.length, length);
-    let name = format.target_name(base.hash, hash);
+    let name = delta::target_name(base.hash, hash);
     let (target_name, target) =
-        checked_target(verified, &name, format.patch_limit(length), None, None)?;
+        checked_target(verified, &name, delta::patch_limit(length), None, None)?;
     let full = checked_payload_target(verified, hash, length)?;
     ensure!(
         target.length < full.metadata.length,
@@ -988,7 +989,6 @@ async fn try_delta(
     let patch = download_target(verified, &name, &target_name, target, &parent).await?;
     let mut result = NamedTempFile::new_in(&parent)?;
     delta::reconstruct(
-        format,
         &base_file,
         base.length,
         std::io::BufReader::new(patch.reopen()?),
@@ -1171,9 +1171,11 @@ fn check_cache_origin(directory: &Root, publisher: &str, key: &[u8]) -> Result<(
     let identity = format!("\n{publisher}\n{}\n", hex::encode(key));
     let origin = String::from_utf8(read_limited(
         directory.file("origin")?,
-        64 + identity.len() as u64,
+        (CACHE_FORMAT.len() + 64 + identity.len()) as u64,
     )?)?;
     let anchor = origin
+        .strip_prefix(CACHE_FORMAT)
+        .context("unsupported TUF cache format")?
         .strip_suffix(&identity)
         .context("TUF cache is configured for a different publisher or key")?;
     validate_digest(anchor)
@@ -1197,15 +1199,6 @@ async fn materialize(
     fetch_object(verified, repo, "catalogs", &hash, CATALOG_LIMIT, None).await?;
     let catalog = read_catalog(repo, &hash, publisher, key)?;
     if let Some(guard) = guard {
-        if let Some(previous) = guard.legacy_predecessor(publisher, &hash)
-            && !path_present(&repo.join("catalogs").join(previous))?
-        {
-            fetch_object(verified, repo, "catalogs", previous, CATALOG_LIMIT, None)
-                .await
-                .with_context(|| {
-                    format!("fetching last applied catalog {previous} for {publisher}")
-                })?;
-        }
         guard.check(repo, source, &hash, &catalog)?;
     }
     let checkpoint = repo.join(PUBLISHER_CHECKPOINT);
@@ -1213,12 +1206,7 @@ async fn materialize(
         .then(|| read_pointer(repo, PUBLISHER_CHECKPOINT))
         .transpose()?;
     if trusted.as_deref() != Some(&hash) {
-        let previous = match trusted {
-            Some(previous) => Some(previous),
-            None if path_present(&repo.join("current"))? => Some(read_current(repo)?),
-            None => None,
-        };
-        if let Some(previous) = previous.filter(|previous| previous != &hash) {
+        if let Some(previous) = trusted {
             read_catalog(repo, &previous, publisher, key)?.check_successor(&catalog, &previous)?;
         }
         // Remember the signed catalog even when its payloads cannot be fetched.

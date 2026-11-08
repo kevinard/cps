@@ -50,16 +50,17 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
     assert!(apply(&f.root, &serde_json::from_value(tampered)?).is_err());
     assert_eq!(apply(&f.root, &freeze)?, 2);
     assert_eq!(apply(&f.root, &freeze)?, 2);
-    assert_eq!(Image::open_query(&f.root)?.settings()?.format, 9);
+    assert_eq!(
+        Image::open_query(&f.root)?.settings()?.format,
+        crate::image::IMAGE_FORMAT
+    );
     assert!(format!("{:#}", apply(&f.root, &stale).unwrap_err()).contains("stale plan"));
     let freezes = list_freezes(&f.root)?;
     assert_eq!(
         freezes[runtime].reason.as_deref(),
         Some("keep known-good graphics ABI")
     );
-    let details = crate::transaction_details(&f.root, &freeze.id()?)?
-        .details
-        .unwrap();
+    let details = crate::transaction_details(&f.root, &freeze.id()?)?.details;
     assert_eq!(details.freeze_changes, freeze.freeze_changes);
     assert_eq!(details.planned_path_changes, 0);
     fs::rename(f.repo.with_extension("offline"), &f.repo)?;
@@ -214,7 +215,7 @@ fn signed_profile_freezes_follow_staged_roots_and_require_explicit_unfreezing() 
         fs::write(
             f.repo.join("publish-policy.kdl"),
             format!(
-                r#"schema-version 1
+                r#"schema-version 1 kind="publish-policy"
 publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {{ package "{name}@{version}"; }}
@@ -226,7 +227,7 @@ publisher "canopa" {{
         fs::write(
             &definition,
             format!(
-                "schema-version 1\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
                 fs::read_to_string(f.repo.join("current"))?.trim()
             ),
         )?;
@@ -238,7 +239,7 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="image-config"
 release-profile "desktop"
 publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
 "#,

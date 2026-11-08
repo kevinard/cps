@@ -139,7 +139,7 @@ pub(super) fn revert(
     managed: &BTreeMap<String, Managed>,
     selected: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, Write>> {
-    let mut updates = super::config::updates(root, settings, managed)?;
+    let mut updates = super::config::updates(settings, managed)?;
     let mut writes = BTreeMap::new();
     for path in selected {
         let path = path.as_str();
@@ -172,6 +172,6 @@ pub(super) fn revert(
             );
         }
     }
-    settings.config_updates = Some(updates);
+    settings.config_updates = updates;
     Ok(writes)
 }

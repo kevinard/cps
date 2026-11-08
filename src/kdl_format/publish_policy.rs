@@ -263,7 +263,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
 
 pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
     let doc = document(text)?;
-    schema(&doc)?;
+    schema(&doc, "publish-policy")?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and publisher nodes"

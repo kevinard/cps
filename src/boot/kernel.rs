@@ -136,7 +136,7 @@ impl Artifacts {
         let root = &image.root;
         self.kernel.validate()?;
         let directory = self.directory()?;
-        let state_path = path.join(settings.state_layout.directory());
+        let state_path = path.join(crate::image::STATE_DIRECTORY);
         let state_dir = image.state_dir.as_file();
         let final_path = state_path.join(&directory);
         match fs::symlink_metadata(&final_path) {

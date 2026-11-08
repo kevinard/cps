@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/filesystem" publisher="canopa-usr-base" version="1.0.0-0" {
     dir "usr" mode="0755" uid=0 gid=0
     dir "usr/bin" mode="0755" uid=0 gid=0

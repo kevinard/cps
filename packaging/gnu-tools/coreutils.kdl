@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/coreutils" publisher="canopa-utilities" version="9.12.0-0" architecture="x86_64" {
     require "system/elf-runtime"
     file "usr/bin/coreutils" mode="0755" uid=0 gid=0

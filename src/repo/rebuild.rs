@@ -162,7 +162,7 @@ pub fn export_rebuild_inputs(
     Ok(output.join("source").join(recipe_name))
 }
 
-/// Check a local rebuild against the version 3 attestation admitted by the signed catalog.
+/// Check a local rebuild against the build attestation admitted by the signed catalog.
 /// Returns the number of verified payloads.
 pub fn verify_rebuild(
     repo: &Path,

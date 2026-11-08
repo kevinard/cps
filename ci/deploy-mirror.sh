@@ -48,7 +48,11 @@ state=$repo/.ci-tuf-state.json
 if [[ -e $state || -L $state ]]; then
     [[ -f $state && ! -L $state && -O $state && $(stat -c %a -- "$state") == 600 ]] ||
         fail 'TUF publication state must be a private file owned by the signer'
-    previous=$(jq -er --arg mirror "$mirror" 'select(.mirror == $mirror) | .version' "$state") ||
+    previous=$(jq -ers --arg mirror "$mirror" '
+        select(length == 1) | .[0]
+        | select(keys == ["format", "mirror", "published", "version"] and .format == 1 and .mirror == $mirror)
+        | .version | numbers
+    ' "$state") ||
         fail 'Invalid TUF publication state or a different mirror is configured'
 elif [[ -n ${CPS_MIRROR_INITIAL_VERSION:-} ]]; then
     previous=$CPS_MIRROR_INITIAL_VERSION
@@ -66,7 +70,7 @@ version=$((previous + 1))
 
 record_state() {
     jq -n --arg mirror "$mirror" --argjson version "$version" \
-        --argjson published "$1" '{mirror: $mirror, version: $version, published: $published}' > "$state_tmp"
+        --argjson published "$1" '{format: 1, mirror: $mirror, version: $version, published: $published}' > "$state_tmp"
     sync -- "$state_tmp"
     mv -T -- "$state_tmp" "$state"
     sync -- "$repo"
@@ -122,7 +126,7 @@ stage_root "$stage/root.json" "$root_version"
 
 jq -n --arg publisher "$publisher" --rawfile tuf_root "$stage/bootstrap-root.json" \
     --arg trust_key "$(base64 -w0 -- "$stage/publisher.der")" \
-    '{schema_version: 1, publisher: $publisher, tuf_root: ($tuf_root | @base64), trust_key: $trust_key}' \
+    '{schema_version: 1, kind: "publisher-bootstrap", publisher: $publisher, tuf_root: ($tuf_root | @base64), trust_key: $trust_key}' \
     > "$stage/publisher.json"
 if [[ -e $mirror/publisher.json || -L $mirror/publisher.json ]]; then
     [[ -f $mirror/publisher.json && ! -L $mirror/publisher.json ]] &&

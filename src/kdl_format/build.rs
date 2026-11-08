@@ -10,28 +10,32 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::model::{
-    FileDigest, Manifest, PackageSpec, validate_digest, validate_name, validate_path,
+    FileDigest, MANIFEST_FORMAT, Manifest, PackageSpec, validate_digest, validate_path,
     validate_publisher,
 };
-use crate::plan::SolverRevision;
 use crate::repo::read_limited;
 
-use super::{Fields, PublisherConfig, document, one, publisher_config, schema};
+use super::{
+    Fields, MANIFEST_KIND, PublisherConfig, SCHEMA_VERSION, document, one, publisher_config,
+    schema, schema_header,
+};
 
 pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
+const RECIPE_KIND: &str = "build-recipe";
 
 pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, String)> {
     let doc = document(text)?;
-    schema(&doc)?;
+    schema(&doc, "git-package")?;
     ensure!(
         doc.nodes().len() == 3,
         "expected schema-version, package, and build in cps.kdl"
     );
-    let schema = one(&doc, "schema-version")?;
     let mut package = one(&doc, "package")?.clone();
     package.insert("publisher", publisher);
     let mut manifest = KdlDocument::new();
-    manifest.nodes_mut().extend([schema.clone(), package]);
+    manifest
+        .nodes_mut()
+        .extend([schema_header(MANIFEST_FORMAT, MANIFEST_KIND), package]);
     let manifest = super::parse_manifest(&manifest.to_string())?;
 
     let mut build = one(&doc, "build")?.clone();
@@ -42,7 +46,9 @@ pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, Str
     );
     children.nodes_mut().push(KdlNode::new("manifest"));
     let mut recipe = KdlDocument::new();
-    recipe.nodes_mut().extend([schema.clone(), build]);
+    recipe
+        .nodes_mut()
+        .extend([schema_header(SCHEMA_VERSION, RECIPE_KIND), build]);
     Ok((manifest, recipe.to_string()))
 }
 
@@ -63,7 +69,7 @@ pub(crate) fn git_toolchain_template(template: &str, config: &Path) -> Result<St
         RECIPE_LIMIT,
     )?;
     let pins = document(std::str::from_utf8(&bytes)?)?;
-    schema(&pins)?;
+    schema(&pins, "git-toolchain")?;
     ensure!(
         pins.nodes().len() == 2,
         "expected schema-version and toolchain in {}",
@@ -88,16 +94,10 @@ pub(crate) struct PublisherPin {
     pub key_sha256: String,
 }
 
-pub(crate) enum ToolchainPins {
-    Single(String),
-    Publishers(Vec<PublisherPin>),
-}
-
 pub(crate) struct BuildRecipe {
-    pub solver: Option<SolverRevision>,
     pub arch: String,
     pub epoch: u32,
-    pub toolchain: ToolchainPins,
+    pub toolchain: Vec<PublisherPin>,
     pub packages: BTreeSet<String>,
     pub manifest: String,
     pub manifest_digest: String,
@@ -111,11 +111,9 @@ impl BuildRecipe {
         let mut requested = BTreeMap::new();
         for selector in &self.packages {
             let spec = PackageSpec::parse(selector)?;
-            if let ToolchainPins::Publishers(pins) = &self.toolchain
-                && let Some(name) = spec.publisher
-            {
+            if let Some(name) = spec.publisher {
                 ensure!(
-                    pins.iter().any(|pin| pin.name == name),
+                    self.toolchain.iter().any(|pin| pin.name == name),
                     "requested toolchain publisher {name} is not pinned"
                 );
             }
@@ -235,7 +233,7 @@ pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, Publ
         .context("missing toolchain configuration directory")?
         .to_owned();
     let doc = document(std::str::from_utf8(&bytes)?)?;
-    schema(&doc)?;
+    schema(&doc, "toolchain-config")?;
     let mut publishers = BTreeMap::new();
     for node in doc.nodes() {
         match node.name().value() {
@@ -257,7 +255,7 @@ pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, Publ
 
 pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     let doc = document(text)?;
-    schema(&doc)?;
+    schema(&doc, RECIPE_KIND)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and build nodes"
@@ -270,17 +268,11 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     let children = build.children().context("build requires a child block")?;
 
     let toolchain = one(children, "toolchain")?;
-    let legacy = toolchain
-        .entries()
-        .iter()
-        .any(|entry| entry.name().is_none());
-    let fields = Fields::read(toolchain, usize::from(legacy), &["solver"], true)?;
-    let solver = match fields.string("solver")?.as_deref() {
-        None => None,
-        Some("sat-v1") => Some(SolverRevision::SatV1),
-        Some("sat-v2") => Some(SolverRevision::SatV2),
-        Some(name) => bail!("unsupported toolchain solver {name:?}"),
-    };
+    let fields = Fields::read(toolchain, 0, &["solver"], true)?;
+    ensure!(
+        fields.required_string("solver")? == "sat-v2",
+        "unsupported toolchain solver, expected sat-v2"
+    );
     let mut packages = BTreeSet::new();
     let mut pins = Vec::new();
     let mut publishers = BTreeSet::new();
@@ -292,15 +284,12 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         match node.name().value() {
             "package" => {
                 let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
-                if legacy {
-                    validate_name(&name)?;
-                }
                 ensure!(
                     packages.insert(name.clone()),
                     "duplicate toolchain package {name}"
                 );
             }
-            "publisher" if !legacy => {
+            "publisher" => {
                 let fields = Fields::read(node, 1, &["catalog", "key-sha256"], false)?;
                 let name = fields.string_arg(0)?;
                 validate_publisher(&name)?;
@@ -325,21 +314,10 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         !packages.is_empty(),
         "build requires at least one toolchain package"
     );
-    let toolchain = if legacy {
-        let catalog = fields.string_arg(0)?;
-        validate_digest(&catalog).context("invalid toolchain catalog")?;
-        ToolchainPins::Single(catalog)
-    } else {
-        ensure!(
-            !pins.is_empty(),
-            "build requires a pinned toolchain publisher"
-        );
-        ensure!(
-            solver.is_some(),
-            "publisher pins require an explicit toolchain solver"
-        );
-        ToolchainPins::Publishers(pins)
-    };
+    ensure!(
+        !pins.is_empty(),
+        "build requires a pinned toolchain publisher"
+    );
 
     let fields = Fields::read(one(children, "manifest")?, 1, &["sha256"], false)?;
     let manifest = fields.string_arg(0)?;
@@ -412,10 +390,9 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         );
     }
     let recipe = BuildRecipe {
-        solver,
         arch,
         epoch,
-        toolchain,
+        toolchain: pins,
         packages,
         manifest,
         manifest_digest,
@@ -465,13 +442,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn git_definition_extracts_a_version_one_manifest() -> Result<()> {
+        let (manifest, recipe) = git_document(
+            r#"schema-version 1 kind="git-package"
+package "test/example" version="1.0.0-0"
+build architecture="x86_64" epoch=1700000000 {
+    toolchain "default"
+    script "true"
+}
+"#,
+            "local",
+        )?;
+        assert_eq!(manifest.format, 1);
+        assert_eq!(manifest.publisher, "local");
+        schema(&document(&recipe)?, RECIPE_KIND)?;
+        Ok(())
+    }
+
+    #[test]
     fn effective_recipe_pins_option_overrides_and_preserves_default_bytes() -> Result<()> {
         let work = tempfile::tempdir()?;
         let path = work.path().join("example.build.kdl");
         let recipe = format!(
-            r#"schema-version 1
+            r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
-    toolchain "{digest}" {{ package "devel/base"; }}
+    toolchain solver="sat-v2" {{
+        publisher "seed" catalog="{digest}" key-sha256="{digest}"
+        package "devel/base"
+    }}
     manifest "nested/hello.kdl" sha256="{digest}"
     option "CFLAGS" "-O2" // compiler flags
     script "true"
@@ -479,6 +477,8 @@ build architecture="x86_64" epoch=1700000000 {{
 "#,
             digest = "0".repeat(64),
         );
+        assert!(parse(&recipe.replace("sat-v2", "sat-v1")).is_err());
+        assert!(parse(&recipe.replace(" solver=\"sat-v2\"", "")).is_err());
         std::fs::write(&path, &recipe)?;
         let options = |name: &str, value: &str| BTreeMap::from([(name.into(), value.into())]);
         let (bytes, parsed) = read_with_options(&path, &options("CFLAGS", "-O2"))?;

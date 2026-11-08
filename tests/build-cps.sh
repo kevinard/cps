@@ -102,14 +102,14 @@ rm -f -- "$work/native-rust/usr/lib/ld-linux-x86-64.so.2"
     --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
 "$cps" publish --repo runtime-seed --proto "$work/elf-runtime" --signing-key "$work/runtime-seed.der" elf-runtime.kdl
 
-printf 'schema-version 1\n' > bootstrap-toolchain.kdl
+printf 'schema-version 1 kind="toolchain-config"\n' > bootstrap-toolchain.kdl
 pins="$work/publisher-pins"
 append_toolchain_publisher "$pins" bootstrap-toolchain.kdl seed toolchain toolchain-public.der
 append_toolchain_publisher "$pins" bootstrap-toolchain.kdl canopa-runtime-seed runtime-seed runtime-seed-public.der
 toolchain_recipe="$work/toolchain-recipe"
 write_toolchain_recipe() {
     {
-        printf '    toolchain solver="sat-v1" {\n'
+        printf '    toolchain solver="sat-v2" {\n'
         cat "$pins"
         printf '        package "%s"\n' \
             "cps://seed/build/native-rust@$seed_version" \
@@ -179,24 +179,8 @@ mkdir repo
 cp builder-public.der repo/
 sqlite_recipe=$(sha sqlite.build.kdl)
 seccomp_recipe=$(sha libseccomp.build.kdl)
-verify_toolchains=
-review_bootstrap=
-review_cps=
-if (( ${cps_version##*-} >= 17 )); then
-    verify_toolchains=' verify-toolchains=#true'
-    review_bootstrap=' toolchain-config="../bootstrap-toolchain.kdl"'
-    review_cps=' toolchain-config="../toolchain.kdl"'
-fi
-archive_build_inputs=
-require_source_archives=
-publication_sources=()
-if (( ${cps_version##*-} >= 18 )); then
-    archive_build_inputs=' archive-build-inputs=#true'
-fi
-if (( ${cps_version##*-} >= 22 )); then
-    require_source_archives=' require-source-archives=#true'
-    publication_sources=(--source-cache sources)
-fi
+review_bootstrap=' toolchain-config="../bootstrap-toolchain.kdl"'
+review_cps=' toolchain-config="../toolchain.kdl"'
 write_profile() {
     local name=$1
     shift
@@ -222,8 +206,8 @@ write_policy() {
     local reviewed=${1:-}
     {
         cat <<POLICY
-schema-version 1
-publisher "canopa"$verify_toolchains$archive_build_inputs$require_source_archives {
+schema-version 1 kind="publish-policy"
+publisher "canopa" verify-toolchains=#true archive-build-inputs=#true require-source-archives=#true {
     builder-key "builder-public.der"
     approve "system/sqlite" version="$sqlite_version" sha256="$sqlite_recipe"$review_bootstrap
     approve "system/libseccomp" version="$seccomp_version" sha256="$seccomp_recipe"$review_bootstrap
@@ -246,21 +230,14 @@ POLICY
 }
 write_policy
 cat > bootstrap-release.kdl <<RELEASE
-schema-version 1
+schema-version 1 kind="publish-release"
 release "canopa" base="empty" {
     bundle "cps://canopa/system/sqlite@$sqlite_version" path="sqlite.bundle" builder-key="builder-public.der" recipe-sha256="$sqlite_recipe"
     bundle "cps://canopa/system/libseccomp@$seccomp_version" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
 }
 RELEASE
 "$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
-    "${publication_sources[@]}" bootstrap-release.kdl
-archive_sources() {
-    "$cps" repo archive-sources --repo repo --signing-key "$work/release.der" --source-cache sources "$1"
-}
-if (( ${cps_version##*-} >= 20 && ${cps_version##*-} < 22 )); then
-    archive_sources "cps://canopa/system/sqlite@$sqlite_version"
-    archive_sources "cps://canopa/system/libseccomp@$seccomp_version"
-fi
+    --source-cache sources bootstrap-release.kdl
 bootstrap_catalog=$(cat repo/current)
 cp bootstrap-toolchain.kdl toolchain.kdl
 append_toolchain_publisher "$pins" toolchain.kdl canopa repo release-public.der
@@ -287,7 +264,7 @@ cps_package=cps://canopa/system/cps@$cps_version
 final_packages=("$cps_package")
 {
     cat <<RELEASE
-schema-version 1
+schema-version 1 kind="publish-release"
 release "canopa" base="$bootstrap_catalog" {
     bundle "$cps_package" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
 RELEASE
@@ -306,10 +283,7 @@ RELEASE
     printf '}\n'
 } > release.kdl
 "$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
-    "${publication_sources[@]}" release.kdl
-if (( ${cps_version##*-} >= 20 && ${cps_version##*-} < 22 )); then
-    for package in "${final_packages[@]}"; do archive_sources "$package"; done
-fi
+    --source-cache sources release.kdl
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
     "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
@@ -321,7 +295,7 @@ if [[ -n $archive_build_inputs ]]; then
     cmp bundle/attestation.json reviewed-cps/attestation.json
 fi
 cat > image.kdl <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 release-profile "cps-runtime"
 facet "devel" #false
 publisher "canopa" {
@@ -333,10 +307,6 @@ publisher "canopa-runtime-seed" {
     trust-key "runtime-seed-public.der"
 }
 CONFIG
-if ! grep -Fq 'var/lib/cps/image' "$source_tree/src/image/mod.rs" &&
-   [[ $("$cps" image-create --help) == *image-state* ]]; then
-    printf 'image-state "legacy"\n' >> image.kdl
-fi
 "$cps" image-create --root image --config image.kdl
 if [[ -n $trust_version || -n $git_build_version ]]; then
     "$cps" plan --root image --output install.json install-profile
@@ -364,18 +334,12 @@ for library in libsqlite3.so.0 libseccomp.so.2 libc.so.6 libm.so.6 libgcc_s.so.1
     grep -F "$library => $PWD/image/usr/lib/$library (" <<< "$libraries"
 done
 "${loader[@]}" image/usr/bin/cps verify --root image --pristine
-if (( ${cps_version##*-} >= 19 )); then
-    "${loader[@]}" image/usr/bin/cps repo verify-rebuild --repo repo --publisher canopa \
-        --trust-key release-public.der --bundle bundle "$cps_package"
-fi
-if (( ${cps_version##*-} >= 20 )); then
-    for package in "${final_packages[@]}" "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"; do
-        "${loader[@]}" image/usr/bin/cps repo fetch-sources --repo repo --publisher canopa \
-            --trust-key release-public.der --source-cache recovered-sources "$package"
-    done
-    diff -r sources/sha256 recovered-sources/sha256
-fi
-if (( ${cps_version##*-} >= 21 )); then
-    "${loader[@]}" image/usr/bin/cps repo fetch-toolchain --toolchain-config toolchain.kdl build.kdl
-fi
+"${loader[@]}" image/usr/bin/cps repo verify-rebuild --repo repo --publisher canopa \
+    --trust-key release-public.der --bundle bundle "$cps_package"
+for package in "${final_packages[@]}" "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"; do
+    "${loader[@]}" image/usr/bin/cps repo fetch-sources --repo repo --publisher canopa \
+        --trust-key release-public.der --source-cache recovered-sources "$package"
+done
+diff -r sources/sha256 recovered-sources/sha256
+"${loader[@]}" image/usr/bin/cps repo fetch-toolchain --toolchain-config toolchain.kdl build.kdl
 printf 'Verified reproducible CPS build, signed provenance, and installation from Git %s\n' "$revision"

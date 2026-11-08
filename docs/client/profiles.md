@@ -1,0 +1,181 @@
+# Install or replicate a signed composition
+
+[Documentation](../README.md) · [Clients](README.md)
+
+## Images that follow a signed release profile
+
+Add `release-profile "desktop"` to the image KDL to follow that profile in the
+first publisher's signed catalog. Configure the same architecture, facets, and
+publisher order as the profile. Each companion repository must have the signed
+catalog referenced by the profile. The signed publishers keep their signed
+membership and order. Repository paths can be relocated in place.
+
+On an image with no installed packages, use the profile's checked roots and
+dependencies directly.
+
+```sh
+cps plan --root image --output install.json install-profile
+cps fetch --root image --plan install.json  # for an index-only mirror cache
+cps apply --root image install.json
+```
+
+CPS checks every manifest digest against the signed composition, then
+checks dependencies, paths, and configured build trust before using the
+normal transaction. It marks the profile roots as explicitly installed.
+The image records the manifest digests of the applied composition. Local
+installs, exact installs, removals, and dependency cleanup preserve that
+composition. Exact installs reconcile local additions around the protected
+packages. Only a signed profile update can replace the protected set.
+
+After installing the signed composition, you can add a publisher from an HTTPS
+mirror using its preinstalled TUF root at `/etc/cps/tuf-root.json`. Provision the
+root through a trusted channel, such as the signed installer. Use
+`--tuf-root PATH` to select another locally trusted root.
+
+```sh
+sudo cps publisher add https://packages.example.org/extras/
+sudo cps install cps://extras/apps/editor
+sudo cps upgrade
+```
+
+CPS verifies the mirror's TUF metadata with the local root, then fetches the
+publisher name and public key as authenticated targets. It displays the
+verified identity and asks for confirmation. After confirmation, CPS checks
+the catalog signature and saves the trust material for later refreshes.
+
+For non-interactive setup or independently provisioned trust, supply the
+TUF root metadata and CPS publisher key explicitly.
+
+```sh
+sudo cps publisher add extras --url https://packages.example.org/extras/ \
+    --tuf-root /etc/cps/keys/extras-root.json \
+    --trust-key /etc/cps/keys/extras.der
+```
+
+The URL must serve `metadata/` and `targets/` beneath it. CPS verifies
+and registers the mirror in one command, and `upgrade` refreshes it
+automatically using the saved trust root. The default cache lives in
+`repositories/NAME` under the configured Btrfs environments directory so
+it is available across boots. Use `--cache PATH` for a different location
+or when adding to an offline image. Use `--no-refresh` on `upgrade` to
+use already cached catalogs.
+
+For a local repository or a manually managed mirror cache, use `--repo`.
+
+```sh
+sudo cps publisher add extras --repo /var/lib/cps/extras \
+    --trust-key /etc/cps/keys/extras.der
+```
+
+The image stores local publishers after the signed ones. `publisher prefer`
+reorders local publishers within that group. `publisher remove` removes a
+local publisher once its packages have been removed. A local package can
+depend on the protected base, and CPS rejects package selections that would
+replace a protected manifest or conflict with its files. On an installed
+Btrfs system, publisher membership edits use the boot configuration in
+`/etc/cps/image.kdl` and apply to the running known-good environment.
+
+Keep the signed publishers and their mirror definitions in the profile's
+image configuration. CPS refreshes URL-added publishers independently of
+the signed profile sync. A profile update uses the signed companion pins
+and each local publisher's current verified catalog. For manually managed
+mirrors, run `repo sync --image /` with the mirror options to check the
+new catalog against the installed system.
+
+To install a particular published release, set `bootstrap-catalog` to the
+primary publisher's signed catalog digest.
+
+```kdl
+release-profile "desktop" bootstrap-catalog="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+Keep that catalog and its signed companion catalogs in the configured local
+repositories. With mirrors, `repo sync-profile --config image.kdl` requires
+both the current and bootstrap catalog sets to be advertised as current or
+retained TUF targets. It verifies both compositions before promoting the
+current release. CPS uses the bootstrap pin when creating the image,
+looking up available packages, and planning `install-profile`. Cache
+pruning with `--keep-image` retains the pinned catalogs' payloads. The first
+committed `install-profile` consumes the pin, and subsequent plans follow the
+current signed release.
+
+For reproducible release images, also set `image-id` to the release image's
+UUID. This fixes the initial image identity used in saved plans, ext4 exports,
+and boot entries.
+
+```kdl
+image-id "a47593c2-e985-42d2-92b6-44c7057e1e96"
+```
+
+To compare independent builds, use the same signed bootstrap catalog, image
+configuration, canonical repository paths, builder UID and GID, and
+`SOURCE_DATE_EPOCH`. Use the same GPT template for byte-identical disk
+images. A staged upgrade receives a fresh image identity.
+
+On a profiled image with installed packages, `plan update` reconciles the
+image to the current signed composition plus the packages the operator
+explicitly requested and their dependencies. A previous profile default
+leaves the image if the new profile and local packages no longer require it.
+The package can remain published for manual installation. Use
+`plan mark explicit` to keep an installed default as a local choice.
+`plan exact-install` replaces the local choices while preserving the signed
+composition. Signed obsoletion rules still apply. A profile update fails if
+the signed set requires a downgrade or a publisher switch.
+
+Save and apply the plan normally, or stage it in a boot environment.
+The image tracks local requests separately from the signed profile roots.
+
+Available-package queries and new plans use the primary publisher's current
+catalog and the companion digests it signs. Saved plans use their original
+primary catalog and must match the companion digests signed in that catalog.
+Local history keeps those plans usable after a release advances. Offline
+installed-package queries, removal, and repair use committed image state.
+
+## Provisioning the same composition on another machine
+
+```sh
+cps image-lock --root installed > desktop.lock.json
+cps image-create --root replica --config image.kdl --lock desktop.lock.json
+cps plan --root replica --output install.json install-lock desktop.lock.json
+cps fetch --root replica --plan install.json
+cps apply --root replica install.json
+cps image-diff installed replica
+```
+
+An image lock is a JSON document with `"format": 1` and
+`"kind": "image-lock"`. It records the exact package composition, publisher order and key
+fingerprints, catalog pins, architecture, facets, and local package
+requests. The replica gets a fresh image identity. The target's KDL
+configuration supplies its repository locations, trust keys, and build
+trust policies. Give it the locked architecture, facets, profile name,
+and publisher order, including any locally added publishers. Retain the
+pinned signed catalogs and their selected payloads in the configured
+repositories or caches.
+
+Capture a profiled image after its applied base matches its archived
+primary catalog. If a local install advanced that catalog to a different
+profile composition, apply the signed profile update before capturing.
+A lock can provision a fresh image from historical catalogs. Future
+updates use the installed image's usual catalog checkpoints and profile
+policy.
+
+For disconnected provisioning, export the lock together with the repository
+objects it needs. Populate the source caches with the selected package
+payloads before exporting.
+
+```sh
+cps image-lock --root installed --export desktop.bundle
+cps image-create --root replica --config image.kdl --bundle desktop.bundle
+cps plan --root replica --output install.json install-lock desktop.bundle/image.lock.json
+cps apply --root replica install.json
+```
+
+Export verifies every copied object and publishes the new directory only
+after the copy succeeds. The bundle contains the pinned signed catalogs,
+their manifest indexes, and the selected attestations and payloads. Its
+repositories supply the historical pins. The target configuration still
+supplies publisher keys and build trust. Keep the bundle at a stable path
+for offline repair, or configure regular repositories to resume updates.
+Before initializing the requested root, `image-create --bundle` replays
+the lock with the local trust policy and reports missing or damaged
+payloads from the bundle.

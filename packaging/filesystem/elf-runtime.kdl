@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/elf-runtime" publisher="canopa-usr-base" version="1.0.0-1" {
     require "system/filesystem"
     file "usr/lib/ld-linux-x86-64.so.2" mode="0755" uid=0 gid=0

@@ -19,10 +19,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     boot::kernel::{self, Artifacts},
     image::{
-        Image, Installed, Managed, ProfileIntent, Settings, State, StateLayout,
-        history::TransactionDetails, lock::ImageLock, publisher_generation_is_initial, root::Root,
+        CONFIG_UPDATES_DIRECTORY, IMAGE_FORMAT, Image, Installed, Managed, ProfileIntent,
+        STATE_DIRECTORY, Settings, State, history::TransactionDetails, lock::ImageLock,
+        publisher_generation_is_initial, root::Root,
     },
-    model::{FORMAT, Node, PackageSpec, digest, validate_name, validate_publisher},
+    model::{Node, PackageSpec, digest, validate_name, validate_publisher},
     repo::{BuildReceipt, Published, ReleaseAdvisory},
     systemd::{self, Action as SystemdAction},
 };
@@ -42,20 +43,11 @@ pub(crate) use resolve::{
 pub use update::{HeldBackUpdate, PhasedUpdateDeferred};
 
 fn is_config_update(path: &str) -> bool {
-    [StateLayout::Legacy, StateLayout::VarLib]
-        .iter()
-        .any(|layout| {
-            path.strip_prefix(layout.config_updates())
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
+    path.strip_prefix(CONFIG_UPDATES_DIRECTORY)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum SolverRevision {
-    SatV1,
-    SatV2,
-}
+const PLAN_FORMAT: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -178,23 +170,18 @@ struct Transfer {
 #[serde(deny_unknown_fields)]
 pub struct Plan {
     format: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) solver: Option<SolverRevision>,
+    // Required to distinguish the current schema from development format 1 plans.
+    pub(crate) install_recommends: bool,
     pub(crate) image: String,
     pub(crate) base_revision: u64,
     #[serde(default, skip_serializing_if = "publisher_generation_is_initial")]
     publisher_generation: u64,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    prune_directories: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) track_profile_intent: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     force_phased_update: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     git_updates: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     deferred_publishers: BTreeSet<String>,
-    pub(crate) catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
     pub(crate) request: Request,
@@ -276,22 +263,18 @@ impl Plan {
     fn with_selection(
         settings: &Settings,
         request: Request,
-        saved: Option<&Plan>,
-        solver: Option<SolverRevision>,
+        install_recommends: bool,
         installed: &BTreeMap<String, Installed>,
     ) -> Self {
         Self {
-            format: FORMAT,
-            solver,
+            format: PLAN_FORMAT,
+            install_recommends,
             image: settings.id.clone(),
             base_revision: settings.revision,
             publisher_generation: settings.publisher_generation,
-            prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
-            track_profile_intent: false,
             force_phased_update: false,
             git_updates: Vec::new(),
             deferred_publishers: BTreeSet::new(),
-            catalog: None,
             catalogs: BTreeMap::new(),
             request,
             selected: installed
@@ -311,11 +294,7 @@ impl Plan {
         }
     }
 
-    pub(crate) fn transaction_details(&self, state: &State) -> TransactionDetails {
-        let mut catalogs = self.catalogs.clone();
-        if let Some(hash) = &self.catalog {
-            catalogs.insert(state.publishers.as_slice()[0].name.clone(), hash.clone());
-        }
+    pub(crate) fn transaction_details(&self) -> TransactionDetails {
         TransactionDetails {
             base_image: self.image.clone(),
             base_revision: self.base_revision,
@@ -324,7 +303,7 @@ impl Plan {
             package_changes: self.package_changes.clone(),
             intent_changes: self.intent_changes.clone(),
             freeze_changes: self.freeze_changes.clone(),
-            catalogs,
+            catalogs: self.catalogs.clone(),
             planned_path_changes: self
                 .writes
                 .iter()
@@ -504,7 +483,7 @@ impl Plan {
     }
 
     pub(crate) fn id(&self) -> Result<String> {
-        ensure!(self.format == FORMAT, "unsupported plan format");
+        ensure!(self.format == PLAN_FORMAT, "unsupported plan format");
         Ok(digest(&serde_json::to_vec(self)?))
     }
 
@@ -527,11 +506,10 @@ impl Plan {
                 && after.publisher_generation == before.publisher_generation
                 && after.boot_parent == before.boot_parent
                 && after.arch == before.arch
-                && after.state_layout == before.state_layout
                 && after.uid == before.uid
                 && after.gid == before.gid
                 && next.publishers == current.publishers
-                && after.format == next.publishers.image_format(after),
+                && after.format == IMAGE_FORMAT,
             "pending state does not match the image identity or transaction revision"
         );
         ensure!(
@@ -578,7 +556,7 @@ impl Plan {
         Ok(())
     }
 
-    pub(crate) fn config_payload(&self, layout: StateLayout) -> Option<(String, &Node)> {
+    pub(crate) fn config_payload(&self) -> Option<(String, &Node)> {
         let Request::ResolveConfig {
             path,
             take: ConfigChoice::Vendor,
@@ -591,10 +569,7 @@ impl Plan {
             .writes
             .iter()
             .find(|write| write.path == *path && write.replaces_file())?;
-        Some((
-            config::vendor_copy(layout, revision, path),
-            write.after.as_ref()?,
-        ))
+        Some((config::vendor_copy(revision, path), write.after.as_ref()?))
     }
 }
 
@@ -735,7 +710,7 @@ fn plan_with_state(
     diagnostics: Option<UpdateDiagnostics<'_>>,
     selection: UpdateSelection<'_>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
-    let solver = if options.install_recommends
+    let install_recommends = options.install_recommends
         && matches!(
             request,
             Request::Install { .. }
@@ -743,17 +718,13 @@ fn plan_with_state(
                 | Request::Update
                 | Request::UpdateProfile
                 | Request::Autoremove
-        ) {
-        SolverRevision::SatV2
-    } else {
-        SolverRevision::SatV1
-    };
+        );
     build_with_update_diagnostics(
         image,
         state,
         request,
         None,
-        Some(solver),
+        install_recommends,
         options.force_phased_update,
         diagnostics,
         selection,
@@ -766,7 +737,7 @@ fn resolve_local<'a>(
     requested: &BTreeMap<&'a str, PackageSpec<'a>>,
     update: bool,
     exact: bool,
-    solver: Option<SolverRevision>,
+    install_recommends: bool,
 ) -> Result<(BTreeMap<String, Installed>, BTreeMap<String, Managed>)> {
     let mut pinned = requested.clone();
     for name in state.settings.profile_packages.keys() {
@@ -804,8 +775,8 @@ fn resolve_local<'a>(
         } else {
             Retention::All
         },
-        solver,
-        |installed| composition_paths(&state.settings, installed, solver),
+        install_recommends,
+        |installed| composition_paths(&state.settings, installed),
     )?;
     state.settings.check_profile_packages(&installed)?;
     for name in state.settings.profile_packages.keys() {
@@ -820,12 +791,9 @@ fn resolve_local<'a>(
 fn composition_paths(
     settings: &Settings,
     installed: &BTreeMap<String, Installed>,
-    solver: Option<SolverRevision>,
 ) -> Result<BTreeMap<String, Managed>> {
     let paths = effective_paths(settings, installed)?;
-    if solver == Some(SolverRevision::SatV2) {
-        kernel::selected(installed, &paths)?;
-    }
+    kernel::selected(installed, &paths)?;
     Ok(paths)
 }
 
@@ -834,14 +802,14 @@ pub(crate) fn build(
     state: State,
     request: Request,
     saved: Option<&Plan>,
-    solver: Option<SolverRevision>,
+    install_recommends: bool,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     build_with_update_diagnostics(
         image,
         state,
         request,
         saved,
-        solver,
+        install_recommends,
         saved.is_some_and(|plan| plan.force_phased_update),
         None,
         UpdateSelection::default(),
@@ -853,7 +821,7 @@ fn build_with_update_diagnostics(
     mut state: State,
     request: Request,
     saved: Option<&Plan>,
-    solver: Option<SolverRevision>,
+    install_recommends: bool,
     force_phased_update: bool,
     mut diagnostics: Option<UpdateDiagnostics<'_>>,
     selection: UpdateSelection<'_>,
@@ -921,10 +889,11 @@ fn build_with_update_diagnostics(
     );
     if let Request::Mark { choice, packages } = &request {
         let (installed, intent_changes) = intent::mark(image, &mut state, *choice, packages)?;
-        let mut plan = Plan::with_selection(&state.settings, request, saved, solver, &installed);
+        let mut plan =
+            Plan::with_selection(&state.settings, request, install_recommends, &installed);
         plan.intent_changes = intent_changes;
         state.settings.revision = state.settings.next_revision()?;
-        state.settings.format = state.publishers.image_format(&state.settings);
+
         state.installed = installed;
         return Ok((plan, state, Vec::new()));
     }
@@ -935,19 +904,22 @@ fn build_with_update_diagnostics(
         );
         image.verify_catalog_archives(&state)?;
         let (freezes, changes) = freeze::changes(&state, &request)?;
-        let mut plan =
-            Plan::with_selection(&state.settings, request, saved, solver, &state.installed);
+        let mut plan = Plan::with_selection(
+            &state.settings,
+            request,
+            install_recommends,
+            &state.installed,
+        );
         plan.freeze_changes = changes;
         state.settings.freezes = freezes;
         state.settings.revision = state.settings.next_revision()?;
-        state.settings.format = state.publishers.image_format(&state.settings);
+
         return Ok((plan, state, Vec::new()));
     }
     let mut catalogs = catalogs::Catalogs::default();
     let mut receipts = Vec::new();
     let mut next_facets = None;
     let mut update_profile = matches!(request, Request::UpdateProfile);
-    let mut track_profile_intent = false;
     let (mut installed, paths) = match &request {
         Request::ChangeFacet { facets } => {
             ensure!(
@@ -960,10 +932,6 @@ fn build_with_update_diagnostics(
                 "path ownership index differs from installed manifests"
             );
             image.verify_catalog_archives(&state)?;
-            if state.settings.config_updates.is_none() {
-                state.settings.config_updates =
-                    Some(config::updates(root, &state.settings, &state.paths)?);
-            }
             let mut settings = state.settings.facets.clone();
             for (name, value) in facets {
                 validate_publisher(name).with_context(|| format!("invalid facet {name:?}"))?;
@@ -1068,7 +1036,7 @@ fn build_with_update_diagnostics(
                 &requested,
                 false,
                 true,
-                solver,
+                install_recommends,
             )?
         }
         _ => {
@@ -1136,26 +1104,18 @@ fn build_with_update_diagnostics(
                                 && target.version.as_ref() == Some(&manifest.version)
                         })
             });
-            update_profile |= saved.is_none()
-                && matches!(request, Request::Update)
+            update_profile |= matches!(request, Request::Update)
                 && !state.installed.is_empty()
-                && catalogs
-                    .profile
-                    .as_ref()
-                    .is_some_and(|profile| !profile.composition.is_empty());
+                && catalogs.profile.as_ref().is_some();
             if let Some(diagnostics) = &mut diagnostics {
                 // Keep the known candidates available even if resolution fails.
                 *diagnostics.held_back = update::candidates(&state, &catalogs, update_profile);
             }
-            let locked_profile = lock.is_some_and(|lock| lock.profile.is_some());
-            track_profile_intent = locked_profile
-                || saved.map_or(
-                    update_profile
-                        || (!requested.is_empty() && !state.settings.profile_packages.is_empty()),
-                    |plan| plan.track_profile_intent,
-                );
+            let track_profile_intent = install_profile
+                || update_profile
+                || (!requested.is_empty() && !state.settings.profile_packages.is_empty());
             if track_profile_intent && state.settings.profile_intent.is_none() {
-                state.settings.profile_intent = Some(image.reconstruct_profile_intent(&state)?);
+                state.settings.profile_intent = Some(Image::profile_intent(&state));
             }
             catalogs.renames.check_freezes(&state.settings.freezes)?;
             catalogs.renames.check_profile(
@@ -1188,18 +1148,14 @@ fn build_with_update_diagnostics(
                         .profile
                         .as_ref()
                         .context("missing signed release profile")?;
-                    ensure!(
-                        !profile.composition.is_empty(),
-                        "signed release profile has no recorded composition"
-                    );
                     catalogs.candidates.update_profile(
                         &state.installed,
                         profile,
                         &state.settings.freezes,
                         retained.as_ref(),
                         requirements,
-                        solver,
-                        |installed| composition_paths(&state.settings, installed, solver),
+                        install_recommends,
+                        |installed| composition_paths(&state.settings, installed),
                     )
                 } else {
                     resolve_local(
@@ -1213,7 +1169,7 @@ fn build_with_update_diagnostics(
                         requirements,
                         matches!(request, Request::Update),
                         matches!(request, Request::ExactInstall { .. }),
-                        solver,
+                        install_recommends,
                     )
                 }
             };
@@ -1221,10 +1177,6 @@ fn build_with_update_diagnostics(
                 let mut installed = lock.replay(&catalogs.candidates.packages)?;
                 state.settings.mediators.clone_from(&lock.mediators);
                 if let Some(profile) = &catalogs.profile {
-                    ensure!(
-                        !profile.composition.is_empty(),
-                        "locked release profile has no signed composition"
-                    );
                     state
                         .settings
                         .profile_packages
@@ -1244,18 +1196,13 @@ fn build_with_update_diagnostics(
                 }
                 resolve::check(&installed).context("checking dependencies of the locked image")?;
                 freeze::check(&state.settings.freezes, &installed)?;
-                let paths =
-                    composition_paths(&state.settings, &installed, Some(SolverRevision::SatV2))?;
+                let paths = composition_paths(&state.settings, &installed)?;
                 (installed, paths)
             } else if install_profile {
                 let profile = catalogs
                     .profile
                     .as_ref()
                     .context("missing signed release profile")?;
-                ensure!(
-                    !profile.composition.is_empty(),
-                    "signed release profile has no recorded composition"
-                );
                 let installed = catalogs.candidates.replay(profile)?;
                 freeze::check(&state.settings.freezes, &installed)?;
                 let paths = effective_paths(&state.settings, &installed)?;
@@ -1325,8 +1272,6 @@ fn build_with_update_diagnostics(
                     .extend(requested.keys().map(|name| (*name).to_owned()));
             }
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
-            state.settings.catalog_archives = true;
-            state.settings.archived_profile_catalog = None;
             (installed, paths)
         }
     };
@@ -1334,17 +1279,6 @@ fn build_with_update_diagnostics(
         intent.local.retain(|name| installed.contains_key(name));
         for (name, package) in &mut installed {
             package.explicit = intent.roots.contains(name) || intent.local.contains(name);
-        }
-        // Preserve the old image format when the archived signed roots and
-        // explicit marks can reconstruct both sets on their own.
-        if track_profile_intent
-            && intent.roots.is_disjoint(&intent.local)
-            && catalogs.profile.as_ref().is_some_and(|profile| {
-                profile.composition == state.settings.profile_packages
-                    && profile.roots.keys().eq(&intent.roots)
-            })
-        {
-            state.settings.profile_intent = None;
         }
     }
     freeze::check(&state.settings.freezes, &installed)?;
@@ -1361,11 +1295,9 @@ fn build_with_update_diagnostics(
         kernel::selected(&installed, &paths)?,
     )?;
     let mut plan = Plan {
-        track_profile_intent,
         force_phased_update,
         git_updates: git_updates.to_vec(),
         deferred_publishers: deferred_publishers.clone(),
-        catalog: catalogs.legacy,
         catalogs: catalogs.pins,
         systemd: systemd::plan_actions(&state, &installed, &paths),
         kernel_install,
@@ -1376,8 +1308,7 @@ fn build_with_update_diagnostics(
             } else {
                 request
             },
-            saved,
-            solver,
+            install_recommends,
             &installed,
         )
     };
@@ -1475,11 +1406,10 @@ fn build_with_update_diagnostics(
             continue;
         }
         let mut retired_update = None;
-        if let Some(updates) = &mut state.settings.config_updates
-            && (!after.is_some_and(|target| target.preserve)
-                || before.map(|old| &old.node) != after.map(|new| &new.node))
+        if !after.is_some_and(|target| target.preserve)
+            || before.map(|old| &old.node) != after.map(|new| &new.node)
         {
-            retired_update = updates.remove(path);
+            retired_update = state.settings.config_updates.remove(path);
         }
         if let (Some(old), Some(new)) = (before, after) {
             check_path_type(path, old, new)?;
@@ -1554,8 +1484,7 @@ fn build_with_update_diagnostics(
                 }
             }
             None if before.is_some_and(|old| old.node.is_dir()) => {
-                if plan.prune_directories
-                    && state.settings.created_directories.contains(path)
+                if state.settings.created_directories.contains(path)
                     && observed.as_ref() == before.map(|old| &old.node)
                 {
                     None
@@ -1637,7 +1566,7 @@ fn build_with_update_diagnostics(
         state.settings.facets = facets;
     }
     config::retain_disabled(&mut state.settings, &installed, &paths);
-    state.settings.format = state.publishers.image_format(&state.settings);
+
     state
         .settings
         .created_directories
@@ -1791,8 +1720,8 @@ fn requested_names(packages: &[String]) -> Result<BTreeSet<String>> {
     Ok(packages.iter().cloned().collect())
 }
 
-pub(crate) fn config_update_prefix(layout: StateLayout, revision: u64) -> String {
-    format!("{}/{revision}/", layout.config_updates())
+pub(crate) fn config_update_prefix(revision: u64) -> String {
+    format!("{CONFIG_UPDATES_DIRECTORY}/{revision}/")
 }
 
 fn stage_config(
@@ -1803,12 +1732,9 @@ fn stage_config(
     node: &Node,
     writes: &mut BTreeMap<String, Write>,
 ) -> Result<()> {
-    if let Some(updates) = &mut settings.config_updates {
-        updates.insert(path.to_owned(), revision);
-    }
-    let layout = settings.state_layout;
-    let path = config::vendor_copy(layout, revision, path);
-    let depth = layout.directory().split('/').count();
+    settings.config_updates.insert(path.to_owned(), revision);
+    let path = config::vendor_copy(revision, path);
+    let depth = STATE_DIRECTORY.split('/').count();
     for (index, _) in path.match_indices('/').skip(depth) {
         let parent = &path[..index];
         if !writes.contains_key(parent) {

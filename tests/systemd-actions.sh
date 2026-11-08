@@ -50,7 +50,7 @@ UNIT
 write_unit "$existing" 'Existing disabled service'
 printf '[Unit]\nDescription=Fixture target\n' > proto/usr/lib/systemd/system/multi-user.target
 cat > package.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/systemd-actions" publisher="canopa" version="1.0.0-0" {
     file "usr/lib/systemd/system/$existing" mode="0644" uid=$uid gid=$gid
     file "usr/lib/systemd/system/multi-user.target" mode="0644" uid=$uid gid=$gid
@@ -81,7 +81,7 @@ printf 'enable %s*\ndisable *\n' "$scope" > proto/usr/lib/systemd/system-preset/
 for unit in "$existing" "$enabled" "$masked" "$denied"; do write_unit "$unit" "Version 2 of $unit"; done
 : > proto/etc/passwd
 cat > package.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/systemd-actions" publisher="canopa" version="2.0.0-0" {
     file "etc/passwd" mode="0644" uid=$uid gid=$gid preserve=#true
     file "usr/lib/sysusers.d/$scope.conf" mode="0644" uid=$uid gid=$gid
@@ -213,28 +213,17 @@ test "$(sha256sum /etc/passwd /etc/group)" = "$host_accounts"
 echo 'Verified sysusers, tmpfiles, and presets only changed the staged root'
 
 mv repo-offline repo
-# A retired vendor unit must lose links created by its preset. Older images
-# may still contain the dangling link, which must not override a new preset.
+# A retired vendor unit must lose links created by its preset.
 "$cps" plan --root staged --output remove.json remove test/systemd-actions
 "$cps" apply --root staged remove.json
 test ! -e "staged/usr/lib/systemd/system/$enabled"
 test ! -L "staged/$wants/$enabled"
 test "$(readlink "staged/etc/systemd/system/$masked")" = /dev/null
-"$cps" image-create --root legacy --repo repo --publisher canopa --trust-key public.der
-mkdir -p "legacy/$wants" legacy/etc/systemd/system-preset
-ln -s "/usr/lib/systemd/system/$enabled" "legacy/$wants/$enabled"
-ln -s /dev/null "legacy/etc/systemd/system/$masked"
-printf 'disable %s\n' "$enabled" > legacy/etc/systemd/system-preset/00-local.preset
-"$cps" plan --root legacy --output reinstall.json install test/systemd-actions
-"$cps" apply --root legacy reinstall.json
-test ! -L "legacy/$wants/$enabled"
-test "$(readlink "legacy/etc/systemd/system/$masked")" = /dev/null
-"$cps" verify --root legacy
 
 facet_rule="$scope-facet.conf"
 printf 'd /var/lib/%s-facet 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$facet_rule"
 cat > package.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/optional-tmpfiles" publisher="canopa" version="1.0.0-0" {
     file "usr/lib/tmpfiles.d/$facet_rule" mode="0644" uid=$uid gid=$gid facet="optional"
     tmpfiles "$facet_rule"

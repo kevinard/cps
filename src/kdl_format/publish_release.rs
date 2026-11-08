@@ -41,7 +41,7 @@ fn path(value: String) -> Result<PathBuf> {
 
 pub(crate) fn parse(text: &str) -> Result<Release> {
     let doc = document(text)?;
-    schema(&doc)?;
+    schema(&doc, "publish-release")?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and release nodes"

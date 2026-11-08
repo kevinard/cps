@@ -17,7 +17,7 @@ while read -r name upstream; do
         "imports/$name" > generated.kdl
     grep -F "version=\"$upstream\"" generated.kdl
     cat > package.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "imports/$name" publisher="imports" version="$upstream" upstream-version="$upstream" {
     file "$path" mode="0644" uid=$(id -u) gid=$(id -g)
 }
@@ -36,7 +36,7 @@ FIXTURES
 
 for version in '3.0.0~rc2-1' '3.0.0~rc10-1' '3.0.0-1'; do
     cat > package.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "imports/release-candidate" publisher="imports" version="$version" {
     file "usr/share/imports/release-candidate" mode="0644" uid=$(id -u) gid=$(id -g)
 }
@@ -45,7 +45,7 @@ MANIFEST
 done
 
 cat > consumer.kdl <<'MANIFEST'
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "imports/consumer" publisher="imports" version="1.0" {
     require "imports/release-candidate" version=">=3.0.0~rc1-1, <3.0.0-1"
 }
@@ -53,7 +53,7 @@ MANIFEST
 "$cps" publish --repo repo --proto proto --signing-key private.der consumer.kdl
 
 cat > architecture.kdl <<'MANIFEST'
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "imports/arch" publisher="imports" version="1.0.0-0" architecture="x86_64"
 MANIFEST
 "$cps" publish --repo repo --proto proto --signing-key private.der architecture.kdl

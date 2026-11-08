@@ -3,7 +3,6 @@ set -euo pipefail
 
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cps=$(realpath -- "${CPS_TEST_BINARY:-"$project/target/debug/cps"}")
-baseline=$(realpath -- "${CPS_TEST_PREVIOUS_BINARY:-$cps}")
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
@@ -14,16 +13,16 @@ mkdir proto
 for name in one two; do
     echo "$name" > "proto/$name"
     cat > package.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/$name" publisher="test" version="1.0.0-0" {
     file "$name" mode="0644" uid=$(id -u) gid=$(id -g)
 }
 MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der package.kdl
 done
-"$baseline" image-create --root image --repo repo --publisher test --trust-key public.der
+"$cps" image-create --root image --repo repo --publisher test --trust-key public.der
 "$cps" image-create --root other --repo repo --publisher test --trust-key public.der
-"$baseline" plan --root image --output one.json install test/one
+"$cps" plan --root image --output one.json install test/one
 "$cps" plan --root image --output two.json install test/two
 
 progress() {

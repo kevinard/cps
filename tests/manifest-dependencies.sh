@@ -12,7 +12,7 @@ for publisher in runtime tools; do
     openssl pkey -inform DER -in "$publisher.der" -pubout -outform DER -out "$publisher-public.der"
 done
 cat > image.kdl <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 architecture "$(uname -m)"
 publisher "runtime" {
     repository "runtime-repo"

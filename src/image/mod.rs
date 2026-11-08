@@ -27,66 +27,16 @@ use crate::{
     attestation::BuildTrust,
     git_install::GitSource,
     kdl_format::{ImageDefinition, PublisherConfig, read_image_definition},
-    model::{FORMAT, Node, validate_digest, validate_name, validate_publisher},
+    model::{Node, validate_digest, validate_name, validate_publisher},
     repo::{BuildReceipt, CatalogCheckpoint, Published, canonical_repo, catalog_index, read_key},
 };
 
-// Earlier binaries must reject protected images instead of ignoring build trust.
-const BUILD_TRUST_IMAGE_FORMAT: u32 = 2;
-// Older binaries must reject an image before they can ignore its bootstrap pin.
-const BOOTSTRAP_IMAGE_FORMAT: u32 = 3;
-// Older writers would discard the catalog checkpoints.
-const CHECKPOINT_IMAGE_FORMAT: u32 = 4;
-// Older writers would discard the installed profile's package requirements.
-const PROFILE_IMAGE_FORMAT: u32 = 5;
-// Older writers would advance checkpoints without keeping the catalogs.
-const CATALOG_ARCHIVE_IMAGE_FORMAT: u32 = 6;
-// Older writers would lose the history of locally preserved disabled facets.
-const DORMANT_CONFIG_IMAGE_FORMAT: u32 = 7;
-// Older writers cannot preserve the distinction between profile and operator roots.
-const PROFILE_INTENT_IMAGE_FORMAT: u32 = 8;
-// Older writers do not enforce persistent package version constraints.
-const FREEZE_IMAGE_FORMAT: u32 = 9;
-// Older clients cannot verify a boot entry after a live package transaction.
-const LIVE_IMAGE_FORMAT: u32 = 10;
-// Older clients interpret every publisher in a profiled image as signed.
-const LOCAL_PUBLISHER_IMAGE_FORMAT: u32 = 11;
-const GIT_PUBLISHER_IMAGE_FORMAT: u32 = 12;
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum StateLayout {
-    #[default]
-    Legacy,
-    VarLib,
-}
-
-impl StateLayout {
-    fn is_legacy(&self) -> bool {
-        *self == Self::Legacy
-    }
-
-    pub(crate) fn directory(self) -> &'static str {
-        match self {
-            Self::Legacy => ".cps",
-            Self::VarLib => "var/lib/cps/image",
-        }
-    }
-
-    pub(crate) fn ancestors(self) -> &'static [&'static str] {
-        match self {
-            Self::Legacy => &[],
-            Self::VarLib => &["var", "var/lib", "var/lib/cps"],
-        }
-    }
-
-    pub(crate) fn config_updates(self) -> &'static str {
-        match self {
-            Self::Legacy => ".cps/config-updates",
-            Self::VarLib => "var/lib/cps/image/config-updates",
-        }
-    }
-}
+pub(crate) const IMAGE_FORMAT: u32 = 1;
+// Development databases also used format 1 but did not set an application ID.
+const IMAGE_APPLICATION_ID: i32 = i32::from_be_bytes(*b"CPSI");
+pub(crate) const STATE_DIRECTORY: &str = "var/lib/cps/image";
+pub(crate) const STATE_ANCESTORS: &[&str] = &["var", "var/lib", "var/lib/cps"];
+pub(crate) const CONFIG_UPDATES_DIRECTORY: &str = "var/lib/cps/image/config-updates";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +58,7 @@ pub(crate) struct DormantConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub format: u32,
     pub id: String,
@@ -115,8 +66,6 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "publisher_generation_is_initial")]
     pub publisher_generation: u64,
     pub arch: String,
-    #[serde(default, skip_serializing_if = "StateLayout::is_legacy")]
-    pub(crate) state_layout: StateLayout,
     pub facets: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) mediators: BTreeMap<String, String>,
@@ -130,24 +79,13 @@ pub struct Settings {
     pub(crate) boot_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bootstrap_catalog: Option<String>,
-    #[serde(
-        default,
-        rename = "build_profile_catalog",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) archived_profile_catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalog_checkpoints: BTreeMap<String, CatalogCheckpoint>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) catalog_archives: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) profile_packages: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) profile_intent: Option<ProfileIntent>,
-    // Absent on images that predate tracking. Their proposals are discovered
-    // from the saved vendor copies the first time they are reviewed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) config_updates: Option<BTreeMap<String, u64>>,
+    pub(crate) config_updates: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) dormant_configs: BTreeMap<String, DormantConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -174,7 +112,7 @@ impl BootParent {
 
 impl Settings {
     pub(crate) fn check_state_paths(&self, paths: &BTreeMap<String, Managed>) -> Result<()> {
-        let directory = self.state_layout.directory();
+        let directory = STATE_DIRECTORY;
         let prefix = format!("{directory}/");
         ensure!(
             !paths.contains_key(directory)
@@ -184,7 +122,7 @@ impl Settings {
                     .is_some_and(|(path, _)| path.starts_with(&prefix)),
             "reserved image state path {directory}"
         );
-        for &ancestor in self.state_layout.ancestors() {
+        for &ancestor in STATE_ANCESTORS {
             if let Some(managed) = paths.get(ancestor) {
                 ensure!(
                     matches!(managed.node, Node::Dir { mode, uid, .. } if uid == self.uid && mode & 0o022 == 0),
@@ -242,9 +180,13 @@ impl Settings {
         &self,
         installed: &BTreeMap<String, Installed>,
     ) -> Result<()> {
+        ensure!(
+            self.profile_packages.is_empty() == self.profile_intent.is_none(),
+            "installed signed profiles require recorded package roots"
+        );
         if let Some(intent) = &self.profile_intent {
             ensure!(
-                !self.profile_packages.is_empty()
+                !intent.roots.is_empty()
                     && intent
                         .roots
                         .iter()
@@ -365,53 +307,6 @@ impl Publishers {
             .find(|publisher| publisher.name == name)
     }
 
-    pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
-        if self
-            .as_slice()
-            .iter()
-            .any(|publisher| publisher.git.is_some())
-        {
-            GIT_PUBLISHER_IMAGE_FORMAT
-        } else if matches!(
-            self,
-            Self::Profiled {
-                signed_count: Some(_),
-                ..
-            }
-        ) {
-            LOCAL_PUBLISHER_IMAGE_FORMAT
-        } else if settings.boot_revision.is_some()
-            || settings
-                .boot_parent
-                .as_ref()
-                .is_some_and(|parent| parent.source_revision.is_some())
-        {
-            LIVE_IMAGE_FORMAT
-        } else if !settings.freezes.is_empty() {
-            FREEZE_IMAGE_FORMAT
-        } else if settings.bootstrap_catalog.is_some() {
-            BOOTSTRAP_IMAGE_FORMAT
-        } else if settings.profile_intent.is_some() {
-            PROFILE_INTENT_IMAGE_FORMAT
-        } else if !settings.dormant_configs.is_empty() {
-            DORMANT_CONFIG_IMAGE_FORMAT
-        } else if settings.catalog_archives {
-            CATALOG_ARCHIVE_IMAGE_FORMAT
-        } else if !settings.profile_packages.is_empty() {
-            PROFILE_IMAGE_FORMAT
-        } else if !settings.catalog_checkpoints.is_empty() {
-            CHECKPOINT_IMAGE_FORMAT
-        } else if self
-            .as_slice()
-            .iter()
-            .any(|publisher| publisher.build_trust.is_some())
-        {
-            BUILD_TRUST_IMAGE_FORMAT
-        } else {
-            FORMAT
-        }
-    }
-
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.as_slice().is_empty(),
@@ -507,7 +402,7 @@ pub struct Image {
     db: Connection,
     pub root: Root,
     pub(crate) state_dir: Root,
-    state_layout: StateLayout,
+
     _lock: File,
 }
 
@@ -550,7 +445,6 @@ pub fn create_image(
         facets,
         None,
         None,
-        StateLayout::VarLib,
     )
 }
 
@@ -629,7 +523,6 @@ pub fn create_configured_image_at(
         config.facets,
         config.bootstrap_catalog,
         config.image_id,
-        config.state_layout.unwrap_or(StateLayout::VarLib),
     )
 }
 
@@ -663,20 +556,19 @@ fn initialize(
     facets: BTreeMap<String, bool>,
     bootstrap_catalog: Option<String>,
     image_id: Option<String>,
-    state_layout: StateLayout,
 ) -> Result<String> {
     validate_publisher(arch).context("invalid architecture")?;
     for facet in facets.keys() {
         validate_publisher(facet).context("invalid facet")?;
     }
     let id = image_id.map_or_else(new_identity, Ok)?;
-    let mut settings = Settings {
-        format: FORMAT,
+    let settings = Settings {
+        format: IMAGE_FORMAT,
         id: id.clone(),
         revision: 0,
         publisher_generation: 0,
         arch: arch.to_owned(),
-        state_layout,
+
         facets,
         mediators: BTreeMap::new(),
         uid: geteuid().as_raw(),
@@ -685,16 +577,13 @@ fn initialize(
         boot_parent: None,
         boot_revision: None,
         bootstrap_catalog,
-        archived_profile_catalog: None,
         catalog_checkpoints: BTreeMap::new(),
-        catalog_archives: false,
         profile_packages: BTreeMap::new(),
         profile_intent: None,
-        config_updates: Some(BTreeMap::new()),
+        config_updates: BTreeMap::new(),
         dormant_configs: BTreeMap::new(),
         freezes: BTreeMap::new(),
     };
-    settings.format = publishers.image_format(&settings);
     fs::create_dir_all(path)?;
     let root = Root::open(path)?;
     ensure!(
@@ -704,12 +593,12 @@ fn initialize(
     let scratch = tempfile::Builder::new()
         .prefix(".cps-init-")
         .tempdir_in(path)?;
-    for ancestor in state_layout.ancestors() {
+    for ancestor in STATE_ANCESTORS {
         let directory = scratch.path().join(ancestor);
         fs::create_dir(&directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
     }
-    let state = scratch.path().join(state_layout.directory());
+    let state = scratch.path().join(STATE_DIRECTORY);
     DirBuilder::new().mode(0o700).create(&state)?;
     OpenOptions::new()
         .create_new(true)
@@ -721,13 +610,16 @@ fn initialize(
     let mut db = Connection::open(state.join("state.sqlite"))?;
     configure(&db)?;
     let tx = db.transaction()?;
+    tx.pragma_update(None, "application_id", IMAGE_APPLICATION_ID)?;
     tx.execute_batch(
         "CREATE TABLE image (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
          CREATE TABLE publishers (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
          CREATE TABLE installed (name TEXT PRIMARY KEY, data TEXT NOT NULL);
          CREATE TABLE paths (path TEXT PRIMARY KEY, data TEXT NOT NULL);
          CREATE TABLE pending (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
-         CREATE TABLE history (plan TEXT PRIMARY KEY, revision INTEGER NOT NULL);",
+         CREATE TABLE history (plan TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+         CREATE TABLE transaction_details (plan TEXT PRIMARY KEY, data TEXT NOT NULL, sha256 TEXT NOT NULL);
+         CREATE TABLE catalog_archives (publisher TEXT PRIMARY KEY, catalog BLOB NOT NULL);",
     )?;
     tx.execute(
         "INSERT INTO image VALUES (1, ?1)",
@@ -740,14 +632,10 @@ fn initialize(
     tx.commit()?;
     drop(db);
     File::open(state)?.sync_all()?;
-    for ancestor in state_layout.ancestors().iter().rev() {
+    for ancestor in STATE_ANCESTORS.iter().rev() {
         File::open(scratch.path().join(ancestor))?.sync_all()?;
     }
-    let entry = state_layout
-        .ancestors()
-        .first()
-        .copied()
-        .unwrap_or(state_layout.directory());
+    let entry = STATE_ANCESTORS[0];
     let source = Root::open(scratch.path())?;
     renameat_with(
         source.as_file(),
@@ -831,7 +719,7 @@ impl Image {
         flags: rusqlite::OpenFlags,
         package_write: bool,
     ) -> Result<Self> {
-        let (state_layout, state_dir) = root.open_image_state()?;
+        let state_dir = root.open_image_state()?;
         let lock = state_dir.file("lock")?;
         flock(
             &lock,
@@ -849,6 +737,12 @@ impl Image {
             Root::fd_path(state_dir.as_file()).join("state.sqlite"),
             flags,
         )?;
+        let application_id =
+            db.pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))?;
+        ensure!(
+            application_id == IMAGE_APPLICATION_ID,
+            "unsupported image database layout"
+        );
         if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE) {
             configure(&db)?;
         }
@@ -856,7 +750,7 @@ impl Image {
             root,
             db,
             state_dir,
-            state_layout,
+
             _lock: lock,
         })
     }
@@ -896,28 +790,7 @@ impl Image {
 
     pub(crate) fn settings(&self) -> Result<Settings> {
         let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
-        ensure!(
-            settings.state_layout == self.state_layout,
-            "image state directory differs from its database layout"
-        );
-        ensure!(
-            matches!(
-                settings.format,
-                FORMAT
-                    | BUILD_TRUST_IMAGE_FORMAT
-                    | BOOTSTRAP_IMAGE_FORMAT
-                    | CHECKPOINT_IMAGE_FORMAT
-                    | PROFILE_IMAGE_FORMAT
-                    | CATALOG_ARCHIVE_IMAGE_FORMAT
-                    | DORMANT_CONFIG_IMAGE_FORMAT
-                    | PROFILE_INTENT_IMAGE_FORMAT
-                    | FREEZE_IMAGE_FORMAT
-                    | LIVE_IMAGE_FORMAT
-                    | LOCAL_PUBLISHER_IMAGE_FORMAT
-                    | GIT_PUBLISHER_IMAGE_FORMAT
-            ),
-            "unsupported image format"
-        );
+        ensure!(settings.format == IMAGE_FORMAT, "unsupported image format");
         ensure!(
             settings
                 .boot_revision
@@ -936,17 +809,10 @@ impl Image {
         let settings = self.settings()?;
         let publishers = self.publishers()?;
         ensure!(
-            settings.format == publishers.image_format(&settings)
-                && (settings.bootstrap_catalog.is_none()
-                    || (publishers.release_profile().is_some()
-                        && settings.catalog_checkpoints.is_empty())),
-            "image format does not match its repository policy"
-        );
-        ensure!(
-            !settings.catalog_archives
-                || (settings.archived_profile_catalog.is_none()
-                    && settings.bootstrap_catalog.is_none()),
-            "catalog archives conflict with legacy profile state"
+            settings.bootstrap_catalog.is_none()
+                || (publishers.release_profile().is_some()
+                    && settings.catalog_checkpoints.is_empty()),
+            "bootstrap catalog requires an unprovisioned release profile"
         );
         ensure!(
             settings.profile_packages.is_empty()
@@ -972,21 +838,6 @@ impl Image {
                 "checkpoint for unconfigured publisher {publisher}"
             );
             validate_digest(&checkpoint.catalog).context("invalid catalog checkpoint digest")?;
-        }
-        if let Some(hash) = &settings.archived_profile_catalog {
-            validate_digest(hash).context("invalid archived profile catalog")?;
-            ensure!(
-                publishers.release_profile().is_some() && settings.bootstrap_catalog.is_none(),
-                "archived catalog requires an installed release profile"
-            );
-            let primary = &publishers.as_slice()[0];
-            ensure!(
-                settings
-                    .catalog_checkpoints
-                    .get(&primary.name)
-                    .is_none_or(|checkpoint| checkpoint.catalog == *hash),
-                "archived profile differs from the installed primary catalog"
-            );
         }
         let paths = decode_rows(&self.db, "SELECT path, data FROM paths")?;
         let mut dormant_identities = BTreeSet::new();
@@ -1041,7 +892,6 @@ impl Image {
         settings.id = new_identity()?;
         settings.boot_parent = Some(parent);
         settings.boot_revision = None;
-        settings.format = self.publishers()?.image_format(&settings);
         self.db.execute(
             "UPDATE image SET data=?1 WHERE id=1",
             [serde_json::to_string(&settings)?],
@@ -1146,9 +996,6 @@ impl Image {
             )?;
         }
         builds::prune(&tx, state)?;
-        if state.settings.catalog_archives {
-            tx.execute("DROP TABLE IF EXISTS build_profile", [])?;
-        }
         tx.execute("DELETE FROM paths", [])?;
         for (path, managed) in &state.paths {
             tx.execute(

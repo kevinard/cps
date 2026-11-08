@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/busybox" publisher="canopa-bootstrap" version="1.38.0-0" {
     file "bin/busybox" mode="0755" uid=0 gid=0
     symlink "bin/insmod" target="busybox" uid=0 gid=0

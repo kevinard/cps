@@ -35,6 +35,7 @@ use self::policy::{BootEntry, BootRoot, LoaderPolicy, field};
 
 const LINUX_HASH: &str = "# cps-linux-sha256 ";
 const INITRD_HASH: &str = "# cps-initrd-sha256 ";
+const SLOT_RETIREMENT_FORMAT: &str = "cps slot retirement v1\n";
 
 #[derive(Debug)]
 pub struct BootEnvironment {
@@ -282,14 +283,11 @@ fn rollback_target<'a>(
         return find_known_good(entries, id);
     }
     let current = current.context("no configured default CPS boot environment")?;
-    if let Some(parent) = &current.parent {
-        return find_known_good(entries, parent).context("the recorded parent is unavailable");
-    }
-    // Legacy entries predate explicit parent records.
-    entries
-        .iter()
-        .find(|entry| entry.tries.is_none() && entry.revision < current.revision)
-        .context("no previous known-good boot environment")
+    let parent = current
+        .parent
+        .as_deref()
+        .context("no recorded parent boot environment")?;
+    find_known_good(entries, parent).context("the recorded parent is unavailable")
 }
 
 fn find_known_good<'a>(entries: &'a [BootEntry], id: &str) -> Result<&'a BootEntry> {
@@ -649,13 +647,11 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
             receipt.state_sha256 == digest_reader(image.state_dir.file("state.sqlite")?)?,
             "image state differs from the root export receipt"
         );
-        if let Some(expected) = &receipt.tree_sha256 {
-            ensure!(
-                tree::digest(&image.root).context("fingerprinting the root for activation")?
-                    == *expected,
-                "root tree differs from the root export receipt"
-            );
-        }
+        ensure!(
+            tree::digest(&image.root).context("fingerprinting the root for activation")?
+                == receipt.tree_sha256,
+            "root tree differs from the root export receipt"
+        );
         if deployment.root.is_none() {
             if let Some(target) = deployment.target {
                 target.verify(partuuid, &receipt)?;
@@ -746,26 +742,14 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
         None
     };
 
-    // Retries of entries created before artifact hashes keep the original BLS text.
-    let record_hashes = if let Some(entry) = existing_entry {
-        field(&entry.description, LINUX_HASH)?.is_some()
-            || field(&entry.description, INITRD_HASH)?.is_some()
-    } else {
-        true
-    };
     let mut description = Entry {
         id: &id,
         revision: boot_revision,
-        parent: if existing_entry.is_some_and(|entry| entry.parent.is_none()) {
-            None // Keep activation retries compatible with previously registered entries.
-        } else {
-            fallback.as_deref()
-        },
+        parent: fallback.as_deref(),
         cmdline: &cmdline,
         btrfs: btrfs.as_ref(),
         linux_sha256: &linux_sha256,
         initrd_sha256: initrd_sha256.as_deref(),
-        record_hashes,
         uki_sha256: signed_uki.as_ref().map(|(_, hash)| hash.as_str()),
         kernel_release: managed
             .as_ref()
@@ -828,9 +812,10 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
         None => None,
     };
     if let Some(pending) = &pending {
+        let retired = parse_slot_retirement(pending)?;
         ensure!(
             deployment.is_some_and(|deployment| deployment.target.is_some())
-                && replace.is_some_and(|id| pending.strip_suffix(b"\n") == Some(id.as_bytes())),
+                && replace == Some(retired),
             "an interrupted slot replacement must be resumed with activate-device and its original --replace ID"
         );
     }
@@ -1060,6 +1045,15 @@ fn check_replacement(
     })
 }
 
+fn parse_slot_retirement(bytes: &[u8]) -> Result<&str> {
+    let id = std::str::from_utf8(bytes)?
+        .strip_prefix(SLOT_RETIREMENT_FORMAT)
+        .and_then(|id| id.strip_suffix('\n'))
+        .context("unsupported CPS slot retirement format")?;
+    policy::entry_identity(id)?;
+    Ok(id)
+}
+
 fn retire_device_entry(
     esp: &Path,
     marker: &Path,
@@ -1068,7 +1062,7 @@ fn retire_device_entry(
 ) -> Result<()> {
     // Remember the retired identity before removing its boot entry. The
     // directory fsync must complete before any write to the root partition.
-    install_text(marker, &format!("{id}\n"))?;
+    install_text(marker, &format!("{SLOT_RETIREMENT_FORMAT}{id}\n"))?;
     let entries = File::open(esp.join("loader/entries"))?;
     if let Some(retired) = retired {
         fs::remove_file(esp.join("loader/entries").join(retired.file))?;
@@ -1118,7 +1112,6 @@ struct Entry<'a> {
     parent: Option<&'a str>,
     linux_sha256: &'a str,
     initrd_sha256: Option<&'a str>,
-    record_hashes: bool,
     uki_sha256: Option<&'a str>,
     kernel_release: Option<&'a str>,
 }
@@ -1133,7 +1126,6 @@ impl Entry<'_> {
             parent,
             linux_sha256,
             initrd_sha256,
-            record_hashes,
             uki_sha256,
             kernel_release,
         } = self;
@@ -1141,7 +1133,11 @@ impl Entry<'_> {
             Some(release) => format!("Canopa ({id}, Linux {release})"),
             None => format!("Canopa ({id})"),
         };
-        let mut entry = format!("title {title}\nsort-key cps\nversion {revision}\n");
+        let mut entry = format!(
+            "title {title}\nsort-key cps\nversion {revision}\n{}{}\n",
+            policy::ENTRY_FORMAT_FIELD,
+            policy::ENTRY_FORMAT,
+        );
         if uki_sha256.is_some() {
             entry.push_str(&format!("uki /EFI/cps/{id}/{}\n", uki::NAME));
         } else {
@@ -1153,14 +1149,10 @@ impl Entry<'_> {
         if let Some(sha256) = uki_sha256 {
             entry.push_str(&format!("{}{sha256}\n", uki::HASH));
         } else {
-            if *record_hashes {
-                entry.push_str(&format!("{LINUX_HASH}{linux_sha256}\n"));
-            }
+            entry.push_str(&format!("{LINUX_HASH}{linux_sha256}\n"));
             if let Some(initrd_sha256) = initrd_sha256 {
                 entry.push_str(&format!("initrd /EFI/cps/{id}/initramfs.img\n"));
-                if *record_hashes {
-                    entry.push_str(&format!("{INITRD_HASH}{initrd_sha256}\n"));
-                }
+                entry.push_str(&format!("{INITRD_HASH}{initrd_sha256}\n"));
             }
         }
         if let Some(btrfs) = btrfs {
@@ -1215,17 +1207,15 @@ fn verify_fallback_artifacts(esp: &Path, boot: &BootEntry) -> Result<()> {
         linux.and_then(|path| path.strip_prefix('/')) == Some(kernel.as_str()),
         "unexpected fallback kernel path"
     );
-    let linux_sha256 = field(entry, LINUX_HASH)?;
+    let linux_sha256 = field(entry, LINUX_HASH)?.context("missing boot kernel digest")?;
     let initrd_sha256 = field(entry, INITRD_HASH)?;
-    if linux_sha256.is_some() || initrd_sha256.is_some() {
-        ensure!(
-            linux_sha256.is_some() && initrd_sha256.is_some() == initrd.is_some(),
-            "incomplete boot artifact digests in entry {id}"
-        );
-    }
+    ensure!(
+        initrd_sha256.is_some() == initrd.is_some(),
+        "incomplete boot artifact digests in entry {id}"
+    );
     verify_artifact(&esp, &kernel, linux_sha256)
         .context("checking the known-good fallback kernel")?;
-    if let Some(path) = initrd {
+    if let (Some(path), Some(initrd_sha256)) = (initrd, initrd_sha256) {
         let expected = format!("EFI/cps/{id}/initramfs.img");
         ensure!(
             path.strip_prefix('/') == Some(expected.as_str()),
@@ -1237,15 +1227,12 @@ fn verify_fallback_artifacts(esp: &Path, boot: &BootEntry) -> Result<()> {
     Ok(())
 }
 
-fn verify_artifact(esp: &Root, path: &str, sha256: Option<&str>) -> Result<()> {
-    let file = esp.file(path)?;
-    if let Some(sha256) = sha256 {
-        validate_digest(sha256)?;
-        ensure!(
-            digest_reader(file)? == sha256,
-            "boot artifact digest mismatch at {path}"
-        );
-    }
+fn verify_artifact(esp: &Root, path: &str, sha256: &str) -> Result<()> {
+    validate_digest(sha256)?;
+    ensure!(
+        digest_reader(esp.file(path)?)? == sha256,
+        "boot artifact digest mismatch at {path}"
+    );
     Ok(())
 }
 
@@ -1359,7 +1346,24 @@ fn install_checked(
 
 #[cfg(test)]
 mod tests {
-    use super::{digest, install_checked};
+    use super::{digest, install_checked, parse_slot_retirement, retire_device_entry};
+
+    #[test]
+    fn slot_retirement_requires_version_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let esp = dir.path();
+        std::fs::create_dir_all(esp.join("loader/entries"))?;
+        std::fs::create_dir_all(esp.join("EFI/cps"))?;
+        let marker = esp.join("loader/entries/test.cps-retired");
+        let id = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
+        retire_device_entry(esp, &marker, id, None)?;
+        assert_eq!(parse_slot_retirement(&std::fs::read(&marker)?)?, id);
+        assert!(parse_slot_retirement(format!("{id}\n").as_bytes()).is_err());
+        assert!(
+            parse_slot_retirement(format!("cps slot retirement v2\n{id}\n").as_bytes()).is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn rejected_boot_artifact_stays_unpublished() -> anyhow::Result<()> {

@@ -52,7 +52,7 @@ for target in publisher publisher.der; do
 done
 cmp root.json <(jq -er '.tuf_root' public/publisher.json | base64 -d)
 cmp publisher.der <(jq -er '.trust_key' public/publisher.json | base64 -d)
-jq -e '.schema_version == 1 and .publisher == "canopa"' public/publisher.json
+jq -e '.schema_version == 1 and .kind == "publisher-bootstrap" and .publisher == "canopa"' public/publisher.json
 cp public/publisher.json original-descriptor.json
 cp public/metadata/timestamp.json original-timestamp.json
 

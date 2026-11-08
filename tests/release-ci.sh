@@ -29,7 +29,7 @@ for version in 1 2 3; do
 done
 policy() {
     cat > repo/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa" {
     builder-key "unused.der"
     profile "desktop" architecture="$(uname -m)" rollout-percentage=$2 {
@@ -44,7 +44,7 @@ POLICY
 }
 for version in 1 2; do
     policy "$version" 100
-    printf 'schema-version 1\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
+    printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
     "$CPS_BIN" repo publish-release --repo repo --signing-key key.der baseline.kdl
     if [[ $version == 1 ]]; then
         cat repo/current > requests/next/cases/desktop/baselines
@@ -52,9 +52,9 @@ for version in 1 2; do
 done
 base=$(cat repo/current)
 policy 3 0
-printf 'schema-version 1\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$base" > requests/next/release.kdl
+printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$base" > requests/next/release.kdl
 cat > requests/next/cases/desktop/image.kdl <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 architecture "$(uname -m)"
 release-profile "desktop"
 publisher "canopa" { repository "$work/repo"; trust-key "$work/public.der"; }
@@ -187,7 +187,7 @@ record_timestamp() {
     checksum=$(sha256sum < "$timestamp")
     jq -n --arg mirror "$CPS_MIRROR_DIR" --arg catalog "$complete" \
         --arg expires "$(jq -r .signed.expires "$timestamp")" --arg sha256 "${checksum%% *}" \
-        '{mirror: $mirror, version: 1, published: {catalog: $catalog, expires: $expires, sha256: $sha256}}' > "$state"
+        '{format: 1, mirror: $mirror, version: 1, published: {catalog: $catalog, expires: $expires, sha256: $sha256}}' > "$state"
     chmod 600 "$state"
 }
 
@@ -195,6 +195,14 @@ timestamp_expires '+3 days'
 record_timestamp
 release refresh-mirror
 [[ ! -s $CPS_TEST_LOG ]]
+
+cp "$state" signer-state.json
+for filter in 'del(.format)' '.format = 2'; do
+    jq "$filter" signer-state.json > "$state"
+    reject release refresh-mirror
+    [[ ! -s $CPS_TEST_LOG ]]
+done
+cat signer-state.json > "$state"
 
 # Future dates in the origin cannot suppress repair of an unknown timestamp.
 timestamp_expires '+30 years'

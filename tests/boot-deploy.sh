@@ -143,6 +143,7 @@ reject_activation() {
 
 export_with_receipt base
 base_hash=$(sha256sum base.ext4)
+grep -Fx 'schema-version 1 kind="boot-export-receipt"' base.kdl
 grep -F "bytes=16777216 sha256=\"${base_hash%% *}\"" base.kdl
 deploy template.raw base.ext4 "$base" base.raw
 reject_activation 'does not match the root export receipt' \
@@ -180,18 +181,38 @@ test -z "$(ls -A esp)"
 base_id=$(activate_checked base base.raw "$base" base.kdl --known-good)
 base_id=${base_id#Activated }
 test -f "esp/loader/entries/$base_id.conf"
+grep -Fx '# cps-boot-entry-version 1' "esp/loader/entries/$base_id.conf"
 kernel_hash=$(sha256sum base/boot/vmlinuz)
 initrd_hash=$(sha256sum base/boot/initrd)
 grep -Fx "# cps-linux-sha256 ${kernel_hash%% *}" "esp/loader/entries/$base_id.conf"
 grep -Fx "# cps-initrd-sha256 ${initrd_hash%% *}" "esp/loader/entries/$base_id.conf"
 
-cp -a esp legacy-esp
-sed -i '/^# cps-.*-sha256 /d' "legacy-esp/loader/entries/$base_id.conf"
+sed '1s/ kind="boot-export-receipt"$//' base.kdl > untyped.kdl
+reject_activation 'missing kind property' \
+    base base.raw "$base" untyped.kdl --known-good
+sed '1s/schema-version 1/schema-version 2/' base.kdl > wrong-version.kdl
+reject_activation 'expected schema-version 1 for boot-export-receipt' \
+    base base.raw "$base" wrong-version.kdl --known-good
+
 sed -E 's/ tree-sha256="[0-9a-f]+"$//' base.kdl > legacy.kdl
-cp -a legacy-esp legacy-before
-"$cps" boot-env activate --root base --esp legacy-esp --root-partuuid "$base" \
-    --disk base.raw --receipt legacy.kdl --known-good --initrd boot/initrd
-diff -r legacy-before legacy-esp
+reject_activation 'missing tree-sha256 property' \
+    base base.raw "$base" legacy.kdl --known-good
+
+cp -a esp hashless-esp
+sed -i '/^# cps-.*-sha256 /d' "hashless-esp/loader/entries/$base_id.conf"
+if "$cps" boot-env list --esp hashless-esp > rejected.log 2>&1; then
+    echo 'Accepted a boot entry without artifact digests' >&2
+    exit 1
+fi
+grep -F 'missing boot kernel digest' rejected.log
+
+cp -a esp unversioned-esp
+sed -i '/^# cps-boot-entry-version /d' "unversioned-esp/loader/entries/$base_id.conf"
+if "$cps" boot-env list --esp unversioned-esp > rejected.log 2>&1; then
+    echo 'Accepted a boot entry without its format version' >&2
+    exit 1
+fi
+grep -F 'unsupported CPS boot entry format' rejected.log
 
 "$cps" boot-env stage --source base --root staged update.json
 export_with_receipt staged
@@ -458,15 +479,6 @@ reviewed_id=$(raw_activate reviewed review-base.raw "$trial" reviewed.raw --root
 reviewed_id=${reviewed_id#Activated }
 assert_default reviewed.raw "$reviewed_id" 'trial (2 left)'
 mcopy -i reviewed.raw@@1048576 "::/loader/entries/$reviewed_id+2.conf" - | grep -Fx "# cps-parent $review_base_id"
-if [[ -n ${CPS_TEST_LEGACY_BOOT_BINARY:-} ]]; then
-    before_legacy=$(sha256sum reviewed.raw)
-    if "$CPS_TEST_LEGACY_BOOT_BINARY" boot-env list --disk reviewed.raw --esp-partuuid "$esp" > legacy-boot.log 2>&1; then
-        echo 'An earlier client accepted parent metadata it cannot interpret' >&2
-        exit 1
-    fi
-    grep -F 'invalid parent' legacy-boot.log
-    test "$(sha256sum reviewed.raw)" = "$before_legacy"
-fi
 raw_rollback reviewed.raw reviewed-rollback.raw
 assert_default reviewed-rollback.raw "$review_base_id" known-good
 test "$(cat base/etc/version)" = 1.0.0-0

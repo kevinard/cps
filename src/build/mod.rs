@@ -22,14 +22,11 @@ use rustix::{
 use tempfile::TempDir;
 
 use crate::{
-    attestation::{self, BuildTrust, LegacyToolchain, PinnedPackage, PinnedToolchain, Toolchain},
+    attestation::{self, BuildTrust, PinnedPackage, Toolchain},
     image::{Installed, Managed, root::Root},
     kdl_format::{
         PublisherConfig,
-        build::{
-            BuildRecipe, PublisherPin, ToolchainPins, read, read_toolchain_config,
-            read_with_options,
-        },
+        build::{BuildRecipe, PublisherPin, read, read_toolchain_config, read_with_options},
         parse_manifest,
     },
     model::{FileDigest, Node, digest, digest_reader},
@@ -446,11 +443,11 @@ struct ToolchainRepository {
 }
 
 impl ToolchainRepository {
-    fn configured(entry: PublisherConfig, catalog: &str, key_pin: Option<&str>) -> Result<Self> {
+    fn configured(entry: PublisherConfig, pin: &PublisherPin) -> Result<Self> {
         let key = read_key(&entry.trust_key)?;
         let key_sha256 = digest(&key);
         ensure!(
-            key_pin.is_none_or(|hash| hash == key_sha256),
+            pin.key_sha256 == key_sha256,
             "toolchain key digest mismatch for {}",
             entry.name
         );
@@ -461,11 +458,7 @@ impl ToolchainRepository {
             .transpose()
             .with_context(|| format!("loading build trust for {}", entry.name))?;
         Ok(Self {
-            pin: PublisherPin {
-                name: entry.name,
-                key_sha256,
-                catalog_sha256: catalog.to_owned(),
-            },
+            pin: pin.clone(),
             repository: entry.repository,
             key,
             build_trust,
@@ -474,31 +467,35 @@ impl ToolchainRepository {
 }
 
 fn toolchain_repositories(
-    pins: &ToolchainPins,
+    pins: &[PublisherPin],
     location: BuildToolchain<'_>,
 ) -> Result<Vec<ToolchainRepository>> {
-    match (pins, location) {
-        (
-            ToolchainPins::Single(catalog),
-            BuildToolchain::Single {
-                repo,
-                publisher,
-                trust_key,
-            },
-        ) => {
+    match location {
+        BuildToolchain::Single {
+            repo,
+            publisher,
+            trust_key,
+        } => {
+            let [pin] = pins else {
+                bail!("multiple pinned publishers require a toolchain configuration");
+            };
+            ensure!(
+                pin.name == publisher,
+                "toolchain publisher differs from the recipe pin"
+            );
             let key = read_key(trust_key)?;
+            ensure!(
+                pin.key_sha256 == digest(&key),
+                "toolchain key digest mismatch for {publisher}"
+            );
             Ok(vec![ToolchainRepository {
-                pin: PublisherPin {
-                    name: publisher.to_owned(),
-                    catalog_sha256: catalog.clone(),
-                    key_sha256: digest(&key),
-                },
+                pin: pin.clone(),
                 repository: repo.to_owned(),
                 key,
                 build_trust: None,
             }])
         }
-        (ToolchainPins::Publishers(pins), BuildToolchain::Config(config)) => {
+        BuildToolchain::Config(config) => {
             let mut config = read_toolchain_config(config)
                 .with_context(|| format!("loading toolchain configuration {}", config.display()))?;
             ensure!(
@@ -510,27 +507,9 @@ fn toolchain_repositories(
                     let entry = config.remove(&pin.name).with_context(|| {
                         format!("missing toolchain configuration for {}", pin.name)
                     })?;
-                    ToolchainRepository::configured(
-                        entry,
-                        &pin.catalog_sha256,
-                        Some(&pin.key_sha256),
-                    )
+                    ToolchainRepository::configured(entry, pin)
                 })
                 .collect()
-        }
-        (ToolchainPins::Publishers(_), _) => {
-            bail!("pinned toolchain publishers require a toolchain configuration")
-        }
-        (ToolchainPins::Single(catalog), BuildToolchain::Config(config)) => {
-            let mut entries = read_toolchain_config(config)?;
-            ensure!(
-                entries.len() == 1,
-                "a legacy toolchain catalog requires one configured publisher"
-            );
-            let (_, entry) = entries
-                .pop_first()
-                .context("missing toolchain repository")?;
-            Ok(vec![ToolchainRepository::configured(entry, catalog, None)?])
         }
     }
 }
@@ -585,7 +564,7 @@ fn resolve_toolchain(
         &requested,
         false,
         crate::plan::Retention::None,
-        recipe.solver,
+        true,
         |installed| {
             select_paths(
                 &recipe.arch,
@@ -630,7 +609,7 @@ pub(crate) fn verify_toolchain(
 ) -> Result<()> {
     let selection = resolve_toolchain(BuildToolchain::Config(config), recipe)?;
     ensure!(
-        &selection.evidence(&recipe.toolchain)? == claimed,
+        &selection.evidence() == claimed,
         "attested toolchain differs from the independently resolved toolchain"
     );
     Ok(())
@@ -755,7 +734,7 @@ fn prepare_toolchain(
     }
     set_mode(path, 0o755)?;
     normalize(path, recipe.epoch)?;
-    selection.evidence(&recipe.toolchain)
+    Ok(selection.evidence())
 }
 
 impl ResolvedToolchain {
@@ -764,46 +743,28 @@ impl ResolvedToolchain {
         Ok(&self.installed[owner].published.manifest.publisher)
     }
 
-    fn evidence(self, pins: &ToolchainPins) -> Result<Toolchain> {
-        let Self {
-            repositories,
-            installed,
-            ..
-        } = self;
-        match pins {
-            ToolchainPins::Single(_) => {
-                let pin = repositories
-                    .into_iter()
-                    .next()
-                    .context("missing toolchain repository")?
-                    .pin;
-                Ok(Toolchain::Legacy(LegacyToolchain {
-                    publisher: pin.name,
-                    key_sha256: pin.key_sha256,
-                    catalog_sha256: pin.catalog_sha256,
-                    package_manifests: installed
-                        .into_iter()
-                        .map(|(name, package)| (name, package.published.sha256))
-                        .collect(),
-                }))
-            }
-            ToolchainPins::Publishers(_) => Ok(Toolchain::Pinned(PinnedToolchain {
-                publishers: repositories.into_iter().map(|source| source.pin).collect(),
-                package_manifests: installed
-                    .into_iter()
-                    .map(|(name, package)| {
-                        let published = package.published;
-                        (
-                            name,
-                            PinnedPackage {
-                                publisher: published.manifest.publisher,
-                                version: published.manifest.version,
-                                sha256: published.sha256,
-                            },
-                        )
-                    })
-                    .collect(),
-            })),
+    fn evidence(self) -> Toolchain {
+        Toolchain {
+            publishers: self
+                .repositories
+                .into_iter()
+                .map(|source| source.pin)
+                .collect(),
+            package_manifests: self
+                .installed
+                .into_iter()
+                .map(|(name, package)| {
+                    let published = package.published;
+                    (
+                        name,
+                        PinnedPackage {
+                            publisher: published.manifest.publisher,
+                            version: published.manifest.version,
+                            sha256: published.sha256,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }

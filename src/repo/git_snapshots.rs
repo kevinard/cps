@@ -19,10 +19,12 @@ use super::{
 
 const SERIES: &str = "0.0.0-";
 const RESERVATIONS: &str = "git-snapshots";
+const RESERVATION_FORMAT: u32 = 1;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Reservation {
+    format: u32,
     revision: u64,
     fingerprint: String,
 }
@@ -102,6 +104,11 @@ pub(crate) fn assign_git_version(
     let last = match directory.file(&name) {
         Ok(file) => {
             let last: Reservation = serde_json::from_slice(&read_limited(file, 1024)?)?;
+            ensure!(
+                last.format == RESERVATION_FORMAT,
+                "unsupported Git snapshot reservation format {}",
+                last.format
+            );
             validate_digest(&last.fingerprint)?;
             Some(last)
         }
@@ -194,6 +201,7 @@ pub(crate) fn assign_git_version(
 
 fn save_reservation(directory: &Root, name: &str, revision: u64, fingerprint: &str) -> Result<()> {
     let reservation = Reservation {
+        format: RESERVATION_FORMAT,
         revision,
         fingerprint: fingerprint.to_owned(),
     };

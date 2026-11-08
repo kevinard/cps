@@ -98,7 +98,7 @@ root="$work/files/@"
 "$cps" apply --root "$root" install.json
 if [[ -n $kernel_fixture ]]; then
     cat > kernel-builders.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="build-trust"
 build-trust {
     builder-key "$kernel_fixture/builder-public.der"
 }
@@ -175,7 +175,7 @@ if [[ $native_boot == 1 ]]; then
         cp repo/current "$root/repository/catalog-base-upgrade"
         install -m755 "$project/tests/system-workflow-guest.sh" "$root/usr/local/libexec/cps-system-workflow"
         cat > "$root/etc/cps/image.kdl" <<CONFIG
-schema-version 1
+schema-version 1 kind="image-config"
 publisher "test" {
     repository "/repository"
     trust-key "test.der"

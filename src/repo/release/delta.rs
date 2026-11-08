@@ -21,66 +21,21 @@ const INDEX_BLOCKS: u64 = 65536;
 const ROLL: u64 = 257;
 const COPY: u8 = 1;
 const LITERAL: u8 = 2;
-const V1_FILE_LIMIT: u64 = 64 * 1024 * 1024;
+const MAGIC: &[u8; 5] = b"CPSP1";
+const NUMBER_WIDTH: u64 = 8;
 
-#[derive(Clone, Copy)]
-pub(super) enum Format {
-    V1,
-    V2,
+pub(super) fn patch_limit(size: u64) -> u64 {
+    size - size / 8
 }
 
-impl Format {
-    pub(super) fn for_lengths(base: u64, new: u64) -> Self {
-        if base.max(new) <= V1_FILE_LIMIT {
-            Self::V1
-        } else {
-            Self::V2
-        }
-    }
+pub(super) fn target_name(base: &str, result: &str) -> String {
+    format!("payload-delta-v1-{base}-{result}")
+}
 
-    fn magic(self) -> &'static [u8; 5] {
-        match self {
-            Self::V1 => b"CPSD1",
-            Self::V2 => b"CPSD2",
-        }
-    }
-
-    fn number_width(self) -> u64 {
-        match self {
-            Self::V1 => 4,
-            Self::V2 => 8,
-        }
-    }
-
-    pub(super) fn patch_limit(self, size: u64) -> u64 {
-        let useful = size - size / 8;
-        match self {
-            Self::V1 => useful.min(16 * 1024 * 1024),
-            Self::V2 => useful,
-        }
-    }
-
-    pub(super) fn target_name(self, base: &str, result: &str) -> String {
-        let version = match self {
-            Self::V1 => 1,
-            Self::V2 => 2,
-        };
-        format!("delta-v{version}-{base}-{result}")
-    }
-
-    fn write_number(self, output: &mut impl Write, value: u64) -> Result<()> {
-        match self {
-            Self::V1 => output.write_all(&u32::try_from(value)?.to_le_bytes())?,
-            Self::V2 => output.write_all(&value.to_le_bytes())?,
-        }
-        Ok(())
-    }
-
-    fn read_number(self, patch: &mut impl Read) -> Result<u64> {
-        let mut bytes = [0; 8];
-        patch.read_exact(&mut bytes[..self.number_width() as usize])?;
-        Ok(u64::from_le_bytes(bytes))
-    }
+fn read_number(patch: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0; NUMBER_WIDTH as usize];
+    patch.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 pub(super) fn verified_file(mut file: File, hash: &str, size: u64) -> Result<File> {
@@ -164,17 +119,17 @@ pub(super) fn export(
             }
             let base = verified_file(root.file(&format!("blobs/{old}"))?, old, *old_size)?;
             let new_file = verified_file(root.file(&format!("blobs/{new}"))?, new, *new_size)?;
-            let format = Format::for_lengths(*old_size, *new_size);
+
             let mut patch = NamedTempFile::new_in(output)?;
             let complete = {
                 let mut writer = BufWriter::new(patch.as_file_mut());
-                let complete = encode(&base, *old_size, &new_file, *new_size, format, &mut writer)?;
+                let complete = encode(&base, *old_size, &new_file, *new_size, &mut writer)?;
                 writer.flush()?;
                 complete
             };
             if complete {
                 patch.as_file().sync_all()?;
-                patch.persist_noclobber(output.join(format.target_name(old, new)))?;
+                patch.persist_noclobber(output.join(target_name(old, new)))?;
             }
         }
     }
@@ -249,7 +204,6 @@ fn copy_range(mut file: &File, offset: u64, length: u64, output: &mut impl Write
 }
 
 struct PatchWriter<'a, W> {
-    format: Format,
     output: &'a mut W,
     remaining: u64,
 }
@@ -259,26 +213,26 @@ impl<W: Write> PatchWriter<'_, W> {
         if length == 0 {
             return Ok(true);
         }
-        let header = 1 + self.format.number_width();
+        let header = 1 + NUMBER_WIDTH;
         if length > self.remaining.saturating_sub(header) {
             return Ok(false);
         }
         self.remaining -= header + length;
         self.output.write_all(&[LITERAL])?;
-        self.format.write_number(self.output, length)?;
+        self.output.write_all(&length.to_le_bytes())?;
         copy_range(file, offset, length, self.output)?;
         Ok(true)
     }
 
     fn copy(&mut self, offset: u64, length: u64) -> Result<bool> {
-        let header = 1 + 2 * self.format.number_width();
+        let header = 1 + 2 * NUMBER_WIDTH;
         if header > self.remaining {
             return Ok(false);
         }
         self.remaining -= header;
         self.output.write_all(&[COPY])?;
-        self.format.write_number(self.output, offset)?;
-        self.format.write_number(self.output, length)?;
+        self.output.write_all(&offset.to_le_bytes())?;
+        self.output.write_all(&length.to_le_bytes())?;
         Ok(true)
     }
 }
@@ -289,7 +243,6 @@ fn encode(
     base_length: u64,
     new_file: &File,
     new_length: u64,
-    format: Format,
     output: &mut impl Write,
 ) -> Result<bool> {
     let block = BLOCK as u64;
@@ -307,11 +260,10 @@ fn encode(
         offset += stride;
     }
 
-    output.write_all(format.magic())?;
+    output.write_all(MAGIC)?;
     let mut patch = PatchWriter {
-        format,
         output,
-        remaining: format.patch_limit(new_length) - format.magic().len() as u64,
+        remaining: patch_limit(new_length) - MAGIC.len() as u64,
     };
     let high = ROLL.wrapping_pow((BLOCK - 1) as u32);
     let mut base = FileWindow::new(base_file, base_length);
@@ -354,26 +306,25 @@ fn encode(
 }
 
 pub(super) fn reconstruct(
-    format: Format,
     base: &File,
     base_length: u64,
     mut patch: impl Read,
     output: &mut impl Write,
     size: u64,
 ) -> Result<()> {
-    let mut magic = [0; 5];
+    let mut magic = [0; MAGIC.len()];
     patch.read_exact(&mut magic)?;
-    ensure!(magic == *format.magic(), "unknown delta format");
+    ensure!(magic == *MAGIC, "unknown delta format");
     let mut remaining = size;
     let mut tag = [0; 1];
     while remaining != 0 {
         patch.read_exact(&mut tag)?;
         let offset = match tag[0] {
-            COPY => Some(format.read_number(&mut patch)?),
+            COPY => Some(read_number(&mut patch)?),
             LITERAL => None,
             _ => bail!("invalid delta instruction"),
         };
-        let length = format.read_number(&mut patch)?;
+        let length = read_number(&mut patch)?;
         ensure!(
             length > 0 && length <= remaining,
             "delta output length mismatch"
@@ -427,13 +378,11 @@ mod tests {
             base_length,
             &new_file,
             new_length,
-            Format::V1,
             &mut patch
         )?);
         assert!(patch.len() < new.len() / 4);
         let mut output = Vec::new();
         reconstruct(
-            Format::V1,
             &base_file,
             base_length,
             patch.as_slice(),
@@ -442,16 +391,14 @@ mod tests {
         )?;
         assert_eq!(output, new);
         let invalid = |base_length, patch: &[u8], size| {
-            reconstruct(
-                Format::V1,
-                &base_file,
-                base_length,
-                patch,
-                &mut Vec::new(),
-                size,
-            )
-            .is_err()
+            reconstruct(&base_file, base_length, patch, &mut Vec::new(), size).is_err()
         };
+        assert!(patch.starts_with(b"CPSP1"));
+        let mut old_patch = patch.clone();
+        for magic in [b"CPSD1", b"CPSD2"] {
+            old_patch[..MAGIC.len()].copy_from_slice(magic);
+            assert!(invalid(base_length, &old_patch, new_length));
+        }
         assert!(invalid(BLOCK as u64, &patch, new_length));
         assert!(invalid(base_length, &patch, 1));
         assert!(invalid(base_length, &patch[..patch.len() - 1], new_length));
@@ -461,33 +408,25 @@ mod tests {
             base_length,
             &unrelated,
             base_length,
-            Format::V1,
             &mut Vec::new()
         )?);
         Ok(())
     }
 
     #[test]
-    fn v2_reconstructs_from_beyond_four_gibibytes() -> Result<()> {
+    fn reconstructs_from_beyond_four_gibibytes() -> Result<()> {
         let base = tempfile::tempfile()?;
         let offset = 1u64 << 32;
-        let bytes = b"data beyond the v1 offset range";
+        let bytes = b"data beyond the 32-bit offset range";
         let length = bytes.len() as u64;
         let base_length = offset + length;
         base.write_all_at(bytes, offset)?;
-        let mut patch = b"CPSD2".to_vec();
+        let mut patch = b"CPSP1".to_vec();
         patch.push(COPY);
         patch.extend_from_slice(&offset.to_le_bytes());
         patch.extend_from_slice(&length.to_le_bytes());
         let mut output = Vec::new();
-        reconstruct(
-            Format::V2,
-            &base,
-            base_length,
-            patch.as_slice(),
-            &mut output,
-            length,
-        )?;
+        reconstruct(&base, base_length, patch.as_slice(), &mut output, length)?;
         assert_eq!(output, bytes);
         Ok(())
     }

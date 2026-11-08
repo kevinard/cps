@@ -252,11 +252,10 @@ fn check_state(
     }
     if pristine {
         let aliases = hardlink_groups(&expected);
-        let layout = state.settings.state_layout;
-        root.walk(Some(layout.directory()), |path, entry, info| {
+        root.walk(Some(crate::image::STATE_DIRECTORY), |path, entry, info| {
             let kind = FileType::from_raw_mode(info.st_mode);
             let Some(managed) = expected.get(path) else {
-                if kind == FileType::Directory && layout.ancestors().contains(&path) {
+                if kind == FileType::Directory && crate::image::STATE_ANCESTORS.contains(&path) {
                     return Ok(true);
                 }
                 findings.push(Finding {

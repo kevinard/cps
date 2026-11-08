@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs::File,
     path::Path,
 };
 
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ConfigMove, Write, config_update_prefix, paths::config_name, stage_config};
 use crate::{
-    image::{DormantConfig, Image, Installed, Managed, Settings, State, StateLayout, root::Root},
+    image::{DormantConfig, Image, Installed, Managed, Settings, State, root::Root},
     model::{Node, copy_payload, validate_path},
     verify::manifest_paths,
 };
@@ -38,10 +38,10 @@ pub fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
         paths == state.paths,
         "path ownership index differs from installed manifests"
     );
-    Ok(updates(&image.root, &state.settings, &paths)?
+    Ok(updates(&state.settings, &paths)?
         .into_iter()
         .map(|(path, revision)| {
-            let vendor_copy = vendor_copy(state.settings.state_layout, revision, &path);
+            let vendor_copy = vendor_copy(revision, &path);
             let vendor_available = image
                 .root
                 .inspect(&vendor_copy)
@@ -75,11 +75,11 @@ pub fn config_diff_inputs(
         paths == state.paths,
         "path ownership index differs from installed manifests"
     );
-    let revision = updates(&image.root, &state.settings, &paths)?
+    let revision = updates(&state.settings, &paths)?
         .get(path)
         .copied()
         .with_context(|| format!("no pending configuration update for {path}"))?;
-    let copy = vendor_copy(state.settings.state_layout, revision, path);
+    let copy = vendor_copy(revision, path);
     copy_payload(&image.root.file(&copy)?, &paths[path].node, vendor)
         .with_context(|| format!("checking staged vendor configuration {copy}"))?;
     if let Some(entry) = image.root.regular_entry(path)? {
@@ -106,7 +106,7 @@ pub(super) fn resolve(
         .get(path)
         .filter(|file| file.preserve)
         .with_context(|| format!("no managed preserved configuration at {path}"))?;
-    let mut updates = updates(root, settings, paths)?;
+    let mut updates = updates(settings, paths)?;
     let revision = updates
         .remove(path)
         .with_context(|| format!("no pending configuration update for {path}"))?;
@@ -124,7 +124,7 @@ pub(super) fn resolve(
     let after = match choice {
         ConfigChoice::Local => before.clone(),
         ConfigChoice::Vendor => {
-            let copy = vendor_copy(settings.state_layout, revision, path);
+            let copy = vendor_copy(revision, path);
             ensure!(
                 root.inspect(&copy)?.as_ref() == Some(&vendor.node),
                 "staged vendor configuration {copy} differs from its installed manifest"
@@ -132,7 +132,7 @@ pub(super) fn resolve(
             Some(vendor.node.clone())
         }
     };
-    settings.config_updates = Some(updates);
+    settings.config_updates = updates;
     Ok((
         revision,
         Write {
@@ -345,7 +345,6 @@ pub(super) fn reclaim_disabled(
                 state
                     .settings
                     .config_updates
-                    .get_or_insert_default()
                     .insert(to.to_owned(), revision);
             }
             let replacement = observed
@@ -426,9 +425,7 @@ pub(super) fn plan_move(
         ),
         "unexpected file type or capabilities on local configuration {from}"
     );
-    if let Some(updates) = &mut settings.config_updates {
-        updates.remove(from);
-    }
+    settings.config_updates.remove(from);
     let (after, local) = if observed.as_ref() == Some(old) {
         (Some(target.node.clone()), None)
     } else {
@@ -467,57 +464,20 @@ pub(super) fn plan_move(
 }
 
 pub(super) fn updates(
-    root: &Root,
     settings: &Settings,
     paths: &BTreeMap<String, Managed>,
 ) -> Result<BTreeMap<String, u64>> {
-    if let Some(updates) = &settings.config_updates {
-        for (path, revision) in updates {
-            validate_path(path)?;
-            ensure!(
-                paths.get(path).is_some_and(|file| file.preserve)
-                    && (1..=settings.revision).contains(revision),
-                "invalid pending configuration update for {path}"
-            );
-        }
-        return Ok(updates.clone());
+    for (path, revision) in &settings.config_updates {
+        validate_path(path)?;
+        ensure!(
+            paths.get(path).is_some_and(|file| file.preserve)
+                && (1..=settings.revision).contains(revision),
+            "invalid pending configuration update for {path}"
+        );
     }
-
-    // Recover old proposals only if their bytes and metadata match the
-    // currently installed default. Prior revisions can contain older defaults.
-    let directory = settings.state_layout.config_updates();
-    if root.inspect(directory)?.is_none() {
-        return Ok(BTreeMap::new());
-    }
-    let dir = root.dir(directory)?;
-    let mut revisions = Vec::new();
-    for entry in fs::read_dir(Root::fd_path(&dir))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if let Some(revision) = name.to_str().and_then(|name| name.parse::<u64>().ok())
-            && name == revision.to_string().as_str()
-            && (1..=settings.revision).contains(&revision)
-            && entry.file_type()?.is_dir()
-        {
-            revisions.push(revision);
-        }
-    }
-    revisions.sort_unstable_by(|a, b| b.cmp(a));
-    let mut found = BTreeMap::new();
-    for (path, file) in paths.iter().filter(|(_, file)| file.preserve) {
-        if root.inspect(path)?.as_ref() == Some(&file.node) {
-            continue;
-        }
-        if let Some(revision) = revisions.iter().copied().find(|revision| {
-            root.inspect(&vendor_copy(settings.state_layout, *revision, path))
-                .is_ok_and(|copy| copy.as_ref() == Some(&file.node))
-        }) {
-            found.insert(path.clone(), revision);
-        }
-    }
-    Ok(found)
+    Ok(settings.config_updates.clone())
 }
 
-pub(super) fn vendor_copy(layout: StateLayout, revision: u64, path: &str) -> String {
-    format!("{}{path}", config_update_prefix(layout, revision))
+pub(super) fn vendor_copy(revision: u64, path: &str) -> String {
+    format!("{}{path}", config_update_prefix(revision))
 }

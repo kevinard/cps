@@ -36,10 +36,10 @@ install -m644 -- "$public_key" "$destination/public.der"
     for blob in repo/blobs/*; do
         zstd --quiet --zstd=wlog=21 --rm -o "repo/blobs-${blob##*/}.zst" -- "$blob"
     done
-    printf 'schema-version 1\n' > toolchain.kdl
+    printf 'schema-version 1 kind="toolchain-config"\n' > toolchain.kdl
     append_toolchain_publisher "$work/pins" toolchain.kdl canopa-git-tools repo public.der
     {
-        printf 'schema-version 1\ntoolchain solver="sat-v1" {\n'
+        printf 'schema-version 1 kind="git-toolchain"\ntoolchain solver="sat-v2" {\n'
         cat "$work/pins"
         printf '    package "cps://canopa-git-tools/build/base-tools@1.0.0-0"\n}\n'
     } > toolchain.default.kdl

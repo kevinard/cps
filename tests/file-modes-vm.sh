@@ -33,7 +33,7 @@ printf 'protected\n' > proto/tmp/root-owned
 for version in 1 2 3 4; do
     case $version in 1) mode=6755 ;; 2) mode=4755 ;; 3) mode=2755 ;; 4) mode=0755 ;; esac
     cat > modes.kdl <<MANIFEST
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/modes" publisher="modetest" version="$version.0.0-0" {
     file "bin/helper" mode="$mode" uid=0 gid=0
     hardlink "bin/helper-link" target="bin/helper"
@@ -45,7 +45,7 @@ MANIFEST
     "$cps" publish --repo root/repository --proto proto --signing-key private.der modes.kdl
 done
 cat > groups.kdl <<'MANIFEST'
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "test/groups" publisher="modetest" version="1.0.0-0" {
     dir "var/shared" mode="2777" uid=0 gid=0
 }

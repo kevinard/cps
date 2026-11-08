@@ -16,7 +16,7 @@ mod version;
 
 pub use version::Version;
 
-pub const FORMAT: u32 = 1;
+pub(crate) const MANIFEST_FORMAT: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -665,7 +665,7 @@ impl Manifest {
 
     pub fn validate(&self, published: bool) -> Result<()> {
         ensure!(
-            self.format == FORMAT,
+            self.format == MANIFEST_FORMAT,
             "unsupported manifest format {}",
             self.format
         );

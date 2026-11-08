@@ -24,15 +24,18 @@ openssl genpkey -algorithm ED25519 -outform DER -out private.der
 openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 mkdir proto
 cat > template.kdl <<'KDL'
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "demo/snapshot" publisher="demo" version="0.0.0-42"
 KDL
 "$cps" publish --repo repo --proto proto --signing-key private.der template.kdl
 manifest_sha256=$(sha256sum template.kdl | cut -d' ' -f1)
 cat > template.build.kdl <<KDL
-schema-version 1
+schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {
-    toolchain "$(printf '%064d' 0)" { package "devel/base"; }
+    toolchain solver="sat-v2" {
+        publisher "seed" catalog="$(printf '%064d' 0)" key-sha256="$(printf '%064d' 0)"
+        package "devel/base"
+    }
     manifest "template.kdl" sha256="$manifest_sha256"
     source "git.tar" size=0 sha256="$(printf '%064d' 0)"
     option "MODE" "test"
@@ -43,7 +46,7 @@ KDL
 snapshot_from() {
     local output=$1
     shift
-    "$cps" source git-snapshot --git-repo "${git_repo:-./upstream}" --repo repo \
+    "$cps" source git-snapshot --git-repo "${git_repo:-$work/upstream}" --repo repo \
         --trust-key public.der --output "$output" "$@" template.build.kdl
 }
 
@@ -110,13 +113,24 @@ reject_snapshot --commit "$(git -C upstream rev-parse refs/tags/release)"
 reject_snapshot --tag release --branch main
 reject_snapshot
 
+reservation=repo/git-snapshots/$(printf '%s' 'cps://demo/demo/snapshot@' | sha256sum | cut -d' ' -f1)
+cp "$reservation" reservation.json
+jq -e '.format == 1' reservation.json
+jq 'del(.format)' reservation.json > "$reservation"
+reject_snapshot --branch main
+grep -F 'missing field `format`' rejected.log
+jq '.format = 2' reservation.json > "$reservation"
+reject_snapshot --branch main
+grep -F 'unsupported Git snapshot reservation format 2' rejected.log
+cp reservation.json "$reservation"
+
 git init --quiet --initial-branch=main --object-format=sha256 upstream-sha256
 git -C upstream-sha256 -c user.name='CPS test' -c user.email=cps@example.invalid \
     commit --quiet --allow-empty -m initial
 sha256=$(git -C upstream-sha256 rev-parse HEAD)
 git -C upstream-sha256 tag release
-git_repo=./upstream-sha256 snapshot_from sha256-tag --tag release | grep -F "from tag:release@$sha256"
-git_repo=./upstream-sha256 snapshot_from sha256-commit --commit "$sha256" | grep -F "from $sha256"
+git_repo="$work/upstream-sha256" snapshot_from sha256-tag --tag release | grep -F "from tag:release@$sha256"
+git_repo="$work/upstream-sha256" snapshot_from sha256-commit --commit "$sha256" | grep -F "from $sha256"
 test "$(git get-tar-commit-id < sha256-tag/sources/git.tar)" = "$sha256"
 cmp sha256-tag/sources/git.tar sha256-commit/sources/git.tar
 

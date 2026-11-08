@@ -177,7 +177,7 @@ case ${1:-} in
         deployed=$repo/.ci-deployed-catalog
         state=$repo/.ci-tuf-state.json
         if [[ ! -e $deployed && ! -L $deployed ]]; then
-            [[ ! -e $state && ! -e $timestamp && ! -L $timestamp ]] ||
+            [[ ! -e $state && ! -L $state && ! -e $timestamp && ! -L $timestamp ]] ||
                 fail 'Run deploy-current to record the deployed catalog before refreshing.'
             printf '%s\n' 'The first mirror deployment is pending.'
             exit 0
@@ -185,10 +185,20 @@ case ${1:-} in
         base=$(current)
         digest "$base" && [[ -f $deployed && ! -L $deployed && $(cat "$deployed") == "$base" ]] ||
             fail 'Refresh requires the current catalog to be recorded as deployed. Complete the deployment with deploy-current first.'
-        if [[ -f $state && ! -L $state && -O $state && $(stat -c %a -- "$state") == 600 &&
-            -f $timestamp && ! -L $timestamp ]] &&
+        if [[ -e $state || -L $state ]]; then
+            [[ -f $state && ! -L $state && -O $state && $(stat -c %a -- "$state") == 600 ]] ||
+                fail 'TUF publication state must be a private file owned by the signer'
+            version=$(jq -ers --arg mirror "$mirror" '
+                select(length == 1) | .[0]
+                | select(keys == ["format", "mirror", "published", "version"] and .format == 1 and .mirror == $mirror)
+                | .version | numbers
+            ' "$state") &&
+                [[ $version =~ ^(0|[1-9][0-9]{0,14})$ ]] ||
+                fail 'Invalid TUF publication state or a different mirror is configured'
+        fi
+        if [[ -f $state && -f $timestamp && ! -L $timestamp ]] &&
             record=$(jq -er --arg mirror "$mirror" --arg base "$base" '
-                select(.mirror == $mirror and .published.catalog == $base) | .published |
+                select(.format == 1 and .mirror == $mirror and .published.catalog == $base) | .published |
                 select(.expires | strings | test("^[0-9]{4}(-[0-9]{2}){2}T[0-9]{2}(:[0-9]{2}){2}Z$")) |
                 select(.sha256 | strings | test("^[0-9a-f]{64}$")) | [.expires, .sha256] | @tsv
             ' "$state") &&

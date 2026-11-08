@@ -1,4 +1,4 @@
-schema-version 1
+schema-version 1 kind="package-manifest"
 package "system/cps" publisher="canopa" version="0.1.0-39" architecture="x86_64" {
     require "system/elf-runtime"
     require "system/libseccomp" version=">=2.6.1-1"

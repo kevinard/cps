@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Plan, Renames, Retention, SolverRevision, resolve};
+use super::{Plan, Renames, Retention, resolve};
 use crate::{
     attestation::BuildTrust,
     image::{Image, Installed, Publisher, State, lock::ImageLock},
@@ -15,7 +15,6 @@ use crate::{
 
 #[derive(Default)]
 pub(super) struct Catalogs {
-    pub legacy: Option<String>,
     pub pins: BTreeMap<String, String>,
     pub candidates: CandidateSet<Published>,
     pub renames: Renames,
@@ -160,7 +159,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         freezes: &BTreeMap<String, super::FrozenPackage>,
         local_roots: Option<&BTreeSet<String>>,
         renames: &BTreeMap<&str, PackageSpec<'_>>,
-        solver: Option<SolverRevision>,
+        install_recommends: bool,
         compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
     ) -> Result<(BTreeMap<String, Installed>, T)> {
         let locked = self.replay(profile)?;
@@ -208,7 +207,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
             &requested,
             true,
             local_roots.map_or(Retention::All, Retention::Names),
-            solver,
+            install_recommends,
             compose,
         )?;
         for (name, package) in &mut installed {
@@ -293,29 +292,14 @@ pub(super) fn load(
     lock: Option<&ImageLock>,
 ) -> Result<Catalogs> {
     let publishers = state.publishers.as_slice();
-    let single = publishers.len() == 1;
-    // Modern images can rely on their verified archives for installed packages.
-    // A legacy image may still need the cached catalog to archive its old state.
-    let omit_catalog = |name: &str| {
-        deferred_publishers.contains(name)
-            && (state.settings.catalog_archives
-                || !state
-                    .installed
-                    .values()
-                    .any(|package| package.published.manifest.publisher == name))
-    };
+    let omit_catalog = |name: &str| deferred_publishers.contains(name);
     if let Some(saved) = saved {
         ensure!(
-            if single {
-                saved.catalog.is_some() && saved.catalogs.is_empty()
-            } else {
-                saved.catalog.is_none()
-                    && saved.catalogs.len()
-                        == publishers
-                            .iter()
-                            .filter(|publisher| !omit_catalog(&publisher.name))
-                            .count()
-            },
+            saved.catalogs.len()
+                == publishers
+                    .iter()
+                    .filter(|publisher| !omit_catalog(&publisher.name))
+                    .count(),
             "saved plan's catalogs do not match the image's publishers"
         );
     }
@@ -334,7 +318,6 @@ pub(super) fn load(
     let saved_pin = |publisher: &str| -> Result<Option<&str>> {
         match saved {
             None => Ok(None),
-            Some(plan) if single => Ok(plan.catalog.as_deref()),
             Some(plan) => {
                 Ok(Some(plan.catalogs.get(publisher).with_context(|| {
                     format!("saved plan has no catalog for {publisher}")
@@ -423,13 +406,9 @@ pub(super) fn load(
         catalogs
             .checkpoints
             .insert(publisher.name.clone(), snapshot.builds.history.clone());
-        if single {
-            catalogs.legacy = Some(snapshot.sha256.clone());
-        } else {
-            catalogs
-                .pins
-                .insert(publisher.name.clone(), snapshot.sha256.clone());
-        }
+        catalogs
+            .pins
+            .insert(publisher.name.clone(), snapshot.sha256.clone());
         if deferred_publishers.contains(&publisher.name) {
             continue;
         }

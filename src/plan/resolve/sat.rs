@@ -253,12 +253,13 @@ mod tests {
         for index in 0..COUNT {
             let next = (index + 1) % COUNT;
             let document = format!(
-                "schema-version 1\npackage \"system/chain-{index:04}\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n\
+                "schema-version 1 kind=\"package-manifest\"\npackage \"system/chain-{index:04}\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n\
                  require \"system/chain-{next:04}\"\n}}\n"
             );
             packages.push(serde_json::from_value(serde_json::json!({
                 "sha256": digest(document.as_bytes()),
                 "manifest": parse_manifest(&document)?,
+                "document": document,
             }))?);
         }
         let candidates = packages

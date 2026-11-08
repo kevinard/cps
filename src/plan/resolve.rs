@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 
-use super::SolverRevision;
 use super::freeze::{self, FrozenPackage};
 use crate::{
     image::Installed,
@@ -41,7 +40,7 @@ pub fn resolve<'a, T>(
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     update: bool,
     retention: Retention<'_>,
-    solver: Option<SolverRevision>,
+    install_recommends: bool,
     compose: impl Fn(&BTreeMap<String, Installed>) -> Result<T>,
 ) -> Result<(BTreeMap<String, Installed>, T)> {
     for (name, spec) in requested {
@@ -176,22 +175,13 @@ pub fn resolve<'a, T>(
         let composed = compose(&installed)?;
         Ok((installed, composed))
     };
-    let result = match solver {
-        Some(solver) => sat::solve(
-            &candidates,
-            &wanted,
-            installed,
-            (solver == SolverRevision::SatV2).then_some(available.profile_packages),
-            materialize,
-        ),
-        None => {
-            // Existing saved plans and pinned build recipes retain their original selection order.
-            let mut selected = BTreeMap::new();
-            search(&candidates, wanted.clone(), &mut selected)
-                .context("cannot satisfy package constraints")
-                .and_then(|()| materialize(selected))
-        }
-    };
+    let result = sat::solve(
+        &candidates,
+        &wanted,
+        installed,
+        install_recommends.then_some(available.profile_packages),
+        materialize,
+    );
     if available.freezes.is_empty() {
         result
     } else {
@@ -199,59 +189,6 @@ pub fn resolve<'a, T>(
             format!("resolving package selection with freezes: {}; use plan unfreeze to lift a constraint", available.freezes.iter().map(|(name, frozen)| format!("{name}@{}{}", frozen.version, freeze::reason_suffix(frozen))).collect::<Vec<_>>().join(", "))
         })
     }
-}
-
-fn search<'a>(
-    candidates: &BTreeMap<&'a str, Vec<&'a Published>>,
-    mut wanted: BTreeSet<&'a str>,
-    selected: &mut BTreeMap<&'a str, &'a Published>,
-) -> Result<()> {
-    let Some(name) = wanted.pop_first() else {
-        return Ok(());
-    };
-    if selected.contains_key(name) {
-        return search(candidates, wanted, selected);
-    }
-    let versions = candidates
-        .get(name)
-        .with_context(|| format!("no candidate for {name}"))?;
-    let mut failure = None;
-    for package in versions {
-        if let Some(action) =
-            package
-                .manifest
-                .dependency
-                .iter()
-                .find_map(|dependency| match dependency {
-                    Dependency::RequireCapability(_) => Some("require-capability"),
-                    Dependency::RequireAny { .. } => Some("require-any"),
-                    Dependency::Conditional { .. } => Some("conditional"),
-                    _ => None,
-                })
-        {
-            failure = Some(anyhow::anyhow!(
-                "{} requires solver sat-v1 for {action}",
-                package.manifest.id()
-            ));
-            continue;
-        }
-        selected.insert(name, package);
-        let mut wanted = wanted.clone();
-        for dependency in &package.manifest.dependency {
-            if let Dependency::Require(target) = dependency
-                && !selected.contains_key(target.package.as_str())
-            {
-                wanted.insert(target.package.as_str());
-            }
-        }
-        let attempt = check_selected(selected).and_then(|()| search(candidates, wanted, selected));
-        if attempt.is_ok() {
-            return Ok(());
-        }
-        failure = attempt.err();
-        selected.remove(name);
-    }
-    Err(failure.context("no compatible version")?).with_context(|| format!("selecting {name}"))
 }
 
 fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {

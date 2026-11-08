@@ -47,7 +47,7 @@ def main():
         def publish(name, version, path, dependencies=""):
             (proto / path).write_text(f"{name} {version}\n")
             manifest.write_text(
-                f'schema-version 1\npackage "{name}" publisher="bench" version="{version}.0.0-0" {{\n'
+                f'schema-version 1 kind="package-manifest"\npackage "{name}" publisher="bench" version="{version}.0.0-0" {{\n'
                 f'{dependencies}    file "{path}" mode="0644" uid={os.getuid()} gid={os.getgid()}\n'
                 '}\n'
             )

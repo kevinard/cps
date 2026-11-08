@@ -27,11 +27,12 @@ bash "$project/tests/seed-native-c.sh" "$work/native-gnu" --util-linux
 "$cps" publish --repo toolchain --proto "$work/native-gnu" --signing-key "$work/toolchain.der" native-gnu.kdl
 mkdir repo
 cp builder-public.der repo/
-printf 'schema-version 1\npublisher "canopa-utilities" {\n    builder-key "builder-public.der"\n}\n' > repo/publish-policy.kdl
+printf 'schema-version 1 kind="publish-policy"\npublisher "canopa-utilities" {\n    builder-key "builder-public.der"\n}\n' > repo/publish-policy.kdl
 for utility in coreutils grep; do
     recipe="$project/packaging/gnu-tools"
     sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/$utility.kdl" > "$utility.kdl"
     sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
+        -e "s/@KEY_SHA256@/$(tail -c 32 -- toolchain-public.der | sha256sum | cut -d' ' -f1)/g" \
         -e "s/@MANIFEST_SHA256@/$(sha "$utility.kdl")/g" "$recipe/$utility.build.kdl.in" > "$utility.build.kdl"
     "$cps" source import --from "$sources" --cache sources "$utility.build.kdl"
     "$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \

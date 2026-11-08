@@ -10,10 +10,9 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
-    image::StateLayout,
     model::{
-        Action, Dependency, DependencyTarget, FORMAT, Manifest, NIL_UUID, OptionalDependency,
-        is_uuid, validate_digest, validate_name, validate_publisher,
+        Action, Dependency, DependencyTarget, MANIFEST_FORMAT, Manifest, NIL_UUID,
+        OptionalDependency, is_uuid, validate_digest, validate_name, validate_publisher,
     },
     repo::read_limited,
     systemd::Action as SystemdAction,
@@ -24,6 +23,9 @@ pub(crate) mod build;
 pub(crate) mod publish_policy;
 pub(crate) mod publish_release;
 pub(crate) mod worker;
+
+const SCHEMA_VERSION: u32 = 1;
+const MANIFEST_KIND: &str = "package-manifest";
 
 struct Fields<'a> {
     args: Vec<&'a KdlValue>,
@@ -109,12 +111,19 @@ impl<'a> Fields<'a> {
     }
 }
 
-fn schema(doc: &KdlDocument) -> Result<()> {
-    let node = one(doc, "schema-version")?;
-    let fields = Fields::read(node, 1, &[], false)?;
+fn schema(doc: &KdlDocument, kind: &str) -> Result<()> {
+    schema_version(doc, SCHEMA_VERSION, kind)
+}
+
+fn schema_version(doc: &KdlDocument, version: u32, kind: &str) -> Result<()> {
+    let fields = Fields::read(one(doc, "schema-version")?, 1, &["kind"], false)?;
     ensure!(
-        fields.args[0].as_integer() == Some(i128::from(FORMAT)),
-        "expected schema-version {FORMAT}"
+        fields.args[0].as_integer() == Some(i128::from(version)),
+        "expected schema-version {version} for {kind}"
+    );
+    ensure!(
+        fields.required_string("kind")? == kind,
+        "expected schema-version kind={kind:?}"
     );
     Ok(())
 }
@@ -138,7 +147,7 @@ fn document(text: &str) -> Result<KdlDocument> {
 
 pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let doc = document(text)?;
-    schema(&doc)?;
+    schema_version(&doc, MANIFEST_FORMAT, MANIFEST_KIND)?;
     let package = one(&doc, "package")?;
     ensure!(
         doc.nodes().len() == 2,
@@ -158,7 +167,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         true,
     )?;
     let mut manifest = Manifest {
-        format: FORMAT,
+        format: MANIFEST_FORMAT,
         name: fields.string_arg(0)?,
         publisher: fields.required_string("publisher")?,
         version: fields.required_string("version")?.parse()?,
@@ -392,11 +401,17 @@ fn target_node(name: &str, target: &DependencyTarget) -> KdlNode {
     node
 }
 
+fn schema_header(version: u32, kind: &str) -> KdlNode {
+    let mut schema = KdlNode::new("schema-version");
+    schema.push(i128::from(version));
+    schema.insert("kind", kind);
+    schema
+}
+
 pub fn manifest_text(manifest: &Manifest) -> String {
     let mut doc = KdlDocument::new();
-    let mut schema = KdlNode::new("schema-version");
-    schema.push(i128::from(manifest.format));
-    doc.nodes_mut().push(schema);
+    doc.nodes_mut()
+        .push(schema_header(manifest.format, MANIFEST_KIND));
     let mut package = KdlNode::new("package");
     package.push(manifest.name.as_str());
     package.insert("publisher", manifest.publisher.as_str());
@@ -609,7 +624,7 @@ pub(crate) fn read_build_trust(path: &Path) -> Result<BuildTrustConfig> {
         .context("missing build trust policy directory")?;
     let bytes = read_limited(File::open(&path)?, 1024 * 1024)?;
     let doc = document(std::str::from_utf8(&bytes)?)?;
-    schema(&doc)?;
+    schema(&doc, "build-trust")?;
     ensure!(
         doc.nodes().len() == 2,
         "expected only schema-version and build-trust"
@@ -675,7 +690,6 @@ pub(crate) struct ImageDefinition {
     pub boot_btrfs: Option<BtrfsConfig>,
     pub stage_packages: BTreeSet<String>,
     pub cache_keep_versions: Option<usize>,
-    pub state_layout: Option<StateLayout>,
     pub git_toolchain_config: Option<PathBuf>,
 }
 
@@ -705,7 +719,7 @@ pub(crate) fn read_image_definition(path: &Path) -> Result<ImageDefinition> {
 
 fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
     let doc = document(text)?;
-    schema(&doc)?;
+    schema(&doc, "image-config")?;
     let mut config = ImageDefinition {
         publishers: Vec::new(),
         arch: std::env::consts::ARCH.to_owned(),
@@ -717,7 +731,6 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         boot_btrfs: None,
         stage_packages: BTreeSet::new(),
         cache_keep_versions: None,
-        state_layout: None,
         git_toolchain_config: None,
     };
     let mut architecture = false;
@@ -810,15 +823,6 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 let path = Fields::read(node, 1, &[], false)?.string_arg(0)?;
                 config.git_toolchain_config = Some(parent.join(path));
             }
-            "image-state" => {
-                ensure!(config.state_layout.is_none(), "duplicate image-state node");
-                let fields = Fields::read(node, 1, &[], false)?;
-                config.state_layout = Some(match fields.string_arg(0)?.as_str() {
-                    "var-lib" => StateLayout::VarLib,
-                    "legacy" => StateLayout::Legacy,
-                    _ => bail!("image-state must be var-lib or legacy"),
-                });
-            }
             "cache-keep-versions" => {
                 ensure!(
                     config.cache_keep_versions.is_none(),
@@ -898,7 +902,7 @@ mod tests {
     #[test]
     fn configuration_resolves_paths_and_checks_duplicates() -> Result<()> {
         let config = r#"
-            schema-version 1
+            schema-version 1 kind="image-config"
             publisher "canopa" {
                 repository "../repo"
                 trust-key "/etc/keys/canopa.der"
@@ -909,6 +913,12 @@ mod tests {
             image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"
         "#;
         let parsed = parse_image_config(config, Path::new("/tmp/config"))?;
+        for invalid in [
+            config.replace(" kind=\"image-config\"", ""),
+            config.replace("image-config", "toolchain-config"),
+        ] {
+            assert!(parse_image_config(&invalid, Path::new("/tmp/config")).is_err());
+        }
         assert_eq!(
             parsed.publishers[0].repository,
             Path::new("/tmp/config/../repo")
@@ -957,9 +967,26 @@ mod tests {
     }
 
     #[test]
+    fn manifest_version_one_requires_its_kind() -> Result<()> {
+        let input = "schema-version 1 kind=\"package-manifest\"\npackage \"test/example\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
+        let manifest = parse_manifest(input)?;
+        assert_eq!(manifest.format, 1);
+        assert_eq!(parse_manifest(&manifest_text(&manifest))?, manifest);
+
+        for invalid in [
+            input.replace(" kind=\"package-manifest\"", ""),
+            input.replace("package-manifest", "build-recipe"),
+            input.replace("schema-version 1", "schema-version 2"),
+        ] {
+            assert!(parse_manifest(&invalid).is_err(), "{invalid}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn manifest_rejects_duplicate_properties() {
         let input = r#"
-            schema-version 1
+            schema-version 1 kind="package-manifest"
             package "test/example" publisher="canopa" version="1.0.0-0" {
                 file "usr/bin/example" mode="0755" uid=0 uid=1 gid=0
             }
@@ -972,7 +999,7 @@ mod tests {
     fn capability_declarations_round_trip_and_reject_invalid_values() -> Result<()> {
         let package = |body: &str| {
             format!(
-                "schema-version 1\npackage \"test/example\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{body}\n}}"
+                "schema-version 1 kind=\"package-manifest\"\npackage \"test/example\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{body}\n}}"
             )
         };
         let manifest = parse_manifest(&package(

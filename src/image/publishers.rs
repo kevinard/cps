@@ -89,12 +89,7 @@ impl Image {
             checkpoint,
         )?;
         if let Some(selected) = &selected {
-            self.check_catalog_transition(
-                settings,
-                primary,
-                &selected.primary.sha256,
-                settings.archived_profile_catalog.as_deref(),
-            )?;
+            self.check_catalog_transition(settings, primary, &selected.primary.sha256)?;
         }
         Ok(selected)
     }
@@ -506,12 +501,13 @@ fn audit_archived<'a>(
     if installed.peek().is_none() {
         return Ok((audit, missing));
     }
-    let applied = catalogs::read_applied(&image.db, state, publisher, profile)?;
-    ensure!(
-        !state.settings.catalog_archives || applied.is_some(),
-        "missing catalog checkpoint for installed publisher {}",
-        publisher.name
-    );
+    let (applied, applied_hash) = catalogs::read_applied(&image.db, state, publisher, profile)?
+        .with_context(|| {
+            format!(
+                "missing catalog checkpoint for installed publisher {}",
+                publisher.name
+            )
+        })?;
     let archive = builds::exists(&image.db)?;
     let mut supplemental = None;
     for package in installed {
@@ -525,19 +521,12 @@ fn audit_archived<'a>(
                 continue;
             }
             Ok(Some((receipt, bytes))) => (|| {
-                let admitted = match &applied {
-                    Some((catalog, _)) => catalog
-                        .check_installed(package)?
-                        .map(|hash| (catalog, hash)),
-                    None => None,
-                };
-                let (catalog, expected) = if let Some(admitted) = admitted {
-                    admitted
+                let (catalog, expected) = if let Some(hash) = applied.check_installed(package)? {
+                    (&applied, hash)
                 } else {
                     if supplemental.is_none() {
                         let found = builds::admission_catalog(&image.db, publisher)?;
-                        if let (Some((applied, applied_hash)), Some((catalog, hash))) =
-                            (&applied, &found)
+                        if let Some((catalog, hash)) = &found
                             && hash != applied_hash
                         {
                             applied.check_successor(catalog, applied_hash).context(
@@ -547,15 +536,7 @@ fn audit_archived<'a>(
                         supplemental = Some(found);
                     }
                     let Some((catalog, _)) = supplemental.as_ref().and_then(Option::as_ref) else {
-                        if applied.is_some() {
-                            // Re-audit old receipts whose later catalog was never saved.
-                            return Ok(false);
-                        }
-                        // Legacy images can have receipts without their full catalog.
-                        policies.iter().try_for_each(|trust| {
-                            receipt.verify(&bytes, package, &publisher.key, trust)
-                        })?;
-                        return Ok(true);
+                        return Ok(false);
                     };
                     let hash = catalog
                         .check_installed(package)?
@@ -698,7 +679,6 @@ fn save(
     settings
         .dormant_configs
         .retain(|_, config| publishers.get(&config.publisher).is_some());
-    settings.format = publishers.image_format(&settings);
     settings.publisher_generation = settings
         .publisher_generation
         .checked_add(1)

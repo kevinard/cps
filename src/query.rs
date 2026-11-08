@@ -150,7 +150,6 @@ pub(crate) fn select_install_sources(
 pub enum ProfileRole {
     Root,
     Dependency,
-    Protected,
     None,
 }
 
@@ -159,7 +158,6 @@ impl fmt::Display for ProfileRole {
         f.write_str(match self {
             Self::Root => "root",
             Self::Dependency => "dependency",
-            Self::Protected => "protected",
             Self::None => "-",
         })
     }
@@ -315,7 +313,7 @@ pub(crate) fn verified_intent(image: &Image) -> Result<(State, ProfileIntent)> {
     image.require_clean()?;
     let state = image.state()?;
     image.verify_catalog_archives(&state)?;
-    let intent = image.profile_intent(&state)?;
+    let intent = Image::profile_intent(&state);
     verify_installed(&state.installed, &state.publishers)?;
     Ok((state, intent))
 }
@@ -331,8 +329,6 @@ pub(crate) fn intent_row(
         ProfileRole::None
     } else if intent.roots.contains(name) {
         ProfileRole::Root
-    } else if intent.roots.is_empty() {
-        ProfileRole::Protected
     } else {
         ProfileRole::Dependency
     };
@@ -640,10 +636,6 @@ pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
 
 fn verify_installed_metadata(image: &Image) -> Result<()> {
     let state = image.state()?;
-    ensure!(
-        state.settings.catalog_archives,
-        "missing signed catalog archives for installed package metadata"
-    );
     image.verify_catalog_archives(&state)
 }
 

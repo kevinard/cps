@@ -180,15 +180,6 @@ pub fn sync_profile_with_payloads(
             &definition.facets,
             companions.iter().map(|source| source.publisher),
         )?;
-        ensure!(
-            definition.bootstrap_catalog.as_ref() != Some(&pin.sha256)
-                || !profile.composition.is_empty(),
-            "bootstrap catalog has no recorded signed composition for profile {name}"
-        );
-        ensure!(
-            !prefetch || !profile.composition.is_empty(),
-            "--profile-payloads requires a recorded signed composition for profile {name}"
-        );
         profiles.push((pin, profile));
     }
     let mut staged = Vec::with_capacity(companions.len());
@@ -229,10 +220,7 @@ pub fn sync_profile_with_payloads(
         staged.push((source, repo, release));
     }
     let mut selected_blobs = BTreeMap::new();
-    for (pin, profile) in profiles
-        .iter()
-        .filter(|(_, profile)| !profile.composition.is_empty())
-    {
+    for (pin, profile) in profiles.iter() {
         check_composition(
             profile,
             pin,

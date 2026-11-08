@@ -27,6 +27,7 @@ const BUNDLE_REPOSITORIES: &str = "repositories";
 #[serde(deny_unknown_fields)]
 pub struct ImageLock {
     format: u32,
+    kind: LockKind,
     pub(crate) architecture: String,
     pub(crate) facets: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -36,6 +37,12 @@ pub struct ImageLock {
     pub(crate) publishers: Vec<LockedPublisher>,
     pub(crate) local_roots: BTreeSet<String>,
     packages: BTreeMap<String, LockedPackage>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum LockKind {
+    ImageLock,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,10 +69,6 @@ pub fn capture_image_lock(root: &Path) -> Result<ImageLock> {
 
 fn capture(image: &Image) -> Result<(ImageLock, State)> {
     let (state, intent) = verified_intent(image)?;
-    ensure!(
-        state.settings.catalog_archives,
-        "image-lock requires an image with archived signed catalogs"
-    );
     let profile = state.publishers.release_profile();
     if profile.is_some() {
         let applied = catalogs::read_profile(&image.db, &state)?
@@ -121,6 +124,7 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
         .collect();
     let lock = ImageLock {
         format: LOCK_FORMAT,
+        kind: LockKind::ImageLock,
         architecture: state.settings.arch.clone(),
         facets: state.settings.facets.clone(),
         mediators: state.settings.mediators.clone(),
@@ -484,7 +488,6 @@ fn create_locked(
             config.facets.clone(),
             bootstrap.clone(),
             None,
-            config.state_layout.unwrap_or(super::StateLayout::VarLib),
         )?;
         let (plan, state, _) = crate::plan::plan_image(
             scratch.path(),
@@ -504,6 +507,5 @@ fn create_locked(
         config.facets,
         bootstrap,
         None,
-        config.state_layout.unwrap_or(super::StateLayout::VarLib),
     )
 }

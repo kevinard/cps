@@ -32,6 +32,7 @@ bash "$project/tests/seed-native-c.sh" "$work/native-util-linux" --util-linux
 recipe="$project/packaging/util-linux"
 sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/util-linux.kdl" > util-linux.kdl
 sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
+    -e "s/@KEY_SHA256@/$(tail -c 32 -- toolchain-public.der | sha256sum | cut -d' ' -f1)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha util-linux.kdl)/g" "$recipe/build.kdl.in" > build.kdl
 "$cps" source import --from "$sources" --cache sources build.kdl
 "$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \
@@ -42,7 +43,7 @@ mkdir repo
 cp builder-public.der repo/
 reviewed=$(sha build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
-schema-version 1
+schema-version 1 kind="publish-policy"
 publisher "canopa-util-linux" {
     builder-key "builder-public.der"
     approve "system/util-linux" version="2.42.4-1" sha256="$reviewed"
