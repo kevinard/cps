@@ -152,6 +152,11 @@ and install the CPS health service for trial boot assessment. Keep the
 repository caches at stable paths outside the boot roots. Use `options`
 for any kernel arguments the installation requires. Use `kernel` and
 `initrd` only for images that supply boot files manually.
+Omit `root-partuuid` to boot by Btrfs filesystem UUID with an initramfs.
+See [Activating Btrfs roots](#activating-btrfs-roots) for the requirements
+and a LUKS2 example. Set `uki=#true` for
+[signed UKIs](#signed-ukis-for-btrfs-roots) with systemd-boot or
+`uefi=#true` for [direct UEFI boot](#direct-uefi-boot-for-btrfs-roots).
 
 The first live transaction upgrades the image state format so the boot
 entry keeps its identity while the package revision advances. Use the
@@ -2548,7 +2553,11 @@ Run `cargo build` followed by [`tests/systemd-actions.sh`](tests/systemd-actions
 
 ## Boot environments
 
-Boot environments use separate Linux roots and a dedicated systemd-boot EFI System Partition (ESP). Start with an inactive, single-filesystem base root containing the kernel. GNU `cp` clones the image and uses a reflink where supported. The destination must be a new directory.
+Boot environments use separate Linux roots and an EFI System Partition
+(ESP). The systemd-boot workflow below starts with an inactive,
+single-filesystem base root containing the kernel. GNU `cp` clones the
+image and uses a reflink where supported. The destination must be a new
+directory. Btrfs roots also support [direct UEFI boot](#direct-uefi-boot-for-btrfs-roots).
 
 ```sh
 cps boot-env export --root base --output base.ext4 --size-mib 2048 --receipt > base.kdl
@@ -2697,11 +2706,52 @@ has built-in VFAT and NLS support for the EFI partition.
 
 ### Activating Btrfs roots
 
-Use a single-device Btrfs filesystem directly on a GPT Linux filesystem
-partition, with the writable VFAT ESP on the same disk. Mount the Btrfs
-top-level subvolume (ID 5) read-write so CPS can verify and register named
-roots beneath it.
-The commands use the disk's 512-byte logical sector layout.
+CPS snapshots one Btrfs root subvolume per environment. The backing devices
+can be assembled and unlocked by the initramfs before it mounts that root.
+
+- Mount the Btrfs top-level subvolume (ID 5) read-write at `volume`.
+  Each boot root must be a named subvolume reachable through that mount.
+  Keep the paths of registered roots stable.
+- Place the root's CPS state and managed files in the root subvolume.
+  Store staged roots in a root-owned directory on the same filesystem,
+  beneath the top-level mount and outside the boot roots. Shared data such
+  as `/home`, `/var/log`, or a swapfile can live on sibling subvolumes
+  mounted at ordinary directories in each root.
+  A Btrfs snapshot omits nested subvolume contents.
+- Mount the dedicated, writable VFAT systemd-boot ESP at `esp`. CPS verifies
+  its GPT partition using 512-byte logical sectors. When booting by Btrfs
+  filesystem UUID, the ESP can be on a different disk.
+- Supply a kernel and initramfs that can discover the Btrfs filesystem by
+  its unique UUID, including any device assembly and unlock needed by your
+  layout. CPS publishes Type #1 systemd-boot entries and selects the root with
+  `root=UUID=… rootfstype=btrfs rootflags=subvolid=…`. Keep any `/` line in
+  `/etc/fstab` usable across snapshots by omitting `subvol=` and `subvolid=`
+  from that line. Keep the selectors for shared mounts.
+
+For example, on a LUKS2 installation using mkinitcpio's systemd and
+`sd-encrypt` hooks, mount the top level from the open mapping and pass the
+LUKS container UUID in `rd.luks.name=`. CPS reads the distinct filesystem
+UUID from the mounted Btrfs volume. Store the kernel and matching standalone
+initramfs in the image root, or use the image's prepared kernel artifacts.
+
+```sh
+mount -t btrfs -o subvolid=5 /dev/mapper/root /cps
+cps boot-env activate-btrfs --known-good --root /cps/@ \
+    --btrfs-volume /cps --esp /efi \
+    --kernel "usr/lib/modules/$(uname -r)/vmlinuz" --initrd boot/cps-initramfs.img \
+    --options "rd.luks.name=$luks_uuid=root rw"
+```
+
+Here `$luks_uuid` is the UUID of the encrypted container and
+`/boot/cps-initramfs.img` is the standalone initramfs inside the root. Set
+`kernel`, `initrd` and `options` to the corresponding values in the
+`boot-btrfs` node for system package commands. Omit `root-partuuid` in that
+node. The firmware-launched UKIs and their embedded command lines are
+independent of the CPS entries.
+
+For a single-device Btrfs filesystem directly on a GPT Linux filesystem
+partition, you can select the partition with `--root-partuuid`.
+This mode requires the writable VFAT ESP on the same GPT disk.
 
 ```sh
 mount -t btrfs -o subvolid=5 "/dev/disk/by-partuuid/$root_partuuid" /mnt/cps-volume
@@ -2715,12 +2765,10 @@ cps boot-env rollback --esp /efi --btrfs-volume /mnt/cps-volume
 
 Register the original known-good root before activating its staged upgrade.
 Bootstrap can read the running root through its top-level path. Each entry
-records the filesystem UUID, subvolume UUID and ID, and root path. CPS
-compares the mounted filesystem's device with the GPT root partition and
-ESP, checks the CPS image identity and revision, and verifies the fallback
-root and its boot artifacts. The kernel receives the recorded subvolume ID
-through `rootflags`. Keep registered paths stable so rollback can check
-their identities and installed contents.
+records the filesystem UUID, subvolume UUID and ID, and root path. CPS checks
+these against the mounted Btrfs volume, checks the CPS image identity and
+revision, and verifies the fallback root and its boot artifacts. The kernel
+receives the recorded subvolume ID through `rootflags`.
 [Btrfs ioctl documentation](https://btrfs.readthedocs.io/en/stable/btrfs-ioctl.html)
 
 Native activation marks the root with the `user.cps.boot-environment`
@@ -2729,6 +2777,69 @@ under the image's exclusive lock before applying package transactions.
 `stage-btrfs` clears the inherited mark on its private writable snapshot.
 Activation retries accept the matching registration. If activation fails
 after marking the root, rerun it to finish registration.
+
+#### Signed UKIs for Btrfs roots
+
+Use systemd-boot 262 or newer, `systemd-ukify`, and a configured `sbctl`
+with its db certificate trusted by the firmware. Sign the systemd-boot
+binary you launch with that key as part of your Secure Boot setup.
+CPS creates its `loader/loader.conf` when you register the first known-good
+environment on an ESP with that path available.
+Keep the host's `sbctl` state on a protected persistent mount shared by the
+environments, so a root snapshot or rollback does not copy or revert its keys.
+[sbctl manual](https://man.archlinux.org/man/sbctl.8.en)
+
+Add `--uki` to the `activate-btrfs --known-good` command above, and add
+`uki=#true` to `boot-btrfs` for staged system transactions. For manual trial
+activation, pass `--uki` again. Bootstrap a signed known-good environment
+before publishing signed trials. The trial and its CPS fallback must use
+the same boot artifact type.
+
+CPS builds a UKI from the selected root's kernel and initramfs and embeds
+the root selector, the snapshot's subvolume ID, and the configured options.
+It uses the host's `sbctl` key to sign and verify the completed image before
+publishing it. It stores the UKI under `EFI/cps/<id>/uki.efi` and points a
+counted systemd-boot entry at it. Each new environment gets its own signature,
+so `sbctl sign --save` is only needed for boot files you manage separately.
+The firmware verifies the signed systemd-boot binary and UKI at boot.
+[systemd-stub command line](https://www.freedesktop.org/software/systemd/man/262/systemd-stub.html)
+
+#### Direct UEFI boot for Btrfs roots
+
+Use the same signed UKI inputs and enrolled `sbctl` db certificate. Boot
+the running CPS root in UEFI mode with `efivarfs` mounted, and mount the
+writable GPT/VFAT ESP and the Btrfs top level as described above. Use an ESP
+without CPS systemd-boot entries. Existing firmware entries for other
+systems or recovery UKIs can share the ESP.
+
+Set `uefi=#true` in the `boot-btrfs` node in `/etc/cps/image.kdl`. This
+selects signed UKIs and one boot attempt. Enable the packaged promotion
+service in the root before staging so each snapshot inherits it.
+
+```sh
+systemctl enable cps-uefi-bless.service
+cps boot-env activate-btrfs --known-good --uefi --root /cps/@ \
+    --btrfs-volume /cps --esp /efi \
+    --kernel "usr/lib/modules/$(uname -r)/vmlinuz" --initrd boot/cps-initramfs.img \
+    --options "rd.luks.name=$luks_uuid=root rw"
+```
+
+Bootstrapping verifies the running root and places its signed UKI first in
+`BootOrder`, preserving the other firmware entries. For a staged upgrade,
+CPS creates a firmware option for the new UKI and sets only `BootNext`.
+The promotion service waits for `boot-complete.target` and
+`cps-boot-health.service`. It verifies the running Btrfs snapshot and the
+firmware's `BootCurrent` before making the trial the default. Firmware
+consumes `BootNext` before launching the trial, so after a failed trial
+the next reset boots the known-good root.
+[UEFI Boot Manager specification](https://uefi.org/specs/UEFI/2.11/03_Boot_Manager.html)
+
+Use `--uefi` for manual trial activation. With the ESP mounted on the
+machine, `boot-env list`, Btrfs rollback and `destroy-btrfs` use the
+firmware entries. After booting the fallback, retire an exhausted trial
+with `destroy-btrfs` before staging the same transaction again. CPS
+preserves an unrelated `BootNext` and reports it if it conflicts with
+activation or rollback.
 
 The package's health service and systemd blessing apply to Btrfs trials.
 Set `CPS_VM_BTRFS_BOOT=1` on `tests/boot-capture-vm.sh`, provide
@@ -3010,7 +3121,7 @@ root by PARTUUID on that disk. The command requires read access to the disk
 and write access to the ESP. For a detached ESP directory, the operator
 supplies the partition mapping.
 
-The list marks the default configured on the ESP and shows each registered root's partition UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. Rollback selects the default environment's recorded parent unless an ID is supplied. Entries from earlier CPS versions use the previous known-good revision. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
+The list marks the default configured on the ESP and shows each registered root's partition or Btrfs filesystem UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. Rollback selects the default environment's recorded parent unless an ID is supplied. Entries from earlier CPS versions use the previous known-good revision. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
 Compare two committed image states offline, including independently created roots.
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Promote a healthy CPS direct UEFI trial
+DefaultDependencies=no
+Requires=boot-complete.target cps-boot-health.service
+After=boot-complete.target multi-user.target cps-boot-health.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cps boot-env bless-uefi
+
+[Install]
+WantedBy=multi-user.target

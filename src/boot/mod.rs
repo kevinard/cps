@@ -7,6 +7,7 @@ mod export;
 pub(crate) mod kernel;
 mod systemd_boot;
 mod tree;
+mod uki;
 
 use std::{
     env::{self, VarError},
@@ -37,7 +38,7 @@ pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub use btrfs_boot::{
     activate_btrfs_boot_environment, preview_btrfs_rollback, rollback_btrfs_boot_environment,
 };
-pub(crate) use btrfs_boot::{with_registered_images, with_running_environment};
+pub(crate) use btrfs_boot::{bless_uefi, with_registered_images, with_running_environment};
 pub use deploy::deploy_boot_environment;
 pub use esp::{
     activate_boot_environment_on_disk, deploy_and_activate_boot_environment,

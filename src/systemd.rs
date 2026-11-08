@@ -579,6 +579,17 @@ fn live_systemctl() -> Command {
     command
 }
 
+pub(crate) fn require_boot_health() -> Result<()> {
+    for unit in ["cps-boot-health.service", "boot-complete.target"] {
+        let status = live_systemctl()
+            .args(["is-active", "--quiet", unit])
+            .status()
+            .with_context(|| format!("checking {unit}"))?;
+        ensure!(status.success(), "{unit} has not completed successfully");
+    }
+    Ok(())
+}
+
 fn run_live_job(command: &mut Command, action: &str) -> Result<()> {
     const TIMEOUT: Duration = Duration::from_secs(120);
     let mut child = command

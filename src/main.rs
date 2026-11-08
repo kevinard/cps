@@ -20,14 +20,13 @@ use cps::{
     Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, GitSnapshotRef,
     MarkChoice, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, RootDeployment,
     SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
-    activate_btrfs_boot_environment, activate_deployed_boot_environment,
-    activate_device_boot_environment, add_publisher_from_url, add_publisher_with_build_trust,
-    apply, archive_build_sources, audit_publisher_builds, build_with_recipe_options,
-    capture_boot_environment, create_image, deploy_and_activate_boot_environment,
-    deploy_boot_environment, destroy_btrfs_boot_environment, export_boot_environment,
-    export_boot_environment_receipt, export_rebuild_inputs, fetch_build_sources,
-    fetch_plan_with_archives, fetch_sources, fetch_sources_with_local, fetch_toolchain,
-    generate_manifest_for_architecture, import_sources, list_boot_environments,
+    activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
+    add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
+    build_with_recipe_options, capture_boot_environment, create_image,
+    deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
+    export_boot_environment, export_boot_environment_receipt, export_rebuild_inputs,
+    fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
+    fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
     list_publishers, list_withdrawals, plan_with_options, prefer_publisher,
     prepare_boot_environment, prepare_git_snapshot_ref, publish,
@@ -1197,7 +1196,7 @@ enum BootCommand {
         /// Environment ID. Defaults to the previous known-good environment.
         id: Option<String>,
     },
-    /// Publish a systemd-boot entry for a root on a mounted Btrfs volume
+    /// Publish a boot entry for a root on a mounted Btrfs volume
     ActivateBtrfs {
         #[arg(long)]
         root: PathBuf,
@@ -1205,18 +1204,31 @@ enum BootCommand {
         btrfs_volume: PathBuf,
         #[arg(long)]
         esp: PathBuf,
+        /// Use a direct GPT root partition instead of the mounted Btrfs filesystem UUID
         #[arg(long)]
-        root_partuuid: String,
+        root_partuuid: Option<String>,
         #[arg(long, default_value = "boot/vmlinuz")]
         kernel: String,
         #[arg(long)]
         initrd: Option<String>,
+        /// Build a snapshot-specific UKI and sign it with the host's sbctl key
+        #[arg(long)]
+        uki: bool,
+        /// Sign a UKI and boot it directly from UEFI, with a one-shot trial
+        #[arg(long)]
+        uefi: bool,
         #[arg(long, default_value = "")]
         options: String,
-        #[arg(long, default_value_t = 2)]
-        tries: u32,
+        /// Trial attempts (default 2, or 1 with --uefi)
+        #[arg(long)]
+        tries: Option<u32>,
         #[arg(long)]
         known_good: bool,
+    },
+    /// Verify and promote the running direct UEFI trial
+    BlessUefi {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
     },
     /// Clone the base image and apply a saved plan in a new directory
     Stage {
@@ -3083,7 +3095,13 @@ fn run(command: Command) -> Result<ExitCode> {
                 if environments.is_empty() {
                     println!("No boot environments registered");
                 } else {
-                    println!("DEFAULT\tSTATUS\tID\tROOT PARTUUID\tTITLE");
+                    let by_filesystem = environments.iter().any(|entry| entry.root_uuid.is_some());
+                    let header = if by_filesystem {
+                        "ROOT"
+                    } else {
+                        "ROOT PARTUUID"
+                    };
+                    println!("DEFAULT\tSTATUS\tID\t{header}\tTITLE");
                     for environment in environments {
                         let marker = if environment.is_default { "*" } else { "-" };
                         let status = if environment.is_retiring {
@@ -3095,9 +3113,16 @@ fn run(command: Command) -> Result<ExitCode> {
                                 Some(tries) => format!("trial ({tries} left)"),
                             }
                         };
+                        let root = match environment.root_uuid {
+                            Some(uuid) => format!("UUID={uuid}"),
+                            None if by_filesystem => {
+                                format!("PARTUUID={}", environment.root_partuuid)
+                            }
+                            None => environment.root_partuuid,
+                        };
                         println!(
-                            "{marker}\t{status}\t{}\t{}\t{}",
-                            environment.id, environment.root_partuuid, environment.title
+                            "{marker}\t{status}\t{}\t{root}\t{}",
+                            environment.id, environment.title
                         );
                     }
                 }
@@ -3177,6 +3202,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 root_partuuid,
                 kernel,
                 initrd,
+                uki,
+                uefi,
                 options,
                 tries,
                 known_good,
@@ -3186,11 +3213,22 @@ fn run(command: Command) -> Result<ExitCode> {
                     kernel,
                     initrd,
                     options,
-                    tries,
+                    tries: tries.unwrap_or(if uefi { 1 } else { 2 }),
                     known_good,
                 };
-                let id = activate_btrfs_boot_environment(&root, &btrfs_volume, &esp, &activation)?;
+                let id = if uefi {
+                    activation.activate_btrfs_uefi(&root, &btrfs_volume, &esp)?
+                } else if uki {
+                    activation.activate_btrfs_uki(&root, &btrfs_volume, &esp)?
+                } else {
+                    activation.activate_btrfs(&root, &btrfs_volume, &esp)?
+                };
                 println!("Activated {id}");
+            }
+            BootCommand::BlessUefi { config } => {
+                if let Some(id) = System::load(&config)?.bless_uefi()? {
+                    println!("Promoted {id} in UEFI BootOrder");
+                }
             }
             BootCommand::Capture { source, output } => {
                 let id = capture_boot_environment(&source, &output)?;

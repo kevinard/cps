@@ -16,9 +16,7 @@ use crate::{
     BootEnvironment, GitSnapshotRef, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions,
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
     apply::{PublisherFetchError, apply_live, repair_pending_live, resume_live},
-    boot::{
-        activate_btrfs_boot_environment, entry_id, stage_running_btrfs, with_running_environment,
-    },
+    boot::{entry_id, stage_running_btrfs, with_running_environment},
     fetch_plan,
     git_install::{GitBuild, GitSource, GitStore},
     image::Image,
@@ -284,7 +282,7 @@ impl System {
         crate::boot::with_registered_images(
             &boot.volume,
             &boot.esp,
-            &boot.activation.root_partuuid,
+            boot.activation.root_partuuid.as_deref(),
             |images| {
                 crate::release::prune_with_registered_roots(
                     repo, publisher, key, keep, images, locks, apply,
@@ -302,7 +300,7 @@ impl System {
         let result = crate::boot::with_registered_images(
             &boot.volume,
             &boot.esp,
-            &boot.activation.root_partuuid,
+            boot.activation.root_partuuid.as_deref(),
             |images| {
                 let mut seen = BTreeSet::new();
                 for (_, image) in images {
@@ -393,7 +391,7 @@ impl System {
         with_running_environment(
             &boot.volume,
             &boot.esp,
-            &boot.activation.root_partuuid,
+            boot.activation.root_partuuid.as_deref(),
             |root, id, revision| {
                 register_git_publisher(
                     &mut Image::open_for_live_apply(root, id, revision)?,
@@ -568,7 +566,7 @@ impl System {
             with_running_environment(
                 &boot.volume,
                 &boot.esp,
-                &boot.activation.root_partuuid,
+                boot.activation.root_partuuid.as_deref(),
                 |root, id, revision| {
                     apply_live(
                         Image::open_for_live_apply(root, id, revision)?,
@@ -582,10 +580,17 @@ impl System {
         }
 
         let root = self.stage_change(change)?;
-        let id = activate_btrfs_boot_environment(&root, &boot.volume, &boot.esp, &boot.activation)
-            .with_context(|| {
-                format!("activating the prepared environment at {}", root.display())
-            })?;
+        let id = if boot.uefi {
+            boot.activation
+                .activate_btrfs_uefi(&root, &boot.volume, &boot.esp)
+        } else if boot.uki {
+            boot.activation
+                .activate_btrfs_uki(&root, &boot.volume, &boot.esp)
+        } else {
+            boot.activation
+                .activate_btrfs(&root, &boot.volume, &boot.esp)
+        }
+        .with_context(|| format!("activating the prepared environment at {}", root.display()))?;
         self.prune_after_transaction();
         Ok(Some(id))
     }
@@ -607,7 +612,7 @@ impl System {
         let plan_id = change.plan.id()?;
         let output = boot.environments.join(format!("upgrade-{plan_id}"));
         let root = output.join("root");
-        if output.try_exists()? {
+        if root.try_exists()? {
             let staged = Image::open_query(&root)?;
             staged.require_clean()?;
             let settings = staged.settings()?;
@@ -627,6 +632,17 @@ impl System {
                 );
             }
         } else {
+            if output.try_exists()? {
+                ensure!(
+                    list_boot_environments(&boot.esp)?
+                        .iter()
+                        .all(|entry| !entry.is_retiring),
+                    "finish retiring boot environments before reusing the staging directory"
+                );
+                fs::remove_dir(&output).with_context(|| {
+                    format!("removing the empty staging directory {}", output.display())
+                })?;
+            }
             stage_running_btrfs(&output, &change.plan)?;
         }
         Ok(root)
@@ -645,7 +661,7 @@ impl System {
         let revision = with_running_environment(
             &boot.volume,
             &boot.esp,
-            &boot.activation.root_partuuid,
+            boot.activation.root_partuuid.as_deref(),
             |root, id, revision| {
                 let image = Image::open_for_live_apply(root, id, revision)?;
                 if repair {
@@ -665,6 +681,13 @@ impl System {
             entry_id(&settings.id, settings.boot_revision()),
             list_boot_environments(&self.boot().esp)?,
         ))
+    }
+
+    /// Promote the running one-shot firmware trial after verifying its health.
+    pub fn bless_uefi(&self) -> Result<Option<String>> {
+        let boot = self.boot();
+        ensure!(boot.uefi, "configure uefi=#true in boot-btrfs");
+        crate::boot::bless_uefi(&boot.esp, &boot.volume)
     }
 
     pub fn transaction_progress(&self, plan: &Plan, validate: bool) -> Result<TransactionProgress> {
@@ -691,7 +714,7 @@ impl System {
         let registered = crate::boot::with_registered_images(
             &boot.volume,
             &boot.esp,
-            &boot.activation.root_partuuid,
+            boot.activation.root_partuuid.as_deref(),
             |images| {
                 for (id, image) in images {
                     let Some(entry) = entries.iter().find(|entry| entry.id == *id) else {
@@ -735,7 +758,7 @@ impl System {
         with_running_environment(
             &boot.volume,
             &boot.esp,
-            &boot.activation.root_partuuid,
+            boot.activation.root_partuuid.as_deref(),
             |root, id, revision| {
                 let image = Image::open_query_root(root)?;
                 let settings = image.settings()?;

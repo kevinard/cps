@@ -88,7 +88,14 @@ fn activate_disk(
         root: install,
         target: None,
     };
-    let update = systemd_boot::activate(root, &esp.tree, activation, Some(deployment), None)?;
+    let update = systemd_boot::activate(
+        root,
+        &esp.tree,
+        activation,
+        Some(deployment),
+        None,
+        systemd_boot::BootMode::Split,
+    )?;
     if let Some(retired) = &update.retired {
         esp.remove_entry(retired)?;
     }
@@ -257,6 +264,7 @@ impl Esp {
                 let dir = format!("EFI/cps/{}", entry.name);
                 self.read_file_if_present(&dir, "vmlinuz.efi", MAX_ESP_BYTES)?;
                 self.read_file_if_present(&dir, "initramfs.img", MAX_ESP_BYTES)?;
+                self.read_file_if_present(&dir, "uki.efi", MAX_ESP_BYTES)?;
             }
         }
         Ok(())

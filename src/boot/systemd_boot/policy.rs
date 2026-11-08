@@ -8,7 +8,10 @@ use anyhow::{Context, Result, ensure};
 use tempfile::NamedTempFile;
 
 use super::{canonical_partuuid, read_regular};
-use crate::boot::btrfs_boot::BtrfsRecord;
+use crate::{
+    boot::{btrfs_boot::BtrfsRecord, uki},
+    model::validate_digest,
+};
 
 const OPTIONS: &str = "timeout 0\neditor no\nauto-entries no\nauto-firmware no\n";
 const AUTO: &str = "default cps-*.conf\n";
@@ -160,9 +163,101 @@ pub(super) struct BootEntry {
     pub tries: Option<u32>,
     pub description: String,
     pub title: String,
-    pub partuuid: String,
+    pub root: BootRoot,
     pub parent: Option<String>,
     pub btrfs: Option<BtrfsRecord>,
+    pub uki: Option<BootUki>,
+}
+
+#[derive(Debug)]
+pub(super) struct BootUki {
+    pub sha256: String,
+    pub cmdline: String,
+}
+
+impl BootUki {
+    fn parse(entry: &str, id: &str) -> Result<Option<Self>> {
+        let values = [
+            boot_field(entry, "uki")?,
+            field(entry, uki::HASH)?,
+            field(entry, uki::CMDLINE)?,
+        ];
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let [Some(path), Some(sha256), Some(cmdline)] = values else {
+            anyhow::bail!("incomplete UKI boot entry");
+        };
+        ensure!(
+            path == format!("/EFI/cps/{id}/{}", uki::NAME),
+            "unexpected UKI path in boot entry"
+        );
+        for line in entry.lines().map(str::trim_ascii_start) {
+            if !line.is_empty() && !line.starts_with('#') {
+                let key = line.split_ascii_whitespace().next();
+                ensure!(
+                    matches!(key, Some("title" | "sort-key" | "version" | "uki")),
+                    "unexpected field in UKI boot entry: {line}"
+                );
+            }
+        }
+        validate_digest(sha256)?;
+        ensure!(
+            cmdline
+                .bytes()
+                .all(|c| c == b' ' || c.is_ascii_graphic() && c != b'"'),
+            "invalid UKI command line"
+        );
+        Ok(Some(Self {
+            sha256: sha256.to_owned(),
+            cmdline: cmdline.to_owned(),
+        }))
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(in crate::boot) enum BootRoot {
+    Partition(String),
+    Btrfs(String),
+}
+
+impl BootRoot {
+    fn parse(options: &str, btrfs: Option<&BtrfsRecord>) -> Result<Self> {
+        let mut roots = options
+            .split_ascii_whitespace()
+            .filter(|arg| *arg == "root" || arg.starts_with("root="));
+        let root = roots
+            .next()
+            .and_then(|arg| arg.strip_prefix("root="))
+            .context("CPS boot entry is missing root=")?;
+        ensure!(
+            roots.next().is_none(),
+            "multiple root options in CPS boot entry"
+        );
+        if let Some(uuid) = root.strip_prefix("PARTUUID=") {
+            return Ok(Self::Partition(canonical_partuuid(uuid)?));
+        }
+        let record = btrfs.context("CPS boot entry is missing its root PARTUUID")?;
+        ensure!(
+            !options.contains('"') && root.strip_prefix("UUID=") == Some(record.fsid.as_str()),
+            "Btrfs root UUID differs from the recorded filesystem"
+        );
+        Ok(Self::Btrfs(record.fsid.clone()))
+    }
+
+    pub fn partuuid(&self) -> Result<&str> {
+        match self {
+            Self::Partition(uuid) => Ok(uuid),
+            Self::Btrfs(_) => anyhow::bail!("expected a root PARTUUID"),
+        }
+    }
+
+    pub fn argument(&self) -> String {
+        match self {
+            Self::Partition(uuid) => format!("PARTUUID={uuid}"),
+            Self::Btrfs(uuid) => format!("UUID={uuid}"),
+        }
+    }
 }
 
 pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
@@ -228,25 +323,28 @@ pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
             && boot_field(&description, "version")? == Some(revision.to_string().as_str()),
         "boot entry sort key or version differs from CPS policy: {id}"
     );
-    let options = boot_field(&description, "options")?.context("CPS boot entry has no options")?;
-    let mut roots = options
-        .split_ascii_whitespace()
-        .filter_map(|arg| arg.strip_prefix("root="));
-    let partuuid = roots
-        .next()
-        .and_then(|root| root.strip_prefix("PARTUUID="))
-        .context("CPS boot entry is missing its root PARTUUID")?;
+    let uki = BootUki::parse(&description, id)?;
+    let options = match &uki {
+        Some(uki) => uki.cmdline.as_str(),
+        None => boot_field(&description, "options")?.context("CPS boot entry has no options")?,
+    };
+    let btrfs = BtrfsRecord::parse(&description, options)?;
     ensure!(
-        roots.next().is_none(),
-        "multiple root options in CPS boot entry {id}"
+        uki.is_none() || btrfs.is_some(),
+        "UKI boot entries require a Btrfs root"
     );
-    let partuuid = canonical_partuuid(partuuid)?;
+    let root = BootRoot::parse(options, btrfs.as_ref())?;
+    if matches!(root, BootRoot::Btrfs(_)) && uki.is_none() {
+        ensure!(
+            boot_field(&description, "initrd")?.is_some_and(|path| !path.is_empty()),
+            "booting by Btrfs filesystem UUID requires an initramfs"
+        );
+    }
     let parent = field(&description, "# cps-parent ")?;
     if let Some(parent) = parent {
         check_parent(parent, id).with_context(|| format!("invalid parent for {id}"))?;
     }
     let parent = parent.map(str::to_owned);
-    let btrfs = BtrfsRecord::parse(&description, options)?;
     Ok(BootEntry {
         path,
         id: id.to_owned(),
@@ -254,9 +352,10 @@ pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
         tries,
         description,
         title,
-        partuuid,
+        root,
         parent,
         btrfs,
+        uki,
     })
 }
 
@@ -299,7 +398,7 @@ pub(super) fn inventory(esp: &Path) -> Result<(Option<LoaderPolicy>, Vec<BootEnt
     Ok((policy, entries))
 }
 
-fn directory_exists(path: &Path) -> Result<bool> {
+pub(super) fn directory_exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             ensure!(metadata.is_dir(), "{} is not a directory", path.display());
@@ -312,7 +411,7 @@ fn directory_exists(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{boot_field, check_parent};
+    use super::{BootRoot, BtrfsRecord, boot_field, check_parent, read_entry};
 
     #[test]
     fn boot_parent_precedes_a_distinct_staged_image_after_several_transactions()
@@ -351,6 +450,80 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_uuid_boot_entry_requires_matching_btrfs_identity_and_initrd() -> anyhow::Result<()>
+    {
+        let record = BtrfsRecord {
+            fsid: "ebcd29cb-f4ac-43ef-8f65-f7975a22d024".into(),
+            uuid: "82ec1cf9-8e6f-4b7a-afb5-d3b171a2b4a2".into(),
+            subvolid: 277,
+            path: "@environments/trial/root".into(),
+        };
+        let file = tempfile::NamedTempFile::new()?;
+        let name = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2+2";
+        let header = "title Canopa\nsort-key cps\nversion 2\n";
+        let initrd = "initrd /EFI/cps/trial/initramfs.img\n";
+        let options = format!(
+            "options root=UUID={} rootfstype=btrfs rootflags=subvolid=277 rd.luks.name={}=root rw\n",
+            record.fsid, record.uuid
+        );
+        let identity = record.render();
+        let entry = format!("{header}{initrd}{identity}{options}");
+        let read = |text: &str| {
+            std::fs::write(file.path(), text)?;
+            read_entry(file.path().to_owned(), name)
+        };
+        assert_eq!(read(&entry)?.root, BootRoot::Btrfs(record.fsid.clone()));
+        for invalid in [
+            entry.replace(
+                &format!("root=UUID={}", record.fsid),
+                &format!("root=UUID={}", record.uuid),
+            ),
+            entry.replace(initrd, ""),
+            entry.replace(&identity, ""),
+            entry.replace(" rw", " root=/dev/mapper/root rw"),
+        ] {
+            assert!(read(&invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uki_boot_entry_binds_one_image_and_uses_its_embedded_command_line() -> anyhow::Result<()> {
+        let record = BtrfsRecord {
+            fsid: "ebcd29cb-f4ac-43ef-8f65-f7975a22d024".into(),
+            uuid: "82ec1cf9-8e6f-4b7a-afb5-d3b171a2b4a2".into(),
+            subvolid: 277,
+            path: "@environments/trial/root".into(),
+        };
+        let id = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
+        let file = tempfile::NamedTempFile::new()?;
+        let entry = format!(
+            "title Canopa\nsort-key cps\nversion 2\nuki /EFI/cps/{id}/uki.efi\n{}{}\n{}root=UUID={} rootfstype=btrfs rootflags=subvolid=277 rw\n{}",
+            super::uki::HASH,
+            "a".repeat(64),
+            super::uki::CMDLINE,
+            record.fsid,
+            record.render(),
+        );
+        let read = |text: &str| {
+            std::fs::write(file.path(), text)?;
+            read_entry(file.path().to_owned(), &format!("{id}+2"))
+        };
+        assert!(read(&entry)?.uki.is_some());
+        for invalid in [
+            format!("{entry}options rw\n"),
+            format!("{entry}extra /addon.efi\n"),
+            format!("{entry}profile 1\n"),
+            entry.replace("/uki.efi", "/other.efi"),
+            entry.replace("rootflags=subvolid=277", "rootflags=subvolid=278"),
+            entry.replace(super::uki::HASH, "# unrelated "),
+        ] {
+            assert!(read(&invalid).is_err());
+        }
         Ok(())
     }
 }

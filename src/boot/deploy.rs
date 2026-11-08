@@ -241,14 +241,17 @@ impl OfflineDisk {
     }
 
     pub fn check_esp_extent(&self, esp: (u64, u64)) -> Result<()> {
-        ensure!(
-            self.partitions
-                .values()
-                .any(|part| part.kind.eq_ignore_ascii_case(EFI_SYSTEM)
-                    && (part.offset, part.bytes) == esp),
-            "mounted filesystem does not match a GPT EFI System Partition"
-        );
-        Ok(())
+        self.esp_uuid_at(esp).map(|_| ())
+    }
+
+    pub fn esp_uuid_at(&self, esp: (u64, u64)) -> Result<&str> {
+        self.partitions
+            .iter()
+            .find_map(|(uuid, part)| {
+                (part.kind.eq_ignore_ascii_case(EFI_SYSTEM) && (part.offset, part.bytes) == esp)
+                    .then_some(uuid.as_str())
+            })
+            .context("mounted filesystem does not match a GPT EFI System Partition")
     }
 
     pub fn write_root(

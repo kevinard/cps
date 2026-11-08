@@ -1,5 +1,6 @@
 mod destroy;
 pub(super) mod policy;
+mod uefi;
 pub use destroy::destroy_btrfs_boot_environment;
 
 use std::{
@@ -18,7 +19,7 @@ use super::{
     check_image_integrity,
     deploy::{OfflineDisk, offline_file},
     device::{is_fat, mounted_esp_disk},
-    entry_id, kernel, tree,
+    entry_id, kernel, tree, uki,
 };
 use crate::{
     image::{
@@ -30,7 +31,7 @@ use crate::{
     model::{digest, digest_reader, is_uuid, validate_digest},
 };
 
-use self::policy::{BootEntry, LoaderPolicy, field, inventory};
+use self::policy::{BootEntry, BootRoot, LoaderPolicy, field};
 
 const LINUX_HASH: &str = "# cps-linux-sha256 ";
 const INITRD_HASH: &str = "# cps-initrd-sha256 ";
@@ -39,16 +40,63 @@ const INITRD_HASH: &str = "# cps-initrd-sha256 ";
 pub struct BootEnvironment {
     pub id: String,
     pub title: String,
+    /// Empty when the entry boots by Btrfs filesystem UUID.
     pub root_partuuid: String,
+    pub root_uuid: Option<String>,
     pub tries_left: Option<u32>,
     pub is_default: bool,
     pub is_retiring: bool,
 }
 
+struct Inventory {
+    policy: Option<LoaderPolicy>,
+    entries: Vec<BootEntry>,
+    firmware: Option<uefi::Firmware>,
+}
+
+fn inventory(esp: &Path, lock: &File, direct: bool) -> Result<Inventory> {
+    if direct || uefi::present(esp)? {
+        if policy::directory_exists(&esp.join("loader/entries"))? {
+            for entry in fs::read_dir(esp.join("loader/entries"))? {
+                let name = entry?.file_name();
+                ensure!(
+                    !name
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with("cps-"),
+                    "the ESP already contains CPS systemd-boot entries"
+                );
+            }
+        }
+        let firmware = uefi::Firmware::open(esp, lock)?;
+        let mut entries = if uefi::present(esp)? {
+            policy::boot_entries(&esp.join(uefi::DIRECTORY))?
+        } else {
+            Vec::new()
+        };
+        let policy = firmware.inventory(&mut entries)?;
+        return Ok(Inventory {
+            policy,
+            entries,
+            firmware: Some(firmware),
+        });
+    }
+    let (policy, entries) = policy::inventory(esp)?;
+    Ok(Inventory {
+        policy,
+        entries,
+        firmware: None,
+    })
+}
+
 pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let _lock = lock_esp(&esp, FlockOperation::LockShared)?;
-    let (policy, entries) = inventory(&esp)?;
+    let Inventory {
+        policy,
+        entries,
+        firmware: _firmware,
+    } = inventory(&esp, &_lock, false)?;
     let selected = policy
         .as_ref()
         .and_then(|policy| policy.selected(&entries))
@@ -69,7 +117,11 @@ pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
             is_default: selected.as_deref() == Some(&entry.id),
             id: entry.id,
             title: entry.title,
-            root_partuuid: entry.partuuid,
+            root_partuuid: entry.root.partuuid().unwrap_or_default().to_owned(),
+            root_uuid: match entry.root {
+                BootRoot::Btrfs(uuid) => Some(uuid),
+                BootRoot::Partition(_) => None,
+            },
             tries_left: entry.tries,
             is_retiring,
         })
@@ -93,13 +145,18 @@ pub(super) fn rollback(
     } else {
         None
     };
-    let (policy, entries) = inventory(&esp)?;
+    let Inventory {
+        policy,
+        entries,
+        firmware,
+    } = inventory(&esp, &lock, false)?;
     let policy = policy.context("no CPS boot environments registered")?;
-    let target = rollback_target(&policy, &entries, id)?;
-    verify_fallback_artifacts(&esp, &target.id, &target.description)?;
+    let current = rollback_source(&policy, &entries, firmware.as_ref())?;
+    let target = rollback_target(current, &entries, id)?;
+    verify_fallback_artifacts(&esp, target)?;
     let _root_lock = if let Some(record) = &target.btrfs {
         let volume = volume.context("use --btrfs-volume to verify this rollback root")?;
-        volume.check_disk(&esp, &lock, &target.partuuid)?;
+        volume.check_boot_device(&esp, &lock, &target.root)?;
         let (image, revision) = policy::entry_identity(&target.id)?;
         Some(
             volume
@@ -113,33 +170,49 @@ pub(super) fn rollback(
         && let Some(disk) = disk.or(mounted.as_ref())
     {
         let (image, revision) = policy::entry_identity(&target.id)?;
-        disk.verify_filesystem(&target.partuuid, image, revision)
+        disk.verify_filesystem(target.root.partuuid()?, image, revision)
             .context("checking the rollback root partition")?;
     }
-    LoaderPolicy::pinned(&target.id).write(&esp.join("loader/loader.conf"))?;
+    if let Some(firmware) = firmware {
+        firmware.rollback(&esp, &target.id, &entries)?;
+    } else {
+        LoaderPolicy::pinned(&target.id).write(&esp.join("loader/loader.conf"))?;
+    }
     Ok(target.id.clone())
 }
 
 pub(super) fn with_registered_images<T>(
     esp: &Path,
     volume: &BtrfsVolume,
-    partuuid: &str,
+    partuuid: Option<&str>,
     action: impl FnOnce(&[(String, Image)]) -> Result<T>,
 ) -> Result<T> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockShared)?;
-    let partuuid = canonical_partuuid(partuuid)?;
-    volume.check_disk(&esp, &lock, &partuuid)?;
-    let (_, entries) = inventory(&esp)?;
+    let root = volume.boot_root(partuuid)?;
+    volume.check_boot_device(&esp, &lock, &root)?;
+    let Inventory {
+        entries,
+        firmware: _firmware,
+        ..
+    } = inventory(&esp, &lock, false)?;
     let mut images = Vec::new();
-    for entry in entries
-        .into_iter()
-        .filter(|entry| entry.partuuid == partuuid)
-    {
+    for entry in entries {
+        if entry.root != root
+            && !entry
+                .btrfs
+                .as_ref()
+                .is_some_and(|record| volume.has_fsid(&record.fsid))
+        {
+            continue;
+        }
         let record = entry
             .btrfs
             .as_ref()
             .context("expected a Btrfs entry for this partition")?;
+        if entry.root != root {
+            volume.check_boot_device(&esp, &lock, &entry.root)?;
+        }
         let (image, revision) = policy::entry_identity(&entry.id)?;
         let image = volume
             .open_image(record, image, revision)
@@ -161,39 +234,54 @@ pub(super) fn preview_btrfs_rollback(
 ) -> Result<(String, ImageDiff)> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockShared)?;
-    let (policy, entries) = inventory(&esp)?;
+    let Inventory {
+        policy,
+        entries,
+        firmware,
+    } = inventory(&esp, &lock, false)?;
     let policy = policy.context("no CPS boot environments registered")?;
-    let current = policy
-        .selected(&entries)
+    let current = rollback_source(&policy, &entries, firmware.as_ref())?
         .context("no configured default CPS boot environment")?;
-    let target = rollback_target(&policy, &entries, id)?;
+    let target = rollback_target(Some(current), &entries, id)?;
     let open = |entry: &BootEntry| -> Result<Image> {
         let record = entry
             .btrfs
             .as_ref()
             .context("expected a Btrfs boot entry")?;
-        volume.check_disk(&esp, &lock, &entry.partuuid)?;
+        volume.check_boot_device(&esp, &lock, &entry.root)?;
         let (image, revision) = policy::entry_identity(&entry.id)?;
         volume.open_image(record, image, revision)
     };
-    verify_fallback_artifacts(&esp, &target.id, &target.description)?;
+    verify_fallback_artifacts(&esp, target)?;
     let before = open(current).context("opening the configured default root")?;
     let after = open(target).context("opening the rollback root")?;
     check_image_integrity(&after)?;
     Ok((target.id.clone(), diff_open_images(&before, &after, paths)?))
 }
 
-fn rollback_target<'a>(
+fn rollback_source<'a>(
     policy: &LoaderPolicy,
+    entries: &'a [BootEntry],
+    firmware: Option<&uefi::Firmware>,
+) -> Result<Option<&'a BootEntry>> {
+    // Firmware has already consumed BootNext while the trial is running.
+    // Its recorded parent is still the rollback target for that boot.
+    let trial = firmware
+        .map(|fw| fw.running_trial(entries))
+        .transpose()?
+        .flatten();
+    Ok(trial.or_else(|| policy.selected(entries)))
+}
+
+fn rollback_target<'a>(
+    current: Option<&'a BootEntry>,
     entries: &'a [BootEntry],
     id: Option<&str>,
 ) -> Result<&'a BootEntry> {
     if let Some(id) = id {
         return find_known_good(entries, id);
     }
-    let current = policy
-        .selected(entries)
-        .context("no configured default CPS boot environment")?;
+    let current = current.context("no configured default CPS boot environment")?;
     if let Some(parent) = &current.parent {
         return find_known_good(entries, parent).context("the recorded parent is unavailable");
     }
@@ -230,17 +318,71 @@ fn lock_esp(esp: &Path, operation: FlockOperation) -> Result<File> {
     Ok(file)
 }
 
+fn same_root(a: &Root, b: &Root) -> Result<bool> {
+    let (a, b) = (a.as_file().metadata()?, b.as_file().metadata()?);
+    Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
+}
+
+pub(super) fn bless_uefi(esp: &Path, volume: &BtrfsVolume) -> Result<Option<String>> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
+    let Inventory {
+        entries, firmware, ..
+    } = inventory(&esp, &lock, true)?;
+    let firmware = firmware.context("expected the direct UEFI backend")?;
+    let Some(trial) = firmware.running_trial(&entries)? else {
+        return Ok(None);
+    };
+    let parent = find_known_good(
+        &entries,
+        trial
+            .parent
+            .as_deref()
+            .context("missing UEFI trial fallback")?,
+    )?;
+    let verify = |entry: &BootEntry| {
+        verify_fallback_artifacts(&esp, entry)?;
+        volume.check_boot_device(&esp, &lock, &entry.root)?;
+        let (id, revision) = policy::entry_identity(&entry.id)?;
+        volume.verify(
+            entry
+                .btrfs
+                .as_ref()
+                .context("missing UEFI Btrfs identity")?,
+            id,
+            revision,
+        )
+    };
+    let _fallback = verify(parent).context("checking the UEFI fallback")?;
+    let image = verify(trial).context("checking the UEFI trial's health")?;
+    let running = Root::open(Path::new("/"))?;
+    ensure!(
+        same_root(&running, &image.root)?,
+        "running root differs from the firmware trial"
+    );
+    crate::systemd::require_boot_health()?;
+    firmware.bless(&esp, trial, parent)?;
+    Ok(Some(trial.id.clone()))
+}
+
 pub(super) fn with_running_environment<T>(
     volume: &BtrfsVolume,
     esp: &Path,
-    partuuid: &str,
+    partuuid: Option<&str>,
     action: impl FnOnce(Root, &str, u64) -> Result<T>,
 ) -> Result<T> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockShared)?;
-    let partuuid = canonical_partuuid(partuuid)?;
-    volume.check_disk(&esp, &lock, &partuuid)?;
-    let (policy, entries) = inventory(&esp)?;
+    let root = volume.boot_root(partuuid)?;
+    volume.check_boot_device(&esp, &lock, &root)?;
+    let Inventory {
+        policy,
+        entries,
+        firmware,
+    } = inventory(&esp, &lock, false)?;
+    if let Some(firmware) = &firmware {
+        firmware.require_no_next()?;
+    }
     let selected = policy
         .and_then(|policy| policy.selected(&entries))
         .context("no CPS boot environment is selected")?;
@@ -248,33 +390,45 @@ pub(super) fn with_running_environment<T>(
         selected.tries.is_none(),
         "a trial is pending; boot it before making more package changes"
     );
-    ensure!(
-        selected.partuuid == partuuid,
-        "the selected root uses a different partition"
-    );
+    if let (BootRoot::Partition(expected), BootRoot::Partition(selected)) = (&root, &selected.root)
+    {
+        ensure!(
+            selected == expected,
+            "the selected root uses a different partition"
+        );
+    }
     let record = selected
         .btrfs
         .as_ref()
         .context("expected a registered Btrfs root")?;
+    if selected.root != root {
+        volume.check_boot_device(&esp, &lock, &selected.root)?;
+    }
     let registered = volume.open_registered(record, &selected.id)?;
     let running = Root::open(Path::new("/"))?;
-    let expected = registered.as_file().metadata()?;
-    let actual = running.as_file().metadata()?;
     ensure!(
-        (expected.dev(), expected.ino()) == (actual.dev(), actual.ino()),
+        same_root(&registered, &running)?,
         "a different system is selected for the next boot; reboot before changing packages"
     );
     let (id, revision) = policy::entry_identity(&selected.id)?;
     action(running, id, revision)
 }
 
-pub struct Activation {
-    pub root_partuuid: String,
+pub struct Activation<R = String> {
+    /// Btrfs activation accepts `None` to boot by filesystem UUID.
+    pub root_partuuid: R,
     pub kernel: String,
     pub initrd: Option<String>,
     pub options: String,
     pub tries: u32,
     pub known_good: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BootMode {
+    Split,
+    Uki,
+    Uefi,
 }
 
 /// A root payload to deploy before activation, optionally replacing a retired slot.
@@ -297,7 +451,7 @@ pub fn activate_boot_environment(
     esp: &Path,
     activation: &Activation,
 ) -> Result<String> {
-    Ok(activate(root, esp, activation, None, None)?.id)
+    Ok(activate(root, esp, activation, None, None, BootMode::Split)?.id)
 }
 
 /// Activate an environment after verifying its deployed root in an offline disk.
@@ -315,7 +469,15 @@ pub fn activate_deployed_boot_environment(
         root: None,
         target: None,
     };
-    Ok(activate(root, esp, activation, Some(deployment), None)?.id)
+    Ok(activate(
+        root,
+        esp,
+        activation,
+        Some(deployment),
+        None,
+        BootMode::Split,
+    )?
+    .id)
 }
 
 /// Deploy or verify an inactive partition before publishing its boot entry.
@@ -336,7 +498,15 @@ pub fn activate_device_boot_environment(
         root: root_deployment,
         target: Some(&target),
     };
-    Ok(activate(root, esp, activation, Some(deployment), None)?.id)
+    Ok(activate(
+        root,
+        esp,
+        activation,
+        Some(deployment),
+        None,
+        BootMode::Split,
+    )?
+    .id)
 }
 
 pub(super) struct ActivationUpdate {
@@ -350,18 +520,34 @@ pub(super) struct RetiredEntry {
     pub file: String,
 }
 
-pub(super) fn activate(
+pub(super) fn activate<R: Clone + Into<Option<String>>>(
     root: &Path,
     esp: &Path,
-    activation: &Activation,
+    activation: &Activation<R>,
     deployment: Option<Deployment<'_>>,
     volume: Option<&BtrfsVolume>,
+    mode: BootMode,
 ) -> Result<ActivationUpdate> {
-    let partuuid = canonical_partuuid(&activation.root_partuuid)?;
+    let sign_uki = mode != BootMode::Split;
+    let direct = mode == BootMode::Uefi;
+    let requested_partuuid = activation.root_partuuid.clone().into();
+    let boot_root = if let Some(volume) = volume {
+        volume.boot_root(requested_partuuid.as_deref())?
+    } else {
+        let uuid = requested_partuuid
+            .as_deref()
+            .context("expected a root PARTUUID")?;
+        BootRoot::Partition(canonical_partuuid(uuid)?)
+    };
+    let partuuid = boot_root.partuuid().ok();
     validate_options(&activation.options)?;
     ensure!(
         (1..=99).contains(&activation.tries),
         "tries must be between 1 and 99"
+    );
+    ensure!(
+        !direct || activation.tries == 1,
+        "direct UEFI trials allow exactly one boot attempt"
     );
     let root = fs::canonicalize(root)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
@@ -386,7 +572,7 @@ pub(super) fn activate(
             !activation
                 .options
                 .split_ascii_whitespace()
-                .any(|arg| arg.starts_with("rootflags=") || arg.starts_with("rootfstype=")),
+                .any(|arg| matches!(arg.split('=').next(), Some("rootflags" | "rootfstype"))),
             "Btrfs activation supplies rootflags and rootfstype"
         );
     }
@@ -417,7 +603,7 @@ pub(super) fn activate(
     };
 
     let managed = kernel::selected(&state.installed, &state.paths)?;
-    let (kernel, initrd, linux_sha256, initrd_sha256) = if let Some(artifacts) = &managed {
+    let (mut kernel, mut initrd, linux_sha256, initrd_sha256) = if let Some(artifacts) = &managed {
         ensure!(
             activation.kernel == "boot/vmlinuz" && activation.initrd.is_none(),
             "the image uses kernel-install artifacts; omit --kernel and --initrd"
@@ -444,7 +630,16 @@ pub(super) fn activate(
         let initrd_sha256 = initrd.as_mut().map(digest_artifact).transpose()?;
         (kernel, initrd, linux_sha256, initrd_sha256)
     };
+    ensure!(
+        !matches!(boot_root, BootRoot::Btrfs(_)) || initrd.is_some(),
+        "booting by Btrfs filesystem UUID requires an initramfs"
+    );
+    ensure!(
+        !sign_uki || initrd.is_some(),
+        "UKI activation requires an initramfs"
+    );
     let receipt = if let Some(deployment) = deployment {
+        let partuuid = boot_root.partuuid()?;
         let receipt = read_export_receipt(deployment.receipt)?;
         ensure!(
             receipt.image == image_id && receipt.revision == settings.revision,
@@ -463,14 +658,14 @@ pub(super) fn activate(
         }
         if deployment.root.is_none() {
             if let Some(target) = deployment.target {
-                target.verify(&partuuid, &receipt)?;
+                target.verify(partuuid, &receipt)?;
             } else {
                 deployment
                     .disk
-                    .verify_payload(&partuuid, receipt.bytes, &receipt.sha256)?;
+                    .verify_payload(partuuid, receipt.bytes, &receipt.sha256)?;
                 deployment
                     .disk
-                    .verify_filesystem(&partuuid, &image_id, settings.revision)?;
+                    .verify_filesystem(partuuid, &image_id, settings.revision)?;
             }
         }
         Some(receipt)
@@ -478,7 +673,7 @@ pub(super) fn activate(
         None
     };
     if let Some(volume) = volume {
-        volume.check_disk(&esp, &_lock, &partuuid)?;
+        volume.check_boot_device(&esp, &_lock, &boot_root)?;
     } else if let Some(target) = deployment.and_then(|deployment| deployment.target) {
         target.check_esp(&esp, &_lock)?;
     } else {
@@ -487,12 +682,69 @@ pub(super) fn activate(
             "use boot-env activate-device for a mounted VFAT ESP"
         );
     }
-    let (policy, existing) = inventory(&esp)?;
+    ensure!(
+        direct || !uefi::present(&esp)?,
+        "this ESP uses direct UEFI boot; use --uefi or configure uefi=#true"
+    );
+    let Inventory {
+        policy,
+        entries: existing,
+        firmware,
+    } = inventory(&esp, &_lock, direct)?;
+    if let Some(firmware) = &firmware {
+        firmware.check_next(&existing, false)?;
+        if activation.known_good {
+            let running = Root::open(Path::new("/"))?;
+            ensure!(
+                same_root(&running, &image.root)?,
+                "bootstrap direct UEFI boot from the running root"
+            );
+        }
+    }
     ensure!(
         !destroy::pending(&esp)?.iter().any(|entry| entry.id == id),
         "this boot environment is retiring; finish destroy-btrfs first"
     );
     let existing_entry = existing.iter().find(|entry| entry.id == id);
+    if let Some(entry) = existing_entry {
+        ensure!(
+            sign_uki == entry.uki.is_some(),
+            "this environment already has a different boot artifact type"
+        );
+    }
+    let root_arg = boot_root.argument();
+    let options = &activation.options;
+    let mut cmdline = match &btrfs {
+        Some(record) => format!(
+            "root={root_arg} rootwait rootfstype=btrfs rootflags=subvolid={} {options}",
+            record.subvolid
+        ),
+        None => format!("root={root_arg} rootwait {options}"),
+    };
+    let signed_uki = if sign_uki {
+        cmdline = cmdline
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let registered_digest = existing_entry
+            .and_then(|entry| entry.uki.as_ref())
+            .map(|uki| uki.sha256.as_str());
+        Some(uki::prepare(
+            &esp,
+            &id,
+            &cmdline,
+            (&mut kernel, &linux_sha256),
+            (
+                initrd.as_mut().context("missing UKI initramfs")?,
+                initrd_sha256
+                    .as_deref()
+                    .context("missing initramfs digest")?,
+            ),
+            registered_digest,
+        )?)
+    } else {
+        None
+    };
 
     // Retries of entries created before artifact hashes keep the original BLS text.
     let record_hashes = if let Some(entry) = existing_entry {
@@ -501,25 +753,34 @@ pub(super) fn activate(
     } else {
         true
     };
-    let description = Entry {
+    let mut description = Entry {
         id: &id,
         revision: boot_revision,
-        partuuid: &partuuid,
         parent: if existing_entry.is_some_and(|entry| entry.parent.is_none()) {
             None // Keep activation retries compatible with previously registered entries.
         } else {
             fallback.as_deref()
         },
-        options: &activation.options,
+        cmdline: &cmdline,
         btrfs: btrfs.as_ref(),
         linux_sha256: &linux_sha256,
         initrd_sha256: initrd_sha256.as_deref(),
         record_hashes,
+        uki_sha256: signed_uki.as_ref().map(|(_, hash)| hash.as_str()),
         kernel_release: managed
             .as_ref()
             .map(|artifacts| artifacts.kernel.release.as_str()),
     }
     .render();
+    if let Some(firmware) = &firmware
+        && fallback.is_some()
+    {
+        description.push_str(&format!(
+            "{}{}\n",
+            uefi::ARMED,
+            firmware.armed_boot(existing_entry)?
+        ));
+    }
     ensure!(
         description.len() <= policy::MAX_ENTRY_BYTES,
         "boot entry exceeds 64 KiB"
@@ -530,7 +791,12 @@ pub(super) fn activate(
             "the registered boot environment is a trial"
         );
         ensure!(
-            entry.tries != Some(0),
+            entry.tries != Some(0)
+                || firmware
+                    .as_ref()
+                    .map(|fw| fw.can_arm(entry))
+                    .transpose()?
+                    .unwrap_or(false),
             "boot attempts are exhausted; stage a new environment"
         );
         ensure!(
@@ -556,8 +822,11 @@ pub(super) fn activate(
         replace.is_none() || select_trial,
         "a slot replacement requires a new trial and a known-good base"
     );
-    let marker = esp.join(format!("loader/entries/{partuuid}.cps-retired"));
-    let pending = read_regular(&marker)?;
+    let marker = partuuid.map(|uuid| esp.join(format!("loader/entries/{uuid}.cps-retired")));
+    let pending = match &marker {
+        Some(path) => read_regular(path)?,
+        None => None,
+    };
     if let Some(pending) = &pending {
         ensure!(
             deployment.is_some_and(|deployment| deployment.target.is_some())
@@ -577,13 +846,17 @@ pub(super) fn activate(
                 .is_some_and(|entry| entry.id == fallback),
             "select the known-good base environment {fallback} before activating its upgrade"
         );
-        verify_fallback_artifacts(&esp, fallback, &base.description)?;
+        ensure!(
+            sign_uki == base.uki.is_some(),
+            "the known-good fallback must use the same boot artifact type as its trial"
+        );
+        verify_fallback_artifacts(&esp, base)?;
         if let Some(volume) = volume {
             let record = base
                 .btrfs
                 .as_ref()
                 .context("the fallback must be a verified Btrfs environment")?;
-            volume.check_disk(&esp, &_lock, &base.partuuid)?;
+            volume.check_boot_device(&esp, &_lock, &base.root)?;
             let (image, revision) = policy::entry_identity(&base.id)?;
             let parent = volume
                 .verify(record, image, revision)
@@ -601,14 +874,14 @@ pub(super) fn activate(
         }
         if let Some(replace) = replace {
             ensure!(
-                replace != base.id && partuuid != base.partuuid,
+                replace != base.id && boot_root != base.root,
                 "cannot replace the known-good base"
             );
             let disk = deployment
                 .context("slot replacement requires a verified disk")?
                 .disk;
             if let Some(entry) = existing.iter().find(|entry| entry.id == replace) {
-                retired = Some(check_replacement(disk, entry, &partuuid)?);
+                retired = Some(check_replacement(disk, entry, boot_root.partuuid()?)?);
             } else {
                 ensure!(
                     pending.is_some(),
@@ -620,12 +893,12 @@ pub(super) fn activate(
         ensure!(
             !existing.iter().any(|entry| entry.id != id
                 && Some(entry.id.as_str()) != replace
-                && entry.partuuid == partuuid
-                && !matches!((&entry.btrfs, &btrfs), (Some(existing), Some(candidate))
-                    if existing.fsid == candidate.fsid
-                        && existing.subvolid != candidate.subvolid
-                        && existing.uuid != candidate.uuid)),
-            "each environment requires a distinct root PARTUUID"
+                && match (&entry.btrfs, &btrfs) {
+                    (Some(existing), Some(candidate)) if existing.fsid == candidate.fsid =>
+                        existing.same_subvolume(candidate),
+                    _ => entry.root == boot_root,
+                }),
+            "each environment requires a distinct root PARTUUID or Btrfs subvolume"
         );
     } else if existing_entry.is_none() {
         ensure!(
@@ -647,19 +920,21 @@ pub(super) fn activate(
         deployment
             .disk
             .verify_filesystem(
-                &base.partuuid,
+                base.root.partuuid()?,
                 &canonical_partuuid(&parent.id)?,
                 parent.revision,
             )
             .context("checking the known-good fallback partition")?;
     }
     if let Some(root) = root_deployment {
+        let partuuid = boot_root.partuuid()?;
         let deployment = deployment.context("root deployment requires a verified disk")?;
         let receipt = receipt
             .as_ref()
             .context("root deployment requires an export receipt")?;
         if let Some(target) = deployment.target {
-            let payload = target.prepare(root.image, &partuuid, receipt)?;
+            let payload = target.prepare(root.image, partuuid, receipt)?;
+            let marker = marker.context("missing slot retirement path")?;
             if let Some(replace) = replace {
                 if matches!(policy, Some(LoaderPolicy::Pinned { .. })) {
                     let base = fallback.as_deref().context("missing known-good base")?;
@@ -667,7 +942,7 @@ pub(super) fn activate(
                 }
                 retire_device_entry(&esp, &marker, replace, retired.take())?;
             }
-            target.write(payload, &partuuid, receipt)?;
+            target.write(payload, partuuid, receipt)?;
             if replace.is_some() {
                 fs::remove_file(&marker)?;
                 File::open(esp.join("loader/entries"))?.sync_all()?;
@@ -675,51 +950,77 @@ pub(super) fn activate(
         } else {
             deployment
                 .disk
-                .write_root(&partuuid, root.image, Some(receipt))?;
+                .write_root(partuuid, root.image, Some(receipt))?;
             deployment
                 .disk
-                .verify_filesystem(&partuuid, &image_id, settings.revision)?;
+                .verify_filesystem(partuuid, &image_id, settings.revision)?;
         }
     }
-    if btrfs.is_some() {
+    if btrfs.is_some() && !sign_uki {
         mark_registered(&image.root, &id)?;
     }
-    let loader = ensure_dir(&esp, "loader")?;
-    let entries = ensure_dir(&loader, "entries")?;
-    let config_path = loader.join("loader.conf");
     let efi = ensure_dir(&esp, "EFI")?;
+    let entries = if direct {
+        ensure_dir(&efi, "cps-uefi")?
+    } else {
+        ensure_dir(&ensure_dir(&esp, "loader")?, "entries")?
+    };
+    let config_path = esp.join("loader/loader.conf");
     let artifacts = ensure_dir(&ensure_dir(&efi, "cps")?, &id)?;
     let mut files = Vec::new();
-    if install(&artifacts.join("vmlinuz.efi"), kernel, &linux_sha256)? {
-        files.push(format!("EFI/cps/{id}/vmlinuz.efi"));
-    }
-    if let Some(initrd) = initrd
-        && install(
-            &artifacts.join("initramfs.img"),
-            initrd,
-            initrd_sha256
-                .as_deref()
-                .context("missing initramfs digest")?,
-        )?
-    {
-        files.push(format!("EFI/cps/{id}/initramfs.img"));
+    if let Some((uki, hash)) = signed_uki {
+        let path = artifacts.join(uki::NAME);
+        if install_checked(&path, uki, &hash, |candidate| {
+            // sbctl's verification sandbox can read the mounted ESP.
+            if existing_entry.is_none() {
+                uki::verify_signature(&esp, candidate)?;
+            }
+            Ok(())
+        })? {
+            files.push(format!("EFI/cps/{id}/{}", uki::NAME));
+        }
+        mark_registered(&image.root, &id)?;
+    } else {
+        if install(&artifacts.join("vmlinuz.efi"), kernel, &linux_sha256)? {
+            files.push(format!("EFI/cps/{id}/vmlinuz.efi"));
+        }
+        if let Some(initrd) = initrd
+            && install(
+                &artifacts.join("initramfs.img"),
+                initrd,
+                initrd_sha256
+                    .as_deref()
+                    .context("missing initramfs digest")?,
+            )?
+        {
+            files.push(format!("EFI/cps/{id}/initramfs.img"));
+        }
     }
     if let Some(entry) = existing_entry {
         File::open(&entry.path)?.sync_all()?;
         File::open(&entries)?.sync_all()?;
     } else {
-        if fallback.is_none() {
+        if fallback.is_none() && !direct {
             LoaderPolicy::Automatic.write(&config_path)?;
             files.push("loader/loader.conf".into());
         }
         let file = match fallback {
             None => format!("{id}.conf"),
-            Some(_) => format!("{id}+{}.conf", activation.tries),
+            Some(_) => format!("{id}+{}.conf", if direct { 1 } else { activation.tries }),
         };
         install_text(&entries.join(&file), &description)?;
-        files.push(format!("loader/entries/{file}"));
+        let directory = if direct {
+            uefi::DIRECTORY
+        } else {
+            "loader/entries"
+        };
+        files.push(format!("{directory}/{file}"));
     }
-    if let Some(fallback) = fallback
+    if let Some(firmware) = firmware {
+        if fallback.is_none() || select_trial {
+            firmware.activate(&id, fallback.is_some())?;
+        }
+    } else if let Some(fallback) = fallback
         .as_deref()
         .filter(|_| select_trial && policy != Some(LoaderPolicy::Automatic))
     {
@@ -738,7 +1039,7 @@ fn check_replacement(
 ) -> Result<RetiredEntry> {
     let id = &entry.id;
     ensure!(
-        entry.partuuid == partuuid,
+        entry.root.partuuid()? == partuuid,
         "replacement entry {id} belongs to a different root PARTUUID"
     );
     ensure!(
@@ -812,13 +1113,13 @@ fn read_export_receipt(path: &Path) -> Result<ExportReceipt> {
 struct Entry<'a> {
     id: &'a str,
     revision: u64,
-    partuuid: &'a str,
-    options: &'a str,
+    cmdline: &'a str,
     btrfs: Option<&'a BtrfsRecord>,
     parent: Option<&'a str>,
     linux_sha256: &'a str,
     initrd_sha256: Option<&'a str>,
     record_hashes: bool,
+    uki_sha256: Option<&'a str>,
     kernel_release: Option<&'a str>,
 }
 
@@ -827,50 +1128,68 @@ impl Entry<'_> {
         let Self {
             id,
             revision,
-            partuuid,
-            options,
+            cmdline,
             btrfs,
             parent,
             linux_sha256,
             initrd_sha256,
             record_hashes,
+            uki_sha256,
             kernel_release,
         } = self;
         let title = match kernel_release {
             Some(release) => format!("Canopa ({id}, Linux {release})"),
             None => format!("Canopa ({id})"),
         };
-        let mut entry = format!(
-            "title {title}\nsort-key cps\nversion {revision}\nlinux /EFI/cps/{id}/vmlinuz.efi\n"
-        );
+        let mut entry = format!("title {title}\nsort-key cps\nversion {revision}\n");
+        if uki_sha256.is_some() {
+            entry.push_str(&format!("uki /EFI/cps/{id}/{}\n", uki::NAME));
+        } else {
+            entry.push_str(&format!("linux /EFI/cps/{id}/vmlinuz.efi\n"));
+        }
         if let Some(parent) = parent {
             entry.push_str(&format!("# cps-parent {parent}\n"));
         }
-        if *record_hashes {
-            entry.push_str(&format!("{LINUX_HASH}{linux_sha256}\n"));
-        }
-        if let Some(initrd_sha256) = initrd_sha256 {
-            entry.push_str(&format!("initrd /EFI/cps/{id}/initramfs.img\n"));
+        if let Some(sha256) = uki_sha256 {
+            entry.push_str(&format!("{}{sha256}\n", uki::HASH));
+        } else {
             if *record_hashes {
-                entry.push_str(&format!("{INITRD_HASH}{initrd_sha256}\n"));
+                entry.push_str(&format!("{LINUX_HASH}{linux_sha256}\n"));
+            }
+            if let Some(initrd_sha256) = initrd_sha256 {
+                entry.push_str(&format!("initrd /EFI/cps/{id}/initramfs.img\n"));
+                if *record_hashes {
+                    entry.push_str(&format!("{INITRD_HASH}{initrd_sha256}\n"));
+                }
             }
         }
         if let Some(btrfs) = btrfs {
             entry.push_str(&btrfs.render());
-            entry.push_str(&format!(
-                "options root=PARTUUID={partuuid} rootwait rootfstype=btrfs rootflags=subvolid={} {options}\n", btrfs.subvolid
-            ));
+        }
+        if uki_sha256.is_some() {
+            entry.push_str(&format!("{}{cmdline}\n", uki::CMDLINE));
         } else {
-            entry.push_str(&format!(
-                "options root=PARTUUID={partuuid} rootwait {options}\n"
-            ));
+            entry.push_str(&format!("options {cmdline}\n"));
         }
         entry
     }
 }
 
-fn verify_fallback_artifacts(esp: &Path, id: &str, entry: &str) -> Result<()> {
+fn verify_fallback_artifacts(esp: &Path, boot: &BootEntry) -> Result<()> {
     let esp = Root::open(esp)?;
+    let id = &boot.id;
+    if let Some(uki) = &boot.uki {
+        let path = format!("EFI/cps/{id}/{}", uki::NAME);
+        let mut file = esp
+            .file(&path)
+            .context("opening the known-good fallback UKI")?;
+        ensure!(
+            digest_reader(&mut file)? == uki.sha256,
+            "boot artifact digest mismatch at {path}"
+        );
+        return uki::verify_contents(&mut file, &uki.cmdline, None);
+    }
+    let entry = &boot.description;
     let kernel = format!("EFI/cps/{id}/vmlinuz.efi");
     let mut linux = None;
     let mut initrd = None;
@@ -949,8 +1268,8 @@ fn validate_options(options: &str) -> Result<()> {
     ensure!(
         !options
             .split_ascii_whitespace()
-            .any(|arg| arg.contains('"') || arg.starts_with("root=")),
-        "boot options must be unquoted tokens and root= comes from --root-partuuid"
+            .any(|arg| arg.contains('"') || arg.split('=').next() == Some("root")),
+        "boot options must be unquoted tokens and CPS supplies root="
     );
     Ok(())
 }
@@ -991,7 +1310,16 @@ fn install_text(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn install(path: &Path, mut bytes: impl Read, sha256: &str) -> Result<bool> {
+fn install(path: &Path, bytes: impl Read, sha256: &str) -> Result<bool> {
+    install_checked(path, bytes, sha256, |_| Ok(()))
+}
+
+fn install_checked(
+    path: &Path,
+    mut bytes: impl Read,
+    sha256: &str,
+    verify: impl FnOnce(&Path) -> Result<()>,
+) -> Result<bool> {
     let parent = path.parent().context("missing EFI destination directory")?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1006,6 +1334,7 @@ fn install(path: &Path, mut bytes: impl Read, sha256: &str) -> Result<bool> {
                 "boot file {} already exists with different contents",
                 path.display()
             );
+            verify(path)?;
             current.sync_all()?;
             File::open(parent)?.sync_all()?;
             return Ok(false);
@@ -1021,8 +1350,30 @@ fn install(path: &Path, mut bytes: impl Read, sha256: &str) -> Result<bool> {
         "boot file {} changed while being copied",
         path.display()
     );
+    verify(temp.path())?;
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)?;
     File::open(parent)?.sync_all()?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{digest, install_checked};
+
+    #[test]
+    fn rejected_boot_artifact_stays_unpublished() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("uki.efi");
+        let bytes = b"fixture UKI";
+        let hash = digest(bytes);
+        let result = install_checked(&path, bytes.as_slice(), &hash, |candidate| {
+            assert_eq!(std::fs::read(candidate)?, bytes);
+            anyhow::bail!("signature rejected")
+        });
+        assert_eq!(result.unwrap_err().to_string(), "signature rejected");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+        Ok(())
+    }
 }

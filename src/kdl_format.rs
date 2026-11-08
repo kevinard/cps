@@ -683,7 +683,9 @@ pub(crate) struct BtrfsConfig {
     pub volume: PathBuf,
     pub environments: PathBuf,
     pub esp: PathBuf,
-    pub activation: crate::boot::Activation,
+    pub activation: crate::boot::Activation<Option<String>>,
+    pub uki: bool,
+    pub uefi: bool,
 }
 
 pub(crate) struct MirrorConfig {
@@ -756,21 +758,40 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                         "options",
                         "kernel",
                         "initrd",
+                        "uki",
+                        "uefi",
                         "tries",
                     ],
                     false,
                 )?;
-                let tries = fields.integer("tries")?.unwrap_or(2);
+                let uefi = fields
+                    .properties
+                    .get("uefi")
+                    .map(|value| value.as_bool().context("uefi must be #true or #false"))
+                    .transpose()?
+                    .unwrap_or(false);
+                let tries = fields.integer("tries")?.unwrap_or(if uefi { 1 } else { 2 });
                 ensure!(
                     (1..=99).contains(&tries),
                     "boot tries must be between 1 and 99"
+                );
+                ensure!(
+                    !uefi || tries == 1,
+                    "direct UEFI trials allow exactly one boot attempt"
                 );
                 config.boot_btrfs = Some(BtrfsConfig {
                     volume: parent.join(fields.required_string("volume")?),
                     environments: parent.join(fields.required_string("environments")?),
                     esp: parent.join(fields.required_string("esp")?),
+                    uki: fields
+                        .properties
+                        .get("uki")
+                        .map(|value| value.as_bool().context("uki must be #true or #false"))
+                        .transpose()?
+                        .unwrap_or(false),
+                    uefi,
                     activation: crate::boot::Activation {
-                        root_partuuid: fields.required_string("root-partuuid")?,
+                        root_partuuid: fields.string("root-partuuid")?,
                         kernel: fields
                             .string("kernel")?
                             .unwrap_or_else(|| "boot/vmlinuz".into()),

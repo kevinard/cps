@@ -9,19 +9,19 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{AtFlags, FileType, FlockOperation, RenameFlags, flock, renameat_with, unlinkat};
 
 use super::{
-    lock_esp,
-    policy::{self, BootEntry, LoaderPolicy, inventory},
-    verify_fallback_artifacts,
+    Inventory, inventory, lock_esp,
+    policy::{self, BootEntry, LoaderPolicy},
+    uefi, verify_fallback_artifacts,
 };
 use crate::{
-    boot::btrfs_boot::{BtrfsRecord, BtrfsVolume},
+    boot::{btrfs_boot::BtrfsVolume, uki},
     image::root::Root,
 };
 
 const SUFFIX: &str = ".cps-destroy";
 
 pub(super) fn pending(esp: &Path) -> Result<Vec<BootEntry>> {
-    let directory = esp.join("loader/entries");
+    let directory = esp.join(entries_dir(esp)?);
     let mut entries = Vec::new();
     let children = match fs::read_dir(directory) {
         Ok(children) => children,
@@ -48,6 +48,14 @@ pub(super) fn pending(esp: &Path) -> Result<Vec<BootEntry>> {
     Ok(entries)
 }
 
+fn entries_dir(esp: &Path) -> Result<&'static str> {
+    Ok(if uefi::present(esp)? {
+        uefi::DIRECTORY
+    } else {
+        "loader/entries"
+    })
+}
+
 /// Retire an inactive Btrfs root and its private boot artifacts, with retryable cleanup.
 pub fn destroy_btrfs_boot_environment(
     esp: &Path,
@@ -59,7 +67,11 @@ pub fn destroy_btrfs_boot_environment(
     let volume = BtrfsVolume::open(volume)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let esp_lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
-    let (policy, mut entries) = inventory(&esp)?;
+    let Inventory {
+        policy,
+        mut entries,
+        firmware,
+    } = inventory(&esp, &esp_lock, false)?;
     let policy = policy.context("no CPS boot environments registered")?;
     let mut retiring = pending(&esp)?;
     let resumed = retiring.iter().position(|entry| entry.id == id);
@@ -80,12 +92,16 @@ pub fn destroy_btrfs_boot_environment(
         .btrfs
         .as_ref()
         .context("destroy-btrfs requires a registered Btrfs root")?;
-    volume.check_disk(&esp, &esp_lock, &target.partuuid)?;
+    volume.check_fsid(&record.fsid)?;
+    volume.check_boot_device(&esp, &esp_lock, &target.root)?;
     let selected = check_selection(&policy, &entries, &target)?;
+    if let Some(firmware) = &firmware {
+        firmware.check_removal(id)?;
+    }
     for entry in entries.iter().chain(&retiring) {
         if let Some(other) = &entry.btrfs {
             ensure!(
-                !same_root(record, other),
+                !record.same_subvolume(other),
                 "another boot entry references the Btrfs root being destroyed"
             );
         }
@@ -129,12 +145,12 @@ pub fn destroy_btrfs_boot_environment(
         volume.running_parent()?.as_deref() != Some(id),
         "cannot destroy the running environment's fallback"
     );
-    verify_fallback_artifacts(&esp, &selected.id, &selected.description)?;
+    verify_fallback_artifacts(&esp, selected)?;
     let selected_record = selected
         .btrfs
         .as_ref()
         .context("the selected environment must have a verified Btrfs root")?;
-    volume.check_disk(&esp, &esp_lock, &selected.partuuid)?;
+    volume.check_boot_device(&esp, &esp_lock, &selected.root)?;
     let (image, revision) = policy::entry_identity(&selected.id)?;
     let _selected = volume
         .verify(selected_record, image, revision)
@@ -148,11 +164,12 @@ pub fn destroy_btrfs_boot_environment(
             parent.tries.is_none(),
             "the selected environment's parent is not known-good"
         );
-        verify_fallback_artifacts(&esp, &parent.id, &parent.description)?;
+        verify_fallback_artifacts(&esp, parent)?;
         let record = parent
             .btrfs
             .as_ref()
             .context("the fallback must have a verified Btrfs root")?;
+        volume.check_boot_device(&esp, &esp_lock, &parent.root)?;
         let (image, revision) = policy::entry_identity(&parent.id)?;
         Some(
             volume
@@ -167,7 +184,7 @@ pub fn destroy_btrfs_boot_environment(
     if dry_run {
         return Ok(id.to_owned());
     }
-    let loader_entries = esp_root.dir("loader/entries")?;
+    let loader_entries = esp_root.dir(entries_dir(&esp)?)?;
     let filename = target
         .path
         .file_name()
@@ -186,10 +203,11 @@ pub fn destroy_btrfs_boot_environment(
     if resumed.is_none() {
         // An exhausted preferred trial is no longer selected. Remove its
         // obsolete preference before withdrawing the entry from systemd-boot.
-        if let LoaderPolicy::Pinned {
-            default,
-            preferred: Some(preferred),
-        } = &policy
+        if firmware.is_none()
+            && let LoaderPolicy::Pinned {
+                default,
+                preferred: Some(preferred),
+            } = &policy
             && preferred == id
         {
             LoaderPolicy::pinned(default).write(&esp.join("loader/loader.conf"))?;
@@ -203,6 +221,9 @@ pub fn destroy_btrfs_boot_environment(
         )?;
         loader_entries.sync_all()?;
     }
+    if let Some(firmware) = firmware {
+        firmware.remove(id)?;
+    }
     if let Some(root) = &root {
         check_inactive(root)?;
         volume.destroy(record, root)?;
@@ -211,10 +232,6 @@ pub fn destroy_btrfs_boot_environment(
     unlinkat(&loader_entries, &marker, AtFlags::empty())?;
     loader_entries.sync_all()?;
     Ok(id.to_owned())
-}
-
-fn same_root(a: &BtrfsRecord, b: &BtrfsRecord) -> bool {
-    a.fsid == b.fsid && (a.subvolid == b.subvolid || a.uuid == b.uuid || a.path == b.path)
 }
 
 fn check_selection<'a>(
@@ -302,6 +319,7 @@ fn check_inactive(root: &Root) -> Result<()> {
 }
 
 fn check_artifacts(esp: &Root, id: &str) -> Result<()> {
+    let fat = super::is_fat(esp.as_file())?;
     let path = format!("EFI/cps/{id}");
     let directory = match esp.subdir(&path) {
         Ok(directory) => directory,
@@ -314,7 +332,9 @@ fn check_artifacts(esp: &Root, id: &str) -> Result<()> {
     };
     directory.walk(None, |path, _, info| {
         ensure!(
-            matches!(path, "vmlinuz.efi" | "initramfs.img")
+            ["vmlinuz.efi", "initramfs.img", uki::NAME]
+                .iter()
+                .any(|name| path == *name || (fat && path.eq_ignore_ascii_case(name)))
                 && FileType::from_raw_mode(info.st_mode) == FileType::RegularFile,
             "unexpected file in retired boot artifacts: {path:?}"
         );
@@ -326,7 +346,7 @@ fn remove_artifacts(esp: &Root, id: &str) -> Result<()> {
     let path = format!("EFI/cps/{id}");
     match esp.dir(&path) {
         Ok(directory) => {
-            for name in ["vmlinuz.efi", "initramfs.img"] {
+            for name in ["vmlinuz.efi", "initramfs.img", uki::NAME] {
                 match unlinkat(&directory, name, AtFlags::empty()) {
                     Ok(()) | Err(rustix::io::Errno::NOENT) => (),
                     Err(error) => return Err(error.into()),
@@ -357,9 +377,10 @@ mod tests {
             tries,
             description: String::new(),
             title: String::new(),
-            partuuid: "7adff456-af50-498f-b39a-dcf87cb4a7c1".into(),
+            root: policy::BootRoot::Partition("7adff456-af50-498f-b39a-dcf87cb4a7c1".into()),
             parent: parent.map(str::to_owned),
             btrfs: None,
+            uki: None,
         }
     }
 

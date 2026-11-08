@@ -148,6 +148,7 @@ impl DevicePartition {
 
 struct KernelPartition {
     disk: PathBuf,
+    number: u32,
     extent: (u64, u64),
 }
 
@@ -155,19 +156,42 @@ impl KernelPartition {
     fn read(device: u64) -> Result<Self> {
         let name = device_number(device);
         let path = fs::canonicalize(Path::new("/sys/dev/block").join(&name))?;
+        let number =
+            u32::try_from(sysfs_number(&path, "partition")?).context("invalid partition number")?;
         ensure!(
-            fs::read_to_string(path.join("dev"))?.trim() == name
-                && sysfs_number(&path, "partition").is_ok_and(|number| number != 0),
+            fs::read_to_string(path.join("dev"))?.trim() == name && number != 0,
             "expected a partition block device"
         );
         let disk = path.parent().context("missing parent disk")?.to_owned();
         let extent = (sectors(&path, "start")?, sectors(&path, "size")?);
-        Ok(Self { disk, extent })
+        Ok(Self {
+            disk,
+            number,
+            extent,
+        })
     }
 
     fn open_disk(&self) -> Result<OfflineDisk> {
         OfflineDisk::from_sized_file(open_parent(&self.disk)?, sectors(&self.disk, "size")?)
     }
+}
+
+pub(super) struct EspDevicePath {
+    pub number: u32,
+    pub start: u64,
+    pub sectors: u64,
+    pub uuid: String,
+}
+
+pub(super) fn esp_device_path(path: &Path, file: &File) -> Result<EspDevicePath> {
+    let esp = esp_partition(path, file)?;
+    let disk = esp.open_disk()?;
+    Ok(EspDevicePath {
+        number: esp.number,
+        start: esp.extent.0 / SECTOR_SIZE,
+        sectors: esp.extent.1 / SECTOR_SIZE,
+        uuid: disk.esp_uuid_at(esp.extent)?.to_owned(),
+    })
 }
 
 fn esp_partition(path: &Path, file: &File) -> Result<KernelPartition> {

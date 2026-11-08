@@ -14,8 +14,11 @@ use rustix::{
 
 use super::{
     Activation, check_image_integrity,
-    device::mounted_root_disk,
-    systemd_boot::{self, canonical_partuuid, policy::field},
+    device::{mounted_esp_disk, mounted_root_disk},
+    systemd_boot::{
+        self, BootMode, canonical_partuuid,
+        policy::{BootRoot, field},
+    },
 };
 use crate::{
     image::{Image, root::Root},
@@ -149,11 +152,11 @@ impl BtrfsRecord {
         );
         let flags: Vec<_> = options
             .split_ascii_whitespace()
-            .filter(|arg| arg.starts_with("rootflags="))
+            .filter(|arg| *arg == "rootflags" || arg.starts_with("rootflags="))
             .collect();
         let types: Vec<_> = options
             .split_ascii_whitespace()
-            .filter(|arg| arg.starts_with("rootfstype="))
+            .filter(|arg| *arg == "rootfstype" || arg.starts_with("rootfstype="))
             .collect();
         ensure!(
             flags == [format!("rootflags=subvolid={number}")] && types == ["rootfstype=btrfs"],
@@ -173,13 +176,19 @@ impl BtrfsRecord {
             self.fsid, self.uuid, self.subvolid, self.path
         )
     }
+
+    pub fn same_subvolume(&self, other: &Self) -> bool {
+        self.fsid == other.fsid
+            && (self.subvolid == other.subvolid
+                || self.uuid == other.uuid
+                || self.path == other.path)
+    }
 }
 
 pub(super) struct BtrfsVolume {
     root: Root,
     path: PathBuf,
     fsid: String,
-    device: PathBuf,
 }
 
 impl BtrfsVolume {
@@ -190,10 +199,15 @@ impl BtrfsVolume {
             subvolume_info(&root)?.treeid == 5,
             "--btrfs-volume must expose the top-level subvolume (ID 5)"
         );
-        let fs = filesystem_info(&root)?;
+        let fsid = uuid_string(&filesystem_info(&root)?.fsid);
+        Ok(Self { root, path, fsid })
+    }
+
+    fn single_device(&self) -> Result<PathBuf> {
+        let fs = filesystem_info(&self.root)?;
         ensure!(
             fs.num_devices == 1,
-            "Btrfs boot activation requires a single-device filesystem"
+            "root-partuuid requires a single-device Btrfs filesystem"
         );
         let mut device = DeviceInfo {
             devid: fs.max_id,
@@ -206,7 +220,7 @@ impl BtrfsVolume {
         };
         const DEVICE: Opcode = opcode::read_write::<DeviceInfo>(0x94, 30);
         // SAFETY: the initialized buffer matches btrfs_ioctl_dev_info_args.
-        unsafe { ioctl(root.as_file(), Updater::<DEVICE, _>::new(&mut device)) }
+        unsafe { ioctl(self.root.as_file(), Updater::<DEVICE, _>::new(&mut device)) }
             .context("identifying the mounted Btrfs device")?;
         let end = device
             .path
@@ -218,12 +232,7 @@ impl BtrfsVolume {
             device.is_absolute(),
             "Btrfs device has no absolute block path"
         );
-        Ok(Self {
-            root,
-            path,
-            fsid: uuid_string(&fs.fsid),
-            device,
-        })
+        Ok(device)
     }
 
     pub fn record(&self, root: &Root, path: &Path) -> Result<BtrfsRecord> {
@@ -257,9 +266,39 @@ impl BtrfsVolume {
         })
     }
 
-    pub fn check_disk(&self, esp: &Path, locked: &File, partuuid: &str) -> Result<()> {
-        mounted_root_disk(esp, locked, &self.device, partuuid)?;
+    pub fn boot_root(&self, partuuid: Option<&str>) -> Result<BootRoot> {
+        match partuuid {
+            Some(uuid) => Ok(BootRoot::Partition(canonical_partuuid(uuid)?)),
+            None => Ok(BootRoot::Btrfs(self.fsid.clone())),
+        }
+    }
+
+    pub fn check_boot_device(&self, esp: &Path, locked: &File, root: &BootRoot) -> Result<()> {
+        match root {
+            BootRoot::Partition(uuid) => {
+                mounted_root_disk(esp, locked, &self.single_device()?, uuid)?;
+            }
+            BootRoot::Btrfs(uuid) => {
+                self.check_fsid(uuid)?;
+                ensure!(
+                    mounted_esp_disk(esp, locked)?.is_some(),
+                    "--esp must name the root of a mounted EFI partition"
+                );
+            }
+        }
         Ok(())
+    }
+
+    pub fn check_fsid(&self, fsid: &str) -> Result<()> {
+        ensure!(
+            self.has_fsid(fsid),
+            "the boot entry belongs to a different Btrfs filesystem"
+        );
+        Ok(())
+    }
+
+    pub fn has_fsid(&self, fsid: &str) -> bool {
+        fsid == self.fsid
     }
 
     pub fn verify(&self, record: &BtrfsRecord, image_id: &str, revision: u64) -> Result<Image> {
@@ -280,10 +319,7 @@ impl BtrfsVolume {
     }
 
     pub fn open_registered(&self, record: &BtrfsRecord, id: &str) -> Result<Root> {
-        ensure!(
-            record.fsid == self.fsid,
-            "the boot entry belongs to a different Btrfs filesystem"
-        );
+        self.check_fsid(&record.fsid)?;
         let root = self.root.subvolume(&record.path)?;
         ensure!(
             self.record(&root, &self.path.join(&record.path))? == *record,
@@ -339,7 +375,31 @@ pub fn activate_btrfs_boot_environment(
     activation: &Activation,
 ) -> Result<String> {
     let volume = BtrfsVolume::open(volume)?;
-    Ok(systemd_boot::activate(root, esp, activation, None, Some(&volume))?.id)
+    Ok(systemd_boot::activate(root, esp, activation, None, Some(&volume), BootMode::Split)?.id)
+}
+
+impl Activation<Option<String>> {
+    /// Activate a Btrfs root, using the mounted filesystem UUID when no PARTUUID is supplied.
+    pub fn activate_btrfs(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
+        let volume = BtrfsVolume::open(volume)?;
+        Ok(systemd_boot::activate(root, esp, self, None, Some(&volume), BootMode::Split)?.id)
+    }
+
+    /// Build and sign a UKI for the exact Btrfs subvolume being activated.
+    pub fn activate_btrfs_uki(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
+        let volume = BtrfsVolume::open(volume)?;
+        Ok(systemd_boot::activate(root, esp, self, None, Some(&volume), BootMode::Uki)?.id)
+    }
+
+    /// Activate a signed UKI using the firmware's one-shot boot selection.
+    pub fn activate_btrfs_uefi(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
+        let volume = BtrfsVolume::open(volume)?;
+        Ok(systemd_boot::activate(root, esp, self, None, Some(&volume), BootMode::Uefi)?.id)
+    }
+}
+
+pub(crate) fn bless_uefi(esp: &Path, volume: &Path) -> Result<Option<String>> {
+    systemd_boot::bless_uefi(esp, &BtrfsVolume::open(volume)?)
 }
 
 pub fn rollback_btrfs_boot_environment(
@@ -364,7 +424,7 @@ pub fn preview_btrfs_rollback(
 pub(crate) fn with_registered_images<T>(
     volume: &Path,
     esp: &Path,
-    partuuid: &str,
+    partuuid: Option<&str>,
     action: impl FnOnce(&[(String, Image)]) -> Result<T>,
 ) -> Result<T> {
     systemd_boot::with_registered_images(esp, &BtrfsVolume::open(volume)?, partuuid, action)
@@ -373,7 +433,7 @@ pub(crate) fn with_registered_images<T>(
 pub(crate) fn with_running_environment<T>(
     volume: &Path,
     esp: &Path,
-    partuuid: &str,
+    partuuid: Option<&str>,
     action: impl FnOnce(Root, &str, u64) -> Result<T>,
 ) -> Result<T> {
     let volume = BtrfsVolume::open(volume)?;

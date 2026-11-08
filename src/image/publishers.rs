@@ -665,7 +665,7 @@ fn edit_publisher_order(
     with_running_environment(
         &boot.volume,
         &boot.esp,
-        &boot.activation.root_partuuid,
+        boot.activation.root_partuuid.as_deref(),
         |root, id, revision| {
             let running = root.as_file().metadata()?;
             ensure!(
