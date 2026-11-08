@@ -103,6 +103,8 @@ pub(crate) struct DormantConfig {
     pub vendor: Node,
     pub local: Option<Node>,
     pub pending_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retained: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -991,7 +993,8 @@ impl Image {
         for (path, config) in &settings.dormant_configs {
             crate::model::validate_path(path)?;
             ensure!(
-                publishers.release_profile().is_none()
+                (config.retained || publishers.release_profile().is_none())
+                    && (!config.retained || config.local.is_some())
                     && publishers.get(&config.publisher).is_some()
                     && !paths.contains_key(path)
                     && dormant_identities.insert((&config.publisher, &config.identity))

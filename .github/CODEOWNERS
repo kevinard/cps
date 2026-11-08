@@ -1,0 +1,7 @@
+/.github/CODEOWNERS @kevinard
+/.github/workflows/ @kevinard
+/.cargo/ @kevinard
+/Cargo.toml @kevinard
+/Cargo.lock @kevinard
+/ci/ @kevinard
+/packaging/ @kevinard

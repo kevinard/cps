@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::{
     BootEnvironment, GitSnapshotRef, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions,
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
-    apply::{apply_live, repair_pending_live, resume_live},
+    apply::{PublisherFetchError, apply_live, repair_pending_live, resume_live},
     boot::{
         activate_btrfs_boot_environment, entry_id, stage_running_btrfs, with_running_environment,
     },
@@ -26,7 +26,7 @@ use crate::{
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
-    plan::{UpdateDiagnostics, inspect_update, plan_system},
+    plan::{UpdateDiagnostics, UpdateSelection, inspect_update, plan_system},
     query::{InstallSource, SelectSource, select_install_sources},
     release::{
         SyncOptions, prune_system_payloads, refresh_url_publishers, sync_profile_for_image,
@@ -47,7 +47,19 @@ pub struct System {
     config: PathBuf,
     definition: ImageDefinition,
     plan_options: PlanOptions,
+    base_only: bool,
 }
+
+#[derive(Debug)]
+pub struct RetryBaseOnly;
+
+impl std::fmt::Display for RetryBaseOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an optional publisher could not supply its payloads")
+    }
+}
+
+impl std::error::Error for RetryBaseOnly {}
 
 pub struct Change {
     plan: Plan,
@@ -69,6 +81,8 @@ pub struct UpdateReport {
     pub status: UpdateStatus,
     pub changes: Vec<PackageChange>,
     pub held_back: Vec<HeldBackUpdate>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub deferred_publishers: BTreeSet<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<ReleaseAdvisory>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,6 +97,7 @@ impl UpdateReport {
         result: Result<Change>,
         held_back: Vec<HeldBackUpdate>,
         advisories: Vec<ReleaseAdvisory>,
+        deferred_publishers: BTreeSet<String>,
     ) -> Self {
         let phased_update = result
             .as_ref()
@@ -93,6 +108,8 @@ impl UpdateReport {
             Ok(change) => {
                 let status = if !change.is_empty() {
                     UpdateStatus::UpdatesAvailable
+                } else if !deferred_publishers.is_empty() && held_back.is_empty() {
+                    UpdateStatus::Deferred
                 } else if held_back.is_empty() {
                     UpdateStatus::UpToDate
                 } else {
@@ -119,6 +136,7 @@ impl UpdateReport {
             status,
             changes,
             held_back,
+            deferred_publishers,
             advisories,
             phased_update,
             blockers,
@@ -195,6 +213,7 @@ impl System {
             config: config.to_owned(),
             definition,
             plan_options: PlanOptions::default(),
+            base_only: false,
         })
     }
 
@@ -205,6 +224,11 @@ impl System {
 
     pub fn with_force_phased_update(mut self, enabled: bool) -> Self {
         self.plan_options.force_phased_update = enabled;
+        self
+    }
+
+    pub fn with_base_only(mut self, enabled: bool) -> Self {
+        self.base_only = enabled;
         self
     }
 
@@ -431,11 +455,11 @@ impl System {
     }
 
     pub fn plan(&self, request: Request, refresh: bool) -> Result<Change> {
-        self.plan_request(request, refresh, None, None, &[])
+        self.plan_request(request, refresh, None, &[])
     }
 
     pub fn plan_git_upgrade(&self, updates: &[String], refresh: bool) -> Result<Change> {
-        self.plan_request(Request::Update, refresh, None, None, updates)
+        self.plan_request(Request::Update, refresh, None, updates)
     }
 
     pub fn plan_with_source_selection(
@@ -444,7 +468,7 @@ impl System {
         refresh: bool,
         mut choose: impl FnMut(&str, &[InstallSource]) -> Result<usize>,
     ) -> Result<Change> {
-        self.plan_request(request, refresh, Some(&mut choose), None, &[])
+        self.plan_request(request, refresh, Some(&mut choose), &[])
     }
 
     /// Check the running system with the same refresh and planner as an upgrade.
@@ -457,19 +481,32 @@ impl System {
         refresh: bool,
         explain: Option<&str>,
     ) -> UpdateReport {
+        Self::check_updates_with_scope(config, refresh, explain, false)
+    }
+
+    pub fn check_updates_with_scope(
+        config: &Path,
+        refresh: bool,
+        explain: Option<&str>,
+        base_only: bool,
+    ) -> UpdateReport {
         let mut held_back = Vec::new();
         let mut advisories = Vec::new();
+        let mut deferred = BTreeSet::new();
         let result = (|| {
-            let system = Self::load(config)?;
+            let system = Self::load(config)?.with_base_only(base_only);
             let _lock = system.lock()?;
+            system.check_running()?;
+            deferred = system.refresh_for_request(&Request::Update, refresh)?;
             let diagnostics = UpdateDiagnostics {
                 held_back: &mut held_back,
                 explain,
                 advisories: Some(&mut advisories),
             };
-            system.plan_request(Request::Update, refresh, None, Some(diagnostics), &[])
+            let plan = inspect_update(Path::new(ROOT), diagnostics, &deferred)?;
+            Ok(Change::from_plan(plan, &system.definition.stage_packages))
         })();
-        UpdateReport::from_plan(result, held_back, advisories)
+        UpdateReport::from_plan(result, held_back, advisories, deferred)
     }
 
     fn plan_request(
@@ -477,7 +514,6 @@ impl System {
         mut request: Request,
         refresh: bool,
         choose: Option<&mut SelectSource<'_>>,
-        diagnostics: Option<UpdateDiagnostics<'_>>,
         git_updates: &[String],
     ) -> Result<Change> {
         let uses_current_catalogs = matches!(request, Request::Install { .. } | Request::Update);
@@ -494,18 +530,19 @@ impl System {
             "unsupported system package request"
         );
         self.check_running()?;
-        if refresh && uses_current_catalogs {
-            self.refresh(matches!(request, Request::Update))?;
-        }
+        let deferred = self.refresh_for_request(&request, refresh)?;
         if let (Request::Install { packages }, Some(choose)) = (&mut request, choose) {
             select_install_sources(Path::new(ROOT), packages, choose)?;
         }
-        let root = Path::new(ROOT);
-        if let Some(diagnostics) = diagnostics {
-            let plan = inspect_update(root, diagnostics)?;
-            return Ok(Change::from_plan(plan, &self.definition.stage_packages));
-        }
-        let (plan, services) = plan_system(root, request, self.plan_options, git_updates)?;
+        let (plan, services) = plan_system(
+            Path::new(ROOT),
+            request,
+            self.plan_options,
+            UpdateSelection {
+                git_updates,
+                deferred_publishers: Some(&deferred),
+            },
+        )?;
         let mut change = Change::from_plan(plan, &self.definition.stage_packages);
         change.live_services = Some(services);
         Ok(change)
@@ -513,7 +550,19 @@ impl System {
 
     pub fn apply(&self, change: &Change) -> Result<Option<String>> {
         self.check_running()?;
-        fetch_plan(Path::new(ROOT), &change.plan).context("fetching the approved packages")?;
+        if let Err(error) = fetch_plan(Path::new(ROOT), &change.plan) {
+            if !self.base_only
+                && matches!(
+                    change.plan.request,
+                    Request::Update | Request::UpdateProfile
+                )
+                && let Some(PublisherFetchError(name)) = error.downcast_ref::<PublisherFetchError>()
+                && self.is_optional_publisher(name).unwrap_or(false)
+            {
+                return Err(error.context(RetryBaseOnly));
+            }
+            return Err(error.context("fetching the approved packages"));
+        }
         let boot = self.boot();
         if change.boot_reason.is_none() {
             with_running_environment(
@@ -701,12 +750,34 @@ impl System {
         )
     }
 
-    fn refresh(&self, upgrade: bool) -> Result<()> {
-        self.refresh_configured_mirrors(upgrade)?;
-        if upgrade {
-            refresh_url_publishers(Path::new(ROOT))?;
+    fn is_optional_publisher(&self, name: &str) -> Result<bool> {
+        let publishers = Image::open_query(Path::new(ROOT))?.publishers()?;
+        let required = publishers.signed_publishers().len().max(1);
+        Ok(publishers.as_slice()[required..]
+            .iter()
+            .any(|publisher| publisher.name == name)
+            && !self
+                .definition
+                .publishers
+                .iter()
+                .any(|publisher| publisher.name == name))
+    }
+
+    fn refresh_for_request(&self, request: &Request, refresh: bool) -> Result<BTreeSet<String>> {
+        let upgrade = matches!(request, Request::Update);
+        if refresh && (upgrade || matches!(request, Request::Install { .. })) {
+            self.refresh_configured_mirrors(upgrade)?;
         }
-        Ok(())
+        if upgrade && (refresh || self.base_only) {
+            let required = self
+                .definition
+                .publishers
+                .iter()
+                .map(|publisher| publisher.name.as_str())
+                .collect();
+            return refresh_url_publishers(Path::new(ROOT), &required, self.base_only, refresh);
+        }
+        Ok(BTreeSet::new())
     }
 
     fn refresh_configured_mirrors(&self, upgrade: bool) -> Result<()> {
@@ -786,7 +857,12 @@ mod tests {
             percentage: 10,
             cohort: 30,
         };
-        let report = UpdateReport::from_plan(Err(deferred.clone().into()), Vec::new(), Vec::new());
+        let report = UpdateReport::from_plan(
+            Err(deferred.clone().into()),
+            Vec::new(),
+            Vec::new(),
+            BTreeSet::new(),
+        );
         assert_eq!(report.status, UpdateStatus::Deferred);
         assert!(report.blockers.is_empty());
         assert_eq!(report.reboot_required, Some(false));

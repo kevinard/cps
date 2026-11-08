@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '37 3 * * *'
   workflow_call:
   workflow_dispatch:
 
@@ -11,82 +13,117 @@ permissions:
   contents: read
 
 jobs:
-  transactions:
+  dependency-audit:
+    name: Rust dependency audit
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Scan the locked dependencies with RustSec
+        run: |
+          lock="$GITHUB_WORKSPACE/Cargo.lock"
+          test -f "$lock"
+          cd "$(mktemp -d "$RUNNER_TEMP/cps-audit.XXXXXXXX")"
+          archive=cargo-audit-x86_64-unknown-linux-gnu-v0.22.2
+          curl --fail --silent --show-error --location --proto '=https' --retry 3 \
+            --output "$archive.tgz" "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/$archive.tgz"
+          printf '%s  %s\n' ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39 "$archive.tgz" | sha256sum --check
+          tar -xzf "$archive.tgz" --strip-components=1 "$archive/cargo-audit"
+          ./cargo-audit audit --file "$lock" --db "$PWD/advisory-db" --deny unsound --deny yanked
+
+  transactions:
+    if: github.event_name != 'schedule'
+    needs: dependency-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Install test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            attr dosfstools e2fsprogs fdisk jq libseccomp-dev libsqlite3-dev mtools udev
-          rustup toolchain install stable --profile minimal
+      - name: Build the pinned test environment
+        run: docker build --target transactions -t cps-ci ci
       - name: Build and test
         run: |
-          cargo +stable test --locked --all-targets
-          cargo +stable build --locked --bin cps --example tuf-fixture
-          export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
-          export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
-          for test in package-identity elf-transactions systemd-actions hwdb-trigger mediators \
-              package-freezes git-snapshots release-ci release-notes sharded-mirror boot-export; do
-            bash "tests/$test.sh"
-          done
-          bash tests/boot-deploy.sh --esp
-      - name: Apply a plan saved by the previous revision
-        run: |
           git worktree add --detach "$RUNNER_TEMP/cps-previous" HEAD^1
-          cargo +stable build --locked --manifest-path "$RUNNER_TEMP/cps-previous/Cargo.toml" \
-            --target-dir "$RUNNER_TEMP/cps-previous-target" --bin cps
-          CPS_TEST_BINARY="$PWD/target/debug/cps" \
-            CPS_TEST_PREVIOUS_BINARY="$RUNNER_TEMP/cps-previous-target/debug/cps" \
-            bash tests/transaction-progress.sh
+          mkdir -p "$RUNNER_TEMP/cps-cargo"
+          run_ci() {
+            docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
+              --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
+              --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$PWD" "$@"
+          }
+          run_ci cps-ci bash -euc '
+            cargo fetch --locked
+            cargo fetch --locked --manifest-path "$RUNNER_TEMP/cps-previous/Cargo.toml"
+          '
+          run_ci --network none cps-ci bash -euc '
+              cargo test --frozen --all-targets
+              cargo build --frozen --bin cps --example tuf-fixture
+              export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
+              export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
+              for test in package-identity elf-transactions systemd-actions hwdb-trigger mediators \
+                  package-freezes git-snapshots release-ci release-notes sharded-mirror boot-export; do
+                bash "tests/$test.sh"
+              done
+              bash tests/boot-deploy.sh --esp
+              cargo build --frozen --manifest-path "$RUNNER_TEMP/cps-previous/Cargo.toml" \
+                --target-dir "$RUNNER_TEMP/cps-previous-target" --bin cps
+              CPS_TEST_PREVIOUS_BINARY="$RUNNER_TEMP/cps-previous-target/debug/cps" \
+                bash tests/transaction-progress.sh
+            '
 
   boot:
+    if: github.event_name != 'schedule'
+    needs: dependency-audit
     runs-on: ubuntu-24.04
-    container: archlinux:base-devel
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: bash
+    timeout-minutes: 75
     steps:
-      - name: Install boot test dependencies
-        run: |
-          pacman -Syu --noconfirm --needed bc btrfs-progs cmake cpio curl dosfstools edk2-ovmf \
-            elfutils git libseccomp mkinitcpio-busybox mtools qemu-system-x86 rust sqlite systemd
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Build the repository's pinned VM kernel
+      - name: Build the pinned VM environment
+        run: docker build --target boot -t cps-ci ci
+      - name: Build the pinned kernel and exercise boot recovery
         run: |
+          mkdir -p "$RUNNER_TEMP/cps-cargo"
+          run_ci() {
+            docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
+              --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
+              --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$PWD" "$@"
+          }
+          run_ci -i cps-ci bash -euo pipefail <<'DOWNLOAD'
+          cargo fetch --locked
           recipe=packaging/kernel-qemu/build.kdl.in
           read -r archive checksum url < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" url="(https:[^"]+)"$/\1 \2 \3/p' "$recipe")
           cd "$RUNNER_TEMP"
-          curl --fail --location --retry 3 --output "$archive" "$url"
+          curl --fail --location --proto '=https' --retry 3 --output "$archive" "$url"
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
+          DOWNLOAD
+          run_ci --network none -i cps-ci bash -euo pipefail <<'VM'
+          workspace=$PWD
+          recipe=packaging/kernel-qemu/build.kdl.in
+          read -r archive checksum < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" url="https:[^"]+"$/\1 \2/p' "$recipe")
+          cd "$RUNNER_TEMP"
           printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
           tar -xf "$archive"
           cd "${archive%.tar.xz}"
-          config="$GITHUB_WORKSPACE/packaging/kernel-qemu/vm.config"
+          config="$workspace/packaging/kernel-qemu/vm.config"
           make KCONFIG_ALLCONFIG="$config" allnoconfig
           while IFS= read -r setting; do
             grep -Fxq "$setting" .config || { echo "Kernel configuration dropped $setting" >&2; exit 1; }
           done < "$config"
           make -j"$(nproc)" bzImage
           cp arch/x86/boot/bzImage "$RUNNER_TEMP/cps-vmlinuz"
-          printf 'CPS_VM_KERNEL_RELEASE=%s\n' "$(make -s kernelrelease)" >> "$GITHUB_ENV"
-      - name: Boot, recover, and roll back in QEMU
-        env:
-          CPS_VM_OVMF_CODE: /usr/share/edk2/x64/OVMF_CODE.4m.fd
-          CPS_VM_OVMF_VARS: /usr/share/edk2/x64/OVMF_VARS.4m.fd
-          CPS_VM_BTRFS: /usr/bin/btrfs
-          CPS_VM_MKFS_BTRFS: /usr/bin/mkfs.btrfs
-          CPS_VM_FAT_BUILTIN: '1'
-          CPS_VM_TIMEOUT: '600'
-        run: |
-          cargo build --locked --release --bin cps
+          export CPS_VM_KERNEL_RELEASE="$(make -s kernelrelease)"
+          cd "$workspace"
+          cargo build --frozen --release --bin cps
+          export CPS_VM_OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.4m.fd
+          export CPS_VM_OVMF_VARS=/usr/share/edk2/x64/OVMF_VARS.4m.fd
+          export CPS_VM_BTRFS=/usr/bin/btrfs CPS_VM_MKFS_BTRFS=/usr/bin/mkfs.btrfs
+          export CPS_VM_FAT_BUILTIN=1 CPS_VM_TIMEOUT=600
           export CPS_BIN="$PWD/target/release/cps" CPS_VM_KERNEL="$RUNNER_TEMP/cps-vmlinuz"
           bash tests/systemd-boot-vm.sh health-fail
           CPS_VM_BTRFS_BOOT=1 CPS_VM_SYSTEM_COMMANDS=1 bash tests/boot-capture-vm.sh
+          VM

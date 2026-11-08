@@ -695,6 +695,9 @@ fn save(
     settings
         .catalog_checkpoints
         .retain(|name, _| publishers.get(name).is_some());
+    settings
+        .dormant_configs
+        .retain(|_, config| publishers.get(&config.publisher).is_some());
     settings.format = publishers.image_format(&settings);
     settings.publisher_generation = settings
         .publisher_generation

@@ -41,29 +41,40 @@ for directory in "$metadata" "$targets"; do
         fail "Invalid mirror directory $directory"
 done
 timestamp=$metadata/timestamp.json
-[[ ! -L $timestamp && ( ! -e $timestamp || -f $timestamp ) ]] ||
-    fail 'Invalid mirror timestamp'
+[[ ! -d $timestamp || -L $timestamp ]] || fail 'Invalid mirror timestamp path'
 
-# A failed publication may have left versioned metadata ahead of the timestamp.
-max_version=0
-consider_version() {
-    [[ $1 =~ ^[1-9][0-9]{0,14}$ && $1 != 999999999999999 ]] ||
-        fail "Invalid or exhausted TUF metadata version $1"
-    if (( $1 > max_version )); then
-        max_version=$1
-    fi
-}
-if [[ -f $timestamp ]]; then
-    consider_version "$(jq -er '.signed.version' "$timestamp")"
+# Reserve metadata versions on the signing host before exposing them at the origin.
+state=$repo/.ci-tuf-state.json
+if [[ -e $state || -L $state ]]; then
+    [[ -f $state && ! -L $state && -O $state && $(stat -c %a -- "$state") == 600 ]] ||
+        fail 'TUF publication state must be a private file owned by the signer'
+    previous=$(jq -er --arg mirror "$mirror" 'select(.mirror == $mirror) | .version' "$state") ||
+        fail 'Invalid TUF publication state or a different mirror is configured'
+elif [[ -n ${CPS_MIRROR_INITIAL_VERSION:-} ]]; then
+    previous=$CPS_MIRROR_INITIAL_VERSION
+    [[ $previous != 0 ]] || fail 'Use the highest previously reserved metadata version'
+else
+    existing=("$metadata"/*.{root,snapshot,targets}.json "$metadata"/*.objects-?.json)
+    [[ ! -e $repo/.ci-deployed-catalog && ! -e $mirror/publisher.json &&
+        ! -L $mirror/publisher.json && ! -e $timestamp && ! -L $timestamp && ${#existing[@]} == 0 ]] ||
+        fail 'Missing signer state for an existing mirror. Restore it or set CPS_MIRROR_INITIAL_VERSION from trusted records.'
+    previous=0
 fi
-for file in "$metadata"/*.{snapshot,targets}.json "$metadata"/*.objects-?.json; do
-    filename=${file##*/}
-    consider_version "${filename%%.*}"
-done
-version=$((max_version + 1))
+[[ $previous =~ ^(0|[1-9][0-9]{0,14})$ && $previous != 999999999999999 ]] ||
+    fail 'Invalid or exhausted TUF metadata version in signer state'
+version=$((previous + 1))
+
+record_state() {
+    jq -n --arg mirror "$mirror" --argjson version "$version" \
+        --argjson published "$1" '{mirror: $mirror, version: $version, published: $published}' > "$state_tmp"
+    sync -- "$state_tmp"
+    mv -T -- "$state_tmp" "$state"
+    sync -- "$repo"
+}
 
 stage=$(mktemp -d -- "$(dirname -- "$mirror")/.cps-mirror.XXXXXXXX")
-trap 'rm -rf -- "$stage"' EXIT
+state_tmp=
+trap 'rm -rf -- "$stage"; if [[ -n $state_tmp ]]; then rm -f -- "$state_tmp"; fi' EXIT
 cp -- "$bootstrap_root" "$stage/bootstrap-root.json"
 cp -- "$active_root" "$stage/root.json"
 cp -- "$publisher_key" "$stage/publisher.der"
@@ -136,6 +147,13 @@ exec {stage_fd}<&-
 [[ $(read_root_version "$stage/verified/.tuf/trusted/root.json") == "$root_version" ]] ||
     fail 'TUF verification did not reach the active root through the published root history'
 
+timestamp_hash=$(sha256sum < "$stage/signed/metadata/timestamp.json")
+publication=$(jq -n --arg catalog "$catalog" --arg expires "$timestamp_expiry" \
+    --arg sha256 "${timestamp_hash%% *}" '{catalog: $catalog, expires: $expires, sha256: $sha256}')
+state_tmp=$(mktemp "$repo/.ci-tuf-state.XXXXXXXX")
+record_state null
+state_tmp=
+
 mkdir -p -m 0755 -- "$metadata" "$targets"
 device=$(stat -c %d -- "$stage")
 for directory in "$mirror" "$metadata" "$targets"; do
@@ -180,4 +198,7 @@ publish_immutable "$stage/roots/$active_filename" "$metadata/$active_filename"
 sync -- "$metadata/$active_filename" "$metadata"
 mv -T -- "$stage/timestamp.next" "$timestamp"
 sync -f -- "$mirror"
+state_tmp=$(mktemp "$repo/.ci-tuf-state.XXXXXXXX")
+record_state "$publication"
+state_tmp=
 printf 'Published TUF version %s for catalog %s at %s\n' "$version" "$catalog" "$mirror"

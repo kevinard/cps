@@ -420,16 +420,40 @@ pub(crate) fn sync_url_publisher(
     write_atomic(&refresh_root, &source.anchor, true)
 }
 
-pub(crate) fn refresh_url_publishers(root: &Path) -> Result<()> {
+pub(crate) fn refresh_url_publishers(
+    root: &Path,
+    required: &BTreeSet<&str>,
+    base_only: bool,
+    refresh: bool,
+) -> Result<BTreeSet<String>> {
     let guard = ImageGuard::open(root)?;
     let publishers = &guard.state.publishers;
+    let mut deferred = BTreeSet::new();
     // Profile sync alone controls the primary and companion catalogs.
-    for publisher in &publishers.as_slice()[publishers.signed_publishers().len()..] {
-        let repo = &publisher.repo;
-        if !path_present(&repo.join(".tuf").join(REFRESH_ROOT))? {
+    for (index, publisher) in publishers
+        .as_slice()
+        .iter()
+        .enumerate()
+        .skip(publishers.signed_publishers().len())
+    {
+        let required = index == 0 || required.contains(publisher.name.as_str());
+        if base_only && !required {
+            deferred.insert(publisher.name.clone());
             continue;
         }
-        let refresh = || -> Result<()> {
+        if !refresh {
+            continue;
+        }
+        let repo = &publisher.repo;
+        let sync = || -> Result<()> {
+            if !path_present(&repo.join(".tuf").join(REFRESH_ROOT))? {
+                ensure!(
+                    path_present(&repo.join("current"))?,
+                    "publisher has no cached catalog"
+                );
+                return Ok(());
+            }
+            eprintln!("Refreshing publisher {}…", publisher.name);
             let _lock = lock_repo(repo)?;
             let directory = open_state(repo)?;
             let source = SyncSource {
@@ -441,11 +465,20 @@ pub(crate) fn refresh_url_publishers(root: &Path) -> Result<()> {
             sync_current_locked(repo, &source, false, &[], Some(&guard))?;
             Ok(())
         };
-        eprintln!("Refreshing publisher {}…", publisher.name);
-        refresh()
-            .with_context(|| format!("refreshing third-party publisher {}", publisher.name))?;
+        if let Err(error) =
+            sync().with_context(|| format!("refreshing publisher {}", publisher.name))
+        {
+            if required {
+                return Err(error);
+            }
+            eprintln!(
+                "Warning: {error:#}. Deferring updates from {}.",
+                publisher.name
+            );
+            deferred.insert(publisher.name.clone());
+        }
     }
-    Ok(())
+    Ok(deferred)
 }
 
 pub struct ArchiveSyncOptions<'a> {

@@ -71,8 +71,13 @@ fi
 cmp original-timestamp.json public/metadata/timestamp.json
 mv -- timestamp.pem keys/timestamp.pem
 
-# Reserve version 2 as if a previous attempt stopped before publishing its timestamp.
+# Simulate an interrupted publication, then forge the untrusted origin's version.
+state=repo/.ci-tuf-state.json
+jq '.version = 2 | .published = null' "$state" > state.json
+install -m 0600 state.json "$state"
 cp public/metadata/{1,2}.targets.json
+cp public/metadata/{1,999999999999999}.targets.json
+jq '.signed.version = 999999999999999' original-timestamp.json > public/metadata/timestamp.json
 deploy "$second"
 jq -e '.signed.version == 3' public/metadata/timestamp.json
 sync_mirror "$second"
@@ -83,6 +88,16 @@ CPS_RELEASE_DEPLOY="$project/ci/deploy-mirror.sh" CPS_RELEASE_REPO="$work/repo" 
     CPS_RELEASE_PUBLISHER=canopa bash "$project/ci/release.sh" deploy-current "$second"
 [[ $(cat repo/.ci-deployed-catalog) == "$second" ]]
 jq -e '.signed.version == 4' public/metadata/timestamp.json
+sync_mirror "$second"
+
+# An existing origin needs a trusted migration floor when signer state is missing.
+mv "$state" saved-state.json
+if deploy "$second"; then
+    echo 'An existing origin was deployed without a trusted version floor' >&2
+    exit 1
+fi
+CPS_MIRROR_INITIAL_VERSION=4 deploy "$second"
+jq -e '.signed.version == 5' public/metadata/timestamp.json
 sync_mirror "$second"
 cp public/metadata/timestamp.json before-rotation.json
 

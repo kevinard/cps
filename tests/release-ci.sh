@@ -102,17 +102,43 @@ printf 'deploy %s\n' "$3" >> "$CPS_TEST_LOG"
 DEPLOY
 chmod +x "$CPS_RELEASE_VM_GATE" "$CPS_RELEASE_ROLLOUT_GATE" "$CPS_RELEASE_DEPLOY"
 release() { bash "$project/ci/release.sh" "$@"; }
-if CPS_RELEASE_DEPLOYED_OUTPUT=$work/outputs CPS_TEST_FAIL_GATE=upgrade release promote next; then
-    echo 'An upgrade check failed but promotion succeeded' >&2
+reject() {
+    if "$@"; then
+        printf 'Unexpected success: %s\n' "$*" >&2
+        exit 1
+    fi
+}
+reject release promote next
+ln -s "$CPS_RELEASE_SIGNING_KEY" "repo/catalogs/$(printf '%064d' 0)"
+reject release prepare next "$work/rejected-snapshot"
+[[ ! -e $work/rejected-snapshot && $(cat repo/current) == "$base" ]]
+rm "repo/catalogs/$(printf '%064d' 0)"
+release prepare next "$work/snapshot"
+candidate=$(cat snapshot/candidate)
+[[ $candidate != "$base" && $(cat snapshot/base) == "$base" ]]
+[[ $(cat repo/current) == "$base" && ! -e snapshot/current && ! -e snapshot/publish-policy.kdl ]]
+cmp "repo/catalogs/$candidate" "snapshot/catalogs/$candidate"
+rehearse() {
+    env -u CPS_RELEASE_SIGNING_KEY -u CPS_RELEASE_REPO -u CPS_RELEASE_INPUTS \
+        -u CPS_RELEASE_DEPLOY CPS_REHEARSAL_REPO="$work/snapshot" \
+        bash "$project/ci/rehearse-release.sh" "$work/requests/next/cases" \
+        "$1" "$2" "$CPS_RELEASE_VM_GATE"
+}
+reject rehearse "$base" "$candidate"
+reject rehearse "$candidate" '../not-a-digest'
+if CPS_TEST_FAIL_GATE=upgrade rehearse "$candidate" "$base"; then
+    echo 'An upgrade check unexpectedly passed' >&2
     exit 1
 fi
-[[ $(cat repo/current) == "$base" ]]
-[[ ! -e $work/outputs ]]
-! rg -q '^deploy ' "$CPS_TEST_LOG"
+[[ $(cat repo/current) == "$base" && ! -e $work/outputs ]]
+reject rg -q '^deploy ' "$CPS_TEST_LOG"
 : > "$CPS_TEST_LOG"
-CPS_RELEASE_DEPLOYED_OUTPUT=$work/outputs release promote next
-candidate=$(cat repo/current)
-[[ $candidate != "$base" ]]
+rehearse "$candidate" "$base"
+reject release promote next "$(printf '%064d' 0)"
+reject release promote next "$base"
+[[ $(cat repo/current) == "$base" ]]
+CPS_RELEASE_DEPLOYED_OUTPUT=$work/outputs release promote next "$candidate"
+[[ $(cat repo/current) == "$candidate" ]]
 [[ $(cat "$work/outputs") == "catalog=$candidate" ]]
 [[ $(cat "$CPS_TEST_LOG") == "$(printf 'fresh %s\nupgrade-2 %s\nupgrade-1 %s\ndeploy %s' \
     "$candidate" "$candidate" "$candidate" "$candidate")" ]]
@@ -151,21 +177,29 @@ export CPS_MIRROR_DIR=$work/mirror
 mkdir -p "$CPS_MIRROR_DIR/metadata"
 timestamp=$CPS_MIRROR_DIR/metadata/timestamp.json
 : > "$CPS_TEST_LOG"
+state=$work/repo/.ci-tuf-state.json
 timestamp_expires() {
     jq -n --arg expires "$(date -u --date="$1" '+%Y-%m-%dT%H:%M:%SZ')" \
         '{signed: {expires: $expires}}' > "$timestamp"
 }
+record_timestamp() {
+    local checksum
+    checksum=$(sha256sum < "$timestamp")
+    jq -n --arg mirror "$CPS_MIRROR_DIR" --arg catalog "$complete" \
+        --arg expires "$(jq -r .signed.expires "$timestamp")" --arg sha256 "${checksum%% *}" \
+        '{mirror: $mirror, version: 1, published: {catalog: $catalog, expires: $expires, sha256: $sha256}}' > "$state"
+    chmod 600 "$state"
+}
 
 timestamp_expires '+3 days'
+record_timestamp
 release refresh-mirror
 [[ ! -s $CPS_TEST_LOG ]]
 
-timestamp_expires '+1 day'
+# Future dates in the origin cannot suppress repair of an unknown timestamp.
+timestamp_expires '+30 years'
 printf '%s\n' "$widened" > repo/.ci-deployed-catalog
-if release refresh-mirror; then
-    echo 'Refresh accepted a catalog that had not been recorded as deployed' >&2
-    exit 1
-fi
+reject release refresh-mirror
 [[ ! -s $CPS_TEST_LOG ]]
 printf '%s\n' "$complete" > repo/.ci-deployed-catalog
 
@@ -176,5 +210,16 @@ fi
 [[ ! -s $CPS_TEST_LOG ]]
 release refresh-mirror
 [[ $(cat "$CPS_TEST_LOG") == "deploy $complete" ]]
+: > "$CPS_TEST_LOG"
+
+timestamp_expires '+1 day'
+record_timestamp
+release refresh-mirror
+[[ $(cat "$CPS_TEST_LOG") == "deploy $complete" ]]
+: > "$CPS_TEST_LOG"
+
+rm "$timestamp"
+release refresh-mirror
+[[ $(cat "$CPS_TEST_LOG") == "deploy $complete" ]]
 [[ $(cat repo/current) == "$complete" ]]
-echo 'Verified timestamp refresh for the deployed catalog'
+echo 'Verified mirror refresh uses signer state and repairs a forged or missing timestamp'

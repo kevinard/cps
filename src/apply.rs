@@ -274,6 +274,17 @@ pub fn apply(path: &Path, plan: &Plan) -> Result<u64> {
     apply_with(path, plan, |_| {})
 }
 
+#[derive(Debug)]
+pub(crate) struct PublisherFetchError(pub(crate) String);
+
+impl std::fmt::Display for PublisherFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "preparing payloads from {}", self.0)
+    }
+}
+
+impl std::error::Error for PublisherFetchError {}
+
 pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     fetch_plan_with_archives(path, plan, &[])
 }
@@ -354,7 +365,7 @@ pub fn fetch_plan_with_archives(
             (hash, *size, payload.base)
         });
         fetch_payloads(publisher, &image.root, blobs)
-            .with_context(|| format!("preparing payloads from {}", publisher.name))?;
+            .with_context(|| PublisherFetchError(publisher.name.clone()))?;
     }
     Ok(count)
 }
@@ -639,7 +650,7 @@ fn resume_pending(
         .verify_catalog_archives(work.next)
         .context("verifying catalog archives for the pending transaction")?;
     let after = if let PendingRecord::Live { live: journal } = &pending {
-        check_live_plan(plan, &BTreeSet::new())?;
+        check_live_plan(plan, repair.unwrap_or(&BTreeSet::new()))?;
         let services = systemd::LiveServices::plan(plan, state, work.next);
         if let Some(jobs) = &journal.live_jobs {
             services.check_jobs(jobs)?;
@@ -699,11 +710,15 @@ fn finish(
     }
     let work = pending.work();
     if !work.files_ready {
+        if repair.is_some() {
+            restore_pending_payloads(stage, work.writes, work.next)?;
+        }
         write_files(
             &image.root,
             stage,
             work.writes,
             &work.next.paths,
+            repair.is_some(),
             &mut after_write,
         )?;
     }
@@ -806,8 +821,13 @@ fn restore_pending_paths(
             );
         }
     }
+    restore_pending_payloads(stage, &writes, next)?;
+    write_files(root, stage, &writes, &next.paths, false, &mut |_| {})
+}
+
+fn restore_pending_payloads(stage: &Root, writes: &[Write], next: &State) -> Result<()> {
     let dir = Root::fd_path(stage.as_file());
-    for (publisher, blobs) in payload_sources(&writes, next)? {
+    for (publisher, blobs) in payload_sources(writes, next)? {
         for (hash, payload) in blobs {
             if checked_payload(stage, payload.node).is_ok() {
                 continue;
@@ -820,8 +840,7 @@ fn restore_pending_paths(
             file.persist(dir.join(hash))?;
         }
     }
-    stage.as_file().sync_all()?;
-    write_files(root, stage, &writes, &next.paths, &mut |_| {})
+    Ok(stage.as_file().sync_all()?)
 }
 
 fn write_files(
@@ -829,6 +848,7 @@ fn write_files(
     stage: &Root,
     writes: &[Write],
     paths: &BTreeMap<String, Managed>,
+    repair: bool,
     after_write: &mut impl FnMut(&Write),
 ) -> Result<()> {
     for node in payloads(writes).into_values() {
@@ -841,15 +861,6 @@ fn write_files(
         BTreeMap::new()
     };
     for write in writes {
-        if let (Some(before @ Node::Dir { .. }), Some(after @ Node::Dir { .. })) =
-            (&write.before, &write.after)
-            && before != after
-        {
-            if root.repair_directory(&write.path, before, after)? {
-                after_write(write);
-            }
-            continue;
-        }
         let link_source = if let Some(target) = write.hardlink_target() {
             if checked_target
                 .as_ref()
@@ -873,6 +884,29 @@ fn write_files(
             continue;
         }
         let observed = root.inspect(&write.path)?;
+        // Only restore immutable paths still owned by the pending composition.
+        // Removals and edits to preserved or locally moved config remain strict.
+        let before = if repair
+            && observed != write.after
+            && let Some(managed) = paths.get(&write.path)
+            && !managed.preserve
+            && write.after.as_ref() == Some(&managed.node)
+            && observed.as_ref().is_none_or(|node| {
+                node.is_dir() == managed.node.is_dir() && !matches!(node, Node::Special)
+            }) {
+            &observed
+        } else {
+            &write.before
+        };
+        if let (Some(before @ Node::Dir { .. }), Some(after @ Node::Dir { .. })) =
+            (before, &write.after)
+            && before != after
+        {
+            if root.repair_directory(&write.path, before, after)? {
+                after_write(write);
+            }
+            continue;
+        }
         let detach = write.detach
             && observed == write.after
             && root.has_other_links(
@@ -887,7 +921,7 @@ fn write_files(
             continue;
         }
         ensure!(
-            observed == write.before,
+            &observed == before,
             "unexpected state at {}; pending transaction retained",
             write.path
         );

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use std::path::Path;
 
 use jiff::Timestamp;
@@ -673,6 +675,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
             explain: None,
             advisories: Some(&mut advisories),
         },
+        &Default::default(),
     )
     .unwrap_err();
     assert!(error.downcast_ref::<PhasedUpdateDeferred>().is_some());
@@ -706,6 +709,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
             explain: None,
             advisories: Some(&mut advisories),
         },
+        &Default::default(),
     )?;
     assert!(advisories.is_empty());
 
@@ -1350,14 +1354,21 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         "extras",
         editor,
         "3.0.0-0",
-        format!("    require {library:?}\n"),
+        format!("    require {library:?}\n")
+            + &extras.file("usr/share/extras/editor", "third-party payload", "0644", "")?,
     )?;
     serve_extras(2)?;
     let saved_root = cache.join(".tuf/refresh-root.json");
     let original = fs::read(&saved_root)?;
     let old_extra = fs::read(cache.join("current"))?;
     fs::write(&saved_root, b"changed anchor")?;
-    let error = mirror_release::refresh_url_publishers(&main.root).unwrap_err();
+    let error = mirror_release::refresh_url_publishers(
+        &main.root,
+        &BTreeSet::from(["extras"]),
+        false,
+        true,
+    )
+    .unwrap_err();
     assert!(format!("{error:#}").contains("different trust root or publisher"));
     assert_eq!(fs::read(cache.join("current"))?, old_extra);
     fs::write(&saved_root, original)?;
@@ -1367,7 +1378,10 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     fs::write(companion.repo.join(".tuf/refresh-root.json"), b"invalid")?;
     let primary_before = fs::read(main.repo.join("current"))?;
     let companion_before = fs::read(companion.repo.join("current"))?;
-    mirror_release::refresh_url_publishers(&main.root)?;
+    assert!(
+        mirror_release::refresh_url_publishers(&main.root, &BTreeSet::new(), false, true)?
+            .is_empty()
+    );
     assert_ne!(fs::read(cache.join("current"))?, old_extra);
     assert_eq!(fs::read(main.repo.join("current"))?, primary_before);
     assert_eq!(fs::read(companion.repo.join("current"))?, companion_before);
@@ -1439,9 +1453,72 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     fs::rename(&repo_offline, &main.repo)?;
     assert!(plan(&locked_root, request).is_err());
 
+    // A failed optional mirror can have a newer catalog cached with missing
+    // payloads. Plan the base update without selecting any of those packages.
+    let offline_mirror = served.with_extension("offline");
+    fs::rename(&served, &offline_mirror)?;
+    let full_upgrade = plan(&main.root, Request::Update)?;
+    let fetch_error = fetch_plan(&main.root, &full_upgrade).unwrap_err();
+    let publisher = fetch_error
+        .downcast_ref::<crate::apply::PublisherFetchError>()
+        .unwrap();
+    assert_eq!(publisher.0, "extras");
+    let deferred =
+        mirror_release::refresh_url_publishers(&main.root, &BTreeSet::new(), false, true)?;
+    assert_eq!(deferred, BTreeSet::from(["extras".to_owned()]));
+    assert_eq!(
+        mirror_release::refresh_url_publishers(&main.root, &BTreeSet::new(), true, false)?,
+        deferred
+    );
+    let (base_only, _) = crate::plan::plan_system(
+        &main.root,
+        Request::Update,
+        crate::PlanOptions::default(),
+        crate::plan::UpdateSelection {
+            deferred_publishers: Some(&deferred),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(base_only.deferred_publishers(), &deferred);
+    assert_eq!(base_only.catalogs["seed"], pin.trim());
+    assert!(!base_only.catalogs.contains_key("extras"));
+    assert!(
+        base_only
+            .package_changes()
+            .iter()
+            .any(|change| change.name == base)
+    );
+    assert!(
+        base_only
+            .package_changes()
+            .iter()
+            .all(|change| change.name != editor)
+    );
+
+    // A saved plan must still be applicable when even the optional local
+    // cache is unavailable. The installed optional package keeps its archive.
+    fs::rename(&cache, cache.with_extension("unavailable"))?;
+    let base_only = serde_json::from_slice(&serde_json::to_vec(&base_only)?)?;
+    fetch_plan(&main.root, &base_only)?;
+    let base_upgrade = work.join("base-only-upgrade");
+    crate::stage_boot_environment(&main.root, &base_upgrade, &base_only)?;
+    assert!(verify(&base_upgrade)?.is_empty());
+    assert!(
+        list_packages(&base_upgrade, Scope::Installed)?
+            .iter()
+            .any(|row| { row.id == "cps://extras/apps/editor@2.0.0-0" })
+    );
+    assert_eq!(
+        fs::read_to_string(base_upgrade.join(COMPOSITOR))?,
+        "2.0.0-0"
+    );
+    fs::rename(cache.with_extension("unavailable"), &cache)?;
+    fs::rename(&offline_mirror, &served)?;
+
     let upgrade = plan(&main.root, Request::Update)?;
     assert_eq!(upgrade.catalogs["seed"], pin.trim());
     let staged = main._dir.path().join("upgrade");
+    fetch_plan(&main.root, &upgrade)?;
     crate::stage_boot_environment(&main.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "2.0.0-0");
     let installed = list_packages(&staged, Scope::Installed)?;

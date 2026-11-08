@@ -160,6 +160,62 @@ fn live_install_recovers_offline_and_preserves_boot_identity() -> Result<()> {
 }
 
 #[test]
+fn resume_with_repair_restores_damaged_pending_writes() -> Result<()> {
+    use std::panic;
+
+    let fixture = Fixture::new()?;
+    let path = "usr/share/updated";
+    fixture.package(
+        "test/app",
+        "1.0.0-0",
+        fixture.file(path, "old", "0644", "")?,
+    )?;
+    fixture.create()?;
+    let install = plan(
+        &fixture.root,
+        Request::Install {
+            packages: vec!["test/app".into()],
+        },
+    )?;
+    apply(&fixture.root, &install)?;
+    fixture.package(
+        "test/app",
+        "2.0.0-0",
+        fixture.file(path, "new", "0644", "")?,
+    )?;
+    let update = plan(&fixture.root, Request::Update)?;
+    let interrupted = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        apply_with(&fixture.root, &update, |write| {
+            if write.path == path {
+                panic!("interrupted after publishing the file");
+            }
+        })
+        .unwrap();
+    }));
+    assert!(interrupted.is_err());
+    assert_eq!(fs::read_to_string(fixture.root.join(path))?, "new");
+    fs::write(fixture.root.join(path), "damaged")?;
+    assert!(crate::resume_transaction(&fixture.root).is_err());
+    assert!(
+        !crate::transaction_status(&fixture.root)?
+            .pending
+            .unwrap()
+            .files_ready
+    );
+
+    // The new payload may need to be restored from the local repository as well.
+    let image = crate::image::Image::open_query(&fixture.root)?;
+    let stage = image.stage()?;
+    fs::remove_file(crate::image::root::Root::fd_path(stage.as_file()).join(digest(b"new")))?;
+    drop(image);
+
+    assert_eq!(crate::repair_pending_transaction(&fixture.root)?, Some(2));
+    assert_eq!(fs::read_to_string(fixture.root.join(path))?, "new");
+    assert!(verify(&fixture.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn live_resume_repairs_unrelated_drift_in_the_pending_image() -> Result<()> {
     use std::{collections::BTreeSet, os::unix::fs::MetadataExt, panic};
 
@@ -252,7 +308,7 @@ fn system_plan_previews_live_service_effects() -> Result<()> {
             packages: vec!["service/example".into()],
         },
         crate::PlanOptions::default(),
-        &[],
+        crate::plan::UpdateSelection::default(),
     )?;
     assert_eq!(
         services.preview(),
@@ -2643,6 +2699,7 @@ fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
             explain: Some("desktop/app"),
             advisories: None,
         },
+        &Default::default(),
     )?;
     assert!(!inspected.has_changes());
     assert_eq!(held_back.len(), 1);
@@ -2803,6 +2860,64 @@ fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Resul
     assert!(state.paths.contains_key(CONFIG));
     assert!(state.settings.dormant_configs.is_empty());
     assert_eq!(state.settings.format, before.settings.format);
+    Ok(())
+}
+
+#[test]
+fn reinstall_reclaims_the_same_package_config_after_removal() -> Result<()> {
+    let f = Fixture::new()?;
+    let name = "test/config";
+    let install = Request::Install {
+        packages: vec![name.into()],
+    };
+    f.package(
+        name,
+        "1.0.0-0",
+        f.file(CONFIG, "first default", "0644", "preserve=#true")?,
+    )?;
+    f.create()?;
+    apply(&f.root, &plan(&f.root, install.clone())?)?;
+    fs::write(f.root.join(CONFIG), "local settings")?;
+    let remove = Request::Remove {
+        packages: vec![name.into()],
+    };
+    apply(&f.root, &plan(&f.root, remove)?)?;
+    assert_eq!(fs::read_to_string(f.root.join(CONFIG))?, "local settings");
+    assert!(verify(&f.root)?.is_empty());
+
+    let other = "test/another-config";
+    f.package(
+        other,
+        "1.0.0-0",
+        f.file(CONFIG, "other default", "0644", "preserve=#true")?,
+    )?;
+    let error = plan(
+        &f.root,
+        Request::Install {
+            packages: vec![other.into()],
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unmanaged path"));
+
+    fs::write(f.root.join(CONFIG), "edited while uninstalled")?;
+    f.package(
+        name,
+        "2.0.0-0",
+        f.file(CONFIG, "new default", "0600", "preserve=#true")?,
+    )?;
+    apply(&f.root, &plan(&f.root, install)?)?;
+    assert_eq!(
+        fs::read_to_string(f.root.join(CONFIG))?,
+        "edited while uninstalled"
+    );
+    let proposals = crate::list_config_updates(&f.root)?;
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(
+        fs::read_to_string(f.root.join(&proposals[0].vendor_copy))?,
+        "new default"
+    );
+    assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     Ok(())
 }
 

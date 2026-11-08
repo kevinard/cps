@@ -116,6 +116,7 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
             explain: None,
             advisories: None,
         },
+        &Default::default(),
     )?;
     assert_eq!(update, plan(&f.root, Request::Update)?);
     assert_eq!(held_back.len(), 2);
@@ -169,6 +170,7 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
             explain: None,
             advisories: None,
         },
+        &Default::default(),
     )?;
     assert!(!blocked.has_changes());
     assert_eq!(held_back.len(), 2);
@@ -189,6 +191,7 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
             explain: None,
             advisories: None,
         },
+        &Default::default(),
     )?;
     assert!(held_back.is_empty());
     apply(&f.root, &update)?;
@@ -285,7 +288,8 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
                 held_back: &mut held_back,
                 explain: None,
                 advisories: None,
-            }
+            },
+            &Default::default(),
         )?
         .has_changes()
     );
@@ -301,6 +305,7 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
             explain: None,
             advisories: None,
         },
+        &Default::default(),
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("validate desktop compatibility"));

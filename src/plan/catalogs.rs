@@ -288,17 +288,33 @@ pub(super) fn load(
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     saved: Option<&Plan>,
     updating: bool,
+    deferred_publishers: &BTreeSet<String>,
     rollout: super::update::Rollout<'_>,
     lock: Option<&ImageLock>,
 ) -> Result<Catalogs> {
     let publishers = state.publishers.as_slice();
     let single = publishers.len() == 1;
+    // Modern images can rely on their verified archives for installed packages.
+    // A legacy image may still need the cached catalog to archive its old state.
+    let omit_catalog = |name: &str| {
+        deferred_publishers.contains(name)
+            && (state.settings.catalog_archives
+                || !state
+                    .installed
+                    .values()
+                    .any(|package| package.published.manifest.publisher == name))
+    };
     if let Some(saved) = saved {
         ensure!(
             if single {
                 saved.catalog.is_some() && saved.catalogs.is_empty()
             } else {
-                saved.catalog.is_none() && saved.catalogs.len() == publishers.len()
+                saved.catalog.is_none()
+                    && saved.catalogs.len()
+                        == publishers
+                            .iter()
+                            .filter(|publisher| !omit_catalog(&publisher.name))
+                            .count()
             },
             "saved plan's catalogs do not match the image's publishers"
         );
@@ -357,6 +373,14 @@ pub(super) fn load(
     let mut catalogs = Catalogs::default();
     let mut snapshots = Vec::new();
     for publisher in publishers {
+        if omit_catalog(&publisher.name) {
+            if let Some(previous) = state.settings.catalog_checkpoints.get(&publisher.name) {
+                catalogs
+                    .checkpoints
+                    .insert(publisher.name.clone(), previous.clone());
+            }
+            continue;
+        }
         let pin = selected_pin(&publisher.name)?;
         let signed = profile
             .as_ref()
@@ -383,12 +407,14 @@ pub(super) fn load(
             publisher,
             &snapshot.builds.history,
         )?;
-        catalogs.renames.add(
-            &state.installed,
-            &publisher.name,
-            &snapshot.rename_targets,
-            &snapshot.obsoletions,
-        );
+        if !deferred_publishers.contains(&publisher.name) {
+            catalogs.renames.add(
+                &state.installed,
+                &publisher.name,
+                &snapshot.rename_targets,
+                &snapshot.obsoletions,
+            );
+        }
         snapshots.push((publisher, signed, snapshot));
     }
     catalogs.renames.check_request(updating)?;
@@ -397,6 +423,16 @@ pub(super) fn load(
         catalogs
             .checkpoints
             .insert(publisher.name.clone(), snapshot.builds.history.clone());
+        if single {
+            catalogs.legacy = Some(snapshot.sha256.clone());
+        } else {
+            catalogs
+                .pins
+                .insert(publisher.name.clone(), snapshot.sha256.clone());
+        }
+        if deferred_publishers.contains(&publisher.name) {
+            continue;
+        }
         catalogs
             .candidates
             .add_obsoletions(&mut sources, &publisher.name, &snapshot.obsoletions);
@@ -411,13 +447,6 @@ pub(super) fn load(
                 let id = format!("cps://{}/{}@{version}", publisher.name, spec.name);
                 ensure!(!snapshot.is_withdrawn(&id), "{id} was withdrawn");
             }
-        }
-        if single {
-            catalogs.legacy = Some(snapshot.sha256);
-        } else {
-            catalogs
-                .pins
-                .insert(publisher.name.clone(), snapshot.sha256);
         }
         catalogs.candidates.add_packages(
             &mut sources,

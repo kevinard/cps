@@ -1,31 +1,18 @@
-name: Release promotion and rollout
+name: Release rehearsal
 
 on:
-  schedule:
-    - cron: '17,47 * * * *'
-    - cron: '23 4 * * *'
   workflow_dispatch:
     inputs:
-      operation:
-        description: Release operation
-        type: choice
-        options:
-          - promote
-          - widen
-          - advance
-          - deploy-current
-        required: true
       request:
-        description: Release request directory name for promote
+        description: Rehearsal cases directory name
         type: string
-      catalog:
-        description: Expected current catalog SHA-256 for widen or deploy-current
+        required: true
+      candidate:
+        description: Prepared candidate catalog SHA-256
         type: string
-      profile:
-        description: Signed release profile for widen
-        type: string
-      percentage:
-        description: New percentage for widen
+        required: true
+      base:
+        description: Current catalog SHA-256 when prepared (empty for a first release)
         type: string
 
 permissions:
@@ -33,84 +20,63 @@ permissions:
 
 jobs:
   preflight:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.operation == 'promote'
+    if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/ci.yml
 
-  release:
+  rehearse:
+    if: github.ref == 'refs/heads/main'
     needs: preflight
-    permissions:
-      contents: write
-    if: >-
-      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
-      ((github.event_name == 'workflow_dispatch' &&
-        (inputs.operation != 'promote' || needs.preflight.result == 'success')) ||
-       (github.event.schedule == '17,47 * * * *' && vars.CPS_RELEASE_AUTOROLLOUT == 'true') ||
-       (github.event.schedule == '23 4 * * *' && vars.CPS_MIRROR_DIR != '' && vars.CPS_RELEASE_DEPLOY == '')) }}
-    concurrency:
-      group: cps-release
-      cancel-in-progress: false
-    runs-on: [self-hosted, linux, cps-release]
-    environment: cps-release
+    runs-on: [self-hosted, linux, x64, cps-rehearsal]
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Build and test the release tool
-        run: |
-          cargo build --locked --offline --release
-          cargo test --locked --offline
-          CPS_BIN="$GITHUB_WORKSPACE/target/release/cps" bash tests/release-ci.sh
-      - name: Run release operation
-        id: release_operation
+      - name: Build the pinned rehearsal environment
+        run: docker build --target boot -t "cps-rehearsal:$GITHUB_RUN_ID" ci
+      - name: Rehearse the prepared catalog
         env:
-          CPS_RELEASE_REPO: ${{ vars.CPS_RELEASE_REPO }}
+          CPS_REHEARSAL_DATA: ${{ vars.CPS_REHEARSAL_DATA }}
+          CPS_REHEARSAL_REPO: ${{ vars.CPS_REHEARSAL_REPO }}
+          CPS_REHEARSAL_CASES: ${{ vars.CPS_REHEARSAL_CASES }}
+          CPS_REHEARSAL_VM_GATE: ${{ vars.CPS_REHEARSAL_VM_GATE }}
           CPS_RELEASE_PUBLISHER: ${{ vars.CPS_RELEASE_PUBLISHER }}
-          CPS_RELEASE_INPUTS: ${{ vars.CPS_RELEASE_INPUTS }}
-          CPS_RELEASE_SOURCE_CACHE: ${{ vars.CPS_RELEASE_SOURCE_CACHE }}
-          CPS_RELEASE_VM_GATE: ${{ vars.CPS_RELEASE_VM_GATE }}
-          CPS_RELEASE_ROLLOUT_GATE: ${{ vars.CPS_RELEASE_ROLLOUT_GATE }}
-          CPS_RELEASE_ROLLOUT_PLAN: ${{ vars.CPS_RELEASE_ROLLOUT_PLAN }}
-          CPS_RELEASE_DEPLOY: ${{ vars.CPS_RELEASE_DEPLOY }}
-          CPS_MIRROR_DIR: ${{ vars.CPS_MIRROR_DIR }}
-          CPS_MIRROR_PUBLISHER_KEY: ${{ vars.CPS_MIRROR_PUBLISHER_KEY }}
-          CPS_MIRROR_TUF_ROOT: ${{ vars.CPS_MIRROR_TUF_ROOT }}
-          CPS_MIRROR_TUF_ACTIVE_ROOT: ${{ vars.CPS_MIRROR_TUF_ACTIVE_ROOT }}
-          CPS_MIRROR_TUF_KEYS: ${{ vars.CPS_MIRROR_TUF_KEYS }}
-          CPS_RELEASE_SIGNING_KEY: ${{ secrets.CPS_RELEASE_SIGNING_KEY_PATH }}
-          CPS_OPERATION: >-
-            ${{ github.event.schedule == '23 4 * * *' && 'refresh-mirror' ||
-                (github.event_name == 'schedule' && 'advance') || inputs.operation }}
           CPS_REQUEST: ${{ inputs.request }}
-          CPS_CATALOG: ${{ inputs.catalog }}
-          CPS_PROFILE: ${{ inputs.profile }}
-          CPS_PERCENTAGE: ${{ inputs.percentage }}
+          CPS_CANDIDATE: ${{ inputs.candidate }}
+          CPS_BASE: ${{ inputs.base }}
         run: |
-          export CPS_BIN="$GITHUB_WORKSPACE/target/release/cps"
-          export CPS_RELEASE_DEPLOY="${CPS_RELEASE_DEPLOY:-$GITHUB_WORKSPACE/ci/deploy-mirror.sh}"
-          if [[ "$CPS_OPERATION" != refresh-mirror ]]; then
-            export CPS_RELEASE_DEPLOYED_OUTPUT="$GITHUB_OUTPUT"
-          fi
-          case "$CPS_OPERATION" in
-            promote) bash ci/release.sh promote "$CPS_REQUEST" ;;
-            widen) bash ci/release.sh widen "$CPS_CATALOG" "$CPS_PROFILE" "$CPS_PERCENTAGE" ;;
-            advance) bash ci/release.sh advance ;;
-            deploy-current) bash ci/release.sh deploy-current "$CPS_CATALOG" ;;
-            refresh-mirror) bash ci/release.sh refresh-mirror ;;
-            *) exit 2 ;;
-          esac
-      - name: Publish signed mirror release notes
-        if: >-
-          steps.release_operation.outputs.catalog != '' &&
-          vars.CPS_MIRROR_URL != '' && vars.CPS_RELEASE_DEPLOY == ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          CPS_MIRROR_URL: ${{ vars.CPS_MIRROR_URL }}
-          CPS_MIRROR_DIR: ${{ vars.CPS_MIRROR_DIR }}
-          CPS_MIRROR_TUF_ROOT: ${{ vars.CPS_MIRROR_TUF_ROOT }}
-          CPS_MIRROR_PUBLISHER_KEY: ${{ vars.CPS_MIRROR_PUBLISHER_KEY }}
-          CPS_RELEASE_NOTES_SIGNING_KEY: ${{ secrets.CPS_RELEASE_NOTES_SIGNING_KEY_PATH }}
-          CPS_RELEASE_PUBLISHER: ${{ vars.CPS_RELEASE_PUBLISHER }}
-          CPS_DEPLOYED_CATALOG: ${{ steps.release_operation.outputs.catalog }}
-        run: bash ci/publish-release-notes.sh "$CPS_RELEASE_PUBLISHER" "$CPS_DEPLOYED_CATALOG"
+          [[ "$CPS_REQUEST" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]
+          [[ "$CPS_REHEARSAL_DATA" = /* && "$CPS_REHEARSAL_CASES" = /* ]]
+          data=$(realpath -e -- "$CPS_REHEARSAL_DATA")
+          workspace=$(pwd -P)
+          [[ -d "$data" && "$data" != / ]]
+          for writable in "$workspace" "$(realpath -e -- "$RUNNER_TEMP")"; do
+            [[ "$data/" != "$writable/"* && "$writable/" != "$data/"* ]]
+          done
+          for path in "$CPS_REHEARSAL_REPO" "$CPS_REHEARSAL_CASES" "$CPS_REHEARSAL_VM_GATE"; do
+            [[ $(realpath -e -- "$path") == "$data/"* ]]
+          done
+          CPS_REHEARSAL_REPO=$(realpath -e -- "$CPS_REHEARSAL_REPO")
+          CPS_REHEARSAL_CASES=$(realpath -e -- "$CPS_REHEARSAL_CASES")
+          CPS_REHEARSAL_VM_GATE=$(realpath -e -- "$CPS_REHEARSAL_VM_GATE")
+          mkdir -p "$RUNNER_TEMP/cps-cargo"
+          run_ci() {
+            docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp \
+              --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$workspace:$workspace" \
+              --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$workspace" "$@"
+          }
+          image="cps-rehearsal:$GITHUB_RUN_ID"
+          run_ci "$image" cargo fetch --locked
+          run_ci --network none --env CPS_REHEARSAL_REPO --env CPS_REHEARSAL_CASES --env CPS_REHEARSAL_VM_GATE \
+            --env CPS_RELEASE_PUBLISHER --env CPS_REQUEST --env CPS_CANDIDATE --env CPS_BASE \
+            --volume "$data:$data:ro" "$image" bash -euc '
+              cargo build --frozen --release
+              cargo test --frozen
+              export CPS_BIN="$PWD/target/release/cps"
+              bash tests/release-ci.sh
+              bash ci/rehearse-release.sh "$CPS_REHEARSAL_CASES/$CPS_REQUEST" \
+                  "$CPS_CANDIDATE" "$CPS_BASE" "$CPS_REHEARSAL_VM_GATE"
+            '
+      - name: Remove the local rehearsal image
+        if: always()
+        run: docker image rm "cps-rehearsal:$GITHUB_RUN_ID" || true

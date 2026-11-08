@@ -25,8 +25,19 @@ pub(super) fn save(tx: &Transaction<'_>, state: &State) -> Result<()> {
             .publishers
             .get(name)
             .context("missing checkpoint publisher")?;
-        let bytes = catalog_bytes(&publisher.repo, &checkpoint.catalog)
-            .with_context(|| format!("archiving the signed catalog for {name}"))?;
+        let bytes = match catalog_bytes(&publisher.repo, &checkpoint.catalog) {
+            Ok(bytes) => bytes,
+            Err(_)
+                if read(tx, name)
+                    .is_ok_and(|bytes| crate::model::digest(&bytes) == checkpoint.catalog) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("archiving the signed catalog for {name}"));
+            }
+        };
         insert.execute((name, bytes))?;
     }
     Ok(())

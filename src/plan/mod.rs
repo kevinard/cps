@@ -192,6 +192,8 @@ pub struct Plan {
     force_phased_update: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     git_updates: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    deferred_publishers: BTreeSet<String>,
     pub(crate) catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
@@ -263,6 +265,10 @@ impl Plan {
             || self.kernel_install.is_some()
     }
 
+    pub fn deferred_publishers(&self) -> &BTreeSet<String> {
+        &self.deferred_publishers
+    }
+
     pub(crate) fn package_changes(&self) -> &[PackageChange] {
         &self.package_changes
     }
@@ -284,6 +290,7 @@ impl Plan {
             track_profile_intent: false,
             force_phased_update: false,
             git_updates: Vec::new(),
+            deferred_publishers: BTreeSet::new(),
             catalog: None,
             catalogs: BTreeMap::new(),
             request,
@@ -635,7 +642,11 @@ pub(crate) struct UpdateDiagnostics<'a> {
     pub advisories: Option<&'a mut Vec<ReleaseAdvisory>>,
 }
 
-pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) -> Result<Plan> {
+pub(crate) fn inspect_update(
+    path: &Path,
+    diagnostics: UpdateDiagnostics<'_>,
+    deferred_publishers: &BTreeSet<String>,
+) -> Result<Plan> {
     let UpdateDiagnostics {
         held_back,
         explain,
@@ -648,8 +659,11 @@ pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) ->
     if let Some(name) = explain {
         validate_name(name).context("invalid package name for --explain")?;
     }
-    let (plan, next, _) = plan_image(
-        path,
+    let image = Image::open_query(path)?;
+    image.require_clean()?;
+    let (plan, next, _) = plan_with_state(
+        &image,
+        image.state()?,
         Request::Update,
         PlanOptions::default(),
         Some(UpdateDiagnostics {
@@ -657,6 +671,10 @@ pub(crate) fn inspect_update(path: &Path, diagnostics: UpdateDiagnostics<'_>) ->
             explain,
             advisories,
         }),
+        UpdateSelection {
+            deferred_publishers: Some(deferred_publishers),
+            ..UpdateSelection::default()
+        },
     )?;
     held_back.retain_mut(|update| {
         let Some(package) = next.installed.get(&update.name) else {
@@ -678,20 +696,33 @@ pub(crate) fn plan_image(
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
-    plan_with_state(&image, state, request, options, diagnostics, &[])
+    plan_with_state(
+        &image,
+        state,
+        request,
+        options,
+        diagnostics,
+        UpdateSelection::default(),
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UpdateSelection<'a> {
+    pub git_updates: &'a [String],
+    pub deferred_publishers: Option<&'a BTreeSet<String>>,
 }
 
 pub(crate) fn plan_system(
     path: &Path,
     request: Request,
     options: PlanOptions,
-    git_updates: &[String],
+    selection: UpdateSelection<'_>,
 ) -> Result<(Plan, crate::systemd::LiveServices)> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let before = image.state()?;
     let (plan, after, _) =
-        plan_with_state(&image, before.clone(), request, options, None, git_updates)?;
+        plan_with_state(&image, before.clone(), request, options, None, selection)?;
     let services = crate::systemd::LiveServices::plan(&plan, &before, &after);
     Ok((plan, services))
 }
@@ -702,7 +733,7 @@ fn plan_with_state(
     request: Request,
     options: PlanOptions,
     diagnostics: Option<UpdateDiagnostics<'_>>,
-    git_updates: &[String],
+    selection: UpdateSelection<'_>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let solver = if options.install_recommends
         && matches!(
@@ -725,7 +756,7 @@ fn plan_with_state(
         Some(solver),
         options.force_phased_update,
         diagnostics,
-        git_updates,
+        selection,
     )
 }
 
@@ -813,7 +844,7 @@ pub(crate) fn build(
         solver,
         saved.is_some_and(|plan| plan.force_phased_update),
         None,
-        &[],
+        UpdateSelection::default(),
     )
 }
 
@@ -825,11 +856,29 @@ fn build_with_update_diagnostics(
     solver: Option<SolverRevision>,
     force_phased_update: bool,
     mut diagnostics: Option<UpdateDiagnostics<'_>>,
-    git_updates: &[String],
+    selection: UpdateSelection<'_>,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
-    let git_updates = saved.map_or(git_updates, |plan| plan.git_updates.as_slice());
+    let git_updates = saved.map_or(selection.git_updates, |plan| plan.git_updates.as_slice());
+    let empty = BTreeSet::new();
+    let deferred_publishers = saved
+        .map_or(selection.deferred_publishers.unwrap_or(&empty), |plan| {
+            &plan.deferred_publishers
+        });
     let root = &image.root;
     let updating = matches!(request, Request::Update | Request::UpdateProfile);
+    if !deferred_publishers.is_empty() {
+        ensure!(updating, "deferring publishers requires an upgrade");
+        let publishers = &state.publishers;
+        let required = publishers.signed_publishers().len().max(1);
+        for name in deferred_publishers {
+            ensure!(
+                publishers.as_slice()[required..]
+                    .iter()
+                    .any(|publisher| &publisher.name == name),
+                "cannot defer required or unknown publisher {name}"
+            );
+        }
+    }
     ensure!(
         git_updates.is_empty() || updating,
         "Git update selections require an upgrade"
@@ -1054,6 +1103,7 @@ fn build_with_update_diagnostics(
                 &requested,
                 saved,
                 updating,
+                deferred_publishers,
                 update::Rollout {
                     force: force_phased_update,
                     advisories: diagnostics
@@ -1118,6 +1168,20 @@ fn build_with_update_diagnostics(
                     .iter()
                     .map(|(&name, target)| (name, target.clone())),
             );
+            let retained = state
+                .settings
+                .profile_intent
+                .as_ref()
+                .filter(|_| track_profile_intent)
+                .map(|intent| {
+                    let mut retained = intent.local.clone();
+                    retained.extend(state.installed.iter().filter_map(|(name, package)| {
+                        deferred_publishers
+                            .contains(&package.published.manifest.publisher)
+                            .then(|| name.clone())
+                    }));
+                    retained
+                });
             let select = |state: &State, requirements: &BTreeMap<&str, PackageSpec<'_>>| {
                 if update_profile {
                     let profile = catalogs
@@ -1132,12 +1196,7 @@ fn build_with_update_diagnostics(
                         &state.installed,
                         profile,
                         &state.settings.freezes,
-                        state
-                            .settings
-                            .profile_intent
-                            .as_ref()
-                            .filter(|_| track_profile_intent)
-                            .map(|intent| &intent.local),
+                        retained.as_ref(),
                         requirements,
                         solver,
                         |installed| composition_paths(&state.settings, installed, solver),
@@ -1305,6 +1364,7 @@ fn build_with_update_diagnostics(
         track_profile_intent,
         force_phased_update,
         git_updates: git_updates.to_vec(),
+        deferred_publishers: deferred_publishers.clone(),
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
         systemd: systemd::plan_actions(&state, &installed, &paths),
@@ -1517,14 +1577,15 @@ fn build_with_update_diagnostics(
                         "unexpected file capabilities on preserved config {path}"
                     );
                     plan.preserved.push(path.clone());
-                    if next_facets.is_some() {
-                        config::remember_disabled(
+                    if next_facets.is_some() || observed.is_some() {
+                        config::remember_unowned(
                             &state.installed,
                             &mut state.settings,
                             path,
                             old,
                             observed.clone(),
                             retired_update,
+                            next_facets.is_none(),
                         )?;
                     }
                     observed.clone()

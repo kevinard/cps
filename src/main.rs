@@ -77,6 +77,9 @@ enum Command {
         /// Upgrade even if this image is outside the signed profile rollout
         #[arg(long)]
         force_phased_update: bool,
+        /// Use only the distribution publishers for this upgrade
+        #[arg(long)]
+        base_only: bool,
     },
     /// Check for upgrades and report any blockers or reboot requirement
     CheckUpdates {
@@ -88,6 +91,9 @@ enum Command {
         /// Use the currently cached catalogs
         #[arg(long)]
         no_refresh: bool,
+        /// Check updates from distribution publishers only
+        #[arg(long)]
+        base_only: bool,
         /// Probe the exact newer version of this held-back package
         #[arg(long, value_name = "PACKAGE")]
         explain: Option<String>,
@@ -1528,6 +1534,7 @@ fn change_system(
     mut request: Request,
     stage: bool,
     force_phased_update: bool,
+    base_only: bool,
     prepare_only: bool,
     git: Option<(&str, GitSnapshotRef<'_>)>,
 ) -> Result<()> {
@@ -1537,7 +1544,8 @@ fn change_system(
     );
     let system = System::load(&options.config)?
         .with_install_recommends(!options.no_install_recommends)
-        .with_force_phased_update(force_phased_update);
+        .with_force_phased_update(force_phased_update)
+        .with_base_only(base_only);
     let _lock = system.lock()?;
     let refresh = !options.no_refresh;
     let mut git_preview = false;
@@ -1582,7 +1590,7 @@ fn change_system(
             packages: vec![package],
         };
     }
-    let git_updates = if refresh && matches!(request, Request::Update) {
+    let git_updates = if refresh && !base_only && matches!(request, Request::Update) {
         system.prepare_git_updates(approve_git)?
     } else {
         Vec::new()
@@ -1609,6 +1617,18 @@ fn change_system(
     }
     if let Some(path) = &options.save_plan {
         save(path, change.saved_plan())?;
+    }
+    if !change.saved_plan().deferred_publishers().is_empty() {
+        eprintln!(
+            "Deferred publishers: {}",
+            change
+                .saved_plan()
+                .deferred_publishers()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     if change.is_empty() {
         if !git_preview {
@@ -1652,10 +1672,25 @@ fn change_system(
     if prepare_recovery {
         let root = system.prepare_recovery(&change)?;
         println!("Prepared recovery root {}", root.display());
-    } else if let Some(id) = system.apply(&change)? {
-        println!("Prepared {id}. Reboot when ready to use the new system.");
     } else {
-        println!("Changes are available now.");
+        match system.apply(&change) {
+            Ok(Some(id)) => println!("Prepared {id}. Reboot when ready to use the new system."),
+            Ok(None) => println!("Changes are available now."),
+            Err(error) if error.downcast_ref::<system::RetryBaseOnly>().is_some() => {
+                eprintln!("Warning: {error:#}. Replanning with distribution publishers only.");
+                drop(_lock);
+                return change_system(
+                    options,
+                    Request::Update,
+                    stage,
+                    force_phased_update,
+                    true,
+                    false,
+                    None,
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -1664,9 +1699,10 @@ fn check_system_updates(
     config: &Path,
     refresh: bool,
     json: bool,
+    base_only: bool,
     explain: Option<&str>,
 ) -> Result<ExitCode> {
-    let report = System::check_updates_with_explanation(config, refresh, explain);
+    let report = System::check_updates_with_scope(config, refresh, explain, base_only);
     if json {
         let mut out = io::stdout().lock();
         serde_json::to_writer_pretty(&mut out, &report)?;
@@ -1674,6 +1710,17 @@ fn check_system_updates(
     } else {
         if report.status == UpdateStatus::UpToDate {
             println!("Up to date.");
+        }
+        if !report.deferred_publishers.is_empty() {
+            println!(
+                "Deferred publishers: {}",
+                report
+                    .deferred_publishers
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         if let Some(deferred) = &report.phased_update {
             println!("{deferred}");
@@ -1737,6 +1784,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 stage,
                 false,
                 false,
+                false,
                 source,
             )?;
         }
@@ -1744,11 +1792,13 @@ fn run(command: Command) -> Result<ExitCode> {
             options,
             stage,
             force_phased_update,
+            base_only,
         } => change_system(
             options,
             Request::Update,
             stage,
             force_phased_update,
+            base_only,
             false,
             None,
         )?,
@@ -1756,9 +1806,10 @@ fn run(command: Command) -> Result<ExitCode> {
             config,
             json,
             no_refresh,
+            base_only,
             explain,
         } => {
-            return check_system_updates(&config, !no_refresh, json, explain.as_deref());
+            return check_system_updates(&config, !no_refresh, json, base_only, explain.as_deref());
         }
         Command::Remove {
             options,
@@ -1770,11 +1821,18 @@ fn run(command: Command) -> Result<ExitCode> {
             stage,
             false,
             false,
+            false,
             None,
         )?,
-        Command::Autoremove { options, stage } => {
-            change_system(options, Request::Autoremove, stage, false, false, None)?
-        }
+        Command::Autoremove { options, stage } => change_system(
+            options,
+            Request::Autoremove,
+            stage,
+            false,
+            false,
+            false,
+            None,
+        )?,
         Command::Repair {
             options,
             prepare_only,
@@ -1786,7 +1844,7 @@ fn run(command: Command) -> Result<ExitCode> {
             } else {
                 Request::RepairPaths { paths }
             };
-            change_system(options, request, false, false, prepare_only, None)?;
+            change_system(options, request, false, false, false, prepare_only, None)?;
         }
         Command::Revert {
             options,
@@ -1796,6 +1854,7 @@ fn run(command: Command) -> Result<ExitCode> {
             change_system(
                 options,
                 Request::Revert { paths },
+                false,
                 false,
                 false,
                 prepare_only,

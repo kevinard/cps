@@ -237,13 +237,14 @@ fn identity<'a>(
     )
 }
 
-pub(super) fn remember_disabled(
+pub(super) fn remember_unowned(
     installed: &BTreeMap<String, Installed>,
     settings: &mut Settings,
     path: &str,
     old: &Managed,
     local: Option<Node>,
     pending_revision: Option<u64>,
+    retained: bool,
 ) -> Result<()> {
     ensure!(
         matches!(
@@ -264,6 +265,7 @@ pub(super) fn remember_disabled(
             vendor: old.node.clone(),
             local,
             pending_revision,
+            retained,
         },
     );
     Ok(())
@@ -298,10 +300,23 @@ pub(super) fn reclaim_disabled(
             // selected vendor action through the ordinary path checks.
             continue;
         }
-        ensure!(
-            observed == record.local,
-            "disabled configuration changed at {from}"
-        );
+        if record.retained {
+            ensure!(
+                matches!(
+                    observed,
+                    Some(Node::File {
+                        capabilities: None,
+                        ..
+                    })
+                ),
+                "unexpected file type or capabilities on retained configuration {from}"
+            );
+        } else {
+            ensure!(
+                observed == record.local,
+                "disabled configuration changed at {from}"
+            );
+        }
         let target = &paths[to];
         if from != to {
             plan_move(
@@ -313,8 +328,8 @@ pub(super) fn reclaim_disabled(
                 writes,
             )?;
             ensure!(
-                writes[&from].before == record.local,
-                "disabled configuration changed at {from}"
+                writes[&from].before == observed,
+                "configuration changed while planning a move from {from}"
             );
         } else {
             if target.node != record.vendor {
@@ -383,7 +398,8 @@ pub(super) fn retain_disabled(
         .collect::<BTreeSet<_>>();
     settings.dormant_configs.retain(|path, record| {
         !paths.contains_key(path)
-            && identities.contains(&(record.publisher.as_str(), record.identity.clone()))
+            && (record.retained
+                || identities.contains(&(record.publisher.as_str(), record.identity.clone())))
     });
 }
 

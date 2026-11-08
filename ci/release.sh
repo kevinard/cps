@@ -8,9 +8,12 @@ digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
 cps=${CPS_BIN:?Set CPS_BIN to the built CPS executable}
 repo=${CPS_RELEASE_REPO:?Set CPS_RELEASE_REPO to the publishing repository}
 publisher=${CPS_RELEASE_PUBLISHER:?Set CPS_RELEASE_PUBLISHER}
-deploy=${CPS_RELEASE_DEPLOY:?Set CPS_RELEASE_DEPLOY to the mirror deployment adapter}
-[[ $cps = /* && -x $cps && $repo = /* && -d $repo && $deploy = /* && -x $deploy ]] ||
-    fail 'CPS, the repository, and the deployment adapter need absolute paths'
+[[ $cps = /* && -x $cps && $repo = /* && -d $repo ]] ||
+    fail 'CPS and the repository need absolute paths'
+if [[ ${1:-} != prepare ]]; then
+    deploy=${CPS_RELEASE_DEPLOY:?Set CPS_RELEASE_DEPLOY to the mirror deployment adapter}
+    [[ $deploy = /* && -x $deploy ]] || fail 'Use an absolute executable path for deployment'
+fi
 
 current() {
     if [[ -e $repo/current ]]; then
@@ -62,30 +65,62 @@ widen_catalog() {
 }
 
 case ${1:-} in
-    promote)
-        [[ $# == 2 && $2 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || fail 'Expected promote REQUEST'
+    prepare|promote)
+        operation=$1
+        [[ $# == 3 && $2 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] ||
+            fail 'Expected prepare REQUEST EXPORT_DIRECTORY or promote REQUEST REHEARSED_SHA256'
         inputs=${CPS_RELEASE_INPUTS:?Set CPS_RELEASE_INPUTS to the release requests directory}
         key=${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}
-        gate=${CPS_RELEASE_VM_GATE:?Set CPS_RELEASE_VM_GATE to the boot and service test adapter}
-        [[ $inputs = /* && $gate = /* && -x $gate ]] || fail 'Use absolute paths for inputs and the VM gate'
-        request="$inputs/$2"
-        [[ -f $request/release.kdl && -d $request/cases ]] || fail 'Release request needs release.kdl and cases/'
-        base=$(current)
-        [[ -z $base ]] || digest "$base" || fail 'Invalid current catalog'
+        [[ $inputs = /* ]] || fail 'Use an absolute release requests directory'
+        key=$(realpath -e -- "$key")
+        [[ -f $key && $key != "$(realpath -e -- "$repo")/"* ]] ||
+            fail 'Keep the publisher signing key outside the publishing repository'
+        request="$inputs/$2/release.kdl"
+        [[ -f $request ]] || fail 'Release request needs release.kdl'
         publish=("$cps" repo publish-release --repo "$repo" --signing-key "$key")
         if [[ -n ${CPS_RELEASE_SOURCE_CACHE:-} ]]; then
             publish+=(--source-cache "$CPS_RELEASE_SOURCE_CACHE")
         fi
-        message=$("${publish[@]}" --prepare "$request/release.kdl")
-        candidate=$(catalog_from_output "$message" Prepared)
-        [[ $(current) == "$base" ]] || fail 'The repository advanced during preparation'
-        [[ $candidate != "$base" ]] || fail 'The request produced no new catalog'
-        env -u CPS_RELEASE_SIGNING_KEY bash "$(dirname -- "$0")/rehearse-release.sh" \
-            "$request/cases" "$candidate" "$base" "$gate"
-        message=$("${publish[@]}" --expect-catalog "$candidate" "$request/release.kdl")
-        promoted=$(catalog_from_output "$message" Published)
-        [[ $promoted == "$candidate" ]] || fail 'Promotion returned a different catalog'
-        deploy_catalog "$promoted"
+        if [[ $operation == prepare ]]; then
+            output=$3
+            [[ $output = /* && ! -e $output && ! -L $output ]] ||
+                fail 'Use a new absolute export directory'
+            base=$(current)
+            [[ -z $base ]] || digest "$base" || fail 'Invalid current catalog'
+            message=$("${publish[@]}" --prepare "$request")
+            candidate=$(catalog_from_output "$message" Prepared)
+            exec {repo_lock}< "$repo/publish.lock"
+            flock "$repo_lock"
+            [[ $(current) == "$base" ]] || fail 'The repository advanced during preparation'
+            [[ $candidate != "$base" ]] || fail 'The request produced no new catalog'
+            stage=$(mktemp -d -- "$(dirname -- "$output")/.cps-rehearsal.XXXXXXXX")
+            trap 'rm -rf -- "$stage"' EXIT
+            for dir in catalogs manifests blobs attestations file-indexes; do
+                if [[ ! -e $repo/$dir && ! -L $repo/$dir ]]; then
+                    continue
+                fi
+                [[ -d $repo/$dir && ! -L $repo/$dir ]] ||
+                    fail "Invalid publishing object directory $dir"
+                unexpected=$(find "$repo/$dir" -regextype posix-extended -mindepth 1 -maxdepth 1 \
+                    \( ! -type f -o ! -regex '.*/[0-9a-f]{64}' \) -print -quit)
+                [[ -z $unexpected ]] || fail "Unexpected file in publishing object directory $dir"
+                cp -a --reflink=auto -- "$repo/$dir" "$stage/"
+            done
+            printf '%s\n' "$candidate" > "$stage/candidate"
+            printf '%s\n' "$base" > "$stage/base"
+            mv -T --no-clobber -- "$stage" "$output"
+            [[ ! -e $stage ]] || fail 'The rehearsal export destination already exists'
+            printf 'Prepared catalog %s\nBase catalog %s\n' "$candidate" "${base:-(empty)}"
+        else
+            candidate=$3
+            digest "$candidate" || fail 'Expected the rehearsed catalog SHA-256'
+            printf '%s  %s\n' "$candidate" "$repo/catalogs/$candidate" | sha256sum --check --status ||
+                fail 'The rehearsed catalog is missing from the publishing repository or has changed'
+            message=$("${publish[@]}" --expect-catalog "$candidate" "$request")
+            promoted=$(catalog_from_output "$message" Published)
+            [[ $promoted == "$candidate" ]] || fail 'Promotion returned a different catalog'
+            deploy_catalog "$promoted"
+        fi
         ;;
     widen)
         [[ $# == 4 ]] && digest "$2" && [[ $4 =~ ^(100|[1-9][0-9]?)$ ]] ||
@@ -137,26 +172,35 @@ case ${1:-} in
         ;;
     refresh-mirror)
         [[ $# == 1 ]] || fail 'Expected refresh-mirror'
-        timestamp=${CPS_MIRROR_DIR:?Set CPS_MIRROR_DIR to the HTTPS document directory}/metadata/timestamp.json
+        mirror=$(realpath -e -- "${CPS_MIRROR_DIR:?Set CPS_MIRROR_DIR to the HTTPS document directory}")
+        timestamp=$mirror/metadata/timestamp.json
         deployed=$repo/.ci-deployed-catalog
-        if [[ ! -e $timestamp && ! -L $timestamp ]]; then
-            [[ ! -e $deployed ]] || fail 'The deployed mirror is missing its timestamp. Run deploy-current to restore it.'
+        state=$repo/.ci-tuf-state.json
+        if [[ ! -e $deployed && ! -L $deployed ]]; then
+            [[ ! -e $state && ! -e $timestamp && ! -L $timestamp ]] ||
+                fail 'Run deploy-current to record the deployed catalog before refreshing.'
             printf '%s\n' 'The first mirror deployment is pending.'
             exit 0
         fi
-        [[ -f $timestamp && ! -L $timestamp ]] || fail 'Invalid mirror timestamp'
-        expires=$(jq -er '.signed.expires | strings | select(length > 0)' "$timestamp") ||
-            fail 'Missing expiration in mirror timestamp'
-        expiry=$(date -u --date="$expires" +%s) || fail 'Invalid expiration in mirror timestamp'
-        cutoff=$(date -u --date='+48 hours' +%s)
-        if (( expiry > cutoff )); then
+        base=$(current)
+        digest "$base" && [[ -f $deployed && ! -L $deployed && $(cat "$deployed") == "$base" ]] ||
+            fail 'Refresh requires the current catalog to be recorded as deployed. Complete the deployment with deploy-current first.'
+        if [[ -f $state && ! -L $state && -O $state && $(stat -c %a -- "$state") == 600 &&
+            -f $timestamp && ! -L $timestamp ]] &&
+            record=$(jq -er --arg mirror "$mirror" --arg base "$base" '
+                select(.mirror == $mirror and .published.catalog == $base) | .published |
+                select(.expires | strings | test("^[0-9]{4}(-[0-9]{2}){2}T[0-9]{2}(:[0-9]{2}){2}Z$")) |
+                select(.sha256 | strings | test("^[0-9a-f]{64}$")) | [.expires, .sha256] | @tsv
+            ' "$state") &&
+            IFS=$'\t' read -r expires expected <<< "$record" &&
+            expiry=$(date -u --date="$expires" +%s) &&
+            (( expiry > $(date -u --date='+48 hours' +%s) )) &&
+            checksum=$(timeout 5 head -c 1048577 -- "$timestamp" | sha256sum) &&
+            [[ ${checksum%% *} == "$expected" ]]; then
             printf 'Mirror timestamp is valid until %s.\n' "$expires"
             exit 0
         fi
-        base=$(current)
-        digest "$base" && [[ -f $deployed && $(cat "$deployed") == "$base" ]] ||
-            fail 'Refresh requires the current catalog to be recorded as deployed. Complete the deployment with deploy-current first.'
         deploy_catalog "$base"
         ;;
-    *) fail 'Expected promote, widen, advance, deploy-current, or refresh-mirror' ;;
+    *) fail 'Expected prepare, promote, widen, advance, deploy-current, or refresh-mirror' ;;
 esac

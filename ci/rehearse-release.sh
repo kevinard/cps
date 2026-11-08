@@ -2,20 +2,30 @@
 set -euo pipefail
 umask 077
 
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
+
+[[ $# == 4 ]] || fail 'Expected CASES CANDIDATE_SHA256 BASE_SHA256 VM_GATE'
 cases=$1
 candidate=$2
 base=$3
 gate=$4
 cps=${CPS_BIN:?}
-repo=${CPS_RELEASE_REPO:?}
+repo=${CPS_REHEARSAL_REPO:?Set CPS_REHEARSAL_REPO to the prepared catalog snapshot}
 publisher=${CPS_RELEASE_PUBLISHER:?}
+digest "$candidate" && { [[ -z $base ]] || digest "$base"; } && [[ $candidate != "$base" ]] ||
+    fail 'Invalid rehearsal candidate or base catalog digest'
+[[ $cps = /* && -x $cps && $repo = /* && -d $repo && $cases = /* && -d $cases && $gate = /* && -x $gate ]] ||
+    fail 'Use absolute paths for CPS, the snapshot, the rehearsal cases, and the VM gate'
+[[ $(cat -- "$repo/candidate") == "$candidate" && $(cat -- "$repo/base") == "$base" ]] ||
+    fail 'The rehearsal snapshot does not match the requested candidate and base'
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 private=$work/repo
 mkdir "$private"
 
 # Copy only repository objects. The test repository has its own current pointer.
-for dir in catalogs manifests blobs attestations build-inputs source-archives file-indexes; do
+for dir in catalogs manifests blobs attestations file-indexes; do
     if [[ -d $repo/$dir ]]; then
         cp -a --reflink=auto -- "$repo/$dir" "$private/"
     fi
@@ -88,4 +98,4 @@ done
 
 LC_ALL=C sort -u "$work/tested" -o "$work/tested"
 diff -u "$work/profiles" "$work/tested"
-printf 'Rehearsed catalog %s\n' "$candidate"
+printf 'Rehearsed catalog %s\nBase catalog %s\n' "$candidate" "${base:-(empty)}"

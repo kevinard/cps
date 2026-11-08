@@ -28,6 +28,17 @@ before committing. A failed job or a job that takes longer than two minutes
 leaves the transaction pending. Use `cps resume` after correcting the cause.
 New services follow the image's preset policy.
 
+On upgrade, an unavailable optional publisher is deferred while CPS
+continues with the distribution repositories. CPS keeps installed packages
+from the deferred publisher at their current versions. If an optional
+publisher fails during payload download, CPS previews a new distribution-only
+plan and asks for confirmation again unless you passed `--yes`. To use
+distribution publishers from the start, pass `--base-only` to `upgrade` or
+`check-updates`. This scope includes the primary publisher, signed profile
+companions, and publishers declared in the system image configuration.
+Package dependencies still apply, so an incompatible installed add-on can
+hold back a base upgrade.
+
 `check-updates --json` runs the upgrade planner on the running system.
 It refreshes configured mirrors as `upgrade` does. Use `--no-refresh` to
 check the cached catalogs. It only plans the transaction, so the installed
@@ -42,7 +53,9 @@ profile offer a newer version than the plan selects. Each entry gives the
 installed, newest available, and selected versions and the freeze reason
 when applicable. The selected version is `null` if planning fails.
 `blockers` contains errors that prevented a plan, such as a
-pending trial boot or an unsatisfiable release profile. A check can report
+pending trial boot or an unsatisfiable release profile. When publishers were
+deferred, the report names them in `deferred_publishers`. A check with no
+actionable changes and only deferred publishers reports `deferred`. A check can report
 both actionable changes and held-back packages. Use
 `check-updates --explain library/libdisplay` to probe the newest held-back
 version of one package with the same catalog pins. The report includes
@@ -116,7 +129,7 @@ transaction using the files saved in its journal. If resume reports damage
 to managed files, use `sudo cps resume --repair`. For an offline image use
 `cps transaction resume --root IMAGE --repair`. These commands restore
 damaged paths in the pending package state from verified staged or cached
-payloads before retrying final actions. They keep local edits to preserved
+payloads, including during the file-writing phase. They keep local edits to preserved
 configuration. If a systemd helper still fails, correct its reported
 problem and resume again. The explicit
 `plan`, `fetch`, `apply`, and `boot-env` commands remain available for
@@ -1910,84 +1923,109 @@ same publisher. Publication rejects a new profile version that matches the
 affected range. Publishers can revise a notice by declaring it again for
 the same ID and package. Upgrade clients before publishing profiles with advisories.
 
-### Running release promotion in CI
+### Rehearsing and promoting releases
 
-The package and boot test workflow runs on pull requests and pushes to
-`main`. It applies a plan saved by the previous revision, deploys and
-syncs a signed mirror, and exercises EFI boot, Btrfs trial rollback, and
-live transaction recovery after a forced reboot without a filesystem sync
-in QEMU. Release promotion requires the same checks to pass before it
-starts on the signing runner.
+Run the `Release rehearsal` workflow on the protected `main` branch. It
+runs the package and boot preflight and builds the rehearsal tool on a
+x86-64 Linux runner labeled `cps-rehearsal`. Provision Docker on the
+keyless runner. CI builds CPS and runs the tests in [the pinned build
+image](ci/Dockerfile). The image pins the Arch base by digest, verifies the
+dated package indexes before installation, and checks each Rust archive
+against the committed SHA-256. CI fetches the locked crates before building
+with `--frozen` and runs builds and tests in a container without network access.
 
-The GitHub Actions release workflow runs on a dedicated, trusted Linux
-runner labeled `cps-release` and uses the `cps-release` environment. Restrict
-the environment and runner to the protected `main` branch. Install the CPS
-build dependencies, populate the locked Cargo dependency cache, and install
-GNU coreutils and `jq` on the runner.
+The **Rust dependency audit** check scans `Cargo.lock` on pull requests and
+daily against the current RustSec advisory database. It blocks builds on
+vulnerabilities, unsound crates, and yanked versions. Protect `main` with
+required code-owner review and require the audit check in GitHub. Review
+changes to dependencies, the CI image and its hashes, and packaging recipes
+before updating those pins. The hosted runner supplies the kernel and Docker
+engine used to run the pinned image.
 
-Configure the environment variables below as absolute runner paths unless
-the value is a publisher name. Put the local path of the protected publisher
-key in the environment secret `CPS_RELEASE_SIGNING_KEY_PATH`.
+Keep the signing host outside GitHub Actions. Install the reviewed CPS
+binary and release scripts on that host through a separate administrator
+process. Keep the publisher, online TUF, and release notes keys there,
+outside the publishing repository and the public mirror. The rehearsal
+runner needs a read-only copy of release objects and publisher public keys.
+Give it no signing or deployment credentials, access to the signing host,
+or write access to its repository, release requests, scripts, or mirror.
+Retire the old `cps-release` Actions runner and remove the old signing
+secrets from GitHub. Rotate keys that were available to that runner if
+untrusted code may have run there.
+
+Set these variables in the signing host's private service or operator
+configuration. Use absolute paths for files and directories.
 
 | Variable | Value |
 | --- | --- |
+| `CPS_BIN` | Installed and reviewed CPS binary |
 | `CPS_RELEASE_REPO` | Writable publishing repository |
 | `CPS_RELEASE_PUBLISHER` | Publisher name |
+| `CPS_RELEASE_SIGNING_KEY` | Private publisher key outside the publishing repository |
 | `CPS_RELEASE_INPUTS` | Trusted parent directory of release requests |
 | `CPS_RELEASE_SOURCE_CACHE` | Optional source cache for release build bundles |
-| `CPS_RELEASE_VM_GATE` | Executable that boots and smoke-tests an actual rehearsed root |
-| `CPS_RELEASE_ROLLOUT_GATE` | Executable that checks health of the deployed cohort |
-| `CPS_RELEASE_ROLLOUT_PLAN` | JSON policy for scheduled rollout advancement |
-| `CPS_RELEASE_DEPLOY` | Optional custom deployment executable. The workflow defaults to `ci/deploy-mirror.sh`. |
+| `CPS_RELEASE_ROLLOUT_GATE` | Administrator-installed cohort health adapter |
+| `CPS_RELEASE_ROLLOUT_PLAN` | Approved policy for rollout advancement |
+| `CPS_RELEASE_DEPLOY` | Administrator-installed deployment adapter, such as `ci/deploy-mirror.sh` |
 
-Each request contains `release.kdl` and a `cases/` directory. Each named
-case contains an `image.kdl` using trusted publisher keys and the intended
-profile and architecture. Add a `baselines` file with one additional
-historical catalog digest per line. An optional executable
+1. On the signing host, run `bash ci/release.sh prepare REQUEST /path/to/new-snapshot`.
+   CPS reads the reviewed `REQUEST/release.kdl` and its bundle references.
+   Preparation signs the candidate for rehearsal and exports a private
+   snapshot of content-addressed repository objects. The production catalog
+   pointer and mirror are unchanged. Record the candidate and base digests.
+2. Transfer the snapshot from the signing host to the rehearsal host using
+   a one-way copy. On the rehearsal host, make it available read-only under
+   the directory configured as `CPS_REHEARSAL_REPO`. Configure
+   `CPS_REHEARSAL_CASES` as the parent of the named case directories,
+   `CPS_REHEARSAL_VM_GATE` as the absolute path of the boot and service test
+   adapter, and `CPS_RELEASE_PUBLISHER` as the publisher name. Put the
+   snapshot, cases, adapter, and any referenced companion repositories and
+   public keys under the absolute `CPS_REHEARSAL_DATA` directory. The workflow
+   mounts that directory read-only at the same path inside the pinned image.
+   Dispatch the workflow with the request name and both recorded digests.
+   Leave the base empty for a first release.
+3. After reviewing the successful preflight and rehearsal for the intended
+   request, candidate, and base, authorize promotion on the signing host
+   with `bash ci/release.sh promote REQUEST REHEARSED_SHA256`. Use the digest
+   recorded on the signing host. Promotion rebuilds the catalog from the
+   signing host's reviewed inputs and requires an exact digest match and
+   a current base before it advances the production pointer and deploys.
+   The rehearsal job's result informs this operator decision.
+
+Each named case contains an `image.kdl` using trusted publisher keys and the
+intended profile and architecture. List any additional historical catalog
+digests in `baselines`, one per line. An optional executable
 `before-upgrade` receives the CPS binary, baseline root, baseline digest,
-and candidate digest. Use it to install representative third-party
-software or prepare service state. The runner rehearses each profile's
-fresh install and upgrade from the current signed profile, plus the
-specified historical baselines. List every supported historical composition
-in the relevant cases. Each rehearsal checks the applied catalog pin and
-calls the VM gate with mode (`fresh` or `upgrade`), profile, candidate
-digest, baseline digest, resulting root, and previous root. The baseline
-digest and previous root are empty for a fresh install.
+and candidate digest. Use it to install representative third-party software
+or prepare service state. The runner rehearses fresh installation and upgrade
+from the current signed profile and listed historical baselines. It checks
+the applied catalog pin and calls the VM gate with the mode (`fresh` or
+`upgrade`), profile, candidate digest, baseline digest, resulting root, and
+previous root. The baseline digest and previous root are empty for a fresh install.
 
-Dispatch `promote` with a request name. A failed rehearsal leaves the
-publishing pointer in place. Dispatch `widen` with the deployed catalog
-digest, profile, and new percentage. It calls the rollout gate with the
-repository, publisher, digest, profile, and percentage before signing a
-successor. Widening changes only the signed rollout percentage and
-catalog sequence. The existing cohort assignment stays stable.
+Run `bash ci/release.sh widen CURRENT_SHA256 PROFILE PERCENTAGE` on the
+signing host to widen rollout after the installed health adapter approves.
+Widening changes the signed rollout percentage and catalog sequence while
+preserving cohort assignment. To advance automatically, schedule
+`bash ci/release.sh advance` on the signing host and configure the protected
+policy file. Set `catalog` to the initial promoted digest, `profile` to the
+profile name, and `percentages` to approved increasing steps beginning at
+the signed initial percentage. Each run can widen by one step. The health
+adapter checks that the mirror serves the requested digest and checks the
+cohort's health. Exit 75 to wait for further observations.
 
-For scheduled advancement, set the repository variable
-`CPS_RELEASE_AUTOROLLOUT=true` and configure a protected runner policy file.
-Set `catalog` to the initial promoted digest, `profile` to its profile name,
-and `percentages` to increasing approved steps beginning at the signed
-initial percentage. For example, a release admitted at 10 percent can use
-`"percentages": [10, 25, 50, 100]`. The workflow checks twice an hour
-and can also be dispatched with `advance`. Each run can widen by one step.
-The health adapter must confirm the serving mirror exposes the requested
-digest and check the cohort's health. Exit 75 to wait for more observations
-or a longer soak. Any other nonzero exit fails the run.
-
-The deployment adapter receives the repository, publisher, and exact
-catalog digest. The bundled adapter exports and verifies that catalog,
-publishes `publisher.json` with its TUF root and publisher public key, and
-publishes the new timestamp last. It retains earlier versioned files and
-chooses a higher TUF metadata version on retries.
-The workflow records successful deployment in `.ci-deployed-catalog`
-in the publishing repository. If the approved current digest has not
-been recorded, a scheduled run retries its deployment before widening.
-If mirror deployment fails after local promotion, dispatch
-`deploy-current` with the current digest to retry that deployment.
-`bash tests/release-ci.sh` exercises the workflow with a local repository
+The deployment adapter receives the repository, publisher, and exact catalog
+digest. The bundled adapter exports and verifies that catalog, publishes
+`publisher.json` with its TUF root and publisher public key, and publishes
+the new timestamp last. The release script records successful deployment in
+`.ci-deployed-catalog`. If deployment fails after local promotion, retry on
+the signing host with `bash ci/release.sh deploy-current CURRENT_SHA256`.
+Run `bash tests/release-ci.sh` to exercise the split using disposable keys
 and test adapters.
 
 ### Serving a basic HTTPS mirror
 
-Install `jq` and `flock` on the release runner. Use
+Install `jq` and `flock` on the signing host. Use
 [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool) on the
 key provisioning machine to create and rotate the TUF root. Provision an existing, writable
 directory for this publisher and serve it with a static HTTPS server. The
@@ -2046,7 +2084,7 @@ done
 tuftool root sign "$root_json" --key "$root_key_a" --key "$root_key_b"
 ```
 
-Copy the signed root and the three release keys to the release runner. Keep
+Copy the signed root and the three release keys to the signing host. Keep
 the root signing keys offline. For 2-of-3, store the root keys separately so
 two remain available if one is lost. The adapter pins the published bootstrap
 descriptor to that root and CPS public key.
@@ -2064,13 +2102,21 @@ CPS_RELEASE_REPO="$repo" CPS_RELEASE_PUBLISHER=canopa \
 
 Install the signed TUF root at `/etc/cps/tuf-root.json` on clients for URL-only
 registration. Redeploy existing mirrors with the updated exporter to include
-the publisher discovery targets. Set `CPS_MIRROR_DIR` as a GitHub repository variable and leave
-`CPS_RELEASE_DEPLOY` unset to enable automatic refresh with the bundled adapter.
-The workflow checks the mirror daily at 04:23 UTC and signs fresh TUF metadata
-for the already-deployed catalog when the timestamp has 48 hours or less left.
-This runs independently of scheduled rollout advancement. If the initial
-mirror was published by calling the deploy adapter directly, run
-`deploy-current` once to record the deployed catalog for the refresh job.
+the publisher discovery targets. To refresh automatically, schedule
+`bash ci/release.sh refresh-mirror` daily on the signing host with
+`CPS_MIRROR_DIR` and the deployment adapter configured. It signs fresh TUF
+metadata for the deployed catalog when the last signed timestamp has 48 hours
+or less left or its bytes are missing or differ at the origin. The bundled
+adapter reserves versions and records published timestamp fingerprints in
+`.ci-tuf-state.json` in the private publishing repository. Back up that
+file with the repository and keep it writable only by the signing account.
+A custom adapter that keeps no such record refreshes on each scheduled run.
+
+To migrate an existing mirror without this signer record, use a trusted
+backup or set `CPS_MIRROR_INITIAL_VERSION` to the highest version previously
+published or reserved, from signing-host records. Run `deploy-current`
+with that setting once to create the protected state, then remove the
+setting. A new mirror starts at version 1.
 Serve `metadata/timestamp.json` with revalidation so clients see the latest
 version promptly.
 Run `bash tests/deploy-mirror.sh` to exercise publishing and syncing a
@@ -2088,7 +2134,7 @@ For a 2-of-3 root, the two remaining keys can authorize a successor that
 revokes the third. A signature from a key authorized by both roots counts
 toward both thresholds.
 
-Copy the signed successor to the release runner and set
+Copy the signed successor to the signing host and set
 `CPS_MIRROR_TUF_ACTIVE_ROOT` to its path. If you also rotated the online
 roles, point `CPS_MIRROR_TUF_KEYS` at the matching release keys. Run
 `deploy-current` for the deployed catalog digest.
@@ -2100,20 +2146,21 @@ the new timestamp. Existing clients pick up the successor on sync. Keep
 
 ### Publishing and verifying signed mirror release notes
 
-To publish notes for the bundled mirror, set the GitHub repository variable
-`CPS_MIRROR_URL` to the public HTTPS mirror URL. Install GitHub CLI and OpenSSH
-on the release runner. Set the protected `cps-release` environment secret
-`CPS_RELEASE_NOTES_SIGNING_KEY_PATH` to the absolute path of a dedicated
-Ed25519 OpenSSH signing key that the runner can use unattended. Keep the
-signing key and both trusted input files outside the HTTPS directory.
+To publish notes for the bundled mirror, install GitHub CLI and OpenSSH on
+the signing host. Configure `CPS_MIRROR_URL`, the mirror paths, and
+`CPS_RELEASE_NOTES_SIGNING_KEY` in its private configuration. Use an
+Ed25519 OpenSSH key kept outside the HTTPS directory with the trusted
+root and publisher public key. Provide the signing host with GitHub
+credentials scoped to publishing releases, `GH_REPO` for the repository,
+and `GITHUB_SHA` for the reviewed release commit.
 
-After deploying a catalog, the workflow checks that the published
-`publisher.json` matches the runner's trusted TUF root and CPS public key.
-It publishes an optional GitHub Release for that catalog with `release-notes.md`
-and `release-notes.md.sig`. The signed notes identify the publisher,
-mirror URL, catalog digest, and SHA-256 fingerprints of the exact root JSON
-and DER key bytes. Retry a failed notes publication with `deploy-current`
-for the same catalog.
+After deployment, run
+`bash ci/publish-release-notes.sh PUBLISHER DEPLOYED_CATALOG_SHA256` on the
+signing host. It checks that `publisher.json` matches the trusted TUF root
+and CPS public key and publishes an optional GitHub Release with
+`release-notes.md` and `release-notes.md.sig`. The signed notes identify the
+publisher, mirror URL, catalog digest, and SHA-256 fingerprints of the root
+JSON and DER key bytes. Rerun the command with the same catalog to retry.
 
 For independent verification of the release notes, obtain the notes signer's
 public key through a trusted channel. With that key in
@@ -2205,7 +2252,7 @@ clients before publishing packages that use it.
 - `conditional "desktop/plugin" version="=2.0.0-0" when="runtime/desktop" when-version=">=2.0.0-0"` requires the plugin when the resulting image includes a matching runtime. Omit `when-version` to match any installed version of the runtime. The predicate alone leaves the runtime optional.
 - New plans use Resolvo to resolve compatible versions and report incompatible requirements. When selected file actions collide, CPS excludes the conflicting version or pair of versions and retries. Directory sharing still requires identical metadata. SAT resolution has a 60-second time limit. Saved plans record their solver version so apply can verify the same selection against the pinned catalog. Plans created before solver versioning retain their original behavior. [Resolvo](https://github.com/prefix-dev/resolvo)
 - Actions support `file`, `dir`, `symlink`, and `hardlink`. A symlink specifies `target` in place of `mode`. Use `hardlink "bin/tool" target="usr/bin/tool"` to share the inode of an immutable regular file in the same package. The target is relative to the image root and supplies ownership, mode, and content. The optional `arch` and `facet` selectors match image policy. A hard link's target must be selected whenever the alias is selected. Facets default to enabled and can be set with `image-create --facet doc.man=false`. [IPS hard-link actions](https://docs.oracle.com/cd/E53394_01/html/E54820/pkgterms.html)
-- Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. When the vendor file changes, find its new copy under `/var/lib/cps/image/config-updates/<revision>/` inside the image.
+- Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. Removing a managed action leaves a modified file in place and records its configuration identity so a reinstall can reclaim it. When the vendor file changes, find its new copy under `/var/lib/cps/image/config-updates/<revision>/` inside the image.
 - The image must be inactive and reside on one filesystem. Existing explicit directory metadata must match either the installed declaration or the selected action; matching installed directories can be updated in place. Unmanaged or locally changed directory metadata must already match the selected action. Transitions between a directory and a file or symlink are rejected. When ownership ends, CPS prunes directories it recorded creating if they are empty and their metadata still matches. It keeps pre-existing directories and directories with local content or extended attributes.
 
 Use `cps plan --root image --output cleanup.json autoremove` to preview
