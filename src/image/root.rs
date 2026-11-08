@@ -20,6 +20,7 @@ use rustix::{
     process::{Gid, Uid},
 };
 
+use super::StateLayout;
 use crate::{
     file_caps::{ATTRIBUTE, FileCapabilities},
     model::{Node, copy_payload, digest_reader, validate_path},
@@ -106,6 +107,36 @@ impl Root {
 
     pub(crate) fn subdir(&self, path: &str) -> Result<Self> {
         Ok(Self(self.dir(path)?))
+    }
+
+    pub(crate) fn open_image_state(&self) -> Result<(StateLayout, Self)> {
+        let legacy = StateLayout::Legacy;
+        let (layout, state) =
+            match self.open_relative(legacy.directory(), OFlags::RDONLY | OFlags::DIRECTORY) {
+                Ok(directory) => (legacy, Self(directory)),
+                Err(Errno::NOENT) => {
+                    let layout = StateLayout::VarLib;
+                    let state = self.subdir(layout.directory()).context(
+                        "opening image state under /var/lib/cps/image on the image filesystem",
+                    )?;
+                    (layout, state)
+                }
+                Err(error) => return Err(error).context("opening legacy image state"),
+            };
+        let metadata = state.as_file().metadata()?;
+        let device = self.0.metadata()?.dev();
+        ensure!(
+            metadata.dev() == device && state.dir("stage")?.metadata()?.dev() == device,
+            "image state and staging must be on the image's own filesystem and subvolume"
+        );
+        for &ancestor in layout.ancestors() {
+            let parent = self.dir(ancestor)?.metadata()?;
+            ensure!(
+                parent.uid() == metadata.uid() && parent.mode() & 0o022 == 0,
+                "unsafe image state ancestor {ancestor}"
+            );
+        }
+        Ok((layout, state))
     }
 
     /// Open a Btrfs subvolume beneath a verified top-level volume.

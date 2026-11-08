@@ -252,6 +252,7 @@ fn system_plan_previews_live_service_effects() -> Result<()> {
             packages: vec!["service/example".into()],
         },
         crate::PlanOptions::default(),
+        &[],
     )?;
     assert_eq!(
         services.preview(),
@@ -1078,6 +1079,51 @@ fn exact_version_requests_respect_dependencies_and_allow_deliberate_downgrades()
 }
 
 #[test]
+fn boot_environment_keeps_its_own_image_state() -> Result<()> {
+    let f = Fixture::new()?;
+    let name = "desktop/compositor";
+    f.package(name, "1.0.0-0", f.file(COMPOSITOR, "previous", "0755", "")?)?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec![name.into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    let database = "var/lib/cps/image/state.sqlite";
+    let base_state = fs::read(f.root.join(database))?;
+
+    f.package(name, "2.0.0-0", f.file(COMPOSITOR, "trial", "0755", "")?)?;
+    let staged = f.root.with_extension("staged");
+    let update = plan(&f.root, Request::Update)?;
+    crate::stage_boot_environment(&f.root, &staged, &update)?;
+    assert_eq!(fs::read(f.root.join(database))?, base_state);
+    assert_ne!(fs::read(staged.join(database))?, base_state);
+    for (root, payload) in [(&f.root, "previous"), (&staged, "trial")] {
+        assert!(!root.join(".cps").exists());
+        assert_eq!(fs::read_to_string(root.join(COMPOSITOR))?, payload);
+        assert!(crate::verify_pristine(root)?.is_empty());
+    }
+
+    f.package(
+        "test/state-collision",
+        "1.0.0-0",
+        f.file(database, "unexpected", "0644", "")?,
+    )?;
+    let error = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/state-collision".into()],
+        },
+    )
+    .expect_err("packages must not own the image state directory");
+    assert!(format!("{error:#}").contains("reserved image state path"));
+    assert_eq!(fs::read(f.root.join(database))?, base_state);
+    Ok(())
+}
+
+#[test]
 fn publisher_changes_invalidate_plans_without_changing_boot_lineage() -> Result<()> {
     use crate::{add_publisher, image::Image, list_publishers, prefer_publisher, remove_publisher};
 
@@ -1335,7 +1381,7 @@ build architecture="x86_64" epoch=1700000000 {{
     assert!(audit.failures.is_empty());
 
     {
-        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
         assert_eq!(
             db.execute("UPDATE build_receipts SET envelope=x'00'", [])?,
             1
@@ -1352,7 +1398,7 @@ build architecture="x86_64" epoch=1700000000 {{
         },
     )?;
     assert_eq!(apply(&f.root, &remove)?, 2);
-    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
     let count: u32 = db.query_row("SELECT count(*) FROM build_receipts", [], |row| row.get(0))?;
     assert_eq!(count, 0);
     Ok(())
@@ -2889,7 +2935,7 @@ fn legacy_journal_requires_a_saved_plan_and_checks_its_writes() -> Result<()> {
         &install,
         COMPOSITOR,
     )?;
-    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
     let journal: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let journal: serde_json::Value = serde_json::from_str(&journal)?;
@@ -3099,7 +3145,10 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
         "administrator edit"
     );
     assert_eq!(
-        fs::read_to_string(f.root.join(format!(".cps/config-updates/3/{CONFIG}")))?,
+        fs::read_to_string(
+            f.root
+                .join(format!("var/lib/cps/image/config-updates/3/{CONFIG}"))
+        )?,
         "vendor config 2"
     );
     assert!(!f.root.join(MANPAGE).exists());
@@ -3196,7 +3245,7 @@ fn reconciles_preserved_config_metadata_atomically() -> Result<()> {
     assert_eq!(fs::read_to_string(&alias)?, LOCAL);
     assert!(
         !f.root
-            .join(".cps/stage")
+            .join("var/lib/cps/image/stage")
             .join(digest(LOCAL.as_bytes()))
             .exists()
     );
@@ -3631,7 +3680,12 @@ fn imports_legacy_config_proposals_without_reopening_dismissed_updates() -> Resu
         )
     };
     package("1.0.0-0", "vendor version one")?;
-    f.create()?;
+    let config = f._dir.path().join("legacy.kdl");
+    fs::write(
+        &config,
+        "schema-version 1\nimage-state \"legacy\"\npublisher \"canopa\" {\n repository \"repo\"\n trust-key \"public.der\"\n}\n",
+    )?;
+    crate::create_configured_image(&f.root, &config)?;
     let initial = plan(
         &f.root,
         Request::Install {
@@ -3650,6 +3704,7 @@ fn imports_legacy_config_proposals_without_reopening_dismissed_updates() -> Resu
             row.get::<_, String>(0)
         })?;
         let mut settings: serde_json::Value = serde_json::from_str(&text)?;
+        assert!(settings.get("state_layout").is_none());
         settings.as_object_mut().unwrap().remove("config_updates");
         db.execute(
             "UPDATE image SET data=?1 WHERE id=1",
@@ -3659,6 +3714,7 @@ fn imports_legacy_config_proposals_without_reopening_dismissed_updates() -> Resu
     let updates = list_config_updates(&f.root)?;
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].revision, 3);
+    assert!(updates[0].vendor_copy.starts_with(".cps/config-updates/"));
     let keep = plan(
         &f.root,
         Request::ResolveConfig {

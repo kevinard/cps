@@ -117,7 +117,8 @@ pub fn destroy_btrfs_boot_environment(
     let _image_lock = root
         .as_ref()
         .map(|root| -> Result<File> {
-            let lock = root.file(".cps/lock")?;
+            let (_, state) = root.open_image_state()?;
+            let lock = state.file("lock")?;
             flock(&lock, FlockOperation::NonBlockingLockExclusive)
                 .context("the Btrfs root is busy with another CPS operation")?;
             check_inactive(root)?;

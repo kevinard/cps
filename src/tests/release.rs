@@ -2716,6 +2716,7 @@ publisher "canopa" archive-build-inputs={archive} {{
         repo: protected_cache.clone(),
         key: read_key(&f.public)?,
         build_trust: None,
+        git: None,
     };
     mirror_release::ArchiveCache::open(&archive_cache, &publisher)?.restore_metadata(&publisher)?;
     check(
@@ -3376,6 +3377,122 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
 }
 
 #[test]
+fn automatic_payload_pruning_keeps_cached_versions_and_registered_roots() -> Result<()> {
+    let f = Fixture::new()?;
+    let work = f._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    let cache = work.join("cache");
+    let sync = |version, index_only| -> Result<()> {
+        let mirror = work.join(format!("mirror-{version}"));
+        sign_release(&f, &mirror, version, fresh, &anchor, &tuf_key)?;
+        mirror_release::sync_with_options(
+            &cache,
+            &anchor,
+            Url::from_directory_path(mirror.join("metadata"))
+                .unwrap()
+                .as_str(),
+            Url::from_directory_path(mirror.join("targets"))
+                .unwrap()
+                .as_str(),
+            "canopa",
+            &f.public,
+            mirror_release::SyncOptions {
+                index_only,
+                image: None,
+            },
+        )?;
+        Ok(())
+    };
+    let package = |version, bytes| {
+        f.package(
+            "desktop/compositor",
+            version,
+            f.file(COMPOSITOR, bytes, "0644", "")?,
+        )
+    };
+    let install = |root, version| -> Result<()> {
+        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        let plan = plan(
+            root,
+            Request::Install {
+                packages: vec![format!("desktop/compositor@{version}")],
+            },
+        )?;
+        apply(root, &plan)?;
+        assert!(
+            fs::read_dir(root.join("var/lib/cps/image/stage"))?
+                .next()
+                .is_none()
+        );
+        Ok(())
+    };
+    let fallback = work.join("fallback");
+    let current = work.join("running");
+    package("1.0.0-0", "fallback")?;
+    sync(1, false)?;
+    install(&fallback, "1.0.0-0")?;
+    package("2.0.0-0", "obsolete")?;
+    package("3.0.0-0", "retained")?;
+    package("10.0.0-0", "latest")?;
+    f.package(
+        "test/other",
+        "1.0.0-0",
+        f.file(LIBRARY, "other", "0644", "")?,
+    )?;
+    sync(2, false)?;
+    install(&current, "10.0.0-0")?;
+    withdraw_package(
+        &f.repo,
+        &f.private,
+        "cps://canopa/desktop/compositor@3.0.0-0",
+    )?;
+    package("20.0.0-0", "unfetched")?;
+    sync(3, true)?;
+    let blob = |bytes: &str| cache.join("blobs").join(digest(bytes.as_bytes()));
+    let orphan = blob("orphan");
+    fs::write(&orphan, b"orphan")?;
+    let prune = |versions| -> Result<()> {
+        let images = [
+            ("running".into(), crate::image::Image::open_query(&current)?),
+            (
+                "fallback".into(),
+                crate::image::Image::open_query(&fallback)?,
+            ),
+        ];
+        let publishers = images[0].1.publishers()?;
+        mirror_release::prune_system_payloads(&publishers.as_slice()[0], &images, versions)?;
+        Ok(())
+    };
+    prune(2)?;
+    assert!(!orphan.exists());
+    assert!(!blob("obsolete").exists());
+    assert!(!blob("unfetched").exists());
+    for content in ["fallback", "retained", "latest", "other"] {
+        assert!(blob(content).is_file(), "missing {content}");
+    }
+    prune(0)?;
+    assert!(!blob("retained").exists());
+    assert!(!blob("other").exists());
+    fs::rename(work.join("mirror-3"), work.join("offline"))?;
+    for (root, expected) in [(&fallback, "fallback"), (&current, "latest")] {
+        fs::write(root.join(COMPOSITOR), "damaged")?;
+        let repair = plan(
+            root,
+            Request::Repair {
+                packages: Vec::new(),
+            },
+        )?;
+        fetch_plan(root, &repair)?;
+        apply(root, &repair)?;
+        assert_eq!(fs::read_to_string(root.join(COMPOSITOR))?, expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()> {
     let f = Fixture::new()?;
     let builder = Fixture::new()?;
@@ -3868,7 +3985,7 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
     retire("fork-three")?;
     let resurrection = fs::read_to_string(&current)?;
     {
-        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
         db.execute(
             "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'), '$.format', 5)
              WHERE id=1",
@@ -3955,7 +4072,7 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
     interrupt_apply_at(&f.root, &saved, &plan, COMPOSITOR)?;
     fs::remove_file(saved)?;
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
-    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
     let status = crate::transaction_status(&f.root)?;
     assert_eq!(status.revision, 1);
     let pending = status.pending.unwrap();
@@ -3997,18 +4114,24 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
         "INSERT INTO catalog_archives VALUES ('canopa', ?1)",
         [&archive],
     )?;
-    let payload = f.root.join(".cps/stage").join(digest(b"second"));
+    let payload = f
+        .root
+        .join("var/lib/cps/image/stage")
+        .join(digest(b"second"));
     fs::write(&payload, b"broken")?;
     let error = crate::resume_transaction(&f.root).unwrap_err();
     assert!(format!("{error:#}").contains("is corrupt"));
     assert!(!f.root.join(SECOND).exists());
-    fs::write(payload, b"second")?;
+    fs::write(&payload, b"second")?;
     assert_eq!(crate::resume_transaction(&f.root)?, Some(2));
+    assert!(!payload.exists());
     assert_eq!(crate::resume_transaction(&f.root)?, None);
     let status = crate::transaction_status(&f.root)?;
     assert_eq!(status.revision, 2);
     assert!(status.pending.is_none());
+    fs::write(&payload, b"second")?;
     assert_eq!(apply(&f.root, &plan)?, 2);
+    assert!(!payload.exists());
     assert_eq!(fs::read_to_string(f.root.join(SECOND))?, "second");
     assert!(verify(&f.root)?.is_empty());
 
@@ -4167,7 +4290,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         let cached = seed.repo.with_extension("offline").join("catalogs");
         let previous = fs::read_to_string(cached.join(seed_branch.trim()))?;
         let applied = fs::read(cached.join(applied_seed.trim()))?;
-        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
         let settings: String =
             db.query_row("SELECT data FROM image WHERE id=1", [], |row| row.get(0))?;
         db.execute(
@@ -4388,7 +4511,7 @@ fn legacy_cache_relocation_requires_the_applied_catalog() -> Result<()> {
     )?;
     apply(&f.root, &install)?;
     let applied = fs::read_to_string(f.repo.join("current"))?;
-    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
     db.execute(
         "UPDATE image SET data=json_set(json_remove(data, '$.catalog_archives'), '$.format', 4) WHERE id=1",
         [],
@@ -5128,7 +5251,7 @@ fn offline_build_audit_requires_the_catalog_admitted_attestation() -> Result<()>
         ),
     )?;
     crate::set_publisher_build_trust(&f.root, "canopa", &policy, false)?;
-    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
     let supplemental: String = db.query_row(
         "SELECT hash FROM build_admission_catalogs WHERE publisher='canopa'",
         [],
@@ -5284,7 +5407,7 @@ publisher "seed" {{
     apply(&f.root, &followup)?;
 
     {
-        let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
         // The same valid DSSE envelope with different bytes has a different
         // digest and must not stand in for the catalog's admitted object.
         let mut alternative = envelope.clone();
@@ -5356,7 +5479,7 @@ publisher "seed" {{
     assert_eq!(audit.verified, 0);
     assert_eq!(audit.failures.len(), 1);
 
-    let db = rusqlite::Connection::open(f.root.join(".cps/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
     assert_eq!(
         db.execute(
             "UPDATE catalog_archives SET catalog=?1 WHERE publisher='canopa'",

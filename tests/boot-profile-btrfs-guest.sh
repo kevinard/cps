@@ -58,7 +58,7 @@ if [ "${1:-}" != observe ]; then
         next_kernel=$(sha256sum "$trial/usr/lib/modules/$next_release/vmlinuz"); next_kernel=${next_kernel%% *}
         test "$base_kernel" != "$next_kernel"
         prepared=false
-        for artifact in "$trial"/.cps/kernel-*/linux; do
+        for artifact in "$trial"/var/lib/cps/image/kernel-*/linux; do
             digest=$(sha256sum "$artifact"); digest=${digest%% *}
             if [ "$digest" = "$next_kernel" ]; then prepared=true; fi
         done

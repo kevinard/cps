@@ -8,7 +8,8 @@ pub(crate) mod root;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions},
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -16,7 +17,7 @@ use anyhow::{Context, Result, ensure};
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 use rustix::{
-    fs::{FlockOperation, flock},
+    fs::{FlockOperation, RenameFlags, flock, renameat_with},
     process::{getegid, geteuid},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use self::root::Root;
 use crate::{
     attestation::BuildTrust,
+    git_install::GitSource,
     kdl_format::{ImageDefinition, PublisherConfig, read_image_definition},
     model::{FORMAT, Node, validate_digest, validate_name, validate_publisher},
     repo::{BuildReceipt, CatalogCheckpoint, Published, canonical_repo, catalog_index, read_key},
@@ -49,6 +51,42 @@ const FREEZE_IMAGE_FORMAT: u32 = 9;
 const LIVE_IMAGE_FORMAT: u32 = 10;
 // Older clients interpret every publisher in a profiled image as signed.
 const LOCAL_PUBLISHER_IMAGE_FORMAT: u32 = 11;
+const GIT_PUBLISHER_IMAGE_FORMAT: u32 = 12;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum StateLayout {
+    #[default]
+    Legacy,
+    VarLib,
+}
+
+impl StateLayout {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+
+    pub(crate) fn directory(self) -> &'static str {
+        match self {
+            Self::Legacy => ".cps",
+            Self::VarLib => "var/lib/cps/image",
+        }
+    }
+
+    pub(crate) fn ancestors(self) -> &'static [&'static str] {
+        match self {
+            Self::Legacy => &[],
+            Self::VarLib => &["var", "var/lib", "var/lib/cps"],
+        }
+    }
+
+    pub(crate) fn config_updates(self) -> &'static str {
+        match self {
+            Self::Legacy => ".cps/config-updates",
+            Self::VarLib => "var/lib/cps/image/config-updates",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +113,8 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "publisher_generation_is_initial")]
     pub publisher_generation: u64,
     pub arch: String,
+    #[serde(default, skip_serializing_if = "StateLayout::is_legacy")]
+    pub(crate) state_layout: StateLayout,
     pub facets: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) mediators: BTreeMap<String, String>,
@@ -131,6 +171,28 @@ impl BootParent {
 }
 
 impl Settings {
+    pub(crate) fn check_state_paths(&self, paths: &BTreeMap<String, Managed>) -> Result<()> {
+        let directory = self.state_layout.directory();
+        let prefix = format!("{directory}/");
+        ensure!(
+            !paths.contains_key(directory)
+                && !paths
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(path, _)| path.starts_with(&prefix)),
+            "reserved image state path {directory}"
+        );
+        for &ancestor in self.state_layout.ancestors() {
+            if let Some(managed) = paths.get(ancestor) {
+                ensure!(
+                    matches!(managed.node, Node::Dir { mode, uid, .. } if uid == self.uid && mode & 0o022 == 0),
+                    "unsafe image state ancestor {ancestor}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn boot_revision(&self) -> u64 {
         self.boot_revision.unwrap_or(self.revision)
     }
@@ -212,6 +274,8 @@ pub struct Publisher {
     pub key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) build_trust: Option<BuildTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) git: Option<GitSource>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -300,7 +364,13 @@ impl Publishers {
     }
 
     pub(crate) fn image_format(&self, settings: &Settings) -> u32 {
-        if matches!(
+        if self
+            .as_slice()
+            .iter()
+            .any(|publisher| publisher.git.is_some())
+        {
+            GIT_PUBLISHER_IMAGE_FORMAT
+        } else if matches!(
             self,
             Self::Profiled {
                 signed_count: Some(_),
@@ -362,6 +432,12 @@ impl Publishers {
         let mut names = BTreeSet::new();
         for publisher in self.as_slice() {
             validate_publisher(&publisher.name)?;
+            if let Some(git) = &publisher.git {
+                ensure!(
+                    publisher.name == git.publisher(),
+                    "invalid Git publisher identity"
+                );
+            }
             if let Some(trust) = &publisher.build_trust {
                 trust.validate()?;
                 trust.check_publisher_key(&publisher.key)?;
@@ -384,6 +460,7 @@ impl Publisher {
             repo: canonical_repo(repo)?,
             key: read_key(key)?,
             build_trust: None,
+            git: None,
         })
     }
 }
@@ -427,7 +504,8 @@ pub struct State {
 pub struct Image {
     db: Connection,
     pub root: Root,
-    _state_dir: File,
+    pub(crate) state_dir: Root,
+    state_layout: StateLayout,
     _lock: File,
 }
 
@@ -470,6 +548,7 @@ pub fn create_image(
         facets,
         None,
         None,
+        StateLayout::VarLib,
     )
 }
 
@@ -548,6 +627,7 @@ pub fn create_configured_image_at(
         config.facets,
         config.bootstrap_catalog,
         config.image_id,
+        config.state_layout.unwrap_or(StateLayout::VarLib),
     )
 }
 
@@ -581,6 +661,7 @@ fn initialize(
     facets: BTreeMap<String, bool>,
     bootstrap_catalog: Option<String>,
     image_id: Option<String>,
+    state_layout: StateLayout,
 ) -> Result<String> {
     validate_publisher(arch).context("invalid architecture")?;
     for facet in facets.keys() {
@@ -593,6 +674,7 @@ fn initialize(
         revision: 0,
         publisher_generation: 0,
         arch: arch.to_owned(),
+        state_layout,
         facets,
         mediators: BTreeMap::new(),
         uid: geteuid().as_raw(),
@@ -612,22 +694,29 @@ fn initialize(
     };
     settings.format = publishers.image_format(&settings);
     fs::create_dir_all(path)?;
-    Root::open(path)?;
+    let root = Root::open(path)?;
     ensure!(
         fs::read_dir(path)?.next().is_none(),
         "image-create requires an empty directory"
     );
-    let state = tempfile::Builder::new()
+    let scratch = tempfile::Builder::new()
         .prefix(".cps-init-")
         .tempdir_in(path)?;
+    for ancestor in state_layout.ancestors() {
+        let directory = scratch.path().join(ancestor);
+        fs::create_dir(&directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
+    }
+    let state = scratch.path().join(state_layout.directory());
+    DirBuilder::new().mode(0o700).create(&state)?;
     OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(state.path().join("lock"))?
+        .open(state.join("lock"))?
         .sync_all()?;
-    fs::create_dir(state.path().join("stage"))?;
-    File::open(state.path().join("stage"))?.sync_all()?;
-    let mut db = Connection::open(state.path().join("state.sqlite"))?;
+    fs::create_dir(state.join("stage"))?;
+    File::open(state.join("stage"))?.sync_all()?;
+    let mut db = Connection::open(state.join("state.sqlite"))?;
     configure(&db)?;
     let tx = db.transaction()?;
     tx.execute_batch(
@@ -648,9 +737,25 @@ fn initialize(
     )?;
     tx.commit()?;
     drop(db);
-    File::open(state.path())?.sync_all()?;
-    fs::rename(state.path(), path.join(".cps"))?;
-    File::open(path)?.sync_all()?;
+    File::open(state)?.sync_all()?;
+    for ancestor in state_layout.ancestors().iter().rev() {
+        File::open(scratch.path().join(ancestor))?.sync_all()?;
+    }
+    let entry = state_layout
+        .ancestors()
+        .first()
+        .copied()
+        .unwrap_or(state_layout.directory());
+    let source = Root::open(scratch.path())?;
+    renameat_with(
+        source.as_file(),
+        entry,
+        root.as_file(),
+        entry,
+        RenameFlags::NOREPLACE,
+    )
+    .context("publishing image state")?;
+    root.as_file().sync_all()?;
     Ok(id)
 }
 
@@ -724,8 +829,8 @@ impl Image {
         flags: rusqlite::OpenFlags,
         package_write: bool,
     ) -> Result<Self> {
-        let state_dir = root.dir(".cps").context("opening image state")?;
-        let lock = root.file(".cps/lock")?;
+        let (state_layout, state_dir) = root.open_image_state()?;
+        let lock = state_dir.file("lock")?;
         flock(
             &lock,
             if exclusive {
@@ -737,16 +842,19 @@ impl Image {
         if package_write {
             crate::boot::check_package_write_root(&root)?;
         }
-        root.file(".cps/state.sqlite")?;
-        let db =
-            Connection::open_with_flags(Root::fd_path(&state_dir).join("state.sqlite"), flags)?;
+        state_dir.file("state.sqlite")?;
+        let db = Connection::open_with_flags(
+            Root::fd_path(state_dir.as_file()).join("state.sqlite"),
+            flags,
+        )?;
         if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE) {
             configure(&db)?;
         }
         Ok(Self {
             root,
             db,
-            _state_dir: state_dir,
+            state_dir,
+            state_layout,
             _lock: lock,
         })
     }
@@ -787,6 +895,10 @@ impl Image {
     pub(crate) fn settings(&self) -> Result<Settings> {
         let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
         ensure!(
+            settings.state_layout == self.state_layout,
+            "image state directory differs from its database layout"
+        );
+        ensure!(
             matches!(
                 settings.format,
                 FORMAT
@@ -800,6 +912,7 @@ impl Image {
                     | FREEZE_IMAGE_FORMAT
                     | LIVE_IMAGE_FORMAT
                     | LOCAL_PUBLISHER_IMAGE_FORMAT
+                    | GIT_PUBLISHER_IMAGE_FORMAT
             ),
             "unsupported image format"
         );
@@ -933,8 +1046,8 @@ impl Image {
         Ok(settings)
     }
 
-    pub fn stage(&self) -> Result<File> {
-        self.root.dir(".cps/stage")
+    pub fn stage(&self) -> Result<Root> {
+        self.state_dir.subdir("stage")
     }
 
     pub(crate) fn archived_build(&self, manifest: &str) -> Result<Option<(BuildReceipt, Vec<u8>)>> {

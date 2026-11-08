@@ -1,0 +1,4 @@
+schema-version 1
+package "system/canopa-trust" publisher="canopa" version="1.0.0-@ROOT_VERSION@" {
+    file "etc/cps/tuf-root.json" mode="0644" uid=0 gid=0
+}

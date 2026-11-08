@@ -1,6 +1,6 @@
 pub(crate) mod cgroup;
 mod sandbox;
-mod snapshot;
+pub(crate) mod snapshot;
 pub(crate) mod sources;
 pub use snapshot::{GitSnapshotRef, prepare_git_snapshot, prepare_git_snapshot_ref};
 
@@ -36,7 +36,8 @@ use crate::{
     plan::{CandidateSet, Candidates, resolve_packages, select_paths},
     repo::{
         MANIFEST_LIMIT, read_key, read_limited, read_signing_key,
-        release::fetch_repository_payloads, snapshot, stage_blob,
+        release::{compressed_payload_name, copy_compressed_payload, fetch_repository_payloads},
+        snapshot, stage_blob,
     },
 };
 
@@ -658,7 +659,16 @@ pub fn fetch_toolchain(recipe_path: &Path, config: &Path) -> Result<usize> {
     for source in &selection.repositories {
         if let Some(blobs) = required.remove(source.pin.name.as_str()) {
             count += blobs.len();
-            fetch_repository_payloads(&source.repository, &source.pin.name, &source.key, blobs)
+            let root = Root::open(&source.repository)?;
+            let mut remaining = BTreeMap::new();
+            for (hash, length) in blobs {
+                if let Some(compressed) = packaged_payload(&root, hash)? {
+                    copy_compressed_payload(compressed, &mut tempfile::tempfile()?, hash, length)?;
+                } else {
+                    remaining.insert(hash, length);
+                }
+            }
+            fetch_repository_payloads(&source.repository, &source.pin.name, &source.key, remaining)
                 .with_context(|| format!("fetching pinned toolchain for {}", source.pin.name))?;
         }
     }
@@ -667,6 +677,14 @@ pub fn fetch_toolchain(recipe_path: &Path, config: &Path) -> Result<usize> {
         "toolchain payload has no configured publisher"
     );
     Ok(count)
+}
+
+fn packaged_payload(repo: &Root, hash: &str) -> Result<Option<File>> {
+    match repo.file(&compressed_payload_name(hash)) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.downcast_ref() == Some(&rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn prepare_toolchain(
@@ -694,18 +712,23 @@ fn prepare_toolchain(
             }
             Node::Symlink { target, .. } => symlink(target, &file)?,
             Node::Hardlink { .. } => {}
-            Node::File { mode, .. } => {
+            Node::File {
+                mode, sha256, size, ..
+            } => {
                 let publisher = selection.file_publisher(managed)?;
                 let mut destination = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create_new(true)
                     .open(&file)?;
-                stage_blob(
-                    paths_by_publisher[publisher],
-                    &managed.node,
-                    &mut destination,
-                )
+                let repository = paths_by_publisher[publisher];
+                (|| {
+                    if let Some(compressed) = packaged_payload(&Root::open(repository)?, sha256)? {
+                        copy_compressed_payload(compressed, &mut destination, sha256, *size)
+                    } else {
+                        stage_blob(repository, &managed.node, &mut destination)
+                    }
+                })()
                 .with_context(|| format!("materializing toolchain file {name}"))?;
                 let mode = if mode & 0o111 == 0 { 0o444 } else { 0o555 };
                 destination.set_permissions(fs::Permissions::from_mode(mode))?;

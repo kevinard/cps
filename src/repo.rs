@@ -1127,16 +1127,25 @@ impl Snapshot {
     }
 }
 
+const PUBLIC_KEY_DER_LEN: u64 = 44;
+
+fn read_key_der(path: &Path) -> Result<Vec<u8>> {
+    (|| read_limited(File::open(path)?, PUBLIC_KEY_DER_LEN))()
+        .with_context(|| format!("reading trust key {}", path.display()))
+}
+
 pub fn read_key(path: &Path) -> Result<Vec<u8>> {
-    let bytes = (|| read_limited(File::open(path)?, 44))()
-        .with_context(|| format!("reading trust key {}", path.display()))?;
+    parse_public_key(&read_key_der(path)?).map(<[u8]>::to_vec)
+}
+
+fn parse_public_key(bytes: &[u8]) -> Result<&[u8]> {
     // SubjectPublicKeyInfo for Ed25519, as emitted by openssl pkey -pubout -outform DER.
     const PREFIX: &[u8] = b"\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00";
     let key = bytes
         .strip_prefix(PREFIX)
         .context("expected an Ed25519 DER public key")?;
     ensure!(key.len() == 32, "invalid Ed25519 public key length");
-    Ok(key.to_vec())
+    Ok(key)
 }
 
 pub(crate) fn read_signing_key(path: &Path) -> Result<Ed25519KeyPair> {

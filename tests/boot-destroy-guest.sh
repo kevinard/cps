@@ -82,7 +82,9 @@ reject 'Btrfs subvolume identity differs' "$base"
 $bb cat /run/original-entry > "$entry"
 
 $bb mkfifo /run/release-destroy
-flock --shared /volume/@/.cps/lock sh -c ': > /run/destroy-locked; read released < /run/release-destroy' &
+state_dir=var/lib/cps/image
+if [ -d /volume/@/.cps ]; then state_dir=.cps; fi
+flock --shared "/volume/@/$state_dir/lock" sh -c ': > /run/destroy-locked; read released < /run/release-destroy' &
 holding=$!
 while [ ! -e /run/destroy-locked ]; do $bb sleep 0.01; done
 reject 'busy with another CPS operation' "$base"

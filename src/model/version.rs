@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, fmt, str::FromStr, sync::Arc};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -25,6 +25,21 @@ impl FromStr for Version {
 }
 
 impl Version {
+    pub(crate) fn next_source_revision(&self) -> Result<Self> {
+        let (_, release, revision) = self.parts();
+        let (prefix, tail) = revision.rsplit_once('.').unwrap_or(("", revision));
+        let next = tail
+            .parse::<u64>()?
+            .checked_add(1)
+            .context("Git package revision exhausted")?;
+        let epoch = self
+            .0
+            .split_once(':')
+            .map_or(String::new(), |(epoch, _)| format!("{epoch}:"));
+        let dot = if prefix.is_empty() { "" } else { "." };
+        format!("{epoch}{release}-{prefix}{dot}{next}").parse()
+    }
+
     fn parts(&self) -> (&str, &str, &str) {
         let (epoch, release) = self.0.split_once(':').unwrap_or(("0", &self.0));
         let (upstream, revision) = release

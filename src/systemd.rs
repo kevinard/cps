@@ -157,7 +157,8 @@ pub(crate) fn run(
     let mut sysusers = Vec::new();
     let mut presets = Vec::new();
     let mut rebuild_hwdb = false;
-    let mut rules = tempfile::tempfile_in(path.join(".cps/stage"))?;
+    let state_path = state.settings.state_layout.directory();
+    let mut rules = tempfile::tempfile_in(path.join(state_path).join("stage"))?;
     for action in actions {
         action.validate()?;
         let vendor_path = action.path();
@@ -218,7 +219,9 @@ pub(crate) fn run(
             tool.arg("-E");
         }
         run_tool(
-            tool.args(["--create", "--exclude-prefix=/.cps", "--", "-"])
+            tool.arg("--create")
+                .arg(format!("--exclude-prefix=/{state_path}"))
+                .args(["--", "-"])
                 .stdin(Stdio::from(rules)),
             "tmpfiles",
             live,

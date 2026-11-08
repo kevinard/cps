@@ -17,6 +17,11 @@ destroy=${CPS_VM_BTRFS_DESTROY:-0}
 destroy_failed=${CPS_VM_BTRFS_DESTROY_FAILED:-0}
 staged_transactions=${CPS_VM_STAGED_TRANSACTIONS:-0}
 system_commands=${CPS_VM_SYSTEM_COMMANDS:-0}
+git_installs=${CPS_VM_GIT_INSTALLS:-0}
+if [[ $git_installs == 1 && $system_commands != 1 ]]; then
+    echo 'CPS_VM_GIT_INSTALLS requires CPS_VM_SYSTEM_COMMANDS=1' >&2
+    exit 2
+fi
 if [[ $health_fail != 0 && $health_fail != 1 && $health_fail != readiness ]]; then
     echo 'CPS_VM_BTRFS_HEALTH_FAIL must be 0, 1, or readiness' >&2
     exit 2
@@ -76,11 +81,20 @@ publish() {
     fi
     "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
 }
+base_packages=(test/live-root)
+if [[ $git_installs == 1 ]]; then
+    CPS_GIT_BUILD_BUSYBOX="$busybox" bash "$project/tests/seed-git-build.sh" "$cps" \
+        "$work/git-build" "$work/private.der" "$work/public.der"
+    "$cps" manifest generate --proto git-build --publisher test --version 1.0.0-0 \
+        --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
+    "$cps" publish --repo repo --proto git-build --signing-key private.der git-build.kdl
+    base_packages+=(system/git-build)
+fi
 publish 1.0.0-0
 mkdir files
 root="$work/files/@"
 "$cps" image-create --root "$root" --repo "$work/repo" --publisher test --trust-key public.der
-"$cps" plan --root "$root" --output install.json install test/live-root
+"$cps" plan --root "$root" --output install.json install "${base_packages[@]}"
 "$cps" apply --root "$root" install.json
 if [[ -n $kernel_fixture ]]; then
     cat > kernel-builders.kdl <<POLICY
@@ -133,7 +147,7 @@ strip --strip-debug -o "$root/usr/bin/cps" "$cps"
 copy_runtime_deps "$root" "$cps"
 cp "$btrfs" "$root/usr/bin/btrfs"
 copy_runtime_deps "$root" "$btrfs"
-for tool in cp mke2fs e2fsck mount umount find sha256sum sfdisk flock; do
+for tool in cp cmp mke2fs e2fsck mount umount find sha256sum sfdisk flock; do
     binary=$(command -v "$tool")
     cp "$binary" "$root/usr/bin/$tool"
     copy_runtime_deps "$root" "$binary"
@@ -143,7 +157,7 @@ if [[ -n $kernel_fixture ]]; then
     mkdir -p "$root"/usr/lib/kernel/install.d "$root/vm-modules/$trial_release"
     : > "$root/vm-modules/$trial_release/load"
     cp /usr/lib/kernel/install.d/90-loaderentry.install "$root/usr/lib/kernel/install.d/"
-    for tool in kernel-install install chown mkdir grep tr stat rm cmp; do
+    for tool in kernel-install install chown mkdir grep tr stat rm; do
         binary=$(command -v "$tool")
         cp "$binary" "$root/usr/bin/$tool"
         copy_runtime_deps "$root" "$binary"
@@ -167,6 +181,15 @@ publisher "test" {
 }
 boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid" options="rw console=ttyS0 loglevel=3 init=/init-systemd"
 CONFIG
+        if [[ $git_installs == 1 ]]; then
+            for tool in git bwrap; do
+                binary=$(command -v "$tool")
+                cp "$binary" "$root/usr/bin/$tool"
+                copy_runtime_deps "$root" "$binary"
+            done
+            ln -s git "$root/usr/bin/git-upload-pack"
+            install -m755 "$project/tests/git-install-guest.sh" "$root/usr/local/libexec/cps-system-workflow"
+        fi
     fi
     if [[ $destroy == 1 ]]; then
         touch "$root/etc/cps-btrfs-destroy"
@@ -274,6 +297,18 @@ if [ "$version" = "$trial_version" ] && [ -f /etc/cps-btrfs-fail-health ]; then
     exec $bb reboot -f
 fi
 cps verify --root /
+if [ -f /volume/@captures/rollback-base.sha256 ] && [ ! -f /etc/cps-btrfs-destroy ]; then
+    state_dir=var/lib/cps/image
+    if [ -d /.cps ]; then state_dir=.cps; fi
+    phase=base
+    if [ "$version" = "$trial_version" ]; then phase=trial; fi
+    database=$(sha256sum "/$state_dir/state.sqlite")
+    database=${database%% *}
+    test "$database" = "$($bb cat "/volume/@captures/rollback-$phase.sha256")"
+    installed=$(cps list --root / | $bb awk '$1 ~ /^cps:\/\/test\/test\/live-root@/ { print $1 }')
+    test "$installed" = "cps://test/test/live-root@$version"
+    echo "CPS_VM_BTRFS_STATE: $phase version=$version database=$database path=/$state_dir/state.sqlite"
+fi
 if [ -f /etc/cps-btrfs-destroy ] && [ ! -f /run/cps-vm-counted ]; then
     exec /usr/local/libexec/cps-vm-destroy
 fi
@@ -360,7 +395,9 @@ else
 fi
 cps plan --root / --output /captures/upgrade.json update
 printf 'captured local state\n' > /etc/cps-capture-local
-before=$(sha256sum /.cps/state.sqlite)
+state_dir=var/lib/cps/image
+if [ -d /.cps ]; then state_dir=.cps; fi
+before=$(sha256sum "/$state_dir/state.sqlite")
 reject() {
     expected=$1
     shift
@@ -372,6 +409,12 @@ reject() {
 }
 reject 'requires the root of a Btrfs subvolume' --source /etc --output /captures/wrong-source
 reject 'separate Btrfs subvolume' --source / --output /bad-capture
+if [ "$state_dir" = var/lib/cps/image ]; then
+    mount --bind /tmp "/$state_dir"
+    reject 'opening image state under /var/lib/cps/image on the image filesystem' \
+        --source / --output /captures/shared-state
+    umount "/$state_dir"
+fi
 btrfs subvolume create /nested
 reject 'capture omits nested Btrfs subvolume' --source / --output /captures/incomplete
 test ! -e /captures/incomplete
@@ -397,6 +440,7 @@ $bb rmdir /captures/race
 result=$(cps boot-env capture --source / --output /captures/base)
 echo "$result"
 btrfs property get /captures/base/root ro | $bb grep -Fx 'ro=true'
+cmp "/$state_dir/state.sqlite" "/captures/base/root/$state_dir/state.sqlite"
 if $bb touch /captures/base/root/changed 2>/tmp/rejected; then exit 1; fi
 reject 'destination already exists' --source / --output /captures/base
 printf 'running local state\n' > /etc/cps-capture-local
@@ -443,7 +487,7 @@ if [ -f /etc/cps-btrfs-staged-transactions ]; then
 fi
 test "$($bb cat /captures/base/root/etc/cps-capture-version)" = 1.0.0-0
 test "$($bb cat /etc/cps-capture-version)" = 1.0.0-0
-test "$(sha256sum /.cps/state.sqlite)" = "$before"
+test "$(sha256sum "/$state_dir/state.sqlite")" = "$before"
 if [ -f /etc/cps-btrfs-boot ]; then
     test "$(sha256sum /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI)" = "$boot_files"
     test "$(find /boot /efi -print)" = "$boot_paths"
@@ -455,7 +499,7 @@ if [ -f /etc/cps-btrfs-trial-kernel ]; then
     test "$audit" = 'Verified build evidence for 1 installed package(s) from canopa-kernel'
     release=$($bb cat /etc/cps-btrfs-trial-kernel)
     found=false
-    for prepared in "$stage"/.cps/kernel-*/linux; do
+    for prepared in "$stage/$state_dir"/kernel-*/linux; do
         if cmp -s "$prepared" "$stage/usr/lib/modules/$release/vmlinuz"; then found=true; fi
     done
     test "$found" = true
@@ -499,9 +543,9 @@ if [ -f /etc/cps-btrfs-boot ]; then
     $bb grep -F 'top-level subvolume' /tmp/rejected
     test "$(sha256sum /efi/loader/loader.conf)" = "$before"
     cps plan --root /volume/@captures/trial/root --output /tmp/mark.json mark explicit test/live-root
-    staged_state=$(sha256sum /volume/@captures/trial/root/.cps/state.sqlite)
+    staged_state=$(sha256sum "/volume/@captures/trial/root/$state_dir/state.sqlite")
     $bb mkfifo /tmp/release
-    flock --shared /volume/@captures/trial/root/.cps/lock sh -c ': > /tmp/locked; read released < /tmp/release' &
+    flock --shared "/volume/@captures/trial/root/$state_dir/lock" sh -c ': > /tmp/locked; read released < /tmp/release' &
     holding=$!
     while [ ! -e /tmp/locked ]; do $bb sleep 0.01; done
     cps apply --root /volume/@captures/trial/root /tmp/mark.json > /tmp/race-rejected 2>&1 &
@@ -520,7 +564,11 @@ if [ -f /etc/cps-btrfs-boot ]; then
     $bb grep -F 'registered Btrfs root' /tmp/race-rejected
     if cps apply --root /volume/@captures/trial/root /tmp/mark.json > /tmp/rejected 2>&1; then exit 1; fi
     $bb grep -F 'registered Btrfs root' /tmp/rejected
-    test "$(sha256sum /volume/@captures/trial/root/.cps/state.sqlite)" = "$staged_state"
+    test "$(sha256sum "/volume/@captures/trial/root/$state_dir/state.sqlite")" = "$staged_state"
+    base_state=$(sha256sum "/$state_dir/state.sqlite")
+    test "${base_state%% *}" != "${staged_state%% *}"
+    printf '%s\n' "${base_state%% *}" > /captures/rollback-base.sha256
+    printf '%s\n' "${staged_state%% *}" > /captures/rollback-trial.sha256
     cps boot-env list --esp /efi
     echo 'CPS_VM_BTRFS_BOOT: retried trial activation after freeing ESP space'
     umount /efi
@@ -633,6 +681,9 @@ if [[ $native_boot == 1 ]]; then
         if [[ $destroy_failed == 1 ]]; then
             grep -Fx 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed' uefi.log.clean
         fi
+    elif [[ $git_installs == 1 ]]; then
+        grep -Fx 'CPS_VM_GIT: tracked package advanced and pinned package stayed at its commit' uefi.log.clean
+        grep -Fx 'CPS_VM_GIT: rollback restored the tracked commit and payload' uefi.log.clean
     elif [[ $system_commands == 1 ]]; then
         grep -Fx 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: installed and upgraded in place, then staged the base upgrade' uefi.log.clean
@@ -644,6 +695,8 @@ if [[ $native_boot == 1 ]]; then
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial blessed' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_BOOT: trial default after reboot' uefi.log.clean
         grep -Fx 'CPS_VM_BTRFS_BOOT: previous root after rollback' uefi.log.clean
+        grep -F "CPS_VM_BTRFS_STATE: trial version=$(cat "$root/etc/cps-btrfs-trial-version") database=" uefi.log.clean
+        grep -F 'CPS_VM_BTRFS_STATE: base version=1.0.0-0 database=' uefi.log.clean
     fi
     if [[ $staged_transactions == 1 ]]; then
         grep -Fx 'CPS_VM_STAGED_TRANSACTIONS: unfroze and upgraded the private Btrfs root' capture.log.clean

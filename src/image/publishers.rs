@@ -14,6 +14,7 @@ use super::{Image, Publisher, Publishers, Settings, State, builds, catalogs};
 use crate::{
     attestation::BuildTrust,
     boot::{is_registered_btrfs, with_running_environment},
+    git_install::GitSource,
     kdl_format::{read_build_trust, read_image_definition},
     model::validate_publisher,
     repo::{
@@ -22,6 +23,37 @@ use crate::{
         release::sync_url_publisher, release_profile,
     },
 };
+
+pub(crate) fn register_git_publisher(
+    image: &mut Image,
+    source: GitSource,
+    repo: &Path,
+    key: &Path,
+    registered: bool,
+) -> Result<()> {
+    image.require_clean()?;
+    let configured = image.publishers()?;
+    let name = source.publisher();
+    let mut publisher = Publisher::from_config(&name, repo, key)?;
+    publisher.git = Some(source);
+    if let Some(existing) = configured.get(&name) {
+        ensure!(
+            existing == &publisher,
+            "Git publisher {name} is configured differently"
+        );
+        return Ok(());
+    }
+    check_new_publisher(image, &configured, &name)?;
+    catalog_index(&publisher.repo, &name, &publisher.key, None)?;
+    let mut publishers = configured.as_slice().to_vec();
+    publishers.push(publisher);
+    save(
+        image,
+        configured.with_publishers(publishers)?,
+        &[],
+        registered,
+    )
+}
 
 pub struct PublisherInfo {
     pub name: String,

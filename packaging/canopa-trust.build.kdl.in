@@ -1,0 +1,9 @@
+schema-version 1
+build architecture="@ARCH@" epoch=0 {
+@TOOLCHAIN@
+    manifest "canopa-trust.kdl" sha256="@MANIFEST_SHA256@"
+    source "tuf-root.json" size=@ROOT_SIZE@ sha256="@ROOT_SHA256@"
+    script """
+    install -Dm644 "$CPS_SOURCES/tuf-root.json" "$DESTDIR/etc/cps/tuf-root.json"
+    """
+}

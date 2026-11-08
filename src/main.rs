@@ -55,7 +55,16 @@ enum Command {
         /// Stage the transaction in a new Btrfs trial boot environment
         #[arg(long)]
         stage: bool,
-        #[arg(required = true, value_name = "PACKAGE")]
+        /// Build and install the package described by cps.kdl in this Git repository
+        #[arg(long, requires = "git_ref", conflicts_with = "packages")]
+        git: Option<String>,
+        /// Pin the install to a full Git commit ID
+        #[arg(long, requires = "git", group = "git_ref")]
+        commit: Option<String>,
+        /// Follow this branch when running cps upgrade
+        #[arg(long, requires = "git", group = "git_ref")]
+        track_branch: Option<String>,
+        #[arg(required_unless_present = "git", value_name = "PACKAGE")]
         packages: Vec<String>,
     },
     /// Upgrade the system and stage changes that require a reboot
@@ -226,6 +235,9 @@ enum Command {
         export: Option<PathBuf>,
     },
     /// Initialize an empty directory as an image
+    #[command(
+        long_about = "Initialize an empty directory as an image. With --config, use image-state \"legacy\" to provision an image for older CPS clients."
+    )]
     ImageCreate {
         #[arg(long)]
         root: PathBuf,
@@ -633,22 +645,25 @@ enum PublisherCommand {
         #[arg(long, default_value = "/")]
         root: PathBuf,
         /// Existing local repository
-        #[arg(long, required_unless_present = "url", conflicts_with = "url")]
+        #[arg(long, conflicts_with = "url", requires = "trust_key")]
         repo: Option<PathBuf>,
         /// Base URL of a TUF mirror containing metadata/ and targets/
-        #[arg(long, requires = "tuf_root")]
+        #[arg(long, requires_all = ["tuf_root", "trust_key"])]
         url: Option<String>,
-        /// Trusted TUF root metadata obtained from the publisher
-        #[arg(long, requires = "url")]
+        /// Trusted TUF root metadata for a mirror
+        #[arg(long, conflicts_with = "repo")]
         tuf_root: Option<PathBuf>,
         /// Cache directory for a URL mirror
-        #[arg(long, requires = "url")]
+        #[arg(long, conflicts_with = "repo")]
         cache: Option<PathBuf>,
+        /// Trusted CPS publisher public key for --repo or --url
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_key: Option<PathBuf>,
         /// Require builder signatures from this KDL policy
         #[arg(long)]
         build_trust: Option<PathBuf>,
+        /// Publisher name with --repo or --url, or an HTTPS mirror URL
+        #[arg(value_name = "NAME_OR_URL")]
         name: String,
     },
     /// Replace one or more local repository paths as a single change
@@ -1490,10 +1505,11 @@ fn print_package_changes(changes: &[PackageChange]) {
 
 fn change_system(
     options: SystemOptions,
-    request: Request,
+    mut request: Request,
     stage: bool,
     force_phased_update: bool,
     prepare_only: bool,
+    git: Option<(&str, GitSnapshotRef<'_>)>,
 ) -> Result<()> {
     let recovery = matches!(
         request,
@@ -1504,7 +1520,56 @@ fn change_system(
         .with_force_phased_update(force_phased_update);
     let _lock = system.lock()?;
     let refresh = !options.no_refresh;
-    let result = if !options.yes && !options.dry_run && io::stdin().is_terminal() {
+    let mut git_preview = false;
+    let mut approve_git = |change: &system::GitChange| -> Result<bool> {
+        let branch = change
+            .branch
+            .as_ref()
+            .map_or(String::new(), |branch| format!(" (tracking {branch})"));
+        let revision = change.previous.as_ref().map_or_else(
+            || change.commit.clone(),
+            |previous| format!("{previous} → {}", change.commit),
+        );
+        println!(
+            "Git {}{branch}\n  {}\n  {revision}",
+            change.package, change.url
+        );
+        if options.dry_run {
+            git_preview = true;
+            return Ok(false);
+        }
+        if options.yes {
+            return Ok(true);
+        }
+        ensure!(
+            io::stdin().is_terminal(),
+            "use --yes to confirm in a non-interactive session"
+        );
+        eprint!("Build this Git commit? [y/N] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    };
+    if let Some((url, reference)) = git {
+        let Some(package) = system.prepare_git_install(url, reference, &mut approve_git)? else {
+            return Ok(());
+        };
+        request = Request::Install {
+            packages: vec![package],
+        };
+    }
+    let git_updates = if refresh && matches!(request, Request::Update) {
+        system.prepare_git_updates(approve_git)?
+    } else {
+        Vec::new()
+    };
+    let result = if !git_updates.is_empty() {
+        system.plan_git_upgrade(&git_updates, refresh)
+    } else if !options.yes && !options.dry_run && io::stdin().is_terminal() {
         system.plan_with_source_selection(request, refresh, choose_install_source)
     } else {
         system.plan(request, refresh)
@@ -1526,7 +1591,9 @@ fn change_system(
         save(path, change.saved_plan())?;
     }
     if change.is_empty() {
-        println!("Nothing to do.");
+        if !git_preview {
+            println!("Nothing to do.");
+        }
         return Ok(());
     }
     if recovery {
@@ -1633,13 +1700,38 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Install {
             options,
             stage,
+            git,
+            commit,
+            track_branch,
             packages,
-        } => change_system(options, Request::Install { packages }, stage, false, false)?,
+        } => {
+            let source = match (git.as_deref(), commit.as_deref(), track_branch.as_deref()) {
+                (Some(url), Some(commit), None) => Some((url, GitSnapshotRef::Commit(commit))),
+                (Some(url), None, Some(branch)) => Some((url, GitSnapshotRef::Branch(branch))),
+                (None, None, None) => None,
+                _ => unreachable!("clap validates Git install arguments"),
+            };
+            change_system(
+                options,
+                Request::Install { packages },
+                stage,
+                false,
+                false,
+                source,
+            )?;
+        }
         Command::Upgrade {
             options,
             stage,
             force_phased_update,
-        } => change_system(options, Request::Update, stage, force_phased_update, false)?,
+        } => change_system(
+            options,
+            Request::Update,
+            stage,
+            force_phased_update,
+            false,
+            None,
+        )?,
         Command::CheckUpdates {
             config,
             json,
@@ -1652,9 +1744,16 @@ fn run(command: Command) -> Result<ExitCode> {
             options,
             stage,
             packages,
-        } => change_system(options, Request::Remove { packages }, stage, false, false)?,
+        } => change_system(
+            options,
+            Request::Remove { packages },
+            stage,
+            false,
+            false,
+            None,
+        )?,
         Command::Autoremove { options, stage } => {
-            change_system(options, Request::Autoremove, stage, false, false)?
+            change_system(options, Request::Autoremove, stage, false, false, None)?
         }
         Command::Repair {
             options,
@@ -1667,7 +1766,7 @@ fn run(command: Command) -> Result<ExitCode> {
             } else {
                 Request::RepairPaths { paths }
             };
-            change_system(options, request, false, false, prepare_only)?;
+            change_system(options, request, false, false, prepare_only, None)?;
         }
         Command::Revert {
             options,
@@ -1680,6 +1779,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 false,
                 false,
                 prepare_only,
+                None,
             )?;
         }
         Command::Status {
@@ -2308,6 +2408,49 @@ fn run(command: Command) -> Result<ExitCode> {
                 build_trust,
                 name,
             } => {
+                let credentials;
+                let (name, url, tuf_root, trust_key) = if repo.is_none() && url.is_none() {
+                    ensure!(trust_key.is_none(), "use --repo or --url with --trust-key");
+                    ensure!(
+                        name.contains("://"),
+                        "provide an HTTPS mirror URL, or a publisher name with --repo or --url"
+                    );
+                    ensure!(
+                        io::stdin().is_terminal(),
+                        "publisher confirmation requires a terminal; use --url with explicit trust files for non-interactive setup"
+                    );
+                    let trusted_root = tuf_root
+                        .as_deref()
+                        .unwrap_or(Path::new("/etc/cps/tuf-root.json"));
+                    let bootstrap = release::PublisherBootstrap::fetch(&name, trusted_root)?;
+                    let (root_hash, key_hash) = bootstrap.fingerprints();
+                    eprintln!("Publisher key verified by TUF.");
+                    eprintln!("Publisher: {}\nMirror: {}", bootstrap.name, bootstrap.url);
+                    eprintln!("TUF root SHA-256: {root_hash}\nPublisher key SHA-256: {key_hash}");
+                    eprint!("Trust this publisher? [y/N] ");
+                    io::stderr().flush()?;
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                        println!("Canceled.");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+
+                    credentials = tempfile::tempdir()?;
+                    let root_path = credentials.path().join("root.json");
+                    let key_path = credentials.path().join("publisher.der");
+                    fs::write(&root_path, &bootstrap.tuf_root)?;
+                    fs::write(&key_path, &bootstrap.trust_key)?;
+                    (
+                        bootstrap.name,
+                        Some(bootstrap.url.into()),
+                        Some(root_path),
+                        Some(key_path),
+                    )
+                } else {
+                    (name, url, tuf_root, trust_key)
+                };
+                let trust_key = trust_key.context("missing trust key")?;
                 if let Some(url) = url {
                     let (cache, _lock) = if let Some(cache) = cache {
                         (cache, None)

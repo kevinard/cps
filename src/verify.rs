@@ -127,7 +127,9 @@ pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>>
     for (name, package) in &state.installed {
         package.verify(name, &state.publishers)?;
     }
-    effective_paths(&state.settings, &state.installed)
+    let paths = effective_paths(&state.settings, &state.installed)?;
+    state.settings.check_state_paths(&paths)?;
+    Ok(paths)
 }
 
 pub(crate) fn verify_state(
@@ -250,15 +252,19 @@ fn check_state(
     }
     if pristine {
         let aliases = hardlink_groups(&expected);
-        root.walk(Some(".cps"), |path, entry, info| {
+        let layout = state.settings.state_layout;
+        root.walk(Some(layout.directory()), |path, entry, info| {
+            let kind = FileType::from_raw_mode(info.st_mode);
             let Some(managed) = expected.get(path) else {
+                if kind == FileType::Directory && layout.ancestors().contains(&path) {
+                    return Ok(true);
+                }
                 findings.push(Finding {
                     is_error: true,
                     message: format!("unmanaged path {path:?}"),
                 });
                 return Ok(false);
             };
-            let kind = FileType::from_raw_mode(info.st_mode);
             let file = match &managed.node {
                 Node::Hardlink { target } => expected.get(target).unwrap_or(managed),
                 _ => managed,

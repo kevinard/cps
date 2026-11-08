@@ -19,7 +19,7 @@ use crate::{
 
 use super::{parent, read_recipe_manifest};
 
-const ARCHIVE: &str = "git.tar";
+pub(crate) const ARCHIVE: &str = "git.tar";
 
 #[derive(Clone, Copy, Debug)]
 pub enum GitSnapshotRef<'a> {
@@ -128,7 +128,7 @@ pub fn prepare_git_snapshot_ref(
     Ok((manifest.id(), commit))
 }
 
-fn git() -> Command {
+pub(crate) fn git() -> Command {
     let mut command = Command::new("git");
     command
         .env("GIT_ALLOW_PROTOCOL", "file:https:ssh")
@@ -156,24 +156,36 @@ fn archive_revision(
 ) -> Result<(String, FileDigest)> {
     let work = TempDir::new_in(parent(archive))?;
     let clone = work.path().join("repo");
+    let commit = checkout(repo, source, &clone, false, git)?;
+    let digest = archive_commit(&clone, &commit, archive, git)?;
+    Ok((commit, digest))
+}
+
+pub(crate) fn checkout(
+    repo: &OsStr,
+    source: GitSnapshotRef<'_>,
+    clone: &Path,
+    full_history: bool,
+    command: fn() -> Command,
+) -> Result<String> {
     let reference = match source {
-        GitSnapshotRef::Branch(branch) => clone_branch(repo, branch, &clone)?,
+        GitSnapshotRef::Branch(branch) => clone_branch(repo, branch, clone, full_history, command)?,
         GitSnapshotRef::Tag(tag) => {
-            let reference = checked_ref("tags", tag)?;
-            let format = tag_object_format(repo, &reference)?;
-            fetch_revision(repo, &clone, &reference, format)?;
+            let reference = checked_ref("tags", tag, command)?;
+            let format = tag_object_format(repo, &reference, command)?;
+            fetch_revision(repo, clone, &reference, format, command)?;
             "FETCH_HEAD".to_owned()
         }
         GitSnapshotRef::Commit(sha) => {
             let format = object_format(sha)
                 .context("expected a full Git commit SHA (40 or 64 hex digits)")?;
-            fetch_revision(repo, &clone, &sha.to_ascii_lowercase(), format)?;
+            fetch_revision(repo, clone, &sha.to_ascii_lowercase(), format, command)?;
             "FETCH_HEAD".to_owned()
         }
     };
-    let result = git()
+    let result = command()
         .arg("-C")
-        .arg(&clone)
+        .arg(clone)
         .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
         .stderr(Stdio::inherit())
         .output()
@@ -194,9 +206,18 @@ fn archive_revision(
         );
     }
 
-    let status = git()
+    Ok(commit)
+}
+
+pub(crate) fn archive_commit(
+    clone: &Path,
+    commit: &str,
+    archive: &Path,
+    command: fn() -> Command,
+) -> Result<FileDigest> {
+    let status = command()
         .arg("-C")
-        .arg(&clone)
+        .arg(clone)
         .args([
             "-c",
             "core.attributesFile=/dev/null",
@@ -204,7 +225,7 @@ fn archive_revision(
             "tar.umask=0002",
             "archive",
             "--format=tar",
-            &commit,
+            commit,
         ])
         .stdout(File::create(archive)?)
         .status()
@@ -213,14 +234,14 @@ fn archive_revision(
     let file = File::open(archive)?;
     let size = file.metadata()?.len();
     let sha256 = digest_reader(file)?;
-    Ok((commit, FileDigest { size, sha256 }))
+    Ok(FileDigest { size, sha256 })
 }
 
-fn checked_ref(namespace: &str, name: &str) -> Result<String> {
+fn checked_ref(namespace: &str, name: &str, command: fn() -> Command) -> Result<String> {
     let reference = format!("refs/{namespace}/{name}");
     ensure!(
         !name.starts_with('-')
-            && git()
+            && command()
                 .args(["check-ref-format", &reference])
                 .status()
                 .context("running git check-ref-format")?
@@ -230,17 +251,27 @@ fn checked_ref(namespace: &str, name: &str) -> Result<String> {
     Ok(reference)
 }
 
-fn clone_branch(repo: &OsStr, branch: &str, clone: &Path) -> Result<String> {
-    let reference = checked_ref("heads", branch)?;
-    let status = git()
+fn clone_branch(
+    repo: &OsStr,
+    branch: &str,
+    clone: &Path,
+    full_history: bool,
+    command: fn() -> Command,
+) -> Result<String> {
+    let reference = checked_ref("heads", branch, command)?;
+    let mut git = command();
+    if !full_history {
+        git.args(["clone", "--depth=1"]);
+    } else {
+        git.arg("clone");
+    }
+    let status = git
         .args([
-            "clone",
             "--quiet",
             "--bare",
             "--single-branch",
             "--no-tags",
             "--no-local",
-            "--depth=1",
             "--template=",
             "--branch",
             branch,
@@ -254,7 +285,7 @@ fn clone_branch(repo: &OsStr, branch: &str, clone: &Path) -> Result<String> {
     Ok(reference)
 }
 
-fn object_format(oid: &str) -> Option<&'static str> {
+pub(crate) fn object_format(oid: &str) -> Option<&'static str> {
     if !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
@@ -265,9 +296,13 @@ fn object_format(oid: &str) -> Option<&'static str> {
     }
 }
 
-fn tag_object_format(repo: &OsStr, reference: &str) -> Result<&'static str> {
+fn tag_object_format(
+    repo: &OsStr,
+    reference: &str,
+    command: fn() -> Command,
+) -> Result<&'static str> {
     // Initialize the temporary repository with the tag's object format.
-    let result = git()
+    let result = command()
         .args(["ls-remote", "--refs", "--exit-code", "--"])
         .arg(repo)
         .arg(reference)
@@ -286,8 +321,14 @@ fn tag_object_format(repo: &OsStr, reference: &str) -> Result<&'static str> {
         .with_context(|| format!("Git did not return a valid object ID for {reference:?}"))
 }
 
-fn fetch_revision(repo: &OsStr, clone: &Path, reference: &str, format: &str) -> Result<()> {
-    let status = git()
+fn fetch_revision(
+    repo: &OsStr,
+    clone: &Path,
+    reference: &str,
+    format: &str,
+    command: fn() -> Command,
+) -> Result<()> {
+    let status = command()
         .args([
             "init",
             "--quiet",
@@ -303,7 +344,7 @@ fn fetch_revision(repo: &OsStr, clone: &Path, reference: &str, format: &str) -> 
         "initializing temporary Git repository failed"
     );
 
-    let status = git()
+    let status = command()
         // Keep the caller's working directory so relative Git repository paths resolve correctly.
         .arg("--git-dir")
         .arg(clone)

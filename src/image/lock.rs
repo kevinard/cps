@@ -484,6 +484,7 @@ fn create_locked(
             config.facets.clone(),
             bootstrap.clone(),
             None,
+            config.state_layout.unwrap_or(super::StateLayout::VarLib),
         )?;
         let (plan, state, _) = crate::plan::plan_image(
             scratch.path(),
@@ -503,5 +504,6 @@ fn create_locked(
         config.facets,
         bootstrap,
         None,
+        config.state_layout.unwrap_or(super::StateLayout::VarLib),
     )
 }

@@ -3,6 +3,7 @@ name: Release promotion and rollout
 on:
   schedule:
     - cron: '17,47 * * * *'
+    - cron: '23 4 * * *'
   workflow_dispatch:
     inputs:
       operation:
@@ -30,13 +31,18 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: cps-release
-  cancel-in-progress: false
-
 jobs:
   release:
-    if: github.ref == 'refs/heads/main' && (github.event_name != 'schedule' || vars.CPS_RELEASE_AUTOROLLOUT == 'true')
+    permissions:
+      contents: write
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.schedule == '17,47 * * * *' && vars.CPS_RELEASE_AUTOROLLOUT == 'true') ||
+       (github.event.schedule == '23 4 * * *' && vars.CPS_MIRROR_DIR != '' && vars.CPS_RELEASE_DEPLOY == ''))
+    concurrency:
+      group: cps-release
+      cancel-in-progress: false
     runs-on: [self-hosted, linux, cps-release]
     environment: cps-release
     timeout-minutes: 180
@@ -49,7 +55,8 @@ jobs:
           cargo build --locked --offline --release
           cargo test --locked --offline
           CPS_BIN="$GITHUB_WORKSPACE/target/release/cps" bash tests/release-ci.sh
-      - name: Rehearse, promote, or widen
+      - name: Run release operation
+        id: release_operation
         env:
           CPS_RELEASE_REPO: ${{ vars.CPS_RELEASE_REPO }}
           CPS_RELEASE_PUBLISHER: ${{ vars.CPS_RELEASE_PUBLISHER }}
@@ -59,18 +66,45 @@ jobs:
           CPS_RELEASE_ROLLOUT_GATE: ${{ vars.CPS_RELEASE_ROLLOUT_GATE }}
           CPS_RELEASE_ROLLOUT_PLAN: ${{ vars.CPS_RELEASE_ROLLOUT_PLAN }}
           CPS_RELEASE_DEPLOY: ${{ vars.CPS_RELEASE_DEPLOY }}
+          CPS_MIRROR_DIR: ${{ vars.CPS_MIRROR_DIR }}
+          CPS_MIRROR_PUBLISHER_KEY: ${{ vars.CPS_MIRROR_PUBLISHER_KEY }}
+          CPS_MIRROR_TUF_ROOT: ${{ vars.CPS_MIRROR_TUF_ROOT }}
+          CPS_MIRROR_TUF_ACTIVE_ROOT: ${{ vars.CPS_MIRROR_TUF_ACTIVE_ROOT }}
+          CPS_MIRROR_TUF_KEYS: ${{ vars.CPS_MIRROR_TUF_KEYS }}
           CPS_RELEASE_SIGNING_KEY: ${{ secrets.CPS_RELEASE_SIGNING_KEY_PATH }}
-          CPS_OPERATION: ${{ github.event_name == 'schedule' && 'advance' || inputs.operation }}
+          CPS_OPERATION: >-
+            ${{ github.event.schedule == '23 4 * * *' && 'refresh-mirror' ||
+                (github.event_name == 'schedule' && 'advance') || inputs.operation }}
           CPS_REQUEST: ${{ inputs.request }}
           CPS_CATALOG: ${{ inputs.catalog }}
           CPS_PROFILE: ${{ inputs.profile }}
           CPS_PERCENTAGE: ${{ inputs.percentage }}
         run: |
           export CPS_BIN="$GITHUB_WORKSPACE/target/release/cps"
+          export CPS_RELEASE_DEPLOY="${CPS_RELEASE_DEPLOY:-$GITHUB_WORKSPACE/ci/deploy-mirror.sh}"
+          if [[ "$CPS_OPERATION" != refresh-mirror ]]; then
+            export CPS_RELEASE_DEPLOYED_OUTPUT="$GITHUB_OUTPUT"
+          fi
           case "$CPS_OPERATION" in
             promote) bash ci/release.sh promote "$CPS_REQUEST" ;;
             widen) bash ci/release.sh widen "$CPS_CATALOG" "$CPS_PROFILE" "$CPS_PERCENTAGE" ;;
             advance) bash ci/release.sh advance ;;
             deploy-current) bash ci/release.sh deploy-current "$CPS_CATALOG" ;;
+            refresh-mirror) bash ci/release.sh refresh-mirror ;;
             *) exit 2 ;;
           esac
+      - name: Publish signed mirror release notes
+        if: >-
+          steps.release_operation.outputs.catalog != '' &&
+          vars.CPS_MIRROR_URL != '' && vars.CPS_RELEASE_DEPLOY == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CPS_MIRROR_URL: ${{ vars.CPS_MIRROR_URL }}
+          CPS_MIRROR_DIR: ${{ vars.CPS_MIRROR_DIR }}
+          CPS_MIRROR_TUF_ROOT: ${{ vars.CPS_MIRROR_TUF_ROOT }}
+          CPS_MIRROR_PUBLISHER_KEY: ${{ vars.CPS_MIRROR_PUBLISHER_KEY }}
+          CPS_RELEASE_NOTES_SIGNING_KEY: ${{ secrets.CPS_RELEASE_NOTES_SIGNING_KEY_PATH }}
+          CPS_RELEASE_PUBLISHER: ${{ vars.CPS_RELEASE_PUBLISHER }}
+          CPS_DEPLOYED_CATALOG: ${{ steps.release_operation.outputs.catalog }}
+        run: bash ci/publish-release-notes.sh "$CPS_RELEASE_PUBLISHER" "$CPS_DEPLOYED_CATALOG"

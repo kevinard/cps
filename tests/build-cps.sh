@@ -15,7 +15,6 @@ arch=$(uname -m)
 mkdir -m 700 -- "$output"
 work=$(mktemp -d "$output/.private.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
-cd -- "$output"
 
 keypair() {
     openssl genpkey -algorithm ED25519 -outform DER -out "$work/$1.der"
@@ -28,7 +27,6 @@ git -C "$project" archive --format=tar --prefix=cps/ "$revision" | gzip -n > "$w
 tar -xzf "$work/sources/cps.tar.gz" -C "$work"
 source_tree="$work/cps"
 source "$source_tree/tests/build-toolchain.sh"
-printf '%s\n' "$revision" > source-revision
 manifest_version() {
     local version
     version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$1")
@@ -40,6 +38,30 @@ manifest_version() {
 }
 cps_manifest="$source_tree/packaging/cps.kdl"
 cps_version=$(manifest_version "$cps_manifest")
+trust_manifest="$source_tree/packaging/canopa-trust.kdl.in"
+git_build_template="$source_tree/packaging/git-build.build.kdl.in"
+git_build_version=
+trust_version=
+if [[ -f $trust_manifest ]]; then
+    root=${CPS_MIRROR_TUF_ROOT:?Set CPS_MIRROR_TUF_ROOT to the reviewed public TUF root JSON}
+    [[ -f $root ]] || { echo 'Expected a public TUF root file' >&2; exit 1; }
+    trust_root="$work/sources/tuf-root.json"
+    head -c 1048577 -- "$root" > "$trust_root"
+    root_size=$(wc -c < "$trust_root")
+    (( root_size <= 1048576 )) || { echo 'TUF root exceeds the CPS size limit' >&2; exit 1; }
+    root_version=$(jq -ser '
+        select(length == 1) | .[0]
+        | select(.signed._type == "root" and .signed.consistent_snapshot == true
+                 and (.signatures | type == "array" and length > 0))
+        | .signed.version | select(type == "number")
+    ' "$trust_root") && [[ $root_version =~ ^[1-9][0-9]{0,14}$ ]] || {
+        echo 'Expected signed TUF root metadata with a valid version and consistent snapshots' >&2
+        exit 1
+    }
+    trust_version="1.0.0-$root_version"
+fi
+cd -- "$output"
+printf '%s\n' "$revision" > source-revision
 sqlite_version=$(manifest_version "$source_tree/packaging/runtime/sqlite.kdl")
 seccomp_version=$(manifest_version "$source_tree/packaging/runtime/libseccomp.kdl")
 seed_version=1.0.0-0
@@ -104,6 +126,42 @@ build_bundle() {
     "$cps" build --toolchain-config "$1" --source-cache sources --output "$3" \
         --check-reproducible --builder-signing-key "$work/builder.der" "$2"
 }
+if [[ -n $trust_version ]]; then
+    fixture_manifest "$trust_manifest" | sed "s/@ROOT_VERSION@/$root_version/" > canopa-trust.kdl
+    sed -e "s/@ARCH@/$arch/g" -e "/^@TOOLCHAIN@\$/ {
+r $toolchain_recipe
+d
+}" \
+        -e "s/@MANIFEST_SHA256@/$(sha canopa-trust.kdl)/g" \
+        -e "s/@ROOT_SIZE@/$root_size/g" -e "s/@ROOT_SHA256@/$(sha "$trust_root")/g" \
+        "$source_tree/packaging/canopa-trust.build.kdl.in" > canopa-trust.build.kdl
+    "$cps" source import --from "$work/sources" --cache sources canopa-trust.build.kdl
+    build_bundle bootstrap-toolchain.kdl canopa-trust.build.kdl canopa-trust.bundle
+    trust_recipe=$(sha canopa-trust.build.kdl)
+fi
+if [[ -f $git_build_template ]]; then
+    git_build_version=1.0.0-0
+    keypair git-build
+    git_build_proto="$work/git-build-proto"
+    bash "$source_tree/tests/seed-git-build.sh" "$cps" "$git_build_proto" \
+        "$work/git-build.der" "$output/git-build-public.der"
+    "$cps" manifest generate --proto "$git_build_proto" --publisher canopa --version "$git_build_version" \
+        --architecture "$arch" --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
+    git_build_archive="$work/sources/git-build.tar.gz"
+    tar --sort=name --format=gnu --mtime=@0 --owner=0 --group=0 --numeric-owner \
+        -C "$git_build_proto" -cf - . | gzip -n > "$git_build_archive"
+    sed -e "s/@ARCH@/$arch/g" -e "/^@TOOLCHAIN@\$/ {
+r $toolchain_recipe
+d
+}" \
+        -e "s/@MANIFEST_SHA256@/$(sha git-build.kdl)/g" \
+        -e "s/@SOURCE_SIZE@/$(wc -c < "$git_build_archive")/g" \
+        -e "s/@SOURCE_SHA256@/$(sha "$git_build_archive")/g" \
+        "$git_build_template" > git-build.build.kdl
+    "$cps" source import --from "$work/sources" --cache sources git-build.build.kdl
+    build_bundle bootstrap-toolchain.kdl git-build.build.kdl git-build.bundle
+    git_build_recipe=$(sha git-build.build.kdl)
+fi
 for library in sqlite libseccomp; do
     recipe="$source_tree/packaging/runtime/$library"
     fixture_manifest "$recipe.kdl" > "$library.kdl"
@@ -157,6 +215,9 @@ write_profile() {
     }
 PROFILE
 }
+runtime_packages=("system/cps@$cps_version")
+if [[ -n $trust_version ]]; then runtime_packages+=("system/canopa-trust@$trust_version"); fi
+if [[ -n $git_build_version ]]; then runtime_packages+=("system/git-build@$git_build_version"); fi
 write_policy() {
     local reviewed=${1:-}
     {
@@ -170,7 +231,15 @@ POLICY
         write_profile cps-build-libs "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version"
         if [[ -n $reviewed ]]; then
             printf '    approve "system/cps" version="%s" sha256="%s"%s\n' "$cps_version" "$reviewed" "$review_cps"
-            write_profile cps-runtime "system/cps@$cps_version"
+            if [[ -n $trust_version ]]; then
+                printf '    approve "system/canopa-trust" version="%s" sha256="%s"%s\n' \
+                    "$trust_version" "$trust_recipe" "$review_bootstrap"
+            fi
+            if [[ -n $git_build_version ]]; then
+                printf '    approve "system/git-build" version="%s" sha256="%s"%s\n' \
+                    "$git_build_version" "$git_build_recipe" "$review_bootstrap"
+            fi
+            write_profile cps-runtime "${runtime_packages[@]}"
         fi
         printf '}\n'
     } > repo/publish-policy.kdl
@@ -215,15 +284,32 @@ build_bundle toolchain.kdl build.kdl bundle
 reviewed=$(sha build.kdl)
 write_policy "$reviewed"
 cps_package=cps://canopa/system/cps@$cps_version
-cat > release.kdl <<RELEASE
+final_packages=("$cps_package")
+{
+    cat <<RELEASE
 schema-version 1
 release "canopa" base="$bootstrap_catalog" {
     bundle "$cps_package" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
-}
 RELEASE
+    if [[ -n $trust_version ]]; then
+        trust_package="cps://canopa/system/canopa-trust@$trust_version"
+        printf '    bundle "%s" path="canopa-trust.bundle" builder-key="builder-public.der" recipe-sha256="%s"\n' \
+            "$trust_package" "$trust_recipe"
+        final_packages+=("$trust_package")
+    fi
+    if [[ -n $git_build_version ]]; then
+        git_build_package="cps://canopa/system/git-build@$git_build_version"
+        printf '    bundle "%s" path="git-build.bundle" builder-key="builder-public.der" recipe-sha256="%s"\n' \
+            "$git_build_package" "$git_build_recipe"
+        final_packages+=("$git_build_package")
+    fi
+    printf '}\n'
+} > release.kdl
 "$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
     "${publication_sources[@]}" release.kdl
-if (( ${cps_version##*-} >= 20 && ${cps_version##*-} < 22 )); then archive_sources "$cps_package"; fi
+if (( ${cps_version##*-} >= 20 && ${cps_version##*-} < 22 )); then
+    for package in "${final_packages[@]}"; do archive_sources "$package"; done
+fi
 "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
     "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
@@ -247,10 +333,25 @@ publisher "canopa-runtime-seed" {
     trust-key "runtime-seed-public.der"
 }
 CONFIG
+if ! grep -Fq 'var/lib/cps/image' "$source_tree/src/image/mod.rs" &&
+   [[ $("$cps" image-create --help) == *image-state* ]]; then
+    printf 'image-state "legacy"\n' >> image.kdl
+fi
 "$cps" image-create --root image --config image.kdl
-"$cps" plan --root image --output install.json install "$cps_package"
+if [[ -n $trust_version || -n $git_build_version ]]; then
+    "$cps" plan --root image --output install.json install-profile
+else
+    "$cps" plan --root image --output install.json install "$cps_package"
+fi
 "$cps" apply --root image install.json
 cmp bundle/proto/usr/bin/cps image/usr/bin/cps
+if [[ -n $trust_version ]]; then
+    cmp "$trust_root" image/etc/cps/tuf-root.json
+    test "$(stat -c %a image/etc/cps/tuf-root.json)" = 644
+fi
+if [[ -n $git_build_version ]]; then
+    diff -r "$git_build_proto/usr/share/cps/git-build" image/usr/share/cps/git-build
+fi
 test image/lib64/ld-linux-x86-64.so.2 -ef image/usr/lib/ld-linux-x86-64.so.2
 for path in usr/include/{sqlite3,sqlite3ext,seccomp,seccomp-syscalls}.h \
     usr/lib/pkgconfig/{sqlite3,libseccomp}.pc usr/lib/{libsqlite3,libseccomp}.so; do
@@ -268,7 +369,7 @@ if (( ${cps_version##*-} >= 19 )); then
         --trust-key release-public.der --bundle bundle "$cps_package"
 fi
 if (( ${cps_version##*-} >= 20 )); then
-    for package in "$cps_package" "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"; do
+    for package in "${final_packages[@]}" "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"; do
         "${loader[@]}" image/usr/bin/cps repo fetch-sources --repo repo --publisher canopa \
             --trust-key release-public.der --source-cache recovered-sources "$package"
     done

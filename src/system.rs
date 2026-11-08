@@ -13,28 +13,35 @@ use rustix::fs::{FlockOperation, flock};
 use serde::Serialize;
 
 use crate::{
-    BootEnvironment, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, ReleaseAdvisory,
-    Request, TransactionPhase, TransactionProgress,
+    BootEnvironment, GitSnapshotRef, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions,
+    ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
     apply::{apply_live, repair_pending_live, resume_live},
     boot::{
         activate_btrfs_boot_environment, entry_id, stage_running_btrfs, with_running_environment,
     },
     fetch_plan,
+    git_install::{GitBuild, GitSource, GitStore},
     image::Image,
+    image::publishers::register_git_publisher,
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
     plan::{UpdateDiagnostics, inspect_update, plan_system},
     query::{InstallSource, SelectSource, select_install_sources},
-    release::{SyncOptions, refresh_url_publishers, sync_profile_for_image, sync_with_options},
+    release::{
+        SyncOptions, prune_system_payloads, refresh_url_publishers, sync_profile_for_image,
+        sync_with_options,
+    },
     systemd::LiveServices,
     transaction_progress,
 };
 
+pub use crate::git_install::GitChange;
 pub use crate::plan::HeldBackUpdate;
 
 pub const CONFIG: &str = "/etc/cps/image.kdl";
 const ROOT: &str = "/";
+const GIT_TOOLCHAIN: &str = "/usr/share/cps/git-build/toolchain.kdl";
 
 pub struct System {
     config: PathBuf,
@@ -262,6 +269,54 @@ impl System {
         )
     }
 
+    // The system operation already holds the environments lock.
+    fn prune_after_transaction(&self) {
+        let Some(versions) = self.definition.cache_keep_versions else {
+            return;
+        };
+        let boot = self.boot();
+        let result = crate::boot::with_registered_images(
+            &boot.volume,
+            &boot.esp,
+            &boot.activation.root_partuuid,
+            |images| {
+                let mut seen = BTreeSet::new();
+                for (_, image) in images {
+                    let publishers = image.publishers()?;
+                    for publisher in publishers.as_slice() {
+                        if !seen.insert(publisher.repo.clone()) {
+                            continue;
+                        }
+                        let result = (|| -> Result<()> {
+                            if publisher.repo.join(".tuf").try_exists()? {
+                                let report = prune_system_payloads(publisher, images, versions)?;
+                                if !report.blobs.is_empty() {
+                                    eprintln!(
+                                        "Pruned {} cached payload(s) for {}, {} bytes",
+                                        report.blobs.len(),
+                                        publisher.name,
+                                        report.bytes,
+                                    );
+                                }
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = result {
+                            eprintln!(
+                                "Warning: could not prune {}'s cache: {error:#}",
+                                publisher.name
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            eprintln!("Warning: could not prune system caches: {error:#}");
+        }
+    }
+
     pub fn publisher_cache(&self, publisher: &str) -> Result<PathBuf> {
         validate_publisher(publisher)?;
         self.check_running()?;
@@ -273,8 +328,114 @@ impl System {
             .join(publisher))
     }
 
+    fn git_toolchain(&self) -> Result<&Path> {
+        if let Some(config) = &self.definition.git_toolchain_config {
+            return Ok(config);
+        }
+        let config = Path::new(GIT_TOOLCHAIN);
+        ensure!(
+            config.is_file(),
+            "install system/git-build or set git-toolchain-config in the system image configuration"
+        );
+        Ok(config)
+    }
+
+    /// Prepare an explicitly selected Git commit and return its local package ID.
+    pub fn prepare_git_install(
+        &self,
+        url: &str,
+        reference: GitSnapshotRef<'_>,
+        approve: impl FnOnce(&GitChange) -> Result<bool>,
+    ) -> Result<Option<String>> {
+        self.check_running()?;
+        let source = GitSource::new(url, reference)?;
+        let build =
+            GitBuild::prepare(&source, None)?.context("Git install has no selected commit")?;
+        let state = Image::open_query(Path::new(ROOT))?.state()?;
+        if let Some(package) = state.installed.get(&build.manifest.name) {
+            ensure!(
+                package.published.manifest.publisher == build.manifest.publisher,
+                "{} is already installed from another source; remove it before changing its source",
+                build.manifest.name
+            );
+        }
+        if !approve(&build.change)? {
+            return Ok(None);
+        }
+        let toolchain = self.git_toolchain()?;
+        let store = GitStore::open(self.publisher_cache(&source.publisher())?)?;
+        let package = build.publish(&source, &store, toolchain)?;
+        let boot = self.boot();
+        with_running_environment(
+            &boot.volume,
+            &boot.esp,
+            &boot.activation.root_partuuid,
+            |root, id, revision| {
+                register_git_publisher(
+                    &mut Image::open_for_live_apply(root, id, revision)?,
+                    source,
+                    &store.repo(),
+                    &store.public_key(),
+                    true,
+                )
+            },
+        )?;
+        Ok(Some(package))
+    }
+
+    /// Check opted-in Git sources and build the exact commits approved for this upgrade.
+    pub fn prepare_git_updates(
+        &self,
+        mut approve: impl FnMut(&GitChange) -> Result<bool>,
+    ) -> Result<Vec<String>> {
+        self.check_running()?;
+        let state = Image::open_query(Path::new(ROOT))?.state()?;
+        let mut updates = Vec::new();
+        for (name, package) in &state.installed {
+            let manifest = &package.published.manifest;
+            let publisher = state
+                .publishers
+                .get(&manifest.publisher)
+                .context("missing installed publisher")?;
+            let Some(source) = publisher
+                .git
+                .as_ref()
+                .filter(|source| source.branch().is_some())
+            else {
+                continue;
+            };
+            if state.settings.freezes.contains_key(name) {
+                continue;
+            }
+            let build = match GitBuild::prepare(source, Some(manifest)) {
+                Ok(Some(build)) => build,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!("Could not check Git update for {name}: {error:#}");
+                    continue;
+                }
+            };
+            if approve(&build.change)? {
+                let path = self.publisher_cache(&publisher.name)?;
+                ensure!(path.is_dir(), "missing Git publisher cache for {name}");
+                let store = GitStore::open(path)?;
+                ensure!(
+                    fs::canonicalize(store.repo())? == publisher.repo
+                        && crate::repo::read_key(&store.public_key())? == publisher.key,
+                    "Git publisher cache or signing key changed for {name}"
+                );
+                updates.push(build.publish(source, &store, self.git_toolchain()?)?);
+            }
+        }
+        Ok(updates)
+    }
+
     pub fn plan(&self, request: Request, refresh: bool) -> Result<Change> {
-        self.plan_request(request, refresh, None, None)
+        self.plan_request(request, refresh, None, None, &[])
+    }
+
+    pub fn plan_git_upgrade(&self, updates: &[String], refresh: bool) -> Result<Change> {
+        self.plan_request(Request::Update, refresh, None, None, updates)
     }
 
     pub fn plan_with_source_selection(
@@ -283,7 +444,7 @@ impl System {
         refresh: bool,
         mut choose: impl FnMut(&str, &[InstallSource]) -> Result<usize>,
     ) -> Result<Change> {
-        self.plan_request(request, refresh, Some(&mut choose), None)
+        self.plan_request(request, refresh, Some(&mut choose), None, &[])
     }
 
     /// Check the running system with the same refresh and planner as an upgrade.
@@ -306,7 +467,7 @@ impl System {
                 explain,
                 advisories: Some(&mut advisories),
             };
-            system.plan_request(Request::Update, refresh, None, Some(diagnostics))
+            system.plan_request(Request::Update, refresh, None, Some(diagnostics), &[])
         })();
         UpdateReport::from_plan(result, held_back, advisories)
     }
@@ -317,6 +478,7 @@ impl System {
         refresh: bool,
         choose: Option<&mut SelectSource<'_>>,
         diagnostics: Option<UpdateDiagnostics<'_>>,
+        git_updates: &[String],
     ) -> Result<Change> {
         let uses_current_catalogs = matches!(request, Request::Install { .. } | Request::Update);
         ensure!(
@@ -343,7 +505,7 @@ impl System {
             let plan = inspect_update(root, diagnostics)?;
             return Ok(Change::from_plan(plan, &self.definition.stage_packages));
         }
-        let (plan, services) = plan_system(root, request, self.plan_options)?;
+        let (plan, services) = plan_system(root, request, self.plan_options, git_updates)?;
         let mut change = Change::from_plan(plan, &self.definition.stage_packages);
         change.live_services = Some(services);
         Ok(change)
@@ -366,6 +528,7 @@ impl System {
                     )
                 },
             )?;
+            self.prune_after_transaction();
             return Ok(None);
         }
 
@@ -374,6 +537,7 @@ impl System {
             .with_context(|| {
                 format!("activating the prepared environment at {}", root.display())
             })?;
+        self.prune_after_transaction();
         Ok(Some(id))
     }
 
@@ -429,7 +593,7 @@ impl System {
 
     fn resume_transaction(&self, repair: bool) -> Result<Option<u64>> {
         let boot = self.boot();
-        with_running_environment(
+        let revision = with_running_environment(
             &boot.volume,
             &boot.esp,
             &boot.activation.root_partuuid,
@@ -441,7 +605,9 @@ impl System {
                     resume_live(image)
                 }
             },
-        )
+        )?;
+        self.prune_after_transaction();
+        Ok(revision)
     }
 
     pub fn boot_status(&self) -> Result<(String, Vec<BootEnvironment>)> {

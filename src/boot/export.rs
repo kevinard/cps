@@ -101,7 +101,7 @@ fn export(
     check_image_integrity(&image)?;
     let state = image.state()?;
     if let Some(artifacts) = kernel::selected(&state.installed, &state.paths)? {
-        artifacts.open_prepared(&image.root)?;
+        artifacts.open_prepared(&image.state_dir)?;
     }
     let uuid = canonical_partuuid(&state.settings.id).context("invalid image identity")?;
     let source = image.root.as_file().metadata()?;
@@ -206,7 +206,7 @@ fn export(
             ExportReceipt {
                 image: uuid.clone(),
                 revision: state.settings.revision,
-                state_sha256: digest_reader(image.root.file(".cps/state.sqlite")?)?,
+                state_sha256: digest_reader(image.state_dir.file("state.sqlite")?)?,
                 tree_sha256: Some(tree_sha256),
                 bytes,
                 sha256: digest_reader(checked)?,

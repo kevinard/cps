@@ -199,7 +199,7 @@ fn finish_staged_root(staged: &Path, previous: BootParent, plan: &Plan) -> Resul
     check_image_integrity(&image)?;
     let state = image.state()?;
     if let Some(kernel) = kernel::selected(&state.installed, &state.paths)? {
-        kernel.open_prepared(&image.root)?;
+        kernel.open_prepared(&image.state_dir)?;
     }
     let settings = image.fork_for_boot(previous)?;
     Ok(entry_id(&settings.id, settings.revision))

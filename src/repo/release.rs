@@ -28,13 +28,15 @@ use crate::{
 use super::{
     CATALOG_LIMIT, Catalog, CatalogEntry, CatalogPin, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
     MANIFEST_LIMIT, Published, Root, Snapshot, catalog_snapshot, lock_repo, parse_current,
-    path_present, prepare_objects, read_catalog, read_current, read_key, read_limited,
-    read_package, read_pointer, rebuild, source_archive, write_atomic,
+    parse_public_key, path_present, prepare_objects, read_catalog, read_current, read_key,
+    read_key_der, read_limited, read_package, read_pointer, rebuild, source_archive, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
 
 const ROOT_LIMIT: u64 = 1024 * 1024;
+const PUBLISHER_NAME_TARGET: &str = "publisher";
+const PUBLISHER_KEY_TARGET: &str = "publisher.der";
 const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
 const ENDPOINTS_LIMIT: u64 = 8192;
 const PAYLOAD_DOWNLOADS: usize = 8;
@@ -130,14 +132,16 @@ fn endpoint(value: &str) -> Result<Url> {
 }
 
 mod archive;
+mod bootstrap;
 mod cache;
 mod delta;
 mod profile;
 pub(crate) use archive::ArchiveCache;
-pub(crate) use cache::prune_with_registered_roots;
+pub use bootstrap::PublisherBootstrap;
 pub use cache::{
     CacheRetention, PruneReport, RetainedRoot, prune_payloads, prune_payloads_with_locks,
 };
+pub(crate) use cache::{prune_system_payloads, prune_with_registered_roots};
 pub use profile::{
     ProfilePayloads, sync_profile, sync_profile_for_image, sync_profile_with_payloads,
 };
@@ -157,11 +161,10 @@ impl Mirror {
     }
 
     fn from_base(base: &str) -> Result<Self> {
-        let base = if base.ends_with('/') {
-            endpoint(base)?
-        } else {
-            endpoint(&format!("{base}/"))?
-        };
+        Self::from_base_url(&mirror_base(base)?)
+    }
+
+    fn from_base_url(base: &Url) -> Result<Self> {
         Self::new(
             base.join("metadata/")?.as_str(),
             base.join("targets/")?.as_str(),
@@ -186,6 +189,19 @@ impl Mirror {
     fn document(&self) -> String {
         format!("{}\n{}\n", self.metadata, self.targets)
     }
+}
+
+fn mirror_base(base: &str) -> Result<Url> {
+    if base.ends_with('/') {
+        endpoint(base)
+    } else {
+        endpoint(&format!("{base}/"))
+    }
+}
+
+fn read_tuf_root(path: &Path) -> Result<Vec<u8>> {
+    (|| read_limited(File::open(path)?, ROOT_LIMIT))()
+        .with_context(|| format!("reading trusted TUF root {}", path.display()))
 }
 
 fn open_state(repo: &Path) -> Result<Root> {
@@ -570,8 +586,7 @@ impl<'a> SyncSource<'a> {
     ) -> Result<Self> {
         validate_publisher(publisher)?;
         let key = read_key(trust_key)?;
-        let anchor = read_limited(File::open(trusted_root)?, ROOT_LIMIT)
-            .with_context(|| format!("reading trusted TUF root {}", trusted_root.display()))?;
+        let anchor = read_tuf_root(trusted_root)?;
         ensure!(
             mirror.document().len() as u64 <= ENDPOINTS_LIMIT,
             "mirror endpoints exceed the size limit"
@@ -973,7 +988,7 @@ struct PayloadTarget<'a> {
     compressed: bool,
 }
 
-fn compressed_payload_name(hash: &str) -> String {
+pub(crate) fn compressed_payload_name(hash: &str) -> String {
     format!("blobs-{hash}.zst")
 }
 
@@ -1045,21 +1060,31 @@ fn decompress_payload(
     length: u64,
 ) -> Result<NamedTempFile> {
     compressed.as_file_mut().rewind()?;
-    let mut decoder = zstd::stream::read::Decoder::new(compressed.as_file_mut())?;
-    decoder.window_log_max(PAYLOAD_ZSTD_WINDOW_LOG)?;
     let mut result = NamedTempFile::new_in(parent)?;
-    let copied = std::io::copy(&mut decoder.by_ref().take(length), &mut result)?;
+    copy_compressed_payload(compressed.as_file_mut(), result.as_file_mut(), hash, length)?;
+    result.as_file().sync_all()?;
+    Ok(result)
+}
+
+pub(crate) fn copy_compressed_payload(
+    source: impl Read,
+    destination: &mut File,
+    hash: &str,
+    length: u64,
+) -> Result<()> {
+    let mut decoder = zstd::stream::read::Decoder::new(source)?;
+    decoder.window_log_max(PAYLOAD_ZSTD_WINDOW_LOG)?;
+    let copied = std::io::copy(&mut decoder.by_ref().take(length), destination)?;
     ensure!(
         copied == length && decoder.read(&mut [0])? == 0,
         "decompressed payload length mismatch for {hash}"
     );
-    result.as_file_mut().rewind()?;
+    destination.rewind()?;
     ensure!(
-        digest_reader(result.as_file_mut())? == hash,
+        digest_reader(destination)? == hash,
         "decompressed payload digest mismatch for {hash}"
     );
-    result.as_file().sync_all()?;
-    Ok(result)
+    Ok(())
 }
 
 pub(super) fn fetch_source_archives(
@@ -1596,9 +1621,10 @@ fn export_targets(
     include_sources: bool,
     delta_from: &[String],
 ) -> Result<String> {
-    let key = read_key(trust_key)?;
+    let key_der = read_key_der(trust_key)?;
+    let key = parse_public_key(&key_der)?;
     let current = read_current(repo)?;
-    let catalog = read_catalog(repo, &current, publisher, &key)?;
+    let catalog = read_catalog(repo, &current, publisher, key)?;
     let (pointer, hash, catalog, retained) = match selection {
         ExportSelection::Current(retained) => {
             let pins = retained_catalogs(retained.iter().map(String::as_str), &current)?;
@@ -1608,7 +1634,7 @@ fn export_targets(
             let archived = if pin == current {
                 catalog
             } else {
-                let archived = read_catalog(repo, pin, publisher, &key)?;
+                let archived = read_catalog(repo, pin, publisher, key)?;
                 archived.check_successor(&catalog, pin).with_context(|| {
                     format!("checking archive catalog {pin} against current {current}")
                 })?;
@@ -1625,15 +1651,15 @@ fn export_targets(
     let stage = TempDir::new_in(parent)?;
     let mut blobs = BTreeMap::new();
     for pin in &retained {
-        let previous = read_catalog(repo, pin, publisher, &key)?;
+        let previous = read_catalog(repo, pin, publisher, key)?;
         previous
             .check_successor(&catalog, pin)
             .with_context(|| format!("checking retained catalog {pin} against current {hash}"))?;
-        let release = catalog_snapshot(repo, previous, (*pin).to_owned(), &key)?;
+        let release = catalog_snapshot(repo, previous, (*pin).to_owned(), key)?;
         export_catalog(&root, stage.path(), &release, &mut blobs)?;
     }
     let include_sources = include_sources || catalog.source_archives_required;
-    let release = catalog_snapshot(repo, catalog, hash.clone(), &key)?;
+    let release = catalog_snapshot(repo, catalog, hash.clone(), key)?;
     export_catalog(&root, stage.path(), &release, &mut blobs)?;
     for (hash, length) in blobs {
         export_payload(&root, stage.path(), &hash, length)?;
@@ -1641,14 +1667,14 @@ fn export_targets(
     if !delta_from.is_empty() {
         let pins = retained_catalogs(delta_from.iter().map(String::as_str), &hash)
             .context("checking delta base catalog pins")?;
-        let current = read_catalog(repo, &hash, publisher, &key)?;
+        let current = read_catalog(repo, &hash, publisher, key)?;
         let mut seen = BTreeSet::new();
         for pin in pins {
-            let previous = read_catalog(repo, pin, publisher, &key)?;
+            let previous = read_catalog(repo, pin, publisher, key)?;
             previous
                 .check_successor(&current, pin)
                 .with_context(|| format!("checking delta base catalog {pin}"))?;
-            let previous = catalog_snapshot(repo, previous, pin.to_owned(), &key)?;
+            let previous = catalog_snapshot(repo, previous, pin.to_owned(), key)?;
             delta::export(&root, stage.path(), &previous, &release, &mut seen)?;
         }
     }
@@ -1677,6 +1703,14 @@ fn export_targets(
             document.push('\n');
         }
         write_atomic(&stage.path().join(RETAINED), document.as_bytes(), false)?;
+    }
+    if pointer == "current" {
+        write_atomic(
+            &stage.path().join(PUBLISHER_NAME_TARGET),
+            publisher.as_bytes(),
+            false,
+        )?;
+        write_atomic(&stage.path().join(PUBLISHER_KEY_TARGET), &key_der, false)?;
     }
     write_atomic(
         &stage.path().join(pointer),

@@ -422,7 +422,7 @@ pub(super) fn activate(
             activation.kernel == "boot/vmlinuz" && activation.initrd.is_none(),
             "the image uses kernel-install artifacts; omit --kernel and --initrd"
         );
-        let (kernel, initrd) = artifacts.open_prepared(&image.root)?;
+        let (kernel, initrd) = artifacts.open_prepared(&image.state_dir)?;
         (
             kernel,
             initrd,
@@ -451,7 +451,7 @@ pub(super) fn activate(
             "root export receipt is for a different image or revision"
         );
         ensure!(
-            receipt.state_sha256 == digest_reader(image.root.file(".cps/state.sqlite")?)?,
+            receipt.state_sha256 == digest_reader(image.state_dir.file("state.sqlite")?)?,
             "image state differs from the root export receipt"
         );
         if let Some(expected) = &receipt.tree_sha256 {

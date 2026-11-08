@@ -1,0 +1,9 @@
+schema-version 1
+build architecture="@ARCH@" epoch=0 {
+@TOOLCHAIN@
+    manifest "git-build.kdl" sha256="@MANIFEST_SHA256@"
+    source "git-build.tar.gz" size=@SOURCE_SIZE@ sha256="@SOURCE_SHA256@"
+    script """
+    tar -xzf "$CPS_SOURCES/git-build.tar.gz" -C "$DESTDIR"
+    """
+}

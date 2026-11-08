@@ -4,6 +4,7 @@ mod boot;
 mod build;
 mod file_caps;
 mod generate;
+mod git_install;
 mod image;
 mod kdl_format;
 mod model;

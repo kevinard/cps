@@ -399,11 +399,11 @@ fn validate_in_image(image: &Image, plan: &Plan) -> Result<()> {
     let (checked, next, _) = check_plan(image, state, plan)?;
     check_drift(&image.root, &checked, &next)?;
     let parent = image.stage()?;
-    let scratch = tempfile::tempdir_in(Root::fd_path(&parent))?;
-    let stage = File::open(scratch.path())?;
+    let scratch = tempfile::tempdir_in(Root::fd_path(parent.as_file()))?;
+    let stage = Root::open(scratch.path())?;
     prepare(&image.root, &stage, &checked, &next)?;
     if let Some(previous) = &previous {
-        elf::check(&image.root, &stage, &checked, previous, &next)?;
+        elf::check(&image.root, stage.as_file(), &checked, previous, &next)?;
     }
     Ok(())
 }
@@ -473,6 +473,7 @@ pub(crate) fn apply_to_image(
         );
     }
     if let Some(revision) = image.applied(&id)? {
+        discard_stage(&image);
         return Ok(revision);
     }
     let check_elf = elf::applies(plan, &state);
@@ -495,7 +496,7 @@ pub(crate) fn apply_to_image(
             .as_ref()
             .or_else(|| current.as_ref().map(|state| &state.paths))
             .expect("ELF checking retained the previous paths");
-        elf::check(&image.root, &stage, &checked, previous, &next)?;
+        elf::check(&image.root, stage.as_file(), &checked, previous, &next)?;
     }
     let repo_backed = checked.catalog.is_some() || !checked.catalogs.is_empty();
     let journal = Box::new(Journal {
@@ -561,6 +562,7 @@ fn resume_image(
 ) -> Result<Option<u64>> {
     let state = image.state()?;
     let Some(pending) = image.pending::<PendingRecord>()? else {
+        discard_stage(&image);
         return Ok(None);
     };
     resume_pending(&mut image, &state, pending, None, live, repair, |_| {}).map(Some)
@@ -662,7 +664,7 @@ impl AfterFiles {
 
 fn finish(
     image: &mut Image,
-    stage: &File,
+    stage: &Root,
     mut pending: PendingRecord,
     saved: Option<&Plan>,
     after: AfterFiles,
@@ -709,7 +711,7 @@ fn finish(
             )?;
         }
         if let Some(kernel) = work.kernel_install {
-            kernel.prepare(&image.root, path, &work.next.settings.id)?;
+            kernel.prepare(image, path, &work.next.settings)?;
         }
         let phase = if pending.is_live() { "live" } else { "offline" };
         let repaired = matches!(&pending, PendingRecord::Live { live } if live.plan.is_recovery())
@@ -738,12 +740,24 @@ fn finish(
         _ => saved.context("missing verified plan for the pending transaction")?,
     };
     image.commit(work.id, work.next, &plan.transaction_details(work.next))?;
+    discard_stage(image);
     Ok(revision)
+}
+
+fn discard_stage(image: &Image) {
+    let result = (|| -> Result<()> {
+        let stage = image.stage()?;
+        clear_stage(&stage)?;
+        Ok(stage.as_file().sync_all()?)
+    })();
+    if let Err(error) = result {
+        eprintln!("Warning: could not clear transaction staging files: {error:#}");
+    }
 }
 
 fn restore_pending_paths(
     root: &Root,
-    stage: &File,
+    stage: &Root,
     next: &State,
     live: bool,
     stage_packages: &BTreeSet<String>,
@@ -759,10 +773,10 @@ fn restore_pending_paths(
             );
         }
     }
-    let dir = Root::fd_path(stage);
+    let dir = Root::fd_path(stage.as_file());
     for (publisher, blobs) in payload_sources(&writes, next)? {
         for (hash, payload) in blobs {
-            if checked_payload(root, payload.node).is_ok() {
+            if checked_payload(stage, payload.node).is_ok() {
                 continue;
             }
             let mut file = NamedTempFile::new_in(&dir)?;
@@ -773,19 +787,19 @@ fn restore_pending_paths(
             file.persist(dir.join(hash))?;
         }
     }
-    stage.sync_all()?;
+    stage.as_file().sync_all()?;
     write_files(root, stage, &writes, &next.paths, &mut |_| {})
 }
 
 fn write_files(
     root: &Root,
-    stage: &File,
+    stage: &Root,
     writes: &[Write],
     paths: &BTreeMap<String, Managed>,
     after_write: &mut impl FnMut(&Write),
 ) -> Result<()> {
     for node in payloads(writes).into_values() {
-        checked_payload(root, node)?;
+        checked_payload(stage, node)?;
     }
     let mut checked_target: Option<(&str, File)> = None;
     let groups = if writes.iter().any(|write| write.detach) {
@@ -822,7 +836,7 @@ fn write_files(
             && root.shares_inode(&write.path, source)?
         {
             root.sync_parent(&write.path)?;
-            stage.sync_all()?;
+            stage.as_file().sync_all()?;
             continue;
         }
         let observed = root.inspect(&write.path)?;
@@ -835,7 +849,7 @@ fn write_files(
         if observed == write.after && !detach {
             if write.before != write.after || write.detach {
                 root.sync_parent(&write.path)?;
-                stage.sync_all()?;
+                stage.as_file().sync_all()?;
             }
             continue;
         }
@@ -855,7 +869,7 @@ fn write_files(
                 let payload = match node {
                     Node::File { .. } => Some(match write.local_config_source() {
                         Some((path, before)) => ReplacementSource::LocalConfig { path, before },
-                        None => ReplacementSource::Staged(checked_payload(root, node)?),
+                        None => ReplacementSource::Staged(checked_payload(stage, node)?),
                     }),
                     Node::Hardlink { .. } => Some(ReplacementSource::Staged(
                         link_source
@@ -868,7 +882,7 @@ fn write_files(
                     &write.path,
                     node,
                     payload,
-                    stage,
+                    stage.as_file(),
                     write.config_move.is_some(),
                 )?;
             }
@@ -879,10 +893,8 @@ fn write_files(
     Ok(())
 }
 
-fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> {
-    let writes = &plan.writes;
-    let dir = Root::fd_path(stage);
-    for entry in fs::read_dir(&dir)? {
+fn clear_stage(stage: &Root) -> Result<()> {
+    for entry in fs::read_dir(Root::fd_path(stage.as_file()))? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             fs::remove_dir(entry.path())?;
@@ -890,6 +902,13 @@ fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> 
             fs::remove_file(entry.path())?;
         }
     }
+    Ok(())
+}
+
+fn prepare(root: &Root, stage: &Root, plan: &Plan, state: &State) -> Result<()> {
+    let writes = &plan.writes;
+    let dir = Root::fd_path(stage.as_file());
+    clear_stage(stage)?;
     for write in writes.iter().filter(|write| write.replaces_file()) {
         if let Some(node) = &write.after
             && (node.capabilities().is_some()
@@ -910,7 +929,9 @@ fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> 
             })?;
         }
     }
-    if let Some((path, node @ Node::File { sha256, .. })) = plan.config_payload() {
+    if let Some((path, node @ Node::File { sha256, .. })) =
+        plan.config_payload(state.settings.state_layout)
+    {
         let mut file = NamedTempFile::new_in(&dir)?;
         copy_payload(&root.file(&path)?, node, file.as_file_mut())
             .with_context(|| format!("staging vendor configuration {path}"))?;
@@ -926,7 +947,7 @@ fn prepare(root: &Root, stage: &File, plan: &Plan, state: &State) -> Result<()> 
             }
         }
     }
-    stage.sync_all()?;
+    stage.as_file().sync_all()?;
     Ok(())
 }
 
@@ -936,7 +957,7 @@ fn payload_sources<'a>(
 ) -> Result<Vec<PublisherPayloads<'a>>> {
     let mut seen = std::collections::BTreeSet::new();
     let mut by_publisher = BTreeMap::<_, BTreeMap<_, _>>::new();
-    let config_updates = config_update_prefix(state.settings.revision);
+    let config_updates = config_update_prefix(state.settings.state_layout, state.settings.revision);
     for write in writes.iter().filter(|write| write.needs_blob()) {
         let Some(node @ Node::File { sha256, .. }) = &write.after else {
             unreachable!("only file replacements require a payload");
@@ -988,13 +1009,12 @@ fn payload_sources<'a>(
         .collect()
 }
 
-fn checked_payload(root: &Root, node: &Node) -> Result<File> {
+fn checked_payload(stage: &Root, node: &Node) -> Result<File> {
     let Node::File { sha256, size, .. } = node else {
         anyhow::bail!("expected a file payload");
     };
-    let path = format!(".cps/stage/{sha256}");
-    let mut file = root
-        .file(&path)
+    let mut file = stage
+        .file(sha256)
         .with_context(|| format!("opening staged blob {sha256}"))?;
     ensure!(
         file.metadata()?.len() == *size && digest_reader(&mut file)? == *sha256,

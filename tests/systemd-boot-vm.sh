@@ -103,6 +103,8 @@ if $health_failure || [[ $mode == bless || $mode == rollback || $mode == capabil
     systemd_guest=true
 fi
 fixture_publisher=canopa
+boot_trust_dependency=
+boot_git_build_dependency=
 if [[ -n $cps_fixture ]]; then
     $systemd_guest || { echo 'CPS_VM_CPS_FIXTURE requires a systemd guest' >&2; exit 2; }
     cps_fixture=$(realpath -- "$cps_fixture")
@@ -113,6 +115,26 @@ if [[ -n $cps_fixture ]]; then
         *) echo "Unsupported CPS fixture version: $cps_version" >&2; exit 2 ;;
     esac
     cps_packages=("system/cps@$cps_version" "system/sqlite@$sqlite_version" "system/libseccomp@$seccomp_version")
+    if [[ -f "$cps_fixture/canopa-trust.kdl" ]]; then
+        trust_version=$(sed -n 's/^package "system\/canopa-trust" .* version="\([^"]*\)".*/\1/p' \
+            "$cps_fixture/canopa-trust.kdl")
+        [[ $trust_version =~ ^1\.0\.0-[1-9][0-9]{0,14}$ ]] || {
+            echo 'Could not determine the Canopa trust package version' >&2
+            exit 2
+        }
+        cps_packages+=("system/canopa-trust@$trust_version")
+        boot_trust_dependency="    require \"system/canopa-trust\" version=\"=$trust_version\""
+    fi
+    if [[ -f "$cps_fixture/git-build.kdl" ]]; then
+        git_build_version=$(sed -n 's/^package "system\/git-build" .* version="\([^"]*\)".*/\1/p' \
+            "$cps_fixture/git-build.kdl")
+        [[ $git_build_version =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || {
+            echo 'Could not determine the Git build package version' >&2
+            exit 2
+        }
+        cps_packages+=("system/git-build@$git_build_version")
+        boot_git_build_dependency="    require \"system/git-build\" version=\"=$git_build_version\""
+    fi
     for package in "${cps_packages[@]}"; do
         "$cps" repo attestation --repo "$cps_fixture/repo" --publisher canopa \
             --trust-key "$cps_fixture/release-public.der" "cps://canopa/$package" >/dev/null
@@ -528,6 +550,8 @@ package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
 $boot_kernel_dependency
 $boot_systemd_dependency
     require "system/cps" version="=$cps_version"
+$boot_trust_dependency
+$boot_git_build_dependency
     require "system/sqlite" version="=$sqlite_version"
     require "system/libseccomp" version="=$seccomp_version"
     require "system/busybox" version="=$busybox_version"
@@ -579,11 +603,17 @@ publisher "$fixture_publisher" {
 CONFIG
     if [[ $mode == facet-change ]]; then printf 'facet "doc.man" #false\n' >> image.kdl; fi
 fi
+if [[ -n $cps_fixture && -d "$cps_fixture/image/.cps" &&
+      $("$cps" image-create --help) == *image-state* ]]; then
+    printf 'image-state "legacy"\n' >> image.kdl
+fi
 if [[ $tuf_mirrors == 1 ]]; then
     "$cps" repo sync-profile --config image.kdl --index-only
     test -z "$(find mirror-cache -path '*/blobs/*' -type f -print -quit)"
 fi
 "$cps" image-create --root base --config image.kdl
+state_dir=var/lib/cps/image
+if [[ -d base/.cps ]]; then state_dir=.cps; fi
 if ! $profiled && [[ -n $cps_fixture ]]; then
     "$cps" publisher add --root base --repo "$cps_fixture/repo" \
         --trust-key "$cps_fixture/release-public.der" canopa
@@ -651,6 +681,12 @@ if [[ -n $cps_fixture ]]; then
     for path in usr/bin/cps "${cps_library_paths[@]}"; do
         cmp "base/$path" "$cps_fixture/image/$path"
     done
+    if [[ -n $boot_trust_dependency ]]; then
+        cmp base/etc/cps/tuf-root.json "$cps_fixture/image/etc/cps/tuf-root.json"
+    fi
+    if [[ -n $boot_git_build_dependency ]]; then
+        diff -r "$cps_fixture/image/usr/share/cps/git-build" base/usr/share/cps/git-build
+    fi
     for path in "${elf_runtime_paths[@]}"; do
         cmp "base/$path" "$elf_runtime/image/$path"
     done
@@ -973,7 +1009,7 @@ if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     test ! -e "$staged_root/usr/lib/modules/$base_release/vmlinuz"
     cmp "$trial_kernel" "$staged_root/usr/lib/modules/$trial_release/vmlinuz"
     prepared=
-    for file in "$staged_root"/.cps/kernel-*/linux; do
+    for file in "$staged_root/$state_dir"/kernel-*/linux; do
         if cmp -s "$file" "$trial_kernel"; then prepared=$file; break; fi
     done
     test -n "$prepared"
@@ -1097,13 +1133,13 @@ fi
 if $health_failure; then
     # Simulate an offline modification after checked activation.
     if [[ $mode == catalog-health-fail ]]; then
-        debugfs -R 'dump /.cps/state.sqlite trial.sqlite' "$staged_image" >/dev/null
+        debugfs -R "dump /$state_dir/state.sqlite trial.sqlite" "$staged_image" >/dev/null
         changed=$(sqlite3 -batch -bail trial.sqlite \
             "UPDATE catalog_archives SET catalog=x'00'; SELECT changes();")
         test "$changed" -gt 0
-        printf '%s\n' 'rm /.cps/state.sqlite' 'write trial.sqlite /.cps/state.sqlite' > corrupt-debugfs
+        printf '%s\n' "rm /$state_dir/state.sqlite" "write trial.sqlite /$state_dir/state.sqlite" > corrupt-debugfs
         debugfs -w -f corrupt-debugfs "$staged_image" >/dev/null
-        debugfs -R 'dump /.cps/state.sqlite modified.sqlite' "$staged_image" >/dev/null
+        debugfs -R "dump /$state_dir/state.sqlite modified.sqlite" "$staged_image" >/dev/null
         cmp trial.sqlite modified.sqlite
     else
         debugfs -w -R 'set_inode_field /etc/cps-vm-state mode 0100600' "$staged_image" >/dev/null

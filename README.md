@@ -232,11 +232,19 @@ timestamps so independently provisioned images can still match byte for byte.
 
 Run `cps verify --root image --pristine` to check a freshly assembled offline
 root. It checks all package paths, including preserved configuration and
-implicit directories, and reports unmanaged paths outside the reserved
-`.cps` state directory. It also rejects unexpected hard links to regular files
+implicit directories, and reports unmanaged paths outside the image state.
+It also rejects unexpected hard links to regular files
 and undeclared extended attributes on managed regular files and directories.
 Use regular `verify` after provisioning or booting, when the system can
 generate files outside package ownership.
+
+New images keep the package database, transaction staging, and prepared kernel
+files under `/var/lib/cps/image/` inside the image. On Btrfs, this directory and
+its ancestors must be part of the root subvolume. Keep `/var` on that subvolume
+so each boot environment carries the package state that matches its files.
+Existing images with state under `/.cps` still use that layout. To provision
+an image for an older CPS binary, add `image-state "legacy"` to the KDL
+passed to `image-create --config`.
 
 Use `plan exact-install NAME ...` to reconcile an image to the named packages and their required dependencies. The plan previews packages that would be removed. Use `plan remove NAME ...` to remove selected packages from committed image state while offline. Removal fails if a package that remains still requires one of those packages. Both operations preserve locally edited files declared with `preserve=#true`. A saved install, exact-install, remove, or update plan can also be applied to a clone with `boot-env stage`.
 
@@ -575,8 +583,8 @@ and each selected package's publisher, version, and manifest digest.
 
 ### Building CPS itself
 
-On an x86-64 Arch Linux worker with Rust, the native GCC toolchain, and Python
-3.11 or newer, build the fixture in a new output directory. The worker needs a
+On an x86-64 Arch Linux worker with Rust, the native GCC toolchain, jq, zstd, and
+Python 3.11 or newer, build the fixture in a new output directory. The worker needs a
 sparse crates.io cache populated for the selected revision's `Cargo.lock` and a
 directory with the SQLite 3.54.1 autoconf archive and the libseccomp 2.6.1 release
 archive. The recipes verify the archive lengths and digests on import.
@@ -584,7 +592,8 @@ archive. The recipes verify the archive lengths and digests on import.
 
 ```sh
 cargo fetch --locked
-CPS_RUNTIME_SOURCE_DIR=/path/to/runtime-sources tests/build-cps.sh target/cps-fixture HEAD
+CPS_MIRROR_TUF_ROOT=/path/to/reviewed-public-root.json \
+  CPS_RUNTIME_SOURCE_DIR=/path/to/runtime-sources tests/build-cps.sh target/cps-fixture HEAD
 ```
 
 The fixture takes the package manifests, build recipes, and worker seed scripts
@@ -600,15 +609,22 @@ recipe pins that library catalog, the Rust and C toolchain catalog,
 and the `runtime-seed` catalog with the worker's prebuilt ELF loader and C
 and GCC runtime libraries. The seed provides both loader paths used by CPS
 and glibc as hard links to one inode. After two matching builds, the release
-adds CPS to the catalog and validates the `cps-runtime` profile with `devel`
-disabled.
-The fixture installs that profile and uses its own loader and libraries to
-run the installed CPS binary and verify the image.
+adds CPS, `system/canopa-trust`, and `system/git-build` to the catalog and validates the signed
+`cps-runtime` profile with `devel` disabled. The trust package pins the
+reviewed public root by size and SHA-256 and installs its exact bytes at
+`/etc/cps/tuf-root.json` with mode `0644`. Its package version is `1.0.0-N`,
+where `N` is the TUF root version. Provide the public bootstrap root from the
+offline signing ceremony through `CPS_MIRROR_TUF_ROOT`. The Git build package
+ships the default configuration, public key, and a signed local catalog with
+BusyBox and its runtime files. The worker takes BusyBox from
+`/usr/lib/initcpio/busybox` or `CPS_GIT_BUILD_BUSYBOX`. The fixture installs
+the profile, checks the installed root and Git toolchain, and uses the image's loader and libraries
+to run the installed CPS binary and verify the image.
 
 The output includes `source-revision`, the recipes, source cache, toolchain
 repository, protected package repository, and runtime seed repository. Set
 `CPS_VM_CPS_FIXTURE` to that output directory for a systemd VM boot test. The
-VM fixture installs the exact protected CPS package and its dependencies from
+VM fixture installs the exact protected CPS, trust, and Git build packages and their dependencies from
 the signed repositories. Set `CPS_BIN` to `image/usr/bin/cps` inside the output
 directory to also use that executable to assemble the guest. The VM defaults
 to package revision `0.1.0-38`. Use the current host and guest CPS to assemble
@@ -670,6 +686,62 @@ series independently of numbered releases. A release such as `1.2.0` sorts
 above these snapshots in automatic version selection. Concurrent preparations
 for the same package fetch and reserve in order. Repeating the latest snapshot
 preparation with the same inputs reuses its version while it remains eligible.
+
+### Installing directly from Git
+
+Put one `cps.kdl` at the Git repository root. It combines the usual package
+actions and build recipe. CPS assigns the local publisher and supplies the
+manifest and `git.tar` pins when it prepares a build.
+
+```kdl
+schema-version 1
+package "demo/hello" version="1.0.0-0" {
+    file "usr/bin/hello" mode="0755" uid=0 gid=0
+}
+build architecture="x86_64" epoch=1700000000 {
+    toolchain "default"
+    script """
+    tar -xf "$CPS_SOURCES/git.tar"
+    install -Dm755 hello "$DESTDIR/usr/bin/hello"
+    """
+}
+```
+
+The signed base profile ships `system/git-build`. CPS reads its
+`/usr/share/cps/git-build/toolchain.kdl` automatically. The default supplies a
+shell, tar, install, and other basic utilities from a local signed catalog.
+Use an explicit toolchain pin and a matching
+[toolchain configuration](#building-with-several-publishers) for builds that
+need a compiler or other tools. Administrators can still set
+`git-toolchain-config "toolchains.kdl"` in `/etc/cps/image.kdl` to use a
+different config. To support `toolchain "default"`, place a schema-versioned
+pinned toolchain block in the companion file `toolchains.default.kdl`.
+
+The running Btrfs system needs Git and Bubblewrap. Invoke CPS through `sudo`
+from an unprivileged account with read access to the toolchain configuration,
+its keys, and the pinned toolchain payloads. Other recipe sources can use their
+normal pinned HTTPS downloads. Files committed in Git are available inside
+`git.tar`.
+
+```sh
+sudo cps install --git https://git.example.org/alice/hello.git --track-branch main
+sudo cps upgrade
+```
+
+Use `--commit FULL_COMMIT_ID` in place of `--track-branch` to pin a package.
+Use an HTTPS URL or a local Git repository path. CPS shows the exact commit
+before building, then offers the normal package transaction for approval.
+The Git package can depend on packages from configured publishers. Its signed
+local catalog is shared across boot environments for offline repair.
+
+An ordinary `cps upgrade` checks opted-in branches for descendants of the
+installed commit. It reports a branch rewrite and leaves that package at its
+installed commit. `--dry-run` shows available Git commits without building, and
+`--no-refresh` uses the installed Git selections. CPS stages tracked updates
+in a new boot environment for rollback. When a tracked commit's version
+would not advance the package, CPS allocates a higher revision. `cps info NAME` shows the
+installed commit as `upstream-version`. That manifest is part of the boot
+environment, so rollback restores the commit and the installed files together.
 
 ### Building and publishing with signed evidence
 
@@ -1091,6 +1163,8 @@ another repository.
 ```kdl
 profile "cps-runtime" architecture="x86_64" {
     package "system/cps"
+    package "system/canopa-trust"
+    package "system/git-build"
     publisher "canopa-runtime-seed" catalog="<signed seed catalog SHA-256>" {
         repository "../runtime-seed"
         trust-key "../runtime-seed-public.der"
@@ -1218,7 +1292,7 @@ rebuilding its own packages.
 cps repo export --repo repo --publisher canopa --trust-key public.der --output release-targets
 ```
 
-The export includes the catalog pointer, signed catalog, and the manifests and payloads for active packages. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
+The live export includes the catalog pointer, signed catalog, and the manifests and payloads for active packages. It also includes the `publisher` and `publisher.der` targets for publisher discovery. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
 
 Export compresses each distinct payload with Zstandard when the result is
 smaller. The mirror carries either `blobs-SHA256.zst` or `blobs-SHA256`,
@@ -1389,6 +1463,28 @@ rebuilt at its configured path. CPS still checks the image revision, publisher c
 history, and the complete plan before fetching payloads or applying it.
 
 ### Reclaiming mirror cache space
+
+To enable automatic pruning on an installed Btrfs system, add this line to
+`/etc/cps/image.kdl`.
+
+```kdl
+cache-keep-versions 2
+```
+
+After a live transaction commits, a staged update registers its boot entry,
+or `cps resume` succeeds, CPS prunes the TUF caches used by registered roots.
+For each package and target architecture, it keeps payloads already cached
+for the newest two versions with cached files. It also keeps cached payloads
+for every package installed in a registered root, including fallback roots,
+regardless of version. Set the count to `0` to keep only the registered roots'
+payloads. Use this policy for caches dedicated to this system's registered
+roots. Offline images and saved plans outside that set can use a separate
+cache and the manual retention options below. Omitting the setting leaves
+pruning manual.
+
+After a transaction commits, CPS clears the recovery copies in
+`/var/lib/cps/image/stage` inside the image.
+An interrupted transaction retains its recovery copies until it commits.
 
 `repo prune-cache` lists unneeded payload files and their lengths. Run it
 once to review the list, then repeat with `--apply` to remove those files.
@@ -1636,16 +1732,29 @@ Older profiles can still be used with ordinary `plan install`. Use
 `repo publish-release` with `refresh-profiles=#true` to record the
 composition before using `install-profile`.
 
-After installing the signed composition, you can add a locally trusted
-publisher directly from a TUF mirror URL. Obtain its TUF root metadata and
-CPS publisher key through a trusted channel before adding it.
+After installing the signed composition, you can add a publisher from an HTTPS
+mirror using its preinstalled TUF root at `/etc/cps/tuf-root.json`. Provision the
+root through a trusted channel, such as the signed installer. Use
+`--tuf-root PATH` to select another locally trusted root.
+
+```sh
+sudo cps publisher add https://packages.example.org/extras/
+sudo cps install cps://extras/apps/editor
+sudo cps upgrade
+```
+
+CPS verifies the mirror's TUF metadata with the local root, then fetches the
+publisher name and public key as authenticated targets. It displays the
+verified identity and asks for confirmation. After confirmation, CPS checks
+the catalog signature and saves the trust material for later refreshes.
+
+For non-interactive setup or independently provisioned trust, supply the
+TUF root metadata and CPS publisher key explicitly.
 
 ```sh
 sudo cps publisher add extras --url https://packages.example.org/extras/ \
     --tuf-root /etc/cps/keys/extras-root.json \
     --trust-key /etc/cps/keys/extras.der
-sudo cps install cps://extras/apps/editor
-sudo cps upgrade
 ```
 
 The URL must serve `metadata/` and `targets/` beneath it. CPS verifies
@@ -1814,7 +1923,7 @@ key in the environment secret `CPS_RELEASE_SIGNING_KEY_PATH`.
 | `CPS_RELEASE_VM_GATE` | Executable that boots and smoke-tests an actual rehearsed root |
 | `CPS_RELEASE_ROLLOUT_GATE` | Executable that checks health of the deployed cohort |
 | `CPS_RELEASE_ROLLOUT_PLAN` | JSON policy for scheduled rollout advancement |
-| `CPS_RELEASE_DEPLOY` | Executable that deploys the signed catalog to the serving mirror |
+| `CPS_RELEASE_DEPLOY` | Optional custom deployment executable. The workflow defaults to `ci/deploy-mirror.sh`. |
 
 Each request contains `release.kdl` and a `cases/` directory. Each named
 case contains an `image.kdl` using trusted publisher keys and the intended
@@ -1849,8 +1958,10 @@ digest and check the cohort's health. Exit 75 to wait for more observations
 or a longer soak. Any other nonzero exit fails the run.
 
 The deployment adapter receives the repository, publisher, and exact
-catalog digest. It should check the digest before exporting and signing
-TUF targets, publish the new timestamp last, and safely accept retries.
+catalog digest. The bundled adapter exports and verifies that catalog,
+publishes `publisher.json` with its TUF root and publisher public key, and
+publishes the new timestamp last. It retains earlier versioned files and
+chooses a higher TUF metadata version on retries.
 The workflow records successful deployment in `.ci-deployed-catalog`
 in the publishing repository. If the approved current digest has not
 been recorded, a scheduled run retries its deployment before widening.
@@ -1858,6 +1969,149 @@ If mirror deployment fails after local promotion, dispatch
 `deploy-current` with the current digest to retry that deployment.
 `bash tests/release-ci.sh` exercises the workflow with a local repository
 and test adapters.
+
+### Serving a basic HTTPS mirror
+
+Install [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool),
+`jq`, and `flock` on the release runner. Provision an existing, writable
+directory for this publisher and serve it with a static HTTPS server. The
+adapter stages files in the parent directory, which must also be writable
+and on the same filesystem. Point the server at the mirror directory.
+
+Configure these absolute paths as workflow variables or shell environment
+variables when invoking the adapter directly.
+
+| Variable | Value |
+| --- | --- |
+| `CPS_MIRROR_DIR` | The directory served over HTTPS |
+| `CPS_MIRROR_PUBLISHER_KEY` | CPS publisher's public DER key |
+| `CPS_MIRROR_TUF_ROOT` | Original signed TUF root JSON used to bootstrap and verify the rotation chain |
+| `CPS_MIRROR_TUF_ACTIVE_ROOT` | Optional current or next signed TUF root JSON, with consistent snapshots enabled |
+| `CPS_MIRROR_TUF_KEYS` | Private TUF release keys directory containing `targets.pem`, `snapshot.pem`, and `timestamp.pem` |
+
+Keep the CPS publisher signing key and all TUF private keys outside the
+HTTPS directory. To provision the TUF roles, run this on a trusted key
+provisioning machine with `root_json`, `offline_root_key`, and `release_keys`
+set to paths outside the web root. Use a new root JSON path and an existing
+private release keys directory.
+
+```sh
+tuftool root init "$root_json"
+tuftool root expire "$root_json" 'in 52 weeks'
+for role in root targets snapshot timestamp; do
+    tuftool root set-threshold "$root_json" "$role" 1
+done
+tuftool root gen-rsa-key "$root_json" "$offline_root_key" --role root
+for role in targets snapshot timestamp; do
+    tuftool root gen-rsa-key "$root_json" "$release_keys/$role.pem" --role "$role"
+done
+tuftool root sign "$root_json" --key "$offline_root_key"
+```
+
+#### Provisioning a 2-of-3 offline root
+
+For a new 2-of-3 mirror, choose a fresh `root_json` path and an empty private
+`release_keys` directory for the online roles. Set `root_key_a`, `root_key_b`,
+and `root_key_c` to three unused private key paths on the offline provisioning
+machine.
+
+```sh
+umask 077
+tuftool root init "$root_json"
+tuftool root expire "$root_json" 'in 52 weeks'
+tuftool root set-threshold "$root_json" root 2
+for root_key in "$root_key_a" "$root_key_b" "$root_key_c"; do
+    tuftool root gen-rsa-key "$root_json" "$root_key" --role root
+done
+for role in targets snapshot timestamp; do
+    tuftool root set-threshold "$root_json" "$role" 1
+    tuftool root gen-rsa-key "$root_json" "$release_keys/$role.pem" --role "$role"
+done
+tuftool root sign "$root_json" --key "$root_key_a" --key "$root_key_b"
+```
+
+Copy the signed root and the three release keys to the release runner. Keep
+the root signing keys offline. For 2-of-3, store the root keys separately so
+two remain available if one is lost. The adapter pins the published bootstrap
+descriptor to that root and CPS public key.
+
+To deploy the current catalog directly, export the required variables above
+and run this from a checkout after building CPS. Set `repo` to the local
+publishing repository.
+
+```sh
+export CPS_BIN="$PWD/target/release/cps"
+CPS_RELEASE_REPO="$repo" CPS_RELEASE_PUBLISHER=canopa \
+    CPS_RELEASE_DEPLOY="$PWD/ci/deploy-mirror.sh" \
+    bash ci/release.sh deploy-current "$(cat "$repo/current")"
+```
+
+Install the signed TUF root at `/etc/cps/tuf-root.json` on clients for URL-only
+registration. Redeploy existing mirrors with the updated exporter to include
+the publisher discovery targets. Set `CPS_MIRROR_DIR` as a GitHub repository variable and leave
+`CPS_RELEASE_DEPLOY` unset to enable automatic refresh with the bundled adapter.
+The workflow checks the mirror daily at 04:23 UTC and signs fresh TUF metadata
+for the already-deployed catalog when the timestamp has 48 hours or less left.
+This runs independently of scheduled rollout advancement. If the initial
+mirror was published by calling the deploy adapter directly, run
+`deploy-current` once to record the deployed catalog for the refresh job.
+Serve `metadata/timestamp.json` with revalidation so clients see the latest
+version promptly.
+Run `bash tests/deploy-mirror.sh` to exercise publishing and syncing a
+disposable mirror with the same signer.
+
+### Rotating a mirror's TUF root
+
+Keep `CPS_MIRROR_TUF_ROOT` pointing to the original bootstrap root. On the
+offline signing machine, prepare a root one version higher than the current
+root. Sign it with enough keys to satisfy both the current and new root
+thresholds. With `tuftool`, first sign `next-root.json` with the new root keys.
+Then run `tuftool root sign next-root.json --cross-sign current-root.json`
+with the previous root keys. This appends the previous root signatures.
+For a 2-of-3 root, the two remaining keys can authorize a successor that
+revokes the third. A signature from a key authorized by both roots counts
+toward both thresholds.
+
+Copy the signed successor to the release runner and set
+`CPS_MIRROR_TUF_ACTIVE_ROOT` to its path. If you also rotated the online
+roles, point `CPS_MIRROR_TUF_KEYS` at the matching release keys. Run
+`deploy-current` for the deployed catalog digest.
+
+The hook verifies the chain from the bootstrap root before publishing,
+retains every versioned root file, and publishes the new root just before
+the new timestamp. Existing clients pick up the successor on sync. Keep
+`CPS_MIRROR_TUF_ACTIVE_ROOT` set for later deployments and timestamp refreshes.
+
+### Publishing and verifying signed mirror release notes
+
+To publish notes for the bundled mirror, set the GitHub repository variable
+`CPS_MIRROR_URL` to the public HTTPS mirror URL. Install GitHub CLI and OpenSSH
+on the release runner. Set the protected `cps-release` environment secret
+`CPS_RELEASE_NOTES_SIGNING_KEY_PATH` to the absolute path of a dedicated
+Ed25519 OpenSSH signing key that the runner can use unattended. Keep the
+signing key and both trusted input files outside the HTTPS directory.
+
+After deploying a catalog, the workflow checks that the published
+`publisher.json` matches the runner's trusted TUF root and CPS public key.
+It publishes an optional GitHub Release for that catalog with `release-notes.md`
+and `release-notes.md.sig`. The signed notes identify the publisher,
+mirror URL, catalog digest, and SHA-256 fingerprints of the exact root JSON
+and DER key bytes. Retry a failed notes publication with `deploy-current`
+for the same catalog.
+
+For independent verification of the release notes, obtain the notes signer's
+public key through a trusted channel. With that key in
+`cps-release-notes.pub`, download both GitHub release assets and verify them.
+
+```sh
+printf 'cps-release namespaces="cps-release-notes" %s\n' \
+    "$(cat cps-release-notes.pub)" > cps-release-allowed-signers
+ssh-keygen -Y verify -f cps-release-allowed-signers -I cps-release \
+    -n cps-release-notes -s release-notes.md.sig < release-notes.md
+```
+
+Run `bash tests/release-notes.sh` to test signing and publication retries
+with a disposable signing key and a local GitHub CLI fixture.
 
 ### Provisioning the same composition on another machine
 
@@ -1935,7 +2189,7 @@ clients before publishing packages that use it.
 - `conditional "desktop/plugin" version="=2.0.0-0" when="runtime/desktop" when-version=">=2.0.0-0"` requires the plugin when the resulting image includes a matching runtime. Omit `when-version` to match any installed version of the runtime. The predicate alone leaves the runtime optional.
 - New plans use Resolvo to resolve compatible versions and report incompatible requirements. When selected file actions collide, CPS excludes the conflicting version or pair of versions and retries. Directory sharing still requires identical metadata. SAT resolution has a 60-second time limit. Saved plans record their solver version so apply can verify the same selection against the pinned catalog. Plans created before solver versioning retain their original behavior. [Resolvo](https://github.com/prefix-dev/resolvo)
 - Actions support `file`, `dir`, `symlink`, and `hardlink`. A symlink specifies `target` in place of `mode`. Use `hardlink "bin/tool" target="usr/bin/tool"` to share the inode of an immutable regular file in the same package. The target is relative to the image root and supplies ownership, mode, and content. The optional `arch` and `facet` selectors match image policy. A hard link's target must be selected whenever the alias is selected. Facets default to enabled and can be set with `image-create --facet doc.man=false`. [IPS hard-link actions](https://docs.oracle.com/cd/E53394_01/html/E54820/pkgterms.html)
-- Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. When the vendor file changes, find its new copy in `image/.cps/config-updates/<revision>/`.
+- Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. When the vendor file changes, find its new copy under `/var/lib/cps/image/config-updates/<revision>/` inside the image.
 - The image must be inactive and reside on one filesystem. Existing explicit directory metadata must match either the installed declaration or the selected action; matching installed directories can be updated in place. Unmanaged or locally changed directory metadata must already match the selected action. Transitions between a directory and a file or symlink are rejected. When ownership ends, CPS prunes directories it recorded creating if they are empty and their metadata still matches. It keeps pre-existing directories and directories with local content or extended attributes.
 
 Use `cps plan --root image --output cleanup.json autoremove` to preview

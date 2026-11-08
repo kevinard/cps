@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::{Path, PathBuf},
 };
@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ImageLock,
-    image::Image,
+    image::{Image, Publisher},
+    model::Version,
     plan::{Plan, payloads},
     repo::read_package,
 };
@@ -164,6 +165,7 @@ fn keep_profile_pins(state: &Root, catalogs: &mut BTreeSet<String>) -> Result<()
     Ok(())
 }
 
+#[derive(Default)]
 pub struct CacheRetention<'a> {
     pub catalogs: &'a [String],
     pub images: &'a [PathBuf],
@@ -235,8 +237,64 @@ pub(crate) fn prune_with_registered_roots(
     locks: &[ImageLock],
     apply: bool,
 ) -> Result<PruneReport> {
+    prune(
+        repo,
+        publisher,
+        &read_key(trust_key)?,
+        registered,
+        PrunePolicy {
+            keep,
+            locks,
+            apply,
+            versions: None,
+        },
+    )
+}
+
+pub(crate) fn prune_system_payloads(
+    publisher: &Publisher,
+    registered: &[(String, Image)],
+    versions: usize,
+) -> Result<PruneReport> {
+    ensure!(
+        !registered.is_empty(),
+        "automatic pruning requires registered boot roots"
+    );
+    prune(
+        &publisher.repo,
+        &publisher.name,
+        &publisher.key,
+        registered,
+        PrunePolicy {
+            keep: CacheRetention::default(),
+            locks: &[],
+            apply: true,
+            versions: Some(versions),
+        },
+    )
+}
+
+struct PrunePolicy<'a> {
+    keep: CacheRetention<'a>,
+    locks: &'a [ImageLock],
+    apply: bool,
+    versions: Option<usize>,
+}
+
+fn prune(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    registered: &[(String, Image)],
+    policy: PrunePolicy<'_>,
+) -> Result<PruneReport> {
+    let PrunePolicy {
+        keep,
+        locks,
+        apply,
+        versions,
+    } = policy;
     validate_publisher(publisher)?;
-    let key = read_key(trust_key)?;
     let repo = fs::canonicalize(repo).context("opening repository cache")?;
     ensure!(
         path_present(&repo.join(".tuf"))?,
@@ -254,7 +312,7 @@ pub(crate) fn prune_with_registered_roots(
         .collect::<Result<Vec<_>>>()?;
     let _lock = lock_repo(&repo)?;
     let state = open_state(&repo)?;
-    check_cache_origin(&state, publisher, &key)?;
+    check_cache_origin(&state, publisher, key)?;
     let current = read_current(&repo)?;
     let retained = read_limited(
         state.file(&format!("{RETENTION}/{current}"))
@@ -268,13 +326,16 @@ pub(crate) fn prune_with_registered_roots(
             .into_iter()
             .map(str::to_owned),
     );
-    keep_profile_pins(&state, &mut catalogs)?;
+    if versions.is_none() {
+        keep_profile_pins(&state, &mut catalogs)?;
+    }
     for hash in keep.catalogs {
         validate_digest(hash)?;
         catalogs.insert(hash.clone());
     }
     let mut live = BTreeSet::new();
     let mut registered_roots = Vec::new();
+    let mut architectures = BTreeSet::new();
     let explicit = images
         .iter()
         .zip(keep.images)
@@ -284,6 +345,16 @@ pub(crate) fn prune_with_registered_roots(
         .map(|(id, image)| (image, id.clone(), true));
     for (image, label, automatic) in explicit.chain(automatic) {
         let state = image.state()?;
+        if versions.is_some() {
+            ensure!(
+                !state
+                    .publishers
+                    .as_slice()
+                    .iter()
+                    .any(|configured| { configured.repo == repo && configured.name != publisher }),
+                "kept image {label} uses this cache for a different publisher"
+            );
+        }
         let configured = state.publishers.get(publisher);
         if automatic && configured.is_none_or(|configured| configured.repo != repo) {
             continue;
@@ -299,7 +370,7 @@ pub(crate) fn prune_with_registered_roots(
         let pins = image.release_pins(&state.publishers, &state.settings)?;
         let pin = pins.get(publisher);
         if let Some(pin) = pin {
-            pin.read(&repo, publisher, &key)?;
+            pin.read(&repo, publisher, key)?;
             catalogs.insert(pin.sha256.clone());
         }
         let mut payloads = BTreeSet::new();
@@ -314,6 +385,7 @@ pub(crate) fn prune_with_registered_roots(
             }
         }
         if automatic {
+            architectures.insert(state.settings.arch);
             registered_roots.push(RetainedRoot {
                 id: label,
                 package_payloads: payloads.len(),
@@ -334,8 +406,8 @@ pub(crate) fn prune_with_registered_roots(
         }
     }
     for lock in locks {
-        let hash = lock.retained_catalog(publisher, &key)?;
-        let catalog = read_catalog(&repo, hash, publisher, &key)
+        let hash = lock.retained_catalog(publisher, key)?;
+        let catalog = read_catalog(&repo, hash, publisher, key)
             .with_context(|| format!("reading locked catalog {hash}"))?;
         for (id, manifest) in lock.pinned_packages(publisher) {
             let entry = catalog
@@ -350,37 +422,54 @@ pub(crate) fn prune_with_registered_roots(
             live.extend(release_blobs([&package])?.into_keys().map(str::to_owned));
         }
     }
-    for hash in catalogs {
-        let catalog = read_catalog(&repo, &hash, publisher, &key)
-            .with_context(|| format!("reading kept catalog {hash}"))?;
-        for (id, entry) in catalog.entries {
-            let package = read_package(&repo, publisher, &id, &entry)?;
-            live.extend(release_blobs([&package])?.into_keys().map(str::to_owned));
-        }
-    }
     let directory = Root::open(&repo)?.dir("blobs")?;
-    let mut report = PruneReport {
-        blobs: Vec::new(),
-        bytes: 0,
-        registered_roots,
-    };
+    let mut cached = BTreeMap::new();
     for entry in fs::read_dir(Root::fd_path(&directory))? {
         let entry = entry?;
         let Ok(hash) = entry.file_name().into_string() else {
             continue;
         };
-        if validate_digest(&hash).is_err() || live.contains(&hash) || !entry.file_type()?.is_file()
-        {
+        if validate_digest(&hash).is_ok() && entry.file_type()?.is_file() {
+            cached.insert(hash, entry.metadata()?.len());
+        }
+    }
+    if let Some(versions) = versions {
+        if versions > 0 && !cached.is_empty() {
+            keep_cached_versions(
+                &repo,
+                publisher,
+                key,
+                &cached,
+                versions,
+                &architectures,
+                &mut live,
+            )?;
+        }
+    } else {
+        for hash in catalogs {
+            let catalog = read_catalog(&repo, &hash, publisher, key)
+                .with_context(|| format!("reading kept catalog {hash}"))?;
+            for (id, entry) in catalog.entries {
+                let package = read_package(&repo, publisher, &id, &entry)?;
+                live.extend(release_blobs([&package])?.into_keys().map(str::to_owned));
+            }
+        }
+    }
+    let mut report = PruneReport {
+        blobs: Vec::new(),
+        bytes: 0,
+        registered_roots,
+    };
+    for (hash, length) in cached {
+        if live.contains(&hash) {
             continue;
         }
-        let length = entry.metadata()?.len();
         report.bytes = report
             .bytes
             .checked_add(length)
             .context("payload size total overflow")?;
         report.blobs.push((hash, length));
     }
-    report.blobs.sort_unstable();
     if apply {
         for (hash, _) in &report.blobs {
             unlinkat(&directory, hash.as_str(), AtFlags::empty())
@@ -389,6 +478,72 @@ pub(crate) fn prune_with_registered_roots(
         directory.sync_all()?;
     }
     Ok(report)
+}
+
+fn keep_cached_versions(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    cached: &BTreeMap<String, u64>,
+    versions: usize,
+    architectures: &BTreeSet<String>,
+    live: &mut BTreeSet<String>,
+) -> Result<()> {
+    let root = Root::open(repo)?;
+    let catalogs = root.dir("catalogs")?;
+    let mut seen = BTreeSet::new();
+    let mut packages = BTreeMap::<_, BTreeMap<Version, BTreeSet<String>>>::new();
+    for catalog in fs::read_dir(Root::fd_path(&catalogs))? {
+        let catalog = catalog?;
+        let Ok(hash) = catalog.file_name().into_string() else {
+            continue;
+        };
+        if validate_digest(&hash).is_err() || !catalog.file_type()?.is_file() {
+            continue;
+        }
+        let catalog = read_catalog(repo, &hash, publisher, key)
+            .with_context(|| format!("reading cached catalog {hash}"))?;
+        for (id, entry) in catalog.entries {
+            let targets = architectures
+                .iter()
+                .filter(|arch| entry.supports_architecture(arch));
+            let digest = entry.manifest_digest();
+            // A cached predecessor can supply lineage without its manifests.
+            if targets.clone().next().is_none()
+                || !seen.insert(digest.to_owned())
+                || !path_present(&repo.join("manifests").join(digest))?
+            {
+                continue;
+            }
+            let package = read_package(repo, publisher, &id, &entry)?;
+            let present: BTreeSet<_> = release_blobs([&package])?
+                .into_iter()
+                .filter(|(hash, length)| cached.get(*hash) == Some(length))
+                .map(|(hash, _)| hash.to_owned())
+                .collect();
+            if present.is_empty() {
+                continue;
+            }
+            let manifest = package.manifest;
+            for arch in targets {
+                let retained = packages.entry((manifest.name.clone(), arch)).or_default();
+                retained
+                    .entry(manifest.version.clone())
+                    .or_default()
+                    .extend(present.iter().cloned());
+                if retained.len() > versions {
+                    retained.pop_first();
+                }
+            }
+        }
+    }
+    live.extend(
+        packages
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+            .flatten(),
+    );
+    Ok(())
 }
 
 #[cfg(test)]

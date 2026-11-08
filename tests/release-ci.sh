@@ -102,16 +102,18 @@ printf 'deploy %s\n' "$3" >> "$CPS_TEST_LOG"
 DEPLOY
 chmod +x "$CPS_RELEASE_VM_GATE" "$CPS_RELEASE_ROLLOUT_GATE" "$CPS_RELEASE_DEPLOY"
 release() { bash "$project/ci/release.sh" "$@"; }
-if CPS_TEST_FAIL_GATE=upgrade release promote next; then
+if CPS_RELEASE_DEPLOYED_OUTPUT=$work/outputs CPS_TEST_FAIL_GATE=upgrade release promote next; then
     echo 'An upgrade check failed but promotion succeeded' >&2
     exit 1
 fi
 [[ $(cat repo/current) == "$base" ]]
+[[ ! -e $work/outputs ]]
 ! rg -q '^deploy ' "$CPS_TEST_LOG"
 : > "$CPS_TEST_LOG"
-release promote next
+CPS_RELEASE_DEPLOYED_OUTPUT=$work/outputs release promote next
 candidate=$(cat repo/current)
 [[ $candidate != "$base" ]]
+[[ $(cat "$work/outputs") == "catalog=$candidate" ]]
 [[ $(cat "$CPS_TEST_LOG") == "$(printf 'fresh %s\nupgrade-2 %s\nupgrade-1 %s\ndeploy %s' \
     "$candidate" "$candidate" "$candidate" "$candidate")" ]]
 if CPS_TEST_FAIL_GATE=rollout release widen "$candidate" desktop 50; then
@@ -144,3 +146,35 @@ test "$(grep -Fc "deploy $complete" "$CPS_TEST_LOG")" = 1
 printf '{"catalog":"%s","profile":"desktop","percentages":[0,50,100]}\n' "$base" > "$CPS_RELEASE_ROLLOUT_PLAN"
 ! release advance
 echo 'Verified digest-pinned promotion, deployment retry, and health-gated rollout'
+
+export CPS_MIRROR_DIR=$work/mirror
+mkdir -p "$CPS_MIRROR_DIR/metadata"
+timestamp=$CPS_MIRROR_DIR/metadata/timestamp.json
+: > "$CPS_TEST_LOG"
+timestamp_expires() {
+    jq -n --arg expires "$(date -u --date="$1" '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{signed: {expires: $expires}}' > "$timestamp"
+}
+
+timestamp_expires '+3 days'
+release refresh-mirror
+[[ ! -s $CPS_TEST_LOG ]]
+
+timestamp_expires '+1 day'
+printf '%s\n' "$widened" > repo/.ci-deployed-catalog
+if release refresh-mirror; then
+    echo 'Refresh accepted a catalog that had not been recorded as deployed' >&2
+    exit 1
+fi
+[[ ! -s $CPS_TEST_LOG ]]
+printf '%s\n' "$complete" > repo/.ci-deployed-catalog
+
+if CPS_TEST_FAIL_GATE=deploy release refresh-mirror; then
+    echo 'A failed refresh was reported as successful' >&2
+    exit 1
+fi
+[[ ! -s $CPS_TEST_LOG ]]
+release refresh-mirror
+[[ $(cat "$CPS_TEST_LOG") == "deploy $complete" ]]
+[[ $(cat repo/current) == "$complete" ]]
+echo 'Verified timestamp refresh for the deployed catalog'

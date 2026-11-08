@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     boot::kernel::{self, Artifacts},
     image::{
-        Image, Installed, Managed, ProfileIntent, Settings, State, history::TransactionDetails,
-        lock::ImageLock, publisher_generation_is_initial, root::Root,
+        Image, Installed, Managed, ProfileIntent, Settings, State, StateLayout,
+        history::TransactionDetails, lock::ImageLock, publisher_generation_is_initial, root::Root,
     },
     model::{FORMAT, Node, PackageSpec, digest, validate_name, validate_publisher},
     repo::{BuildReceipt, Published, ReleaseAdvisory},
@@ -41,7 +41,14 @@ pub(crate) use resolve::{
 };
 pub use update::{HeldBackUpdate, PhasedUpdateDeferred};
 
-const CONFIG_UPDATES_DIR: &str = ".cps/config-updates";
+fn is_config_update(path: &str) -> bool {
+    [StateLayout::Legacy, StateLayout::VarLib]
+        .iter()
+        .any(|layout| {
+            path.strip_prefix(layout.config_updates())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -183,6 +190,8 @@ pub struct Plan {
     pub(crate) track_profile_intent: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     force_phased_update: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    git_updates: Vec<String>,
     pub(crate) catalog: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
@@ -216,6 +225,9 @@ impl Plan {
     pub(crate) fn boot_reason(&self, stage_packages: &BTreeSet<String>) -> Option<String> {
         if self.kernel_install.is_some() {
             return Some("the transaction changes the boot kernel or initramfs".into());
+        }
+        if !self.git_updates.is_empty() {
+            return Some("the transaction updates a tracked Git commit".into());
         }
         if let Some(change) = self
             .package_changes
@@ -271,6 +283,7 @@ impl Plan {
             prune_directories: saved.map_or(solver.is_some(), |plan| plan.prune_directories),
             track_profile_intent: false,
             force_phased_update: false,
+            git_updates: Vec::new(),
             catalog: None,
             catalogs: BTreeMap::new(),
             request,
@@ -382,7 +395,7 @@ impl Plan {
                 });
             }
             for write in &self.writes {
-                if write.config_move.is_some() || write.path.starts_with(CONFIG_UPDATES_DIR) {
+                if write.config_move.is_some() || is_config_update(&write.path) {
                     continue;
                 }
                 match (&write.before, &write.after) {
@@ -414,7 +427,7 @@ impl Plan {
         for write in self
             .writes
             .iter()
-            .filter(|write| write.path.starts_with(CONFIG_UPDATES_DIR) && write.replaces_file())
+            .filter(|write| is_config_update(&write.path) && write.replaces_file())
         {
             lines.push(format!("Stage vendor config {:?}", write.path));
         }
@@ -424,8 +437,7 @@ impl Plan {
             match take {
                 ConfigChoice::Local => lines.push(format!("Keep local config {path}")),
                 ConfigChoice::Vendor => lines.push(format!(
-                    "Install vendor config {path} from {}",
-                    config::vendor_copy(revision, path)
+                    "Install vendor config {path} from revision {revision}"
                 )),
             }
         }
@@ -508,6 +520,7 @@ impl Plan {
                 && after.publisher_generation == before.publisher_generation
                 && after.boot_parent == before.boot_parent
                 && after.arch == before.arch
+                && after.state_layout == before.state_layout
                 && after.uid == before.uid
                 && after.gid == before.gid
                 && next.publishers == current.publishers
@@ -558,7 +571,7 @@ impl Plan {
         Ok(())
     }
 
-    pub(crate) fn config_payload(&self) -> Option<(String, &Node)> {
+    pub(crate) fn config_payload(&self, layout: StateLayout) -> Option<(String, &Node)> {
         let Request::ResolveConfig {
             path,
             take: ConfigChoice::Vendor,
@@ -571,7 +584,10 @@ impl Plan {
             .writes
             .iter()
             .find(|write| write.path == *path && write.replaces_file())?;
-        Some((config::vendor_copy(revision, path), write.after.as_ref()?))
+        Some((
+            config::vendor_copy(layout, revision, path),
+            write.after.as_ref()?,
+        ))
     }
 }
 
@@ -662,18 +678,20 @@ pub(crate) fn plan_image(
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
-    plan_with_state(&image, state, request, options, diagnostics)
+    plan_with_state(&image, state, request, options, diagnostics, &[])
 }
 
 pub(crate) fn plan_system(
     path: &Path,
     request: Request,
     options: PlanOptions,
+    git_updates: &[String],
 ) -> Result<(Plan, crate::systemd::LiveServices)> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let before = image.state()?;
-    let (plan, after, _) = plan_with_state(&image, before.clone(), request, options, None)?;
+    let (plan, after, _) =
+        plan_with_state(&image, before.clone(), request, options, None, git_updates)?;
     let services = crate::systemd::LiveServices::plan(&plan, &before, &after);
     Ok((plan, services))
 }
@@ -684,6 +702,7 @@ fn plan_with_state(
     request: Request,
     options: PlanOptions,
     diagnostics: Option<UpdateDiagnostics<'_>>,
+    git_updates: &[String],
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
     let solver = if options.install_recommends
         && matches!(
@@ -706,6 +725,7 @@ fn plan_with_state(
         Some(solver),
         options.force_phased_update,
         diagnostics,
+        git_updates,
     )
 }
 
@@ -793,6 +813,7 @@ pub(crate) fn build(
         solver,
         saved.is_some_and(|plan| plan.force_phased_update),
         None,
+        &[],
     )
 }
 
@@ -804,9 +825,39 @@ fn build_with_update_diagnostics(
     solver: Option<SolverRevision>,
     force_phased_update: bool,
     mut diagnostics: Option<UpdateDiagnostics<'_>>,
+    git_updates: &[String],
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
+    let git_updates = saved.map_or(git_updates, |plan| plan.git_updates.as_slice());
     let root = &image.root;
     let updating = matches!(request, Request::Update | Request::UpdateProfile);
+    ensure!(
+        git_updates.is_empty() || updating,
+        "Git update selections require an upgrade"
+    );
+    let git_selected = if git_updates.is_empty() {
+        BTreeMap::new()
+    } else {
+        let selected = catalogs::requested(&state, git_updates)?;
+        for (name, target) in &selected {
+            let package = state
+                .installed
+                .get(*name)
+                .context("Git update package is not installed")?;
+            let publisher = &package.published.manifest.publisher;
+            ensure!(
+                target.publisher == Some(publisher)
+                    && target.version.is_some()
+                    && state
+                        .publishers
+                        .get(publisher)
+                        .and_then(|publisher| publisher.git.as_ref())
+                        .and_then(crate::git_install::GitSource::branch)
+                        .is_some(),
+                "Git update must select an exact version from the installed tracking branch"
+            );
+        }
+        selected
+    };
     ensure!(
         !force_phased_update || updating,
         "--force-phased-update requires an update request"
@@ -1011,6 +1062,30 @@ fn build_with_update_diagnostics(
                 },
                 lock,
             )?;
+            // A shared Git catalog can contain approved builds from other boot roots.
+            // Only a transaction that selected an exact version can advance this root.
+            catalogs.candidates.packages.retain(|package| {
+                let manifest = &package.manifest;
+                if state
+                    .publishers
+                    .get(&manifest.publisher)
+                    .is_none_or(|publisher| publisher.git.is_none())
+                {
+                    return true;
+                }
+                state
+                    .installed
+                    .get(&manifest.name)
+                    .is_some_and(|installed| installed.published.sha256 == package.sha256)
+                    || requested
+                        .get(manifest.name.as_str())
+                        .into_iter()
+                        .chain(git_selected.get(manifest.name.as_str()))
+                        .any(|target| {
+                            target.publisher == Some(manifest.publisher.as_str())
+                                && target.version.as_ref() == Some(&manifest.version)
+                        })
+            });
             update_profile |= saved.is_none()
                 && matches!(request, Request::Update)
                 && !state.installed.is_empty()
@@ -1037,7 +1112,12 @@ fn build_with_update_diagnostics(
                 |name| state.settings.profile_packages.contains_key(name),
                 catalogs.profile.as_ref().filter(|_| update_profile),
             )?;
-            let successors = catalogs.renames.requirements();
+            let mut successors = catalogs.renames.requirements();
+            successors.extend(
+                git_selected
+                    .iter()
+                    .map(|(&name, target)| (name, target.clone())),
+            );
             let select = |state: &State, requirements: &BTreeMap<&str, PackageSpec<'_>>| {
                 if update_profile {
                     let profile = catalogs
@@ -1151,6 +1231,11 @@ fn build_with_update_diagnostics(
                     Err(error) => format!("{error:#}"),
                 };
             }
+            for name in git_selected.keys() {
+                if let Some(package) = installed.get_mut(*name) {
+                    package.explicit = state.installed[*name].explicit;
+                }
+            }
             if let Some(intent) = &mut state.settings.profile_intent {
                 catalogs.renames.transfer_local(&mut intent.local);
             } else if !update_profile {
@@ -1204,6 +1289,7 @@ fn build_with_update_diagnostics(
         }
     }
     freeze::check(&state.settings.freezes, &installed)?;
+    state.settings.check_state_paths(&paths)?;
     // Resolving a vendor proposal changes local configuration, so a staged
     // boot environment can still be activated at its original revision.
     let revision = if matches!(request, Request::ResolveConfig { .. }) {
@@ -1218,6 +1304,7 @@ fn build_with_update_diagnostics(
     let mut plan = Plan {
         track_profile_intent,
         force_phased_update,
+        git_updates: git_updates.to_vec(),
         catalog: catalogs.legacy,
         catalogs: catalogs.pins,
         systemd: systemd::plan_actions(&state, &installed, &paths),
@@ -1643,8 +1730,8 @@ fn requested_names(packages: &[String]) -> Result<BTreeSet<String>> {
     Ok(packages.iter().cloned().collect())
 }
 
-pub(crate) fn config_update_prefix(revision: u64) -> String {
-    format!("{CONFIG_UPDATES_DIR}/{revision}/")
+pub(crate) fn config_update_prefix(layout: StateLayout, revision: u64) -> String {
+    format!("{}/{revision}/", layout.config_updates())
 }
 
 fn stage_config(
@@ -1658,8 +1745,10 @@ fn stage_config(
     if let Some(updates) = &mut settings.config_updates {
         updates.insert(path.to_owned(), revision);
     }
-    let path = format!("{}{path}", config_update_prefix(revision));
-    for (index, _) in path.match_indices('/').skip(1) {
+    let layout = settings.state_layout;
+    let path = config::vendor_copy(layout, revision, path);
+    let depth = layout.directory().split('/').count();
+    for (index, _) in path.match_indices('/').skip(depth) {
         let parent = &path[..index];
         if !writes.contains_key(parent) {
             let before = root.inspect(parent)?;

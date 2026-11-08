@@ -10,6 +10,7 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
+    image::StateLayout,
     model::{
         Action, Dependency, DependencyTarget, FORMAT, Manifest, NIL_UUID, OptionalDependency,
         is_uuid, validate_digest, validate_name, validate_publisher,
@@ -673,6 +674,9 @@ pub(crate) struct ImageDefinition {
     pub mirrors: BTreeMap<String, MirrorConfig>,
     pub boot_btrfs: Option<BtrfsConfig>,
     pub stage_packages: BTreeSet<String>,
+    pub cache_keep_versions: Option<usize>,
+    pub state_layout: Option<StateLayout>,
+    pub git_toolchain_config: Option<PathBuf>,
 }
 
 pub(crate) struct BtrfsConfig {
@@ -710,6 +714,9 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         mirrors: BTreeMap::new(),
         boot_btrfs: None,
         stage_packages: BTreeSet::new(),
+        cache_keep_versions: None,
+        state_layout: None,
+        git_toolchain_config: None,
     };
     let mut architecture = false;
     let mut names = BTreeSet::new();
@@ -773,6 +780,35 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                         known_good: false,
                     },
                 });
+            }
+            "git-toolchain-config" => {
+                ensure!(
+                    config.git_toolchain_config.is_none(),
+                    "duplicate git-toolchain-config node"
+                );
+                let path = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                config.git_toolchain_config = Some(parent.join(path));
+            }
+            "image-state" => {
+                ensure!(config.state_layout.is_none(), "duplicate image-state node");
+                let fields = Fields::read(node, 1, &[], false)?;
+                config.state_layout = Some(match fields.string_arg(0)?.as_str() {
+                    "var-lib" => StateLayout::VarLib,
+                    "legacy" => StateLayout::Legacy,
+                    _ => bail!("image-state must be var-lib or legacy"),
+                });
+            }
+            "cache-keep-versions" => {
+                ensure!(
+                    config.cache_keep_versions.is_none(),
+                    "duplicate cache-keep-versions node"
+                );
+                let fields = Fields::read(node, 1, &[], false)?;
+                let versions = fields.args[0]
+                    .as_integer()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .context("cache-keep-versions must be an unsigned integer in range")?;
+                config.cache_keep_versions = Some(versions);
             }
             "stage-package" => {
                 let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
@@ -847,6 +883,7 @@ mod tests {
                 trust-key "/etc/keys/canopa.der"
             }
             architecture "aarch64"
+            cache-keep-versions 2
             facet "doc.man" #false
             image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"
         "#;
@@ -860,6 +897,7 @@ mod tests {
             Path::new("/etc/keys/canopa.der")
         );
         assert_eq!(parsed.arch, "aarch64");
+        assert_eq!(parsed.cache_keep_versions, Some(2));
         assert!(!parsed.facets["doc.man"]);
         assert_eq!(
             parsed.image_id.as_deref(),
@@ -882,6 +920,18 @@ mod tests {
             )
             .is_err()
         );
+        for invalid in ["-1", "#true", "2\ncache-keep-versions 1"] {
+            assert!(
+                parse_image_config(
+                    &config.replace(
+                        "cache-keep-versions 2",
+                        &format!("cache-keep-versions {invalid}")
+                    ),
+                    Path::new("/tmp"),
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 

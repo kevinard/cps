@@ -11,7 +11,7 @@ use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    image::{Installed, Managed, root::Root},
+    image::{Image, Installed, Managed, Settings, root::Root},
     model::{Node, digest, digest_reader},
 };
 
@@ -119,28 +119,29 @@ impl Artifacts {
         Ok(format!("kernel-{}", digest(&serde_json::to_vec(self)?)))
     }
 
-    pub fn open_prepared(&self, root: &Root) -> Result<(File, Option<File>)> {
+    pub fn open_prepared(&self, state: &Root) -> Result<(File, Option<File>)> {
         let dir = self.directory()?;
-        let linux = checked_file(root, &format!(".cps/{dir}/linux"), &self.linux_sha256)
+        let linux = checked_file(state, &format!("{dir}/linux"), &self.linux_sha256)
             .with_context(|| format!("opening prepared kernel {}", self.kernel.release))?;
         let initrd = self
             .initrd_sha256
             .as_ref()
-            .map(|hash| checked_file(root, &format!(".cps/{dir}/initrd"), hash))
+            .map(|hash| checked_file(state, &format!("{dir}/initrd"), hash))
             .transpose()
             .with_context(|| format!("opening prepared initrd for {}", self.kernel.release))?;
         Ok((linux, initrd))
     }
 
-    pub fn prepare(&self, root: &Root, path: &Path, image_id: &str) -> Result<()> {
+    pub fn prepare(&self, image: &Image, path: &Path, settings: &Settings) -> Result<()> {
+        let root = &image.root;
         self.kernel.validate()?;
         let directory = self.directory()?;
-        let state_path = path.join(".cps");
-        let state_dir = root.dir(".cps")?;
+        let state_path = path.join(settings.state_layout.directory());
+        let state_dir = image.state_dir.as_file();
         let final_path = state_path.join(&directory);
         match fs::symlink_metadata(&final_path) {
             Ok(_) => {
-                self.open_prepared(root)?;
+                self.open_prepared(&image.state_dir)?;
                 state_dir.sync_all()?;
                 return Ok(());
             }
@@ -190,7 +191,7 @@ impl Artifacts {
             .env("TMPDIR", scratch.path())
             .env("BOOT_ROOT", &boot)
             .env("BOOT_MNT", &boot)
-            .env("MACHINE_ID", image_id.replace('-', ""))
+            .env("MACHINE_ID", settings.id.replace('-', ""))
             .env("KERNEL_INSTALL_CONF_ROOT", &config)
             .env("KERNEL_INSTALL_PLUGINS", LOADER_ENTRY_PLUGIN)
             .env("KERNEL_INSTALL_READ_MACHINE_INFO", "0")
@@ -220,7 +221,7 @@ impl Artifacts {
         renameat_with(
             &prepared_parent,
             self.kernel.release.as_str(),
-            &state_dir,
+            state_dir,
             directory,
             RenameFlags::NOREPLACE,
         )

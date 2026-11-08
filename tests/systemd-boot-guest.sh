@@ -165,13 +165,15 @@ fi
 "$bb" grep -F 'operation requires an inactive image root' /tmp/rejected
 mount -t ext4 /dev/vdd /installed-copy
 : > /installed-copy/.write-probe
-before=$("$bb" sha256sum /installed-copy/.cps/state.sqlite)
+state_dir=var/lib/cps/image
+if [ -d /installed-copy/.cps ]; then state_dir=.cps; fi
+before=$("$bb" sha256sum "/installed-copy/$state_dir/state.sqlite")
 if cps apply --root /installed-copy /scratch/upgrade.json > /tmp/rejected 2>&1; then
     echo 'CPS_VM_DEVICE: applied a plan to a deployed root'
     exit 1
 fi
 "$bb" grep -F 'use boot-env stage to prepare package changes from a deployed ext4 root' /tmp/rejected
-test "$("$bb" sha256sum /installed-copy/.cps/state.sqlite)" = "$before"
+test "$("$bb" sha256sum "/installed-copy/$state_dir/state.sqlite")" = "$before"
 test "$("$bb" cat /installed-copy/etc/cps-vm-state)" = trial
 "$bb" umount /installed-copy
 mount --bind /fallback/etc /fallback/run

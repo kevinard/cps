@@ -7,11 +7,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    CONFIG_UPDATES_DIR, ConfigMove, Write, config_update_prefix, paths::config_name, stage_config,
-};
+use super::{ConfigMove, Write, config_update_prefix, paths::config_name, stage_config};
 use crate::{
-    image::{DormantConfig, Image, Installed, Managed, Settings, State, root::Root},
+    image::{DormantConfig, Image, Installed, Managed, Settings, State, StateLayout, root::Root},
     model::{Node, copy_payload, validate_path},
     verify::manifest_paths,
 };
@@ -43,7 +41,7 @@ pub fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
     Ok(updates(&image.root, &state.settings, &paths)?
         .into_iter()
         .map(|(path, revision)| {
-            let vendor_copy = vendor_copy(revision, &path);
+            let vendor_copy = vendor_copy(state.settings.state_layout, revision, &path);
             let vendor_available = image
                 .root
                 .inspect(&vendor_copy)
@@ -81,7 +79,7 @@ pub fn config_diff_inputs(
         .get(path)
         .copied()
         .with_context(|| format!("no pending configuration update for {path}"))?;
-    let copy = vendor_copy(revision, path);
+    let copy = vendor_copy(state.settings.state_layout, revision, path);
     copy_payload(&image.root.file(&copy)?, &paths[path].node, vendor)
         .with_context(|| format!("checking staged vendor configuration {copy}"))?;
     if let Some(entry) = image.root.regular_entry(path)? {
@@ -126,7 +124,7 @@ pub(super) fn resolve(
     let after = match choice {
         ConfigChoice::Local => before.clone(),
         ConfigChoice::Vendor => {
-            let copy = vendor_copy(revision, path);
+            let copy = vendor_copy(settings.state_layout, revision, path);
             ensure!(
                 root.inspect(&copy)?.as_ref() == Some(&vendor.node),
                 "staged vendor configuration {copy} differs from its installed manifest"
@@ -471,10 +469,11 @@ pub(super) fn updates(
 
     // Recover old proposals only if their bytes and metadata match the
     // currently installed default. Prior revisions can contain older defaults.
-    if root.inspect(CONFIG_UPDATES_DIR)?.is_none() {
+    let directory = settings.state_layout.config_updates();
+    if root.inspect(directory)?.is_none() {
         return Ok(BTreeMap::new());
     }
-    let dir = root.dir(CONFIG_UPDATES_DIR)?;
+    let dir = root.dir(directory)?;
     let mut revisions = Vec::new();
     for entry in fs::read_dir(Root::fd_path(&dir))? {
         let entry = entry?;
@@ -494,7 +493,7 @@ pub(super) fn updates(
             continue;
         }
         if let Some(revision) = revisions.iter().copied().find(|revision| {
-            root.inspect(&vendor_copy(*revision, path))
+            root.inspect(&vendor_copy(settings.state_layout, *revision, path))
                 .is_ok_and(|copy| copy.as_ref() == Some(&file.node))
         }) {
             found.insert(path.clone(), revision);
@@ -503,6 +502,6 @@ pub(super) fn updates(
     Ok(found)
 }
 
-pub(super) fn vendor_copy(revision: u64, path: &str) -> String {
-    format!("{}{path}", config_update_prefix(revision))
+pub(super) fn vendor_copy(layout: StateLayout, revision: u64, path: &str) -> String {
+    format!("{}{path}", config_update_prefix(layout, revision))
 }

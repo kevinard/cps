@@ -35,6 +35,9 @@ deploy_catalog() {
         rm -f -- "$marker"
         fail 'Cannot record the deployed catalog'
     fi
+    if [[ -n ${CPS_RELEASE_DEPLOYED_OUTPUT:-} ]]; then
+        printf 'catalog=%s\n' "$1" >> "$CPS_RELEASE_DEPLOYED_OUTPUT"
+    fi
     printf 'Deployed catalog %s\n' "$1"
 }
 
@@ -132,5 +135,28 @@ case ${1:-} in
         [[ $# == 2 ]] && digest "$2" || fail 'Expected deploy-current CURRENT_SHA256'
         deploy_catalog "$2"
         ;;
-    *) fail 'Expected promote, widen, advance, or deploy-current' ;;
+    refresh-mirror)
+        [[ $# == 1 ]] || fail 'Expected refresh-mirror'
+        timestamp=${CPS_MIRROR_DIR:?Set CPS_MIRROR_DIR to the HTTPS document directory}/metadata/timestamp.json
+        deployed=$repo/.ci-deployed-catalog
+        if [[ ! -e $timestamp && ! -L $timestamp ]]; then
+            [[ ! -e $deployed ]] || fail 'The deployed mirror is missing its timestamp. Run deploy-current to restore it.'
+            printf '%s\n' 'The first mirror deployment is pending.'
+            exit 0
+        fi
+        [[ -f $timestamp && ! -L $timestamp ]] || fail 'Invalid mirror timestamp'
+        expires=$(jq -er '.signed.expires | strings | select(length > 0)' "$timestamp") ||
+            fail 'Missing expiration in mirror timestamp'
+        expiry=$(date -u --date="$expires" +%s) || fail 'Invalid expiration in mirror timestamp'
+        cutoff=$(date -u --date='+48 hours' +%s)
+        if (( expiry > cutoff )); then
+            printf 'Mirror timestamp is valid until %s.\n' "$expires"
+            exit 0
+        fi
+        base=$(current)
+        digest "$base" && [[ -f $deployed && $(cat "$deployed") == "$base" ]] ||
+            fail 'Refresh requires the current catalog to be recorded as deployed. Complete the deployment with deploy-current first.'
+        deploy_catalog "$base"
+        ;;
+    *) fail 'Expected promote, widen, advance, deploy-current, or refresh-mirror' ;;
 esac

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::model::{
-    FileDigest, PackageSpec, validate_digest, validate_name, validate_path, validate_publisher,
+    FileDigest, Manifest, PackageSpec, validate_digest, validate_name, validate_path,
+    validate_publisher,
 };
 use crate::plan::SolverRevision;
 use crate::repo::read_limited;
@@ -18,6 +19,61 @@ use crate::repo::read_limited;
 use super::{Fields, PublisherConfig, document, one, publisher_config, schema};
 
 pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
+
+pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, String)> {
+    let doc = document(text)?;
+    schema(&doc)?;
+    ensure!(
+        doc.nodes().len() == 3,
+        "expected schema-version, package, and build in cps.kdl"
+    );
+    let schema = one(&doc, "schema-version")?;
+    let mut package = one(&doc, "package")?.clone();
+    package.insert("publisher", publisher);
+    let mut manifest = KdlDocument::new();
+    manifest.nodes_mut().extend([schema.clone(), package]);
+    let manifest = super::parse_manifest(&manifest.to_string())?;
+
+    let mut build = one(&doc, "build")?.clone();
+    let children = build.ensure_children();
+    ensure!(
+        children.get("manifest").is_none(),
+        "CPS supplies the manifest for cps.kdl"
+    );
+    children.nodes_mut().push(KdlNode::new("manifest"));
+    let mut recipe = KdlDocument::new();
+    recipe.nodes_mut().extend([schema.clone(), build]);
+    Ok((manifest, recipe.to_string()))
+}
+
+pub(crate) fn git_toolchain_template(template: &str, config: &Path) -> Result<String> {
+    let mut recipe = document(template)?;
+    let build = recipe.get_mut("build").context("missing build node")?;
+    let children = build.ensure_children();
+    let toolchain = one(children, "toolchain")?;
+    if toolchain.get(0).and_then(KdlValue::as_string) != Some("default") {
+        return Ok(template.to_owned());
+    }
+    Fields::read(toolchain, 1, &[], false)?;
+
+    let default = config.with_extension("default.kdl");
+    let bytes = read_limited(
+        File::open(&default)
+            .with_context(|| format!("opening default Git toolchain {}", default.display()))?,
+        RECIPE_LIMIT,
+    )?;
+    let pins = document(std::str::from_utf8(&bytes)?)?;
+    schema(&pins)?;
+    ensure!(
+        pins.nodes().len() == 2,
+        "expected schema-version and toolchain in {}",
+        default.display()
+    );
+    *children
+        .get_mut("toolchain")
+        .context("missing toolchain node")? = one(&pins, "toolchain")?.clone();
+    Ok(recipe.to_string())
+}
 
 pub(crate) struct Source {
     pub pin: FileDigest,
