@@ -34,7 +34,7 @@ use crate::{
     transaction_progress,
 };
 
-pub use crate::git_install::GitChange;
+pub use crate::git_install::{GitChange, GitSignatures, GitSignedObject};
 pub use crate::plan::HeldBackUpdate;
 
 pub const CONFIG: &str = "/etc/cps/image.kdl";
@@ -371,10 +371,11 @@ impl System {
         &self,
         url: &str,
         reference: GitSnapshotRef<'_>,
+        signatures: Option<GitSignatures>,
         approve: impl FnOnce(&GitChange) -> Result<bool>,
     ) -> Result<Option<String>> {
         self.check_running()?;
-        let source = GitSource::new(url, reference)?;
+        let source = GitSource::new(url, reference, signatures)?;
         let build =
             GitBuild::prepare(&source, None)?.context("Git install has no selected commit")?;
         let state = Image::open_query(Path::new(ROOT))?.state()?;

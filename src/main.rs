@@ -63,6 +63,17 @@ enum Command {
         /// Follow this branch when running cps upgrade
         #[arg(long, requires = "git", group = "git_ref")]
         track_branch: Option<String>,
+        /// Require Git signatures from the signers in ssh:PATH or openpgp:PATH
+        #[arg(long, requires = "git", value_name = "FORMAT:PATH")]
+        allowed_signers: Option<String>,
+        /// Which Git object must carry the allowed signature
+        #[arg(
+            long,
+            requires = "allowed_signers",
+            value_enum,
+            default_value = "commit"
+        )]
+        require_signed: GitSignedArg,
         #[arg(required_unless_present = "git", value_name = "PACKAGE")]
         packages: Vec<String>,
     },
@@ -633,6 +644,14 @@ enum ManifestCommand {
         check: bool,
         manifest: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GitSignedArg {
+    /// The installed commit itself
+    Commit,
+    /// An annotated tag that points at the installed commit
+    Tag,
 }
 
 #[derive(Subcommand)]
@@ -1577,7 +1596,7 @@ fn change_system(
     force_phased_update: bool,
     base_only: bool,
     prepare_only: bool,
-    git: Option<(&str, GitSnapshotRef<'_>)>,
+    git: Option<(&str, GitSnapshotRef<'_>, Option<system::GitSignatures>)>,
 ) -> Result<()> {
     let recovery = matches!(
         request,
@@ -1603,6 +1622,9 @@ fn change_system(
             "Git {}{branch}\n  {}\n  {revision}",
             change.package, change.url
         );
+        if let Some(signature) = &change.signature {
+            println!("  {signature}");
+        }
         if options.dry_run {
             git_preview = true;
             return Ok(false);
@@ -1623,8 +1645,10 @@ fn change_system(
             "y" | "yes"
         ))
     };
-    if let Some((url, reference)) = git {
-        let Some(package) = system.prepare_git_install(url, reference, &mut approve_git)? else {
+    if let Some((url, reference, signatures)) = git {
+        let Some(package) =
+            system.prepare_git_install(url, reference, signatures, &mut approve_git)?
+        else {
             return Ok(());
         };
         request = Request::Install {
@@ -1814,11 +1838,28 @@ fn run(command: Command) -> Result<ExitCode> {
             git,
             commit,
             track_branch,
+            allowed_signers,
+            require_signed,
             packages,
         } => {
+            let signatures = allowed_signers
+                .map(|signers| {
+                    system::GitSignatures::new(
+                        &signers,
+                        match require_signed {
+                            GitSignedArg::Commit => system::GitSignedObject::Commit,
+                            GitSignedArg::Tag => system::GitSignedObject::Tag,
+                        },
+                    )
+                })
+                .transpose()?;
             let source = match (git.as_deref(), commit.as_deref(), track_branch.as_deref()) {
-                (Some(url), Some(commit), None) => Some((url, GitSnapshotRef::Commit(commit))),
-                (Some(url), None, Some(branch)) => Some((url, GitSnapshotRef::Branch(branch))),
+                (Some(url), Some(commit), None) => {
+                    Some((url, GitSnapshotRef::Commit(commit), signatures))
+                }
+                (Some(url), None, Some(branch)) => {
+                    Some((url, GitSnapshotRef::Branch(branch), signatures))
+                }
                 (None, None, None) => None,
                 _ => unreachable!("clap validates Git install arguments"),
             };
