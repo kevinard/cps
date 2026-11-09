@@ -1367,7 +1367,11 @@ enum BootCommand {
     },
 }
 
-fn print_boot_prune(report: &system::BootPruneReport, dry_run: bool) -> ExitCode {
+fn print_boot_prune(
+    report: &system::BootPruneReport,
+    dry_run: bool,
+    report_empty: bool,
+) -> ExitCode {
     for (id, kind) in &report.removed {
         let action = if dry_run { "Would remove" } else { "Removed" };
         println!("{action} {} {id}", system::removal_label(*kind));
@@ -1375,7 +1379,7 @@ fn print_boot_prune(report: &system::BootPruneReport, dry_run: bool) -> ExitCode
     for (id, error) in &report.failed {
         eprintln!("Could not remove {id}: {error}");
     }
-    if report.removed.is_empty() && report.failed.is_empty() {
+    if report.removed.is_empty() && report.failed.is_empty() && report_empty {
         println!("Nothing to prune");
     }
     if report.failed.is_empty() {
@@ -3267,7 +3271,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 let _lock = system.lock()?;
                 let keep = keep.map(usize::try_from).transpose()?;
                 let report = system.prune_boot_environments(keep, dry_run)?;
-                return Ok(print_boot_prune(&report, dry_run));
+                return Ok(print_boot_prune(&report, dry_run, true));
             }
             BootCommand::DiscardTrial { config } => {
                 let system = System::load(&config)?;
@@ -3279,12 +3283,12 @@ fn run(command: Command) -> Result<ExitCode> {
                          prune or staged change removes it."
                     ),
                     Some(id) => println!("Cancelled trial {id}"),
-                    None if discard.prune.removed.is_empty() => {
+                    None if discard.prune.removed.is_empty() && discard.prune.failed.is_empty() => {
                         println!("No pending or failed trial")
                     }
                     None => {}
                 }
-                return Ok(print_boot_prune(&discard.prune, false));
+                return Ok(print_boot_prune(&discard.prune, false, false));
             }
             BootCommand::Capture {
                 source,
