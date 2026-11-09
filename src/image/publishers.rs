@@ -16,7 +16,7 @@ use crate::{
     boot::{is_registered_btrfs, with_running_environment},
     git_install::GitSource,
     kdl_format::{read_build_trust, read_image_definition},
-    model::validate_publisher,
+    model::{Selection, validate_publisher},
     repo::{
         BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
         audit_installed_builds, canonical_repo, catalog_index, read_selected_catalog,
@@ -83,8 +83,7 @@ impl Image {
         let primary = &publishers.as_slice()[0];
         let checkpoint = settings.catalog_checkpoints.get(&primary.name);
         let selected = publishers.select_profile(
-            &settings.arch,
-            &settings.facets,
+            settings.selection(),
             settings.bootstrap_catalog.as_deref().or(primary_pin),
             checkpoint,
         )?;
@@ -112,8 +111,7 @@ impl Image {
 impl Publishers {
     pub(crate) fn select_profile(
         &self,
-        arch: &str,
-        facets: &BTreeMap<String, bool>,
+        selection: Selection<'_>,
         primary_pin: Option<&str>,
         previous: Option<&CatalogCheckpoint>,
     ) -> Result<Option<SelectedProfile>> {
@@ -138,8 +136,7 @@ impl Publishers {
         }
         profile.check_image(
             name,
-            arch,
-            facets,
+            selection,
             companions.iter().map(|publisher| publisher.name.as_str()),
         )?;
         Ok(Some(SelectedProfile {
@@ -318,8 +315,7 @@ pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)
     }
     let publishers = state.publishers.with_publishers(publishers)?;
     let profile = publishers.select_profile(
-        &state.settings.arch,
-        &state.settings.facets,
+        state.settings.selection(),
         state.settings.bootstrap_catalog.as_deref(),
         None,
     )?;

@@ -11,8 +11,9 @@ use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
     model::{
-        Action, Dependency, DependencyTarget, MANIFEST_FORMAT, Manifest, NIL_UUID,
-        OptionalDependency, is_uuid, validate_digest, validate_name, validate_publisher,
+        ARCH_VARIANT, Action, Dependency, DependencyTarget, ImagePolicy, MANIFEST_FORMAT, Manifest,
+        NIL_UUID, OptionalDependency, is_uuid, validate_digest, validate_name, validate_publisher,
+        validate_variant,
     },
     repo::read_limited,
     systemd::Action as SystemdAction,
@@ -25,6 +26,9 @@ pub(crate) mod publish_release;
 pub(crate) mod worker;
 
 const SCHEMA_VERSION: u32 = 1;
+/// Action properties named `variant.NAME` select by variant.
+const VARIANT_PREFIX: &str = "variant.";
+const VARIANT_PROPERTY: &str = "variant.*";
 const MANIFEST_KIND: &str = "package-manifest";
 
 struct Fields<'a> {
@@ -53,7 +57,12 @@ impl<'a> Fields<'a> {
                 "type annotations are unsupported on {name} values"
             );
             if let Some(key) = entry.name().map(|key| key.value()) {
-                ensure!(properties.contains(&key), "unknown {name} property {key}");
+                ensure!(
+                    properties.contains(&key)
+                        || (key.starts_with(VARIANT_PREFIX)
+                            && properties.contains(&VARIANT_PROPERTY)),
+                    "unknown {name} property {key}"
+                );
                 ensure!(
                     fields.properties.insert(key, entry.value()).is_none(),
                     "duplicate {name} property {key}"
@@ -105,10 +114,46 @@ impl<'a> Fields<'a> {
             .transpose()
     }
 
+    /// Read `arch=` and `variant.NAME=` selectors. Values are strings, and `#true` or
+    /// `#false` stand for "true" or "false".
+    fn variants(&self) -> Result<BTreeMap<String, String>> {
+        let mut variants = BTreeMap::new();
+        for (&key, value) in &self.properties {
+            let name = if key == "arch" {
+                ARCH_VARIANT
+            } else if let Some(name) = key.strip_prefix(VARIANT_PREFIX) {
+                name
+            } else {
+                continue;
+            };
+            let value = variant_value(value).with_context(|| format!("invalid {key}"))?;
+            ensure!(
+                variants.insert(name.to_owned(), value).is_none(),
+                "arch and variant.arch select the same variant"
+            );
+        }
+        Ok(variants)
+    }
+
     fn owner(&self, key: &str) -> Result<u32> {
         self.integer(key)?
             .with_context(|| format!("missing {key} property"))
     }
+}
+
+/// Whether a facet rule key carries more package scopes than its node declares.
+fn name_has_scope(key: &str, package: bool) -> bool {
+    key.matches(':').count() > usize::from(package)
+}
+
+fn variant_value(value: &KdlValue) -> Result<String> {
+    if let Some(value) = value.as_bool() {
+        return Ok(value.to_string());
+    }
+    value
+        .as_string()
+        .map(str::to_owned)
+        .context("variant values must be strings, #true, or #false")
 }
 
 fn schema(doc: &KdlDocument, kind: &str) -> Result<()> {
@@ -212,6 +257,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
                 );
             }
             "optional" => {
+                reject_selectors(node)?;
                 let fields = Fields::read(node, 1, &["version", "description"], false)?;
                 manifest.optional_dependencies.push(OptionalDependency {
                     target: DependencyTarget {
@@ -275,7 +321,24 @@ fn parse_target(node: &KdlNode) -> Result<DependencyTarget> {
     })
 }
 
+/// Refuse facet and variant selectors on dependencies with an explanation.
+fn reject_selectors(node: &KdlNode) -> Result<()> {
+    let nodes =
+        std::iter::once(node).chain(node.children().into_iter().flat_map(KdlDocument::nodes));
+    for node in nodes {
+        for key in node.entries().iter().filter_map(|entry| entry.name()) {
+            let key = key.value();
+            ensure!(
+                !matches!(key, "facet" | "arch") && !key.starts_with(VARIANT_PREFIX),
+                "dependencies cannot carry {key} selectors: facets and variants select files within installed packages and never change which packages are installed"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_dependency(node: &KdlNode) -> Result<Dependency> {
+    reject_selectors(node)?;
     let dependency = match node.name().value() {
         "require" => Dependency::Require(parse_target(node)?),
         "require-capability" => Dependency::RequireCapability(parse_target(node)?),
@@ -326,25 +389,26 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             "gid",
             "arch",
             "facet",
+            VARIANT_PROPERTY,
             "preserve",
             "original-name",
             "sha256",
             "size",
             "capabilities",
         ],
-        "dir" => &["mode", "uid", "gid", "arch", "facet"],
-        "hardlink" => &["target", "arch", "facet"],
-        _ => &["target", "uid", "gid", "arch", "facet"],
+        "dir" => &["mode", "uid", "gid", "arch", "facet", VARIANT_PROPERTY],
+        "hardlink" => &["target", "arch", "facet", VARIANT_PROPERTY],
+        _ => &["target", "uid", "gid", "arch", "facet", VARIANT_PROPERTY],
     };
     let fields = Fields::read(node, 1, props, false)?;
     let path = fields.string_arg(0)?;
-    let arch = fields.string("arch")?;
+    let variants = fields.variants()?;
     let facet = fields.string("facet")?;
     if name == "hardlink" {
         return Ok(Action::Hardlink {
             path,
             target: fields.required_string("target")?,
-            arch,
+            variants,
             facet,
         });
     }
@@ -355,7 +419,7 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             path,
             uid,
             gid,
-            arch,
+            variants,
             facet,
             mode: fields.required_string("mode")?,
             preserve: fields
@@ -377,7 +441,7 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             path,
             uid,
             gid,
-            arch,
+            variants,
             facet,
             mode: fields.required_string("mode")?,
         },
@@ -385,7 +449,7 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             path,
             uid,
             gid,
-            arch,
+            variants,
             facet,
             target: fields.required_string("target")?,
         },
@@ -534,12 +598,16 @@ pub fn manifest_text(manifest: &Manifest) -> String {
             node.insert("uid", i128::from(uid));
             node.insert("gid", i128::from(gid));
         }
-        let (facet, arch) = action.selectors();
-        if let Some(facet) = facet {
+        let selectors = action.selectors();
+        if let Some(facet) = selectors.facet {
             node.insert("facet", facet);
         }
-        if let Some(arch) = arch {
-            node.insert("arch", arch);
+        for (name, value) in selectors.variants {
+            if name == ARCH_VARIANT {
+                node.insert("arch", value.as_str());
+            } else {
+                node.insert(format!("{VARIANT_PREFIX}{name}").as_str(), value.as_str());
+            }
         }
         children.push(node);
     }
@@ -566,14 +634,14 @@ pub struct ImageConfig {
     pub repository: PathBuf,
     pub trust_key: PathBuf,
     pub arch: String,
-    pub facets: BTreeMap<String, bool>,
+    pub policy: ImagePolicy,
 }
 
 pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
     let ImageDefinition {
         mut publishers,
         arch,
-        facets,
+        policy,
         release_profile,
         image_id,
         ..
@@ -592,7 +660,7 @@ pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
         repository: publisher.repository,
         trust_key: publisher.trust_key,
         arch,
-        facets,
+        policy,
     })
 }
 
@@ -682,7 +750,7 @@ fn publisher_config(node: &KdlNode, name: String, parent: &Path) -> Result<Publi
 pub(crate) struct ImageDefinition {
     pub publishers: Vec<PublisherConfig>,
     pub arch: String,
-    pub facets: BTreeMap<String, bool>,
+    pub policy: ImagePolicy,
     pub release_profile: Option<String>,
     pub bootstrap_catalog: Option<String>,
     pub image_id: Option<String>,
@@ -723,7 +791,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
     let mut config = ImageDefinition {
         publishers: Vec::new(),
         arch: std::env::consts::ARCH.to_owned(),
-        facets: BTreeMap::new(),
+        policy: ImagePolicy::default(),
         release_profile: None,
         bootstrap_catalog: None,
         image_id: None,
@@ -872,14 +940,48 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 }
             }
             "facet" => {
-                let fields = Fields::read(node, 2, &[], false)?;
+                let fields = Fields::read(node, 2, &["package", "with-dependencies"], false)?;
                 let name = fields.string_arg(0)?;
                 let enabled = fields.args[1]
                     .as_bool()
                     .context("facet must be #true or #false")?;
+                let with_dependencies = fields
+                    .properties
+                    .get("with-dependencies")
+                    .map(|value| {
+                        value
+                            .as_bool()
+                            .context("with-dependencies must be #true or #false")
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                let key = match fields.string("package")? {
+                    Some(package) => format!("{package}:{name}"),
+                    None if with_dependencies => {
+                        bail!("with-dependencies requires a package property")
+                    }
+                    None => name,
+                };
                 ensure!(
-                    config.facets.insert(name.clone(), enabled).is_none(),
-                    "duplicate facet {name}"
+                    !name_has_scope(&key, fields.properties.contains_key("package")),
+                    "write per-package facets as facet NAME VALUE package=PACKAGE"
+                );
+                config
+                    .policy
+                    .insert_facet(&key, enabled, with_dependencies)?;
+            }
+            "variant" => {
+                let fields = Fields::read(node, 2, &[], false)?;
+                let name = fields.string_arg(0)?;
+                let value = variant_value(fields.args[1])?;
+                validate_variant(&name, &value)?;
+                ensure!(
+                    name != ARCH_VARIANT,
+                    "set the arch variant with the architecture node"
+                );
+                ensure!(
+                    config.policy.variants.insert(name.clone(), value).is_none(),
+                    "duplicate variant {name}"
                 );
             }
             name => bail!("unknown image configuration node {name}"),
@@ -929,7 +1031,7 @@ mod tests {
         );
         assert_eq!(parsed.arch, "aarch64");
         assert_eq!(parsed.cache_keep_versions, Some(2));
-        assert!(!parsed.facets["doc.man"]);
+        assert!(!parsed.policy.facets["doc.man"]);
         assert_eq!(
             parsed.image_id.as_deref(),
             Some("a47593c2-e985-42d2-92b6-44c7057e1e96")

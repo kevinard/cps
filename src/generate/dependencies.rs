@@ -90,8 +90,9 @@ fn inspect_dependencies(
         suggestions: BTreeMap::new(),
         diagnostics: Vec::new(),
     };
+    let selection = config.policy.selection(&config.arch);
     for action in &manifest.action {
-        if !action.applies_to(&config.arch, &config.facets) {
+        if !selection.applies(&manifest.name, action) {
             continue;
         }
         let (path, mode) = match action {
@@ -216,8 +217,9 @@ impl<'a> Paths<'a> {
             &manifest.version,
             manifest.publisher.as_str(),
         ));
+        let selection = config.policy.selection(&config.arch);
         for action in &manifest.action {
-            if !action.applies_to(&config.arch, &config.facets) {
+            if !selection.applies(&manifest.name, action) {
                 continue;
             }
             let path = action.path();

@@ -12,8 +12,14 @@ use sha2::{Digest, Sha256};
 
 use crate::file_caps::FileCapabilities;
 
+mod selection;
 mod version;
 
+pub(crate) use selection::{
+    ARCH_VARIANT, DEFAULT_FACETS, Resolved, Selection, facet_pattern_covers, validate_facet,
+    validate_facet_pattern, validate_policy, validate_variant,
+};
+pub use selection::{FacetSource, ImagePolicy, PackageFacet, PackageFacets};
 pub use version::Version;
 
 pub(crate) const MANIFEST_FORMAT: u32 = 1;
@@ -275,8 +281,8 @@ pub enum Action {
         preserve: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        arch: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        variants: BTreeMap<String, String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sha256: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -293,8 +299,8 @@ pub enum Action {
         gid: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        arch: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        variants: BTreeMap<String, String>,
     },
     Symlink {
         path: String,
@@ -303,17 +309,47 @@ pub enum Action {
         gid: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        arch: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        variants: BTreeMap<String, String>,
     },
     Hardlink {
         path: String,
         target: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        arch: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        variants: BTreeMap<String, String>,
     },
+}
+
+/// The facet and variants that select an action.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Selectors<'a> {
+    pub facet: Option<&'a str>,
+    pub variants: &'a BTreeMap<String, String>,
+}
+
+impl<'a> Selectors<'a> {
+    pub fn arch(&self) -> Option<&'a str> {
+        self.variants.get(ARCH_VARIANT).map(String::as_str)
+    }
+
+    /// Whether no image can select both actions, because they require different values
+    /// of one variant.
+    fn excludes(&self, other: &Selectors<'_>) -> bool {
+        self.variants
+            .iter()
+            .any(|(name, value)| other.variants.get(name).is_some_and(|other| other != value))
+    }
+
+    /// Whether every image that selects `self` also selects `other`.
+    fn implies(&self, other: &Selectors<'_>) -> bool {
+        other.facet.is_none_or(|facet| self.facet == Some(facet))
+            && other
+                .variants
+                .iter()
+                .all(|(name, value)| self.variants.get(name) == Some(value))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -393,19 +429,24 @@ impl Action {
         }
     }
 
-    pub fn selectors(&self) -> (Option<&str>, Option<&str>) {
+    pub fn selectors(&self) -> Selectors<'_> {
         match self {
-            Self::File { facet, arch, .. }
-            | Self::Dir { facet, arch, .. }
-            | Self::Symlink { facet, arch, .. }
-            | Self::Hardlink { facet, arch, .. } => (facet.as_deref(), arch.as_deref()),
+            Self::File {
+                facet, variants, ..
+            }
+            | Self::Dir {
+                facet, variants, ..
+            }
+            | Self::Symlink {
+                facet, variants, ..
+            }
+            | Self::Hardlink {
+                facet, variants, ..
+            } => Selectors {
+                facet: facet.as_deref(),
+                variants,
+            },
         }
-    }
-
-    pub(crate) fn applies_to(&self, architecture: &str, facets: &BTreeMap<String, bool>) -> bool {
-        let (facet, arch) = self.selectors();
-        facet.is_none_or(|key| facets.get(key).copied().unwrap_or(true))
-            && arch.is_none_or(|target| target == architecture)
     }
 
     pub fn preserve(&self) -> bool {
@@ -462,12 +503,12 @@ impl Action {
             path.split('/').next() != Some(".cps"),
             "reserved image path {path}"
         );
-        let (facet, arch) = self.selectors();
-        for selector in [facet, arch].into_iter().flatten() {
-            ensure!(
-                name_component(selector),
-                "invalid action selector {selector:?}"
-            );
+        let selectors = self.selectors();
+        if let Some(facet) = selectors.facet {
+            selection::validate_facet(facet)?;
+        }
+        for (name, value) in selectors.variants {
+            validate_variant(name, value)?;
         }
         let (uid, gid) = match self {
             Self::File {
@@ -697,13 +738,13 @@ impl Manifest {
                 "optional dependency description",
             )?;
         }
-        let mut actions = BTreeMap::new();
+        let mut actions = BTreeMap::<&str, Vec<&Action>>::new();
         for action in &self.action {
             action
                 .validate(published)
                 .with_context(|| format!("action {}", action.path()))?;
-            if let (Some(architecture), (_, Some(target))) =
-                (&self.architecture, action.selectors())
+            if let (Some(architecture), Some(target)) =
+                (&self.architecture, action.selectors().arch())
             {
                 ensure!(
                     architecture == target,
@@ -711,26 +752,32 @@ impl Manifest {
                     action.path()
                 );
             }
-            if actions
-                .insert((action.path(), action.selectors()), action)
-                .is_some()
-            {
-                bail!("duplicate action for {}", action.path());
+            let alternatives = actions.entry(action.path()).or_default();
+            // One path may carry alternatives only for different values of one variant,
+            // so that no image can select two of them.
+            for other in alternatives.iter() {
+                ensure!(
+                    action.selectors().excludes(&other.selectors()),
+                    "duplicate action for {}: actions at one path must select different values of a variant",
+                    action.path()
+                );
             }
+            alternatives.push(action);
         }
         for action in &self.action {
             if let Action::Hardlink { path, target, .. } = action {
-                let (facet, arch) = action.selectors();
+                let selectors = action.selectors();
                 ensure!(
-                    [None, facet]
-                        .into_iter()
-                        .any(|facet| [None, arch].into_iter().any(|arch| matches!(
-                            actions.get(&(target.as_str(), (facet, arch))),
-                            Some(Action::File {
+                    actions
+                        .get(target.as_str())
+                        .is_some_and(|targets| targets.iter().any(|target| matches!(
+                            target,
+                            Action::File {
                                 preserve: false,
                                 ..
-                            })
-                        ))),
+                            }
+                        ) && selectors
+                            .implies(&target.selectors()))),
                     "hard link {path} requires an immutable file action for {target} in the same package with compatible selectors"
                 );
             }

@@ -23,8 +23,11 @@ use crate::{
         STATE_DIRECTORY, Settings, State, history::TransactionDetails, lock::ImageLock,
         publisher_generation_is_initial, root::Root,
     },
-    model::{Node, PackageSpec, digest, validate_name, validate_publisher},
-    repo::{BuildReceipt, Published, ReleaseAdvisory},
+    model::{
+        Node, PackageSpec, Selection, digest, facet_pattern_covers, validate_name,
+        validate_publisher,
+    },
+    repo::{BuildReceipt, Published, ReleaseAdvisory, ReleaseProfile},
     systemd::{self, Action as SystemdAction},
 };
 
@@ -34,7 +37,7 @@ pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
 pub use intent::{IntentChange, MarkChoice};
 pub(crate) use paths::{
     check_directory, check_path_type, choose_mediators, effective_paths, hardlink_groups,
-    mediator_offers, select_paths,
+    mediator_offers, resolve_facets, select_paths,
 };
 pub(crate) use rename::Renames;
 pub(crate) use resolve::{
@@ -77,8 +80,17 @@ pub enum Request {
         packages: Vec<String>,
     },
     Autoremove,
+    /// Set (`Some`) or reset (`None`) image-wide `FACET` and per-package `PACKAGE:FACET`
+    /// rules, reusing the installed manifests.
     ChangeFacet {
         facets: BTreeMap<String, Option<bool>>,
+        /// Apply the per-package rules to each package's installed dependency closure.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        with_dependencies: bool,
+    },
+    /// Set or unset non-architecture variants, reusing the installed manifests.
+    ChangeVariant {
+        variants: BTreeMap<String, Option<String>>,
     },
     SetMediator {
         group: String,
@@ -114,6 +126,7 @@ impl Request {
             Self::Remove { .. } => "remove",
             Self::Autoremove => "autoremove",
             Self::ChangeFacet { .. } => "change-facet",
+            Self::ChangeVariant { .. } => "change-variant",
             Self::SetMediator { .. } => "set-mediator",
             Self::Repair { .. } => "repair",
             Self::RepairPaths { .. } => "repair-paths",
@@ -191,6 +204,9 @@ pub struct Plan {
     pub(crate) intent_changes: Vec<IntentChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) freeze_changes: Vec<FreezeChange>,
+    /// Installed packages whose selected actions a facet or variant change alters.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    recomposed: BTreeSet<String>,
     transfers: Vec<Transfer>,
     preserved: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,6 +300,7 @@ impl Plan {
             package_changes: Vec::new(),
             intent_changes: Vec::new(),
             freeze_changes: Vec::new(),
+            recomposed: BTreeSet::new(),
             transfers: Vec::new(),
             preserved: Vec::new(),
             config_update_revision: None,
@@ -373,12 +390,38 @@ impl Plan {
                 None => format!("Unfreeze {}", change.name),
             });
         }
-        if let Request::ChangeFacet { facets } = &self.request {
-            for (name, value) in facets {
-                lines.push(match value {
-                    Some(value) => format!("Set facet {name}={value}"),
-                    None => format!("Reset facet {name} to its default"),
-                });
+        let composition = match &self.request {
+            Request::ChangeFacet {
+                facets,
+                with_dependencies,
+            } => {
+                for (name, value) in facets {
+                    let scope = if *with_dependencies && name.contains(':') {
+                        " with dependencies"
+                    } else {
+                        ""
+                    };
+                    lines.push(match value {
+                        Some(value) => format!("Set facet {name}={value}{scope}"),
+                        None => format!("Reset facet {name} to its default"),
+                    });
+                }
+                true
+            }
+            Request::ChangeVariant { variants } => {
+                for (name, value) in variants {
+                    lines.push(match value {
+                        Some(value) => format!("Set variant {name}={value}"),
+                        None => format!("Unset variant {name}"),
+                    });
+                }
+                true
+            }
+            _ => false,
+        };
+        if composition {
+            for name in &self.recomposed {
+                lines.push(format!("Recompose {name}"));
             }
             for write in &self.writes {
                 if write.config_move.is_some() || is_config_update(&write.path) {
@@ -544,6 +587,19 @@ impl Plan {
         ensure!(
             after.mediators == mediators,
             "pending mediator preferences differ from the verified plan"
+        );
+        let mut policy = before.policy();
+        match &self.request {
+            Request::ChangeFacet {
+                facets,
+                with_dependencies,
+            } => policy.change_facets(facets, *with_dependencies)?,
+            Request::ChangeVariant { variants } => policy.change_variants(variants)?,
+            _ => {}
+        }
+        ensure!(
+            after.policy() == policy,
+            "pending facet or variant policy differs from the verified plan"
         );
         Ok(())
     }
@@ -788,6 +844,64 @@ fn resolve_local<'a>(
     Ok((installed, paths))
 }
 
+/// Installed packages whose selected actions differ between two selections.
+fn recomposed_packages(
+    before: Selection<'_>,
+    after: Selection<'_>,
+    installed: &BTreeMap<String, Installed>,
+) -> Result<BTreeSet<String>> {
+    let before = resolve_facets(before, installed)?;
+    let after = resolve_facets(after, installed)?;
+    Ok(installed
+        .iter()
+        .filter(|(name, package)| {
+            package
+                .published
+                .manifest
+                .action
+                .iter()
+                .any(|action| before.applies(name, action) != after.applies(name, action))
+        })
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
+/// Refuse per-package facet rules that reach packages protected by a signed release
+/// profile, unless the profile allows overriding those facets.
+fn check_profile_facets(
+    image: &Image,
+    state: &State,
+    profile: Option<&ReleaseProfile>,
+    installed: &BTreeMap<String, Installed>,
+) -> Result<()> {
+    if state.settings.package_facets.is_empty() || state.settings.profile_packages.is_empty() {
+        return Ok(());
+    }
+    let archived;
+    let profile = match profile {
+        Some(profile) => profile,
+        None => {
+            archived = image.archived_profile(state)?;
+            archived
+                .as_ref()
+                .context("missing archived release profile")?
+        }
+    };
+    let facets = resolve_facets(state.settings.selection(), installed)?;
+    for name in state.settings.profile_packages.keys() {
+        for (facet, rule) in facets.overrides(name) {
+            ensure!(
+                profile
+                    .facet_overrides
+                    .iter()
+                    .any(|allowed| facet_pattern_covers(allowed, &facet)),
+                "facet rule {rule} reaches {name}, which the signed release profile protects; the profile does not allow overriding facet {facet}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn composition_paths(
     settings: &Settings,
     installed: &BTreeMap<String, Installed>,
@@ -918,37 +1032,52 @@ fn build_with_update_diagnostics(
     }
     let mut catalogs = catalogs::Catalogs::default();
     let mut receipts = Vec::new();
-    let mut next_facets = None;
+    let mut next_policy = None;
+    let mut recomposed = BTreeSet::new();
     let mut update_profile = matches!(request, Request::UpdateProfile);
     let (mut installed, paths) = match &request {
-        Request::ChangeFacet { facets } => {
-            ensure!(
-                state.publishers.release_profile().is_none(),
-                "the signed release profile fixes this image's facets"
-            );
-            ensure!(!facets.is_empty(), "specify at least one facet change");
+        Request::ChangeFacet { .. } | Request::ChangeVariant { .. } => {
+            let mut policy = state.settings.policy();
+            let profile = state.publishers.release_profile().is_some();
+            match &request {
+                Request::ChangeFacet {
+                    facets,
+                    with_dependencies,
+                } => {
+                    ensure!(!facets.is_empty(), "specify at least one facet change");
+                    ensure!(
+                        !profile || facets.keys().all(|key| key.contains(':')),
+                        "the signed release profile fixes this image's image-wide facets; change PACKAGE:FACET rules instead"
+                    );
+                    policy.change_facets(facets, *with_dependencies)?;
+                }
+                Request::ChangeVariant { variants } => {
+                    ensure!(!variants.is_empty(), "specify at least one variant change");
+                    ensure!(
+                        !profile,
+                        "the signed release profile fixes this image's variants"
+                    );
+                    policy.change_variants(variants)?;
+                }
+                _ => unreachable!(),
+            }
             ensure!(
                 crate::verify::manifest_paths(&state)? == state.paths,
                 "path ownership index differs from installed manifests"
             );
             image.verify_catalog_archives(&state)?;
-            let mut settings = state.settings.facets.clone();
-            for (name, value) in facets {
-                validate_publisher(name).with_context(|| format!("invalid facet {name:?}"))?;
-                if let Some(value) = value {
-                    settings.insert(name.clone(), *value);
-                } else {
-                    settings.remove(name);
-                }
-            }
             let paths = select_paths(
-                &state.settings.arch,
-                &settings,
+                policy.selection(&state.settings.arch),
                 &state.settings.mediators,
                 state.settings.directory(),
                 &state.installed,
             )?;
-            next_facets = Some(settings);
+            recomposed = recomposed_packages(
+                state.settings.selection(),
+                policy.selection(&state.settings.arch),
+                &state.installed,
+            )?;
+            next_policy = Some(policy);
             (state.installed.clone(), paths)
         }
         Request::SetMediator { group, provider } => {
@@ -962,8 +1091,7 @@ fn build_with_update_diagnostics(
                 validate_name(provider)?;
                 ensure!(
                     mediator_offers(
-                        &state.settings.arch,
-                        &state.settings.facets,
+                        &resolve_facets(state.settings.selection(), &state.installed)?,
                         &state.installed
                     )
                     .get(group.as_str())
@@ -1506,7 +1634,7 @@ fn build_with_update_diagnostics(
                         "unexpected file capabilities on preserved config {path}"
                     );
                     plan.preserved.push(path.clone());
-                    if next_facets.is_some() || observed.is_some() {
+                    if next_policy.is_some() || observed.is_some() {
                         config::remember_unowned(
                             &state.installed,
                             &mut state.settings,
@@ -1514,7 +1642,7 @@ fn build_with_update_diagnostics(
                             old,
                             observed.clone(),
                             retired_update,
-                            next_facets.is_none(),
+                            next_policy.is_none(),
                         )?;
                     }
                     observed.clone()
@@ -1562,9 +1690,11 @@ fn build_with_update_diagnostics(
         })?;
     state.settings.revision = revision;
     state.settings.bootstrap_catalog = None;
-    if let Some(facets) = next_facets {
-        state.settings.facets = facets;
+    if let Some(policy) = next_policy {
+        state.settings.set_policy(policy);
     }
+    plan.recomposed = recomposed;
+    check_profile_facets(image, &state, catalogs.profile.as_ref(), &installed)?;
     config::retain_disabled(&mut state.settings, &installed, &paths);
 
     state

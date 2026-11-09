@@ -34,6 +34,9 @@ pub(crate) struct RecipeApproval {
 pub(crate) struct Profile {
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
+    pub variants: BTreeMap<String, String>,
+    /// Facet patterns that images may override for profile-protected packages.
+    pub facet_overrides: BTreeSet<String>,
     pub packages: BTreeMap<String, Option<Version>>,
     pub upgrade_from: Option<String>,
     pub signed_baselines: Vec<String>,
@@ -100,6 +103,8 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     );
     let mut packages = BTreeMap::new();
     let mut facets = BTreeMap::new();
+    let mut variants = BTreeMap::new();
+    let mut facet_overrides = BTreeSet::new();
     let mut companions = Vec::new();
     let mut elf_library_dirs = Vec::new();
     let mut elf_require_declarations = false;
@@ -203,13 +208,36 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
             "facet" => {
                 let fields = Fields::read(child, 2, &[], false)?;
                 let facet = fields.string_arg(0)?;
-                validate_publisher(&facet).context("invalid profile facet")?;
+                crate::model::validate_facet_pattern(&facet).context("invalid profile facet")?;
                 let enabled = fields.args[1]
                     .as_bool()
                     .context("facet must be #true or #false")?;
                 ensure!(
                     facets.insert(facet.clone(), enabled).is_none(),
                     "duplicate profile facet {facet}"
+                );
+            }
+            "variant" => {
+                let fields = Fields::read(child, 2, &[], false)?;
+                let variant = fields.string_arg(0)?;
+                let value = super::variant_value(fields.args[1])?;
+                crate::model::validate_variant(&variant, &value)?;
+                ensure!(
+                    variant != crate::model::ARCH_VARIANT,
+                    "set the arch variant with the profile architecture"
+                );
+                ensure!(
+                    variants.insert(variant.clone(), value).is_none(),
+                    "duplicate profile variant {variant}"
+                );
+            }
+            "allow-facet-override" => {
+                let facet = Fields::read(child, 1, &[], false)?.string_arg(0)?;
+                crate::model::validate_facet_pattern(&facet)
+                    .context("invalid allowed facet override")?;
+                ensure!(
+                    facet_overrides.insert(facet.clone()),
+                    "duplicate allow-facet-override {facet}"
                 );
             }
             "elf-check" => {
@@ -249,6 +277,8 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
         Profile {
             arch,
             facets,
+            variants,
+            facet_overrides,
             packages,
             upgrade_from,
             signed_baselines,

@@ -339,11 +339,121 @@ pub(crate) fn intent_row(
     }
 }
 
-/// Read explicitly configured facet values from the committed image.
-pub fn list_facets(root: &Path) -> Result<BTreeMap<String, bool>> {
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct FacetRuleRow {
+    /// `FACET` for an image-wide rule or `PACKAGE:FACET` for a per-package rule.
+    pub rule: String,
+    pub value: bool,
+    /// `local` for a configured rule or `default` for a built-in default.
+    pub source: &'static str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub with_dependencies: bool,
+}
+
+/// List the facet rules of the committed image: built-in defaults that no local rule
+/// replaces, image-wide rules, and per-package rules.
+pub fn list_facets(root: &Path) -> Result<Vec<FacetRuleRow>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
-    Ok(image.settings()?.facets)
+    let settings = image.settings()?;
+    let defaults = crate::model::DEFAULT_FACETS
+        .into_iter()
+        .filter(|(rule, _)| !settings.facets.contains_key(*rule))
+        .map(|(rule, value)| FacetRuleRow {
+            rule: rule.to_owned(),
+            value,
+            source: "default",
+            with_dependencies: false,
+        });
+    let local = settings.facets.iter().map(|(rule, value)| FacetRuleRow {
+        rule: rule.clone(),
+        value: *value,
+        source: "local",
+        with_dependencies: false,
+    });
+    let packages = settings.package_facets.iter().flat_map(|(package, rules)| {
+        rules.iter().map(move |(facet, rule)| FacetRuleRow {
+            rule: format!("{package}:{facet}"),
+            value: rule.value,
+            source: "local",
+            with_dependencies: rule.with_dependencies,
+        })
+    });
+    Ok(defaults.chain(local).chain(packages).collect())
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct FacetValueRow {
+    pub facet: String,
+    pub value: bool,
+    #[serde(flatten)]
+    pub source: crate::model::FacetSource,
+}
+
+/// Show effective facet values and the rule that decided each one. With a package,
+/// resolve its per-package and inherited rules and default to the facets its actions use.
+pub fn facet_values(
+    root: &Path,
+    package: Option<&str>,
+    facets: &[String],
+) -> Result<Vec<FacetValueRow>> {
+    for facet in facets {
+        crate::model::validate_facet(facet)?;
+    }
+    let image = Image::open_query(root)?;
+    let (state, _) = verified_intent(&image)?;
+    let selection = state.settings.selection();
+    let Some(name) = package else {
+        return Ok(facets
+            .iter()
+            .map(|facet| {
+                let (value, source) = selection.image_facet(facet);
+                FacetValueRow {
+                    facet: facet.clone(),
+                    value,
+                    source,
+                }
+            })
+            .collect());
+    };
+    let installed = state
+        .installed
+        .get(name)
+        .with_context(|| format!("package is not installed: {name}"))?;
+    let used = installed
+        .published
+        .manifest
+        .action
+        .iter()
+        .filter_map(|action| action.selectors().facet.map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let names = if facets.is_empty() {
+        used
+    } else {
+        facets.iter().cloned().collect()
+    };
+    let resolved = crate::plan::resolve_facets(selection, &state.installed)?;
+    Ok(names
+        .into_iter()
+        .map(|facet| {
+            let (value, source) = resolved.facet(name, &facet);
+            FacetValueRow {
+                facet,
+                value,
+                source,
+            }
+        })
+        .collect())
+}
+
+/// List the image's variant values, including the built-in arch variant.
+pub fn list_variants(root: &Path) -> Result<BTreeMap<String, String>> {
+    let image = Image::open_query(root)?;
+    image.require_clean()?;
+    let settings = image.settings()?;
+    let mut variants = settings.variants;
+    variants.insert(crate::model::ARCH_VARIANT.to_owned(), settings.arch);
+    Ok(variants)
 }
 
 #[derive(Debug, Serialize)]
@@ -357,11 +467,8 @@ pub struct MediatorRow {
 pub fn list_mediators(root: &Path) -> Result<Vec<MediatorRow>> {
     let image = Image::open_query(root)?;
     let (state, _) = verified_intent(&image)?;
-    let offers = crate::plan::mediator_offers(
-        &state.settings.arch,
-        &state.settings.facets,
-        &state.installed,
-    );
+    let facets = crate::plan::resolve_facets(state.settings.selection(), &state.installed)?;
+    let offers = crate::plan::mediator_offers(&facets, &state.installed);
     let winners = crate::plan::choose_mediators(&offers, &state.settings.mediators);
     let groups: BTreeSet<_> = offers
         .keys()
@@ -685,7 +792,7 @@ pub fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
                 .manifest
                 .action
                 .iter()
-                .filter(|action| action.applies_to(&settings.arch, &settings.facets))
+                .filter(|action| settings.selection().applies(&package.manifest.name, action))
                 .map(|action| action.path())
                 .filter(|path| {
                     if by_path {

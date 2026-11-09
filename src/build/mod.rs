@@ -567,8 +567,7 @@ fn resolve_toolchain(
         true,
         |installed| {
             select_paths(
-                &recipe.arch,
-                &BTreeMap::new(),
+                crate::model::Selection::arch(&recipe.arch, &BTreeMap::new()),
                 &BTreeMap::new(),
                 Node::Dir {
                     mode: 0o755,

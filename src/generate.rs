@@ -86,7 +86,7 @@ pub fn generate_manifest_for_architecture(
                 uid,
                 gid,
                 facet: None,
-                arch: None,
+                variants: BTreeMap::new(),
             },
             FileType::RegularFile => {
                 if info.st_nlink > 1 {
@@ -110,7 +110,7 @@ pub fn generate_manifest_for_architecture(
                                 path: path.to_owned(),
                                 target: group.target.clone(),
                                 facet: None,
-                                arch: None,
+                                variants: BTreeMap::new(),
                             });
                             return Ok(true);
                         }
@@ -125,7 +125,7 @@ pub fn generate_manifest_for_architecture(
                     gid,
                     preserve: false,
                     facet: None,
-                    arch: None,
+                    variants: BTreeMap::new(),
                     sha256: None,
                     size: None,
                     capabilities,
@@ -145,7 +145,7 @@ pub fn generate_manifest_for_architecture(
                     uid,
                     gid,
                     facet: None,
-                    arch: None,
+                    variants: BTreeMap::new(),
                 }
             }
             _ => bail!("unsupported filesystem object at {path:?}"),

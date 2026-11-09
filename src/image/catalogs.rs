@@ -73,13 +73,19 @@ fn profile(catalog: &mut Catalog, hash: &str, name: &str, state: &State) -> Resu
     let profile = take_profile(catalog, hash, name)?;
     profile.check_image(
         name,
-        &state.settings.arch,
-        &state.settings.facets,
+        state.settings.selection(),
         state.publishers.signed_publishers()[1..]
             .iter()
             .map(|publisher| publisher.name.as_str()),
     )?;
     Ok(profile)
+}
+
+impl super::Image {
+    /// The signed release profile archived with the image's applied catalog, offline.
+    pub(crate) fn archived_profile(&self, state: &State) -> Result<Option<ReleaseProfile>> {
+        read_profile(&self.db, state)
+    }
 }
 
 pub(super) fn read_profile(db: &Connection, state: &State) -> Result<Option<ReleaseProfile>> {
