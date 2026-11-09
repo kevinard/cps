@@ -1739,9 +1739,10 @@ fn autoremove_preserves_installed_roots_and_resumes_offline() -> Result<()> {
     f.package(
         "desktop/session",
         "1.0.0-0",
+        // Both providers stay installed, so the declared order keeps the backup.
         r#"    require-any {
-        package "library/primary"
         package "library/backup"
+        package "library/primary"
     }
     conditional "desktop/plugin" when="library/backup"
     conditional "desktop/optional-plugin" when="library/primary"
