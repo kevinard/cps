@@ -746,12 +746,21 @@ enum RepoCommand {
     SignExport {
         #[arg(long)]
         root: PathBuf,
-        #[arg(long)]
-        targets_key: PathBuf,
-        #[arg(long)]
-        snapshot_key: PathBuf,
-        #[arg(long)]
-        timestamp_key: PathBuf,
+        /// Targets role key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        targets_key: Vec<PathBuf>,
+        /// Snapshot role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+        #[arg(long, value_name = "KEY", required = true)]
+        snapshot_key: Vec<PathBuf>,
+        /// Timestamp role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+        #[arg(long, value_name = "KEY", required = true)]
+        timestamp_key: Vec<PathBuf>,
+        /// Key for the objects-* delegations (repeatable; default: the first targets key)
+        #[arg(long, value_name = "KEY")]
+        objects_key: Vec<PathBuf>,
+        /// Signatures required on each objects-* delegation
+        #[arg(long, default_value = "1")]
+        objects_threshold: std::num::NonZeroU64,
         #[arg(long)]
         version: std::num::NonZeroU64,
         #[arg(long)]
@@ -761,6 +770,29 @@ enum RepoCommand {
         #[arg(long)]
         output: PathBuf,
         export: PathBuf,
+    },
+    /// Re-sign the timestamp, and optionally the snapshot, of a published mirror
+    RefreshMetadata {
+        #[arg(long)]
+        root: PathBuf,
+        /// The published versioned snapshot metadata, such as 7.snapshot.json
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Timestamp role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+        #[arg(long, value_name = "KEY", required = true)]
+        timestamp_key: Vec<PathBuf>,
+        /// Also re-sign the snapshot with this key (repeatable)
+        #[arg(long, value_name = "KEY", requires = "snapshot_expires")]
+        snapshot_key: Vec<PathBuf>,
+        #[arg(long, requires = "snapshot_key")]
+        snapshot_expires: Option<String>,
+        #[arg(long)]
+        version: std::num::NonZeroU64,
+        #[arg(long)]
+        timestamp_expires: String,
+        /// New directory for timestamp.json and any re-signed snapshot
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Enable a catalog-signed index for available package file lookups
     IndexFiles {
@@ -2313,6 +2345,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 targets_key,
                 snapshot_key,
                 timestamp_key,
+                objects_key,
+                objects_threshold,
                 version,
                 release_expires,
                 timestamp_expires,
@@ -2322,11 +2356,34 @@ fn run(command: Command) -> Result<ExitCode> {
                 root: &root,
                 export: &export,
                 output: &output,
-                targets_key: &targets_key,
-                snapshot_key: &snapshot_key,
-                timestamp_key: &timestamp_key,
+                keys: release::ReleaseKeys {
+                    targets: &targets_key,
+                    snapshot: &snapshot_key,
+                    timestamp: &timestamp_key,
+                    objects: &objects_key,
+                    objects_threshold,
+                },
                 version,
                 release_expires: &release_expires,
+                timestamp_expires: &timestamp_expires,
+            })?,
+            RepoCommand::RefreshMetadata {
+                root,
+                snapshot,
+                timestamp_key,
+                snapshot_key,
+                snapshot_expires,
+                version,
+                timestamp_expires,
+                output,
+            } => release::refresh_metadata(release::RefreshMetadata {
+                root: &root,
+                snapshot: &snapshot,
+                output: &output,
+                timestamp_keys: &timestamp_key,
+                snapshot_keys: &snapshot_key,
+                version,
+                snapshot_expires: snapshot_expires.as_deref(),
                 timestamp_expires: &timestamp_expires,
             })?,
             RepoCommand::Sync {

@@ -13,6 +13,7 @@ for repositories that require signed build evidence.
 - [Signed catalog format](#signed-catalog-format)
 - [Publishing policy](#publishing-policy)
 - [Publish a coordinated release](#publish-a-coordinated-release)
+- [External catalog signing keys](#external-catalog-signing-keys)
 - [Publisher signing key rotation](#publisher-signing-key-rotation)
 - [Withdrawing and obsoleting packages](#withdrawing-and-obsoleting-packages)
 - [Renaming packages within a publisher](#renaming-packages-within-a-publisher)
@@ -128,6 +129,21 @@ release with `refresh-profiles=#true` and the current `base` digest. The signer
 reruns the profile checks and publishes a new catalog if the signed profile
 records changed. This lets a primary publisher advance a companion pin without
 rebuilding its own packages.
+
+## External catalog signing keys
+
+Every `--signing-key`, `--new-signing-key`, and `CPS_RELEASE_SIGNING_KEY`
+accepts `PATH`, `file:PATH`, or `command:DESCRIPTOR`. A descriptor names an
+external signer that holds the Ed25519 catalog key, such as a PKCS#11 token
+or a cloud KMS. Its `public-key` is the publisher's `public.der`. CPS checks
+each returned signature against that key before it writes a catalog. The
+descriptor format and helper protocol are described in
+[Release keys and external signers](mirrors.md#external-signer-protocol).
+
+```sh
+cps repo publish-release --repo repo \
+    --signing-key command:/etc/cps/signers/catalog.signer.kdl release.kdl
+```
 
 ## Publisher signing key rotation
 

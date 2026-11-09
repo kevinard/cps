@@ -13,6 +13,9 @@
 .B \&sign\-export
 \&Sign an exported mirror with sharded TUF targets metadata
 .TP
+.B \&refresh\-metadata
+\&Re\-sign the timestamp, and optionally the snapshot, of a published mirror
+.TP
 .B \&index\-files
 \&Enable a catalog\-signed index for available package file lookups
 .TP
@@ -92,7 +95,7 @@
 .SS "\&cps repo sign\-export"
 \&Sign an exported mirror with sharded TUF targets metadata
 .PP
-.B \&cps repo sign\-export \-\-root <ROOT> \-\-targets\-key <TARGETS_KEY> \-\-snapshot\-key <SNAPSHOT_KEY> \-\-timestamp\-key <TIMESTAMP_KEY> \-\-version <VERSION> \-\-release\-expires <RELEASE_EXPIRES> \-\-timestamp\-expires <TIMESTAMP_EXPIRES> \-\-output <OUTPUT> <EXPORT>
+.B \&cps repo sign\-export [OPTIONS] \-\-root <ROOT> \-\-targets\-key <KEY> \-\-snapshot\-key <KEY> \-\-timestamp\-key <KEY> \-\-version <VERSION> \-\-release\-expires <RELEASE_EXPIRES> \-\-timestamp\-expires <TIMESTAMP_EXPIRES> \-\-output <OUTPUT> <EXPORT>
 .PP
 .B Arguments
 .PP
@@ -101,12 +104,21 @@
 .B Options
 .PP
 .B \&\-\-root <ROOT>
-.PP
-.B \&\-\-targets\-key <TARGETS_KEY>
-.PP
-.B \&\-\-snapshot\-key <SNAPSHOT_KEY>
-.PP
-.B \&\-\-timestamp\-key <TIMESTAMP_KEY>
+.TP
+.B \&\-\-targets\-key <KEY>
+\&Targets role key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the threshold)
+.TP
+.B \&\-\-snapshot\-key <KEY>
+\&Snapshot role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+.TP
+.B \&\-\-timestamp\-key <KEY>
+\&Timestamp role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+.TP
+.B \&\-\-objects\-key <KEY>
+\&Key for the objects\-* delegations (repeatable; default: the first targets key)
+.TP
+.B \&\-\-objects\-threshold <OBJECTS_THRESHOLD>
+\&Signatures required on each objects\-* delegation [default: 1]
 .PP
 .B \&\-\-version <VERSION>
 .PP
@@ -115,6 +127,35 @@
 .B \&\-\-timestamp\-expires <TIMESTAMP_EXPIRES>
 .PP
 .B \&\-\-output <OUTPUT>
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo refresh\-metadata"
+\&Re\-sign the timestamp, and optionally the snapshot, of a published mirror
+.PP
+.B \&cps repo refresh\-metadata [OPTIONS] \-\-root <ROOT> \-\-snapshot <SNAPSHOT> \-\-timestamp\-key <KEY> \-\-version <VERSION> \-\-timestamp\-expires <TIMESTAMP_EXPIRES> \-\-output <OUTPUT>
+.PP
+.B Options
+.PP
+.B \&\-\-root <ROOT>
+.TP
+.B \&\-\-snapshot <SNAPSHOT>
+\&The published versioned snapshot metadata, such as 7.snapshot.json
+.TP
+.B \&\-\-timestamp\-key <KEY>
+\&Timestamp role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+.TP
+.B \&\-\-snapshot\-key <KEY>
+\&Also re\-sign the snapshot with this key (repeatable)
+.PP
+.B \&\-\-snapshot\-expires <SNAPSHOT_EXPIRES>
+.PP
+.B \&\-\-version <VERSION>
+.PP
+.B \&\-\-timestamp\-expires <TIMESTAMP_EXPIRES>
+.TP
+.B \&\-\-output <OUTPUT>
+\&New directory for timestamp.json and any re\-signed snapshot
 .TP
 .B \&\-h, \-\-help
 \&Print help

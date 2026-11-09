@@ -22,6 +22,7 @@ pub(crate) mod boot_export;
 pub(crate) mod build;
 pub(crate) mod publish_policy;
 pub(crate) mod publish_release;
+pub(crate) mod signer;
 pub(crate) mod worker;
 
 const SCHEMA_VERSION: u32 = 1;

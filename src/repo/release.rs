@@ -64,7 +64,7 @@ const MAX_RETAINED: usize = 32;
 const RETAINED_LIMIT: u64 = (65 * MAX_RETAINED) as u64;
 
 mod sign;
-pub use sign::{SignExport, sign_export};
+pub use sign::{RefreshMetadata, ReleaseKeys, SignExport, refresh_metadata, sign_export};
 const CHECKPOINT_FILES: [(&str, u64); 4] = [
     ("root.json", ROOT_LIMIT),
     ("timestamp.json", TIMESTAMP_LIMIT),

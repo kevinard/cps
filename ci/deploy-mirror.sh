@@ -5,7 +5,15 @@ shopt -s nullglob
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 
-[[ $# == 3 && $3 =~ ^[0-9a-f]{64}$ ]] || fail 'Expected REPO PUBLISHER CATALOG_SHA256'
+# REPO PUBLISHER CATALOG deploys a release and needs the targets, snapshot, and
+# timestamp keys. Adding "refresh" re-signs only the timestamp, or the snapshot
+# and timestamp, for the catalog that is already published.
+mode=deploy
+if [[ $# == 4 && $4 == refresh ]]; then
+    mode=refresh
+    set -- "$1" "$2" "$3"
+fi
+[[ $# == 3 && $3 =~ ^[0-9a-f]{64}$ ]] || fail 'Expected REPO PUBLISHER CATALOG_SHA256 [refresh]'
 repo=$(realpath -e -- "$1")
 publisher=$2
 catalog=$3
@@ -19,12 +27,35 @@ keys=$(realpath -e -- "${CPS_MIRROR_TUF_KEYS:?Set CPS_MIRROR_TUF_KEYS to the TUF
     fail 'Use a dedicated mirror directory separate from the publishing repository'
 [[ $keys != "$mirror" && $keys != "$mirror/"* ]] ||
     fail 'Keep signing keys outside the mirror directory'
-signing=()
-for role in targets snapshot timestamp; do
-    key=$(realpath -e -- "$keys/$role.pem")
-    [[ -f $key && $key != "$mirror/"* ]] || fail "Invalid private key for $role"
-    signing+=("--$role-key" "$key")
-done
+
+lifetime() {
+    local name=$1 value=${!1:-$2}
+    [[ $value =~ ^[1-9][0-9]{0,3}\ (days|hours)$ ]] || fail "$name must be a number of days or hours"
+    printf '%s\n' "$value"
+}
+targets_lifetime=$(lifetime CPS_MIRROR_TARGETS_LIFETIME '30 days')
+snapshot_lifetime=$(lifetime CPS_MIRROR_SNAPSHOT_LIFETIME '30 days')
+timestamp_lifetime=$(lifetime CPS_MIRROR_TIMESTAMP_LIFETIME '7 days')
+objects_threshold=${CPS_MIRROR_OBJECTS_THRESHOLD:-1}
+[[ $objects_threshold =~ ^[1-9][0-9]?$ ]] || fail 'CPS_MIRROR_OBJECTS_THRESHOLD must be a small positive integer'
+
+# ROLE.pem or ROLE-NAME.pem is a private key file. ROLE.signer.kdl or
+# ROLE-NAME.signer.kdl describes an external signer. List several keys to
+# meet a root threshold. Only the roles needed for this operation are read.
+role_keys() {
+    local role=$1 file
+    role_args=()
+    for file in "$keys/$role".pem "$keys/$role".signer.kdl "$keys/$role"-*.pem "$keys/$role"-*.signer.kdl; do
+        [[ -e $file || -L $file ]] || continue
+        file=$(realpath -e -- "$file")
+        [[ -f $file && $file != "$mirror/"* ]] || fail "Invalid $role key source $file"
+        if [[ $file == *.signer.kdl ]]; then
+            role_args+=("--$role-key" "command:$file")
+        else
+            role_args+=("--$role-key" "$file")
+        fi
+    done
+}
 
 # Serialize updates to this origin and hold the approved catalog stable until publication.
 [[ -f $repo/publish.lock && ! -L $repo/publish.lock ]] || fail 'Expected a CPS publishing repository'
@@ -45,6 +76,7 @@ timestamp=$metadata/timestamp.json
 
 # Reserve metadata versions on the signing host before exposing them at the origin.
 state=$repo/.ci-tuf-state.json
+published=null
 if [[ -e $state || -L $state ]]; then
     [[ -f $state && ! -L $state && -O $state && $(stat -c %a -- "$state") == 600 ]] ||
         fail 'TUF publication state must be a private file owned by the signer'
@@ -54,6 +86,9 @@ if [[ -e $state || -L $state ]]; then
         | .version | numbers
     ' "$state") ||
         fail 'Invalid TUF publication state or a different mirror is configured'
+    published=$(jq -c '.published' "$state")
+elif [[ $mode == refresh ]]; then
+    fail 'A metadata refresh needs the signer state of a completed deployment'
 elif [[ -n ${CPS_MIRROR_INITIAL_VERSION:-} ]]; then
     previous=$CPS_MIRROR_INITIAL_VERSION
     [[ $previous != 0 ]] || fail 'Use the highest previously reserved metadata version'
@@ -120,6 +155,137 @@ done
     fail 'Use the latest published TUF root or its immediate successor'
 stage_root "$stage/root.json" "$root_version"
 
+sha256() {
+    local checksum
+    checksum=$(sha256sum < "$1")
+    printf '%s\n' "${checksum%% *}"
+}
+
+# Verify the staged metadata from the bootstrap root as a new client would.
+verify_stage() {
+    local metadata_dir=$1 targets_dir=$2 metadata_fd targets_fd
+    exec {metadata_fd}< "$metadata_dir" {targets_fd}< "$targets_dir"
+    "$cps" repo sync --repo "$stage/verified" --root "$stage/bootstrap-root.json" --publisher "$publisher" \
+        --trust-key "$stage/publisher.der" --metadata "file:///proc/self/fd/$metadata_fd/" \
+        --targets "file:///proc/self/fd/$targets_fd/" --index-only --require-catalog "$catalog"
+    exec {metadata_fd}<&- {targets_fd}<&-
+    [[ $(read_root_version "$stage/verified/.tuf/trusted/root.json") == "$root_version" ]] ||
+        fail 'TUF verification did not reach the active root through the published root history'
+}
+
+publish_immutable() {
+    local source=$1 destination=$2
+    if [[ -e $destination || -L $destination ]]; then
+        [[ -f $destination && ! -L $destination ]] && cmp -s -- "$source" "$destination" ||
+            fail "Conflicting mirror object $destination"
+    else
+        # Serve immutable copies that outlive the staging directory.
+        install -m 0644 -- "$source" "$stage/next"
+        ln -T -- "$stage/next" "$destination"
+        rm -- "$stage/next"
+    fi
+}
+
+if [[ $mode == refresh ]]; then
+    # The trusted record names the published snapshot. The origin is not trusted.
+    record=$(jq -er --arg catalog "$catalog" '
+        select(.catalog == $catalog)
+        | select(.snapshot.version | numbers | . >= 1 and floor == .)
+        | select(.snapshot.sha256 | strings | test("^[0-9a-f]{64}$"))
+        | [.snapshot.version, .snapshot.sha256] | @tsv
+    ' <<< "$published") ||
+        fail 'No completed deployment of this catalog to refresh. Deploy it with deploy-current.'
+    IFS=$'\t' read -r snapshot_version snapshot_sha256 <<< "$record"
+    (( root_version == latest_root_version )) && cmp -s -- "$stage/root.json" "$metadata/$root_version.root.json" ||
+        fail 'Publish the active TUF root with a full deployment before refreshing'
+    snapshot=$metadata/$snapshot_version.snapshot.json
+    [[ -f $snapshot && ! -L $snapshot && $(stat -c %s -- "$snapshot") -le 16777216 &&
+        $(sha256 "$snapshot") == "$snapshot_sha256" ]] ||
+        fail "The published snapshot $snapshot_version differs from the signer record"
+
+    mkdir "$stage/metadata"
+    cp -- "$stage/roots/"*.root.json "$snapshot" "$stage/metadata/"
+    # Copy each role listed by the trusted snapshot and check its digest.
+    while IFS=$'\t' read -r role role_version role_sha256; do
+        [[ $role =~ ^[A-Za-z0-9_-]+\.json$ && $role_version =~ ^[1-9][0-9]{0,14}$ &&
+            $role_sha256 =~ ^[0-9a-f]{64}$ ]] || fail 'Unexpected role in the published snapshot'
+        file=$metadata/$role_version.$role
+        [[ -f $file && ! -L $file && $(sha256 "$file") == "$role_sha256" ]] ||
+            fail "The published $role differs from the snapshot"
+        cp -- "$file" "$stage/metadata/"
+    done < <(jq -er '.signed.meta | to_entries[] | [.key, .value.version, .value.hashes.sha256] | @tsv' "$snapshot")
+    targets_version=$(jq -er '.signed.meta["targets.json"].version' "$snapshot")
+    targets_expires=$(jq -er '.signed.expires' "$metadata/$targets_version.targets.json")
+    snapshot_expires=$(jq -er '.signed.expires' "$snapshot")
+    now=$(date -u +%s)
+    (( $(date -u -d "$targets_expires" +%s) > now )) ||
+        fail "The targets metadata expired at $targets_expires. Deploy the release with the targets key."
+    if (( $(date -u -d "$targets_expires" +%s) < $(date -u -d '+14 days' +%s) )); then
+        printf 'Warning: the targets metadata expires at %s. Deploy the release with the targets key before then.\n' \
+            "$targets_expires" >&2
+    fi
+
+    timestamp_expiry=$(date -u -d "+$timestamp_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
+    refresh=("$cps" repo refresh-metadata --root "$stage/root.json" --snapshot "$snapshot"
+        --version "$version" --timestamp-expires "$timestamp_expiry" --output "$stage/refreshed")
+    role_keys timestamp
+    (( ${#role_args[@]} )) || fail 'Missing timestamp key source'
+    refresh+=("${role_args[@]}")
+    # Re-sign the snapshot when it would expire within a day of the new timestamp.
+    role_keys snapshot
+    if (( $(date -u -d "$snapshot_expires" +%s) < $(date -u -d "+$timestamp_lifetime +1 day" +%s) )); then
+        (( ${#role_args[@]} )) ||
+            fail "The snapshot expires at $snapshot_expires. Supply a snapshot key source to re-sign it."
+        snapshot_expiry=$(date -u -d "+$snapshot_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
+        refresh+=("${role_args[@]}" --snapshot-expires "$snapshot_expiry")
+    fi
+    "${refresh[@]}"
+    cp -- "$stage/refreshed/"* "$stage/metadata/"
+    verify_stage "$stage/metadata" "$targets"
+    next_snapshot=$stage/refreshed/$version.snapshot.json
+    if [[ -f $next_snapshot ]]; then
+        snapshot_version=$version
+        snapshot_sha256=$(sha256 "$next_snapshot")
+        snapshot_expires=$snapshot_expiry
+    fi
+    publication=$(jq -c --arg expires "$timestamp_expiry" --arg sha256 "$(sha256 "$stage/refreshed/timestamp.json")" \
+        --argjson snapshot_version "$snapshot_version" --arg snapshot_sha256 "$snapshot_sha256" \
+        --arg snapshot_expires "$snapshot_expires" '
+        .expires = $expires | .sha256 = $sha256
+        | .snapshot = {version: $snapshot_version, sha256: $snapshot_sha256, expires: $snapshot_expires}
+    ' <<< "$published")
+    # Keep the previous record during the reservation so an interrupted refresh can be retried.
+    state_tmp=$(mktemp "$repo/.ci-tuf-state.XXXXXXXX")
+    record_state "$published"
+    state_tmp=
+    if [[ -f $next_snapshot ]]; then
+        publish_immutable "$next_snapshot" "$metadata/$version.snapshot.json"
+    fi
+    install -m 0644 -- "$stage/refreshed/timestamp.json" "$stage/timestamp.next"
+    sync -f -- "$stage"
+    sync -- "$metadata"
+    mv -T -- "$stage/timestamp.next" "$timestamp"
+    sync -f -- "$mirror"
+    state_tmp=$(mktemp "$repo/.ci-tuf-state.XXXXXXXX")
+    record_state "$publication"
+    state_tmp=
+    if [[ -f $next_snapshot ]]; then
+        printf 'Refreshed TUF snapshot and timestamp version %s for catalog %s at %s\n' "$version" "$catalog" "$mirror"
+    else
+        printf 'Refreshed TUF timestamp version %s for catalog %s at %s\n' "$version" "$catalog" "$mirror"
+    fi
+    exit 0
+fi
+
+signing=()
+for role in targets snapshot timestamp; do
+    role_keys "$role"
+    (( ${#role_args[@]} )) || fail "Missing $role key source"
+    signing+=("${role_args[@]}")
+done
+role_keys objects
+signing+=("${role_args[@]}" --objects-threshold "$objects_threshold")
+
 "$cps" repo export --repo "$repo" --publisher "$publisher" --trust-key "$stage/publisher.der" \
     --output "$stage/export"
 [[ $(cat -- "$stage/export/current") == "$catalog" ]] || fail 'Exported a different catalog'
@@ -134,26 +300,20 @@ if [[ -e $mirror/publisher.json || -L $mirror/publisher.json ]]; then
         fail 'The mirror already advertises different publisher bootstrap material'
 fi
 
-release_expiry=$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')
-timestamp_expiry=$(date -u -d '+7 days' '+%Y-%m-%dT%H:%M:%SZ')
+release_expiry=$(date -u -d "+$targets_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
+timestamp_expiry=$(date -u -d "+$timestamp_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
 "$cps" repo sign-export --root "$stage/root.json" "${signing[@]}" \
     --version "$version" --release-expires "$release_expiry" --timestamp-expires "$timestamp_expiry" \
     --output "$stage/signed" "$stage/export"
 cp -- "$stage/roots/"*.root.json "$stage/signed/metadata/"
 
-# Use an open directory so local verification works with spaces in the staging path.
-exec {stage_fd}< "$stage/signed"
-stage_url=file:///proc/self/fd/$stage_fd
-"$cps" repo sync --repo "$stage/verified" --root "$stage/bootstrap-root.json" --publisher "$publisher" \
-    --trust-key "$stage/publisher.der" --metadata "$stage_url/metadata/" --targets "$stage_url/targets/" \
-    --index-only --require-catalog "$catalog"
-exec {stage_fd}<&-
-[[ $(read_root_version "$stage/verified/.tuf/trusted/root.json") == "$root_version" ]] ||
-    fail 'TUF verification did not reach the active root through the published root history'
+verify_stage "$stage/signed/metadata" "$stage/signed/targets"
 
-timestamp_hash=$(sha256sum < "$stage/signed/metadata/timestamp.json")
 publication=$(jq -n --arg catalog "$catalog" --arg expires "$timestamp_expiry" \
-    --arg sha256 "${timestamp_hash%% *}" '{catalog: $catalog, expires: $expires, sha256: $sha256}')
+    --arg sha256 "$(sha256 "$stage/signed/metadata/timestamp.json")" --argjson snapshot_version "$version" \
+    --arg snapshot_sha256 "$(sha256 "$stage/signed/metadata/$version.snapshot.json")" \
+    --arg snapshot_expires "$release_expiry" '{catalog: $catalog, expires: $expires, sha256: $sha256,
+        snapshot: {version: $snapshot_version, sha256: $snapshot_sha256, expires: $snapshot_expires}}')
 state_tmp=$(mktemp "$repo/.ci-tuf-state.XXXXXXXX")
 record_state null
 state_tmp=
@@ -164,19 +324,6 @@ for directory in "$mirror" "$metadata" "$targets"; do
     [[ $(stat -c %d -- "$directory") == "$device" ]] ||
         fail 'The mirror and its parent must be on the same filesystem'
 done
-
-publish_immutable() {
-    local source=$1 destination=$2
-    if [[ -e $destination || -L $destination ]]; then
-        [[ -f $destination && ! -L $destination ]] && cmp -s -- "$source" "$destination" ||
-            fail "Conflicting mirror object $destination"
-    else
-        # Serve immutable copies that outlive the staging directory.
-        install -m 0644 -- "$source" "$stage/next"
-        ln -T -- "$stage/next" "$destination"
-        rm -- "$stage/next"
-    fi
-}
 
 for file in "$stage/signed/targets/"*; do
     publish_immutable "$file" "$targets/${file##*/}"

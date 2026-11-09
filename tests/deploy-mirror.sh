@@ -186,4 +186,76 @@ jq -e --arg revoked "$revoked" --arg replacement "$replacement" '
 "$CPS_BIN" repo sync --repo new-cache --root root.json --publisher canopa --trust-key publisher.der \
     --metadata "$mirror_url/metadata/" --targets "$mirror_url/targets/" --require-catalog "$second"
 jq -e '.signed.version == 4' new-cache/.tuf/trusted/root.json
+
+# Routine refreshes need only the timestamp key. Take the other release keys offline.
+export CPS_MIRROR_TUF_ACTIVE_ROOT=$work/root-v4.json
+mkdir offline-keys
+mv -- next-keys/targets.pem next-keys/snapshot.pem offline-keys/
+refresh() { "$project/ci/deploy-mirror.sh" repo canopa "$1" refresh; }
+before=$(jq -er '.signed.version' public/metadata/timestamp.json)
+snapshot=$(jq -er '.signed.meta["snapshot.json"].version' public/metadata/timestamp.json)
+if deploy "$second"; then
+    echo 'A release was deployed without the targets key' >&2
+    exit 1
+fi
+refresh "$second"
+jq -e --argjson version "$((before + 1))" --argjson snapshot "$snapshot" \
+    '.signed.version == $version and .signed.meta["snapshot.json"].version == $snapshot' \
+    public/metadata/timestamp.json
+sync_mirror "$second"
+jq -e --argjson version "$((before + 1))" '.signed.version == $version' cache/.tuf/trusted/timestamp.json
+
+# An external signer can hold the timestamp key.
+mv -- next-keys/timestamp.pem timestamp-private.pem
+openssl pkey -in timestamp-private.pem -pubout -out timestamp.pub
+cat > next-keys/timestamp.signer.kdl <<SIGNER
+schema-version 1 kind="signer"
+command "$project/tests/support/openssl-signer.sh" "$work/timestamp-private.pem"
+public-key "$work/timestamp.pub"
+timeout-seconds 10
+SIGNER
+refresh "$second"
+jq -e --argjson version "$((before + 2))" '.signed.version == $version' public/metadata/timestamp.json
+sync_mirror "$second"
+
+# A refresh never signs over a snapshot the origin altered.
+snapshot_file=public/metadata/$snapshot.snapshot.json
+cp -- "$snapshot_file" saved-snapshot.json
+cp public/metadata/timestamp.json before-forgery.json
+jq '.signed.version = 999' saved-snapshot.json > forged-snapshot.json
+cat forged-snapshot.json > "$snapshot_file"
+if refresh "$second" > forgery.log 2>&1; then
+    echo 'A refresh signed over an altered snapshot' >&2
+    exit 1
+fi
+rg -F 'differs from the signer record' forgery.log
+cat saved-snapshot.json > "$snapshot_file"
+cmp before-forgery.json public/metadata/timestamp.json
+
+# A snapshot that would expire before the next timestamp needs the snapshot key.
+if CPS_MIRROR_TIMESTAMP_LIFETIME='40 days' refresh "$second" > snapshot.log 2>&1; then
+    echo 'A refresh outlived its snapshot without the snapshot key' >&2
+    exit 1
+fi
+rg -F 'Supply a snapshot key source' snapshot.log
+cp -- offline-keys/snapshot.pem next-keys/
+CPS_MIRROR_TIMESTAMP_LIFETIME='40 days' refresh "$second"
+jq -e --argjson version "$((before + 3))" \
+    '.signed.version == $version and .signed.meta["snapshot.json"].version == $version' \
+    public/metadata/timestamp.json
+jq -e --argjson version "$((before + 3))" '.signed.version == $version' \
+    "public/metadata/$((before + 3)).snapshot.json"
+sync_mirror "$second"
+"$CPS_BIN" repo sync --repo refreshed-cache --root root.json --publisher canopa --trust-key publisher.der \
+    --metadata "$mirror_url/metadata/" --targets "$mirror_url/targets/" --require-catalog "$second"
+
+# The next content change uses the targets key again and supersedes the refreshes.
+rm -- next-keys/timestamp.signer.kdl
+mv -- timestamp-private.pem next-keys/timestamp.pem
+mv -- offline-keys/targets.pem next-keys/
+publish 3
+third=$(cat repo/current)
+deploy "$third"
+jq -e --argjson version "$((before + 4))" '.signed.version == $version' public/metadata/timestamp.json
+sync_mirror "$third"
 printf '%s\n' 'Verified mirror publication, timestamp refresh, root rotation, and 2-of-3 key revocation'

@@ -72,9 +72,12 @@ case ${1:-} in
         inputs=${CPS_RELEASE_INPUTS:?Set CPS_RELEASE_INPUTS to the release requests directory}
         key=${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}
         [[ $inputs = /* ]] || fail 'Use an absolute release requests directory'
-        key=$(realpath -e -- "$key")
-        [[ -f $key && $key != "$(realpath -e -- "$repo")/"* ]] ||
+        # A command: source names an external signer descriptor instead of a key file.
+        source=${key#command:}
+        source=$(realpath -e -- "${source#file:}")
+        [[ -f $source && $source != "$(realpath -e -- "$repo")/"* ]] ||
             fail 'Keep the publisher signing key outside the publishing repository'
+        if [[ $key == command:* ]]; then key=command:$source; else key=$source; fi
         request="$inputs/$2/release.kdl"
         [[ -f $request ]] || fail 'Release request needs release.kdl'
         publish=("$cps" repo publish-release --repo "$repo" --signing-key "$key")
@@ -210,7 +213,11 @@ case ${1:-} in
             printf 'Mirror timestamp is valid until %s.\n' "$expires"
             exit 0
         fi
-        deploy_catalog "$base"
+        # Routine refreshes re-sign metadata for the deployed catalog. The
+        # adapter needs no targets key or publisher key for this.
+        env -u CPS_RELEASE_SIGNING_KEY "$deploy" "$repo" "$publisher" "$base" refresh
+        [[ $(current) == "$base" ]] || fail 'The repository advanced during the refresh'
+        printf 'Refreshed mirror metadata for catalog %s\n' "$base"
         ;;
     *) fail 'Expected prepare, promote, widen, advance, deploy-current, or refresh-mirror' ;;
 esac
