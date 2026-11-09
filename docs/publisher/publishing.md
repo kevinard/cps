@@ -55,7 +55,9 @@ cps publish --repo repo --proto proto --signing-key private.der manifests/*.kdl
 
 A plain publication reads and rewrites only the catalog shards that hold the
 published names, so its cost follows the size of the change rather than the
-size of the catalog. Repositories with a publish policy, and bundle
+size of the catalog. CPS writes manifests, payloads, and shards without a
+per-object fsync and syncs the repository filesystem once, before it writes
+the signed root that references them. Repositories with a publish policy, and bundle
 publications, still check the complete catalog.
 
 ## Signed catalog format

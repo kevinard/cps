@@ -406,7 +406,6 @@ impl Catalog {
             self.layout.committed.insert(prefix.clone(), hash);
             self.layout.loaded.insert(prefix, shard);
         }
-        File::open(repo.join(SHARD_OBJECTS))?.sync_all()?;
         Ok(shards::Root {
             format: shards::ROOT_FORMAT,
             publisher: self.publisher.clone(),
@@ -2280,10 +2279,33 @@ fn write_atomic(path: &Path, bytes: &[u8], immutable: bool) -> Result<()> {
     Ok(())
 }
 
+/// Store a content-addressed publication object. Objects are written without
+/// a per-object fsync: [`sync_objects`] makes a publication's objects durable
+/// at once, before the signed root that references them.
 fn store(repo: &Path, kind: &str, bytes: &[u8]) -> Result<String> {
     let hash = digest(bytes);
-    write_atomic(&repo.join(kind).join(&hash), bytes, true)?;
+    let parent = repo.join(kind);
+    if parent.join(&hash).try_exists()? {
+        let existing = Root::open(&parent)
+            .and_then(|parent| parent.file(&hash))
+            .and_then(|file| read_limited(file, bytes.len() as u64));
+        if existing.is_ok_and(|existing| existing == bytes) {
+            return Ok(hash);
+        }
+        // An object that does not match its digest name is damaged, for
+        // example by a crash before a sync. These bytes are the correct ones.
+    }
+    let mut file = NamedTempFile::new_in(&parent)?;
+    file.write_all(bytes)?;
+    file.persist(parent.join(&hash))?;
     Ok(hash)
+}
+
+/// Make every object written so far durable, with one filesystem sync
+/// instead of an fsync per object.
+fn sync_objects(repo: &Path) -> Result<()> {
+    rustix::fs::syncfs(File::open(repo)?)
+        .with_context(|| format!("syncing repository {}", repo.display()))
 }
 
 fn lock_repo(repo: &Path) -> Result<File> {
@@ -3129,6 +3151,7 @@ fn write_catalog_document(
     catalog.validate_profile_build_trust(&signer)?;
     prepare_objects(repo)?;
     let root = catalog.commit(repo)?;
+    sync_objects(repo)?;
     let signed = shards::seal(&serde_json::to_vec(&root)?, key)?;
     ensure!(
         signed.len() as u64 <= CATALOG_ROOT_LIMIT,
@@ -3312,20 +3335,21 @@ fn store_blob(
     }
     let parent = repo.join("blobs");
     let path = parent.join(&hash);
-    if path.try_exists()? {
-        let known = VERIFIED_BLOBS
+    let intact = || -> Result<bool> {
+        if VERIFIED_BLOBS
             .lock()
-            .is_ok_and(|verified| verified.contains(&path));
-        if !known {
-            let existing = Root::open(repo)?.file(&format!("blobs/{hash}"))?;
-            ensure!(
-                existing.metadata()?.len() == size
-                    && digest_reader(existing.take(size.saturating_add(1)))? == hash,
-                "immutable payload differs at {}",
-                path.display()
-            );
+            .is_ok_and(|verified| verified.contains(&path))
+        {
+            return Ok(true);
         }
-    } else {
+        let Ok(existing) = Root::open(repo)?.file(&format!("blobs/{hash}")) else {
+            return Ok(false);
+        };
+        Ok(existing.metadata()?.len() == size
+            && digest_reader(existing.take(size.saturating_add(1)))? == hash)
+    };
+    // A damaged blob at this digest is replaced with the verified payload.
+    if !(path.try_exists()? && intact()?) {
         input.rewind()?;
         let mut temp = NamedTempFile::new_in(&parent)?;
         io::copy(&mut (&mut input).take(limit), &mut temp)?;
@@ -3335,9 +3359,7 @@ fn store_blob(
             digest_reader(temp.as_file_mut())? == hash,
             "payload changed while publishing"
         );
-        temp.as_file().sync_all()?;
-        temp.persist_noclobber(&path)?;
-        File::open(parent)?.sync_all()?;
+        temp.persist(&path)?;
     }
     if let Ok(mut verified) = VERIFIED_BLOBS.lock() {
         verified.insert(path);
