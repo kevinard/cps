@@ -1134,6 +1134,40 @@ fn exact_version_requests_respect_dependencies_and_allow_deliberate_downgrades()
 }
 
 #[test]
+fn respelled_releases_satisfy_constraints_but_are_not_upgrades() -> Result<()> {
+    let f = Fixture::new()?;
+    let name = "desktop/compositor";
+    f.package(name, "02.0.0", f.file(COMPOSITOR, "installed", "0755", "")?)?;
+    f.package(
+        "desktop/plugin",
+        "1.0.0-0",
+        format!("    require {name:?} version=\">= 2.0.0, <2.0.1\"\n"),
+    )?;
+    f.create()?;
+    let install = |name: &str| Request::Install {
+        packages: vec![name.into()],
+    };
+    apply(&f.root, &plan(&f.root, install("desktop/plugin"))?)?;
+    f.package(
+        name,
+        "2.0.0-0",
+        f.file(COMPOSITOR, "respelled", "0755", "")?,
+    )?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(!update.summary().contains(name), "{}", update.summary());
+    apply(&f.root, &update)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "installed");
+    // The exact spelling still selects the other package ID deliberately.
+    apply(
+        &f.root,
+        &plan(&f.root, install("desktop/compositor@2.0.0-0"))?,
+    )?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "respelled");
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn boot_environment_keeps_its_own_image_state() -> Result<()> {
     let f = Fixture::new()?;
     let name = "desktop/compositor";
@@ -1705,9 +1739,10 @@ fn autoremove_preserves_installed_roots_and_resumes_offline() -> Result<()> {
     f.package(
         "desktop/session",
         "1.0.0-0",
+        // Both providers stay installed, so the declared order keeps the backup.
         r#"    require-any {
-        package "library/primary"
         package "library/backup"
+        package "library/primary"
     }
     conditional "desktop/plugin" when="library/backup"
     conditional "desktop/optional-plugin" when="library/primary"

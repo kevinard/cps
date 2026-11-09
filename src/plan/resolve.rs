@@ -61,7 +61,7 @@ pub fn resolve<'a, T>(
         available
             .obsoletions
             .get(&manifest.name)
-            .is_some_and(|cutoff| manifest.version <= *cutoff)
+            .is_some_and(|cutoff| manifest.version.semantic() <= cutoff.semantic())
     };
     for package in available
         .packages
@@ -85,7 +85,8 @@ pub fn resolve<'a, T>(
         if let Some(previous) = previous {
             let old = &previous.published.manifest;
             if old.publisher != manifest.publisher
-                || (old.version > manifest.version && pinned != Some(&manifest.version))
+                || (old.version.semantic() > manifest.version.semantic()
+                    && pinned != Some(&manifest.version))
             {
                 continue;
             }
@@ -110,9 +111,14 @@ pub fn resolve<'a, T>(
     for (name, versions) in &mut candidates {
         let prefer_current = !update && !requested.contains_key(*name);
         let current = installed.get(*name).map(|pkg| &pkg.published.sha256);
+        // Prefer the newest release. A respelling of the installed release is
+        // not an upgrade, so the installed package wins a semantic tie.
         versions.sort_by_key(|pkg| {
+            let is_current = current == Some(&pkg.sha256);
             (
-                prefer_current && current == Some(&pkg.sha256),
+                prefer_current && is_current,
+                pkg.manifest.version.semantic(),
+                is_current,
                 &pkg.manifest.version,
             )
         });
@@ -124,7 +130,7 @@ pub fn resolve<'a, T>(
             ensure!(
                 spec.version.as_ref().map_or_else(
                     || candidates.contains_key(spec.name),
-                    |version| version > cutoff
+                    |version| version.semantic() > cutoff.semantic()
                 ),
                 "{} is obsolete through {cutoff}",
                 spec.name

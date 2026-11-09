@@ -103,7 +103,7 @@ pub(crate) fn select_install_sources(
                         .is_none_or(|version| version == &entry.version)
                     && obsolete
                         .get(spec.name)
-                        .is_none_or(|cutoff| entry.version > *cutoff)
+                        .is_none_or(|cutoff| entry.version.semantic() > cutoff.semantic())
             });
             if let Some(entry) = matching {
                 sources.push(InstallSource {
@@ -934,10 +934,10 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
                 .peekable();
             if let Some(cutoff) = obsoletions.get(selector.name) {
                 ensure!(
-                    selector
-                        .version
-                        .as_ref()
-                        .map_or_else(|| named.peek().is_some(), |version| version > cutoff),
+                    selector.version.as_ref().map_or_else(
+                        || named.peek().is_some(),
+                        |version| { version.semantic() > cutoff.semantic() }
+                    ),
                     "{} is obsolete through {cutoff} for {}",
                     selector.name,
                     publisher.name,

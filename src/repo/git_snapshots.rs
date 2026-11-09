@@ -68,7 +68,7 @@ pub(crate) fn assign_git_version(
         let id = format!("{prefix}{version}");
         if let Some(cutoff) = cutoff {
             ensure!(
-                version > *cutoff,
+                version.semantic() > cutoff.semantic(),
                 "Git release {id} is obsolete through {cutoff}"
             );
         }
@@ -86,11 +86,12 @@ pub(crate) fn assign_git_version(
         }
 
         // A numbered tag can overlap a version allocated to an unpublished snapshot.
+        // Leading zeros do not change the release, so `0.0.0-07` overlaps `0.0.0-7`.
         let text = version.to_string();
         let revision = text
             .strip_prefix(SERIES)
-            .filter(|suffix| !suffix.starts_with('0'))
-            .and_then(|suffix| suffix.parse::<u64>().ok());
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+            .filter(|&revision| revision > 0);
         let Some(revision) = revision else {
             return Ok(version);
         };
@@ -166,8 +167,10 @@ pub(crate) fn assign_git_version(
     {
         let version = series_version(last.revision)?;
         let id = format!("{prefix}{version}");
-        if newest.as_ref().is_none_or(|newest| &version >= newest)
-            && cutoff.is_none_or(|cutoff| &version > cutoff)
+        if newest
+            .as_ref()
+            .is_none_or(|newest| version.semantic() >= newest.semantic())
+            && cutoff.is_none_or(|cutoff| version.semantic() > cutoff.semantic())
             && !catalog.withdrawals.contains_key(&id)
         {
             let existing = catalog
@@ -190,7 +193,7 @@ pub(crate) fn assign_git_version(
     let version = series_version(revision)?;
     if let Some(bound) = newest.as_ref().into_iter().chain(cutoff).max() {
         ensure!(
-            &version > bound,
+            version.semantic() > bound.semantic(),
             "snapshot series {SERIES}N cannot advance package {} beyond version {bound}",
             manifest.name
         );

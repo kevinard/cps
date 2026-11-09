@@ -657,7 +657,7 @@ pub(crate) fn inspect_update(
         };
         let selected = &package.published.manifest.version;
         update.selected = Some(selected.clone());
-        selected < &update.available
+        selected.semantic() < update.available.semantic()
     });
     Ok(plan)
 }
@@ -753,7 +753,7 @@ fn resolve_local<'a>(
             available
                 .obsoletions
                 .get(name)
-                .is_none_or(|cutoff| manifest.version > *cutoff),
+                .is_none_or(|cutoff| manifest.version.semantic() > cutoff.semantic()),
             "the current catalog obsoletes protected package {name}; apply a signed profile update first"
         );
         pinned.insert(
@@ -1217,9 +1217,9 @@ fn build_with_update_diagnostics(
                     .held_back
                     .iter_mut()
                     .find(|update| update.name == name)
-                && installed
-                    .get(name)
-                    .is_some_and(|package| package.published.manifest.version < candidate.available)
+                && installed.get(name).is_some_and(|package| {
+                    package.published.manifest.version.semantic() < candidate.available.semantic()
+                })
             {
                 let mut forced = successors.clone();
                 forced.insert(

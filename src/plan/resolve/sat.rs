@@ -193,6 +193,8 @@ impl<'a> Universe<'a> {
             let name = self.pool.intern_package_name(missing);
             return Ok(self.pool.intern_version_set(name, filter).into());
         };
+        // Capability providers have no declared order. Prefer a provider the
+        // transaction wants, then a compatible installed one, then the name.
         let mut choices: Vec<_> = providers
             .iter()
             .map(|&name| {
@@ -211,6 +213,9 @@ impl<'a> Universe<'a> {
         Ok(self.pool.intern_version_set_union(first, sets).into())
     }
 
+    /// Order `require-any` alternatives for the solver, which tries a union's
+    /// sets in order. A compatible installed provider that the transaction
+    /// retains comes first; the rest keep the order the author declared.
     fn alternatives(
         &self,
         targets: &[DependencyTarget],
@@ -227,15 +232,11 @@ impl<'a> Universe<'a> {
                         .constraint
                         .matches(version)
                 });
-            choices.push((
-                !matches_installed,
-                target.package.as_str(),
-                target.version.as_deref(),
-                set,
-            ));
+            choices.push((!matches_installed, set));
         }
-        choices.sort_unstable();
-        let mut sets = choices.into_iter().map(|(_, _, _, set)| set);
+        // A stable sort keeps the declared order within each group.
+        choices.sort_by_key(|&(not_installed, _)| not_installed);
+        let mut sets = choices.into_iter().map(|(_, set)| set);
         let first = sets.next().context("require-any has no alternatives")?;
         Ok(self.pool.intern_version_set_union(first, sets))
     }
@@ -245,6 +246,94 @@ impl<'a> Universe<'a> {
 mod tests {
     use super::*;
     use crate::{kdl_format::parse_manifest, model::digest};
+
+    fn published(name: &str, version: &str, body: &str) -> Result<Published> {
+        let document = format!(
+            "schema-version 1 kind=\"package-manifest\"\npackage \"{name}\" publisher=\"canopa\" version=\"{version}\" {{\n{body}\n}}\n"
+        );
+        Ok(serde_json::from_value(serde_json::json!({
+            "sha256": digest(document.as_bytes()),
+            "manifest": parse_manifest(&document)?,
+            "document": document,
+        }))?)
+    }
+
+    fn selected_names(
+        packages: &[Published],
+        wanted: &[&str],
+        installed: &BTreeMap<String, Installed>,
+    ) -> Result<BTreeSet<String>> {
+        let mut candidates = BTreeMap::<_, Vec<_>>::new();
+        for package in packages {
+            candidates
+                .entry(package.manifest.name.as_str())
+                .or_default()
+                .push(package);
+        }
+        solve(
+            &candidates,
+            &wanted.iter().copied().collect(),
+            installed,
+            None,
+            |selected| Ok(selected.keys().map(|name| name.to_string()).collect()),
+        )
+    }
+
+    #[test]
+    fn require_any_prefers_retained_providers_then_declared_order() -> Result<()> {
+        let app = |first: &str, second: &str| {
+            published(
+                "desktop/app",
+                "1.0.0-0",
+                &format!(
+                    "require-any {{\npackage \"{first}\"\npackage \"{second}\" version=\">= 1.0.0-0\"\n}}"
+                ),
+            )
+        };
+        let alpha = published("backend/alpha", "1.0.0-0", "")?;
+        let zeta = published("backend/zeta", "1.0.0", "")?;
+        let none = BTreeMap::new();
+        for (first, second) in [
+            ("backend/zeta", "backend/alpha"),
+            ("backend/alpha", "backend/zeta"),
+        ] {
+            let packages = [app(first, second)?, alpha.clone(), zeta.clone()];
+            let selected = selected_names(&packages, &["desktop/app"], &none)?;
+            assert!(selected.contains(first), "{selected:?}");
+            assert!(!selected.contains(second), "{selected:?}");
+        }
+
+        let installed = BTreeMap::from([(
+            "backend/alpha".to_owned(),
+            Installed {
+                published: alpha.clone(),
+                explicit: true,
+            },
+        )]);
+        let packages = [app("backend/zeta", "backend/alpha")?, alpha, zeta];
+        let selected = selected_names(&packages, &["desktop/app", "backend/alpha"], &installed)?;
+        assert!(!selected.contains("backend/zeta"), "{selected:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn capability_providers_prefer_wanted_then_name() -> Result<()> {
+        let packages = [
+            published(
+                "mail/client",
+                "1.0.0-0",
+                "require-capability \"cap/mail-transport\"",
+            )?,
+            published("mail/zeta", "1.0.0-0", "provides \"cap/mail-transport\"")?,
+            published("mail/alpha", "1.0.0-0", "provides \"cap/mail-transport\"")?,
+        ];
+        let none = BTreeMap::new();
+        let selected = selected_names(&packages, &["mail/client"], &none)?;
+        assert!(selected.contains("mail/alpha") && !selected.contains("mail/zeta"));
+        let selected = selected_names(&packages, &["mail/client", "mail/zeta"], &none)?;
+        assert!(!selected.contains("mail/alpha"), "{selected:?}");
+        Ok(())
+    }
 
     #[test]
     fn resolves_a_large_cycle() -> Result<()> {
@@ -311,10 +400,9 @@ impl Rejections {
                 "solver selected a rejected candidate pair"
             );
             let version = &universe.package(b).manifest.version;
-            let exact = format!("={version}");
             let filter = Filter {
-                expression: Some(format!("{exact} ({conflict})")),
-                constraint: VersionConstraint::parse(Some(&exact))?,
+                expression: Some(format!("={version} ({conflict})")),
+                constraint: VersionConstraint::exact(version.clone()),
                 exclude: true,
                 capability: None,
             };

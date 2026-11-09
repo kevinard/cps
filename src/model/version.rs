@@ -40,6 +40,17 @@ impl Version {
         format!("{epoch}{release}-{prefix}{dot}{next}").parse()
     }
 
+    /// Compare by release semantics, ignoring spelling.
+    ///
+    /// Use this view for every newer, older, or same-release decision: version
+    /// constraints, upgrades, obsoletion cutoffs, and snapshot allocation. It
+    /// treats `2.0.0`, `2.0.0-0`, and `0:02.0.0-00` as the same release. The
+    /// `Ord` impl on [`Version`] adds a spelling tiebreak for stable ordering of
+    /// distinct package IDs only.
+    pub fn semantic(&self) -> Semantic<'_> {
+        Semantic(self)
+    }
+
     fn parts(&self) -> (&str, &str, &str) {
         let (epoch, release) = self.0.split_once(':').unwrap_or(("0", &self.0));
         let (upstream, revision) = release
@@ -50,14 +61,39 @@ impl Version {
     }
 }
 
+/// A [`Version`] compared by release semantics; see [`Version::semantic`].
+#[derive(Clone, Copy, Debug)]
+pub struct Semantic<'a>(&'a Version);
+
+impl Ord for Semantic<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let (epoch, upstream, revision) = self.0.parts();
+        let (other_epoch, other_upstream, other_revision) = other.0.parts();
+        cmp_numeric(epoch, other_epoch)
+            .then_with(|| tokens(upstream).cmp(tokens(other_upstream)))
+            .then_with(|| tokens(revision).cmp(tokens(other_revision)))
+    }
+}
+
+impl PartialOrd for Semantic<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Semantic<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Semantic<'_> {}
+
+/// Total order for distinct package IDs: semantic order, then the spelling.
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
-        let (epoch, release, revision) = self.parts();
-        let (other_epoch, other_release, other_revision) = other.parts();
-        cmp_numeric(epoch, other_epoch)
-            .then_with(|| cmp_release(release, other_release))
-            .then_with(|| cmp_release(revision, other_revision))
-            // Preserve distinct package IDs when their numeric components tie.
+        self.semantic()
+            .cmp(&other.semantic())
             .then_with(|| self.0.cmp(&other.0))
     }
 }
@@ -78,42 +114,44 @@ fn cmp_numeric(a: &str, b: &str) -> Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
-fn cmp_release(mut a: &str, mut b: &str) -> Ordering {
-    loop {
-        let left = a.as_bytes().first().copied();
-        let right = b.as_bytes().first().copied();
-        let order = match (left, right) {
-            (None, None) => return Ordering::Equal,
-            (Some(l), Some(r)) if l.is_ascii_digit() && r.is_ascii_digit() => {
-                let end_a = a.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(a.len());
-                let end_b = b.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(b.len());
-                let order = cmp_numeric(&a[..end_a], &b[..end_b]);
-                a = &a[end_a..];
-                b = &b[end_b..];
-                order
-            }
-            _ => {
-                let order = byte_rank(left).cmp(&byte_rank(right));
-                if order == Ordering::Equal {
-                    a = &a[1..];
-                    b = &b[1..];
-                }
-                order
-            }
-        };
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
+/// One comparison unit of a version part, in ascending order of the variants.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Token<'a> {
+    Tilde,
+    /// A `-` followed by a letter, as in `1.0.0-rc1`.
+    PreRelease,
+    End,
+    /// A digit run without leading zeros. Ordering by length and then bytes is
+    /// numeric ordering without overflow.
+    Number(usize, &'a [u8]),
+    Letter(u8),
+    /// `+`, `-` before a digit, `.`, or `_`, in ASCII order.
+    Separator(u8),
 }
 
-fn byte_rank(byte: Option<u8>) -> u8 {
-    match byte {
-        Some(b'~') => 0,
-        Some(b'-') => 1,
-        None => 2,
-        Some(byte) => byte,
-    }
+/// Split a version part into tokens and terminate it with [`Token::End`].
+fn tokens(part: &str) -> impl Iterator<Item = Token<'_>> {
+    let bytes = part.as_bytes();
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        let byte = *bytes.get(index)?;
+        let start = index;
+        index += 1;
+        Some(match byte {
+            b'0'..=b'9' => {
+                while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                let digits = part[start..index].trim_start_matches('0').as_bytes();
+                Token::Number(digits.len(), digits)
+            }
+            b'~' => Token::Tilde,
+            b'-' if bytes.get(index).is_some_and(u8::is_ascii_alphabetic) => Token::PreRelease,
+            byte if byte.is_ascii_alphabetic() => Token::Letter(byte),
+            byte => Token::Separator(byte),
+        })
+    })
+    .chain(std::iter::once(Token::End))
 }
 
 impl fmt::Display for Version {
@@ -140,9 +178,17 @@ impl<'de> Deserialize<'de> for Version {
 mod tests {
     use super::*;
 
+    fn versions<const N: usize>(values: [&str; N]) -> Result<[Version; N]> {
+        let parsed = values
+            .map(str::parse::<Version>)
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(parsed.try_into().expect("same length"))
+    }
+
     #[test]
     fn orders_legacy_versions_and_imported_releases() -> Result<()> {
-        let ordered = [
+        let ordered = versions([
             "1.2.3-2",
             "1.2.3-10",
             "1.2.10-0",
@@ -158,19 +204,263 @@ mod tests {
             "262.1-1",
             "1:1.3.2-4",
             "10:1.3.2-1",
-        ]
-        .map(str::parse::<Version>)
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+        ])?;
+        assert!(ordered.is_sorted_by(|a, b| a.semantic() < b.semantic()));
         assert!(ordered.is_sorted_by(|a, b| a < b));
         Ok(())
+    }
+
+    #[test]
+    fn orders_each_part_like_dpkg_with_semver_prereleases() -> Result<()> {
+        let ordered = versions([
+            "1.0~a1~1",
+            "1.0~a1",
+            "1.0~beta",
+            "1.0-alpha",
+            "1.0-alpha.1",
+            "1.0-beta",
+            "1.0-rc1",
+            "1.0",
+            "1.0a",
+            "1.0b3",
+            "1.0+b1",
+            "1.0-1-1",
+            "1.0-15-1",
+            "1.0.0",
+            "1.0.1",
+            "1.0_1",
+            "1.1",
+            "1.1.0-rc1",
+            "1.1.0",
+        ])?;
+        for pair in ordered.windows(2) {
+            assert_eq!(
+                pair[0].semantic().cmp(&pair[1].semantic()),
+                Ordering::Less,
+                "{} < {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let [beta, patch, image, image_release, prerelease, release] = versions([
+            "2.0b3",
+            "2.0.1",
+            "7.1.1-15-1",
+            "7.1.1-1",
+            "1.0.0-rc1",
+            "1.0.0",
+        ])?;
+        assert!(beta.semantic() < patch.semantic());
+        assert!(image.semantic() > image_release.semantic());
+        assert!(prerelease.semantic() < release.semantic());
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_equality_ignores_spelling() -> Result<()> {
+        for group in [
+            &["2.0.0", "2.0.0-0", "0:2.0.0", "00:02.00.000-00"][..],
+            &["1.1", "1.01", "0:1.001-0"],
+            &["1.0-1.0", "1.0-01.00"],
+            &["3:1.0", "03:1.0-0"],
+        ] {
+            let group = group
+                .iter()
+                .map(|value| value.parse::<Version>())
+                .collect::<Result<Vec<_>>>()?;
+            for a in &group {
+                for b in &group {
+                    assert_eq!(a.semantic(), b.semantic(), "{a} = {b}");
+                    assert_eq!(a.cmp(b) == Ordering::Equal, a == b, "{a} ~ {b}");
+                }
+            }
+        }
+        for (a, b) in [
+            ("1.0", "1.0.0"),
+            ("1.0-1", "1.0-1.0"),
+            ("1a", "1a0"),
+            ("1.0", "1:1.0"),
+        ] {
+            let [a, b] = versions([a, b])?;
+            assert!(a.semantic() < b.semantic(), "{a} < {b}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn constraints_match_semantically() -> Result<()> {
+        use crate::model::VersionConstraint;
+        let matches = |constraint: &str, version: &str| -> Result<bool> {
+            Ok(VersionConstraint::parse(Some(constraint))?.matches(&version.parse()?))
+        };
+        for (constraint, version) in [
+            ("=2.0.0-0", "2.0.0"),
+            (">=2.0.0-0", "2.0.0"),
+            ("<=2.0.0", "0:2.0.0-0"),
+            (">= 1.1", "1.01"),
+            ("<  2.0.0-0, >=1.0", "1.9"),
+            (">1.0.0-rc1", "1.0.0"),
+            ("<7.1.1-15-0", "7.1.1-14-3"),
+            ("> 7.1.1", "7.1.1-15-0"),
+        ] {
+            assert!(matches(constraint, version)?, "{version} {constraint}");
+        }
+        for (constraint, version) in [
+            ("<1.0", "0:1.0"),
+            (">2.0.0-0", "2.0.0"),
+            ("<2.0.0", "2.0.0-0"),
+            ("<=2.0.1", "2.0.1b"),
+            ("=1.0", "1.0.0"),
+        ] {
+            assert!(!matches(constraint, version)?, "{version} {constraint}");
+        }
+        for invalid in ["", "1.0", ">=", "> =1.0", ">=1.0,", "=>1.0"] {
+            assert!(
+                VersionConstraint::parse(Some(invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let exact = VersionConstraint::exact("2.0.0-0".parse()?);
+        assert!(exact.matches(&"2.0.0-0".parse()?));
+        assert!(!exact.matches(&"2.0.0".parse()?));
+        Ok(())
+    }
+
+    #[test]
+    fn source_revisions_advance_semantically() -> Result<()> {
+        for (current, next) in [
+            ("1.0.0", "1.0.0-1"),
+            ("1.0.0-0", "1.0.0-1"),
+            ("1.0.0-00", "1.0.0-1"),
+            ("2:1.0-1.9", "2:1.0-1.10"),
+            ("7.1.1-15-0", "7.1.1-15-1"),
+            ("1.0.0-rc1", "1.0.0-rc1-1"),
+        ] {
+            let [current, expected] = versions([current, next])?;
+            let next = current.next_source_revision()?;
+            assert_eq!(next, expected);
+            assert!(next.semantic() > current.semantic(), "{next} > {current}");
+        }
+        Ok(())
+    }
+
+    /// Deterministic generator for property checks, without extra dependencies.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+
+        fn digits(&mut self) -> String {
+            let zeros = "0".repeat(self.next(3) / 2);
+            format!("{zeros}{}", ["0", "1", "2", "9", "10", "99"][self.next(6)])
+        }
+
+        fn version(&mut self) -> Version {
+            let mut text = String::new();
+            if self.next(4) == 0 {
+                text += &format!("{}:", self.digits());
+            }
+            text += &self.digits();
+            for _ in 0..self.next(4) {
+                text.push(['.', '+', '_', '~', '-'][self.next(5)]);
+                if self.next(3) == 0 {
+                    text.push(['a', 'b', 'Z', 'r'][self.next(4)]);
+                }
+                text += &self.digits();
+            }
+            if self.next(3) == 0 {
+                text += &format!("-{}", self.digits());
+            }
+            text.parse().expect("generated versions are valid")
+        }
+    }
+
+    #[test]
+    fn orders_are_total_transitive_and_consistent() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let sample: Vec<_> = (0..120).map(|_| rng.version()).collect();
+        for a in &sample {
+            assert_eq!(a.semantic().cmp(&a.semantic()), Ordering::Equal);
+            for b in &sample {
+                let semantic = a.semantic().cmp(&b.semantic());
+                assert_eq!(semantic, b.semantic().cmp(&a.semantic()).reverse());
+                assert_eq!(a.cmp(b), b.cmp(a).reverse());
+                assert_eq!(a.cmp(b) == Ordering::Equal, a == b, "{a} {b}");
+                // The total order refines the semantic order.
+                assert!(semantic == Ordering::Equal || a.cmp(b) == semantic);
+                for c in &sample {
+                    let bc = b.semantic().cmp(&c.semantic());
+                    if semantic != Ordering::Greater && bc != Ordering::Greater {
+                        assert_ne!(
+                            a.semantic().cmp(&c.semantic()),
+                            Ordering::Greater,
+                            "{a} <= {b} <= {c}"
+                        );
+                    }
+                    if a < b && b < c {
+                        assert!(a < c, "{a} < {b} < {c}");
+                    }
+                }
+            }
+        }
+        let mut sorted = sample.clone();
+        sorted.sort();
+        assert!(sorted.is_sorted_by(|a, b| a.semantic() <= b.semantic()));
+    }
+
+    #[test]
+    fn spelling_variants_compare_like_the_original() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..400 {
+            let (a, b) = (rng.version(), rng.version());
+            let text = a.to_string();
+            let mut variants = vec![format!("0:{text}")];
+            let has_revision = text
+                .rsplit_once('-')
+                .is_some_and(|(_, revision)| revision.split('.').all(is_numeric));
+            if !has_revision {
+                variants.push(format!("{text}-0"));
+            }
+            if let Some(release) = text.strip_prefix("0:") {
+                variants.push(release.to_owned());
+            }
+            // Pad every digit run that starts a number with a leading zero.
+            let mut padded = String::new();
+            let mut previous = None;
+            for ch in text.chars() {
+                if ch.is_ascii_digit() && !previous.is_some_and(|p: char| p.is_ascii_digit()) {
+                    padded.push('0');
+                }
+                padded.push(ch);
+                previous = Some(ch);
+            }
+            variants.push(padded);
+            for variant in variants {
+                let Ok(variant) = variant.parse::<Version>() else {
+                    continue;
+                };
+                assert_eq!(variant.semantic(), a.semantic(), "{variant} = {a}");
+                assert_eq!(
+                    variant.semantic().cmp(&b.semantic()),
+                    a.semantic().cmp(&b.semantic()),
+                    "{variant} vs {b}"
+                );
+            }
+        }
     }
 
     #[test]
     fn preserves_exact_spelling_and_rejects_invalid_selectors() -> Result<()> {
         let legacy = "1.2.3-0".parse::<Version>()?;
         let imported = "0:01.2.3".parse::<Version>()?;
+        assert_eq!(legacy.semantic(), imported.semantic());
         assert_ne!(legacy.cmp(&imported), Ordering::Equal);
+        assert_ne!(legacy, imported);
         for version in [legacy, imported] {
             let encoded = serde_json::to_string(&version)?;
             assert_eq!(encoded, format!("\"{version}\""));

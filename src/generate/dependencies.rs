@@ -175,7 +175,7 @@ fn load_providers(
                 || catalog
                     .obsoletions
                     .get(spec.name)
-                    .is_some_and(|cutoff| version <= *cutoff)
+                    .is_some_and(|cutoff| version.semantic() <= cutoff.semantic())
             {
                 continue;
             }

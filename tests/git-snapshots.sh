@@ -158,6 +158,10 @@ grep -F 'overlaps a reserved snapshot version' rejected.log
 git -C upstream tag v0.0.0-55 "$second"
 snapshot_from numbered-snapshot --tag v0.0.0-55 | grep -F 'snapshot@0.0.0-55 '
 snapshot main after-numbered-snapshot | grep -F 'snapshot@0.0.0-56 '
+# Leading zeros spell the same release as the reserved 0.0.0-56.
+git -C upstream tag v0.0.0-056 "$first"
+reject_snapshot --tag v0.0.0-056
+grep -F 'overlaps a reserved snapshot version' rejected.log
 
 if snapshot main first > existing.log 2>&1; then
     echo 'An existing snapshot directory was overwritten' >&2

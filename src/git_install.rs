@@ -248,7 +248,7 @@ impl GitBuild {
                 "pinned Git source already contains another commit"
             );
             if let Some(newest) = newest
-                && self.manifest.version <= newest
+                && self.manifest.version.semantic() <= newest.semantic()
             {
                 self.manifest.version = newest.next_source_revision()?;
             }

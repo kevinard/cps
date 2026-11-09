@@ -378,11 +378,11 @@ impl Catalog {
         let cutoff = spec.version.context("obsoletion requires a version")?;
         if let Some(previous) = self.obsoletions.get(spec.name) {
             ensure!(
-                cutoff >= *previous,
+                cutoff.semantic() >= previous.semantic(),
                 "obsoletion must advance the cutoff for {}",
                 spec.name
             );
-            if cutoff == *previous {
+            if cutoff.semantic() == previous.semantic() {
                 return Ok(false);
             }
         }
@@ -409,7 +409,7 @@ impl Catalog {
                 .version
                 .context("published package has no version")?;
             ensure!(
-                cutoff > version,
+                cutoff.semantic() > version.semantic(),
                 "obsoletion {id} must be newer than {previous}"
             );
         }
@@ -479,7 +479,7 @@ impl Catalog {
                 ensure!(
                     PackageSpec::parse(id)?
                         .version
-                        .is_some_and(|version| version < *cutoff),
+                        .is_some_and(|version| version.semantic() < cutoff.semantic()),
                     "rename cutoff for {name} must be newer than {id}"
                 );
             }
@@ -560,7 +560,7 @@ impl Catalog {
             ensure!(
                 next.obsoletions
                     .get(name)
-                    .is_some_and(|next| next >= cutoff),
+                    .is_some_and(|next| next.semantic() >= cutoff.semantic()),
                 "release drops or lowers the obsoletion for {name}"
             );
         }
@@ -1334,7 +1334,7 @@ fn decode_catalog(
             catalog
                 .obsoletions
                 .get(spec.name)
-                .is_none_or(|cutoff| version > *cutoff),
+                .is_none_or(|cutoff| version.semantic() > cutoff.semantic()),
             "catalog advertises obsolete package {id}"
         );
         entry.validate()?;
@@ -2051,7 +2051,7 @@ fn stage_manifest(
     );
     if let Some(cutoff) = catalog.obsoletions.get(&manifest.name) {
         ensure!(
-            manifest.version > *cutoff,
+            manifest.version.semantic() > cutoff.semantic(),
             "{id} is obsolete through {cutoff}"
         );
     }

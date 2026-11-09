@@ -227,8 +227,9 @@ impl Dependency {
 pub(crate) struct VersionConstraint(Vec<(&'static str, Version)>);
 
 impl VersionConstraint {
+    /// Match one package ID's exact spelling, unlike the semantic `=` operator.
     pub(crate) fn exact(version: Version) -> Self {
-        Self(vec![("=", version)])
+        Self(vec![("==", version)])
     }
 
     pub(crate) fn parse(constraint: Option<&str>) -> Result<Self> {
@@ -242,19 +243,26 @@ impl VersionConstraint {
                     .into_iter()
                     .find_map(|op| clause.strip_prefix(op).map(|value| (op, value)))
                     .with_context(|| format!("invalid constraint {clause:?}"))?;
-                Ok((operator, bound.parse()?))
+                Ok((operator, bound.trim_start().parse()?))
             })
             .collect::<Result<Vec<_>>>()
             .map(Self)
     }
 
+    /// Match by release semantics, so `2.0.0` satisfies `=2.0.0-0`.
     pub(crate) fn matches(&self, version: &Version) -> bool {
-        self.0.iter().all(|(operator, bound)| match *operator {
-            ">=" => version >= bound,
-            "<=" => version <= bound,
-            ">" => version > bound,
-            "<" => version < bound,
-            _ => version == bound,
+        self.0.iter().all(|(operator, bound)| {
+            if *operator == "==" {
+                return version == bound;
+            }
+            let (version, bound) = (version.semantic(), bound.semantic());
+            match *operator {
+                ">=" => version >= bound,
+                "<=" => version <= bound,
+                ">" => version > bound,
+                "<" => version < bound,
+                _ => version == bound,
+            }
         })
     }
 

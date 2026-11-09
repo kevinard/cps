@@ -58,6 +58,10 @@ installed commit. It reports a branch rewrite and leaves that package at its
 installed commit. `--dry-run` shows available Git commits without building, and
 `--no-refresh` uses the installed Git selections. CPS stages tracked updates
 in a new boot environment for rollback. When a tracked commit's version
-would not advance the package, CPS allocates a higher revision. `cps info NAME` shows the
+would not advance the package, CPS allocates a higher revision. The check uses
+[version ordering](manifests.md#package-metadata-and-version-constraints), so
+`1.0.0` does not advance `1.0.0-0` and the next build becomes `1.0.0-1`. Give an
+upstream release that contains a dash an explicit revision, such as
+`7.1.1-15-0`, so allocated revisions continue as `7.1.1-15-1`. `cps info NAME` shows the
 installed commit as `upstream-version`. That manifest is part of the boot
 environment, so rollback restores the commit and the installed files together.
