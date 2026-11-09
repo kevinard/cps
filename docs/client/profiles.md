@@ -5,8 +5,8 @@
 ## Images that follow a signed release profile
 
 Add `release-profile "desktop"` to the image KDL to follow that profile in the
-first publisher's signed catalog. Configure the same architecture, facets, and
-publisher order as the profile. Each companion repository must have the signed
+first publisher's signed catalog. Configure the same architecture, image-wide
+facet rules, variants, and publisher order as the profile. Each companion repository must have the signed
 catalog referenced by the profile. The signed publishers keep their signed
 membership and order. Repository paths can be relocated in place.
 
@@ -131,6 +131,31 @@ primary catalog and must match the companion digests signed in that catalog.
 Local history keeps those plans usable after a release advances. Offline
 installed-package queries, removal, and repair use committed image state.
 
+## Facet rules on profile images
+
+The signed profile fixes the image-wide facet rules and variants that its
+publisher checked, so `change-facet FACET=...` and `change-variant` are
+refused on a profile image. Per-package rules (`PACKAGE:FACET=...`) follow
+one rule:
+
+- A rule may reach packages you installed locally.
+- A rule that reaches a profile-protected package is refused, unless the
+  profile declares `allow-facet-override` for a pattern that covers the
+  rule's facet. A rule reaches a package when its package name or glob
+  matches it, or when `--with-dependencies` carries it there from a local
+  package.
+
+CPS checks the rule on every plan, so a later profile update that starts
+protecting a package your rule reaches is refused until you reset the rule.
+The publisher tested the composition with the profile's facets. A permitted
+override changes files inside protected packages, which the publisher
+accepted by allowing it, and never changes the protected package set.
+
+```sh
+cps plan --root image --output app.json change-facet tools/app:devel=true
+cps plan --root image --output sqlite.json change-facet library/sqlite:devel=true  # needs allow-facet-override
+```
+
 ## Provisioning the same composition on another machine
 
 ```sh
@@ -144,11 +169,14 @@ cps image-diff installed replica
 
 An image lock is a JSON document with `"format": 1` and
 `"kind": "image-lock"`. It records the exact package composition, publisher order and key
-fingerprints, catalog pins, architecture, facets, and local package
-requests. The replica gets a fresh image identity. The target's KDL
-configuration supplies its repository locations, trust keys, and build
-trust policies. Give it the locked architecture, facets, profile name,
-and publisher order, including any locally added publishers. Retain the
+fingerprints, catalog pins, architecture, image-wide facet rules,
+per-package facet rules, variants, and local package requests. The replica
+gets a fresh image identity. The target's KDL configuration supplies its
+repository locations, trust keys, and build trust policies. Give it the
+locked architecture, image-wide facet rules, variants, profile name, and
+publisher order, including any locally added publishers. The configuration
+may omit per-package facet rules, and the replica then adopts the lock's
+rules. If it lists any, they must equal the lock's. Retain the
 pinned signed catalogs and their selected payloads in the configured
 repositories or caches.
 

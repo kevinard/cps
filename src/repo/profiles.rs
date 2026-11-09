@@ -12,7 +12,7 @@ use crate::{
     boot::kernel,
     image::{Installed, Managed},
     kdl_format::publish_policy::{Companion, Profile},
-    model::{Node, PackageSpec, Version, VersionConstraint},
+    model::{Node, PackageSpec, Selection, Version, VersionConstraint},
     plan::{
         CandidateSet, Candidates, Renames, Retention, check_directory, check_path_type,
         resolve_packages, select_paths,
@@ -202,6 +202,8 @@ pub(super) fn check(
         let next = ReleaseProfile {
             architecture: profile.arch.clone(),
             facets: profile.facets.clone(),
+            variants: profile.variants.clone(),
+            facet_overrides: profile.facet_overrides.clone(),
             roots: profile
                 .packages
                 .keys()
@@ -379,6 +381,7 @@ fn baseline_image(
         ensure!(
             historical.architecture == profile.arch
                 && historical.facets == profile.facets
+                && historical.variants == profile.variants
                 && historical
                     .companions
                     .iter()
@@ -427,7 +430,10 @@ fn baseline_image(
         let installed = baseline
             .replay(historical)
             .context("replaying the baseline image")?;
-        let paths = profile_paths(&profile.arch, &profile.facets, &installed)?;
+        let paths = profile_paths(
+            Selection::image(&profile.arch, &profile.variants, &profile.facets),
+            &installed,
+        )?;
         return Ok((installed, paths));
     }
     compose(&baseline, profile, roots).context("composing the baseline image")
@@ -525,18 +531,23 @@ fn compose<'a>(
         false,
         Retention::None,
         true,
-        |installed| profile_paths(&profile.arch, &profile.facets, installed),
+        |installed| {
+            profile_paths(
+                Selection::image(&profile.arch, &profile.variants, &profile.facets),
+                installed,
+            )
+        },
     )
 }
 
+/// Compose a signed profile's paths. Profiles carry image-wide facets and variants only;
+/// per-package facet rules belong to individual images.
 pub(super) fn profile_paths(
-    arch: &str,
-    facets: &BTreeMap<String, bool>,
+    selection: Selection<'_>,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
     let paths = select_paths(
-        arch,
-        facets,
+        selection,
         &BTreeMap::new(),
         Node::Dir {
             mode: 0o755,
@@ -558,7 +569,12 @@ fn check_upgrade(
     locked: bool,
     renames: &Renames,
 ) -> Result<Composition> {
-    let compose = |installed: &_| profile_paths(&profile.architecture, &profile.facets, installed);
+    let compose = |installed: &_| {
+        profile_paths(
+            Selection::image(&profile.architecture, &profile.variants, &profile.facets),
+            installed,
+        )
+    };
     let successors = renames.requirements();
     let (after, new_paths) = if locked {
         renames.check_profile(|_| true, Some(profile))?;

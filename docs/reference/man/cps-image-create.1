@@ -30,8 +30,15 @@
 .B \&\-\-trust\-key <TRUST_KEY>
 .PP
 .B \&\-\-arch <ARCH>
-.PP
-.B \&\-\-facet <NAME=BOOL>
+.TP
+.B \&\-\-facet <[PACKAGE:]FACET=BOOL>
+\&Set an image\-wide facet rule (FACET, PREFIX.*, or *) or a per\-package rule (PACKAGE:FACET, where PACKAGE may end in /*)
+.TP
+.B \&\-\-with\-dependencies
+\&Apply the per\-package \-\-facet rules to each package's installed dependencies too
+.TP
+.B \&\-\-variant <NAME=VALUE>
+\&Set a variant other than arch, such as container=true
 .TP
 .B \&\-h, \-\-help
 \&Print help

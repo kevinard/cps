@@ -102,6 +102,15 @@ impl Fixture {
     }
 }
 
+/// Image-wide and per-package facet rules configured on an image, without defaults.
+fn local_facets(root: &Path) -> Result<BTreeMap<String, bool>> {
+    Ok(crate::query::list_facets(root)?
+        .into_iter()
+        .filter(|row| row.source == "local")
+        .map(|row| (row.rule, row.value))
+        .collect())
+}
+
 fn dependency(kind: &str, name: &str, version: &str) -> String {
     format!("    {kind} {name:?} version=\"={version}\"\n")
 }
@@ -2753,11 +2762,12 @@ fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
     f.package(
         "desktop/app",
         "4.0.0-0",
-        format!(
-            "{}{}",
-            f.file(COMPOSITOR, "overlapping actions", "0755", "")?,
-            f.file(COMPOSITOR, "overlapping actions", "0755", "arch=\"x86_64\"")?,
-        ),
+        f.file(
+            COMPOSITOR,
+            "requires an unset variant",
+            "0755",
+            "variant.container=\"true\"",
+        )?,
     )?;
     let mut held_back = Vec::new();
     let inspected = crate::plan::inspect_update(
@@ -2859,6 +2869,7 @@ fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Resul
     )?;
     let set = |value| Request::ChangeFacet {
         facets: BTreeMap::from([("doc.man".into(), value)]),
+        with_dependencies: false,
     };
     let enable = plan(&f.root, set(None))?;
     assert!(
@@ -2872,7 +2883,7 @@ fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Resul
     crate::stage_boot_environment(&f.root, &staged, &enable)?;
     assert!(!f.root.join(MANPAGE).exists());
     assert_eq!(fs::read_to_string(staged.join(MANPAGE))?, "manpage 1");
-    assert!(crate::query::list_facets(&staged)?.is_empty());
+    assert!(local_facets(&staged)?.is_empty());
     assert!(crate::verify_pristine(&staged)?.is_empty());
 
     interrupt_apply_at(&f.root, &f._dir.path().join("facet.json"), &enable, MANPAGE)?;
@@ -2908,7 +2919,7 @@ fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Resul
         "administrator settings"
     );
     assert_eq!(
-        crate::query::list_facets(&f.root)?,
+        local_facets(&f.root)?,
         BTreeMap::from([("doc.man".into(), false)])
     );
     assert!(verify(&f.root)?.is_empty());
@@ -3025,6 +3036,7 @@ fn restores_disabled_config_proposals_and_moves_local_edits_after_upgrade() -> R
     assert_eq!(previous.len(), 1);
     let toggle = |value| Request::ChangeFacet {
         facets: BTreeMap::from([("optional".into(), value)]),
+        with_dependencies: false,
     };
     apply(&f.root, &plan(&f.root, toggle(Some(false)))?)?;
     assert!(crate::list_config_updates(&f.root)?.is_empty());
@@ -4255,6 +4267,7 @@ fn exact_install_and_remove_offline() -> Result<()> {
 
 mod release;
 
+mod facets;
 mod freezes;
 mod modes;
 

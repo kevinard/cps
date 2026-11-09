@@ -115,7 +115,7 @@ objects. Replay checkpoints still remember newer verified metadata.
 
 Use `repo sync-profile --config image.kdl --image /path/to/image` to guard
 the whole profile with an existing image. The supplied configuration must
-match the installed profile, architecture, facets, publisher order, and
+match the installed profile, architecture, facets, variants, publisher order, and
 publisher keys. CPS checks the current catalog from each mirror and the
 exact companion catalogs pinned by the new primary profile. It advances
 the CPS checkpoints only after the guarded profile passes validation.

@@ -554,6 +554,8 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
     let profile = crate::repo::ReleaseProfile {
         architecture: "x86_64".to_owned(),
         facets: BTreeMap::new(),
+        variants: BTreeMap::new(),
+        facet_overrides: BTreeSet::new(),
         companions: Vec::new(),
         roots: BTreeMap::from([("desktop/compositor".to_owned(), version)]),
         composition,
@@ -2302,7 +2304,7 @@ publisher "canopa" {{
     assert_eq!(refresh(&first)?, first);
     write_config("aarch64")?;
     let error = create_configured_image(&f.root, &config).unwrap_err();
-    assert!(format!("{error:#}").contains("architecture or facets differ"));
+    assert!(format!("{error:#}").contains("architecture, facets or variants differ"));
     assert!(!f.root.exists());
     write_config("x86_64")?;
     create_configured_image(&f.root, &config)?;
@@ -4339,13 +4341,14 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         &f.root,
         Request::ChangeFacet {
             facets: BTreeMap::from([("doc.man".into(), Some(false))]),
+            with_dependencies: false,
         },
     )
     .unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("the signed release profile fixes this image's facets")
+            .contains("the signed release profile fixes this image's image-wide facets")
     );
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     {
@@ -6314,6 +6317,7 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
         &f.root,
         Request::ChangeFacet {
             facets: BTreeMap::from([("doc.man".into(), None)]),
+            with_dependencies: false,
         },
     )?;
     assert!(!f.root.join(MANPAGE).exists());

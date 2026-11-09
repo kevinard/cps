@@ -84,7 +84,8 @@ pub fn sync_profile_with_payloads(
         ensure!(
             state.publishers.release_profile() == Some(name)
                 && state.settings.arch == definition.arch
-                && state.settings.facets == definition.facets
+                && state.settings.facets == definition.policy.facets
+                && state.settings.variants == definition.policy.variants
                 && state
                     .publishers
                     .signed_publishers()
@@ -176,8 +177,7 @@ pub fn sync_profile_with_payloads(
         )?;
         profile.check_image(
             name,
-            &definition.arch,
-            &definition.facets,
+            definition.policy.selection(&definition.arch),
             companions.iter().map(|source| source.publisher),
         )?;
         profiles.push((pin, profile));
@@ -334,7 +334,10 @@ fn check_composition(
         }
     }
     let installed = candidates.replay(profile)?;
-    let paths = profile_paths(&profile.architecture, &profile.facets, &installed)?;
+    let paths = profile_paths(
+        crate::model::Selection::image(&profile.architecture, &profile.variants, &profile.facets),
+        &installed,
+    )?;
     if let Some(payloads) = payloads {
         for managed in paths.into_values() {
             let Node::File { sha256, size, .. } = managed.node else {

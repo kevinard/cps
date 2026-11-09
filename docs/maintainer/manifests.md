@@ -11,6 +11,8 @@ the generated KDL, then test the package in an [inactive image](../client/images
 - [Generating a manifest from a prototype](#generating-a-manifest-from-a-prototype)
   - [Suggesting runtime dependencies](#suggesting-runtime-dependencies)
 - [Package metadata and version constraints](#package-metadata-and-version-constraints)
+- [Facets and variants](#facets-and-variants)
+  - [Choosing between a facet, a package, and a variant](#choosing-between-a-facet-a-package-and-a-variant)
 - [Mediated links](#mediated-links)
 - [Virtual packages](#virtual-packages)
 - [Recommended packages](#recommended-packages)
@@ -55,7 +57,7 @@ cps manifest dependencies --proto proto --config image.kdl \
 
 Supply one exact signed catalog digest per publisher in the image config.
 The command uses the configured local repositories or metadata caches,
-architecture, and facets. It considers the newest active version of each
+architecture, variants, and facet rules. It considers the newest active version of each
 package name from the first eligible publisher. It reads the pinned
 catalogs even if the repositories have since advanced.
 
@@ -98,8 +100,8 @@ UTF-8 bytes respectively. The catalog signs the summary and the manifest
 digest, which covers the optional dependency descriptions. Publish a new
 package version to add this metadata to a published package.
 
-- Package manifests use KDL 2. The `schema-version 1` header requires `kind="package-manifest"`. Image configuration uses `schema-version 1 kind="image-config"`. Its paths resolve relative to the configuration file. It also accepts `architecture "x86_64"` and `facet "doc.man" #false`.
-- Set `architecture="x86_64"` on the `package` node for a package that targets one architecture, or pass `--architecture x86_64` to `manifest generate`. Only matching packages participate in dependency resolution and publisher ordering. The signed catalog and manifest must agree, and a source build and its attestation must declare the same target. Omit the package property for portable packages or manifests with per-action architecture selectors. Package IDs are unique within a repository, so publishing the same name and version for two architectures requires separate repositories.
+- Package manifests use KDL 2. The `schema-version 1` header requires `kind="package-manifest"`. Image configuration uses `schema-version 1 kind="image-config"`. Its paths resolve relative to the configuration file. It also accepts `architecture "x86_64"`, facet rules such as `facet "doc.man" #false`, and variants such as `variant "container" #true`. See [package selection](../client/configuration.md#facets-and-variants-on-an-existing-image).
+- Set `architecture="x86_64"` on the `package` node for a package that targets one architecture, or pass `--architecture x86_64` to `manifest generate`. Only matching packages participate in dependency resolution and publisher ordering. The signed catalog and manifest must agree, and a source build and its attestation must declare the same target. Omit the package property for portable packages or manifests with per-action `arch` selectors. Package IDs are unique within a repository, so publishing the same name and version for two architectures requires separate repositories.
 - Inside a package block, declare dependencies as `require "library/libdisplay" version=">=1.0.0-0, <2.0.0-0"` or `incorporate "library/libdisplay" version="=1.0.0-0"`. Use `exclude "library/libdisplay" version=">=2.0.0-0"` to reject a range when the package is present. Omit the version to exclude every version of that package.
 - Package versions accept a digit-led release with ASCII letters and digits and single `.`, `+`, `_`, `~`, or `-` separators. An optional numeric epoch precedes `:`. A final dash followed by a number or dotted numbers specifies the packaging revision. When the upstream release itself has a dash before a number, as in `7.1.1-15`, spell the revision explicitly as `7.1.1-15-0`. Versions such as `1:1.3.2-4`, `262.1-1`, `7.2.14.arch1-1`, and `2.44+r50+g1848099f063e-1` can be used directly in package IDs and constraints.
 - CPS compares epoch, release, and revision in that order. Omitted epochs and revisions count as zero. Digit runs compare numerically and ignore leading zeros, so `2.0.0`, `2.0.0-0`, and `0:02.0.0` are the same release and `rc10` follows `rc2`. Within the release and the revision, `~` sorts first. A `-` followed by a letter marks a pre-release and sorts next, then the end of the part, then letters, then `+`, a `-` followed by a digit, `.`, and `_`. So `1.0~rc1` < `1.0-rc1` < `1.0` < `1.0b3` < `1.0+b1` < `1.0-15-0` < `1.0.1` < `1.0_1`, and `7.1.1-15-0` follows `7.1.1-1`. Version constraints, upgrades, downgrade checks, obsoletion cutoffs, and snapshot allocation compare releases this way. A constraint accepts spaces after its operator, as in `>= 1.0`.
@@ -107,9 +109,64 @@ package version to add this metadata to a published package.
 - Use a `require-any` block with two or more `package` entries when interchangeable providers can satisfy a dependency. Each alternative accepts the same `version` constraints as `require`. The solver prefers a compatible installed provider that the transaction will retain, then tries the alternatives in the order listed, so list the preferred provider first. Offline removal checks that a compatible provider remains installed. [IPS dependency types](https://docs.oracle.com/cd/E53394_01/html/E54820/dependtypes.html)
 - `conditional "desktop/plugin" version="=2.0.0-0" when="runtime/desktop" when-version=">=2.0.0-0"` requires the plugin when the resulting image includes a matching runtime. Omit `when-version` to match any installed version of the runtime. The predicate alone leaves the runtime optional.
 - Plans use Resolvo to resolve compatible versions and report incompatible requirements. When selected file actions collide, CPS excludes the conflicting version or pair of versions and retries. Directory sharing still requires identical metadata. SAT resolution has a 60-second time limit. Saved plans record the selected catalog for each publisher and whether to install recommendations. Apply uses those inputs to verify the selection. [Resolvo](https://github.com/prefix-dev/resolvo)
-- Actions support `file`, `dir`, `symlink`, and `hardlink`. A symlink specifies `target` in place of `mode`. Use `hardlink "bin/tool" target="usr/bin/tool"` to share the inode of an immutable regular file in the same package. The target is relative to the image root and supplies ownership, mode, and content. The optional `arch` and `facet` selectors match image policy. A hard link's target must be selected whenever the alias is selected. Facets default to enabled and can be set with `image-create --facet doc.man=false`. [IPS hard-link actions](https://docs.oracle.com/cd/E53394_01/html/E54820/pkgterms.html)
+- Actions support `file`, `dir`, `symlink`, and `hardlink`. A symlink specifies `target` in place of `mode`. Use `hardlink "bin/tool" target="usr/bin/tool"` to share the inode of an immutable regular file in the same package. The target is relative to the image root and supplies ownership, mode, and content. Actions can carry [facet and variant selectors](#facets-and-variants). A hard link's target must be selected whenever the alias is selected, so the target's facet is absent or the same and its variants are a subset of the alias's. [IPS hard-link actions](https://docs.oracle.com/cd/E53394_01/html/E54820/pkgterms.html)
 - Files marked `preserve=#true` keep local edits through an upgrade, including a package ownership transfer at the same path. Removing a managed action leaves a modified file in place and records its configuration identity so a reinstall can reclaim it. When the vendor file changes, find its new copy under `/var/lib/cps/image/config-updates/<revision>/` inside the image.
 - The image must be inactive and reside on one filesystem. Existing explicit directory metadata must match either the installed declaration or the selected action. CPS can update directories in place when their metadata matches the installed declaration. Unmanaged or locally changed directory metadata must already match the selected action. Transitions between a directory and a file or symlink are rejected. When ownership ends, CPS prunes directories it recorded creating if they are empty and their metadata still matches. It keeps pre-existing directories and directories with local content or extended attributes.
+
+## Facets and variants
+
+Mark optional content inside a package with a `facet` and alternative
+content with variants. Both apply to `file`, `dir`, `symlink`, and
+`hardlink` actions.
+
+```kdl
+file "usr/include/sqlite3.h" mode="0644" uid=0 gid=0 facet="devel"
+symlink "usr/lib/libsqlite3.so" target="libsqlite3.so.0" uid=0 gid=0 facet="devel"
+file "usr/share/locale/fr/LC_MESSAGES/sqlite.mo" mode="0644" uid=0 gid=0 facet="locale.fr"
+file "usr/lib/debug/usr/lib/libsqlite3.so.0.debug" mode="0644" uid=0 gid=0 facet="debug.sqlite"
+file "usr/lib32/libsqlite3.so.0" mode="0755" uid=0 gid=0 facet="isa.i686"
+symlink "lib64" target="usr/lib" uid=0 gid=0 arch="x86_64"
+symlink "etc/init.conf" target="../usr/lib/init/container.conf" uid=0 gid=0 variant.container="true"
+symlink "etc/init.conf" target="../usr/lib/init/metal.conf" uid=0 gid=0 variant.container="false"
+```
+
+- A facet name is dot-separated lowercase components, such as `devel`,
+  `doc.man`, or `locale.fr`. An action has at most one facet. Images choose
+  facets with exact names or trailing wildcards such as `locale.*`, so
+  name related facets under a common prefix. An unmatched facet is enabled,
+  except `debug.*` and `isa.*`, which are off unless the image enables them.
+- `variant.NAME="VALUE"` selects the action only when the image sets that
+  variant to that value. `#true` and `#false` stand for `"true"` and
+  `"false"`. `arch="x86_64"` is shorthand for `variant.arch="x86_64"`, and the
+  package-level `architecture` still restricts the whole package. An action
+  can carry several variants and is selected when all of them match.
+- Installing a package that selects content by a variant the image does not
+  set fails, and the solver tries other versions, so publish a variant only
+  together with the images that set it.
+- Several actions can share a path only when every pair requires different
+  values of one variant, so no image can select two of them. A facet
+  difference alone is not enough, because both facets can be enabled.
+  Publication takes a file's payload from the prototype at its path, so
+  alternatives at one path share a payload. Put distinct payloads at
+  distinct paths and select a symlink by variant, as above.
+- Dependencies cannot carry facet or variant selectors. Facets and variants
+  only choose files inside packages that dependency resolution already
+  selected, and the image can change them offline without resolving again.
+  Content with its own dependencies belongs in a separate package.
+
+### Choosing between a facet, a package, and a variant
+
+| Use | When | Examples |
+| --- | --- | --- |
+| Facet | Optional content inside one package that never needs extra dependencies. The image chooses it for all packages or overrides it for one. | `devel` headers and `.so` links, `doc.man`, `locale.fr`, static libraries, `debug.*` symbols, `isa.i686` multilib objects |
+| Separate package | The content must be installed or removed on its own, or has its own dependency closure. | A plugin that requires another service, a daemon split from its client library |
+| Variant | A mutually exclusive image property selects between alternative content. | `arch`, a container or bare-metal variant, a debug build |
+
+Ship 32-bit multilib objects as `isa.*` facets of the 64-bit package, the
+way illumos ships both in one package. A header package that would only
+pull in other headers is still a facet: a client can apply a per-package
+facet rule to the package's dependencies too. See
+[per-package facet rules](../client/configuration.md#per-package-facet-rules).
 
 ## Mediated links
 

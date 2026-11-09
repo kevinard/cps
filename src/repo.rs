@@ -81,6 +81,10 @@ pub(crate) struct Catalog {
 pub(crate) struct ReleaseProfile {
     pub architecture: String,
     pub facets: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variants: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub facet_overrides: BTreeSet<String>,
     pub companions: Vec<CatalogPin>,
     pub roots: BTreeMap<String, Version>,
     pub composition: BTreeMap<String, String>,
@@ -113,13 +117,14 @@ impl ReleaseProfile {
     pub(crate) fn check_image<'a>(
         &self,
         name: &str,
-        arch: &str,
-        facets: &BTreeMap<String, bool>,
+        selection: crate::model::Selection<'_>,
         companions: impl IntoIterator<Item = &'a str>,
     ) -> Result<()> {
         ensure!(
-            self.architecture == arch && &self.facets == facets,
-            "image architecture or facets differ from signed release profile {name}"
+            self.architecture == selection.arch
+                && &self.facets == selection.facets
+                && &self.variants == selection.variants,
+            "image architecture, facets or variants differ from signed release profile {name}"
         );
         ensure!(
             self.companions
@@ -633,6 +638,7 @@ impl Catalog {
                 ensure!(
                     profile.architecture == next.architecture
                         && profile.facets == next.facets
+                        && profile.variants == next.variants
                         && profile
                             .companions
                             .iter()
@@ -1300,8 +1306,11 @@ fn decode_catalog(
         if !profile.elf_library_dirs.is_empty() {
             publish_policy::validate_elf_dirs(&profile.architecture, &profile.elf_library_dirs)?;
         }
-        for facet in profile.facets.keys() {
-            validate_publisher(facet).context("invalid signed profile facet")?;
+        crate::model::validate_policy(&profile.facets, &BTreeMap::new(), &profile.variants)
+            .context("invalid signed profile facets or variants")?;
+        for facet in &profile.facet_overrides {
+            crate::model::validate_facet_pattern(facet)
+                .context("invalid signed profile facet override")?;
         }
         profile.validate_composition(name, &catalog)?;
         let mut publishers = BTreeSet::from([publisher]);
@@ -2558,6 +2567,8 @@ mod tests {
             ReleaseProfile {
                 architecture: "x86_64".to_owned(),
                 facets: BTreeMap::new(),
+                variants: BTreeMap::new(),
+                facet_overrides: BTreeSet::new(),
                 companions: vec![pin.clone()],
                 roots: BTreeMap::new(),
                 composition: BTreeMap::new(),
@@ -2707,6 +2718,8 @@ mod tests {
                 ReleaseProfile {
                     architecture: "x86_64".to_owned(),
                     facets: BTreeMap::new(),
+                    variants: BTreeMap::new(),
+                    facet_overrides: BTreeSet::new(),
                     companions: Vec::new(),
                     roots: BTreeMap::new(),
                     composition: BTreeMap::new(),

@@ -23,7 +23,10 @@
 \&Remove dependencies no longer needed by explicitly installed packages
 .TP
 .B \&change\-facet
-\&Change facet selection for installed package actions
+\&Change facet rules for installed package actions, offline
+.TP
+.B \&change\-variant
+\&Change variants other than arch for installed package actions, offline
 .TP
 .B \&exact\-install
 \&Reconcile an image to the requested packages and their dependencies
@@ -147,15 +150,38 @@
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps plan change\-facet"
-\&Change facet selection for installed package actions
+\&Change facet rules for installed package actions, offline
 .PP
-.B \&cps plan \-\-root <ROOT> \-\-output <OUTPUT> change\-facet [OPTIONS] <NAME=true|false|default>...
+.B \&cps plan \-\-root <ROOT> \-\-output <OUTPUT> change\-facet [OPTIONS] <[PACKAGE:]FACET=true|false|default>...
+.PP
+.B Arguments
+.TP
+.B \&<[PACKAGE:]FACET=true|false|default>...
+\&FACET, PREFIX.*, or * for the whole image; PACKAGE:FACET or PREFIX/*:FACET for packages; `default` removes the rule
+.PP
+.B Options
+.TP
+.B \&\-\-with\-dependencies
+\&Also apply the PACKAGE:FACET rules to each package's installed dependencies
+.TP
+.B \&\-\-no\-install\-recommends
+\&Skip recommended packages when resolving the plan
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps plan change\-variant"
+\&Change variants other than arch for installed package actions, offline
+.PP
+.B \&cps plan \-\-root <ROOT> \-\-output <OUTPUT> change\-variant [OPTIONS] [NAME=VALUE]...
 .PP
 .B Arguments
 .PP
-.B \&<NAME=true|false|default>...
+.B \&[NAME=VALUE]...
 .PP
 .B Options
+.TP
+.B \&\-\-unset <NAME>
+\&Unset a variant
 .TP
 .B \&\-\-no\-install\-recommends
 \&Skip recommended packages when resolving the plan

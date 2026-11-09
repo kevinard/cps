@@ -243,7 +243,10 @@ enum Command {
     ImageCreate {
         #[arg(long)]
         root: PathBuf,
-        #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_key", "arch", "facet"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["repo", "publisher", "trust_key", "arch", "facet", "variant"]
+        )]
         config: Option<PathBuf>,
         /// Initialize with the publisher layout and bootstrap catalog of this lock
         #[arg(long, requires = "config")]
@@ -265,8 +268,16 @@ enum Command {
         trust_key: Option<PathBuf>,
         #[arg(long)]
         arch: Option<String>,
-        #[arg(long, value_name = "NAME=BOOL")]
+        /// Set an image-wide facet rule (FACET, PREFIX.*, or *) or a per-package rule
+        /// (PACKAGE:FACET, where PACKAGE may end in /*)
+        #[arg(long, value_name = "[PACKAGE:]FACET=BOOL")]
         facet: Vec<String>,
+        /// Apply the per-package --facet rules to each package's installed dependencies too
+        #[arg(long, requires = "facet")]
+        with_dependencies: bool,
+        /// Set a variant other than arch, such as container=true
+        #[arg(long, value_name = "NAME=VALUE")]
+        variant: Vec<String>,
     },
     /// Manage an image's ordered set of trusted publishers
     Publisher {
@@ -278,10 +289,26 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// List the image's configured facet overrides
+    /// List facet rules, or show which rule decides each named facet
     Facet {
         #[arg(long)]
         root: PathBuf,
+        /// Resolve facets for this installed package, including per-package rules;
+        /// without FACET arguments, show every facet its actions use
+        #[arg(long)]
+        package: Option<String>,
+        /// Show the effective value of these facets instead of listing rules
+        #[arg(value_name = "FACET")]
+        facets: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the image's variant values, including arch
+    Variant {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     /// Show preferred and active providers for mediated links
     Mediator {
@@ -1078,10 +1105,23 @@ enum PlanCommand {
     },
     /// Remove dependencies no longer needed by explicitly installed packages
     Autoremove,
-    /// Change facet selection for installed package actions
+    /// Change facet rules for installed package actions, offline
     ChangeFacet {
-        #[arg(required = true, value_name = "NAME=true|false|default")]
+        /// FACET, PREFIX.*, or * for the whole image; PACKAGE:FACET or PREFIX/*:FACET for
+        /// packages; `default` removes the rule
+        #[arg(required = true, value_name = "[PACKAGE:]FACET=true|false|default")]
         facets: Vec<String>,
+        /// Also apply the PACKAGE:FACET rules to each package's installed dependencies
+        #[arg(long)]
+        with_dependencies: bool,
+    },
+    /// Change variants other than arch for installed package actions, offline
+    ChangeVariant {
+        #[arg(value_name = "NAME=VALUE")]
+        variants: Vec<String>,
+        /// Unset a variant
+        #[arg(long, value_name = "NAME")]
+        unset: Vec<String>,
     },
     /// Reconcile an image to the requested packages and their dependencies
     ExactInstall {
@@ -1350,18 +1390,50 @@ fn load_plan(path: &Path) -> Result<Plan> {
         .with_context(|| format!("reading plan {}", path.display()))
 }
 
-fn parse_facets(entries: Vec<String>) -> Result<BTreeMap<String, bool>> {
-    let mut facets = BTreeMap::new();
-    for entry in entries {
+fn parse_policy(
+    facets: Vec<String>,
+    with_dependencies: bool,
+    variants: Vec<String>,
+) -> Result<cps::ImagePolicy> {
+    let mut policy = cps::ImagePolicy::default();
+    for entry in facets {
         let (name, value) = entry
             .split_once('=')
-            .context("expected --facet NAME=BOOL")?;
+            .context("expected --facet [PACKAGE:]FACET=BOOL")?;
+        let value = value.parse().context("facet value must be true or false")?;
+        policy.insert_facet(name, value, with_dependencies && name.contains(':'))?;
+    }
+    ensure!(
+        !with_dependencies || !policy.package_facets.is_empty(),
+        "--with-dependencies requires a --facet PACKAGE:FACET=BOOL rule"
+    );
+    for entry in variants {
+        policy.insert_variant(&entry)?;
+    }
+    Ok(policy)
+}
+
+fn parse_variant_changes(
+    entries: Vec<String>,
+    unset: Vec<String>,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let mut variants = BTreeMap::new();
+    let changes = entries
+        .iter()
+        .map(|entry| {
+            let (name, value) = entry.split_once('=').context("expected NAME=VALUE")?;
+            anyhow::Ok((name.to_owned(), Some(value.to_owned())))
+        })
+        .chain(unset.into_iter().map(|name| Ok((name, None))));
+    for change in changes {
+        let (name, value) = change?;
         ensure!(
-            facets.insert(name.to_owned(), value.parse()?).is_none(),
-            "duplicate facet {name}"
+            variants.insert(name.clone(), value).is_none(),
+            "duplicate variant {name}"
         );
     }
-    Ok(facets)
+    ensure!(!variants.is_empty(), "specify at least one variant change");
+    Ok(variants)
 }
 
 fn parse_facet_changes(entries: Vec<String>) -> Result<BTreeMap<String, Option<bool>>> {
@@ -1369,7 +1441,7 @@ fn parse_facet_changes(entries: Vec<String>) -> Result<BTreeMap<String, Option<b
     for entry in entries {
         let (name, value) = entry
             .split_once('=')
-            .context("expected NAME=true|false|default")?;
+            .context("expected [PACKAGE:]FACET=true|false|default")?;
         let value = if value == "default" {
             None
         } else {
@@ -1484,8 +1556,20 @@ fn print_image_diff(diff: &cps::ImageDiff, json: bool) -> Result<()> {
     }
     if diff.before.facets != diff.after.facets {
         println!(
-            "Facet overrides {:?} → {:?}",
+            "Facet rules {:?} → {:?}",
             diff.before.facets, diff.after.facets
+        );
+    }
+    if diff.before.package_facets != diff.after.package_facets {
+        println!(
+            "Per-package facet rules {:?} → {:?}",
+            diff.before.package_facets, diff.after.package_facets
+        );
+    }
+    if diff.before.variants != diff.after.variants {
+        println!(
+            "Variants {:?} → {:?}",
+            diff.before.variants, diff.after.variants
         );
     }
     if diff.before.mediators != diff.after.mediators {
@@ -2474,6 +2558,8 @@ fn run(command: Command) -> Result<ExitCode> {
             trust_key,
             arch,
             facet,
+            with_dependencies,
+            variant,
         } => {
             let id = match (config, lock, bundle) {
                 (Some(config), None, Some(bundle)) => {
@@ -2494,7 +2580,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     &publisher.context("missing publisher")?,
                     &trust_key.context("missing trust key")?,
                     arch.as_deref().unwrap_or(std::env::consts::ARCH),
-                    parse_facets(facet)?,
+                    parse_policy(facet, with_dependencies, variant)?,
                 )?,
                 _ => anyhow::bail!("select either --lock or --bundle with --config"),
             };
@@ -2866,10 +2952,48 @@ fn run(command: Command) -> Result<ExitCode> {
                 }
             }
         }
-        Command::Facet { root } => {
-            println!("FACET\tVALUE");
-            for (facet, value) in list_facets(&root)? {
-                println!("{facet}\t{value}");
+        Command::Facet {
+            root,
+            package,
+            facets,
+            json,
+        } => {
+            if package.is_none() && facets.is_empty() {
+                let rows = list_facets(&root)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    println!("RULE\tVALUE\tSOURCE");
+                    for row in rows {
+                        let scope = if row.with_dependencies {
+                            " with-dependencies"
+                        } else {
+                            ""
+                        };
+                        println!("{}\t{}\t{}{scope}", row.rule, row.value, row.source);
+                    }
+                }
+            } else {
+                let rows = cps::query::facet_values(&root, package.as_deref(), &facets)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    println!("FACET\tVALUE\tRULE");
+                    for row in rows {
+                        println!("{}\t{}\t{}", row.facet, row.value, row.source);
+                    }
+                }
+            }
+        }
+        Command::Variant { root, json } => {
+            let variants = cps::query::list_variants(&root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&variants)?);
+            } else {
+                println!("VARIANT\tVALUE");
+                for (name, value) in variants {
+                    println!("{name}\t{value}");
+                }
             }
         }
         Command::Mediator { root, json } => {
@@ -2927,8 +3051,15 @@ fn run(command: Command) -> Result<ExitCode> {
                 PlanCommand::Mark { choice, packages } => Request::Mark { choice, packages },
                 PlanCommand::Remove { packages } => Request::Remove { packages },
                 PlanCommand::Autoremove => Request::Autoremove,
-                PlanCommand::ChangeFacet { facets } => Request::ChangeFacet {
+                PlanCommand::ChangeFacet {
+                    facets,
+                    with_dependencies,
+                } => Request::ChangeFacet {
                     facets: parse_facet_changes(facets)?,
+                    with_dependencies,
+                },
+                PlanCommand::ChangeVariant { variants, unset } => Request::ChangeVariant {
+                    variants: parse_variant_changes(variants, unset)?,
                 },
                 PlanCommand::SetMediator { group, provider } => {
                     Request::SetMediator { group, provider }

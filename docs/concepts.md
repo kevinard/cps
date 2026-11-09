@@ -69,8 +69,9 @@ local requests and the release profile no longer need them.
 
 | Selection term | Effect |
 | --- | --- |
-| **Architecture** | Restricts eligible package versions or actions to the target CPU architecture. |
-| **Facet** | A named boolean such as `doc.man` that enables or disables selected actions. |
+| **Architecture** | Restricts eligible package versions or actions to the target CPU architecture. It is the built-in `arch` variant. |
+| **Facet** | Optional content inside one package, such as `doc.man` or `devel`, that the image enables or disables. |
+| **Variant** | A mutually exclusive image property, such as `arch` or `container`, that selects between alternative content. |
 | **Freeze** | A persistent constraint on a package's exact version. |
 | **Mediator** | Picks one provider for shared symlinks, such as the default editor command. |
 | **Capability** | In dependency declarations, a virtual package interface under `cap/`. File actions can separately grant Linux executable capabilities such as `cap_net_raw`. |
@@ -79,10 +80,36 @@ local requests and the release profile no longer need them.
 [Inactive image transactions](client/images.md) ·
 [Package selection and configuration](client/configuration.md)
 
+### Facets, separate packages, and variants
+
+CPS follows the IPS split between three ways of shaping what an image
+contains. Each problem has one mechanism.
+
+- A **facet** is optional content inside one package. The image chooses it
+  for every package, and can override the choice for a single package. A
+  facet never adds dependencies. Typical facets are headers and `.so`
+  links (`devel`), manual pages and documentation (`doc.man`, `doc.*`),
+  locales (`locale.fr`), static libraries, debug symbols (`debug.*`), and
+  32-bit multilib objects (`isa.i686`), the way illumos ships 32- and
+  64-bit objects in one package. Debug symbols and multilib objects are off
+  unless the image enables them.
+- A **separate package** is needed when content must be installed or
+  removed on its own, or has its own dependency closure. A runtime library
+  and a plugin that needs another service are separate packages.
+- A **variant** is a mutually exclusive property of the image that selects
+  between alternative content. Today the built-in variant is `arch`. Other
+  examples are a container or bare-metal variant, like the IPS zone
+  variant, or a debug build. An image has exactly one value per variant, so
+  one path can carry different actions for different values.
+
+Facets and variants select files within the packages that dependency
+resolution already chose. They never change which packages are installed,
+so dependency declarations cannot carry them.
+
 ## Release profiles and locks
 
 A **release profile** is a named, signed composition for a target
-architecture and set of facets. A **primary publisher** signs the
+architecture and set of facets and variants. A **primary publisher** signs the
 profile. The profile can pin signed catalogs from **companion publishers**.
 The publisher tests the selected roots and their dependency closure
 before signing it. A profile-following image protects that composition
@@ -91,7 +118,7 @@ rollout** makes a composition-changing update eligible for a percentage of
 image cohorts.
 
 An **image lock** captures one installed image's exact composition, including
-its publisher pins and local requests. Use it to provision another image with
+its publisher pins, facet and variant policy, and local requests. Use it to provision another image with
 that composition. An **image bundle** carries the lock and the verified
 repository objects it needs for disconnected provisioning.
 

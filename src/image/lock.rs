@@ -13,7 +13,8 @@ use super::{Image, Installed, Publisher, Publishers, State, catalogs};
 use crate::{
     kdl_format::ImageDefinition,
     model::{
-        Node, PackageSpec, Version, digest, validate_digest, validate_name, validate_publisher,
+        ImagePolicy, Node, PackageFacets, PackageSpec, Selection, Version, digest, validate_digest,
+        validate_name, validate_policy, validate_publisher,
     },
     query::verified_intent,
     repo::{CATALOG_LIMIT, Published, catalog_index, export_locked_repository, read_limited},
@@ -30,6 +31,10 @@ pub struct ImageLock {
     kind: LockKind,
     pub(crate) architecture: String,
     pub(crate) facets: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) package_facets: PackageFacets,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) variants: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) mediators: BTreeMap<String, String>,
     pub(crate) profile: Option<String>,
@@ -127,6 +132,8 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
         kind: LockKind::ImageLock,
         architecture: state.settings.arch.clone(),
         facets: state.settings.facets.clone(),
+        package_facets: state.settings.package_facets.clone(),
+        variants: state.settings.variants.clone(),
         mediators: state.settings.mediators.clone(),
         profile: profile.map(str::to_owned),
         signed_publishers: state.publishers.signed_publishers().len(),
@@ -218,9 +225,8 @@ impl ImageLock {
     pub(super) fn validate(&self) -> Result<()> {
         ensure!(self.format == LOCK_FORMAT, "unsupported image lock format");
         validate_publisher(&self.architecture).context("invalid locked architecture")?;
-        for facet in self.facets.keys() {
-            validate_publisher(facet).context("invalid locked facet")?;
-        }
+        validate_policy(&self.facets, &self.package_facets, &self.variants)
+            .context("invalid locked facets or variants")?;
         for (group, provider) in &self.mediators {
             validate_publisher(group).context("invalid locked mediator group")?;
             validate_name(provider).context("invalid locked mediator provider")?;
@@ -266,18 +272,31 @@ impl ImageLock {
         Ok(())
     }
 
+    /// The lock's composition policy. Locked provisioning reproduces it exactly.
+    pub(crate) fn policy(&self) -> ImagePolicy {
+        ImagePolicy {
+            facets: self.facets.clone(),
+            package_facets: self.package_facets.clone(),
+            variants: self.variants.clone(),
+        }
+    }
+
     pub(super) fn check_configuration(
         &self,
-        arch: &str,
-        facets: &BTreeMap<String, bool>,
+        selection: Selection<'_>,
         profile: Option<&str>,
         publishers: &[Publisher],
     ) -> Result<()> {
         ensure!(
-            arch == self.architecture
-                && facets == &self.facets
+            selection.arch == self.architecture
+                && selection.facets == &self.facets
+                && selection.variants == &self.variants
                 && profile == self.profile.as_deref(),
-            "architecture, facets or release profile differ from the image lock"
+            "architecture, facets, variants or release profile differ from the image lock"
+        );
+        ensure!(
+            selection.packages.is_empty() || selection.packages == &self.package_facets,
+            "per-package facet rules differ from the image lock"
         );
         ensure!(
             self.publishers
@@ -303,8 +322,7 @@ impl ImageLock {
             "install-lock requires a newly initialized image"
         );
         self.check_configuration(
-            &state.settings.arch,
-            &state.settings.facets,
+            state.settings.selection(),
             state.publishers.release_profile(),
             state.publishers.as_slice(),
         )?;
@@ -437,11 +455,13 @@ fn create_locked(
     );
     let publishers = super::configured_publishers(&config)?;
     lock.check_configuration(
-        &config.arch,
-        &config.facets,
+        config.policy.selection(&config.arch),
         config.release_profile.as_deref(),
         &publishers,
     )?;
+    // Per-package facet rules are part of the locked composition; the configuration
+    // may omit them, and provisioning then adopts the lock's rules.
+    let policy = lock.policy();
     let bootstrap = lock
         .profile
         .as_ref()
@@ -462,7 +482,7 @@ fn create_locked(
     };
     publishers.validate()?;
     if let Some(profile) =
-        publishers.select_profile(&config.arch, &config.facets, bootstrap.as_deref(), None)?
+        publishers.select_profile(policy.selection(&config.arch), bootstrap.as_deref(), None)?
     {
         ensure!(
             !profile.record.composition.is_empty(),
@@ -485,7 +505,7 @@ fn create_locked(
             scratch.path(),
             publishers.clone(),
             &config.arch,
-            config.facets.clone(),
+            policy.clone(),
             bootstrap.clone(),
             None,
         )?;
@@ -500,12 +520,5 @@ fn create_locked(
         .context("checking the bundle's locked composition")?;
         crate::apply::validate_cached_payloads(&plan, &state)?;
     }
-    super::initialize(
-        path,
-        publishers,
-        &config.arch,
-        config.facets,
-        bootstrap,
-        None,
-    )
+    super::initialize(path, publishers, &config.arch, policy, bootstrap, None)
 }

@@ -15,4 +15,4 @@ Choose the workflow based on the root you want to change.
 Use the [package queries](queries.md) to inspect what is installed and
 why. Use [publisher configuration](publishers.md) to add or move a trusted
 source and [image configuration](configuration.md) to adjust package freezes,
-facets, configuration proposals, or link providers.
+facets, variants, configuration proposals, or link providers.

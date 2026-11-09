@@ -385,7 +385,11 @@ pub(super) fn retain_disabled(
                 .action
                 .iter()
                 .filter(move |action| {
-                    action.preserve() && action.selectors().1.is_none_or(|target| target == arch)
+                    action.preserve()
+                        && action
+                            .selectors()
+                            .arch()
+                            .is_none_or(|target| target == arch)
                 })
                 .map(move |action| {
                     (

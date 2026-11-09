@@ -27,7 +27,10 @@ use crate::{
     attestation::BuildTrust,
     git_install::GitSource,
     kdl_format::{ImageDefinition, PublisherConfig, read_image_definition},
-    model::{Node, validate_digest, validate_name, validate_publisher},
+    model::{
+        ImagePolicy, Node, PackageFacets, Selection, validate_digest, validate_name,
+        validate_publisher,
+    },
     repo::{BuildReceipt, CatalogCheckpoint, Published, canonical_repo, catalog_index, read_key},
 };
 
@@ -67,6 +70,10 @@ pub struct Settings {
     pub publisher_generation: u64,
     pub arch: String,
     pub facets: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub package_facets: PackageFacets,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variants: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) mediators: BTreeMap<String, String>,
     pub uid: u32,
@@ -143,6 +150,30 @@ impl Settings {
             revision: self.boot_revision(),
             source_revision: self.boot_revision.map(|_| self.revision),
         }
+    }
+
+    /// The facet and variant policy that selects package actions.
+    pub(crate) fn selection(&self) -> Selection<'_> {
+        Selection {
+            arch: &self.arch,
+            variants: &self.variants,
+            facets: &self.facets,
+            packages: &self.package_facets,
+        }
+    }
+
+    pub(crate) fn policy(&self) -> ImagePolicy {
+        ImagePolicy {
+            facets: self.facets.clone(),
+            package_facets: self.package_facets.clone(),
+            variants: self.variants.clone(),
+        }
+    }
+
+    pub(crate) fn set_policy(&mut self, policy: ImagePolicy) {
+        self.facets = policy.facets;
+        self.package_facets = policy.package_facets;
+        self.variants = policy.variants;
     }
 
     pub(crate) fn next_revision(&self) -> Result<u64> {
@@ -435,14 +466,14 @@ pub fn create_image(
     publisher: &str,
     trust_key: &Path,
     arch: &str,
-    facets: BTreeMap<String, bool>,
+    policy: impl Into<ImagePolicy>,
 ) -> Result<String> {
     let publisher = Publisher::from_config(publisher, repo, trust_key)?;
     initialize(
         path,
         Publishers::Single(publisher),
         arch,
-        facets,
+        policy.into(),
         None,
         None,
     )
@@ -489,8 +520,7 @@ pub fn create_configured_image_at(
     let publishers = configured_publishers(&config)?;
     let publishers = Publishers::new(publishers, config.release_profile)?;
     let profile = publishers.select_profile(
-        &config.arch,
-        &config.facets,
+        config.policy.selection(&config.arch),
         config.bootstrap_catalog.as_deref(),
         None,
     )?;
@@ -520,7 +550,7 @@ pub fn create_configured_image_at(
         path,
         publishers,
         &config.arch,
-        config.facets,
+        config.policy,
         config.bootstrap_catalog,
         config.image_id,
     )
@@ -553,14 +583,12 @@ fn initialize(
     path: &Path,
     publishers: Publishers,
     arch: &str,
-    facets: BTreeMap<String, bool>,
+    policy: ImagePolicy,
     bootstrap_catalog: Option<String>,
     image_id: Option<String>,
 ) -> Result<String> {
     validate_publisher(arch).context("invalid architecture")?;
-    for facet in facets.keys() {
-        validate_publisher(facet).context("invalid facet")?;
-    }
+    policy.validate()?;
     let id = image_id.map_or_else(new_identity, Ok)?;
     let settings = Settings {
         format: IMAGE_FORMAT,
@@ -568,8 +596,9 @@ fn initialize(
         revision: 0,
         publisher_generation: 0,
         arch: arch.to_owned(),
-
-        facets,
+        facets: policy.facets,
+        package_facets: policy.package_facets,
+        variants: policy.variants,
         mediators: BTreeMap::new(),
         uid: geteuid().as_raw(),
         gid: getegid().as_raw(),
