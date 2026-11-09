@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Limit for a self-contained catalog archive: a root and all of its shards.
-pub(crate) const CATALOG_LIMIT: u64 = 1024 * 1024 * 1024;
+pub(crate) const CATALOG_LIMIT: u64 = 512 * 1024 * 1024;
 pub(crate) const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const FILE_INDEX_OBJECTS: &str = "file-indexes";
 const FILE_INDEX_LIMIT: u64 = 64 * 1024 * 1024;

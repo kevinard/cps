@@ -63,10 +63,12 @@ impl Display for Filter {
 /// Resolution work is bounded by solver steps, not wall-clock time, so the
 /// outcome of a plan never depends on the speed of the machine. One step is
 /// one cancellation check: a unit propagation round or a provider request.
-const REQUIRED_WORK: u64 = 4_000_000;
+/// A solve takes about two steps per selected package, and admitting 2048
+/// recommendations about a million, so the limits only stop runaway searches.
+const REQUIRED_WORK: u64 = 50_000_000;
 /// Recommendations share a separate budget. When it runs out, the remaining
 /// recommendations are skipped, at the same point on every machine.
-const RECOMMENDED_WORK: u64 = 4_000_000;
+const RECOMMENDED_WORK: u64 = 50_000_000;
 
 struct Budget {
     used: Cell<u64>,
