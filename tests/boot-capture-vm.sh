@@ -15,6 +15,7 @@ native_boot=${CPS_VM_BTRFS_BOOT:-0}
 health_fail=${CPS_VM_BTRFS_HEALTH_FAIL:-0}
 destroy=${CPS_VM_BTRFS_DESTROY:-0}
 destroy_failed=${CPS_VM_BTRFS_DESTROY_FAILED:-0}
+discard_failed=${CPS_VM_BTRFS_DISCARD_FAILED:-0}
 staged_transactions=${CPS_VM_STAGED_TRANSACTIONS:-0}
 system_commands=${CPS_VM_SYSTEM_COMMANDS:-0}
 git_installs=${CPS_VM_GIT_INSTALLS:-0}
@@ -36,6 +37,10 @@ if [[ $staged_transactions == 1 && ( $native_boot != 1 || $health_fail != 0 || $
 fi
 if [[ $destroy == 1 && ( $native_boot != 1 || $health_fail != 0 ) ]]; then
     echo 'CPS_VM_BTRFS_DESTROY requires native boot without health failure' >&2
+    exit 2
+fi
+if [[ $discard_failed == 1 && ( $native_boot != 1 || $health_fail != 1 || $destroy != 0 || $destroy_failed != 0 ) ]]; then
+    echo 'CPS_VM_BTRFS_DISCARD_FAILED requires a failed native trial without destruction' >&2
     exit 2
 fi
 if [[ $destroy_failed == 1 && ( $native_boot != 1 || $health_fail != 1 || $destroy != 0 ) ]]; then
@@ -199,6 +204,7 @@ CONFIG
         copy_runtime_deps "$root" "$root/usr/local/libexec/cps-vm-deny-unlink"
     fi
     if [[ $destroy_failed == 1 ]]; then touch "$root/etc/cps-btrfs-destroy-failed"; fi
+    if [[ $discard_failed == 1 ]]; then touch "$root/etc/cps-btrfs-discard-failed"; fi
     mkdir -p "$root"/{volume,efi,boot,run,var/tmp}
     cp "$kernel" "$root/boot/vmlinuz"
     cp "$project/packaging/systemd/cps-boot-health.service" "$root/usr/lib/systemd/system/"
@@ -360,6 +366,45 @@ if [ -f /etc/cps-btrfs-destroy-failed ]; then
     test ! -e /volume/@captures/trial/root
     cps verify --root /
     echo 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed'
+fi
+if [ -f /etc/cps-btrfs-discard-failed ]; then
+    . /etc/cps-btrfs-boot
+    # The root is read-only in this mode, so keep the configuration in /run.
+    config=/run/cps-image.kdl
+    $bb cat > "$config" <<CONFIG
+schema-version 1 kind="image-config"
+publisher "test" {
+    repository "/repository"
+    trust-key "/etc/cps/test.der"
+}
+boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid"
+CONFIG
+    $bb chown 0:0 /volume/@captures
+    $bb chmod go-w /volume/@captures
+    failed=
+    for entry in /efi/loader/entries/cps-*+0-*.conf; do
+        test -f "$entry" || continue
+        test -z "$failed"
+        failed=${entry##*/}
+        failed=${failed%%+*}
+    done
+    test -n "$failed"
+    boot_state() { find /efi/loader /efi/EFI/cps -type f -exec sha256sum '{}' +; }
+    before=$(boot_state)
+    cps boot-env prune --config "$config" --dry-run > /run/prune
+    $bb grep -Fx "Would remove failed trial $failed" /run/prune
+    test "$(boot_state)" = "$before"
+    test -d /volume/@captures/trial/root
+    cps boot-env discard-trial --config "$config" > /run/discard
+    $bb cat /run/discard
+    $bb grep -Fx "Removed failed trial $failed" /run/discard
+    test ! -e "/efi/EFI/cps/$failed"
+    test -z "$(find /efi/loader/entries -name "$failed*")"
+    test ! -e /volume/@captures/trial/root
+    test "$(cps boot-env prune --config "$config")" = 'Nothing to prune'
+    test "$(cps boot-env discard-trial --config "$config")" = 'No pending or failed trial'
+    cps verify --root /
+    echo 'CPS_VM_BTRFS_DISCARD: failed trial discarded, nothing left to prune'
 fi
 $bb sync
 exec $bb poweroff -f
@@ -701,6 +746,9 @@ if [[ $native_boot == 1 ]]; then
         fi
         if [[ $destroy_failed == 1 ]]; then
             grep -Fx 'CPS_VM_BTRFS_DESTROY: exhausted failed trial removed' uefi.log.clean
+        fi
+        if [[ $discard_failed == 1 ]]; then
+            grep -Fx 'CPS_VM_BTRFS_DISCARD: failed trial discarded, nothing left to prune' uefi.log.clean
         fi
     elif [[ $git_installs == 1 ]]; then
         grep -Fx 'CPS_VM_GIT: tracked package advanced and pinned package stayed at its commit' uefi.log.clean

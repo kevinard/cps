@@ -158,6 +158,10 @@ retries activation after freeing space.
 Add `CPS_VM_BTRFS_HEALTH_FAIL=1` to change a managed file's metadata at
 trial boot and verify that two unblessed attempts fall back to the original
 subvolume.
+Also set `CPS_VM_BTRFS_DISCARD_FAILED=1` to check, from the fallback, that
+`boot-env prune --dry-run` lists the exhausted trial without changing the
+ESP, that `boot-env discard-trial` removes its root and boot files, and that
+nothing is then left to prune or discard.
 
 Run `tests/boot-profile-btrfs-vm.sh` to test a native Btrfs root assembled
 entirely through a signed release profile. Set `CPS_VM_CPS_FIXTURE`,
