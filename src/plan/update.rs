@@ -137,7 +137,7 @@ pub(super) fn candidates(
             continue;
         };
         let installed = &installed.published.manifest;
-        if manifest.version > installed.version
+        if manifest.version.semantic() > installed.version.semantic()
             && composition
                 .get(&manifest.name)
                 .is_none_or(|digest| digest == &package.sha256)

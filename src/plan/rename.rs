@@ -28,7 +28,8 @@ impl Renames {
         for (old, to) in targets {
             if before.get(old).is_some_and(|package| {
                 let manifest = &package.published.manifest;
-                manifest.publisher == publisher && manifest.version <= obsoletions[old]
+                manifest.publisher == publisher
+                    && manifest.version.semantic() <= obsoletions[old].semantic()
             }) {
                 self.0.insert(
                     old.clone(),

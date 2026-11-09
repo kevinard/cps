@@ -129,7 +129,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
             ensure!(
                 self.obsoletions
                     .get(name)
-                    .is_none_or(|cutoff| package.manifest.version > *cutoff),
+                    .is_none_or(|cutoff| package.manifest.version.semantic() > cutoff.semantic()),
                 "signed profile package {} is obsolete",
                 package.manifest.id()
             );
@@ -175,7 +175,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
                     previous.id()
                 );
                 ensure!(
-                    previous.version <= manifest.version,
+                    previous.version.semantic() <= manifest.version.semantic(),
                     "signed profile would downgrade {} to {}",
                     previous.id(),
                     manifest.version
@@ -421,7 +421,7 @@ pub(super) fn load(
                 && snapshot
                     .obsoletions
                     .get(spec.name)
-                    .is_none_or(|cutoff| version > cutoff)
+                    .is_none_or(|cutoff| version.semantic() > cutoff.semantic())
             {
                 let id = format!("cps://{}/{}@{version}", publisher.name, spec.name);
                 ensure!(!snapshot.is_withdrawn(&id), "{id} was withdrawn");

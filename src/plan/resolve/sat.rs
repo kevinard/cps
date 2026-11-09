@@ -311,10 +311,9 @@ impl Rejections {
                 "solver selected a rejected candidate pair"
             );
             let version = &universe.package(b).manifest.version;
-            let exact = format!("={version}");
             let filter = Filter {
-                expression: Some(format!("{exact} ({conflict})")),
-                constraint: VersionConstraint::parse(Some(&exact))?,
+                expression: Some(format!("={version} ({conflict})")),
+                constraint: VersionConstraint::exact(version.clone()),
                 exclude: true,
                 capability: None,
             };
