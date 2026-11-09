@@ -134,7 +134,9 @@ receipts, and full GPT disks before booting the upgrade scenario.
 Run `tests/boot-capture-vm.sh` with `CPS_VM_BTRFS` and
 `CPS_VM_MKFS_BTRFS` set to trusted Btrfs utilities, QEMU, and a kernel
 with built-in Btrfs and ext4 support. The test captures its running root,
-rejects nested subvolumes, verifies that later source writes leave the
+rejects a nested subvolume outside the exclusions, and checks that
+`var/lib/machines` and an `--exclude-subvolume` path become empty
+directories with the source metadata. It verifies that later source writes leave the
 read-only capture intact, and checks failed and concurrent staging. It boots
 the staged Btrfs subvolume, the previous root, and the exported ext4 root.
 It uses the same `CPS_BIN`, `CPS_VM_QEMU`, `CPS_VM_QEMU_DATA`,
@@ -150,8 +152,9 @@ Set `CPS_VM_BTRFS_BOOT=1` on `tests/boot-capture-vm.sh`, provide
 This mode tests activation, a transaction waiting while registration
 completes, blessing, the trial's default on reboot, rejection of altered
 subvolume metadata, and rollback to the previous root. It also fills the
-EFI partition, checks that a failed activation keeps the known-good boot
-selection, and retries activation after freeing space.
+EFI partition, checks that activation fails its free-space check with a
+pointer to `boot-env prune` and keeps the known-good boot selection, and
+retries activation after freeing space.
 Add `CPS_VM_BTRFS_HEALTH_FAIL=1` to change a managed file's metadata at
 trial boot and verify that two unblessed attempts fall back to the original
 subvolume.
@@ -188,3 +191,18 @@ installs a package live, upgrades its running service, boots a staged
 upgrade, and rolls back to the system with the live package still installed.
 It then removes the package live and boots a staged removal of its unused
 dependency with the repository unavailable.
+
+## Unit tests for retention, loader policy, and direct UEFI boot
+
+`cargo test` covers the pure parts of these features without privileges.
+The retention tests check which environments prune protects and removes.
+The loader policy tests check that administrator lines are preserved and
+that conflicts name the key. The direct UEFI tests run activation, blessing,
+rollback, and option removal against a temporary directory that stands in
+for efivarfs. The UKI tests check a hand-built PE image. Other tests cover
+the GPT reader with 512-byte and 4096-byte sectors, using `sfdisk`, and the
+automount mount-table check.
+
+No VM scenario covers direct UEFI boot yet. It would need `ukify`,
+systemd-stub, and an `sbctl` key in the guest, plus OVMF variables that
+keep `BootNext` across resets.

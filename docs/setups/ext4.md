@@ -61,7 +61,7 @@ mount preserves those access times. Use a decimal epoch from 0 to
 [e2fsprogs release notes](https://github.com/tytso/e2fsprogs/blob/v1.47.1/doc/RelNotes/v1.47.1.txt)
 
 For an offline VM or disk image, provision a raw GPT template with 512-byte
-sectors, one Linux filesystem partition per root, and a FAT EFI System
+sectors, the sector size CPS assumes for disk image files, one Linux filesystem partition per root, and a FAT EFI System
 Partition containing systemd-boot. `deploy` uses GNU
 `cp`, util-linux `sfdisk`, and `e2fsck`. It clones the source disk, checks
 the GPT copies and partition ranges, and writes the payload to the selected
@@ -89,8 +89,9 @@ requires `activate-device`.
 
 ## Provisioning the first root on an installed disk
 
-Start with an inactive CPS base image and a dedicated GPT disk with
-512-byte logical sectors. Mount its writable VFAT ESP with systemd-boot
+Start with an inactive CPS base image and a dedicated GPT disk. CPS reads
+the GPT with the disk's logical block size, so disks with 512-byte and
+4096-byte (4Kn) sectors both work. Mount its writable VFAT ESP with systemd-boot
 already installed and no boot entries registered. Choose an unmounted
 Linux filesystem partition for the base. Set the export size to match that
 partition exactly.
@@ -168,8 +169,7 @@ reboot, and rollback.
 
 With a known-good base already registered, use a dedicated, unregistered
 Linux filesystem partition on the same GPT disk as the mounted ESP for the
-trial. The disk must use 512-byte logical sectors, and the ext4 export must
-match the partition size.
+trial. The ext4 export must match the partition size.
 
 ```sh
 cps boot-env activate-device --root /scratch/upgrade/root --esp /efi \
@@ -232,7 +232,7 @@ For FAT32, CPS can clear a leftover dirty flag in its private copy
 when the primary and backup boot sectors otherwise agree. The copy still
 has to pass the read-only FAT check.
 
-`--known-good` bootstraps the first entry. Later activations require the previous environment's known-good entry and boot files. A trial gets two attempts by default. Install [the `system/cps` package](../../packaging/cps.kdl) in the base image to make its health check part of `boot-complete.target`. The package ships the CPS binary, [the health unit](../../packaging/systemd/cps-boot-health.service), and the required dependency link. The unit runs `cps verify --root /` after `multi-user.target`. Systemd blesses the entry when boot completion succeeds, removing the boot counter. If the attempts run out, systemd-boot selects the previous environment. The managed ESP uses its own loader configuration and assumes no EFI default override. [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
+`--known-good` bootstraps the first entry. Later activations require the previous environment's known-good entry and boot files. A trial gets two attempts by default. Install [the `system/cps` package](../../packaging/cps.kdl) in the base image to make its health check part of `boot-complete.target`. The package ships the CPS binary, [the health unit](../../packaging/systemd/cps-boot-health.service), and the required dependency link. The unit runs `cps verify --root /` after `multi-user.target`. Systemd blesses the entry when boot completion succeeds, removing the boot counter. If the attempts run out, systemd-boot selects the previous environment. CPS owns the boot selection in the ESP's [loader configuration](boot-operations.md#the-loader-configuration) and assumes no EFI default override. [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
 
 ## Reusing a root slot
 

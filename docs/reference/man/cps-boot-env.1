@@ -10,6 +10,12 @@
 .B \&destroy\-btrfs
 \&Retire an inactive Btrfs root and its boot artifacts, or resume its cleanup
 .TP
+.B \&prune
+\&Remove old environments and failed trials under the boot\-btrfs retention policy
+.TP
+.B \&discard\-trial
+\&Cancel a pending or running trial and remove failed trials
+.TP
 .B \&stage\-btrfs
 \&Stage a saved plan in a writable Btrfs snapshot of a read\-only baseline
 .TP
@@ -72,10 +78,40 @@
 .TP
 .B \&\-h, \-\-help
 \&Print help
+.SS "\&cps boot\-env prune"
+\&Remove old environments and failed trials under the boot\-btrfs retention policy
+.PP
+.B \&cps boot\-env prune [OPTIONS]
+.PP
+.B Options
+.TP
+.B \&\-\-config <CONFIG>
+\&[default: /etc/cps/image.kdl]
+.TP
+.B \&\-\-keep <KEEP>
+\&Known\-good environments to keep, overriding keep\-environments
+.TP
+.B \&\-\-dry\-run
+\&Check and list the removals without changing anything
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps boot\-env discard\-trial"
+\&Cancel a pending or running trial and remove failed trials
+.PP
+.B \&cps boot\-env discard\-trial [OPTIONS]
+.PP
+.B Options
+.TP
+.B \&\-\-config <CONFIG>
+\&[default: /etc/cps/image.kdl]
+.TP
+.B \&\-h, \-\-help
+\&Print help
 .SS "\&cps boot\-env stage\-btrfs"
 \&Stage a saved plan in a writable Btrfs snapshot of a read\-only baseline
 .PP
-.B \&cps boot\-env stage\-btrfs \-\-source <SOURCE> \-\-output <OUTPUT> <PLAN>
+.B \&cps boot\-env stage\-btrfs [OPTIONS] \-\-source <SOURCE> \-\-output <OUTPUT> <PLAN>
 .PP
 .B Arguments
 .PP
@@ -88,12 +124,15 @@
 .B \&\-\-output <OUTPUT>
 \&New directory containing the staged root/ subvolume
 .TP
+.B \&\-\-exclude\-subvolume <PATH>
+\&Start the staged root with an empty directory for this nested subvolume
+.TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps boot\-env capture"
 \&Capture a running CPS Btrfs root as a directory with a read\-only root/
 .PP
-.B \&cps boot\-env capture \-\-source <SOURCE> \-\-output <OUTPUT>
+.B \&cps boot\-env capture [OPTIONS] \-\-source <SOURCE> \-\-output <OUTPUT>
 .PP
 .B Options
 .PP
@@ -101,6 +140,9 @@
 .TP
 .B \&\-\-output <OUTPUT>
 \&New path in a separate subvolume on the same Btrfs filesystem
+.TP
+.B \&\-\-exclude\-subvolume <PATH>
+\&Capture an empty directory for this nested subvolume
 .TP
 .B \&\-h, \-\-help
 \&Print help
