@@ -10,11 +10,13 @@ for repositories that require signed build evidence.
 ## On this page
 
 - [Initialize a local publishing repository](#initialize-a-local-publishing-repository)
+- [Publish many manifests at once](#publish-many-manifests-at-once)
 - [Signed catalog format](#signed-catalog-format)
 - [Publishing policy](#publishing-policy)
 - [Publish a coordinated release](#publish-a-coordinated-release)
 - [Publisher signing key rotation](#publisher-signing-key-rotation)
 - [Withdrawing and obsoleting packages](#withdrawing-and-obsoleting-packages)
+- [Pruning withdrawal history](#pruning-withdrawal-history)
 - [Renaming packages within a publisher](#renaming-packages-within-a-publisher)
 
 ## Initialize a local publishing repository
@@ -40,13 +42,76 @@ The signed catalog digest appears in `repo/current`. Use the
 [quickstart](../quickstart.md) for a complete local example. For a
 protected repository, set the policy below before the first publication.
 
+## Publish many manifests at once
+
+`cps publish` accepts any number of manifests that share one prototype tree.
+CPS publishes them in a single signed catalog update, so a distribution build
+signs one catalog per batch instead of one per package. The batch is atomic:
+if any manifest fails, the current catalog stays unchanged.
+
+```sh
+cps publish --repo repo --proto proto --signing-key private.der manifests/*.kdl
+```
+
+A plain publication reads and rewrites only the catalog shards that hold the
+published names, so its cost follows the size of the change rather than the
+size of the catalog. Repositories with a publish policy, and bundle
+publications, still check the complete catalog.
+
 ## Signed catalog format
 
-A signed catalog is a JSON document containing a `catalog` object with
-`"format": 1` and a hex-encoded Ed25519 `signature`. The signing message
-starts with `cps signed catalog v1` and a newline, followed by the compact
-JSON of the `catalog` object as emitted by CPS. The first catalog has sequence 1.
-The catalog digest is the SHA-256 of the signed JSON document.
+A catalog is a small signed **root** that commits by SHA-256 to
+content-addressed **shards**. The **catalog digest**, used as the catalog pin,
+is the SHA-256 of the exact bytes of the stored root.
+
+The root is stored at `catalogs/<digest>` as a signed envelope in compact
+JSON:
+
+```json
+{"signed":"<base64 of the root payload>","signatures":[{"keyid":"<SHA-256 of the Ed25519 public key>","sig":"<128 lowercase hex digits>"}]}
+```
+
+Each signature covers the bytes `cps signed catalog root v1`, a newline, and
+the exact decoded payload. CPS accepts an envelope only in this byte form:
+padded standard base64, lowercase hex, compact JSON without escapes, and
+signatures sorted by unique key ID. Every listed signature must verify with an
+authorized key. Today the only authorized key is the publisher's current
+catalog key, so an envelope carries exactly one signature. The list leaves
+room for threshold signing.
+
+The root payload is a JSON object with these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `format` | `1`. |
+| `publisher` | Publisher name. |
+| `sequence` | Catalog sequence. The first catalog has sequence 1; each successor increases it. |
+| `shards` | Map from a two-hex-digit prefix to the SHA-256 of that shard. Empty shards are omitted. |
+| `file_index` | `true` when every shard carries a signed file index. |
+| `attestations_required`, `toolchains_verified`, `source_archives_required`, `profiles_required` | Protection flags. Once set, successors keep them. |
+| `pruned_through` | Withdrawal retention cutoff, see [Pruning withdrawal history](#pruning-withdrawal-history). |
+| `renames`, `key_rotations`, `release_profiles` | Signed renames, key handoffs, and composition profiles. |
+
+A shard holds the records of every package name whose SHA-256 begins with its
+prefix, so a catalog has at most 256 shards. It is stored at
+`catalog-shards/<digest>` as compact JSON with `format` 1, `publisher`,
+`prefix`, and these maps:
+
+| Field | Keyed by | Value |
+|-------|----------|-------|
+| `entries` | package ID | Active version: `manifest` digest, optional `architecture` and `summary`, and the dependency summary `depends` and `provides`. |
+| `attestations` | package ID | Build attestation digest. |
+| `build_inputs` | package ID | Archived recipe and reviewed manifest digests. |
+| `withdrawals` | package ID | Withdrawn entry, its attestation, and the `sequence` that withdrew it. |
+| `retired` | package ID | Pruned withdrawal: `manifest` digest and `withdrawn` sequence. |
+| `obsoletions` | package name | Obsoletion cutoff. |
+| `file_index` | | Digest of this shard's basename index in `file-indexes/`. |
+
+The dependency summary repeats the manifest's dependencies and provided
+capabilities. The planner resolves with these signed summaries and reads full
+manifests only for the packages it selects. CPS rejects a manifest whose
+dependencies, capabilities, architecture, or summary differ from its catalog
+entry.
 
 ## Publishing policy
 
@@ -172,6 +237,9 @@ catalogs. The publishing repository and existing caches retain previously fetche
 payloads and build evidence for recovery and auditing. A fresh cache only fetches
 objects for active versions.
 
+Withdrawal records stay in every successor catalog until a publisher prunes
+them, as described in the next section.
+
 To retire a package name as part of a rolling release, add an `obsolete` action
 to the KDL file for `repo publish-release`.
 
@@ -195,6 +263,37 @@ A higher version can reintroduce the package, while the cutoff and earlier
 withdrawals remain in the signed history. Saved plans still use their pinned
 catalogs. Inspect the cutoffs with `cps repo obsoletions --repo repo --publisher
 canopa --trust-key public.der`.
+
+## Pruning withdrawal history
+
+A long-lived distribution accumulates withdrawals. To cap that history, prune
+the records withdrawn at or before a catalog sequence from the reviewed
+current catalog.
+
+```sh
+cps repo prune-withdrawals --repo repo --publisher canopa --signing-key private.der \
+  --base "$reviewed_catalog_sha256" --through 120
+```
+
+CPS replaces each pruned withdrawal with a compact `retired` record. The record
+keeps the manifest digest and withdrawal sequence and drops the build evidence
+and rebuild inputs. The cutoff is signed into the root as `pruned_through`, can
+only move forward, and cannot pass the current sequence. Clients accept a
+successor that turns a withdrawal into a retired record only through that
+cutoff, with the same manifest digest. Other changes to the history are still
+rejected as a fork.
+
+Pruning keeps these guarantees:
+
+- A retired package ID can never be republished.
+- Installed copies of a retired version still verify against later catalogs.
+- Withdrawals whose manifest a signed release profile composition names are
+  kept.
+- Historical catalogs keep their full records, so saved plans, image locks, and
+  profiles pinned to them still resolve while their objects are available. The
+  publishing repository never deletes catalog roots or shards.
+
+Build audits of a retired version need a catalog from before the pruning.
 
 ## Renaming packages within a publisher
 

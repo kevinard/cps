@@ -19,7 +19,7 @@
 cps repo export --repo repo --publisher canopa --trust-key public.der --output release-targets
 ```
 
-The live export includes the catalog pointer, signed catalog, and the manifests and payloads for active packages. It also includes the `publisher` and `publisher.der` targets for publisher discovery. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
+The live export includes the catalog pointer, the signed catalog root with its shards and any per-shard file indexes, and the manifests and payloads for active packages. It also includes the `publisher` and `publisher.der` targets for publisher discovery. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
 
 Export compresses each distinct payload with Zstandard when the result is
 smaller. The mirror carries either `blobs-SHA256.zst` or `blobs-SHA256`,
@@ -40,8 +40,10 @@ its objects are available.
 
 ## Sharded targets and delta payloads
 
-Sync downloads missing manifests, attestations, and rebuild metadata in
-bounded parallel batches. The bundled deployment adapter signs mirror
+Sync downloads missing catalog shards, manifests, attestations, and rebuild
+metadata in bounded parallel batches. Shards are content-addressed targets
+named `catalog-shards-SHA256`, so after a publication a cache downloads the new
+root and only the shards that changed. The bundled deployment adapter signs mirror
 objects in 16 delegated targets roles. CPS applies the 16 MiB download limit
 to each role and can refresh an existing cache from a sharded mirror.
 

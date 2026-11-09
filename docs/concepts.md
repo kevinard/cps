@@ -30,10 +30,13 @@ image. One person can fill all these roles in a local test setup.
 
 A **repository** holds signed catalog metadata, manifests, and payload
 objects for a publisher. The **catalog** is a signed snapshot of package
-identities and their manifest digests. Its sequence and signing history let
-clients detect replay and inconsistent successors. A **catalog pin** is
-the SHA-256 of the exact signed catalog. Plans and profiles can keep using
-a historical pin when its objects are available.
+identities, their manifest digests, and the dependency summaries the planner
+resolves with. A small signed **catalog root** commits by digest to
+content-addressed **shards** that partition the records by package name, so a
+publication rewrites only the shards it changes. Its sequence and signing
+history let clients detect replay and inconsistent successors. A **catalog
+pin** is the SHA-256 of the exact signed root. Plans and profiles can keep
+using a historical pin when its objects are available.
 
 A **mirror** distributes an exported repository. CPS verifies the transport
 metadata using a provisioned **TUF root** (The Update Framework), then

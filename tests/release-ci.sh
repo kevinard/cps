@@ -150,9 +150,9 @@ fi
 release widen "$candidate" desktop 50
 widened=$(cat repo/current)
 [[ $candidate != "$widened" ]]
-jq -e '.catalog.release_profiles.desktop.rollout_percentage == 50' "repo/catalogs/$widened"
-diff -u <(jq '.catalog | del(.sequence, .release_profiles.desktop.rollout_percentage)' "repo/catalogs/$candidate") \
-    <(jq '.catalog | del(.sequence, .release_profiles.desktop.rollout_percentage)' "repo/catalogs/$widened")
+jq -e '(.signed | @base64d | fromjson).release_profiles.desktop.rollout_percentage == 50' "repo/catalogs/$widened"
+diff -u <(jq '(.signed | @base64d | fromjson) | del(.sequence, .release_profiles.desktop.rollout_percentage)' "repo/catalogs/$candidate") \
+    <(jq '(.signed | @base64d | fromjson) | del(.sequence, .release_profiles.desktop.rollout_percentage)' "repo/catalogs/$widened")
 ! release widen "$candidate" desktop 50
 release deploy-current "$widened"
 printf '{"catalog":"%s","profile":"desktop","percentages":[0,50,100]}\n' "$candidate" > "$CPS_RELEASE_ROLLOUT_PLAN"
@@ -163,7 +163,7 @@ if CPS_TEST_FAIL_GATE=deploy release advance; then
     exit 1
 fi
 complete=$(cat repo/current)
-jq -e '.catalog.release_profiles.desktop.rollout_percentage == 100' "repo/catalogs/$complete"
+jq -e '(.signed | @base64d | fromjson).release_profiles.desktop.rollout_percentage == 100' "repo/catalogs/$complete"
 [[ $(cat repo/.ci-deployed-catalog) == "$widened" ]]
 CPS_TEST_FAIL_GATE=rollout release advance
 [[ $(cat repo/.ci-deployed-catalog) == "$complete" ]]

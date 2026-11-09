@@ -95,7 +95,7 @@ case ${1:-} in
             [[ $candidate != "$base" ]] || fail 'The request produced no new catalog'
             stage=$(mktemp -d -- "$(dirname -- "$output")/.cps-rehearsal.XXXXXXXX")
             trap 'rm -rf -- "$stage"' EXIT
-            for dir in catalogs manifests blobs attestations file-indexes; do
+            for dir in catalogs catalog-shards manifests blobs attestations file-indexes; do
                 if [[ ! -e $repo/$dir && ! -L $repo/$dir ]]; then
                     continue
                 fi
@@ -146,13 +146,13 @@ case ${1:-} in
                 fail "Cannot verify catalog $hash"
         done
         jq -es --arg profile "$profile" '
-            def stable: .catalog | del(.sequence, .release_profiles[$profile].rollout_percentage);
+            def stable: (.signed | @base64d | fromjson) | del(.sequence, .release_profiles[$profile].rollout_percentage);
             (.[0] | stable) == (.[1] | stable)
         ' "$repo/catalogs/$initial" "$repo/catalogs/$base" >/dev/null ||
             fail 'Current catalog is outside the approved rollout'
-        previous=$(jq -er --arg profile "$profile" '.catalog.release_profiles[$profile].rollout_percentage' \
+        previous=$(jq -er --arg profile "$profile" '(.signed | @base64d | fromjson).release_profiles[$profile].rollout_percentage' \
             "$repo/catalogs/$base")
-        first=$(jq -er --arg profile "$profile" '.catalog.release_profiles[$profile].rollout_percentage' \
+        first=$(jq -er --arg profile "$profile" '(.signed | @base64d | fromjson).release_profiles[$profile].rollout_percentage' \
             "$repo/catalogs/$initial")
         next=$(jq -er --argjson first "$first" --argjson previous "$previous" '
             .percentages | select(.[0] == $first) | index($previous) as $step

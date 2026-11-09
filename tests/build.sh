@@ -610,11 +610,14 @@ assert statement['predicate']['identical_runs'] == 2
 assert set(statement['predicate']['toolchain']['package_manifests']) == {'build/shell', 'build/probe'}
 subjects = {subject['name']: subject for subject in statement['subject']}
 assert set(subjects) == {'manifest.kdl', 'published-manifest.kdl', 'proto/hello'}
-catalog = json.loads((Path('release/catalogs') / Path('release/current').read_text().strip()).read_bytes())
-assert catalog['catalog']['toolchains_verified'] is True
-assert catalog['catalog']['source_archives_required'] is True
-assert catalog['catalog']['build_inputs']['cps://canopa/demo/hello@1.0.0-0']['sources_archived'] is True
-manifest_hash = catalog['catalog']['entries']['cps://canopa/demo/hello@1.0.0-0']['manifest']
+envelope_root = json.loads((Path('release/catalogs') / Path('release/current').read_text().strip()).read_bytes())
+root = json.loads(base64.b64decode(envelope_root['signed'], validate=True))
+assert root['toolchains_verified'] is True
+assert root['source_archives_required'] is True
+shard_hash = root['shards'][hashlib.sha256(b'demo/hello').hexdigest()[:2]]
+shard = json.loads((Path('release/catalog-shards') / shard_hash).read_bytes())
+assert shard['build_inputs']['cps://canopa/demo/hello@1.0.0-0']['sources_archived'] is True
+manifest_hash = shard['entries']['cps://canopa/demo/hello@1.0.0-0']['manifest']
 manifest = (Path('release/manifests') / manifest_hash).read_bytes()
 published = subjects['published-manifest.kdl']
 assert published['digest']['sha256'] == manifest_hash == hashlib.sha256(manifest).hexdigest()
