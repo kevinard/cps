@@ -700,6 +700,11 @@ pub(crate) struct BtrfsConfig {
     pub activation: crate::boot::Activation<Option<String>>,
     pub uki: bool,
     pub uefi: bool,
+    /// Known-good environments retained beyond the protected ones.
+    pub keep_environments: usize,
+    pub auto_prune: bool,
+    /// Nested subvolumes that staged roots replace with empty directories.
+    pub exclude_subvolumes: Vec<String>,
 }
 
 pub(crate) struct MirrorConfig {
@@ -774,9 +779,31 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                         "uki",
                         "uefi",
                         "tries",
+                        "keep-environments",
+                        "auto-prune",
                     ],
-                    false,
+                    true,
                 )?;
+                let mut exclude_subvolumes = Vec::new();
+                for child in node.children().map(|doc| doc.nodes()).unwrap_or_default() {
+                    ensure!(
+                        child.name().value() == "exclude-subvolume",
+                        "unknown boot-btrfs child {}",
+                        child.name().value()
+                    );
+                    let path = Fields::read(child, 1, &[], false)?.string_arg(0)?;
+                    ensure!(
+                        !exclude_subvolumes.contains(&path),
+                        "duplicate exclude-subvolume {path}"
+                    );
+                    exclude_subvolumes.push(path);
+                }
+                crate::boot::excluded_subvolumes(&exclude_subvolumes)?;
+                let keep_environments = fields.integer("keep-environments")?.unwrap_or(3);
+                ensure!(
+                    (1..=99).contains(&keep_environments),
+                    "keep-environments must be between 1 and 99"
+                );
                 let uefi = fields
                     .properties
                     .get("uefi")
@@ -803,6 +830,18 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                         .transpose()?
                         .unwrap_or(false),
                     uefi,
+                    keep_environments,
+                    auto_prune: fields
+                        .properties
+                        .get("auto-prune")
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .context("auto-prune must be #true or #false")
+                        })
+                        .transpose()?
+                        .unwrap_or(true),
+                    exclude_subvolumes,
                     activation: crate::boot::Activation {
                         root_partuuid: fields.string("root-partuuid")?,
                         kernel: fields
@@ -962,6 +1001,64 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn boot_btrfs_retention_and_subvolume_exclusions() -> Result<()> {
+        let base = r#"
+            schema-version 1 kind="image-config"
+            publisher "canopa" {
+                repository "../repo"
+                trust-key "/etc/keys/canopa.der"
+            }
+        "#;
+        let node = r#"boot-btrfs volume="/cps" environments="/cps/@environments" esp="/efi""#;
+        let parse = |boot: &str| {
+            parse_image_config(
+                &format!(
+                    "{base}{boot}
+"
+                ),
+                Path::new("/tmp"),
+            )
+        };
+        let defaults = parse(node)?.boot_btrfs.context("missing boot-btrfs")?;
+        assert_eq!(defaults.keep_environments, 3);
+        assert!(defaults.auto_prune && defaults.exclude_subvolumes.is_empty());
+        let custom = parse(&format!(
+            "{node} keep-environments=5 auto-prune=#false {{
+    exclude-subvolume \"/var/lib/docker\"
+}}"
+        ))?
+        .boot_btrfs
+        .context("missing boot-btrfs")?;
+        assert_eq!(custom.keep_environments, 5);
+        assert!(!custom.auto_prune);
+        assert_eq!(custom.exclude_subvolumes, ["/var/lib/docker"]);
+        for invalid in [
+            format!("{node} keep-environments=0"),
+            format!("{node} keep-environments=100"),
+            format!("{node} auto-prune=1"),
+            format!(
+                "{node} {{
+    exclude-subvolume \"var/lib/cps\"
+}}"
+            ),
+            format!(
+                "{node} {{
+    exclude-subvolume \"a\"
+    exclude-subvolume \"a\"
+}}"
+            ),
+            format!(
+                "{node} {{
+    keep \"a\"
+}}"
+            ),
+        ] {
+            assert!(parse(&invalid).is_err(), "{invalid}");
         }
         Ok(())
     }

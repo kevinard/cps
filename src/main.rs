@@ -1142,6 +1142,22 @@ enum BootCommand {
         dry_run: bool,
         id: String,
     },
+    /// Remove old environments and failed trials under the boot-btrfs retention policy
+    Prune {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+        /// Known-good environments to keep, overriding keep-environments
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=99))]
+        keep: Option<u64>,
+        /// Check and list the removals without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Cancel a pending or running trial and remove failed trials
+    DiscardTrial {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+    },
     /// Stage a saved plan in a writable Btrfs snapshot of a read-only baseline
     StageBtrfs {
         #[arg(long)]
@@ -1149,6 +1165,9 @@ enum BootCommand {
         /// New directory containing the staged root/ subvolume
         #[arg(long)]
         output: PathBuf,
+        /// Start the staged root with an empty directory for this nested subvolume
+        #[arg(long, value_name = "PATH")]
+        exclude_subvolume: Vec<String>,
         plan: PathBuf,
     },
     /// Capture a running CPS Btrfs root as a directory with a read-only root/
@@ -1158,6 +1177,9 @@ enum BootCommand {
         /// New path in a separate subvolume on the same Btrfs filesystem
         #[arg(long)]
         output: PathBuf,
+        /// Capture an empty directory for this nested subvolume
+        #[arg(long, value_name = "PATH")]
+        exclude_subvolume: Vec<String>,
     },
     /// List registered boot environments and the configured default
     List {
@@ -1343,6 +1365,24 @@ enum BootCommand {
         #[arg(long)]
         known_good: bool,
     },
+}
+
+fn print_boot_prune(report: &system::BootPruneReport, dry_run: bool) -> ExitCode {
+    for (id, kind) in &report.removed {
+        let action = if dry_run { "Would remove" } else { "Removed" };
+        println!("{action} {} {id}", system::removal_label(*kind));
+    }
+    for (id, error) in &report.failed {
+        eprintln!("Could not remove {id}: {error}");
+    }
+    if report.removed.is_empty() && report.failed.is_empty() {
+        println!("Nothing to prune");
+    }
+    if report.failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn load_plan(path: &Path) -> Result<Plan> {
@@ -3218,8 +3258,40 @@ fn run(command: Command) -> Result<ExitCode> {
                     println!("Promoted {id} in UEFI BootOrder");
                 }
             }
-            BootCommand::Capture { source, output } => {
-                let id = capture_boot_environment(&source, &output)?;
+            BootCommand::Prune {
+                config,
+                keep,
+                dry_run,
+            } => {
+                let system = System::load(&config)?;
+                let _lock = system.lock()?;
+                let keep = keep.map(usize::try_from).transpose()?;
+                let report = system.prune_boot_environments(keep, dry_run)?;
+                return Ok(print_boot_prune(&report, dry_run));
+            }
+            BootCommand::DiscardTrial { config } => {
+                let system = System::load(&config)?;
+                let _lock = system.lock()?;
+                let discard = system.discard_trial()?;
+                match &discard.cancelled {
+                    Some(id) if discard.running => println!(
+                        "Cancelled the running trial {id}. Reboot into its fallback; the next \
+                         prune or staged change removes it."
+                    ),
+                    Some(id) => println!("Cancelled trial {id}"),
+                    None if discard.prune.removed.is_empty() => {
+                        println!("No pending or failed trial")
+                    }
+                    None => {}
+                }
+                return Ok(print_boot_prune(&discard.prune, false));
+            }
+            BootCommand::Capture {
+                source,
+                output,
+                exclude_subvolume,
+            } => {
+                let id = capture_boot_environment(&source, &output, &exclude_subvolume)?;
                 println!("Captured {id} at {}", output.display());
             }
             BootCommand::Stage { source, root, plan } => {
@@ -3229,9 +3301,15 @@ fn run(command: Command) -> Result<ExitCode> {
             BootCommand::StageBtrfs {
                 source,
                 output,
+                exclude_subvolume,
                 plan,
             } => {
-                let id = stage_btrfs_boot_environment(&source, &output, &load_plan(&plan)?)?;
+                let id = stage_btrfs_boot_environment(
+                    &source,
+                    &output,
+                    &load_plan(&plan)?,
+                    &exclude_subvolume,
+                )?;
                 println!("Staged {id} at {}", output.join("root").display());
             }
             BootCommand::Prepare {

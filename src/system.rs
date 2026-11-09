@@ -16,7 +16,10 @@ use crate::{
     BootEnvironment, GitSnapshotRef, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions,
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
     apply::{PublisherFetchError, apply_live, repair_pending_live, resume_live},
-    boot::{entry_id, stage_running_btrfs, with_running_environment},
+    boot::{
+        discard_btrfs_trial, entry_id, prune_btrfs_boot_environments, stage_running_btrfs,
+        with_running_environment,
+    },
     fetch_plan,
     git_install::{GitBuild, GitSource, GitStore},
     image::Image,
@@ -34,6 +37,7 @@ use crate::{
     transaction_progress,
 };
 
+pub use crate::boot::{BootPruneReport, BootRemoval, TrialDiscard};
 pub use crate::git_install::GitChange;
 pub use crate::plan::HeldBackUpdate;
 
@@ -579,6 +583,7 @@ impl System {
             return Ok(None);
         }
 
+        self.prune_before_staging();
         let root = self.stage_change(change)?;
         let id = if boot.uefi {
             boot.activation
@@ -604,6 +609,7 @@ impl System {
         self.check_running()?;
         fetch_plan(Path::new(ROOT), &change.plan)
             .context("fetching the approved repair payloads")?;
+        self.prune_before_staging();
         self.stage_change(change)
     }
 
@@ -643,7 +649,7 @@ impl System {
                     format!("removing the empty staging directory {}", output.display())
                 })?;
             }
-            stage_running_btrfs(&output, &change.plan)?;
+            stage_running_btrfs(&output, &change.plan, &boot.exclude_subvolumes)?;
         }
         Ok(root)
     }
@@ -687,7 +693,81 @@ impl System {
     pub fn bless_uefi(&self) -> Result<Option<String>> {
         let boot = self.boot();
         ensure!(boot.uefi, "configure uefi=#true in boot-btrfs");
-        crate::boot::bless_uefi(&boot.esp, &boot.volume)
+        let blessed = crate::boot::bless_uefi(&boot.esp, &boot.volume)?;
+        if blessed.is_some() && boot.auto_prune {
+            // The promoted trial is the new default, so older roots can retire.
+            match self.lock() {
+                Ok(_lock) => self.prune_quietly(Some(boot.keep_environments)),
+                Err(error) => eprintln!("Warning: could not prune boot environments: {error:#}"),
+            }
+        }
+        Ok(blessed)
+    }
+
+    /// Apply the retention policy. Callers hold the environments lock.
+    ///
+    /// `keep` overrides keep-environments. Failed and abandoned trials are always removed.
+    pub fn prune_boot_environments(
+        &self,
+        keep: Option<usize>,
+        dry_run: bool,
+    ) -> Result<BootPruneReport> {
+        let boot = self.boot();
+        let report = prune_btrfs_boot_environments(
+            &boot.esp,
+            &boot.volume,
+            Some(keep.unwrap_or(boot.keep_environments)),
+            dry_run,
+        )?;
+        if !dry_run {
+            self.remove_empty_staging_directories();
+        }
+        Ok(report)
+    }
+
+    /// Cancel a pending or running trial and remove failed trials. Callers hold the lock.
+    pub fn discard_trial(&self) -> Result<TrialDiscard> {
+        let boot = self.boot();
+        let discard = discard_btrfs_trial(&boot.esp, &boot.volume)?;
+        self.remove_empty_staging_directories();
+        Ok(discard)
+    }
+
+    /// Remove failed trials, and old roots when auto-prune is set, before staging.
+    fn prune_before_staging(&self) {
+        let boot = self.boot();
+        self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments));
+    }
+
+    fn prune_quietly(&self, keep: Option<usize>) {
+        let boot = self.boot();
+        match prune_btrfs_boot_environments(&boot.esp, &boot.volume, keep, false) {
+            Ok(report) => {
+                for (id, kind) in &report.removed {
+                    eprintln!("Removed {} {id}", removal_label(*kind));
+                }
+                for (id, error) in &report.failed {
+                    eprintln!("Warning: could not remove boot environment {id}: {error}");
+                }
+            }
+            Err(error) => eprintln!("Warning: could not prune boot environments: {error:#}"),
+        }
+        self.remove_empty_staging_directories();
+    }
+
+    /// Remove `upgrade-*` directories left empty after their roots were destroyed.
+    fn remove_empty_staging_directories(&self) {
+        let Ok(children) = fs::read_dir(&self.boot().environments) else {
+            return;
+        };
+        for child in children.flatten() {
+            if child.file_name().to_string_lossy().starts_with("upgrade-")
+                && child.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                // Fails harmlessly while the directory still holds a root.
+                let _ = fs::remove_dir(child.path());
+            }
+        }
     }
 
     pub fn transaction_progress(&self, plan: &Plan, validate: bool) -> Result<TransactionProgress> {
@@ -856,6 +936,16 @@ impl System {
             }
         }
         Ok(())
+    }
+}
+
+/// Describe why prune removed an environment.
+pub fn removal_label(kind: BootRemoval) -> &'static str {
+    match kind {
+        BootRemoval::Retiring => "retiring boot environment",
+        BootRemoval::FailedTrial => "failed trial",
+        BootRemoval::AbandonedTrial => "abandoned trial",
+        BootRemoval::KnownGood => "old boot environment",
     }
 }
 

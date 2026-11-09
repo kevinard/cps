@@ -420,7 +420,25 @@ btrfs subvolume create /nested
 reject 'capture omits nested Btrfs subvolume' --source / --output /captures/incomplete
 test ! -e /captures/incomplete
 test -z "$(find /captures -maxdepth 1 -name '.cps-capture-*')"
-btrfs subvolume delete /nested
+# The systemd subvolumes are excluded by default, and others on request.
+test ! -e /var/lib/machines
+btrfs subvolume create /var/lib/machines
+echo 'machine image' > /var/lib/machines/image
+$bb chmod 0710 /var/lib/machines
+cps boot-env capture --source / --output /captures/excluded --exclude-subvolume /nested
+for path in var/lib/machines nested; do
+    test -d "/captures/excluded/root/$path"
+    test -z "$($bb ls -A "/captures/excluded/root/$path")"
+    test "$($bb stat -c %i "/captures/excluded/root/$path")" != 2
+done
+test "$($bb stat -c '%a %u %g' /captures/excluded/root/var/lib/machines)" = \
+    "$($bb stat -c '%a %u %g' /var/lib/machines)"
+btrfs property get /captures/excluded/root ro | $bb grep -Fx 'ro=true'
+test "$($bb cat /var/lib/machines/image)" = 'machine image'
+btrfs subvolume delete /captures/excluded/root
+$bb rmdir /captures/excluded
+btrfs subvolume delete /var/lib/machines /nested
+echo 'CPS_VM_CAPTURE: excluded nested subvolumes became empty directories'
 $bb cp /etc/cps-capture-version /tmp/version
 printf 'corrupt package file\n' > /etc/cps-capture-version
 reject 'image verification failed' --source / --output /captures/corrupt
@@ -533,7 +551,8 @@ if [ -f /etc/cps-btrfs-boot ]; then
     $bb sync
     if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume \
         --esp /efi --root-partuuid "$root_uuid" --options "$boot_options" > /tmp/full 2>&1; then exit 1; fi
-    $bb grep -F 'No space left on device' /tmp/full
+    $bb grep -F 'insufficient free space on the EFI system partition' /tmp/full
+    $bb grep -F 'cps boot-env prune' /tmp/full
     test "$(sha256sum /efi/loader/loader.conf)" = "$before"
     test "$(cps boot-env list --esp /efi)" = "$entries_before"
     $bb rm /efi/cps-space-test
@@ -644,6 +663,7 @@ run() {
 }
 run capture.log "$root_drive" "root=$root_device rootfstype=btrfs rootflags=subvol=@ rootwait rw init=/init" \
     -drive if=virtio,format=raw,file=scratch.ext4
+grep -Fx 'CPS_VM_CAPTURE: excluded nested subvolumes became empty directories' capture.log.clean
 grep -Fx 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root' capture.log.clean
 if [[ $native_boot == 1 ]]; then
     if [[ $system_commands == 0 ]]; then

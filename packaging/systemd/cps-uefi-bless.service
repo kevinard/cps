@@ -1,5 +1,5 @@
 [Unit]
-Description=Promote a healthy CPS direct UEFI trial
+Description=Promote a healthy CPS direct UEFI trial and prune old environments
 DefaultDependencies=no
 Requires=boot-complete.target cps-boot-health.service
 After=boot-complete.target multi-user.target cps-boot-health.service

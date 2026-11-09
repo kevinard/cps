@@ -1,7 +1,11 @@
 mod destroy;
 pub(super) mod policy;
+mod prune;
 mod uefi;
 pub use destroy::destroy_btrfs_boot_environment;
+pub use prune::{
+    BootPruneReport, BootRemoval, TrialDiscard, discard_btrfs_trial, prune_btrfs_boot_environments,
+};
 
 use std::{
     fs::{self, File},
@@ -36,6 +40,10 @@ use self::policy::{BootEntry, BootRoot, LoaderPolicy, field};
 const LINUX_HASH: &str = "# cps-linux-sha256 ";
 const INITRD_HASH: &str = "# cps-initrd-sha256 ";
 const SLOT_RETIREMENT_FORMAT: &str = "cps slot retirement v1\n";
+const NO_SELECTION: &str = "loader/loader.conf selects no CPS boot environment; select a \
+    known-good environment with `cps boot-env rollback --esp ESP ID`";
+/// Free space kept on the ESP beyond the boot files of an activation.
+const ESP_MARGIN: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct BootEnvironment {
@@ -151,8 +159,15 @@ pub(super) fn rollback(
         entries,
         firmware,
     } = inventory(&esp, &lock, false)?;
-    let policy = policy.context("no CPS boot environments registered")?;
-    let current = rollback_source(&policy, &entries, firmware.as_ref())?;
+    ensure!(!entries.is_empty(), "no CPS boot environments registered");
+    // An explicit ID can restore a selection after the `default` line was removed.
+    let current = match &policy {
+        Some(policy) => rollback_source(policy, &entries, firmware.as_ref())?,
+        None => {
+            ensure!(id.is_some(), NO_SELECTION);
+            None
+        }
+    };
     let target = rollback_target(current, &entries, id)?;
     verify_fallback_artifacts(&esp, target)?;
     let _root_lock = if let Some(record) = &target.btrfs {
@@ -240,7 +255,7 @@ pub(super) fn preview_btrfs_rollback(
         entries,
         firmware,
     } = inventory(&esp, &lock, false)?;
-    let policy = policy.context("no CPS boot environments registered")?;
+    let policy = policy.context(NO_SELECTION)?;
     let current = rollback_source(&policy, &entries, firmware.as_ref())?
         .context("no configured default CPS boot environment")?;
     let target = rollback_target(Some(current), &entries, id)?;
@@ -379,14 +394,20 @@ pub(super) fn with_running_environment<T>(
         firmware,
     } = inventory(&esp, &lock, false)?;
     if let Some(firmware) = &firmware {
-        firmware.require_no_next()?;
+        firmware.require_no_next().context(
+            "boot the scheduled trial, or cancel it with `cps boot-env discard-trial`, before \
+             making more package changes",
+        )?;
     }
     let selected = policy
-        .and_then(|policy| policy.selected(&entries))
-        .context("no CPS boot environment is selected")?;
+        .context(NO_SELECTION)?
+        .selected(&entries)
+        .context("no known-good CPS boot environment is selected")?;
     ensure!(
         selected.tries.is_none(),
-        "a trial is pending; boot it before making more package changes"
+        "a trial is pending ({}); boot it, or cancel it with `cps boot-env discard-trial`, \
+         before making more package changes",
+        selected.id
     );
     if let (BootRoot::Partition(expected), BootRoot::Partition(selected)) = (&root, &selected.root)
     {
@@ -781,7 +802,8 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
                     .map(|fw| fw.can_arm(entry))
                     .transpose()?
                     .unwrap_or(false),
-            "boot attempts are exhausted; stage a new environment"
+            "boot attempts are exhausted; remove the failed trial with \
+             `cps boot-env discard-trial`, then stage again"
         );
         ensure!(
             entry.description == description,
@@ -898,6 +920,28 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
         );
     }
 
+    {
+        // Check before the first write. Existing files are reused on retries.
+        let artifacts = esp.join("EFI/cps").join(&id);
+        let mut files = Vec::new();
+        if let Some((uki, _)) = &signed_uki {
+            files.push((artifacts.join(uki::NAME), uki.metadata()?.len()));
+        } else {
+            files.push((artifacts.join("vmlinuz.efi"), kernel.metadata()?.len()));
+            if let Some(initrd) = &initrd {
+                files.push((artifacts.join("initramfs.img"), initrd.metadata()?.len()));
+            }
+        }
+        if existing_entry.is_none() {
+            files.push((
+                esp.join("loader/entries/new.conf"),
+                description.len() as u64,
+            ));
+        }
+        // loader.conf is replaced through a temporary copy.
+        files.push((esp.join("loader/loader.conf.new"), 64 * 1024));
+        check_esp_space(&esp, &id, &files)?;
+    }
     if let (Some(deployment), Some(fallback), Some(parent)) =
         (deployment, &fallback, &settings.boot_parent)
     {
@@ -1015,6 +1059,31 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
     }
 
     Ok(ActivationUpdate { id, files, retired })
+}
+
+/// Fail before writing boot files that would not fit on the ESP.
+fn check_esp_space(esp: &Path, id: &str, files: &[(PathBuf, u64)]) -> Result<()> {
+    let stat = rustix::fs::statvfs(esp).context("reading EFI system partition free space")?;
+    let cluster = stat.f_frsize.max(1);
+    let mut needed = ESP_MARGIN;
+    for (path, bytes) in files {
+        if !path.try_exists()? {
+            // Each new file and directory occupies whole clusters.
+            needed = needed.saturating_add(bytes.div_ceil(cluster).saturating_add(1) * cluster);
+        }
+    }
+    needed = needed.saturating_add(2 * cluster);
+    let available = stat.f_bavail.saturating_mul(stat.f_frsize);
+    ensure!(
+        available >= needed,
+        "insufficient free space on the EFI system partition for {id}: {} available, {} \
+         needed for its boot files and a {} margin. Remove old boot environments with \
+         `cps boot-env prune`, or free space on the ESP, then retry",
+        super::mib(available),
+        super::mib(needed),
+        super::mib(ESP_MARGIN),
+    );
+    Ok(())
 }
 
 fn check_replacement(
@@ -1346,7 +1415,30 @@ fn install_checked(
 
 #[cfg(test)]
 mod tests {
-    use super::{digest, install_checked, parse_slot_retirement, retire_device_entry};
+    use super::{
+        check_esp_space, digest, install_checked, parse_slot_retirement, retire_device_entry,
+    };
+
+    #[test]
+    fn esp_space_counts_only_missing_files_and_suggests_pruning() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let existing = dir.path().join("vmlinuz.efi");
+        std::fs::write(&existing, b"kernel")?;
+        let id = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
+        check_esp_space(dir.path(), id, &[(dir.path().join("initramfs.img"), 4096)])?;
+        // A retry reuses the file that is already in place.
+        check_esp_space(dir.path(), id, &[(existing, u64::MAX / 2)])?;
+        let message = check_esp_space(
+            dir.path(),
+            id,
+            &[(dir.path().join("uki.efi"), u64::MAX / 2)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("insufficient free space on the EFI system partition"));
+        assert!(message.contains(id) && message.contains("cps boot-env prune"));
+        Ok(())
+    }
 
     #[test]
     fn slot_retirement_requires_version_one() -> anyhow::Result<()> {
