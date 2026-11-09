@@ -171,7 +171,8 @@ Bootstrapping verifies the running root and places its signed UKI first in
 CPS creates a firmware option for the new UKI and sets only `BootNext`.
 The promotion service waits for `boot-complete.target` and
 `cps-boot-health.service`. It verifies the running Btrfs snapshot and the
-firmware's `BootCurrent` before making the trial the default. Firmware
+fallback root with `verify --quick` semantics, and checks the firmware's
+`BootCurrent`, before making the trial the default. Firmware
 consumes `BootNext` before launching the trial, so after a failed trial
 the next reset boots the known-good root.
 [UEFI Boot Manager specification](https://uefi.org/specs/UEFI/2.11/03_Boot_Manager.html)
