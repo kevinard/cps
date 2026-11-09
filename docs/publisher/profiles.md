@@ -12,11 +12,20 @@ profile "desktop" architecture="x86_64" {
     package "desktop/base"
     package "system/kernel@7.2.11-0"
     facet "doc.man" #false
+    facet "locale.*" #false
+    variant "container" #false
+    allow-facet-override "devel"
 }
 ```
 
 CPS resolves each profile against the candidate catalog using the image solver
-and the specified architecture and facets. An unversioned profile package
+and the specified architecture, facet rules, and variants. Facet rules accept
+exact names and trailing wildcards, with the same precedence and built-in
+`debug.*` and `isa.*` defaults as images. `allow-facet-override PATTERN` lets
+images add per-package facet rules for matching facets, such as `devel` or
+`doc.*`, on profile-protected packages. Without it, images may only override
+facets of packages they install locally. See
+[facet rules on profile images](../client/profiles.md#facet-rules-on-profile-images). An unversioned profile package
 selects its newest active version. Dependencies can select any compatible active
 version. The check covers dependencies, file ownership, and the consistency of
 selected kernel actions. Publish coordinated changes in one batch when the
@@ -45,7 +54,7 @@ Signed profiles record the exact versions of the requested roots and
 the manifest digest of every package in the checked composition. When
 the baseline has the same named profile, CPS
 replays its recorded composition using its companion pins. The architecture,
-facets, and publisher order must match the baseline image configuration.
+facets, variants, and publisher order must match the baseline image configuration.
 For a baseline catalog without the named profile, CPS
 selects the newest baseline versions of the current profile's root names.
 
@@ -123,8 +132,8 @@ publisher when the baseline lacks a signed record for the profile. If the
 baseline has that record, any companion `upgrade-from` must match its signed
 pin. A baseline without a profile record or a companion override uses the
 candidate's `catalog` pin. The primary
-catalog signs the checked architecture, facets, and ordered companion catalog
-digests. For each companion it also records the signed catalog sequence and
+catalog signs the checked architecture, facets, variants, allowed facet
+overrides, and ordered companion catalog digests. For each companion it also records the signed catalog sequence and
 the fingerprint of the provisioned trust anchor. Images verify both against
 the pinned companion catalog and their configured key.
 

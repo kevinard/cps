@@ -5,7 +5,10 @@
 ## On this page
 
 - [Freezing package versions](#freezing-package-versions)
-- [Changing facets on an existing image](#changing-facets-on-an-existing-image)
+- [Facets and variants on an existing image](#facets-and-variants-on-an-existing-image)
+  - [Facet rules and precedence](#facet-rules-and-precedence)
+  - [Per-package facet rules](#per-package-facet-rules)
+  - [Changing variants](#changing-variants)
 - [Reviewing configuration updates](#reviewing-configuration-updates)
 - [Choose the provider of a mediated link](#choose-the-provider-of-a-mediated-link)
 
@@ -43,27 +46,120 @@ default reboot, and rollback boots.
 
 Run `cargo test` for the desktop upgrade and interruption tests.
 
-## Changing facets on an existing image
+## Facets and variants on an existing image
+
+Facets enable optional content inside packages, such as headers, manual
+pages, locales, debug symbols, or multilib objects. Variants choose between
+alternative content, such as a container or bare-metal layout. Neither
+changes which packages are installed. See
+[facets, packages, and variants](../concepts.md#facets-separate-packages-and-variants).
 
 ```sh
 cps facet --root image
-cps plan --root image --output facets.json change-facet doc.man=true devel=false
+cps facet --root image locale.fr debug.sqlite
+cps facet --root image --package library/sqlite
+cps plan --root image --output facets.json change-facet doc.man=true 'locale.*=false' locale.fr=true
 cps fetch --root image --plan facets.json
 cps apply --root image facets.json
 ```
 
-`facet` lists explicit overrides. Use `NAME=default` to remove an override and
-restore the default enabled selection. A facet change uses the installed
-manifests and leaves package versions and catalog checkpoints in place. It
-can be staged in a boot environment and resumed like an ordinary plan.
-Enabling an action may require its payload from the repository or cache.
+Without arguments, `facet` lists every rule with its source: `local` for a
+rule set on the image and `default` for a built-in default that no local rule
+replaces. With facet names it prints each effective value and the rule that
+decided it. With `--package` it resolves the facets of one installed package,
+including per-package rules, and lists the facets its actions use unless you
+name some. Add `--json` for machine-readable output.
+
+A facet or variant change uses the installed manifests and leaves package
+versions and catalog checkpoints in place, so it plans offline. The plan
+lists `Recompose PACKAGE` for each installed package whose selected actions
+change, and writes only the paths of those packages. It can be staged in a
+boot environment and resumed like an ordinary plan. Enabling an action may
+require its payload from the repository or cache.
 Disabling a facet records the identity and fingerprint of any edited or
 locally deleted configuration it leaves behind. Re-enabling can reclaim the
 matching file, restore a pending vendor proposal, or follow a configuration
 rename declared with `original-name`. If a file at the disabled path has
 changed, CPS reports a conflict. To install the vendor copy in that case,
 move the changed file aside and generate a fresh plan.
-Signed release profiles fix their facet policy.
+
+### Facet rules and precedence
+
+A rule names a facet exactly (`doc.man`), with a trailing wildcard
+(`locale.*`, which matches `locale.fr` and `locale.fr.ca` but not `locale`),
+or as `*`. `NAME=default` removes a rule. CPS decides each facet of each
+package in this order, following IPS:
+
+1. The package's own rules. An exact package name beats a `PREFIX/*` glob,
+   and a longer glob prefix beats a shorter one. The first package pattern
+   with a matching rule decides.
+2. Rules that a dependent package applies to its dependencies.
+3. The image-wide rules.
+4. The built-in defaults `debug.*=false` and `isa.*=false`.
+5. Otherwise the facet is enabled.
+
+Within one set of rules, the most specific match wins: an exact name beats
+any wildcard, and a longer wildcard prefix beats a shorter one. Debug
+symbols and multilib objects are therefore off on a new image. Enable them
+like any other facet, for example `change-facet 'debug.*=true'` or
+`change-facet isa.i686=true`. The defaults are built in, like IPS's implicit
+`facet.debug.*` rule, and `cps facet` shows them.
+
+Set initial rules with `image-create --facet` or in the image configuration:
+
+```kdl
+facet "devel" #false
+facet "locale.*" #false
+facet "locale.fr" #true
+facet "devel" #true package="library/sqlite" with-dependencies=#true
+variant "container" #true
+```
+
+### Per-package facet rules
+
+Write `PACKAGE:FACET=VALUE` to override a facet for one package, or
+`PREFIX/*:FACET=VALUE` for every package under a prefix. Package names
+contain `/` and facet names contain `.`, and neither contains `:`.
+
+```sh
+cps plan --root image --output headers.json change-facet devel=false library/sqlite:devel=true
+cps plan --root image --output closure.json change-facet --with-dependencies library/sqlite:devel=true
+cps plan --root image --output reset.json change-facet library/sqlite:devel=default
+```
+
+Headers often `#include` the headers of their dependencies, so enabling
+`devel` for one library alone can leave its headers unusable. Add
+`--with-dependencies`, or `with-dependencies=#true` in the image
+configuration, to apply the rule to the package's installed dependency
+closure as well. The closure follows `require`, `require-capability`,
+`require-any`, and `conditional` dependencies to installed packages. It
+skips recommendations, incorporations, and exclusions. A dependency's own
+rule beats an inherited one, and the closure follows later installs and
+removals. Two inherited rules that disagree about the same dependency stop
+the plan; add a rule for that dependency to settle it.
+
+On an image that follows a signed release profile, image-wide facets and
+variants stay fixed by the profile. You can add per-package rules for
+packages you installed locally. A rule that reaches a package the profile
+protects, directly, through a glob, or through `--with-dependencies`, is
+refused unless the profile allows overriding that facet. See
+[profile images](profiles.md#facet-rules-on-profile-images).
+
+### Changing variants
+
+```sh
+cps variant --root image
+cps plan --root image --output container.json change-variant container=true
+cps plan --root image --output unset.json change-variant --unset container
+```
+
+`variant` lists the image's values, including the built-in `arch`. Set
+other variants with `image-create --variant NAME=VALUE`, a `variant` node in
+the image configuration, or `change-variant`. A variant change works like a
+facet change: it reuses the installed manifests and plans offline. The
+architecture is fixed when the image is created, and `change-variant`
+refuses it. Installing a package that selects content by a variant the image
+does not set fails until you set it.
 
 ## Reviewing configuration updates
 

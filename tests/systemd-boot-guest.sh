@@ -464,11 +464,11 @@ if [ -f /etc/cps-vm-assert-facet ]; then
     [ "$("$bb" cat /etc/cps-vm-optional.conf)" = 'local settings' ]
     if [ -f /usr/share/man/man1/cps-vm.1 ]; then
         state=$("$bb" cat /usr/share/man/man1/cps-vm.1)
-        [ "$facets" = "$(printf 'FACET\tVALUE\ndevel\tfalse\noptional\tfalse')" ]
+        [ "$facets" = "$(printf 'RULE\tVALUE\tSOURCE\ndebug.*\tfalse\tdefault\nisa.*\tfalse\tdefault\ndevel\tfalse\tlocal\noptional\tfalse\tlocal')" ]
         printf 'CPS_VM_FACET: %s docs present\n' "$state"
     else
         [ "$state" = previous ]
-        [ "$facets" = "$(printf 'FACET\tVALUE\ndevel\tfalse\ndoc.man\tfalse')" ]
+        [ "$facets" = "$(printf 'RULE\tVALUE\tSOURCE\ndebug.*\tfalse\tdefault\nisa.*\tfalse\tdefault\ndevel\tfalse\tlocal\ndoc.man\tfalse\tlocal')" ]
         printf 'CPS_VM_FACET: previous docs absent\n'
     fi
 fi

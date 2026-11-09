@@ -13,7 +13,7 @@ image. If CPS already manages your machine, go directly to the
 - [Install, upgrade, and recover a running system](client/system.md)
 - [Plan and apply changes to an inactive image](client/images.md)
 - [Find packages, inspect ownership, and explain dependencies](client/queries.md)
-- [Manage freezes, facets, configuration updates, and mediators](client/configuration.md)
+- [Manage freezes, facets, variants, configuration updates, and mediators](client/configuration.md)
 - [Configure publishers and their search order](client/publishers.md)
 - [Install a signed profile or replicate an exact composition](client/profiles.md)
 - [Sync mirrors and manage cached payloads](client/mirrors.md)
