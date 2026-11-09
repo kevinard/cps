@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -35,6 +35,7 @@ const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
 mod git_snapshots;
 mod keys;
+use keys::SigningKey;
 pub(crate) mod profiles;
 mod rebuild;
 pub mod release;
@@ -1642,7 +1643,7 @@ fn prepare_objects(repo: &Path) -> Result<()> {
 }
 
 pub fn publish(repo: &Path, proto: &Path, recipe: &Path, key: &Path) -> Result<String> {
-    let key = read_signing_key(key)?;
+    let key = SigningKey::open(key)?;
     let manifest_bytes = read_limited(File::open(recipe)?, MANIFEST_LIMIT)?;
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)
         .with_context(|| format!("parsing {}", recipe.display()))?;
@@ -1659,7 +1660,7 @@ fn exact_publisher(id: &str) -> Result<&str> {
 
 pub fn withdraw_package(repo: &Path, key: &Path, id: &str) -> Result<()> {
     let publisher = exact_publisher(id)?;
-    let key = read_signing_key(key)?;
+    let key = SigningKey::open(key)?;
     Root::open(repo)?;
     let _lock = lock_repo(repo)?;
     ensure!(
@@ -1696,8 +1697,8 @@ pub fn rotate_publisher_key(
 ) -> Result<String> {
     validate_publisher(publisher)?;
     validate_digest(base)?;
-    let old_key = read_signing_key(old_key)?;
-    let new_key = read_signing_key(new_key)?;
+    let old_key = SigningKey::open(old_key)?;
+    let new_key = SigningKey::open(new_key)?;
     Root::open(repo)?;
     let _lock = lock_repo(repo)?;
     let current = publication_base(repo)?.context("repository has no catalog to rotate")?;
@@ -1774,7 +1775,7 @@ pub fn publish_witnessed_bundle_with_sources(
     witnesses: &[BuildWitness],
     source_cache: Option<&Path>,
 ) -> Result<String> {
-    let key = read_signing_key(key)?;
+    let key = SigningKey::open(key)?;
     let (proto, manifest, verified) = verify_publication(
         bundle,
         builder_key,
@@ -1878,7 +1879,7 @@ pub fn publish_release_with_mode(
     let release = publish_release::parse(std::str::from_utf8(&bytes)?)
         .with_context(|| format!("reading release {}", document.display()))?;
     let parent = document.parent().unwrap_or_else(|| Path::new("."));
-    let key = read_signing_key(key)?;
+    let key = SigningKey::open(key)?;
     let _lock = lock_repo(repo)?;
     let current = publication_base(repo)?;
     ensure!(
@@ -1983,7 +1984,7 @@ fn publication_base(repo: &Path) -> Result<Option<String>> {
 fn publication_catalog(
     repo: &Path,
     publisher: &str,
-    key: &Ed25519KeyPair,
+    key: &SigningKey,
     current: Option<&str>,
 ) -> Result<Catalog> {
     match current {
@@ -2001,7 +2002,7 @@ fn publish_manifest(
     repo: &Path,
     proto: Root,
     manifest: Manifest,
-    key: &Ed25519KeyPair,
+    key: &SigningKey,
     evidence: Option<VerifiedBuild>,
     source_cache: Option<&Root>,
 ) -> Result<String> {
@@ -2199,7 +2200,7 @@ pub(crate) fn read_file_index(repo: &Path, hash: &str) -> Result<FileIndex> {
 /// Enable a signed file lookup index for this publisher's catalogs.
 pub fn enable_file_index(repo: &Path, publisher: &str, key: &Path) -> Result<String> {
     validate_publisher(publisher)?;
-    let key = read_signing_key(key)?;
+    let key = SigningKey::open(key)?;
     let _lock = lock_repo(repo)?;
     let hash = publication_base(repo)?.context("repository has no catalog to index")?;
     let mut catalog = publication_catalog(repo, publisher, &key, Some(&hash))?;
@@ -2228,7 +2229,7 @@ pub fn widen_rollout(
         percentage <= 100,
         "rollout percentage must be between 0 and 100"
     );
-    let key = read_signing_key(key)?;
+    let key = SigningKey::open(key)?;
     let _lock = lock_repo(repo)?;
     let current = publication_base(repo)?.context("repository has no release to widen")?;
     ensure!(
@@ -2276,14 +2277,14 @@ fn store_file_index(repo: &Path, catalog: &Catalog) -> Result<String> {
     store(repo, FILE_INDEX_OBJECTS, &bytes)
 }
 
-fn write_catalog(repo: &Path, catalog: Catalog, key: &Ed25519KeyPair) -> Result<String> {
+fn write_catalog(repo: &Path, catalog: Catalog, key: &SigningKey) -> Result<String> {
     save_catalog(repo, catalog, key, ReleaseMode::Publish)
 }
 
 fn save_catalog(
     repo: &Path,
     mut catalog: Catalog,
-    key: &Ed25519KeyPair,
+    key: &SigningKey,
     mode: ReleaseMode<'_>,
 ) -> Result<String> {
     if catalog.file_index.is_some() {
@@ -2295,7 +2296,7 @@ fn save_catalog(
 fn write_catalog_document(
     repo: &Path,
     mut catalog: Catalog,
-    key: &Ed25519KeyPair,
+    key: &SigningKey,
     mode: ReleaseMode<'_>,
 ) -> Result<String> {
     catalog.rename_targets()?;
@@ -2308,7 +2309,7 @@ fn write_catalog_document(
         keys::Trust::Current(key.public_key().as_ref()),
     )?;
     catalog.validate_profile_build_trust(&signer)?;
-    let signature = hex::encode(key.sign(&catalog.signing_message()?).as_ref());
+    let signature = hex::encode(key.sign(&catalog.signing_message()?)?);
     let signed = SignedCatalog { catalog, signature };
     let signed = serde_json::to_vec(&signed)?;
     ensure!(
@@ -2529,7 +2530,7 @@ mod tests {
         profile: &str,
         dependency: &str,
     ) -> Result<String> {
-        let signer = read_signing_key(key)?;
+        let signer = SigningKey::open(key)?;
         let current = read_current(repo)?;
         let mut catalog = publication_catalog(repo, publisher, &signer, Some(&current))?;
         let composition = &mut catalog
@@ -2546,7 +2547,7 @@ mod tests {
         let repo = tempfile::tempdir()?;
         prepare_objects(repo.path())?;
         let key = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
-        let signer = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let signer = SigningKey::from(Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap());
         let anchor = signer.public_key().as_ref();
         let pin = CatalogPin {
             publisher: "seed".to_owned(),
@@ -2618,7 +2619,8 @@ mod tests {
         prepare_objects(repo.path())?;
         let key =
             Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("generate key");
-        let key = Ed25519KeyPair::from_pkcs8(key.as_ref()).expect("read generated key");
+        let key =
+            SigningKey::from(Ed25519KeyPair::from_pkcs8(key.as_ref()).expect("read generated key"));
         let portable = digest(b"portable");
         let targeted = digest(b"targeted");
         let legacy = format!(
@@ -2626,7 +2628,7 @@ mod tests {
         );
         let signed = format!(
             r#"{{"catalog":{legacy},"signature":"{}"}}"#,
-            hex::encode(key.sign(legacy.as_bytes()).as_ref())
+            hex::encode(key.sign(legacy.as_bytes())?)
         );
         let hash = store(repo.path(), "catalogs", signed.as_bytes())?;
         let read =
@@ -2645,7 +2647,7 @@ mod tests {
             .verify(&message, &hex::decode(&signed.signature)?)
             .unwrap();
 
-        signed.signature = hex::encode(key.sign(&body).as_ref());
+        signed.signature = hex::encode(key.sign(&body)?);
         let hash = store(repo.path(), "catalogs", &serde_json::to_vec(&signed)?)?;
         let error = read(&hash).unwrap_err();
         assert!(format!("{error:#}").contains("invalid signature on catalog"));

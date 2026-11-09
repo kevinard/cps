@@ -8,6 +8,9 @@
 - [Sharded targets and delta payloads](#sharded-targets-and-delta-payloads)
 - [Serving a basic HTTPS mirror](#serving-a-basic-https-mirror)
   - [Provisioning a 2-of-3 offline root](#provisioning-a-2-of-3-offline-root)
+- [Release keys and external signers](#release-keys-and-external-signers)
+  - [Refreshing metadata without the targets key](#refreshing-metadata-without-the-targets-key)
+  - [External signer protocol](#external-signer-protocol)
 - [Rotating a mirror's TUF root](#rotating-a-mirrors-tuf-root)
 - [Publishing and verifying signed mirror release notes](#publishing-and-verifying-signed-mirror-release-notes)
 
@@ -42,8 +45,11 @@ its objects are available.
 
 Sync downloads missing manifests, attestations, and rebuild metadata in
 bounded parallel batches. The bundled deployment adapter signs mirror
-objects in 16 delegated targets roles. CPS applies the 16 MiB download limit
-to each role and can refresh an existing cache from a sharded mirror.
+objects in 16 delegated targets roles. `sign-export` and clients share one
+set of metadata limits: 1 MiB for `root.json` and `timestamp.json`, and
+16 MiB for the snapshot, the top-level targets, and each delegated role.
+`sign-export` refuses to produce metadata that clients would reject. CPS
+can refresh an existing cache from a sharded mirror.
 
 For smaller upgrade downloads, include byte-level patches when exporting a
 mirror release. Pass `--delta-from` with a previously signed catalog digest
@@ -84,7 +90,11 @@ variables when invoking the adapter directly.
 | `CPS_MIRROR_PUBLISHER_KEY` | CPS publisher's public DER key |
 | `CPS_MIRROR_TUF_ROOT` | Original signed TUF root JSON used to bootstrap and verify the rotation chain |
 | `CPS_MIRROR_TUF_ACTIVE_ROOT` | Optional current or next signed TUF root JSON, with consistent snapshots enabled |
-| `CPS_MIRROR_TUF_KEYS` | Private TUF release keys directory containing `targets.pem`, `snapshot.pem`, and `timestamp.pem` |
+| `CPS_MIRROR_TUF_KEYS` | Private TUF release key sources, described in [Release keys and external signers](#release-keys-and-external-signers) |
+| `CPS_MIRROR_TARGETS_LIFETIME` | Optional targets and snapshot lifetime for a deployment, such as `90 days` (default `30 days`) |
+| `CPS_MIRROR_SNAPSHOT_LIFETIME` | Optional lifetime of a snapshot re-signed by a refresh (default `30 days`) |
+| `CPS_MIRROR_TIMESTAMP_LIFETIME` | Optional timestamp lifetime (default `7 days`) |
+| `CPS_MIRROR_OBJECTS_THRESHOLD` | Optional signatures required on each `objects-*` delegation (default 1) |
 
 Keep the CPS publisher signing key and all TUF private keys outside the
 HTTPS directory. To provision the TUF roles, run this on a trusted key
@@ -146,14 +156,17 @@ CPS_RELEASE_REPO="$repo" CPS_RELEASE_PUBLISHER=canopa \
 Install the signed TUF root at `/etc/cps/tuf-root.json` on clients for URL-only
 registration. The mirror exporter includes the publisher discovery targets.
 To refresh automatically, schedule
-`bash ci/release.sh refresh-mirror` daily on the signing host with
-`CPS_MIRROR_DIR` and the deployment adapter configured. It signs fresh TUF
-metadata for the deployed catalog when the last signed timestamp has 48 hours
-or less left or its bytes are missing or differ at the origin. The bundled
-adapter reserves versions and records published timestamp fingerprints in
-`.ci-tuf-state.json` in the private publishing repository with `"format": 1`.
-Back up that file with the repository and keep it private to the signing account.
-A custom adapter that keeps no such record refreshes on each scheduled run.
+`bash ci/release.sh refresh-mirror` daily with `CPS_MIRROR_DIR` and the
+deployment adapter configured. It refreshes the deployed catalog's metadata
+when the last signed timestamp has 48 hours or less left or its bytes are
+missing or differ at the origin. The refresh needs only the timestamp key,
+and the snapshot key when the snapshot is about to expire. See
+[Refreshing metadata without the targets key](#refreshing-metadata-without-the-targets-key).
+The bundled adapter reserves versions and records the published timestamp
+and snapshot fingerprints in `.ci-tuf-state.json` in the private publishing
+repository with `"format": 1`. Back up that file with the repository and
+keep it private to the signing account. A custom adapter that keeps no such
+record refreshes on each scheduled run.
 
 If signer state is lost, restore a trusted backup or set
 `CPS_MIRROR_INITIAL_VERSION` to the highest version previously
@@ -164,6 +177,117 @@ Serve `metadata/timestamp.json` with revalidation so clients see the latest
 version promptly.
 Run `bash tests/deploy-mirror.sh` to exercise publishing and syncing a
 disposable mirror with the same signer.
+
+## Release keys and external signers
+
+The root role stays offline. The online roles have different exposure:
+
+| Role | Needed for | Compromise allows |
+| --- | --- | --- |
+| `targets` and `objects-*` | Each release that changes content | Signing arbitrary mirror targets. CPS still requires the publisher's catalog signature on packages. |
+| `snapshot` | Each release, and a refresh when the snapshot is about to expire | Mixing role versions, which clients' rollback checks limit |
+| `timestamp` | Each release and the daily refresh | Freezing clients on old metadata until the snapshot and targets expire |
+
+Keep the targets key off the host that runs the daily refresh, or in a
+hardware token, and supply it only when you deploy a new catalog. Give the
+targets and snapshot roles lifetimes that cover the longest expected gap
+between releases. Clients reject metadata once the targets role expires,
+whatever the timestamp says.
+
+`cps repo sign-export` and `cps repo refresh-metadata` accept each role key
+as one of these key sources:
+
+- `PATH` or `file:PATH` names a private key file that CPS reads. Use PKCS#8
+  Ed25519 or ECDSA P-256 keys in DER or PEM form, or RSA keys in PEM form.
+- `command:DESCRIPTOR` names an external signer. CPS passes it the bytes to
+  sign and verifies the returned signature against the declared public key.
+
+Repeat `--targets-key`, `--snapshot-key`, or `--timestamp-key` to supply
+several keys for a role. The root sets which keys belong to each role and
+how many signatures it needs. Use `tuftool root set-threshold` and repeat
+`tuftool root gen-rsa-key` on the provisioning machine. CPS checks that
+every supplied key belongs to its role and that the keys meet the root's
+threshold before it signs, and rejects a key listed twice.
+
+The 16 `objects-*` delegations carry the content targets. By default they
+use the first targets key with a threshold of 1. Pass `--objects-key` one
+or more times with `--objects-threshold N` to delegate them to their own
+keys. The targets role records these keys, so changing them takes effect
+with the next release.
+
+The bundled adapter reads key sources from `CPS_MIRROR_TUF_KEYS`. For each
+role (`targets`, `snapshot`, `timestamp`, and optionally `objects`), it uses
+`ROLE.pem` and `ROLE-NAME.pem` as key files and `ROLE.signer.kdl` and
+`ROLE-NAME.signer.kdl` as signer descriptors. It reads only the roles that
+the operation needs.
+
+```kdl
+schema-version 1 kind="signer"
+command "/usr/local/libexec/cps-kms-sign" "--key" "release/timestamp"
+public-key "timestamp.pub"
+timeout-seconds 30
+```
+
+`command` gives an absolute program path and its fixed arguments. CPS runs
+it directly, without a shell, and adds no arguments. `public-key` names the
+declared public key, relative to the descriptor: a PEM SubjectPublicKeyInfo
+for RSA, ECDSA P-256, or Ed25519, an Ed25519 DER key, or the hexadecimal
+Ed25519 form used in TUF metadata. Convert an RSA private key's public half
+with `openssl pkey -in timestamp.pem -pubout -out timestamp.pub`.
+`timeout-seconds` is optional, from 1 to 600, and defaults to 30.
+
+### Refreshing metadata without the targets key
+
+`cps repo refresh-metadata` signs a new `timestamp.json` over the published
+snapshot. With `--snapshot-key` and `--snapshot-expires`, it also signs a
+new snapshot with the same role versions and digests. It reads only the
+root and the published versioned snapshot, so it needs neither the export
+nor the targets key.
+
+```sh
+cps repo refresh-metadata --root root.json --snapshot mirror/metadata/7.snapshot.json \
+    --timestamp-key command:/etc/cps/signers/timestamp.signer.kdl \
+    --version 8 --timestamp-expires 2026-11-17T00:00:00Z --output refreshed
+```
+
+CPS verifies the snapshot's signatures against the root and requires the
+new version to be higher than the snapshot's. The output directory holds
+`timestamp.json` and, when re-signed, `VERSION.snapshot.json`. Publish the
+snapshot before the timestamp.
+
+Run as `deploy-mirror.sh REPO PUBLISHER CATALOG refresh`, the bundled
+adapter uses this command for the catalog recorded as deployed. It locates
+the snapshot from its signer state and checks the published snapshot and
+roles against the recorded digests before signing. It re-signs the snapshot
+when it would expire within a day of the new timestamp, and fails if no
+snapshot key is present then. It warns when the targets role expires within
+14 days and fails once it has expired. A refresh requires the active root to
+be published already. Publish a new root with `deploy-current`.
+
+### External signer protocol
+
+An external signer lets a small helper reach a PKCS#11 token, an HSM, or a
+cloud KMS without CPS linking those libraries. Protocol version 1 works as
+follows:
+
+- CPS executes the program with the descriptor's arguments and its own
+  environment, plus `CPS_SIGNER_PROTOCOL=1`, `CPS_SIGNER_CONTEXT` (`tuf` or
+  `catalog`), `CPS_SIGNER_KEY_ID` (the TUF key ID, or the SHA-256 of the
+  Ed25519 public key for a catalog), and `CPS_SIGNER_ALGORITHM` (`ed25519`,
+  `rsassa-pss-sha256`, or `ecdsa-sha2-nistp256`).
+- Stdin carries the exact message bytes followed by end of file. For TUF this
+  is the canonical JSON of the role. The helper signs the message itself. For
+  RSA, use PSS with SHA-256 and a 32-byte salt. ECDSA signatures are DER.
+- The helper writes only the raw signature bytes to stdout, at most 2048
+  bytes, and exits with status 0. Stderr reaches the operator.
+- Any other exit status, a signal, an empty or oversized output, or a
+  signature that does not verify fails the operation. CPS writes nothing.
+- When the timeout expires, CPS kills the helper's process group and fails.
+
+[`tests/support/openssl-signer.sh`](../../tests/support/openssl-signer.sh)
+is a minimal helper that signs with a local key file. Use it as a template.
+The publisher catalog key accepts the same sources. See
+[Publish and retire packages](publishing.md#external-catalog-signing-keys).
 
 ## Rotating a mirror's TUF root
 

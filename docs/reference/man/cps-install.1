@@ -40,7 +40,13 @@
 .B \&\-\-track\-branch <TRACK_BRANCH>
 \&Follow this branch when running cps upgrade
 .TP
+.B \&\-\-allowed\-signers <FORMAT:PATH>
+\&Require Git signatures from the signers in ssh:PATH or openpgp:PATH
+.TP
+.B \&\-\-require\-signed <REQUIRE_SIGNED>
+\&Which Git object must carry the allowed signature Possible values: \- commit: The installed commit itself \- tag:    An annotated tag that points at the installed commit [default: commit]
+.TP
 .B \&\-h, \-\-help
-\&Print help
+\&Print help (see a summary with '\-h')
 .SH SEE ALSO
 .BR cps (1)

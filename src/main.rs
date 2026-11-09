@@ -63,6 +63,17 @@ enum Command {
         /// Follow this branch when running cps upgrade
         #[arg(long, requires = "git", group = "git_ref")]
         track_branch: Option<String>,
+        /// Require Git signatures from the signers in ssh:PATH or openpgp:PATH
+        #[arg(long, requires = "git", value_name = "FORMAT:PATH")]
+        allowed_signers: Option<String>,
+        /// Which Git object must carry the allowed signature
+        #[arg(
+            long,
+            requires = "allowed_signers",
+            value_enum,
+            default_value = "commit"
+        )]
+        require_signed: GitSignedArg,
         #[arg(required_unless_present = "git", value_name = "PACKAGE")]
         packages: Vec<String>,
     },
@@ -662,6 +673,14 @@ enum ManifestCommand {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GitSignedArg {
+    /// The installed commit itself
+    Commit,
+    /// An annotated tag that points at the installed commit
+    Tag,
+}
+
 #[derive(Subcommand)]
 enum PublisherCommand {
     /// Show configured publishers in search order
@@ -773,12 +792,21 @@ enum RepoCommand {
     SignExport {
         #[arg(long)]
         root: PathBuf,
-        #[arg(long)]
-        targets_key: PathBuf,
-        #[arg(long)]
-        snapshot_key: PathBuf,
-        #[arg(long)]
-        timestamp_key: PathBuf,
+        /// Targets role key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        targets_key: Vec<PathBuf>,
+        /// Snapshot role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+        #[arg(long, value_name = "KEY", required = true)]
+        snapshot_key: Vec<PathBuf>,
+        /// Timestamp role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+        #[arg(long, value_name = "KEY", required = true)]
+        timestamp_key: Vec<PathBuf>,
+        /// Key for the objects-* delegations (repeatable; default: the first targets key)
+        #[arg(long, value_name = "KEY")]
+        objects_key: Vec<PathBuf>,
+        /// Signatures required on each objects-* delegation
+        #[arg(long, default_value = "1")]
+        objects_threshold: std::num::NonZeroU64,
         #[arg(long)]
         version: std::num::NonZeroU64,
         #[arg(long)]
@@ -788,6 +816,29 @@ enum RepoCommand {
         #[arg(long)]
         output: PathBuf,
         export: PathBuf,
+    },
+    /// Re-sign the timestamp, and optionally the snapshot, of a published mirror
+    RefreshMetadata {
+        #[arg(long)]
+        root: PathBuf,
+        /// The published versioned snapshot metadata, such as 7.snapshot.json
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Timestamp role key: PATH, file:PATH, or command:DESCRIPTOR (repeatable)
+        #[arg(long, value_name = "KEY", required = true)]
+        timestamp_key: Vec<PathBuf>,
+        /// Also re-sign the snapshot with this key (repeatable)
+        #[arg(long, value_name = "KEY", requires = "snapshot_expires")]
+        snapshot_key: Vec<PathBuf>,
+        #[arg(long, requires = "snapshot_key")]
+        snapshot_expires: Option<String>,
+        #[arg(long)]
+        version: std::num::NonZeroU64,
+        #[arg(long)]
+        timestamp_expires: String,
+        /// New directory for timestamp.json and any re-signed snapshot
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Enable a catalog-signed index for available package file lookups
     IndexFiles {
@@ -1629,7 +1680,7 @@ fn change_system(
     force_phased_update: bool,
     base_only: bool,
     prepare_only: bool,
-    git: Option<(&str, GitSnapshotRef<'_>)>,
+    git: Option<(&str, GitSnapshotRef<'_>, Option<system::GitSignatures>)>,
 ) -> Result<()> {
     let recovery = matches!(
         request,
@@ -1655,6 +1706,9 @@ fn change_system(
             "Git {}{branch}\n  {}\n  {revision}",
             change.package, change.url
         );
+        if let Some(signature) = &change.signature {
+            println!("  {signature}");
+        }
         if options.dry_run {
             git_preview = true;
             return Ok(false);
@@ -1675,8 +1729,10 @@ fn change_system(
             "y" | "yes"
         ))
     };
-    if let Some((url, reference)) = git {
-        let Some(package) = system.prepare_git_install(url, reference, &mut approve_git)? else {
+    if let Some((url, reference, signatures)) = git {
+        let Some(package) =
+            system.prepare_git_install(url, reference, signatures, &mut approve_git)?
+        else {
             return Ok(());
         };
         request = Request::Install {
@@ -1815,6 +1871,9 @@ fn check_system_updates(
                     .join(", ")
             );
         }
+        for freshness in &report.publisher_freshness {
+            println!("{freshness}");
+        }
         if let Some(deferred) = &report.phased_update {
             println!("{deferred}");
         }
@@ -1863,11 +1922,28 @@ fn run(command: Command) -> Result<ExitCode> {
             git,
             commit,
             track_branch,
+            allowed_signers,
+            require_signed,
             packages,
         } => {
+            let signatures = allowed_signers
+                .map(|signers| {
+                    system::GitSignatures::new(
+                        &signers,
+                        match require_signed {
+                            GitSignedArg::Commit => system::GitSignedObject::Commit,
+                            GitSignedArg::Tag => system::GitSignedObject::Tag,
+                        },
+                    )
+                })
+                .transpose()?;
             let source = match (git.as_deref(), commit.as_deref(), track_branch.as_deref()) {
-                (Some(url), Some(commit), None) => Some((url, GitSnapshotRef::Commit(commit))),
-                (Some(url), None, Some(branch)) => Some((url, GitSnapshotRef::Branch(branch))),
+                (Some(url), Some(commit), None) => {
+                    Some((url, GitSnapshotRef::Commit(commit), signatures))
+                }
+                (Some(url), None, Some(branch)) => {
+                    Some((url, GitSnapshotRef::Branch(branch), signatures))
+                }
                 (None, None, None) => None,
                 _ => unreachable!("clap validates Git install arguments"),
             };
@@ -1986,6 +2062,10 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("This system is running as a trial.");
             } else {
                 println!("No reboot pending.");
+            }
+            match system.publisher_freshness() {
+                Ok(report) => report.iter().for_each(|freshness| println!("{freshness}")),
+                Err(error) => eprintln!("cps: cannot report publisher freshness: {error:#}"),
             }
         }
         Command::Resume { config, repair } => {
@@ -2397,6 +2477,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 targets_key,
                 snapshot_key,
                 timestamp_key,
+                objects_key,
+                objects_threshold,
                 version,
                 release_expires,
                 timestamp_expires,
@@ -2406,11 +2488,34 @@ fn run(command: Command) -> Result<ExitCode> {
                 root: &root,
                 export: &export,
                 output: &output,
-                targets_key: &targets_key,
-                snapshot_key: &snapshot_key,
-                timestamp_key: &timestamp_key,
+                keys: release::ReleaseKeys {
+                    targets: &targets_key,
+                    snapshot: &snapshot_key,
+                    timestamp: &timestamp_key,
+                    objects: &objects_key,
+                    objects_threshold,
+                },
                 version,
                 release_expires: &release_expires,
+                timestamp_expires: &timestamp_expires,
+            })?,
+            RepoCommand::RefreshMetadata {
+                root,
+                snapshot,
+                timestamp_key,
+                snapshot_key,
+                snapshot_expires,
+                version,
+                timestamp_expires,
+                output,
+            } => release::refresh_metadata(release::RefreshMetadata {
+                root: &root,
+                snapshot: &snapshot,
+                output: &output,
+                timestamp_keys: &timestamp_key,
+                snapshot_keys: &snapshot_key,
+                version,
+                snapshot_expires: snapshot_expires.as_deref(),
                 timestamp_expires: &timestamp_expires,
             })?,
             RepoCommand::Sync {

@@ -12,8 +12,8 @@ use crate::{
 };
 
 use super::{
-    exact_publisher, lock_repo, publication_base, publication_catalog, read_key, read_object,
-    read_signing_key, rebuild, release, write_catalog,
+    exact_publisher, keys::SigningKey, lock_repo, publication_base, publication_catalog, read_key,
+    read_object, rebuild, release, write_catalog,
 };
 
 pub(super) const OBJECTS: &str = "source-archives";
@@ -26,7 +26,7 @@ pub fn archive_build_sources(
     id: &str,
 ) -> Result<(String, usize)> {
     let publisher = exact_publisher(id)?;
-    let key = read_signing_key(signing_key)?;
+    let key = SigningKey::open(signing_key)?;
     Root::open(repo)?;
     let _lock = lock_repo(repo)?;
     let current = publication_base(repo)?.context("repository has no published catalog")?;

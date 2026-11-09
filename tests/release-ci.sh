@@ -98,7 +98,13 @@ cat > "$CPS_RELEASE_DEPLOY" <<'DEPLOY'
 set -euo pipefail
 [[ -z ${CPS_RELEASE_SIGNING_KEY:-} && $3 == "$(cat "$1/current")" ]]
 [[ ${CPS_TEST_FAIL_GATE:-} != deploy ]]
-printf 'deploy %s\n' "$3" >> "$CPS_TEST_LOG"
+if [[ $# == 4 ]]; then
+    [[ $4 == refresh ]]
+    printf 'refresh %s\n' "$3" >> "$CPS_TEST_LOG"
+else
+    [[ $# == 3 ]]
+    printf 'deploy %s\n' "$3" >> "$CPS_TEST_LOG"
+fi
 DEPLOY
 chmod +x "$CPS_RELEASE_VM_GATE" "$CPS_RELEASE_ROLLOUT_GATE" "$CPS_RELEASE_DEPLOY"
 release() { bash "$project/ci/release.sh" "$@"; }
@@ -217,17 +223,17 @@ if CPS_TEST_FAIL_GATE=deploy release refresh-mirror; then
 fi
 [[ ! -s $CPS_TEST_LOG ]]
 release refresh-mirror
-[[ $(cat "$CPS_TEST_LOG") == "deploy $complete" ]]
+[[ $(cat "$CPS_TEST_LOG") == "refresh $complete" ]]
 : > "$CPS_TEST_LOG"
 
 timestamp_expires '+1 day'
 record_timestamp
 release refresh-mirror
-[[ $(cat "$CPS_TEST_LOG") == "deploy $complete" ]]
+[[ $(cat "$CPS_TEST_LOG") == "refresh $complete" ]]
 : > "$CPS_TEST_LOG"
 
 rm "$timestamp"
 release refresh-mirror
-[[ $(cat "$CPS_TEST_LOG") == "deploy $complete" ]]
-[[ $(cat repo/current) == "$complete" ]]
+[[ $(cat "$CPS_TEST_LOG") == "refresh $complete" ]]
+[[ $(cat repo/current) == "$complete" && $(cat repo/.ci-deployed-catalog) == "$complete" ]]
 echo 'Verified mirror refresh uses signer state and repairs a forged or missing timestamp'

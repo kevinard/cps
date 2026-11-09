@@ -42,9 +42,10 @@ impl PublisherBootstrap {
             .enable_all()
             .build()?;
         let (name, trust_key) = runtime.block_on(async {
-            let client = https_client().timeout(Duration::from_secs(30)).build()?;
+            let timeout = Duration::from_secs(30);
+            let client = https_client().timeout(timeout).build()?;
             let verified = RepositoryLoader::new(&tuf_root, mirror.metadata, mirror.targets)
-                .transport(MirrorTransport(Some(client)))
+                .transport(MirrorTransport::with_deadline(Some(client), timeout)?)
                 .datastore(scratch.path())
                 .load()
                 .await
@@ -152,7 +153,7 @@ mod tests {
                     endpoints.metadata.clone(),
                     endpoints.targets.clone(),
                 )
-                .transport(MirrorTransport(None))
+                .transport(MirrorTransport::new(None).expect("default transfer limits"))
                 .datastore(scratch.path())
                 .load(),
             )

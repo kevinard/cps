@@ -1,13 +1,103 @@
-use std::{collections::BTreeSet, num::NonZeroU64};
+use std::{collections::BTreeSet, fmt, num::NonZeroU64, path::Path};
 
 use anyhow::{Context, Result, ensure};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
-use crate::model::validate_digest;
+use crate::model::{digest, validate_digest};
+
+pub(crate) mod signer;
+use signer::{CommandSigner, KeySpec, SignRequest};
 
 const MAX_ROTATIONS: usize = 64;
 type PublicKey = [u8; 32];
+
+/// A publisher catalog signing key, held in a local file or by an external signer.
+pub(crate) struct SigningKey {
+    public: PublicKey,
+    backend: Backend,
+}
+
+enum Backend {
+    File(Ed25519KeyPair),
+    Command(CommandSigner),
+}
+
+impl fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("public", &hex::encode(self.public))
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<Ed25519KeyPair> for SigningKey {
+    fn from(key: Ed25519KeyPair) -> Self {
+        let public = public_key(key.public_key().as_ref()).expect("Ed25519 public key length");
+        Self {
+            public,
+            backend: Backend::File(key),
+        }
+    }
+}
+
+impl SigningKey {
+    /// Load `PATH`, `file:PATH`, or `command:DESCRIPTOR`.
+    pub(crate) fn open(spec: &Path) -> Result<Self> {
+        match KeySpec::parse(spec) {
+            KeySpec::File(path) => Ok(super::read_signing_key(&path)?.into()),
+            KeySpec::Command(descriptor) => {
+                let signer = CommandSigner::open(&descriptor)?;
+                let public =
+                    signer::ed25519_public_key(&signer.public_key()?).with_context(|| {
+                        format!("reading the public key for {}", descriptor.display())
+                    })?;
+                Ok(Self {
+                    public,
+                    backend: Backend::Command(signer),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn public_key(&self) -> &PublicKey {
+        &self.public
+    }
+
+    /// Sign with the key. An external signature is checked before it is returned.
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
+        match &self.backend {
+            Backend::File(key) => Ok(key
+                .sign(message)
+                .as_ref()
+                .try_into()
+                .expect("Ed25519 signature length")),
+            Backend::Command(signer) => {
+                let key_id = digest(&self.public);
+                let signature = signer.run(
+                    &SignRequest {
+                        context: "catalog",
+                        key_id: &key_id,
+                        algorithm: "ed25519",
+                    },
+                    message,
+                )?;
+                let signature: [u8; 64] = signature
+                    .as_slice()
+                    .try_into()
+                    .context("external signer returned an invalid Ed25519 signature length")?;
+                UnparsedPublicKey::new(&ED25519, self.public)
+                    .verify(message, &signature)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "external signer returned a signature that does not verify with its declared public key"
+                        )
+                    })?;
+                Ok(signature)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -40,21 +130,21 @@ impl Rotation {
         publisher: &str,
         base: &str,
         first_sequence: NonZeroU64,
-        previous: &Ed25519KeyPair,
-        next: &Ed25519KeyPair,
+        previous: &SigningKey,
+        next: &SigningKey,
     ) -> Result<Self> {
         let transition = Transition {
             publisher: publisher.to_owned(),
             base: base.to_owned(),
             first_sequence,
-            previous: public_key(previous.public_key().as_ref())?,
-            next: public_key(next.public_key().as_ref())?,
+            previous: *previous.public_key(),
+            next: *next.public_key(),
         };
         let message = transition.message()?;
         Ok(Self {
             transition,
-            previous_signature: hex::encode(previous.sign(&message).as_ref()),
-            next_signature: hex::encode(next.sign(&message).as_ref()),
+            previous_signature: hex::encode(previous.sign(&message)?),
+            next_signature: hex::encode(next.sign(&message)?),
         })
     }
 
@@ -172,9 +262,11 @@ mod tests {
     use super::*;
     use ring::rand::SystemRandom;
 
-    fn key() -> Ed25519KeyPair {
+    fn key() -> SigningKey {
         let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate key");
-        Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("read generated key")
+        Ed25519KeyPair::from_pkcs8(document.as_ref())
+            .expect("read generated key")
+            .into()
     }
 
     #[test]

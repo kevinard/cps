@@ -27,14 +27,14 @@ use crate::{
     plan::{UpdateDiagnostics, UpdateSelection, inspect_update, plan_system},
     query::{InstallSource, SelectSource, select_install_sources},
     release::{
-        SyncOptions, prune_system_payloads, refresh_url_publishers, sync_profile_for_image,
-        sync_with_options,
+        PublisherFreshness, SyncOptions, prune_system_payloads, refresh_url_publishers,
+        sync_profile_for_image, sync_with_options, url_publisher_freshness,
     },
     systemd::LiveServices,
     transaction_progress,
 };
 
-pub use crate::git_install::GitChange;
+pub use crate::git_install::{GitChange, GitSignatures, GitSignedObject};
 pub use crate::plan::HeldBackUpdate;
 
 pub const CONFIG: &str = "/etc/cps/image.kdl";
@@ -81,6 +81,9 @@ pub struct UpdateReport {
     pub held_back: Vec<HeldBackUpdate>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub deferred_publishers: BTreeSet<String>,
+    /// Refresh policy and cache age of each URL-added publisher.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub publisher_freshness: Vec<PublisherFreshness>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<ReleaseAdvisory>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +138,7 @@ impl UpdateReport {
             changes,
             held_back,
             deferred_publishers,
+            publisher_freshness: Vec::new(),
             advisories,
             phased_update,
             blockers,
@@ -367,10 +371,11 @@ impl System {
         &self,
         url: &str,
         reference: GitSnapshotRef<'_>,
+        signatures: Option<GitSignatures>,
         approve: impl FnOnce(&GitChange) -> Result<bool>,
     ) -> Result<Option<String>> {
         self.check_running()?;
-        let source = GitSource::new(url, reference)?;
+        let source = GitSource::new(url, reference, signatures)?;
         let build =
             GitBuild::prepare(&source, None)?.context("Git install has no selected commit")?;
         let state = Image::open_query(Path::new(ROOT))?.state()?;
@@ -491,11 +496,15 @@ impl System {
         let mut held_back = Vec::new();
         let mut advisories = Vec::new();
         let mut deferred = BTreeSet::new();
+        let mut freshness = Vec::new();
         let result = (|| {
             let system = Self::load(config)?.with_base_only(base_only);
             let _lock = system.lock()?;
             system.check_running()?;
-            deferred = system.refresh_for_request(&Request::Update, refresh)?;
+            let refreshed = system.refresh_for_request(&Request::Update, refresh);
+            // Report freshness even when a refresh fails under the policy.
+            freshness = system.publisher_freshness().unwrap_or_default();
+            deferred = refreshed?;
             let diagnostics = UpdateDiagnostics {
                 held_back: &mut held_back,
                 explain,
@@ -504,7 +513,14 @@ impl System {
             let plan = inspect_update(Path::new(ROOT), diagnostics, &deferred)?;
             Ok(Change::from_plan(plan, &system.definition.stage_packages))
         })();
-        UpdateReport::from_plan(result, held_back, advisories, deferred)
+        let mut report = UpdateReport::from_plan(result, held_back, advisories, deferred);
+        report.publisher_freshness = freshness;
+        report
+    }
+
+    /// Refresh policy and cache age of each URL-added publisher, without network access.
+    pub fn publisher_freshness(&self) -> Result<Vec<PublisherFreshness>> {
+        url_publisher_freshness(Path::new(ROOT), &self.definition.refresh_policies)
     }
 
     fn plan_request(
@@ -798,7 +814,13 @@ impl System {
                 .iter()
                 .map(|publisher| publisher.name.as_str())
                 .collect();
-            return refresh_url_publishers(Path::new(ROOT), &required, self.base_only, refresh);
+            return refresh_url_publishers(
+                Path::new(ROOT),
+                &required,
+                self.base_only,
+                refresh,
+                &self.definition.refresh_policies,
+            );
         }
         Ok(BTreeSet::new())
     }
