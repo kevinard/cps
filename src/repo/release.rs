@@ -13,8 +13,8 @@ use rustix::fs::{RenameFlags, renameat_with};
 use rustix::process::geteuid;
 use tempfile::{NamedTempFile, TempDir};
 use tough::{
-    FilesystemTransport, Repository, RepositoryLoader, TargetName, Transport, TransportError,
-    TransportErrorKind, TransportStream, async_trait,
+    FilesystemTransport, Limits, Repository, RepositoryLoader, TargetName, Transport,
+    TransportError, TransportErrorKind, TransportStream, async_trait,
 };
 use url::Url;
 
@@ -22,7 +22,7 @@ use crate::{
     build::sources::publish_verified,
     image::{Image, Publisher, State},
     model::{Action, FileDigest, digest, digest_reader, validate_digest, validate_publisher},
-    transport::https_client,
+    transport::{TransferBudget, TransferLimits, https_client},
 };
 
 use super::{
@@ -34,10 +34,21 @@ use super::{
 
 use crate::attestation::ATTESTATION_LIMIT;
 
-const ROOT_LIMIT: u64 = 1024 * 1024;
+/// Metadata size limits shared by the mirror signer and every client loader.
+const TUF_LIMITS: Limits = Limits {
+    max_root_size: 1024 * 1024,
+    max_targets_size: 16 * 1024 * 1024,
+    max_timestamp_size: 1024 * 1024,
+    max_snapshot_size: 16 * 1024 * 1024,
+    max_root_updates: 1024,
+};
+const ROOT_LIMIT: u64 = TUF_LIMITS.max_root_size;
+const TIMESTAMP_LIMIT: u64 = TUF_LIMITS.max_timestamp_size;
+/// Snapshot, top-level targets, and delegated targets roles.
+const ROLE_LIMIT: u64 = TUF_LIMITS.max_targets_size;
+const _: () = assert!(TUF_LIMITS.max_snapshot_size == ROLE_LIMIT);
 const PUBLISHER_NAME_TARGET: &str = "publisher";
 const PUBLISHER_KEY_TARGET: &str = "publisher.der";
-const ROLE_LIMIT: u64 = 16 * 1024 * 1024;
 const ENDPOINTS_LIMIT: u64 = 8192;
 const METADATA_DOWNLOADS: usize = 8;
 const PAYLOAD_DOWNLOADS: usize = 8;
@@ -56,28 +67,58 @@ mod sign;
 pub use sign::{SignExport, sign_export};
 const CHECKPOINT_FILES: [(&str, u64); 4] = [
     ("root.json", ROOT_LIMIT),
-    ("timestamp.json", ROOT_LIMIT),
+    ("timestamp.json", TIMESTAMP_LIMIT),
     ("snapshot.json", ROLE_LIMIT),
     ("latest_known_time.json", 128),
 ];
 
+/// Fetches mirror files within one operation's deadline and throughput floor.
 #[derive(Clone, Debug)]
-struct MirrorTransport(Option<Client>);
+struct MirrorTransport {
+    client: Option<Client>,
+    budget: TransferBudget,
+}
 
 impl MirrorTransport {
+    fn new(client: Option<Client>) -> Result<Self> {
+        Ok(Self {
+            client,
+            budget: TransferLimits::from_env()?.start(),
+        })
+    }
+
+    /// Use a shorter operation deadline than the configured one.
+    fn with_deadline(client: Option<Client>, deadline: std::time::Duration) -> Result<Self> {
+        let mut limits = TransferLimits::from_env()?;
+        limits.deadline = limits.deadline.min(deadline);
+        Ok(Self {
+            client,
+            budget: limits.start(),
+        })
+    }
+
     async fn open(&self, url: Url) -> std::result::Result<TransportStream, TransportError> {
+        let remaining = self.budget.remaining().map_err(|err| {
+            TransportError::new_with_cause(TransportErrorKind::Other, url.as_str(), err)
+        })?;
         if url.scheme() == "file" {
             return FilesystemTransport.fetch(url).await;
         }
         let error = |kind| TransportError::new(kind, url.as_str());
         let client = self
-            .0
+            .client
             .as_ref()
             .filter(|_| url.scheme() == "https")
             .ok_or_else(|| error(TransportErrorKind::UnsupportedUrlScheme))?;
-        let response = client.get(url.clone()).send().await.map_err(|err| {
-            TransportError::new_with_cause(TransportErrorKind::Other, url.as_str(), err)
-        })?;
+        // The request timeout bounds a stalled body that the throughput check cannot observe.
+        let response = client
+            .get(url.clone())
+            .timeout(remaining)
+            .send()
+            .await
+            .map_err(|err| {
+                TransportError::new_with_cause(TransportErrorKind::Other, url.as_str(), err)
+            })?;
         match response.status() {
             StatusCode::NOT_FOUND | StatusCode::GONE => {
                 return Err(error(TransportErrorKind::FileNotFound));
@@ -102,6 +143,7 @@ impl Transport for MirrorTransport {
     async fn fetch(&self, url: Url) -> std::result::Result<TransportStream, TransportError> {
         let metadata = url.path().ends_with(".json");
         let mut count = 0u64;
+        let mut meter = self.budget.meter();
         // tough distinguishes a missing root from a failed root transfer by the stream error.
         let body = self
             .open(url.clone())
@@ -109,6 +151,9 @@ impl Transport for MirrorTransport {
             .unwrap_or_else(|err| Box::pin(stream::iter([Err(err)])));
         Ok(Box::pin(body.map(move |chunk| {
             let chunk = chunk?;
+            meter.record(chunk.len()).map_err(|err| {
+                TransportError::new_with_cause(TransportErrorKind::Other, url.as_str(), err)
+            })?;
             count = count.saturating_add(chunk.len() as u64);
             if metadata && count > ROLE_LIMIT {
                 return Err(TransportError::new_with_cause(
@@ -818,11 +863,11 @@ async fn load_mirror(
     mirror: Mirror,
     anchor: Option<Vec<u8>>,
 ) -> Result<Repository> {
-    let transport = MirrorTransport(
+    let transport = MirrorTransport::new(
         (mirror.metadata.scheme() == "https" || mirror.targets.scheme() == "https")
             .then(|| https_client().build())
             .transpose()?,
-    );
+    )?;
     let trusted = state.join("trusted");
     let trusted_exists = path_present(&trusted)?;
     let root = if trusted_exists {
@@ -834,6 +879,7 @@ async fn load_mirror(
     };
     let result = RepositoryLoader::new(&root, mirror.metadata, mirror.targets)
         .transport(transport)
+        .limits(TUF_LIMITS)
         .datastore(scratch)
         .load()
         .await;

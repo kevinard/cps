@@ -10,6 +10,7 @@ root and the CPS publisher key through a trusted channel.
 ## On this page
 
 - [Sync a single publisher](#sync-a-single-publisher)
+- [Transfer limits](#transfer-limits)
 - [Catalog checkpoints and archived signatures](#catalog-checkpoints-and-archived-signatures)
 - [Synchronizing a signed profile](#synchronizing-a-signed-profile)
 - [Reclaiming mirror cache space](#reclaiming-mirror-cache-space)
@@ -32,7 +33,28 @@ Full sync checks TUF signatures, versions, and expiration, then verifies the CPS
 
 CPS limits repository reads to 64 MiB per catalog and 32 MiB per manifest.
 It bounds payload staging by the signed file length and checks the digest
-before recording the transaction.
+before recording the transaction. TUF metadata is limited to 1 MiB for the
+root and timestamp and 16 MiB for the snapshot and each targets role, the
+same limits the CPS mirror signer enforces.
+
+## Transfer limits
+
+A sync or payload fetch holds the cache lock while it downloads, so CPS
+bounds how long a slow or hostile mirror can keep it. Each operation has an
+overall deadline, and every response body must deliver a minimum rate in
+each 60-second window. A read that stalls for 30 seconds fails, and a
+connection attempt times out after 10 seconds. A failed transfer leaves the
+previous cache in place.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CPS_TRANSFER_DEADLINE_SECONDS` | `14400` (4 hours) | Deadline for one sync or fetch, from 1 second to 7 days |
+| `CPS_TRANSFER_MIN_BYTES_PER_SECOND` | `4096` | Throughput floor for each download. `0` disables it. |
+
+Set them in the environment of the command, or of the service that runs
+`cps upgrade`, when a large release must sync over a slow link. Exceeding
+either limit counts as an unavailable mirror for the
+[refresh policy](publishers.md#refresh-policy-for-mirror-publishers).
 
 When preparing a cache for an existing image, add `--image /path/to/image`
 to `repo sync`. CPS verifies the candidate against the installed publisher
