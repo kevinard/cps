@@ -4078,11 +4078,13 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
             &f.root,
             &["cps://canopa/desktop/compositor@1.0.0-0".into()],
             &[],
+            false,
         )?
         .iter()
         .all(|finding| !finding.is_error)
     );
-    assert!(crate::verify_selected(&f.root, &[], &[format!("/{LIBRARY}")])?[0].is_error);
+    assert!(crate::verify_selected(&f.root, &[], &[format!("/{LIBRARY}")], false)?[0].is_error);
+    assert!(crate::verify_selected(&f.root, &[], &[format!("/{LIBRARY}")], true)?[0].is_error);
 
     fs::remove_file(f.root.join(COMPOSITOR))?;
     fs::create_dir(f.root.join(COMPOSITOR))?;
@@ -4280,5 +4282,233 @@ fn compares_independent_committed_roots_without_the_repository() -> Result<()> {
     assert_eq!(paths.len(), 1);
     assert_eq!(paths[0].name, "usr/bin/tool");
     assert!(crate::image_diff(&next, &next, false)?.packages.is_empty());
+    Ok(())
+}
+
+fn file_records(root: &Path) -> Result<crate::image::FileRecords> {
+    crate::image::Image::open_query(root)?.file_records(None)
+}
+
+/// Treat fingerprints as settled after 50 ms on this test thread, and wait
+/// that long, so a transaction records the files written before the call.
+fn settle_fingerprints() {
+    crate::image::root::TEST_SETTLED_NS.set(50_000_000);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+fn install(root: &Path, name: &str) -> Result<u64> {
+    let saved = plan(
+        root,
+        Request::Install {
+            packages: vec![name.into()],
+        },
+    )?;
+    apply(root, &saved)
+}
+
+fn fingerprint_fixture() -> Result<Fixture> {
+    let f = Fixture::new()?;
+    f.package(
+        "test/one",
+        "1.0.0-0",
+        f.file("usr/share/one", "one", "0644", "")?
+            + &f.file("usr/bin/tool", "tool", "0755", "")?,
+    )?;
+    f.package(
+        "test/two",
+        "1.0.0-0",
+        f.file("usr/share/two", "two", "0644", "")?,
+    )?;
+    f.create()?;
+    install(&f.root, "test/one")?;
+    assert!(file_records(&f.root)?.is_empty());
+    settle_fingerprints();
+    install(&f.root, "test/two")?;
+    Ok(f)
+}
+
+#[test]
+fn transactions_record_fingerprints_that_quick_verification_trusts() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fingerprint_fixture()?;
+    let records = file_records(&f.root)?;
+    // The drift check hashed the unchanged files and recorded them. The new
+    // file changed moments ago, so it is not trusted yet.
+    assert!(records.contains_key("usr/share/one") && records.contains_key("usr/bin/tool"));
+    assert!(!records.contains_key("usr/share/two"));
+    assert_eq!(records["usr/share/one"].observation.sha256, digest(b"one"));
+    // The shared-library check cached what it learned about the files.
+    assert_eq!(records["usr/bin/tool"].elf.as_deref(), Some("null"));
+    assert!(crate::verify_quick(&f.root)?.is_empty());
+
+    // Quick verification believes a matching record instead of hashing.
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let tamper = |sha256: &str| {
+        db.execute(
+            "UPDATE files SET sha256=?1 WHERE path='usr/share/one'",
+            [sha256],
+        )
+    };
+    tamper(&digest(b"other"))?;
+    let findings = crate::verify_quick(&f.root)?;
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.is_error && finding.message.starts_with("usr/share/one:")),
+        "{findings:?}"
+    );
+    assert!(verify(&f.root)?.is_empty());
+    let selected = crate::verify_selected(&f.root, &[], &["/usr/share/one".into()], true)?;
+    assert!(selected.iter().any(|finding| finding.is_error));
+    tamper(&digest(b"one"))?;
+
+    // Every change to a file invalidates its record, even at the same size.
+    fs::write(f.root.join("usr/share/one"), "ONE")?;
+    assert!(
+        crate::verify_quick(&f.root)?
+            .iter()
+            .any(|finding| finding.message == "usr/share/one: content, type, or metadata differs")
+    );
+    fs::write(f.root.join("usr/share/one"), "one")?;
+    assert!(crate::verify_quick(&f.root)?.is_empty());
+    let tool = f.root.join("usr/bin/tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o700))?;
+    assert!(!crate::verify_quick(&f.root)?.is_empty());
+    let remove = plan(
+        &f.root,
+        Request::Remove {
+            packages: vec!["test/two".into()],
+        },
+    )?;
+    let error = apply(&f.root, &remove).unwrap_err();
+    assert!(format!("{error:#}").contains("pre-existing drift at usr/bin/tool"));
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))?;
+
+    // A transaction forgets records of paths it writes or removes and
+    // replaces records that no longer match.
+    fs::write(f.root.join("usr/share/one"), "one")?;
+    settle_fingerprints();
+    apply(&f.root, &remove)?;
+    let records = file_records(&f.root)?;
+    assert!(!records.contains_key("usr/share/two"));
+    assert_eq!(records["usr/share/one"].observation.sha256, digest(b"one"));
+    assert!(crate::verify_quick(&f.root)?.is_empty() && verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn copied_roots_do_not_trust_the_source_fingerprints() -> Result<()> {
+    let f = fingerprint_fixture()?;
+    let copy = f._dir.path().join("copy");
+    let status = Command::new("cp")
+        .arg("-a")
+        .arg(&f.root)
+        .arg(&copy)
+        .status()?;
+    assert!(status.success());
+    let db = rusqlite::Connection::open(copy.join("var/lib/cps/image/state.sqlite"))?;
+    let changed = db.execute(
+        "UPDATE files SET sha256=?1 WHERE path='usr/share/one'",
+        [digest(b"other")],
+    )?;
+    assert_eq!(changed, 1);
+    drop(db);
+    // Copies have new inodes and change times, so CPS hashes them again.
+    assert!(crate::verify_quick(&copy)?.is_empty());
+    let remove = plan(
+        &copy,
+        Request::Remove {
+            packages: vec!["test/two".into()],
+        },
+    )?;
+    settle_fingerprints();
+    apply(&copy, &remove)?;
+    let records = file_records(&copy)?;
+    assert_eq!(records["usr/share/one"].observation.sha256, digest(b"one"));
+    Ok(())
+}
+
+#[test]
+fn journal_records_only_changes_to_the_committed_state() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "test/one",
+        "1.0.0-0",
+        f.file("usr/share/one/a", "a", "0644", "")?
+            + &f.file("usr/share/one/b", "b", "0644", "")?,
+    )?;
+    f.package(
+        "test/two",
+        "1.0.0-0",
+        f.file("usr/share/two", "two", "0644", "")?,
+    )?;
+    f.create()?;
+    install(&f.root, "test/one")?;
+    let saved = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/two".into()],
+        },
+    )?;
+    interrupt_apply_at(
+        &f.root,
+        &f._dir.path().join("plan.json"),
+        &saved,
+        "usr/share/two",
+    )?;
+    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let original: String =
+        db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
+    let journal: serde_json::Value = serde_json::from_str(&original)?;
+    let next = &journal["journaled"]["next"];
+    let installed = next["installed"].as_object().unwrap();
+    assert_eq!(installed.keys().collect::<Vec<_>>(), ["test/two"]);
+    let paths = next["paths"].as_object().unwrap();
+    assert!(paths.contains_key("usr/share/two"));
+    assert!(!paths.contains_key("usr/share/one/a") && !paths.contains_key("usr/share/one"));
+    assert!(next.get("publisher").is_none());
+
+    // A delta that no longer matches its manifests or the committed state
+    // is rejected, even with a matching digest.
+    let tampered = |change: &dyn Fn(&mut serde_json::Value)| -> Result<String> {
+        let mut journal = journal.clone();
+        change(&mut journal["journaled"]["next"]);
+        let delta: crate::image::StateDelta =
+            serde_json::from_value(journal["journaled"]["next"].clone())?;
+        journal["journaled"]["state_sha256"] = digest(&serde_json::to_vec(&delta)?).into();
+        db.execute(
+            "UPDATE pending SET data=?1 WHERE id=1",
+            [journal.to_string()],
+        )?;
+        Ok(format!(
+            "{:#}",
+            crate::resume_transaction(&f.root).unwrap_err()
+        ))
+    };
+    let error = tampered(&|next| {
+        next["paths"]
+            .as_object_mut()
+            .unwrap()
+            .remove("usr/share/two");
+    })?;
+    assert!(error.contains("pending ownership index differs"), "{error}");
+    let error = tampered(&|next| {
+        next["paths"]["usr/share/one/a"] = serde_json::Value::Null;
+    })?;
+    assert!(error.contains("pending ownership index differs"), "{error}");
+    let error = tampered(&|next| {
+        next["paths"]["usr/share/missing"] = serde_json::Value::Null;
+    })?;
+    assert!(error.contains("absent from the committed state"), "{error}");
+    db.execute("UPDATE pending SET data=?1 WHERE id=1", [&original])?;
+    drop(db);
+
+    assert_eq!(crate::resume_transaction(&f.root)?, Some(2));
+    assert!(verify(&f.root)?.is_empty());
+    let image = crate::image::Image::open_query(&f.root)?;
+    let state = image.state()?;
+    assert_eq!(crate::verify::manifest_paths(&state)?, state.paths);
+    assert_eq!(state.installed.len(), 2);
     Ok(())
 }

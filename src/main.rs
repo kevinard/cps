@@ -425,6 +425,9 @@ enum Command {
         /// Limit file verification to this managed path
         #[arg(long = "path", value_name = "PATH")]
         paths: Vec<String>,
+        /// Trust recorded file fingerprints that still match instead of hashing every file
+        #[arg(long, conflicts_with = "pristine")]
+        quick: bool,
         /// Audit the installed managed ELF interpreter and shared-library closure
         #[arg(long, conflicts_with_all = ["packages", "paths"])]
         runtime: bool,
@@ -3036,13 +3039,16 @@ fn run(command: Command) -> Result<ExitCode> {
             pristine,
             packages,
             paths,
+            quick,
             runtime,
             library_dirs,
         } => {
             let findings = if pristine {
                 verify_pristine(&root)?
             } else if !packages.is_empty() || !paths.is_empty() {
-                cps::verify_selected(&root, &packages, &paths)?
+                cps::verify_selected(&root, &packages, &paths, quick)?
+            } else if quick {
+                cps::verify_quick(&root)?
             } else {
                 verify(&root)?
             };

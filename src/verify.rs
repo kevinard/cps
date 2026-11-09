@@ -7,7 +7,10 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::FileType;
 
 use crate::{
-    image::{Image, Managed, State, root::Root},
+    image::{
+        FileRecords, Image, Installed, Managed, State,
+        root::{Observation, Root},
+    },
     model::{Node, PackageSpec, validate_path},
     plan::{check_dependencies, effective_paths, hardlink_groups},
     repo::profiles::runtime::{self, DEFAULT_LIBRARY_DIRS},
@@ -19,8 +22,45 @@ pub struct Finding {
     pub message: String,
 }
 
+/// How a check compares regular files with their manifests.
+#[derive(Clone, Copy)]
+pub(crate) enum Contents<'a> {
+    /// Hash every regular file.
+    Hash,
+    /// Trust a recorded fingerprint that still matches, and hash the rest.
+    Fingerprints(&'a FileRecords),
+}
+
+/// The outcome of a check, along with what it learned about file contents.
+pub(crate) struct Checked {
+    pub(crate) findings: Vec<Finding>,
+    /// New settled fingerprints of files hashed during the check.
+    pub(crate) observed: BTreeMap<String, Observation>,
+    /// Recorded fingerprints that no longer match their file.
+    pub(crate) stale: BTreeSet<String>,
+}
+
+impl Checked {
+    pub(crate) fn errors(&self) -> impl Iterator<Item = &Finding> {
+        self.findings.iter().filter(|finding| finding.is_error)
+    }
+}
+
+/// Check an image, hashing every managed regular file.
 pub fn verify(path: &Path) -> Result<Vec<Finding>> {
     verify_image(&Image::open_query(path)?)
+}
+
+/// Check an image, trusting recorded file fingerprints that still match.
+///
+/// Directories, symlinks, hard links, ownership, modes, and the package and
+/// path index are checked as in full verification. A regular file whose
+/// inode, size, timestamps, mode, and owner still match the fingerprint CPS
+/// recorded when it last hashed the file is not read again. Use full
+/// verification to detect changes made below the filesystem, such as an
+/// edited block device, or by someone who resets the system clock.
+pub fn verify_quick(path: &Path) -> Result<Vec<Finding>> {
+    verify_image_quick(&Image::open_query(path)?)
 }
 
 /// Audit the entire installed managed ELF closure without executing its binaries.
@@ -44,7 +84,12 @@ pub fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
     runtime::audit_installed(&image.root, &paths, &state.settings.arch, library_dirs)
 }
 
-pub fn verify_selected(root: &Path, packages: &[String], paths: &[String]) -> Result<Vec<Finding>> {
+pub fn verify_selected(
+    root: &Path,
+    packages: &[String],
+    paths: &[String],
+    quick: bool,
+) -> Result<Vec<Finding>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let state = image.state()?;
@@ -58,7 +103,18 @@ pub fn verify_selected(root: &Path, packages: &[String], paths: &[String]) -> Re
         })
         .collect::<Vec<_>>();
     selected.extend(targets);
-    check_state(&image.root, &state, false, |path| selected.contains(path))
+    let records = quick
+        .then(|| image.file_records(Some(&selected)))
+        .transpose()?;
+    let contents = records
+        .as_ref()
+        .map_or(Contents::Hash, Contents::Fingerprints);
+    Ok(
+        check_state(&image.root, &state, false, contents, None, |path| {
+            selected.contains(path)
+        })?
+        .findings,
+    )
 }
 
 pub(crate) fn selected_paths<'a>(
@@ -109,22 +165,65 @@ pub fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
         .root
         .offline_path()
         .context("pristine verification requires an inactive image")?;
-    check_image(&image, true)
+    check_image(&image, true, false)
 }
 
 pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     image.require_clean()?;
-    check_image(image, false)
+    check_image(image, false, false)
 }
 
-fn check_image(image: &Image, pristine: bool) -> Result<Vec<Finding>> {
+pub(crate) fn verify_image_quick(image: &Image) -> Result<Vec<Finding>> {
+    image.require_clean()?;
+    check_image(image, false, true)
+}
+
+/// Fail on the first error of a quick verification of an opened image.
+pub(crate) fn require_quick(image: &Image) -> Result<()> {
+    for finding in verify_image_quick(image)? {
+        ensure!(
+            !finding.is_error,
+            "image verification failed: {}",
+            finding.message
+        );
+    }
+    Ok(())
+}
+
+fn check_image(image: &Image, pristine: bool, quick: bool) -> Result<Vec<Finding>> {
     let state = image.state()?;
     image.verify_catalog_archives(&state)?;
-    check_state(&image.root, &state, pristine, |_| true)
+    let records = quick.then(|| image.file_records(None)).transpose()?;
+    let contents = records
+        .as_ref()
+        .map_or(Contents::Hash, Contents::Fingerprints);
+    Ok(check_state(&image.root, &state, pristine, contents, None, |_| true)?.findings)
 }
 
+/// Compute the ownership index from the installed manifests, re-verifying
+/// every stored manifest against its signed KDL document and digest.
 pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>> {
+    manifest_paths_since(state, None)
+}
+
+/// Compute the ownership index, re-verifying only manifests that differ from
+/// the committed installed set.
+///
+/// CPS verifies every manifest before it first commits it, and transactions
+/// reuse committed manifest records unchanged, so only manifests new to this
+/// transaction need their KDL parsed again. Full verification still checks
+/// every stored manifest.
+pub(crate) fn manifest_paths_since(
+    state: &State,
+    committed: Option<&BTreeMap<String, Installed>>,
+) -> Result<BTreeMap<String, Managed>> {
     for (name, package) in &state.installed {
+        if committed
+            .and_then(|committed| committed.get(name))
+            .is_some_and(|old| old.published == package.published)
+        {
+            continue;
+        }
         package.verify(name, &state.publishers)?;
     }
     let paths = effective_paths(&state.settings, &state.installed)?;
@@ -132,33 +231,31 @@ pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>>
     Ok(paths)
 }
 
-pub(crate) fn verify_state(
+/// Check managed paths of a transaction's state. `committed` is the image's
+/// committed installed set, whose manifests were verified when committed.
+pub(crate) fn check_transaction_state(
     root: &Root,
     state: &State,
-    selected: Option<&BTreeSet<&str>>,
-) -> Result<Vec<Finding>> {
-    check_state(root, state, false, |path| {
-        selected.is_none_or(|paths| paths.contains(path))
-    })
-}
-
-pub(crate) fn verify_unchanged(
-    root: &Root,
-    state: &State,
-    changed: &BTreeSet<&str>,
-) -> Result<Vec<Finding>> {
-    check_state(root, state, false, |path| !changed.contains(path))
+    contents: Contents<'_>,
+    committed: &BTreeMap<String, Installed>,
+    include: impl Fn(&str) -> bool,
+) -> Result<Checked> {
+    check_state(root, state, false, contents, Some(committed), include)
 }
 
 fn check_state(
     root: &Root,
     state: &State,
     pristine: bool,
+    contents: Contents<'_>,
+    committed: Option<&BTreeMap<String, Installed>>,
     include: impl Fn(&str) -> bool,
-) -> Result<Vec<Finding>> {
+) -> Result<Checked> {
     crate::plan::freeze::check(&state.settings.freezes, &state.installed)?;
-    let expected = manifest_paths(state)?;
+    let expected = manifest_paths_since(state, committed)?;
     let mut findings = Vec::new();
+    let mut fresh = BTreeMap::new();
+    let mut stale = BTreeSet::new();
     if let Err(error) = check_dependencies(&state.installed) {
         findings.push(Finding {
             is_error: true,
@@ -188,7 +285,21 @@ fn check_state(
             });
             continue;
         }
-        let observed = match root.inspect(path) {
+        let observed = match contents {
+            Contents::Fingerprints(records) => {
+                let record = records.get(path).map(|record| &record.observation);
+                root.inspect_with(path, record).map(|inspected| {
+                    if let Some(observation) = inspected.observed {
+                        fresh.insert(path.clone(), observation);
+                    } else if record.is_some() && !inspected.trusted {
+                        stale.insert(path.clone());
+                    }
+                    inspected.node
+                })
+            }
+            Contents::Hash => root.inspect(path),
+        };
+        let observed = match observed {
             Ok(node) => node,
             Err(error) => {
                 findings.push(Finding {
@@ -293,5 +404,9 @@ fn check_state(
             Ok(true)
         })?;
     }
-    Ok(findings)
+    Ok(Checked {
+        findings,
+        observed: fresh,
+        stale,
+    })
 }

@@ -7,7 +7,7 @@ Before=boot-complete.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/cps verify --root /
+ExecStart=/usr/bin/cps verify --quick --root /
 
 [Install]
 RequiredBy=boot-complete.target
