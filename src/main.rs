@@ -29,13 +29,13 @@ use cps::{
     fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
     list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
     list_publishers, list_withdrawals, plan_with_options, prefer_publisher,
-    prepare_boot_environment, prepare_git_snapshot_ref, publish,
-    publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
-    remove_publisher, repair_pending_transaction, resume_transaction, rollback_boot_environment,
-    rollback_boot_environment_on_disk, rollback_btrfs_boot_environment, rotate_publisher_key,
-    set_publisher_build_trust, set_publisher_repositories, stage_boot_environment,
-    stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
-    transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
+    prepare_boot_environment, prepare_git_snapshot_ref, publish_witnessed_bundle_with_sources,
+    read_attestation, read_worker_config, release, remove_publisher, repair_pending_transaction,
+    resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
+    rollback_btrfs_boot_environment, rotate_publisher_key, set_publisher_build_trust,
+    set_publisher_repositories, stage_boot_environment, stage_btrfs_boot_environment,
+    suggest_dependencies, transaction_details, transaction_history, transaction_status, verify,
+    verify_pristine, verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -189,7 +189,7 @@ enum Command {
         #[command(subcommand)]
         command: ManifestCommand,
     },
-    /// Publish one manifest and its payloads to a local repository
+    /// Publish manifests and their payloads to a local repository in one signed catalog update
     Publish {
         #[arg(long)]
         repo: PathBuf,
@@ -197,7 +197,8 @@ enum Command {
         proto: PathBuf,
         #[arg(long)]
         signing_key: PathBuf,
-        manifest: PathBuf,
+        #[arg(required = true)]
+        manifests: Vec<PathBuf>,
     },
     /// Publish a reproducible build bundle after verifying its worker signature and reviewed recipe
     PublishBundle {
@@ -761,6 +762,21 @@ enum RepoCommand {
         #[arg(long)]
         output: PathBuf,
         export: PathBuf,
+    },
+    /// Replace old withdrawal records with signed tombstones up to a catalog sequence
+    PruneWithdrawals {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        #[arg(long)]
+        signing_key: PathBuf,
+        /// Exact current catalog to build on
+        #[arg(long)]
+        base: String,
+        /// Prune records withdrawn at or before this catalog sequence
+        #[arg(long, value_name = "SEQUENCE")]
+        through: u64,
     },
     /// Enable a catalog-signed index for available package file lookups
     IndexFiles {
@@ -2060,12 +2076,11 @@ fn run(command: Command) -> Result<ExitCode> {
             repo,
             proto,
             signing_key,
-            manifest,
+            manifests,
         } => {
-            println!(
-                "Published {}",
-                publish(&repo, &proto, &manifest, &signing_key)?
-            );
+            for id in cps::publish_batch(&repo, &proto, &manifests, &signing_key)? {
+                println!("Published {id}");
+            }
         }
         Command::PublishBundle {
             repo,
@@ -2107,6 +2122,17 @@ fn run(command: Command) -> Result<ExitCode> {
                     percentage,
                 )?;
                 println!("Published catalog {hash}");
+            }
+            RepoCommand::PruneWithdrawals {
+                repo,
+                publisher,
+                signing_key,
+                base,
+                through,
+            } => {
+                let (hash, pruned) =
+                    cps::prune_withdrawals(&repo, &publisher, &signing_key, &base, through)?;
+                println!("Pruned {pruned} withdrawals; catalog {hash}");
             }
             RepoCommand::IndexFiles {
                 repo,

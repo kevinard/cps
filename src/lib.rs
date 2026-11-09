@@ -65,10 +65,10 @@ pub use plan::{
 pub use repo::{
     BuildAudit, BuildWitness, ReleaseAdvisory, ReleaseMode, archive_build_sources,
     enable_file_index, export_rebuild_inputs, fetch_build_sources, list_obsoletions,
-    list_withdrawals, publish, publish_bundle, publish_release, publish_release_with_mode,
-    publish_release_with_sources, publish_witnessed_bundle, publish_witnessed_bundle_with_sources,
-    read_attestation, release, rotate_publisher_key, verify_rebuild, widen_rollout,
-    withdraw_package,
+    list_withdrawals, prune_withdrawals, publish, publish_batch, publish_bundle, publish_release,
+    publish_release_with_mode, publish_release_with_sources, publish_witnessed_bundle,
+    publish_witnessed_bundle_with_sources, read_attestation, release, rotate_publisher_key,
+    verify_rebuild, widen_rollout, withdraw_package,
 };
 pub use verify::{Finding, verify, verify_elf_runtime, verify_pristine, verify_selected};
 

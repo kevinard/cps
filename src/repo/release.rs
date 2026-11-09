@@ -26,10 +26,11 @@ use crate::{
 };
 
 use super::{
-    CATALOG_LIMIT, Catalog, CatalogEntry, CatalogPin, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
-    MANIFEST_LIMIT, Published, Root, Snapshot, catalog_snapshot, lock_repo, parse_current,
-    parse_public_key, path_present, prepare_objects, read_catalog, read_current, read_key,
-    read_key_der, read_limited, read_package, read_pointer, rebuild, source_archive, write_atomic,
+    CATALOG_ROOT_LIMIT, Catalog, CatalogEntry, CatalogPin, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
+    MANIFEST_LIMIT, Published, Root, SHARD_LIMIT, SHARD_OBJECTS, Snapshot, catalog_shards,
+    catalog_snapshot, lock_repo, parse_current, parse_public_key, path_present, prepare_objects,
+    read_catalog, read_current, read_key, read_key_der, read_limited, read_package, read_pointer,
+    rebuild, source_archive, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -1196,7 +1197,7 @@ async fn materialize(
         .await?
         .context("missing catalog pointer download")?;
     let hash = parse_current(&String::from_utf8(read_limited(pointer.reopen()?, 65)?)?)?;
-    fetch_object(verified, repo, "catalogs", &hash, CATALOG_LIMIT, None).await?;
+    fetch_catalog(verified, repo, &hash).await?;
     let catalog = read_catalog(repo, &hash, publisher, key)?;
     if let Some(guard) = guard {
         guard.check(repo, source, &hash, &catalog)?;
@@ -1234,7 +1235,7 @@ async fn materialize(
         let document = String::from_utf8(read_limited(file.reopen()?, RETAINED_LIMIT)?)?;
         let retained = retained_catalogs(document.lines(), &hash)?;
         for pin in retained {
-            fetch_object(verified, repo, "catalogs", pin, CATALOG_LIMIT, None).await?;
+            fetch_catalog(verified, repo, pin).await?;
             let previous = read_catalog(repo, pin, publisher, key)?;
             previous.check_successor(&catalog, pin).with_context(|| {
                 format!("checking retained catalog {pin} against current {hash}")
@@ -1274,7 +1275,7 @@ async fn materialize_archive(
     full: bool,
     hash: &str,
 ) -> Result<StagedRelease> {
-    fetch_object(verified, repo, "catalogs", hash, CATALOG_LIMIT, None).await?;
+    fetch_catalog(verified, repo, hash).await?;
     let catalog = read_catalog(repo, hash, source.publisher, &source.key)?;
     cache_file_index(verified, repo, &catalog).await?;
     let mut rebuild_objects = BTreeMap::new();
@@ -1297,19 +1298,36 @@ async fn materialize_archive(
     })
 }
 
+/// Fetch a signed catalog root and the shards it commits to. Shards already
+/// cached under their digest are not transferred again.
+async fn fetch_catalog(verified: &Repository, repo: &Path, hash: &str) -> Result<()> {
+    fetch_object(verified, repo, "catalogs", hash, CATALOG_ROOT_LIMIT, None).await?;
+    let shards = catalog_shards(repo, hash)?;
+    stream::iter(shards)
+        .map(|shard| async move {
+            fetch_object(verified, repo, SHARD_OBJECTS, &shard, SHARD_LIMIT, None).await
+        })
+        .buffer_unordered(METADATA_DOWNLOADS)
+        .try_for_each(|()| async { Ok(()) })
+        .await
+}
+
 async fn cache_file_index(verified: &Repository, repo: &Path, catalog: &Catalog) -> Result<()> {
-    if let Some(hash) = &catalog.file_index {
-        fetch_object(
-            verified,
-            repo,
-            FILE_INDEX_OBJECTS,
-            hash,
-            FILE_INDEX_LIMIT,
-            None,
-        )
-        .await?;
-    }
-    Ok(())
+    stream::iter(catalog.file_indexes())
+        .map(|hash| async move {
+            fetch_object(
+                verified,
+                repo,
+                FILE_INDEX_OBJECTS,
+                &hash,
+                FILE_INDEX_LIMIT,
+                None,
+            )
+            .await
+        })
+        .buffer_unordered(METADATA_DOWNLOADS)
+        .try_for_each(|()| async { Ok(()) })
+        .await
 }
 
 async fn cache_rebuild_objects(
@@ -1779,18 +1797,11 @@ fn export_catalog(
         output,
         "catalogs",
         &release.sha256,
-        CATALOG_LIMIT,
+        CATALOG_ROOT_LIMIT,
         None,
     )?;
-    if let Some(hash) = &release.file_index {
-        export_object(
-            root,
-            output,
-            FILE_INDEX_OBJECTS,
-            hash,
-            FILE_INDEX_LIMIT,
-            None,
-        )?;
+    for (kind, hash, limit) in &release.metadata {
+        export_object(root, output, kind, hash, *limit, None)?;
     }
     for package in &release.packages {
         export_object(

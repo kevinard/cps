@@ -4349,20 +4349,27 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     );
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     {
-        let cached = seed.repo.with_extension("offline").join("catalogs");
-        let previous = fs::read_to_string(cached.join(seed_branch.trim()))?;
-        let applied = fs::read(cached.join(applied_seed.trim()))?;
+        let cached = seed.repo.with_extension("offline");
+        let previous = crate::repo::catalog_bytes(&cached, seed_branch.trim())?;
+        let applied = crate::repo::catalog_bytes(&cached, applied_seed.trim())?;
+        let sequence = crate::repo::read_catalog(
+            &cached,
+            seed_branch.trim(),
+            "seed",
+            &read_key(&seed.public)?,
+        )?
+        .sequence();
         let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
         let settings: String =
             db.query_row("SELECT data FROM image WHERE id=1", [], |row| row.get(0))?;
         db.execute(
             "UPDATE image SET data=json_set(data, '$.catalog_checkpoints.seed.catalog', ?1,
-             '$.catalog_checkpoints.seed.sequence', json_extract(?2, '$.catalog.sequence')) WHERE id=1",
-            (seed_branch.trim(), &previous),
+             '$.catalog_checkpoints.seed.sequence', ?2) WHERE id=1",
+            (seed_branch.trim(), i64::try_from(sequence)?),
         )?;
         db.execute(
             "UPDATE catalog_archives SET catalog=?1 WHERE publisher='seed'",
-            [previous.as_bytes()],
+            [previous],
         )?;
         let error = verify(&f.root).unwrap_err();
         assert!(
@@ -5420,7 +5427,7 @@ publisher "seed" {{
     plan(&f.root, Request::Update)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "guarded");
 
-    let old_catalog = fs::read(f.repo.join("catalogs").join(&first))?;
+    let old_catalog = crate::repo::catalog_bytes(&f.repo, &first)?;
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
     fs::rename(&seed.repo, seed.repo.with_extension("offline"))?;
     apply(&interrupted, &install)?;
@@ -6323,5 +6330,305 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
     apply(&f.root, &enable)?;
     assert_eq!(fs::read(f.root.join(MANPAGE))?, b"documentation");
     assert!(crate::verify_pristine(&f.root)?.is_empty());
+    Ok(())
+}
+
+fn object_count(repo: &Path, kind: &str) -> Result<usize> {
+    Ok(fs::read_dir(repo.join(kind))?.count())
+}
+
+fn write_manifest(f: &Fixture, name: &str, version: &str, body: &str) -> Result<PathBuf> {
+    let path = f
+        ._dir
+        .path()
+        .join(format!("{}-{version}.kdl", name.replace('/', "-")));
+    fs::write(
+        &path,
+        format!(
+            "schema-version 1 kind=\"package-manifest\"\npackage {name:?} publisher=\"canopa\" version={version:?} {{\n{body}}}\n"
+        ),
+    )?;
+    Ok(path)
+}
+
+#[test]
+fn batched_publications_sign_once_and_rewrite_only_changed_shards() -> Result<()> {
+    let f = Fixture::new()?;
+    let names: Vec<_> = (0..48)
+        .map(|number| format!("bulk/pkg-{number:02}"))
+        .collect();
+    let mut manifests = Vec::new();
+    for name in &names {
+        let file = f.file(&format!("usr/share/{name}"), name, "0644", "")?;
+        manifests.push(write_manifest(&f, name, "1.0.0-0", &file)?);
+    }
+    let ids = crate::publish_batch(&f.repo, &f.proto, &manifests, &f.private)?;
+    assert_eq!(ids.len(), names.len());
+    let first = fs::read_to_string(f.repo.join("current"))?
+        .trim()
+        .to_owned();
+    assert_eq!(object_count(&f.repo, "catalogs")?, 1);
+    let shards = object_count(&f.repo, crate::repo::SHARD_OBJECTS)?;
+    let key = read_key(&f.public)?;
+    let catalog = crate::repo::read_catalog(&f.repo, &first, "canopa", &key)?;
+    assert_eq!(catalog.sequence(), 1);
+    assert!(shards > 1 && shards <= names.len());
+    assert_eq!(crate::repo::catalog_shards(&f.repo, &first)?.len(), shards);
+
+    // One new package rewrites one shard and the root, nothing else.
+    f.package("bulk/late", "1.0.0-0", String::new())?;
+    let second = fs::read_to_string(f.repo.join("current"))?
+        .trim()
+        .to_owned();
+    assert_eq!(object_count(&f.repo, "catalogs")?, 2);
+    assert_eq!(
+        object_count(&f.repo, crate::repo::SHARD_OBJECTS)?,
+        shards + 1
+    );
+    let before: BTreeSet<_> = crate::repo::catalog_shards(&f.repo, &first)?
+        .into_iter()
+        .collect();
+    let after: BTreeSet<_> = crate::repo::catalog_shards(&f.repo, &second)?
+        .into_iter()
+        .collect();
+    assert_eq!(after.difference(&before).count(), 1);
+    assert!(before.difference(&after).count() <= 1);
+
+    // Republishing identical manifests changes nothing; the old pin still reads.
+    crate::publish_batch(&f.repo, &f.proto, &manifests, &f.private)?;
+    assert_eq!(
+        fs::read_to_string(f.repo.join("current"))?.trim(),
+        second.as_str()
+    );
+    assert_eq!(
+        snapshot(&f.repo, "canopa", &key, Some(&first))?
+            .packages
+            .len(),
+        names.len()
+    );
+    assert_eq!(
+        snapshot(&f.repo, "canopa", &key, None)?.packages.len(),
+        names.len() + 1
+    );
+
+    // A batch is atomic: one bad manifest publishes none of them.
+    let good = write_manifest(&f, "bulk/good", "1.0.0-0", "")?;
+    let bad = write_manifest(&f, "bulk/pkg-00", "1.0.0-0", "    require \"bulk/good\"\n")?;
+    let error = crate::publish_batch(&f.repo, &f.proto, &[good, bad], &f.private).unwrap_err();
+    assert!(format!("{error:#}").contains("already published with different content"));
+    assert_eq!(
+        fs::read_to_string(f.repo.join("current"))?.trim(),
+        second.as_str()
+    );
+
+    // A shard that does not match its root commitment is rejected.
+    let shard = crate::repo::catalog_shards(&f.repo, &second)?.remove(0);
+    let path = f.repo.join(crate::repo::SHARD_OBJECTS).join(&shard);
+    let original = fs::read(&path)?;
+    fs::write(&path, b"{}")?;
+    let error = crate::repo::catalog_bytes(&f.repo, &second).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("digest mismatch"),
+        "{error:#}"
+    );
+    fs::write(&path, original)?;
+    Ok(())
+}
+
+#[test]
+fn planning_reads_manifests_only_for_the_selected_packages() -> Result<()> {
+    let f = Fixture::new()?;
+    let library = f.file(LIBRARY, "library", "0644", "")?;
+    f.package("library/display", "1.0.0-0", library)?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        format!(
+            "    require \"library/display\"\n{}",
+            f.file(COMPOSITOR, "compositor", "0755", "")?
+        ),
+    )?;
+    for number in 0..16 {
+        f.package(&format!("tools/unused-{number}"), "1.0.0-0", String::new())?;
+    }
+    let key = read_key(&f.public)?;
+    let unused = snapshot(&f.repo, "canopa", &key, None)?
+        .packages
+        .into_iter()
+        .filter(|package| package.manifest.name.starts_with("tools/"))
+        .collect::<Vec<_>>();
+    f.create()?;
+    for package in &unused {
+        fs::remove_file(f.repo.join("manifests").join(&package.sha256))?;
+    }
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    assert_eq!(install.package_changes().len(), 2, "{}", install.summary());
+    apply(&f.root, &install)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor");
+    let error = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["tools/unused-0".into()],
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("reading manifest for cps://canopa/tools/unused-0"),
+        "{error:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn withdrawal_pruning_keeps_pins_installed_packages_and_identities() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "apps/tool",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "one", "0755", "")?,
+    )?;
+    f.package(
+        "apps/tool",
+        "2.0.0-0",
+        f.file(COMPOSITOR, "two", "0755", "")?,
+    )?;
+    f.package("apps/other", "1.0.0-0", String::new())?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/tool@1.0.0-0".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    let installed = fs::read_to_string(f.repo.join("current"))?
+        .trim()
+        .to_owned();
+    withdraw_package(&f.repo, &f.private, "cps://canopa/apps/tool@1.0.0-0")?;
+    withdraw_package(&f.repo, &f.private, "cps://canopa/apps/other@1.0.0-0")?;
+    let withdrawn = fs::read_to_string(f.repo.join("current"))?
+        .trim()
+        .to_owned();
+    assert_eq!(list_withdrawals(&f.repo, "canopa", &f.public)?.len(), 2);
+    let key = read_key(&f.public)?;
+    let sequence = crate::repo::read_catalog(&f.repo, &withdrawn, "canopa", &key)?.sequence();
+
+    let error =
+        crate::prune_withdrawals(&f.repo, "canopa", &f.private, &installed, sequence).unwrap_err();
+    assert!(format!("{error:#}").contains("pruning base is stale"));
+    let error = crate::prune_withdrawals(&f.repo, "canopa", &f.private, &withdrawn, sequence + 1)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("beyond the current catalog sequence"));
+    // The first withdrawal happened at sequence - 1; prune only that one.
+    let (pruned, count) =
+        crate::prune_withdrawals(&f.repo, "canopa", &f.private, &withdrawn, sequence - 1)?;
+    assert_eq!(count, 1);
+    assert_eq!(
+        list_withdrawals(&f.repo, "canopa", &f.public)?
+            .into_keys()
+            .collect::<Vec<_>>(),
+        ["cps://canopa/apps/other@1.0.0-0"]
+    );
+    let error =
+        crate::prune_withdrawals(&f.repo, "canopa", &f.private, &pruned, sequence - 2).unwrap_err();
+    assert!(format!("{error:#}").contains("must not move back"));
+
+    // Pruned identities stay reserved and stay admitted for installed images.
+    let error = f
+        .package(
+            "apps/tool",
+            "1.0.0-0",
+            f.file(COMPOSITOR, "new", "0755", "")?,
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("was withdrawn and cannot be republished"));
+    let previous = crate::repo::read_catalog(&f.repo, &installed, "canopa", &key)?;
+    let next = crate::repo::read_catalog(&f.repo, &pruned, "canopa", &key)?;
+    previous.check_successor(&next, &installed)?;
+    let refresh = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/tool".into()],
+        },
+    )?;
+    assert!(
+        refresh.summary().contains("2.0.0-0"),
+        "{}",
+        refresh.summary()
+    );
+    let keep = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/tool@1.0.0-0".into()],
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{keep:#}").contains("was withdrawn"), "{keep:#}");
+    let mark = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/other".into()],
+        },
+    );
+    assert!(mark.is_err());
+
+    // A transaction on the pruned catalog keeps the pruned package installed
+    // and the image still verifies its admission offline.
+    f.package("apps/new", "1.0.0-0", String::new())?;
+    let added = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/new".into()],
+        },
+    )?;
+    apply(&f.root, &added)?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "one");
+    fs::rename(&f.repo, f.repo.with_extension("offline"))?;
+    assert!(verify(&f.root)?.is_empty());
+    fs::rename(f.repo.with_extension("offline"), &f.repo)?;
+
+    // The pinned catalog of the original install still reads in full.
+    let pinned = snapshot(&f.repo, "canopa", &key, Some(&installed))?;
+    assert_eq!(pinned.packages.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn file_indexes_follow_publications_one_shard_at_a_time() -> Result<()> {
+    use crate::query::search_files;
+
+    let f = Fixture::new()?;
+    for number in 0..24 {
+        let path = format!("usr/share/indexed/file-{number:02}");
+        f.package(
+            &format!("indexed/pkg-{number:02}"),
+            "1.0.0-0",
+            f.file(&path, "x", "0644", "")?,
+        )?;
+    }
+    f.create()?;
+    crate::enable_file_index(&f.repo, "canopa", &f.private)?;
+    let indexes = object_count(&f.repo, "file-indexes")?;
+    let current = fs::read_to_string(f.repo.join("current"))?;
+    assert_eq!(
+        indexes,
+        crate::repo::catalog_shards(&f.repo, current.trim())?.len(),
+        "one file index per shard of the indexed catalog"
+    );
+    f.package(
+        "indexed/late",
+        "1.0.0-0",
+        f.file("usr/share/indexed/late-file", "y", "0644", "")?,
+    )?;
+    assert_eq!(object_count(&f.repo, "file-indexes")?, indexes + 1);
+    let found = search_files(&f.root, "late-file")?;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].package, "cps://canopa/indexed/late@1.0.0-0");
+    assert_eq!(search_files(&f.root, "file-07")?.len(), 1);
     Ok(())
 }

@@ -10,14 +10,14 @@ use tempfile::NamedTempFile;
 use crate::{
     image::Publisher,
     model::Node,
-    repo::{canonical_repo, read_object, stage_blob},
+    repo::{canonical_repo, catalog_objects, read_object, stage_blob},
 };
 
 use super::{
-    ARCHIVE, ATTESTATION_LIMIT, CATALOG_LIMIT, Catalog, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
-    MANIFEST_LIMIT, Mirror, Published, Root, cached_object, check_cache_origin,
-    collect_rebuild_objects, fetch_repository_payloads, lock_repo, open_state, path_present,
-    prepare_objects, read_catalog, read_pointer, rebuild, write_atomic,
+    ARCHIVE, ATTESTATION_LIMIT, CATALOG_ROOT_LIMIT, Catalog, MANIFEST_LIMIT, Mirror, Published,
+    Root, cached_object, check_cache_origin, collect_rebuild_objects, fetch_repository_payloads,
+    lock_repo, open_state, path_present, prepare_objects, read_catalog, read_pointer, rebuild,
+    write_atomic,
 };
 
 pub(crate) struct ArchiveCache {
@@ -60,8 +60,8 @@ impl ArchiveCache {
         for hash in manifests {
             self.copy_object(destination, "manifests", hash, MANIFEST_LIMIT)?;
         }
-        if let Some(hash) = &self.catalog.file_index {
-            self.copy_object(destination, FILE_INDEX_OBJECTS, hash, FILE_INDEX_LIMIT)?;
+        for (kind, hash, limit) in catalog_objects(&self.repo, &self.pin)? {
+            self.copy_object(destination, kind, &hash, limit)?;
         }
         let mut attestations = self.catalog.attestations.values().cloned().collect();
         let mut inputs = BTreeMap::new();
@@ -73,7 +73,7 @@ impl ArchiveCache {
             self.copy_object(destination, rebuild::OBJECTS, &hash, limit)?;
         }
         // Publish the exact catalog after its metadata objects are durable.
-        self.copy_object(destination, "catalogs", &self.pin, CATALOG_LIMIT)
+        self.copy_object(destination, "catalogs", &self.pin, CATALOG_ROOT_LIMIT)
     }
 
     fn copy_object(&self, destination: &Path, kind: &str, hash: &str, limit: u64) -> Result<()> {
