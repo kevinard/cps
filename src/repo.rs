@@ -1707,11 +1707,12 @@ pub(crate) fn export_locked_repository(
     for package in packages {
         catalog.check_installed(package)?;
     }
-    // Planning reads the pinned shards, but only the locked selection needs
-    // manifests, attestations, and payloads to provision this image.
-    let manifests = packages
-        .iter()
-        .map(|package| package.sha256.as_str())
+    // Later plans can read any manifest of the pinned catalog, but only the
+    // locked selection needs attestations and payloads to provision this image.
+    let manifests = catalog
+        .entries
+        .values()
+        .map(CatalogEntry::manifest_digest)
         .collect::<BTreeSet<_>>();
     let attestations = packages
         .iter()
