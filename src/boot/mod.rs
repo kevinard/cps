@@ -33,8 +33,8 @@ use crate::{
     verify::verify_image,
 };
 
-pub(crate) use btrfs::stage_running_btrfs;
 pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
+pub(crate) use btrfs::{excluded_subvolumes, stage_running_btrfs};
 pub use btrfs_boot::{
     activate_btrfs_boot_environment, preview_btrfs_rollback, rollback_btrfs_boot_environment,
 };
@@ -46,10 +46,12 @@ pub use esp::{
 };
 pub use export::{export_boot_environment, export_boot_environment_receipt};
 pub use systemd_boot::{
-    Activation, BootEnvironment, RootDeployment, activate_boot_environment,
-    activate_deployed_boot_environment, activate_device_boot_environment,
-    destroy_btrfs_boot_environment, list_boot_environments, rollback_boot_environment,
+    Activation, BootEnvironment, BootPruneReport, BootRemoval, RootDeployment, TrialDiscard,
+    activate_boot_environment, activate_deployed_boot_environment,
+    activate_device_boot_environment, destroy_btrfs_boot_environment, list_boot_environments,
+    rollback_boot_environment,
 };
+pub(crate) use systemd_boot::{discard_btrfs_trial, prune_btrfs_boot_environments};
 
 pub fn stage_boot_environment(source: &Path, destination: &Path, plan: &Plan) -> Result<String> {
     let inputs = staging_inputs(source, destination, plan)?;
@@ -220,6 +222,11 @@ fn publish_directory(parent: &Root, staged: &Path, name: &OsStr) -> Result<()> {
     )?;
     parent.as_file().sync_all()?;
     Ok(())
+}
+
+/// Format a byte count for space diagnostics.
+pub(crate) fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 pub(crate) fn entry_id(image: &str, revision: u64) -> String {

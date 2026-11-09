@@ -182,3 +182,149 @@ pub(super) fn verify_contents(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::model::digest;
+
+    const CMDLINE: &str =
+        "root=UUID=ebcd29cb-f4ac-43ef-8f65-f7975a22d024 rootfstype=btrfs rootflags=subvolid=277 rw";
+
+    /// Build a minimal PE32+ image with the given sections.
+    fn pe(sections: &[(&str, &[u8])]) -> Vec<u8> {
+        let headers = 64 + 4 + 20 + 240 + 40 * sections.len();
+        let mut data_offset = headers.next_multiple_of(512);
+        let mut image = vec![0u8; data_offset];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+        image[64..68].copy_from_slice(b"PE\0\0");
+        let coff = 68;
+        image[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        image[coff + 2..coff + 4].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        image[coff + 16..coff + 18].copy_from_slice(&240u16.to_le_bytes());
+        image[coff + 18..coff + 20].copy_from_slice(&0x22u16.to_le_bytes());
+        let optional = coff + 20;
+        image[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        image[optional + 32..optional + 36].copy_from_slice(&4096u32.to_le_bytes());
+        image[optional + 36..optional + 40].copy_from_slice(&512u32.to_le_bytes());
+        image[optional + 60..optional + 64].copy_from_slice(&(headers as u32).to_le_bytes());
+        image[optional + 108..optional + 112].copy_from_slice(&16u32.to_le_bytes());
+        let mut table = optional + 240;
+        let mut address = 0x1000u32;
+        for (name, bytes) in sections {
+            let mut header = [0u8; 40];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            let size = bytes.len() as u32;
+            header[8..12].copy_from_slice(&size.to_le_bytes());
+            header[12..16].copy_from_slice(&address.to_le_bytes());
+            header[16..20].copy_from_slice(&size.to_le_bytes());
+            header[20..24].copy_from_slice(&(data_offset as u32).to_le_bytes());
+            header[36..40].copy_from_slice(&0x4000_0040u32.to_le_bytes());
+            image[table..table + 40].copy_from_slice(&header);
+            table += 40;
+            image.extend_from_slice(bytes);
+            image.resize(image.len().next_multiple_of(512), 0);
+            data_offset = image.len();
+            address += size.next_multiple_of(4096).max(4096);
+        }
+        image
+    }
+
+    fn file(bytes: &[u8]) -> Result<File> {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(bytes)?;
+        file.rewind()?;
+        Ok(file)
+    }
+
+    fn valid() -> Vec<u8> {
+        pe(&[
+            (".linux", b"kernel image"),
+            (".initrd", b"initramfs image"),
+            (".cmdline", format!("{CMDLINE}\0\0").as_bytes()),
+        ])
+    }
+
+    fn components() -> (String, String) {
+        (digest(b"kernel image"), digest(b"initramfs image"))
+    }
+
+    #[test]
+    fn uki_contents_bind_the_command_line_kernel_and_initramfs() -> Result<()> {
+        let (linux, initrd) = components();
+        verify_contents(&mut file(&valid())?, CMDLINE, Some((&linux, &initrd)))?;
+        verify_contents(&mut file(&valid())?, CMDLINE, None)?;
+        let error = |bytes: &[u8], cmdline: &str, components: Option<(&str, &str)>| {
+            format!(
+                "{:#}",
+                verify_contents(&mut file(bytes).unwrap(), cmdline, components).unwrap_err()
+            )
+        };
+        assert!(error(&valid(), "rw", None).contains("command line differs"));
+        assert!(
+            error(&valid(), CMDLINE, Some((&initrd, &linux))).contains("differs from the image")
+        );
+        let missing = pe(&[
+            (".linux", b"kernel image"),
+            (".cmdline", CMDLINE.as_bytes()),
+        ]);
+        assert!(error(&missing, CMDLINE, None).contains("missing UKI section .initrd"));
+        let duplicate = pe(&[
+            (".linux", b"kernel image"),
+            (".linux", b"other kernel"),
+            (".initrd", b"initramfs image"),
+            (".cmdline", CMDLINE.as_bytes()),
+        ]);
+        assert!(error(&duplicate, CMDLINE, None).contains("invalid UKI section .linux"));
+        let profiles = pe(&[
+            (".linux", b"kernel image"),
+            (".initrd", b"initramfs image"),
+            (".cmdline", CMDLINE.as_bytes()),
+            (".profile", b"ID=1"),
+        ]);
+        assert!(error(&profiles, CMDLINE, None).contains("single boot profile"));
+        let long = "a".repeat(64 * 1024 + 1);
+        let oversized = pe(&[
+            (".linux", b"kernel image"),
+            (".initrd", b"initramfs image"),
+            (".cmdline", long.as_bytes()),
+        ]);
+        assert!(error(&oversized, &long, None).contains("exceeds 64 KiB"));
+        assert!(verify_contents(&mut file(b"\x7fELF not a PE")?, CMDLINE, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn registered_uki_is_reused_only_with_its_recorded_digest() -> Result<()> {
+        let esp = tempfile::tempdir()?;
+        let id = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
+        let (linux, initrd) = components();
+        let mut kernel = file(b"kernel image")?;
+        let mut ramdisk = file(b"initramfs image")?;
+        let mut run = |registered: Option<&str>| {
+            prepare(
+                esp.path(),
+                id,
+                CMDLINE,
+                (&mut kernel, &linux),
+                (&mut ramdisk, &initrd),
+                registered,
+            )
+        };
+        let missing = run(Some(&"a".repeat(64))).unwrap_err().to_string();
+        assert!(missing.contains("registered UKI is missing"), "{missing}");
+        let directory = esp.path().join("EFI/cps").join(id);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(directory.join(NAME), valid())?;
+        let (_, sha256) = run(Some(&digest(&valid())))?;
+        assert_eq!(sha256, digest(&valid()));
+        let (_, sha256) = run(None)?;
+        assert_eq!(sha256, digest(&valid()));
+        let changed = run(Some(&"b".repeat(64))).unwrap_err().to_string();
+        assert!(changed.contains("digest mismatch"), "{changed}");
+        Ok(())
+    }
+}

@@ -111,6 +111,30 @@ struct DeviceInfo {
     path: [u8; 1024],
 }
 
+#[repr(C)]
+struct SearchKey {
+    tree_id: u64,
+    min_objectid: u64,
+    max_objectid: u64,
+    min_offset: u64,
+    max_offset: u64,
+    min_transid: u64,
+    max_transid: u64,
+    min_type: u32,
+    max_type: u32,
+    nr_items: u32,
+    // The UAPI's unused u32 and four unused u64 fields.
+    unused: [u32; 9],
+}
+
+#[repr(C)]
+struct SearchArgs {
+    key: SearchKey,
+    buf: [u8; 4096 - size_of::<SearchKey>()],
+}
+
+const _: () = assert!(size_of::<SearchKey>() == 104);
+const _: () = assert!(size_of::<SearchArgs>() == 4096);
 const _: () = assert!(size_of::<FsInfo>() == 1024);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<SubvolInfo>() == 504);
@@ -340,7 +364,58 @@ impl BtrfsVolume {
         super::btrfs::destroy_by_id(&self.root, record.subvolid)
     }
 
+    /// The filesystem's default subvolume ID, which the kernel refuses to delete.
+    pub fn default_subvolume(&self) -> Result<u64> {
+        // The root tree's directory item named "default" points at the default subvolume.
+        const ROOT_TREE: u64 = 1;
+        const ROOT_TREE_DIR: u64 = 6;
+        const DIR_ITEM: u32 = 84;
+        let mut args = SearchArgs {
+            key: SearchKey {
+                tree_id: ROOT_TREE,
+                min_objectid: ROOT_TREE_DIR,
+                max_objectid: ROOT_TREE_DIR,
+                min_offset: 0,
+                max_offset: u64::MAX,
+                min_transid: 0,
+                max_transid: u64::MAX,
+                min_type: DIR_ITEM,
+                max_type: DIR_ITEM,
+                nr_items: 16,
+                unused: [0; 9],
+            },
+            buf: [0; 4096 - size_of::<SearchKey>()],
+        };
+        const SEARCH: Opcode = opcode::read_write::<SearchArgs>(0x94, 17);
+        // SAFETY: the initialized buffer matches btrfs_ioctl_search_args.
+        unsafe { ioctl(self.root.as_file(), Updater::<SEARCH, _>::new(&mut args)) }
+            .context("reading the Btrfs default subvolume")?;
+        let mut items = &args.buf[..];
+        for _ in 0..args.key.nr_items {
+            let header = items.get(..32).context("truncated Btrfs search result")?;
+            let len = u32::from_ne_bytes(header[28..32].try_into()?) as usize;
+            let item = items
+                .get(32..32 + len)
+                .context("truncated Btrfs search item")?;
+            // btrfs_dir_item: location key (17), transid (8), data_len (2), name_len (2), type (1).
+            if item.len() >= 30 {
+                let name_len = u16::from_le_bytes(item[27..29].try_into()?) as usize;
+                if item.get(30..30 + name_len) == Some(b"default".as_slice()) {
+                    return Ok(u64::from_le_bytes(item[..8].try_into()?));
+                }
+            }
+            items = &items[32 + len..];
+        }
+        // Without the item the top level (ID 5) is the default.
+        Ok(5)
+    }
+
     pub fn running_parent(&self) -> Result<Option<String>> {
+        Ok(self.running()?.and_then(|(_, parent)| parent))
+    }
+
+    /// The registered entry ID of the running root on this volume, and its recorded parent.
+    pub fn running(&self) -> Result<Option<(String, Option<String>)>> {
         let root = Root::open(Path::new("/"))?;
         if fstatfs(root.as_file())?.f_type != libc::BTRFS_SUPER_MAGIC
             || uuid_string(&filesystem_info(&root)?.fsid) != self.fsid
@@ -352,19 +427,21 @@ impl BtrfsVolume {
         };
         let image = Image::open_query_root(root)?;
         let settings = image.settings()?;
+        let id = super::entry_id(&settings.id, settings.boot_revision());
         ensure!(
-            registered == super::entry_id(&settings.id, settings.boot_revision()).as_bytes(),
+            registered == id.as_bytes(),
             "the running root's boot registration differs from its image identity"
         );
-        settings
+        let parent = settings
             .boot_parent
             .map(|parent| {
-                Ok(super::entry_id(
+                Ok::<_, anyhow::Error>(super::entry_id(
                     &canonical_partuuid(&parent.id)?,
                     parent.revision,
                 ))
             })
-            .transpose()
+            .transpose()?;
+        Ok(Some((id, parent)))
     }
 }
 

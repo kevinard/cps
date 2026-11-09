@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, btree_map::Entry},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
+    os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -23,6 +23,7 @@ use crate::{
 };
 
 const DISK: &str = "disk.raw";
+/// Sector size of offline disk images, and the unit of sysfs block extents.
 pub(super) const SECTOR_SIZE: u64 = 512;
 const LINUX_FILESYSTEM: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
 const EFI_SYSTEM: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
@@ -187,6 +188,7 @@ pub(super) struct PartitionExtent {
 
 pub(super) struct OfflineDisk {
     file: File,
+    sector: u64,
     partitions: BTreeMap<String, PartitionExtent>,
 }
 
@@ -200,9 +202,20 @@ impl OfflineDisk {
         Self::from_sized_file(file, bytes)
     }
 
+    /// Read the GPT using the device's logical block size, or 512 bytes for an image file.
     pub fn from_sized_file(file: File, bytes: u64) -> Result<Self> {
-        let partitions = read_partitions(&file, bytes)?;
-        Ok(Self { file, partitions })
+        let sector = logical_sector_size(&file)?;
+        let partitions = read_partitions(&file, bytes, sector)?;
+        Ok(Self {
+            file,
+            sector,
+            partitions,
+        })
+    }
+
+    /// The logical block size used for GPT LBAs on this disk.
+    pub fn sector_size(&self) -> u64 {
+        self.sector
     }
 
     fn partition(&self, partuuid: &str, kind: &str) -> Result<&PartitionExtent> {
@@ -402,24 +415,42 @@ pub(super) fn digest_extent(mut disk: &File, offset: u64, bytes: u64) -> Result<
     Ok(sha256)
 }
 
-fn read_partitions(disk: &File, disk_bytes: u64) -> Result<BTreeMap<String, PartitionExtent>> {
-    let output = sfdisk(disk, "--json")?;
+fn logical_sector_size(file: &File) -> Result<u64> {
+    if !file.metadata()?.file_type().is_block_device() {
+        return Ok(SECTOR_SIZE);
+    }
+    let size = u64::from(
+        rustix::fs::ioctl_blksszget(file).context("reading the disk's logical block size")?,
+    );
+    ensure!(
+        size.is_power_of_two() && (512..=65536).contains(&size),
+        "unsupported logical block size {size}"
+    );
+    Ok(size)
+}
+
+fn read_partitions(
+    disk: &File,
+    disk_bytes: u64,
+    sector: u64,
+) -> Result<BTreeMap<String, PartitionExtent>> {
+    let output = sfdisk(disk, "--json", sector)?;
     let mut table = serde_json::from_slice::<DiskTable>(&output)
         .context("expected a GPT partition table from sfdisk")?
         .partitiontable;
     ensure!(
-        table.label == "gpt" && table.unit == "sectors" && table.sectorsize == SECTOR_SIZE,
-        "expected a GPT disk with 512-byte sectors"
+        table.label == "gpt" && table.unit == "sectors" && table.sectorsize == sector,
+        "expected a GPT disk with {sector}-byte logical sectors"
     );
     ensure!(
-        disk_bytes.is_multiple_of(SECTOR_SIZE)
+        disk_bytes.is_multiple_of(sector)
             && table.firstlba >= 2
             && table.firstlba <= table.lastlba
-            && table.lastlba < (disk_bytes / SECTOR_SIZE).saturating_sub(1),
+            && table.lastlba < (disk_bytes / sector).saturating_sub(1),
         "invalid GPT usable sector range"
     );
-    sfdisk(disk, "--verify")?;
-    check_gpt_copies(disk, disk_bytes / SECTOR_SIZE - 1, &table)?;
+    sfdisk(disk, "--verify", sector)?;
+    check_gpt_copies(disk, disk_bytes / sector - 1, &table, sector)?;
 
     table.partitions.sort_unstable_by_key(|part| part.start);
     let mut next = table.firstlba;
@@ -443,21 +474,21 @@ fn read_partitions(disk: &File, disk_bytes: u64) -> Result<BTreeMap<String, Part
         );
         next = end;
         entry.insert(PartitionExtent {
-            offset: part.start * SECTOR_SIZE,
-            bytes: part.size * SECTOR_SIZE,
+            offset: part.start * sector,
+            bytes: part.size * sector,
             kind: part.kind,
         });
     }
     Ok(partitions)
 }
 
-fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt) -> Result<()> {
+fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt, sector: u64) -> Result<()> {
     // libfdisk can accept two independently valid but disagreeing tables.
     // Compare their shared geometry and the entry arrays before writing.
     let mut primary = [0; 92];
     let mut backup = [0; 92];
-    disk.read_exact_at(&mut primary, SECTOR_SIZE)?;
-    disk.read_exact_at(&mut backup, backup_lba * SECTOR_SIZE)?;
+    disk.read_exact_at(&mut primary, sector)?;
+    disk.read_exact_at(&mut backup, backup_lba * sector)?;
     let lba = |header: &[u8], offset: usize| {
         u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap())
     };
@@ -477,7 +508,7 @@ fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt) -> Result<()>
     let count = u32::from_le_bytes(primary[80..84].try_into().unwrap());
     let entry_size = u32::from_le_bytes(primary[84..88].try_into().unwrap());
     let array_bytes = u64::from(count) * u64::from(entry_size);
-    let array_sectors = array_bytes.div_ceil(SECTOR_SIZE);
+    let array_sectors = array_bytes.div_ceil(sector);
     let first = lba(&primary, 72);
     let last = lba(&backup, 72);
     ensure!(
@@ -490,9 +521,9 @@ fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt) -> Result<()>
             && array_sectors <= backup_lba - last,
         "invalid GPT entry array extent"
     );
-    disk.seek(SeekFrom::Start(first * SECTOR_SIZE))?;
+    disk.seek(SeekFrom::Start(first * sector))?;
     let primary = digest_reader((&mut disk).take(array_bytes))?;
-    disk.seek(SeekFrom::Start(last * SECTOR_SIZE))?;
+    disk.seek(SeekFrom::Start(last * sector))?;
     let backup = digest_reader(disk.take(array_bytes))?;
     ensure!(
         primary == backup,
@@ -501,9 +532,14 @@ fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt) -> Result<()>
     Ok(())
 }
 
-fn sfdisk(disk: &File, action: &str) -> Result<Vec<u8>> {
-    let output = artifact_helper("sfdisk", Path::new("/"))
-        .stdin(Stdio::from(disk.try_clone()?))
+fn sfdisk(disk: &File, action: &str, sector: u64) -> Result<Vec<u8>> {
+    let mut command = artifact_helper("sfdisk", Path::new("/"));
+    command.stdin(Stdio::from(disk.try_clone()?));
+    if sector != SECTOR_SIZE {
+        // libfdisk reads the size of a block device itself. An image file needs it stated.
+        command.arg(format!("--sector-size={sector}"));
+    }
+    let output = command
         .args([action, "/proc/self/fd/0"])
         .output()
         .with_context(|| format!("reading the offline disk with sfdisk {action}"))?;
@@ -516,4 +552,58 @@ fn sfdisk(disk: &File, action: &str) -> Result<Vec<u8>> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpt_image(dir: &Path, sector: u64) -> Result<File> {
+        let path = dir.join(format!("disk-{sector}.raw"));
+        let file = File::create(&path)?;
+        file.set_len(16 * 1024 * 1024)?;
+        drop(file);
+        let mut child = std::process::Command::new("sfdisk")
+            .arg("--quiet")
+            .arg(format!("--sector-size={sector}"))
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("running sfdisk")?;
+        let esp_start = 1024 * 1024 / sector;
+        let size = 4 * 1024 * 1024 / sector;
+        let script = format!(
+            "label: gpt\nstart={esp_start},size={size},type=uefi,uuid=9a138d0b-f9aa-4a2a-b527-93392ad7e812\nstart={},size={size},type=linux,uuid=7adff456-af50-498f-b39a-dcf87cb4a7c1\n",
+            esp_start + size
+        );
+        std::io::Write::write_all(
+            child.stdin.as_mut().context("sfdisk stdin")?,
+            script.as_bytes(),
+        )?;
+        ensure!(child.wait()?.success(), "sfdisk failed");
+        Ok(File::open(path)?)
+    }
+
+    #[test]
+    fn gpt_offsets_follow_the_logical_sector_size() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for sector in [512, 4096] {
+            let disk = gpt_image(dir.path(), sector)?;
+            let bytes = disk.metadata()?.len();
+            let partitions = read_partitions(&disk, bytes, sector)?;
+            let esp = &partitions["9a138d0b-f9aa-4a2a-b527-93392ad7e812"];
+            let root = &partitions["7adff456-af50-498f-b39a-dcf87cb4a7c1"];
+            assert_eq!((esp.offset, esp.bytes), (1024 * 1024, 4 * 1024 * 1024));
+            assert_eq!(
+                (root.offset, root.bytes),
+                (5 * 1024 * 1024, 4 * 1024 * 1024)
+            );
+            let other = if sector == 512 { 4096 } else { 512 };
+            assert!(read_partitions(&disk, bytes, other).is_err());
+        }
+        // An image file is read with 512-byte sectors unless it is a block device.
+        let disk = gpt_image(dir.path(), 512)?;
+        assert_eq!(logical_sector_size(&disk)?, SECTOR_SIZE);
+        Ok(())
+    }
 }

@@ -121,4 +121,6 @@ jobs:
           export CPS_BIN="$PWD/target/release/cps" CPS_VM_KERNEL="$RUNNER_TEMP/cps-vmlinuz"
           bash tests/systemd-boot-vm.sh health-fail
           CPS_VM_BTRFS_BOOT=1 CPS_VM_SYSTEM_COMMANDS=1 bash tests/boot-capture-vm.sh
+          CPS_VM_BTRFS_BOOT=1 CPS_VM_BTRFS_HEALTH_FAIL=1 CPS_VM_BTRFS_DISCARD_FAILED=1 \
+            bash tests/boot-capture-vm.sh
           VM

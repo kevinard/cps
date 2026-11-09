@@ -403,7 +403,7 @@ elif $systemd_guest; then
     else
         cp -- "$cps" proto/usr/bin/cps
     fi
-    cp "$project/packaging/systemd/cps-boot-health.service" proto/usr/lib/systemd/system/
+    cp "$project/packaging/systemd/"{cps-boot-health,cps-uefi-bless}.service proto/usr/lib/systemd/system/
     install -Dm644 "$project/LICENSE" proto/usr/share/licenses/cps/LICENSE
     sed -e '/^    require /d' -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
         "$project/packaging/cps.kdl" > cps.kdl

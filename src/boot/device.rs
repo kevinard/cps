@@ -188,8 +188,9 @@ pub(super) fn esp_device_path(path: &Path, file: &File) -> Result<EspDevicePath>
     let disk = esp.open_disk()?;
     Ok(EspDevicePath {
         number: esp.number,
-        start: esp.extent.0 / SECTOR_SIZE,
-        sectors: esp.extent.1 / SECTOR_SIZE,
+        // The UEFI hard drive device path counts the disk's logical blocks.
+        start: esp.extent.0 / disk.sector_size(),
+        sectors: esp.extent.1 / disk.sector_size(),
         uuid: disk.esp_uuid_at(esp.extent)?.to_owned(),
     })
 }
@@ -199,6 +200,7 @@ fn esp_partition(path: &Path, file: &File) -> Result<KernelPartition> {
     KernelPartition::read(file.metadata()?.dev()).context("identifying the mounted EFI partition")
 }
 
+/// Sysfs reports block extents in 512-byte units, whatever the logical block size.
 fn sectors(path: &Path, name: &str) -> Result<u64> {
     sysfs_number(path, name)?
         .checked_mul(SECTOR_SIZE)
@@ -257,21 +259,56 @@ fn check_esp_mount(path: &Path, file: &File) -> Result<()> {
         }
     }
     let mounts = fs::read("/proc/self/mountinfo").context("reading mounted filesystems")?;
+    if esp_mount_state(&mounts, &escaped, device.as_bytes())? == EspMount::Automount {
+        // An autofs trigger (systemd-gpt-auto or x-systemd.automount) mounts
+        // the ESP on first access. Open fds keep it from expiring.
+        drop(fs::read_dir(path).context("triggering the EFI partition automount")?);
+        let mounts = fs::read("/proc/self/mountinfo").context("reading mounted filesystems")?;
+        ensure!(
+            esp_mount_state(&mounts, &escaped, device.as_bytes())? == EspMount::Mounted,
+            "--esp names an automount point that did not mount the opened EFI partition"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum EspMount {
+    Mounted,
+    /// Only the autofs trigger is mounted at the path.
+    Automount,
+}
+
+fn esp_mount_state(mounts: &[u8], escaped: &[u8], device: &[u8]) -> Result<EspMount> {
+    let mut automount = None;
     let mut found = false;
     for line in mounts.split(|byte| *byte == b'\n') {
         let mut fields = line.split(|byte| *byte == b' ');
-        let (Some(number), Some(root), Some(mount), Some(options)) =
-            (fields.nth(2), fields.next(), fields.next(), fields.next())
-        else {
+        let (Some(id), Some(parent), Some(number), Some(root), Some(mount), Some(options)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
             continue;
         };
         if mount != escaped {
             continue;
         }
         let filesystem = fields.skip_while(|field| *field != b"-").nth(1);
+        if filesystem == Some(b"autofs") && !found {
+            ensure!(
+                automount.replace(id).is_none(),
+                "--esp names more than one automount point"
+            );
+            continue;
+        }
         ensure!(
             !found
-                && number == device.as_bytes()
+                && automount.is_none_or(|trigger| trigger == parent)
+                && number == device
                 && root == b"/"
                 && options
                     .split(|byte| *byte == b',')
@@ -281,6 +318,35 @@ fn check_esp_mount(path: &Path, file: &File) -> Result<()> {
         );
         found = true;
     }
-    ensure!(found, "--esp must name the root of a mounted EFI partition");
-    Ok(())
+    match (found, automount) {
+        (true, _) => Ok(EspMount::Mounted),
+        (false, Some(_)) => Ok(EspMount::Automount),
+        (false, None) => anyhow::bail!("--esp must name the root of a mounted EFI partition"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EspMount, esp_mount_state};
+
+    const AUTOFS: &str =
+        "40 1 0:39 / /efi rw,relatime shared:20 - autofs systemd-1 rw,fd=50,pgrp=1,direct\n";
+    const VFAT: &str =
+        "77 40 259:1 / /efi rw,relatime shared:40 - vfat /dev/nvme0n1p1 rw,fmask=0077\n";
+
+    #[test]
+    fn automounted_esp_uses_the_vfat_mount_stacked_on_its_trigger() -> anyhow::Result<()> {
+        let state = |lines: &[&str]| esp_mount_state(lines.concat().as_bytes(), b"/efi", b"259:1");
+        assert_eq!(state(&[AUTOFS, VFAT])?, EspMount::Mounted);
+        assert_eq!(state(&[VFAT])?, EspMount::Mounted);
+        assert_eq!(state(&[AUTOFS])?, EspMount::Automount);
+        assert!(state(&[]).is_err());
+        // A second filesystem over the ESP, or a VFAT mount beside the trigger.
+        assert!(state(&[AUTOFS, VFAT, VFAT]).is_err());
+        assert!(state(&[AUTOFS, &VFAT.replace("77 40", "77 41")]).is_err());
+        assert!(state(&[AUTOFS, &VFAT.replace("259:1", "259:2")]).is_err());
+        assert!(state(&[AUTOFS, &VFAT.replace("/efi rw", "/efi ro")]).is_err());
+        assert!(state(&[AUTOFS, AUTOFS]).is_err());
+        Ok(())
+    }
 }
