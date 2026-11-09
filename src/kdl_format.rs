@@ -692,6 +692,7 @@ pub(crate) struct ImageDefinition {
     pub stage_packages: BTreeSet<String>,
     pub cache_keep_versions: Option<usize>,
     pub git_toolchain_config: Option<PathBuf>,
+    pub refresh_policies: BTreeMap<String, crate::repo::release::RefreshPolicy>,
 }
 
 pub(crate) struct BtrfsConfig {
@@ -733,6 +734,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
         stage_packages: BTreeSet::new(),
         cache_keep_versions: None,
         git_toolchain_config: None,
+        refresh_policies: BTreeMap::new(),
     };
     let mut architecture = false;
     let mut names = BTreeSet::new();
@@ -757,6 +759,41 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 ensure!(
                     config.mirrors.insert(name.clone(), mirror).is_none(),
                     "duplicate mirror for publisher {name}"
+                );
+            }
+            "refresh-policy" => {
+                let fields =
+                    Fields::read(node, 1, &["on-unavailable", "max-staleness-hours"], false)?;
+                let name = fields.string_arg(0)?;
+                validate_publisher(&name)?;
+                let hours = fields.integer::<u64>("max-staleness-hours")?;
+                let policy = match fields.required_string("on-unavailable")?.as_str() {
+                    "fail" => {
+                        ensure!(
+                            hours.is_none(),
+                            "max-staleness-hours applies only to on-unavailable=\"defer\""
+                        );
+                        None
+                    }
+                    "defer" => Some(
+                        hours
+                            .filter(|hours| {
+                                (1..=crate::repo::release::RefreshPolicy::MAX_STALENESS_HOURS)
+                                    .contains(hours)
+                            })
+                            .context("on-unavailable=\"defer\" needs max-staleness-hours between 1 and 8784")?,
+                    ),
+                    _ => bail!("on-unavailable must be \"fail\" or \"defer\""),
+                };
+                let policy = crate::repo::release::RefreshPolicy {
+                    defer_unavailable_hours: policy,
+                };
+                ensure!(
+                    config
+                        .refresh_policies
+                        .insert(name.clone(), policy)
+                        .is_none(),
+                    "duplicate refresh-policy for publisher {name}"
                 );
             }
             "boot-btrfs" => {
@@ -962,6 +999,41 @@ mod tests {
                     Path::new("/tmp"),
                 )
                 .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_policies_default_to_failing_and_bound_deferral() -> Result<()> {
+        let header = "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" { repository \"repo\"; trust-key \"key.der\"; }\n";
+        let parsed = parse_image_config(
+            &format!(
+                "{header}refresh-policy \"extras\" on-unavailable=\"defer\" max-staleness-hours=72\nrefresh-policy \"tools\" on-unavailable=\"fail\"\n"
+            ),
+            Path::new("/tmp"),
+        )?;
+        assert_eq!(
+            parsed.refresh_policies["extras"].defer_unavailable_hours,
+            Some(72)
+        );
+        assert_eq!(
+            parsed.refresh_policies["tools"].defer_unavailable_hours,
+            None
+        );
+        for invalid in [
+            "refresh-policy \"extras\" on-unavailable=\"defer\"",
+            "refresh-policy \"extras\" on-unavailable=\"defer\" max-staleness-hours=0",
+            "refresh-policy \"extras\" on-unavailable=\"defer\" max-staleness-hours=9000",
+            "refresh-policy \"extras\" on-unavailable=\"fail\" max-staleness-hours=1",
+            "refresh-policy \"extras\" on-unavailable=\"warn\"",
+            "refresh-policy \"extras\"",
+            "refresh-policy \"Bad Name\" on-unavailable=\"fail\"",
+            "refresh-policy \"extras\" on-unavailable=\"fail\"\nrefresh-policy \"extras\" on-unavailable=\"fail\"",
+        ] {
+            assert!(
+                parse_image_config(&format!("{header}{invalid}\n"), Path::new("/tmp")).is_err(),
+                "accepted {invalid}"
             );
         }
         Ok(())

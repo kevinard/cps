@@ -1763,6 +1763,9 @@ fn check_system_updates(
                     .join(", ")
             );
         }
+        for freshness in &report.publisher_freshness {
+            println!("{freshness}");
+        }
         if let Some(deferred) = &report.phased_update {
             println!("{deferred}");
         }
@@ -1934,6 +1937,10 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("This system is running as a trial.");
             } else {
                 println!("No reboot pending.");
+            }
+            match system.publisher_freshness() {
+                Ok(report) => report.iter().for_each(|freshness| println!("{freshness}")),
+                Err(error) => eprintln!("cps: cannot report publisher freshness: {error:#}"),
             }
         }
         Command::Resume { config, repair } => {

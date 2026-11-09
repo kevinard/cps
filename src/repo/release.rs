@@ -58,6 +58,7 @@ const CACHE_FORMAT: &str = "cps mirror cache v1\n";
 const PUBLISHER_CHECKPOINT: &str = ".tuf/catalog";
 const PROFILE_BINDING: &str = "profile";
 const REFRESH_ROOT: &str = "refresh-root.json";
+const REFRESHED: &str = "refreshed";
 const ARCHIVE: &str = "archive";
 const RETAINED: &str = "retained";
 const MAX_RETAINED: usize = 32;
@@ -472,7 +473,166 @@ pub(crate) fn sync_url_publisher(
         );
     }
     sync_current_locked(repo, &source, false, &[], None)?;
-    write_atomic(&refresh_root, &source.anchor, true)
+    write_atomic(&refresh_root, &source.anchor, true)?;
+    record_refresh(repo)
+}
+
+/// How a client treats a URL-added publisher whose mirror cannot be refreshed.
+///
+/// The default fails the update. `defer_unavailable_hours` allows an update
+/// to continue without that publisher after an outage or expired metadata,
+/// but only while its last successful refresh is younger than the limit.
+/// Signature, rollback, and digest failures always fail.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct RefreshPolicy {
+    pub defer_unavailable_hours: Option<u64>,
+}
+
+impl RefreshPolicy {
+    pub const MAX_STALENESS_HOURS: u64 = 366 * 24;
+
+    fn describe(&self) -> String {
+        match self.defer_unavailable_hours {
+            None => "fail when unavailable".to_owned(),
+            Some(hours) => format!("defer when unavailable for up to {hours} hours"),
+        }
+    }
+}
+
+/// The freshness of one URL-added publisher's verified metadata.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct PublisherFreshness {
+    pub publisher: String,
+    pub policy: RefreshPolicy,
+    /// Unix time of the last successful refresh.
+    pub last_refreshed: Option<u64>,
+    pub age_seconds: Option<u64>,
+    /// Expiry of the trusted TUF timestamp.
+    pub metadata_expires: Option<String>,
+    /// The cache is older than the policy allows for deferral, or its age is unknown.
+    pub beyond_policy: bool,
+}
+
+impl std::fmt::Display for PublisherFreshness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Publisher {}: ", self.publisher)?;
+        match self.age_seconds {
+            Some(age) => write!(f, "refreshed {} hours ago", age / 3600)?,
+            None => write!(f, "no recorded refresh")?,
+        }
+        if let Some(expires) = &self.metadata_expires {
+            write!(f, ", metadata expires {expires}")?;
+        }
+        write!(f, ", {}", self.policy.describe())?;
+        if self.beyond_policy && self.policy.defer_unavailable_hours.is_some() {
+            write!(f, " (stale beyond policy)")?;
+        }
+        Ok(())
+    }
+}
+
+enum RefreshFailure {
+    /// The mirror could not be reached or delivered too slowly.
+    Unavailable,
+    /// The verified metadata has expired, as in an outage or a freeze attack.
+    Expired,
+    /// Signature, rollback, digest, size, local state, or CPS catalog failures.
+    Security,
+}
+
+fn classify_refresh_failure(error: &anyhow::Error) -> RefreshFailure {
+    let mut transport = false;
+    let mut expired = false;
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<tough::error::Error>() {
+            match error {
+                tough::error::Error::Transport { .. } => transport = true,
+                tough::error::Error::ExpiredMetadata { .. } => expired = true,
+                // Hash and size failures reach CPS wrapped in transport errors.
+                _ => return RefreshFailure::Security,
+            }
+        } else if cause.is::<TransportError>() {
+            transport = true;
+        }
+    }
+    if expired {
+        RefreshFailure::Expired
+    } else if transport {
+        RefreshFailure::Unavailable
+    } else {
+        RefreshFailure::Security
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn record_refresh(repo: &Path) -> Result<()> {
+    write_atomic(
+        &repo.join(".tuf").join(REFRESHED),
+        format!("{}\n", unix_now()).as_bytes(),
+        false,
+    )
+}
+
+fn last_refresh(directory: &Root) -> Option<u64> {
+    let bytes = read_limited(directory.file(REFRESHED).ok()?, 32).ok()?;
+    std::str::from_utf8(&bytes).ok()?.trim_end().parse().ok()
+}
+
+fn freshness(publisher: &Publisher, policy: RefreshPolicy) -> Result<PublisherFreshness> {
+    // Reporting reads the cache without requiring the sync account.
+    let directory = Root::open(&publisher.repo)?.subdir(".tuf")?;
+    let last_refreshed = last_refresh(&directory);
+    let age_seconds = last_refreshed.map(|time| unix_now().saturating_sub(time));
+    let metadata_expires = directory
+        .file("trusted/timestamp.json")
+        .ok()
+        .and_then(|file| read_limited(file, TIMESTAMP_LIMIT).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value["signed"]["expires"].as_str().map(str::to_owned));
+    let beyond_policy = match (policy.defer_unavailable_hours, age_seconds) {
+        (Some(hours), Some(age)) => age > hours.saturating_mul(3600),
+        _ => true,
+    };
+    Ok(PublisherFreshness {
+        publisher: publisher.name.clone(),
+        policy,
+        last_refreshed,
+        age_seconds,
+        metadata_expires,
+        beyond_policy,
+    })
+}
+
+fn url_publishers(
+    publishers: &crate::image::Publishers,
+) -> impl Iterator<Item = (usize, &Publisher)> {
+    publishers
+        .as_slice()
+        .iter()
+        .enumerate()
+        .skip(publishers.signed_publishers().len())
+}
+
+/// Report the freshness of each URL-added publisher without contacting mirrors.
+pub(crate) fn url_publisher_freshness(
+    root: &Path,
+    policies: &BTreeMap<String, RefreshPolicy>,
+) -> Result<Vec<PublisherFreshness>> {
+    let image = Image::open_query(root)?;
+    let publishers = image.publishers()?;
+    let mut report = Vec::new();
+    for (_, publisher) in url_publishers(&publishers) {
+        if path_present(&publisher.repo.join(".tuf").join(REFRESH_ROOT))? {
+            let policy = policies.get(&publisher.name).copied().unwrap_or_default();
+            report.push(freshness(publisher, policy)?);
+        }
+    }
+    Ok(report)
 }
 
 pub(crate) fn refresh_url_publishers(
@@ -480,17 +640,13 @@ pub(crate) fn refresh_url_publishers(
     required: &BTreeSet<&str>,
     base_only: bool,
     refresh: bool,
+    policies: &BTreeMap<String, RefreshPolicy>,
 ) -> Result<BTreeSet<String>> {
     let guard = ImageGuard::open(root)?;
     let publishers = &guard.state.publishers;
     let mut deferred = BTreeSet::new();
     // Profile sync alone controls the primary and companion catalogs.
-    for (index, publisher) in publishers
-        .as_slice()
-        .iter()
-        .enumerate()
-        .skip(publishers.signed_publishers().len())
-    {
+    for (index, publisher) in url_publishers(publishers) {
         let required = index == 0 || required.contains(publisher.name.as_str());
         if base_only && !required {
             deferred.insert(publisher.name.clone());
@@ -518,7 +674,7 @@ pub(crate) fn refresh_url_publishers(
                 mirror: Mirror::read(&directory)?,
             };
             sync_current_locked(repo, &source, false, &[], Some(&guard))?;
-            Ok(())
+            record_refresh(repo)
         };
         if let Err(error) =
             sync().with_context(|| format!("refreshing publisher {}", publisher.name))
@@ -526,8 +682,32 @@ pub(crate) fn refresh_url_publishers(
             if required {
                 return Err(error);
             }
+            let policy = policies.get(&publisher.name).copied().unwrap_or_default();
+            let kind = match classify_refresh_failure(&error) {
+                RefreshFailure::Security => {
+                    return Err(error.context(format!(
+                        "refusing to defer {}: verification or local state failed, not availability",
+                        publisher.name
+                    )));
+                }
+                RefreshFailure::Unavailable => "unavailable",
+                RefreshFailure::Expired => "expired",
+            };
+            if policy.defer_unavailable_hours.is_none() {
+                return Err(error.context(format!(
+                    "publisher {} is {kind} and its refresh policy does not allow deferral",
+                    publisher.name
+                )));
+            }
+            let state = freshness(publisher, policy)?;
+            if state.beyond_policy {
+                return Err(error.context(format!(
+                    "publisher {} is {kind} and its cache is older than the refresh policy allows",
+                    publisher.name
+                )));
+            }
             eprintln!(
-                "Warning: {error:#}. Deferring updates from {}.",
+                "Warning: {error:#}. Deferring updates from {} ({state}).",
                 publisher.name
             );
             deferred.insert(publisher.name.clone());

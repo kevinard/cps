@@ -38,9 +38,11 @@ before committing. A failed job or a job that takes longer than two minutes
 leaves the transaction pending. Use `cps resume` after correcting the cause.
 New services follow the image's preset policy.
 
-On upgrade, an unavailable optional publisher is deferred while CPS
-continues with the distribution repositories. CPS keeps installed packages
-from the deferred publisher at their current versions. If an optional
+On upgrade, an optional publisher whose mirror is unavailable is deferred
+when its [refresh policy](publishers.md#refresh-policy-for-mirror-publishers)
+allows it. CPS then continues with the distribution repositories and keeps
+installed packages from the deferred publisher at their current versions.
+Without a policy, the refresh failure stops the upgrade. If an optional
 publisher fails during payload download, CPS previews a new distribution-only
 plan and asks for confirmation again unless you passed `--yes`. To use
 distribution publishers from the start, pass `--base-only` to `upgrade` or
@@ -66,7 +68,8 @@ installed, newest available, and selected versions and the freeze reason
 when applicable. The selected version is `null` if planning fails.
 `blockers` contains errors that prevented a plan, such as a
 pending trial boot or an unsatisfiable release profile. When publishers were
-deferred, the report names them in `deferred_publishers`. A check with no
+deferred, the report names them in `deferred_publishers`. `publisher_freshness`
+reports the refresh age and policy of each mirror publisher. A check with no
 actionable changes and only deferred publishers reports `deferred`. A check can report
 both actionable changes and held-back packages. Use
 `check-updates --explain library/libdisplay` to probe the newest held-back

@@ -1354,6 +1354,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         &BTreeSet::from(["extras"]),
         false,
         true,
+        &BTreeMap::new(),
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("different trust root or publisher"));
@@ -1366,8 +1367,14 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     let primary_before = fs::read(main.repo.join("current"))?;
     let companion_before = fs::read(companion.repo.join("current"))?;
     assert!(
-        mirror_release::refresh_url_publishers(&main.root, &BTreeSet::new(), false, true)?
-            .is_empty()
+        mirror_release::refresh_url_publishers(
+            &main.root,
+            &BTreeSet::new(),
+            false,
+            true,
+            &BTreeMap::new()
+        )?
+        .is_empty()
     );
     assert_ne!(fs::read(cache.join("current"))?, old_extra);
     assert_eq!(fs::read(main.repo.join("current"))?, primary_before);
@@ -1466,13 +1473,66 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         .downcast_ref::<crate::apply::PublisherFetchError>()
         .unwrap();
     assert_eq!(publisher.0, "extras");
-    let deferred =
-        mirror_release::refresh_url_publishers(&main.root, &BTreeSet::new(), false, true)?;
+    let refresh_with = |policies: &BTreeMap<String, mirror_release::RefreshPolicy>| {
+        mirror_release::refresh_url_publishers(&main.root, &BTreeSet::new(), false, true, policies)
+    };
+    // By default an unavailable optional mirror fails the update.
+    let error = refresh_with(&BTreeMap::new()).unwrap_err();
+    assert!(format!("{error:#}").contains("does not allow deferral"));
+    let defer = BTreeMap::from([(
+        "extras".to_owned(),
+        mirror_release::RefreshPolicy {
+            defer_unavailable_hours: Some(24),
+        },
+    )]);
+    let freshness = mirror_release::url_publisher_freshness(&main.root, &defer)?;
+    assert_eq!(freshness.len(), 1);
+    assert!(!freshness[0].beyond_policy && freshness[0].metadata_expires.is_some());
+    let deferred = refresh_with(&defer)?;
     assert_eq!(deferred, BTreeSet::from(["extras".to_owned()]));
     assert_eq!(
-        mirror_release::refresh_url_publishers(&main.root, &BTreeSet::new(), true, false)?,
+        mirror_release::refresh_url_publishers(
+            &main.root,
+            &BTreeSet::new(),
+            true,
+            false,
+            &BTreeMap::new()
+        )?,
         deferred
     );
+    // Deferral ends once the cache is older than the policy allows.
+    let refreshed = cache.join(".tuf/refreshed");
+    let last_refresh = fs::read(&refreshed)?;
+    fs::write(&refreshed, b"1000\n")?;
+    let error = refresh_with(&defer).unwrap_err();
+    assert!(format!("{error:#}").contains("older than the refresh policy allows"));
+    assert!(mirror_release::url_publisher_freshness(&main.root, &defer)?[0].beyond_policy);
+    fs::write(&refreshed, last_refresh)?;
+    // A mirror that fails verification is never deferred.
+    let tampered = work.join("tampered-mirror");
+    fs::create_dir_all(tampered.join("metadata"))?;
+    std::os::unix::fs::symlink(
+        fs::canonicalize(&offline_mirror)?.join("targets"),
+        tampered.join("targets"),
+    )?;
+    for entry in fs::read_dir(offline_mirror.join("metadata"))? {
+        let entry = entry?;
+        fs::copy(
+            entry.path(),
+            tampered.join("metadata").join(entry.file_name()),
+        )?;
+    }
+    let timestamp = tampered.join("metadata/timestamp.json");
+    let mut forged: serde_json::Value = serde_json::from_slice(&fs::read(&timestamp)?)?;
+    forged["signed"]["version"] = 999.into();
+    fs::write(&timestamp, serde_json::to_vec(&forged)?)?;
+    std::os::unix::fs::symlink(&tampered, &served)?;
+    let error = refresh_with(&defer).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not availability"),
+        "{error:#}"
+    );
+    fs::remove_file(&served)?;
     let (base_only, _) = crate::plan::plan_system(
         &main.root,
         Request::Update,

@@ -61,3 +61,33 @@ it contains the required signed catalogs. Package payloads are fetched during
 the normal plan and apply workflow. Relocation invalidates outstanding plans
 and preserves the installed packages, boot identity, and applied checkpoints.
 Use the new paths in the KDL configuration used for subsequent mirror syncs.
+
+## Refresh policy for mirror publishers
+
+`upgrade` and `check-updates` refresh publishers added with
+`publisher add --url` before planning. By default, any refresh failure
+stops the update, so an image never keeps using an outdated catalog
+without notice. To let updates continue through a mirror outage, declare
+a policy for that publisher in `/etc/cps/image.kdl`.
+
+```kdl
+refresh-policy "extras" on-unavailable="defer" max-staleness-hours=72
+```
+
+With `on-unavailable="defer"`, CPS defers updates from the publisher when
+the mirror is unreachable, too slow, or serves expired metadata, as long as
+the last successful refresh is no older than `max-staleness-hours` (1 to
+8784). Packages from that publisher stay at their installed versions.
+Beyond that age, or when CPS has no record of a refresh, the update fails.
+Failures that indicate tampering or a broken cache always fail: invalid
+signatures, rollback to older metadata, digest or size mismatches, and CPS
+catalog check failures. `on-unavailable="fail"` states the default
+explicitly. Policies do not apply to the publishers in the image
+configuration or the signed profile, which must always refresh.
+
+`cps status` and `cps check-updates` show each mirror publisher's last
+successful refresh, the expiry of its verified TUF timestamp, and its
+policy. The JSON report lists them in `publisher_freshness` with
+`last_refreshed` as Unix seconds, `age_seconds`, `metadata_expires`, the
+policy's `defer_unavailable_hours`, and `beyond_policy`, which is true
+when the cache is too old to defer or its age is unknown.
