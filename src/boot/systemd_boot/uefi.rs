@@ -422,8 +422,24 @@ fn preferred_order(order: &[u16], first: u16) -> Vec<u16> {
         .collect()
 }
 
+#[cfg(not(test))]
+fn efivarfs() -> PathBuf {
+    PathBuf::from(EFIVARFS)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A directory of regular files standing in for efivarfs in unit tests.
+    static TEST_EFIVARFS: std::cell::RefCell<PathBuf> = std::cell::RefCell::new(PathBuf::from(EFIVARFS));
+}
+
+#[cfg(test)]
+fn efivarfs() -> PathBuf {
+    TEST_EFIVARFS.with(|dir| dir.borrow().clone())
+}
+
 fn variable_path(name: &str) -> PathBuf {
-    Path::new(EFIVARFS).join(format!("{name}-{GLOBAL}"))
+    efivarfs().join(format!("{name}-{GLOBAL}"))
 }
 
 fn option_name(number: u16) -> String {
@@ -469,6 +485,9 @@ fn write_variable(name: &str, data: &[u8], new: bool) -> Result<()> {
     let path = variable_path(name);
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).create_new(new);
+    // efivarfs replaces the whole variable on write. Regular test files need truncation.
+    #[cfg(test)]
+    opts.truncate(true);
     let mut file = opts
         .open(&path)
         .with_context(|| format!("opening UEFI variable {name} for writing"))?;
@@ -613,6 +632,310 @@ mod tests {
                 cmdline: String::new(),
             }),
         }
+    }
+
+    /// Firmware state backed by a temporary directory instead of efivarfs.
+    struct FakeFirmware {
+        _vars: tempfile::TempDir,
+        esp: tempfile::TempDir,
+    }
+
+    impl FakeFirmware {
+        fn new() -> Result<Self> {
+            let vars = tempfile::tempdir()?;
+            TEST_EFIVARFS.with(|dir| *dir.borrow_mut() = vars.path().to_owned());
+            let esp = tempfile::tempdir()?;
+            fs::create_dir_all(esp.path().join(DIRECTORY))?;
+            Ok(Self { _vars: vars, esp })
+        }
+
+        fn set(&self, name: &str, data: &[u8]) -> Result<()> {
+            let mut bytes = ATTRIBUTES.to_le_bytes().to_vec();
+            bytes.extend_from_slice(data);
+            fs::write(variable_path(name), bytes)?;
+            Ok(())
+        }
+
+        /// Store the firmware's cached view and return it.
+        fn firmware(
+            &self,
+            order: &[u16],
+            next: Option<u16>,
+            current: Option<u16>,
+            options: &[(u16, &str)],
+            boot_id: &str,
+        ) -> Result<Firmware> {
+            for variable in fs::read_dir(efivarfs())? {
+                fs::remove_file(variable?.path())?;
+            }
+            let order_bytes: Vec<_> = order.iter().flat_map(|n| n.to_le_bytes()).collect();
+            self.set("BootOrder", &order_bytes)?;
+            if let Some(next) = next {
+                self.set("BootNext", &next.to_le_bytes())?;
+            }
+            if let Some(current) = current {
+                self.set("BootCurrent", &current.to_le_bytes())?;
+            }
+            let mut stored = BTreeMap::new();
+            for (number, id) in options {
+                let option = load_option(&device(), id)?;
+                self.set(&option_name(*number), &option)?;
+                stored.insert(*number, option);
+            }
+            Ok(Firmware {
+                _lock: tempfile::tempfile()?,
+                device: device(),
+                order: order.to_vec(),
+                next,
+                current,
+                options: stored,
+                boot_id: boot_id.into(),
+            })
+        }
+
+        fn record(&self, id: &str, suffix: &str) -> Result<BootEntry> {
+            let mut entry = entry(id, !suffix.is_empty());
+            entry.path = self
+                .esp
+                .path()
+                .join(DIRECTORY)
+                .join(format!("{id}{suffix}.conf"));
+            fs::write(&entry.path, &entry.description)?;
+            Ok(entry)
+        }
+
+        fn records(&self) -> Result<Vec<String>> {
+            let mut names: Vec<_> = fs::read_dir(self.esp.path().join(DIRECTORY))?
+                .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<_>>()?;
+            names.sort();
+            Ok(names)
+        }
+    }
+
+    #[test]
+    fn variables_round_trip_and_reject_malformed_values() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        assert_eq!(variable("BootNext")?, None);
+        assert_eq!(boot_order()?, Vec::<u16>::new());
+        write_variable("BootOrder", &[1, 0, 0x2a, 0], false)?;
+        assert_eq!(boot_order()?, [1, 0x2a]);
+        assert!(write_variable("BootOrder", &[1, 0], true).is_err());
+        fake.set("BootNext", &[1, 0, 0])?;
+        assert!(boot_number("BootNext").is_err());
+        fake.set("BootOrder", &[1])?;
+        assert!(boot_order().is_err());
+        fs::write(variable_path("BootCurrent"), [7, 0])?;
+        assert!(variable("BootCurrent").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn trial_activation_sets_only_boot_next_and_bootstrap_promotes() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        // Bootstrap creates an option and moves it first in BootOrder.
+        let firmware = fake.firmware(&[1, 42], None, Some(1), &[], FIRST_BOOT)?;
+        firmware.activate(BASE, false)?;
+        let order = boot_order()?;
+        assert_eq!(order.len(), 3);
+        assert!(order.ends_with(&[1, 42]));
+        let base = order[0];
+        assert_eq!(
+            variable(&option_name(base))?,
+            Some(load_option(&device(), BASE)?)
+        );
+        // A trial gets a fresh option that is scheduled once and kept out of BootOrder.
+        let firmware = fake.firmware(&order, None, Some(base), &[(base, BASE)], FIRST_BOOT)?;
+        firmware.activate(TRIAL, true)?;
+        let next = boot_number("BootNext")?.context("missing BootNext")?;
+        assert!(![1, 42, base].contains(&next));
+        assert_eq!(boot_order()?, order);
+        assert_eq!(
+            variable(&option_name(next))?,
+            Some(load_option(&device(), TRIAL)?)
+        );
+        // Retrying the same activation is idempotent.
+        let firmware = fake.firmware(
+            &order,
+            Some(next),
+            Some(base),
+            &[(base, BASE), (next, TRIAL)],
+            FIRST_BOOT,
+        )?;
+        firmware.activate(TRIAL, true)?;
+        assert_eq!(boot_number("BootNext")?, Some(next));
+        // An unrelated BootNext is preserved and blocks activation.
+        let firmware = fake.firmware(&order, Some(42), Some(base), &[(base, BASE)], FIRST_BOOT)?;
+        assert!(firmware.activate(TRIAL, true).is_err());
+        assert!(firmware.activate(BASE, false).is_err());
+        assert_eq!(boot_number("BootNext")?, Some(42));
+        // A concurrent change to BootNext is detected.
+        let firmware = fake.firmware(&order, None, Some(base), &[(base, BASE)], FIRST_BOOT)?;
+        fake.set("BootNext", &42u16.to_le_bytes())?;
+        assert!(firmware.activate(TRIAL, true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn blessing_promotes_the_running_trial_after_recording_its_health() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let base = fake.record(BASE, "")?;
+        let trial = fake.record(TRIAL, "+1")?;
+        // The firmware consumed BootNext and booted the trial in a new boot.
+        let firmware = fake.firmware(
+            &[1, 42],
+            None,
+            Some(2),
+            &[(1, BASE), (2, TRIAL)],
+            SECOND_BOOT,
+        )?;
+        assert_eq!(
+            firmware
+                .running_trial(std::slice::from_ref(&trial))?
+                .map(|entry| entry.id.as_str()),
+            Some(TRIAL)
+        );
+        firmware.bless(fake.esp.path(), &trial, &base)?;
+        assert_eq!(boot_order()?, [2, 1, 42]);
+        assert_eq!(
+            fake.records()?,
+            [format!("{BASE}.conf"), format!("{TRIAL}.conf")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blessing_resumes_after_an_interrupted_promotion() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let base = fake.record(BASE, "")?;
+        let mut verified = fake.record(TRIAL, "+0-1")?;
+        verified.tries = None;
+        // BootOrder was already rewritten before the final rename.
+        let firmware = fake.firmware(
+            &[2, 1, 42],
+            None,
+            Some(2),
+            &[(1, BASE), (2, TRIAL)],
+            SECOND_BOOT,
+        )?;
+        firmware.bless(fake.esp.path(), &verified, &base)?;
+        assert_eq!(boot_order()?, [2, 1, 42]);
+        assert_eq!(
+            fake.records()?,
+            [format!("{BASE}.conf"), format!("{TRIAL}.conf")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blessing_refuses_other_boots_and_scheduled_firmware_changes() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let base = fake.record(BASE, "")?;
+        let trial = fake.record(TRIAL, "+1")?;
+        let options = [(1, BASE), (2, TRIAL)];
+        // The fallback booted instead of the trial.
+        let firmware = fake.firmware(&[1, 42], None, Some(1), &options, SECOND_BOOT)?;
+        assert!(firmware.bless(fake.esp.path(), &trial, &base).is_err());
+        // Another BootNext is pending.
+        let firmware = fake.firmware(&[1, 42], Some(42), Some(2), &options, SECOND_BOOT)?;
+        assert!(firmware.bless(fake.esp.path(), &trial, &base).is_err());
+        // The fallback is no longer the firmware default.
+        let firmware = fake.firmware(&[42, 1], None, Some(2), &options, SECOND_BOOT)?;
+        assert!(firmware.bless(fake.esp.path(), &trial, &base).is_err());
+        // A changed option is not trusted.
+        let firmware = fake.firmware(&[1, 42], None, Some(2), &options, SECOND_BOOT)?;
+        fake.set(&option_name(2), &load_option(&device(), BASE)?)?;
+        assert!(firmware.bless(fake.esp.path(), &trial, &base).is_err());
+        assert_eq!(boot_order()?, [1, 42]);
+        assert_eq!(
+            fake.records()?,
+            [format!("{BASE}.conf"), format!("{TRIAL}+1.conf")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_cancels_a_scheduled_trial_and_keeps_the_default() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let base = fake.record(BASE, "")?;
+        let trial = fake.record(TRIAL, "+1")?;
+        let entries = [base, trial];
+        let firmware = fake.firmware(
+            &[1, 42],
+            Some(2),
+            Some(1),
+            &[(1, BASE), (2, TRIAL)],
+            FIRST_BOOT,
+        )?;
+        firmware.rollback(fake.esp.path(), BASE, &entries)?;
+        assert_eq!(boot_number("BootNext")?, None);
+        assert_eq!(boot_order()?, [1, 42]);
+        assert_eq!(
+            fake.records()?,
+            [format!("{BASE}.conf"), format!("{TRIAL}+0.conf")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_from_a_running_trial_marks_it_failed() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let base = fake.record(BASE, "")?;
+        let trial = fake.record(TRIAL, "+1")?;
+        let entries = [base, trial];
+        let firmware = fake.firmware(
+            &[1, 42],
+            None,
+            Some(2),
+            &[(1, BASE), (2, TRIAL)],
+            SECOND_BOOT,
+        )?;
+        firmware.rollback(fake.esp.path(), BASE, &entries)?;
+        assert_eq!(boot_order()?, [1, 42]);
+        assert_eq!(
+            fake.records()?,
+            [format!("{BASE}.conf"), format!("{TRIAL}+0.conf")]
+        );
+        // An unrelated BootNext is never cancelled.
+        let fake = FakeFirmware::new()?;
+        let entries = [fake.record(BASE, "")?, fake.record(TRIAL, "+1")?];
+        let firmware = fake.firmware(
+            &[1, 42],
+            Some(42),
+            Some(1),
+            &[(1, BASE), (2, TRIAL)],
+            FIRST_BOOT,
+        )?;
+        assert!(firmware.rollback(fake.esp.path(), BASE, &entries).is_err());
+        assert_eq!(boot_number("BootNext")?, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn removal_drops_only_an_unselected_cps_option() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let firmware = fake.firmware(
+            &[1, 2, 42],
+            None,
+            Some(1),
+            &[(1, BASE), (2, TRIAL)],
+            FIRST_BOOT,
+        )?;
+        assert!(firmware.remove(BASE).is_err());
+        firmware.remove(TRIAL)?;
+        assert_eq!(boot_order()?, [1, 42]);
+        assert_eq!(variable(&option_name(2))?, None);
+        assert!(variable(&option_name(1))?.is_some());
+        // A third-party option that boots the same UKI blocks removal.
+        let fake = FakeFirmware::new()?;
+        let mut firmware =
+            fake.firmware(&[1], None, Some(1), &[(1, BASE), (2, TRIAL)], FIRST_BOOT)?;
+        let mut copy = load_option(&device(), TRIAL)?;
+        copy[6] ^= 1; // Another description.
+        firmware.options.insert(9, copy);
+        assert!(firmware.remove(TRIAL).is_err());
+        assert!(variable(&option_name(2))?.is_some());
+        Ok(())
     }
 
     #[test]
