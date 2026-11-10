@@ -730,6 +730,9 @@ mod tests {
             upstream_version: None,
             architecture: None,
             summary: None,
+            license: None,
+            homepage: None,
+            source_url: None,
             dependency: requires
                 .iter()
                 .map(|package| {

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::file_caps::FileCapabilities;
 
+mod metadata;
 mod selection;
 mod version;
 
@@ -622,6 +623,15 @@ pub struct Manifest {
     pub architecture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// An SPDX license expression for the packaged content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// The upstream project's HTTPS home page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// Where the upstream source release can be downloaded over HTTPS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
     #[serde(default)]
     pub dependency: Vec<Dependency>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -728,6 +738,15 @@ impl Manifest {
         }
         if let Some(summary) = &self.summary {
             validate_summary(summary)?;
+        }
+        if let Some(license) = &self.license {
+            metadata::validate_license(license)?;
+        }
+        if let Some(homepage) = &self.homepage {
+            metadata::validate_https_url(homepage).context("invalid homepage")?;
+        }
+        if let Some(source_url) = &self.source_url {
+            metadata::validate_https_url(source_url).context("invalid source-url")?;
         }
         for name in self.provides.keys() {
             validate_capability(name)?;
