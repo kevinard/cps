@@ -1573,6 +1573,12 @@ pub(crate) fn trust_root_keys(pinned: &[u8]) -> Result<Vec<PublicKey>> {
     Ok(trust::pinned_keys(pinned)?.into_iter().collect())
 }
 
+/// The publisher that a pinned trust root, already read with
+/// [`read_trust_root`], belongs to.
+pub(crate) fn trust_root_publisher(pinned: &[u8]) -> Result<String> {
+    Ok(trust::Pinned::parse(pinned)?.root().publisher.clone())
+}
+
 fn parse_public_key(bytes: &[u8]) -> Result<&[u8]> {
     // SubjectPublicKeyInfo for Ed25519, as emitted by openssl pkey -pubout -outform DER.
     const PREFIX: &[u8] = b"\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00";

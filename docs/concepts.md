@@ -61,7 +61,8 @@ separately which build workers they trust.
 
 Across many recipes, `cps build-order` prints the order in which to build
 them, `cps rebuild-plan` lists what to rebuild after packages change, and
-`cps recipe repin` moves recipes to new toolchain catalogs.
+`cps recipe repin` refreshes the toolchain, template, and source digests
+that recipes pin.
 
 [Pinned builds](maintainer/builds.md) ·
 [Several packages from one recipe](maintainer/builds.md#building-several-packages-from-one-recipe) ·

@@ -78,11 +78,36 @@ before=$(cat recipes/tool/tool.build.kdl)
 "$cps" recipe repin --dry-run --toolchain-catalog "seed=$one" recipes > dry.txt
 test "$(grep -c '^would repin ' dry.txt)" = 4
 test "$(cat recipes/tool/tool.build.kdl)" = "$before"
+if "$cps" recipe repin --check --toolchain-catalog "seed=$one" recipes > stale.txt 2> stale.log; then
+    echo 'repin --check accepted stale toolchain pins' >&2
+    exit 1
+fi
+test "$(grep -c '^stale ' stale.txt)" = 4
+grep -F '4 pin(s) in 4 recipe(s) are stale' stale.log
+test "$(cat recipes/tool/tool.build.kdl)" = "$before"
 "$cps" recipe repin --toolchain-catalog "seed=$one" recipes > repinned.txt
 test "$(cat recipes/tool/tool.build.kdl)" = "${before//$zero\" key/$one\" key}"
-grep -Fx "repinned recipes/tool/tool.build.kdl seed $zero -> $one (recipe sha256 $(sha recipes/tool/tool.build.kdl))" repinned.txt
+grep -Fx "repinned recipes/tool/tool.build.kdl toolchain seed catalog $zero -> $one" repinned.txt
+grep -Fx "recipe recipes/tool/tool.build.kdl sha256 $(sha recipes/tool/tool.build.kdl)" repinned.txt
 "$cps" recipe repin --toolchain-catalog "seed=$one" recipes > again.txt
 test ! -s again.txt
+"$cps" recipe repin --check --toolchain-catalog "seed=$one" recipes
+
+# A trust root sets key-sha256 for the publisher it names, and a manifest
+# edit is repinned from the template next to its recipe.
+openssl genpkey -algorithm ED25519 -outform DER -out seed.der
+"$cps" repo trust init --repo seed-repo --publisher seed --key seed.der >/dev/null
+seed_key=$(sha seed-repo/trust/1.json)
+old_manifest=$(sha recipes/tool/tool.kdl)
+sed -i 's/^package "devel\/tool" publisher="canopa"/& summary="Tool"/' recipes/tool/tool.kdl
+"$cps" recipe repin --trust-root seed-repo/trust/1.json --manifests recipes > keyed.txt
+grep -Fx "repinned recipes/tool/tool.build.kdl toolchain seed key-sha256 $zero -> $seed_key" keyed.txt
+grep -Fx "repinned recipes/tool/tool.build.kdl manifest tool.kdl sha256 $old_manifest -> $(sha recipes/tool/tool.kdl)" keyed.txt
+test "$(grep -c ' key-sha256 ' keyed.txt)" = 4
+test "$(grep -c ' manifest ' keyed.txt)" = 1
+grep -F "key-sha256=\"$seed_key\" // seed toolchain" recipes/app/app.build.kdl
+"$cps" recipe repin --check --trust-root seed-repo/trust/1.json --manifests \
+    --toolchain-catalog "seed=$one" recipes
 
 # A soname bump breaks the consumers of the removed soname, and every
 # direct dependent of the changed package is listed for a rebuild.
@@ -134,4 +159,4 @@ mv repo/manifests manifests
 "$cps" rebuild-plan --config image.kdl --catalog "canopa=$(cat repo/current)" \
     --changed lib/foo@2.0.0-0 > summary-plan.txt
 grep -Fx 'breaks cps://canopa/apps/app@1.0.0-0' summary-plan.txt
-echo 'Verified recipe build order, cycle reports, toolchain repinning, and soname rebuild plans'
+echo 'Verified recipe build order, cycle reports, pin refreshes and checks, and soname rebuild plans'
