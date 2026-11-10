@@ -8,6 +8,7 @@ mod git_install;
 mod image;
 mod kdl_format;
 mod model;
+pub mod orchestrate;
 mod plan;
 pub mod query;
 mod repo;

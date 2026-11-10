@@ -20,6 +20,10 @@ reviews the resulting package and controls admission to a signed catalog.
 5. Send the reviewed recipe and bundle to the publisher.
    [Publication policy](../publisher/publishing.md#publishing-policy)
 
+When you maintain many recipes, order their builds, list the rebuilds that
+a soname bump requires, and move them to a new toolchain catalog together.
+[Plan builds across recipes](orchestration.md)
+
 For projects users install directly from a Git commit or branch, put a
 combined package manifest and build recipe at the repository root.
 [Package a project for Git installation](git.md)
