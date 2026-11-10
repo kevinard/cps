@@ -449,16 +449,32 @@ else
     mkdir runtime/dev
     # Every environment mounts the same /var subvolume, as an installed system does.
     printf 'PARTUUID=%s /var btrfs subvol=/@var 0 0\n' "$root_uuid" > runtime/etc/fstab
+    # The guest BusyBox has no mount applet.
+    mkdir -p runtime/usr/libexec
+    env -u LD_LIBRARY_PATH -u LD_PRELOAD cc -O2 -Wall -Wextra -Werror -static -x c \
+        -o runtime/usr/libexec/cps-vm-mount-var - <<'C'
+#include <stdio.h>
+#include <sys/mount.h>
+
+int main(void)
+{
+    if (mount("/dev/vda2", "/var", "btrfs", 0, "subvol=/@var") != 0) {
+        perror("mounting /var");
+        return 1;
+    }
+    return 0;
+}
+C
     cat > runtime/init <<'GUEST'
 #!/bin/busybox sh
 set -e
 [ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
 state=$(/bin/busybox cat /etc/cps-vm-boot-state)
 printf 'CPS_VM_BOOT: %s\n' "$state"
-/bin/busybox mount -t btrfs -o rw,subvol=/@var /dev/vda2 /var
+/usr/libexec/cps-vm-mount-var
 printf '%s\n' "$state" >> /var/cps-vm-boots
 /bin/busybox sync
-printf 'CPS_VM_VAR: %s\n' "$(/bin/busybox tr '\n' ' ' < /var/cps-vm-boots)"
+printf 'CPS_VM_VAR: %s\n' "$(/bin/busybox paste -s -d ' ' /var/cps-vm-boots)"
 /bin/busybox umount /var
 if [ -f /etc/cps-vm-assert-kernel ]; then
     printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$(/bin/busybox uname -r)"
@@ -1132,7 +1148,7 @@ fi
 if [[ $mode == fallback || $mode == kernel-upgrade ]]; then
     # The fallback still sees what the failed trial's boots wrote to /var.
     shared=$(tr -d '\r' < serial.log | grep '^CPS_VM_VAR: ' | tail -1)
-    if [[ $shared != 'CPS_VM_VAR: trial trial previous ' ]]; then
+    if [[ $shared != 'CPS_VM_VAR: trial trial previous' ]]; then
         printf 'Expected the trial and its fallback to share /var, got: %s\n' "$shared" >&2
         exit 1
     fi
