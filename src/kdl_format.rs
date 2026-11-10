@@ -17,6 +17,7 @@ use crate::{
     },
     repo::read_limited,
     systemd::Action as SystemdAction,
+    triggers::Trigger,
 };
 
 pub(crate) mod boot_export;
@@ -249,6 +250,7 @@ pub(crate) fn parse_package(
         action: Vec::new(),
         mediated_links: BTreeMap::new(),
         systemd: Vec::new(),
+        triggers: Vec::new(),
         kernel: None,
         requires_reboot: fields
             .properties
@@ -307,16 +309,18 @@ pub(crate) fn parse_package(
                     "duplicate mediation for {path}"
                 );
             }
-            "sysusers" | "tmpfiles" | "preset" | "hwdb" => {
+            "sysusers" | "tmpfiles" | "preset" => {
                 let value = Fields::read(node, 1, &[], false)?.string_arg(0)?;
                 let action = match name {
                     "sysusers" => SystemdAction::Sysusers(value),
                     "tmpfiles" => SystemdAction::Tmpfiles(value),
-                    "hwdb" => SystemdAction::Hwdb(value),
                     _ => SystemdAction::Preset(value),
                 };
                 manifest.systemd.push(action);
             }
+            "trigger" => manifest
+                .triggers
+                .push(parse_trigger(node).with_context(|| format!("{name} declaration"))?),
             "kernel-install" => {
                 ensure!(manifest.kernel.is_none(), "duplicate kernel-install node");
                 let fields = Fields::read(node, 1, &["initrd"], false)?;
@@ -335,6 +339,68 @@ pub(crate) fn parse_package(
         }
     }
     Ok((manifest, declared))
+}
+
+fn parse_trigger(node: &KdlNode) -> Result<Trigger> {
+    let nodes =
+        std::iter::once(node).chain(node.children().into_iter().flat_map(KdlDocument::nodes));
+    for node in nodes {
+        for key in node.entries().iter().filter_map(|entry| entry.name()) {
+            let key = key.value();
+            ensure!(
+                !matches!(key, "facet" | "arch") && !key.starts_with(VARIANT_PREFIX),
+                "triggers cannot carry {key} selectors: a trigger follows the selection of its handler file"
+            );
+        }
+    }
+    let fields = Fields::read(node, 1, &["timeout"], true)?;
+    let mut trigger = Trigger {
+        name: fields.string_arg(0)?,
+        handler: None,
+        args: Vec::new(),
+        watch: Vec::new(),
+        outputs: Vec::new(),
+        reload: Vec::new(),
+        restart: Vec::new(),
+        timeout: fields.integer("timeout")?,
+    };
+    for child in node.children().into_iter().flat_map(KdlDocument::nodes) {
+        let name = child.name().value();
+        if name == "run" {
+            ensure!(trigger.handler.is_none(), "duplicate run node");
+            ensure!(
+                child.ty().is_none() && child.children().is_none(),
+                "run takes only positional arguments"
+            );
+            let mut values = Vec::new();
+            for entry in child.entries() {
+                ensure!(
+                    entry.ty().is_none() && entry.name().is_none(),
+                    "run takes only positional arguments"
+                );
+                values.push(
+                    entry
+                        .value()
+                        .as_string()
+                        .context("run arguments must be strings")?
+                        .to_owned(),
+                );
+            }
+            let mut values = values.into_iter();
+            trigger.handler = Some(values.next().context("run needs a handler path")?);
+            trigger.args = values.collect();
+            continue;
+        }
+        let values = match name {
+            "watch" => &mut trigger.watch,
+            "output" => &mut trigger.outputs,
+            "reload" => &mut trigger.reload,
+            "restart" => &mut trigger.restart,
+            _ => bail!("unknown trigger node {name}"),
+        };
+        values.push(Fields::read(child, 1, &[], false)?.string_arg(0)?);
+    }
+    Ok(trigger)
 }
 
 fn parse_target(node: &KdlNode) -> Result<DependencyTarget> {
@@ -647,6 +713,36 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     for effect in &manifest.systemd {
         let mut node = KdlNode::new(effect.kind());
         node.push(effect.name());
+        children.push(node);
+    }
+    for trigger in &manifest.triggers {
+        let mut node = KdlNode::new("trigger");
+        node.push(trigger.name.as_str());
+        if let Some(timeout) = trigger.timeout {
+            node.insert("timeout", i128::from(timeout));
+        }
+        let mut block = KdlDocument::new();
+        if let Some(handler) = &trigger.handler {
+            let mut run = KdlNode::new("run");
+            run.push(handler.as_str());
+            for arg in &trigger.args {
+                run.push(arg.as_str());
+            }
+            block.nodes_mut().push(run);
+        }
+        for (kind, values) in [
+            ("watch", &trigger.watch),
+            ("output", &trigger.outputs),
+            ("reload", &trigger.reload),
+            ("restart", &trigger.restart),
+        ] {
+            for value in values {
+                let mut child = KdlNode::new(kind);
+                child.push(value.as_str());
+                block.nodes_mut().push(child);
+            }
+        }
+        node.set_children(block);
         children.push(node);
     }
     if let Some(kernel) = &manifest.kernel {

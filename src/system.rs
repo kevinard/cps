@@ -184,6 +184,12 @@ impl Change {
             .systemd
             .iter()
             .map(|action| format!("Run systemd {} for {}", action.kind(), action.name()))
+            .chain(
+                self.plan
+                    .triggers
+                    .iter()
+                    .map(|trigger| format!("Run trigger {}", trigger.label())),
+            )
             .collect::<Vec<_>>();
         if self.boot_reason.is_none()
             && let Some(services) = &self.live_services

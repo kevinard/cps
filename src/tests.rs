@@ -4299,6 +4299,7 @@ mod release;
 mod facets;
 mod freezes;
 mod modes;
+mod triggers;
 
 #[test]
 fn compares_independent_committed_roots_without_the_repository() -> Result<()> {

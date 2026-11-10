@@ -368,11 +368,17 @@ fn check_state(
     }
     if pristine {
         let aliases = hardlink_groups(&expected);
+        // Triggers own what their output patterns cover, and their contents
+        // are not part of any manifest.
+        let generated = crate::triggers::active_outputs(&state.installed, &expected);
         root.walk(Some(crate::image::STATE_DIRECTORY), |path, entry, info| {
             let kind = FileType::from_raw_mode(info.st_mode);
             let Some(managed) = expected.get(path) else {
                 if kind == FileType::Directory && crate::image::STATE_ANCESTORS.contains(&path) {
                     return Ok(true);
+                }
+                if crate::triggers::generated(&generated, path) {
+                    return Ok(false);
                 }
                 findings.push(Finding {
                     is_error: true,

@@ -23,7 +23,7 @@ use super::{
     cgroup::{self, Cgroup},
 };
 
-fn filter(terminal: bool) -> Result<File> {
+pub(crate) fn filter(terminal: bool) -> Result<File> {
     let mut rules = ScmpFilterContext::new(ScmpAction::Allow)?;
     let denied = ScmpAction::Errno(libc::EPERM);
     for syscall in ["socket", "socketpair"] {

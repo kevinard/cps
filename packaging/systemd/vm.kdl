@@ -3,8 +3,10 @@ package "system/systemd-vm" publisher="canopa-systemd" version="262.1.0-0" {
     require "system/elf-runtime"
     require "system/libseccomp" version=">=2.6.1-0"
     require "system/systemd-vm-libs"
+    dir "etc/udev" mode="0755" uid=0 gid=0
     file "usr/bin/kernel-install" mode="0755" uid=0 gid=0
     file "usr/bin/systemctl" mode="0755" uid=0 gid=0
+    file "usr/bin/systemd-hwdb" mode="0755" uid=0 gid=0
     file "usr/bin/systemd-sysusers" mode="0755" uid=0 gid=0
     file "usr/bin/systemd-tmpfiles" mode="0755" uid=0 gid=0
     file "usr/lib/kernel/install.d/90-loaderentry.install" mode="0755" uid=0 gid=0
@@ -29,4 +31,9 @@ package "system/systemd-vm" publisher="canopa-systemd" version="262.1.0-0" {
     file "usr/lib/systemd/system/systemd-bless-boot.service" mode="0644" uid=0 gid=0
     file "usr/lib/systemd/system/timers.target" mode="0644" uid=0 gid=0
     file "usr/share/licenses/systemd-vm/LGPL-2.0-or-later.txt" mode="0644" uid=0 gid=0
+    trigger "hwdb" {
+        run "usr/bin/systemd-hwdb" "--strict" "update"
+        watch "usr/lib/udev/hwdb.d/*.hwdb"
+        output "etc/udev/hwdb.bin"
+    }
 }

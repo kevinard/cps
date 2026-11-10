@@ -668,6 +668,8 @@ pub struct Manifest {
     pub mediated_links: BTreeMap<String, MediatedLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub systemd: Vec<crate::systemd::Action>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<crate::triggers::Trigger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<crate::boot::kernel::Kernel>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -882,6 +884,40 @@ impl Manifest {
                 effect.name()
             );
             self.require_immutable_file(&effect.path(), effect.kind())?;
+        }
+        let mut triggers = BTreeSet::new();
+        for trigger in &self.triggers {
+            trigger.validate()?;
+            ensure!(
+                triggers.insert(&trigger.name),
+                "duplicate trigger {}",
+                trigger.name
+            );
+            if let Some(handler) = &trigger.handler {
+                self.require_immutable_file(handler, "trigger")?;
+                ensure!(
+                    self.action.iter().all(|action| match action {
+                        Action::File { path, mode, .. } if path == handler =>
+                            parse_mode(mode).is_ok_and(|mode| mode & 0o111 != 0),
+                        _ => true,
+                    }),
+                    "trigger {} handler {handler} must be executable",
+                    trigger.name
+                );
+            }
+            for action in &self.action {
+                if let Some(output) = trigger
+                    .outputs
+                    .iter()
+                    .find(|output| crate::triggers::covers(output, action.path()))
+                {
+                    bail!(
+                        "trigger {} output {output} covers the packaged path {}",
+                        trigger.name,
+                        action.path()
+                    );
+                }
+            }
         }
         if let Some(kernel) = &self.kernel {
             kernel.validate()?;

@@ -7,7 +7,7 @@ RUN printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/11/03/$repo
         'd878496b074f4d0e946de0216d0fe00f5bc70ac34bbb16025bd57191affce57e  /var/lib/pacman/sync/core.db' \
         '1848ec50754657edf473b42680099511ba244671f9e008d780e7c82e33911198  /var/lib/pacman/sync/extra.db' \
         | sha256sum --check \
-    && pacman -Su --noconfirm --needed attr curl dosfstools e2fsprogs git jq libseccomp \
+    && pacman -Su --noconfirm --needed attr bubblewrap curl dosfstools e2fsprogs git jq libseccomp \
         mtools openssl python ripgrep sqlite systemd util-linux \
     && rm -f /var/cache/pacman/pkg/*
 
