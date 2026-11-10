@@ -107,7 +107,7 @@ def manifest_text(number, version, model, files, uid, gid, payloads=None):
     for capability in provides:
         lines.append(f'    provides "{capability}"\n')
     for index in range(files):
-        path = f"usr/share/bench/pkg-{number:06}/file-{index:03}"
+        path = f"usr/share/bench/pkg-{number:06}/pkg-{number:06}-{index:03}"
         extra = ""
         if payloads is not None:
             sha256, size = payloads
@@ -207,10 +207,10 @@ def main():
         for number in numbers:
             directory = proto / f"usr/share/bench/pkg-{number:06}"
             directory.mkdir(parents=True)
-            first = directory / "file-000"
+            first = directory / f"pkg-{number:06}-000"
             first.write_bytes(payload(number, version))
             for index in range(1, options.files):
-                os.link(first, directory / f"file-{index:03}")
+                os.link(first, directory / f"pkg-{number:06}-{index:03}")
             path = manifests / f"{number:06}-{version}.kdl"
             path.write_text(manifest_text(number, version, model, options.files, uid, gid))
             paths.append(path)
@@ -250,8 +250,8 @@ def main():
         "install", package_name(options.packages), label="plan_install_after_publish")
 
     run("verify", "--root", "image", "--pristine", label="verify_offline")
-    lookup = ("search", "--root", "image", "--file",
-              f"/usr/share/bench/pkg-{workload:06}/file-000")
+    # Every file has a distinct basename, as most distribution files do.
+    lookup = ("search", "--root", "image", "--file", f"pkg-{workload:06}-000")
     run(*lookup, label="file_search_manifests")
     run("repo", "index-files", "--repo", "repo", "--publisher", PUBLISHER,
         "--signing-key", "private.der", label="publish_file_index")
