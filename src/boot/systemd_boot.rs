@@ -441,6 +441,58 @@ pub(super) fn with_running_environment<T>(
     action(running, id, revision)
 }
 
+/// A trial selected for the next boot whose fallback is the running root.
+pub(crate) struct PendingTrial {
+    pub id: String,
+    pub parent: String,
+    pub root: Root,
+}
+
+/// The trial that the next boot starts in place of the running root, if any.
+pub(super) fn pending_trial(
+    volume: &BtrfsVolume,
+    esp: &Path,
+    partuuid: Option<&str>,
+) -> Result<Option<PendingTrial>> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let lock = lock_esp(&esp, FlockOperation::LockShared)?;
+    let root = volume.boot_root(partuuid)?;
+    volume.check_boot_device(&esp, &lock, &root)?;
+    let Some((running, _)) = volume.running()? else {
+        return Ok(None);
+    };
+    let Inventory {
+        policy, entries, ..
+    } = inventory(&esp, &lock, false)?;
+    let Some(trial) = policy
+        .as_ref()
+        .and_then(|policy| policy.selected(&entries))
+        .filter(|entry| entry.tries.is_some_and(|tries| tries > 0))
+    else {
+        return Ok(None);
+    };
+    if trial.parent.as_deref() != Some(running.as_str()) {
+        return Ok(None);
+    }
+    let record = trial
+        .btrfs
+        .as_ref()
+        .context("expected a registered Btrfs trial")?;
+    if trial.root != root {
+        volume.check_boot_device(&esp, &lock, &trial.root)?;
+    }
+    let trial_root = volume.open_registered(record, &trial.id)?;
+    ensure!(
+        !same_root(&trial_root, &Root::open(Path::new("/"))?)?,
+        "the pending trial is the running root"
+    );
+    Ok(Some(PendingTrial {
+        id: trial.id.clone(),
+        parent: running,
+        root: trial_root,
+    }))
+}
+
 pub struct Activation<R = String> {
     /// Btrfs activation accepts `None` to boot by filesystem UUID.
     pub root_partuuid: R,

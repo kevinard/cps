@@ -500,6 +500,14 @@ pub(crate) fn with_running_environment<T>(
     systemd_boot::with_running_environment(&volume, esp, partuuid, action)
 }
 
+pub(crate) fn pending_trial(
+    volume: &Path,
+    esp: &Path,
+    partuuid: Option<&str>,
+) -> Result<Option<systemd_boot::PendingTrial>> {
+    systemd_boot::pending_trial(&BtrfsVolume::open(volume)?, esp, partuuid)
+}
+
 fn filesystem_info(root: &Root) -> Result<FsInfo> {
     ensure!(
         fstatfs(root.as_file())?.f_type == libc::BTRFS_SUPER_MAGIC,

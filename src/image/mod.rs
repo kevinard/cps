@@ -1126,6 +1126,42 @@ impl Image {
         Ok(settings)
     }
 
+    /// Record pending configuration updates at the current revision for
+    /// preserved files whose vendor copies are already in place.
+    pub(crate) fn add_config_updates(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.require_clean()?;
+        let mut settings = self.settings()?;
+        let revision = settings.revision;
+        ensure!(revision > 0, "no revision for configuration updates");
+        for path in paths {
+            crate::model::validate_path(path)?;
+            ensure!(
+                self.managed_path(path)?
+                    .is_some_and(|managed| managed.preserve),
+                "{path} is not preserved configuration"
+            );
+            settings.config_updates.insert(path.clone(), revision);
+        }
+        self.db.execute(
+            "UPDATE image SET data=?1 WHERE id=1",
+            [serde_json::to_string(&settings)?],
+        )?;
+        Ok(())
+    }
+
+    /// Open an image root exclusively without the package-write checks.
+    pub(crate) fn open_exclusive_root(root: Root) -> Result<Self> {
+        Self::open_database(
+            root,
+            true,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            false,
+        )
+    }
+
     pub fn stage(&self) -> Result<Root> {
         self.state_dir.subdir("stage")
     }

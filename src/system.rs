@@ -17,13 +17,15 @@ use crate::{
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
     apply::{PublisherFetchError, abort_live, apply_live, repair_pending_live, resume_live},
     boot::{
-        discard_btrfs_trial, entry_id, prune_btrfs_boot_environments, stage_running_btrfs,
+        discard_btrfs_trial, entry_id, etc_merge, pending_trial,
+        prune_btrfs_boot_environments, rollback_btrfs_boot_environment, stage_running_btrfs,
         with_running_environment,
     },
     fetch_plan,
     git_install::{GitBuild, GitSource, GitStore},
     image::Image,
     image::publishers::register_git_publisher,
+    image::root::Root,
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
@@ -37,11 +39,14 @@ use crate::{
     transaction_progress,
 };
 
-pub use crate::boot::{BootPruneReport, BootRemoval, TrialDiscard};
+pub use crate::boot::{BootPruneReport, BootRemoval, EtcConflict, EtcMergeReport, TrialDiscard};
 pub use crate::git_install::{GitChange, GitSignatures, GitSignedObject};
 pub use crate::plan::HeldBackUpdate;
 
 pub const CONFIG: &str = "/etc/cps/image.kdl";
+/// Starts `cps-finalize-trial.service`, whose stop merges /etc into the
+/// pending trial at shutdown. It lives in /run, so it lasts for one boot.
+pub const FINALIZE_FLAG: &str = "/run/cps/finalize-trial";
 const ROOT: &str = "/";
 const GIT_TOOLCHAIN: &str = "/usr/share/cps/git-build/toolchain.kdl";
 
@@ -62,6 +67,19 @@ impl std::fmt::Display for RetryBaseOnly {
 }
 
 impl std::error::Error for RetryBaseOnly {}
+
+/// The result of `cps boot-env finalize-trial`.
+#[derive(Debug)]
+pub enum Finalized {
+    /// No trial is selected to replace the running root at the next boot.
+    NoTrial,
+    /// The trial was staged without a merge base, so its /etc stays as staged.
+    NoBase { trial: String },
+    Merged {
+        trial: String,
+        report: EtcMergeReport,
+    },
+}
 
 pub struct Change {
     plan: Plan,
@@ -589,6 +607,9 @@ impl System {
         }
         let boot = self.boot();
         if change.boot_reason.is_none() {
+            if let Err(error) = etc_merge::remove_leftovers(&Root::open(Path::new(ROOT))?) {
+                eprintln!("Warning: could not remove /etc merge leftovers: {error:#}");
+            }
             with_running_environment(
                 &boot.volume,
                 &boot.esp,
@@ -618,8 +639,69 @@ impl System {
                 .activate_btrfs(&root, &boot.volume, &boot.esp)
         }
         .with_context(|| format!("activating the prepared environment at {}", root.display()))?;
+        arm_finalize();
         self.prune_after_transaction();
         Ok(Some(id))
+    }
+
+    /// Merge the running /etc into the trial selected for the next boot.
+    ///
+    /// A failed merge leaves the trial's /etc as staged and cancels the
+    /// trial, so the next boot keeps every local change. Callers hold the
+    /// environments lock.
+    pub fn finalize_trial(&self) -> Result<Finalized> {
+        let boot = self.boot();
+        if let Err(error) = etc_merge::remove_leftovers(&Root::open(Path::new(ROOT))?) {
+            eprintln!("Warning: could not remove /etc merge leftovers: {error:#}");
+        }
+        let Some(trial) = pending_trial(
+            &boot.volume,
+            &boot.esp,
+            boot.activation.root_partuuid.as_deref(),
+        )?
+        else {
+            return Ok(Finalized::NoTrial);
+        };
+        let (id, parent) = (trial.id, trial.parent);
+        let merged = (|| {
+            let image = Image::open_exclusive_root(trial.root)?;
+            etc_merge::finalize(&image, &Root::open(Path::new(ROOT))?)
+        })();
+        match merged {
+            Ok(Some(report)) => Ok(Finalized::Merged { trial: id, report }),
+            Ok(None) => Ok(Finalized::NoBase { trial: id }),
+            Err(error) => {
+                let cancelled =
+                    rollback_btrfs_boot_environment(&boot.esp, &boot.volume, Some(&parent));
+                Err(match cancelled {
+                    Ok(_) => error.context(format!(
+                        "merging /etc into trial {id} failed. CPS cancelled the trial, so the \
+                         next boot starts {parent} with every local change. Correct the \
+                         cause, then stage the change again"
+                    )),
+                    Err(cancel) => error.context(format!(
+                        "merging /etc into trial {id} failed, and cancelling the trial also \
+                         failed ({cancel:#}). The next boot starts the trial without the local \
+                         changes made since staging; cancel it with `cps boot-env \
+                         discard-trial` to keep them"
+                    )),
+                })
+            }
+        }
+    }
+
+    /// Start the shutdown merge for a trial pending from an earlier boot.
+    pub fn arm_finalize(&self) -> Result<Option<String>> {
+        let boot = self.boot();
+        let trial = pending_trial(
+            &boot.volume,
+            &boot.esp,
+            boot.activation.root_partuuid.as_deref(),
+        )?;
+        Ok(trial.map(|trial| {
+            arm_finalize();
+            trial.id
+        }))
     }
 
     /// Stage a recovery plan and verify the result before returning its root.
@@ -993,6 +1075,18 @@ impl System {
             }
         }
         Ok(())
+    }
+}
+
+/// Ask systemd to merge /etc into the activated trial at shutdown.
+fn arm_finalize() {
+    let result = fs::create_dir_all("/run/cps").and_then(|()| fs::write(FINALIZE_FLAG, b""));
+    if let Err(error) = result {
+        eprintln!(
+            "Warning: could not request the /etc merge at shutdown ({FINALIZE_FLAG}: {error}). \
+             Run `cps boot-env finalize-trial --arm`, or local changes made before the reboot \
+             stay out of the trial"
+        );
     }
 }
 

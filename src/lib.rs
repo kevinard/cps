@@ -24,14 +24,15 @@ pub use apply::{
     resume_transaction, transaction_progress, transaction_status, validate_plan,
 };
 pub use boot::{
-    Activation, BootEnvironment, RootDeployment, activate_boot_environment,
-    activate_boot_environment_on_disk, activate_btrfs_boot_environment,
+    Activation, BootEnvironment, EtcConflict, EtcMergeReport, RootDeployment,
+    activate_boot_environment, activate_boot_environment_on_disk, activate_btrfs_boot_environment,
     activate_deployed_boot_environment, activate_device_boot_environment, capture_boot_environment,
     deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
-    export_boot_environment, export_boot_environment_receipt, list_boot_environments,
-    list_boot_environments_on_disk, prepare_boot_environment, preview_btrfs_rollback,
-    rollback_boot_environment, rollback_boot_environment_on_disk, rollback_btrfs_boot_environment,
-    stage_boot_environment, stage_btrfs_boot_environment,
+    export_boot_environment, export_boot_environment_receipt, last_etc_merge,
+    list_boot_environments, list_boot_environments_on_disk, prepare_boot_environment,
+    preview_btrfs_rollback, rollback_boot_environment, rollback_boot_environment_on_disk,
+    rollback_btrfs_boot_environment, saved_etc_versions, stage_boot_environment,
+    stage_btrfs_boot_environment,
 };
 pub use build::{
     BuildOptions, BuildSettings, BuildToolchain, BuildWorker, GitSnapshotRef, SourceLayout, build,

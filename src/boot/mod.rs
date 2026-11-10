@@ -3,6 +3,7 @@ mod btrfs_boot;
 mod deploy;
 mod device;
 mod esp;
+pub(crate) mod etc_merge;
 mod export;
 pub(crate) mod kernel;
 mod systemd_boot;
@@ -33,16 +34,22 @@ use crate::{
     verify::verify_image,
 };
 
-pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub(crate) use btrfs::{excluded_subvolumes, stage_running_btrfs};
+pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub use btrfs_boot::{
     activate_btrfs_boot_environment, preview_btrfs_rollback, rollback_btrfs_boot_environment,
 };
-pub(crate) use btrfs_boot::{bless_uefi, with_registered_images, with_running_environment};
+pub(crate) use btrfs_boot::{
+    bless_uefi, pending_trial, with_registered_images, with_running_environment,
+};
 pub use deploy::deploy_boot_environment;
 pub use esp::{
     activate_boot_environment_on_disk, deploy_and_activate_boot_environment,
     list_boot_environments_on_disk, rollback_boot_environment_on_disk,
+};
+pub use etc_merge::{
+    EtcConflict, EtcMergeReport, last_report as last_etc_merge,
+    saved_versions as saved_etc_versions,
 };
 pub use export::{export_boot_environment, export_boot_environment_receipt};
 pub use systemd_boot::{
@@ -197,6 +204,8 @@ fn check_staging_plan(base: &Image, plan: &Plan) -> Result<()> {
 }
 
 fn finish_staged_root(staged: &Path, previous: BootParent, plan: &Plan) -> Result<String> {
+    // The new root's /etc before the plan is the base of the merge at shutdown.
+    etc_merge::record_base(&Root::open(staged)?)?;
     apply(staged, plan).context("applying the plan in the staged root")?;
     let image = Image::open(staged, true)?;
     check_image_integrity(&image)?;
