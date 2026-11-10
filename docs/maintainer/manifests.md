@@ -142,8 +142,10 @@ meaning: version constraints, upgrades, downgrade checks, obsoletion
 cutoffs, and the revisions that Git builds allocate. Identity uses the
 spelling: a package ID, an `@VERSION` selector, a freeze, and a signed
 composition name one exact spelling, so `@2.0.0` and `@2.0.0-0` are distinct
-packages. An upgrade never replaces an installed package with another
-spelling of the same release. Pick one spelling convention, such as always
+packages. A plan never replaces an installed package with another spelling
+of the same release unless an `@VERSION` selector or a freeze names that
+spelling. When the installed package cannot stay, the plan holds back or
+fails instead. Pick one spelling convention, such as always
 writing the revision, and keep it.
 
 ## Dependencies

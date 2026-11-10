@@ -1185,21 +1185,41 @@ fn respelled_releases_satisfy_constraints_but_are_not_upgrades() -> Result<()> {
         packages: vec![name.into()],
     };
     apply(&f.root, &plan(&f.root, install("desktop/plugin"))?)?;
-    f.package(
-        name,
-        "2.0.0-0",
-        f.file(COMPOSITOR, "respelled", "0755", "")?,
-    )?;
+    // The respelling ships its program elsewhere, so it would dodge path
+    // conflicts that rule out the installed package.
+    f.package(name, "2.0.0-0", f.file(LIBRARY, "respelled", "0755", "")?)?;
     let update = plan(&f.root, Request::Update)?;
     assert!(!update.summary().contains(name), "{}", update.summary());
     apply(&f.root, &update)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "installed");
+    // A plugin update that collides with the installed package is held back
+    // rather than satisfied by the respelling.
+    f.package(
+        "desktop/plugin",
+        "2.0.0-0",
+        format!("    require {name:?} version=\">= 2.0.0, <2.0.1\"\n")
+            + &f.file(COMPOSITOR, "plugin", "0755", "")?,
+    )?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(!update.has_changes(), "{}", update.summary());
+    // An installation that rules out the installed package fails the same way.
+    f.package(
+        "desktop/blocker",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "blocker", "0755", "")?,
+    )?;
+    let error = plan(&f.root, install("desktop/blocker")).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("cannot satisfy package constraints"),
+        "{error:#}"
+    );
     // The exact spelling still selects the other package ID deliberately.
     apply(
         &f.root,
         &plan(&f.root, install("desktop/compositor@2.0.0-0"))?,
     )?;
-    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "respelled");
+    assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "respelled");
+    assert!(!f.root.join(COMPOSITOR).exists());
     assert!(verify(&f.root)?.is_empty());
     Ok(())
 }

@@ -85,8 +85,18 @@ pub fn resolve<'a, T, P: PackageInfo + 'a>(
         let previous = installed.get(name);
         if let Some(previous) = previous {
             let old = &previous.published.manifest;
+            // A respelling of the installed release is a different package with
+            // the same meaning. It replaces the installed one only when a pin or
+            // a freeze names its spelling.
+            let named = pinned == Some(version)
+                || available
+                    .freezes
+                    .get(name)
+                    .is_some_and(|freeze| &freeze.version == version);
+            let respelled = old.version.semantic() == version.semantic() && &old.version != version;
             if old.publisher != package.publisher()
                 || (old.version.semantic() > version.semantic() && pinned != Some(version))
+                || (respelled && !named)
             {
                 continue;
             }
@@ -110,14 +120,12 @@ pub fn resolve<'a, T, P: PackageInfo + 'a>(
         let current = installed
             .get(*name)
             .map(|pkg| pkg.published.sha256.as_str());
-        // Prefer the newest release. A respelling of the installed release is
-        // not an upgrade, so the installed package wins a semantic tie.
+        // Prefer the newest release, then the spelling that sorts last.
         versions.sort_by(|a, b| {
             let (a_current, b_current) = (current == Some(a.sha256()), current == Some(b.sha256()));
             (prefer_current && a_current)
                 .cmp(&(prefer_current && b_current))
                 .then_with(|| a.version().semantic().cmp(&b.version().semantic()))
-                .then_with(|| a_current.cmp(&b_current))
                 .then_with(|| a.version().cmp(b.version()))
         });
         versions.reverse();

@@ -35,8 +35,9 @@ in the order epoch, release, and packaging revision, as dpkg does. Omitted
 epochs and revisions count as zero, and digit runs compare numerically, so
 `2.0.0`, `2.0.0-0`, and `0:02.0.0` are the same release and `rc10` follows
 `rc2`. A `~` sorts before anything, and a `-` followed by a letter marks a
-pre-release, so `1.0~rc1` < `1.0-rc1` < `1.0` < `1.0.1`. An update never
-replaces an installed package with another spelling of the same release.
+pre-release, so `1.0~rc1` < `1.0-rc1` < `1.0` < `1.0.1`. A plan never
+replaces an installed package with another spelling of the same release
+unless an `@VERSION` selector or a freeze names that spelling.
 
 The dependency constraints that packages declare, which `cps info` shows,
 use the same comparison: `>=2.0.0-0` accepts `2.0.0`, and `<2.0.0` rejects
