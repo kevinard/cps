@@ -28,9 +28,9 @@ use crate::{
 use super::{
     CATALOG_ROOT_LIMIT, Catalog, CatalogEntry, CatalogPin, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
     MANIFEST_LIMIT, Published, Root, SHARD_LIMIT, SHARD_OBJECTS, Snapshot, catalog_shards,
-    catalog_snapshot, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
-    read_current, read_current_catalog, read_limited, read_package, read_pointer, read_trust_root,
-    rebuild, source_archive, write_atomic,
+    catalog_snapshot, current_trust_root, lock_repo, parse_current, path_present, prepare_objects,
+    read_catalog, read_current, read_current_catalog, read_fresh_catalog, read_limited,
+    read_package, read_pointer, read_trust_root, rebuild, source_archive, write_atomic,
 };
 
 use crate::attestation::ATTESTATION_LIMIT;
@@ -162,13 +162,29 @@ impl Transport for MirrorTransport {
                 return Err(TransportError::new_with_cause(
                     TransportErrorKind::Other,
                     url.as_str(),
-                    std::io::Error::other("TUF metadata exceeds the download limit"),
+                    MetadataTooLarge,
                 ));
             }
             Ok(chunk)
         })))
     }
 }
+
+/// A mirror served TUF metadata larger than any role may be. Like a size
+/// mismatch, this is a verification failure, not an outage.
+#[derive(Debug)]
+struct MetadataTooLarge;
+
+impl std::fmt::Display for MetadataTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TUF metadata exceeds the {ROLE_LIMIT}-byte download limit"
+        )
+    }
+}
+
+impl std::error::Error for MetadataTooLarge {}
 
 fn endpoint(value: &str) -> Result<Url> {
     let url = Url::parse(value)?;
@@ -511,7 +527,10 @@ pub struct PublisherFreshness {
     pub age_seconds: Option<u64>,
     /// Expiry of the trusted TUF timestamp.
     pub metadata_expires: Option<String>,
-    /// The cache is older than the policy allows for deferral, or its age is unknown.
+    /// Expiry of the trust root version the cached current catalog is signed under.
+    pub trust_root_expires: Option<String>,
+    /// The cache is older than the policy allows for deferral, its trust root
+    /// has expired, or its age or trust root is unknown.
     pub beyond_policy: bool,
 }
 
@@ -524,6 +543,9 @@ impl std::fmt::Display for PublisherFreshness {
         }
         if let Some(expires) = &self.metadata_expires {
             write!(f, ", metadata expires {expires}")?;
+        }
+        if let Some(expires) = &self.trust_root_expires {
+            write!(f, ", trust root expires {expires}")?;
         }
         write!(f, ", {}", self.policy.describe())?;
         if self.beyond_policy && self.policy.defer_unavailable_hours.is_some() {
@@ -553,6 +575,8 @@ fn classify_refresh_failure(error: &anyhow::Error) -> RefreshFailure {
                 // Hash and size failures reach CPS wrapped in transport errors.
                 _ => return RefreshFailure::Security,
             }
+        } else if cause.is::<MetadataTooLarge>() {
+            return RefreshFailure::Security;
         } else if cause.is::<TransportError>() {
             transport = true;
         }
@@ -585,7 +609,10 @@ fn last_refresh(directory: &Root) -> Option<u64> {
     std::str::from_utf8(&bytes).ok()?.trim_end().parse().ok()
 }
 
-fn freshness(publisher: &Publisher, policy: RefreshPolicy) -> Result<PublisherFreshness> {
+pub(crate) fn freshness(
+    publisher: &Publisher,
+    policy: RefreshPolicy,
+) -> Result<PublisherFreshness> {
     // Reporting reads the cache without requiring the sync account.
     let directory = Root::open(&publisher.repo)?.subdir(".tuf")?;
     let last_refreshed = last_refresh(&directory);
@@ -596,8 +623,12 @@ fn freshness(publisher: &Publisher, policy: RefreshPolicy) -> Result<PublisherFr
         .and_then(|file| read_limited(file, TIMESTAMP_LIMIT).ok())
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| value["signed"]["expires"].as_str().map(str::to_owned));
+    let trust_root = current_trust_root(&publisher.repo, &publisher.name, &publisher.key).ok();
+    let trust_unexpired = trust_root
+        .as_ref()
+        .is_some_and(|root| root.check_unexpired().is_ok());
     let beyond_policy = match (policy.defer_unavailable_hours, age_seconds) {
-        (Some(hours), Some(age)) => age > hours.saturating_mul(3600),
+        (Some(hours), Some(age)) => age > hours.saturating_mul(3600) || !trust_unexpired,
         _ => true,
     };
     Ok(PublisherFreshness {
@@ -606,8 +637,35 @@ fn freshness(publisher: &Publisher, policy: RefreshPolicy) -> Result<PublisherFr
         last_refreshed,
         age_seconds,
         metadata_expires,
+        trust_root_expires: trust_root.map(|root| root.expires),
         beyond_policy,
     })
+}
+
+/// Decide whether updates may continue without a publisher that is `kind`.
+/// Deferral lasts until the earlier of the policy's staleness limit and the
+/// expiry of the trust root the cached current catalog is signed under.
+pub(crate) fn check_deferral(
+    publisher: &Publisher,
+    policy: RefreshPolicy,
+    kind: &str,
+) -> Result<PublisherFreshness> {
+    let name = &publisher.name;
+    ensure!(
+        policy.defer_unavailable_hours.is_some(),
+        "publisher {name} is {kind} and its refresh policy does not allow deferral"
+    );
+    current_trust_root(&publisher.repo, name, &publisher.key)
+        .and_then(|root| root.check_unexpired())
+        .with_context(|| {
+            format!("publisher {name} is {kind} and its cached catalog cannot be used past its trust root")
+        })?;
+    let state = freshness(publisher, policy)?;
+    ensure!(
+        !state.beyond_policy,
+        "publisher {name} is {kind} and its cache is older than the refresh policy allows"
+    );
+    Ok(state)
 }
 
 fn url_publishers(
@@ -695,19 +753,10 @@ pub(crate) fn refresh_url_publishers(
                 RefreshFailure::Unavailable => "unavailable",
                 RefreshFailure::Expired => "expired",
             };
-            if policy.defer_unavailable_hours.is_none() {
-                return Err(error.context(format!(
-                    "publisher {} is {kind} and its refresh policy does not allow deferral",
-                    publisher.name
-                )));
-            }
-            let state = freshness(publisher, policy)?;
-            if state.beyond_policy {
-                return Err(error.context(format!(
-                    "publisher {} is {kind} and its cache is older than the refresh policy allows",
-                    publisher.name
-                )));
-            }
+            let state = match check_deferral(publisher, policy, kind) {
+                Ok(state) => state,
+                Err(reason) => return Err(error.context(format!("{reason:#}"))),
+            };
             eprintln!(
                 "Warning: {error:#}. Deferring updates from {} ({state}).",
                 publisher.name
@@ -1425,7 +1474,9 @@ async fn materialize(
         .context("missing catalog pointer download")?;
     let hash = parse_current(&String::from_utf8(read_limited(pointer.reopen()?, 65)?)?)?;
     fetch_catalog(verified, repo, &hash).await?;
-    let catalog = read_catalog(repo, &hash, publisher, key)?;
+    // A current catalog becomes the rollback anchor, so its trust root must
+    // be unexpired. Retained and archived catalogs are historical pins.
+    let catalog = read_fresh_catalog(repo, &hash, publisher, key)?;
     if let Some(guard) = guard {
         guard.check(repo, source, &hash, &catalog)?;
     }
@@ -2110,4 +2161,40 @@ fn export_object(
     );
     dest.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tough::IntoVec;
+
+    fn classify_fetch(url: Url) -> RefreshFailure {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let transport = MirrorTransport::new(None).unwrap();
+        let error = runtime
+            .block_on(async { transport.fetch(url).await?.into_vec().await })
+            .unwrap_err();
+        classify_refresh_failure(&anyhow::Error::new(error).context("refreshing publisher extras"))
+    }
+
+    #[test]
+    fn oversized_metadata_is_never_deferred_as_an_outage() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("snapshot.json");
+        std::fs::write(&path, vec![b' '; ROLE_LIMIT as usize + 1])?;
+        let oversized = Url::from_file_path(&path).unwrap();
+        assert!(matches!(
+            classify_fetch(oversized),
+            RefreshFailure::Security
+        ));
+        let missing = Url::from_file_path(dir.path().join("timestamp.json")).unwrap();
+        assert!(matches!(
+            classify_fetch(missing),
+            RefreshFailure::Unavailable
+        ));
+        Ok(())
+    }
 }

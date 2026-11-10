@@ -639,7 +639,7 @@ enum SourceCommand {
         /// Local CPS repository used to allocate snapshot versions
         #[arg(long)]
         repo: PathBuf,
-        /// Ed25519 DER public key for the package publisher
+        /// The publisher's trust root JSON file that verifies the repository's catalogs
         #[arg(long)]
         trust_root: PathBuf,
         /// New directory for the pinned recipe, manifest, and archive
@@ -837,17 +837,16 @@ fn parse_repository(value: &str) -> std::result::Result<(String, PathBuf), Strin
 /// keep the previous version's values.
 #[derive(Args)]
 struct TrustMembership {
-    /// Publisher name; required for the first version
-    #[arg(long)]
-    publisher: Option<String>,
     /// Root key: a public key file or command:DESCRIPTOR (repeat; replaces the root keys)
     #[arg(long, value_name = "PUBLIC_KEY")]
     root_key: Vec<PathBuf>,
+    /// Root key signatures required (default: the previous version's, or 1)
     #[arg(long)]
     root_threshold: Option<usize>,
     /// Catalog key: a public key file or command:DESCRIPTOR (repeat; replaces the catalog keys)
     #[arg(long, value_name = "PUBLIC_KEY")]
     catalog_key: Vec<PathBuf>,
+    /// Catalog key signatures required (default: the previous version's, or 1)
     #[arg(long)]
     catalog_threshold: Option<usize>,
     /// RFC 3339 UTC expiry, such as 2027-01-01T00:00:00Z (default: one year from now)
@@ -856,9 +855,9 @@ struct TrustMembership {
 }
 
 impl TrustMembership {
-    fn draft(&self) -> cps::TrustDraft<'_> {
+    fn draft<'a>(&'a self, publisher: Option<&'a str>) -> cps::TrustDraft<'a> {
         cps::TrustDraft {
-            publisher: self.publisher.as_deref(),
+            publisher,
             root_keys: &self.root_key,
             root_threshold: self.root_threshold,
             catalog_keys: &self.catalog_key,
@@ -887,6 +886,9 @@ enum TrustCommand {
     Rotate {
         #[arg(long)]
         repo: PathBuf,
+        /// Publisher name, which must match the repository's trust root
+        #[arg(long)]
+        publisher: Option<String>,
         #[command(flatten)]
         membership: TrustMembership,
         /// Root key that signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
@@ -897,6 +899,10 @@ enum TrustCommand {
     Draft {
         #[arg(long)]
         repo: PathBuf,
+        /// Publisher name: required for a repository's first version, and
+        /// otherwise must match its trust root
+        #[arg(long)]
+        publisher: Option<String>,
         #[command(flatten)]
         membership: TrustMembership,
         #[arg(long)]
@@ -946,19 +952,21 @@ fn run_trust(command: TrustCommand) -> Result<()> {
         }
         TrustCommand::Rotate {
             repo,
+            publisher,
             membership,
             key,
         } => {
-            let path = cps::rotate_trust(&repo, &membership.draft(), &key)?;
+            let path = cps::rotate_trust(&repo, &membership.draft(publisher.as_deref()), &key)?;
             println!("Created {}", path.display());
             print!("{}", cps::show_trust(&path)?);
         }
         TrustCommand::Draft {
             repo,
+            publisher,
             membership,
             output,
         } => {
-            let draft = cps::draft_trust(&repo, &membership.draft())?;
+            let draft = cps::draft_trust(&repo, &membership.draft(publisher.as_deref()))?;
             write_new_file(&output, &draft)?;
             println!("Wrote {}", output.display());
         }
@@ -1012,6 +1020,7 @@ enum RepoCommand {
     },
     /// Sign an exported mirror with sharded TUF targets metadata
     SignExport {
+        /// The mirror's active signed TUF root metadata
         #[arg(long)]
         root: PathBuf,
         /// Targets role key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the threshold)
@@ -1029,18 +1038,24 @@ enum RepoCommand {
         /// Signatures required on each objects-* delegation
         #[arg(long, default_value = "1")]
         objects_threshold: std::num::NonZeroU64,
+        /// Version of the new targets, snapshot, and timestamp metadata, above every published version
         #[arg(long)]
         version: std::num::NonZeroU64,
-        #[arg(long)]
+        /// Targets and snapshot expiry: an RFC 3339 time, such as 2027-01-01T00:00:00Z
+        #[arg(long, value_name = "TIME")]
         release_expires: String,
-        #[arg(long)]
+        /// Timestamp expiry: an RFC 3339 time, such as 2026-12-08T00:00:00Z
+        #[arg(long, value_name = "TIME")]
         timestamp_expires: String,
+        /// New directory for the signed metadata and targets
         #[arg(long)]
         output: PathBuf,
+        /// Directory written by `cps repo export`
         export: PathBuf,
     },
     /// Re-sign the timestamp, and optionally the snapshot, of a published mirror
     RefreshMetadata {
+        /// The mirror's active signed TUF root metadata
         #[arg(long)]
         root: PathBuf,
         /// The published versioned snapshot metadata, such as 7.snapshot.json
@@ -1052,11 +1067,14 @@ enum RepoCommand {
         /// Also re-sign the snapshot with this key (repeatable)
         #[arg(long, value_name = "KEY", requires = "snapshot_expires")]
         snapshot_key: Vec<PathBuf>,
-        #[arg(long, requires = "snapshot_key")]
+        /// Expiry of the re-signed snapshot: an RFC 3339 time, such as 2027-01-01T00:00:00Z
+        #[arg(long, value_name = "TIME", requires = "snapshot_key")]
         snapshot_expires: Option<String>,
+        /// Version of the new timestamp and any re-signed snapshot, above the snapshot's version and every published timestamp version
         #[arg(long)]
         version: std::num::NonZeroU64,
-        #[arg(long)]
+        /// Timestamp expiry: an RFC 3339 time, such as 2026-12-08T00:00:00Z
+        #[arg(long, value_name = "TIME")]
         timestamp_expires: String,
         /// New directory for timestamp.json and any re-signed snapshot
         #[arg(long)]
