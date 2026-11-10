@@ -56,7 +56,7 @@ changes which packages are installed. See
 
 ```sh
 cps facet --root image
-cps facet --root image locale.fr debug.sqlite
+cps facet --root image locale.fr debug.symbols
 cps facet --root image --package library/sqlite
 cps plan --root image --output facets.json change-facet doc.man=true 'locale.*=false' locale.fr=true
 cps fetch --root image --plan facets.json

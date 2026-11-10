@@ -118,7 +118,7 @@ entry.
 
 ## Publishing policy
 
-To require attested builds for a release repository, install `publish-policy.kdl` in the repository directory before its first publication. Builder key paths resolve relative to that directory. Approve the reviewed recipe separately for each package version.
+To require attested builds for a release repository, install `publish-policy.kdl` in the repository directory before its first publication. Builder key paths resolve relative to that directory. Approve the reviewed recipe separately for each package version. A recipe that [builds several packages](../maintainer/builds.md#building-several-packages-from-one-recipe) needs an approval with the same digest for each of them.
 
 ```kdl
 schema-version 1 kind="publish-policy"
@@ -187,7 +187,9 @@ cps repo publish-release --repo repo --signing-key private.der release.kdl
 ```
 
 CPS checks the base under the repository lock and uses one policy snapshot for
-all bundles. Readers see a single new signed catalog after every action succeeds.
+all bundles. A `bundle` action names one package of the bundle; CPS publishes
+every package that the bundle's build produced, because they share one
+attestation. Readers see a single new signed catalog after every action succeeds.
 If verification fails, the current catalog stays unchanged. Content-addressed
 objects may remain on disk. Historical catalogs remain available for pinned plans.
 

@@ -24,7 +24,9 @@ the generated KDL, then test the package in an [inactive image](../client/images
 ## Generating a manifest from a prototype
 
 Stage an install into a private prototype tree, for example with `DESTDIR`,
-then generate a KDL manifest for review.
+then generate a KDL manifest for review. For packages built from a recipe,
+[collect rules](builds.md#collecting-installed-files) let `cps build` write
+the file list from what the build installed.
 
 ```sh
 cps manifest generate --proto proto --publisher canopa --version 1.0.0-0 demo/tool > tool.kdl
@@ -84,21 +86,34 @@ detected provider. Use the ELF profile gate to test runtime ABI compatibility.
 
 ## Package metadata and version constraints
 
-Set `summary` on the package node and add an `optional` node for each
-recommended add-on. Optional dependencies are advisory and can be installed
-separately. Their version constraints describe compatible add-on versions.
+Set `summary`, `license`, and `homepage` on the package node and add an
+`optional` node for each recommended add-on. Optional dependencies are
+advisory and can be installed separately. Their version constraints
+describe compatible add-on versions.
 
 ```kdl
 schema-version 1 kind="package-manifest"
-package "apps/editor" publisher="canopa" version="1.0.0-0" summary="A lightweight text editor" {
+package "apps/editor" publisher="canopa" version="1.0.0-0" summary="A lightweight text editor" license="MIT OR Apache-2.0" homepage="https://editor.example.org/" source-url="https://editor.example.org/releases/editor-1.0.0.tar.gz" {
     optional "apps/editor-spellcheck" version=">=1.0.0-0" description="Check spelling while typing"
 }
 ```
 
 Summaries and descriptions are single-line text, limited to 256 and 1024
 UTF-8 bytes respectively. The catalog signs the summary and the manifest
-digest, which covers the optional dependency descriptions. Publish a new
-package version to add this metadata to a published package.
+digest, which covers the other metadata and the optional dependency
+descriptions. Publish a new package version to add this metadata to a
+published package. `cps info` shows every field.
+
+- `license` is an [SPDX license expression](https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/)
+  of at most 1024 bytes, such as `GPL-2.0-or-later WITH Linux-syscall-note`
+  or `(MIT OR Apache-2.0) AND BSD-3-Clause`. CPS checks the expression
+  grammar: identifiers, an optional `+`, `LicenseRef-` and `DocumentRef-`
+  references, uppercase `AND`, `OR`, and `WITH`, and parentheses. It does not
+  check identifiers against the SPDX license list, so new identifiers work.
+- `homepage` and `source-url` are HTTPS URLs without credentials, written in
+  normalized form, such as `https://www.sqlite.org/` with its trailing slash.
+  `source-url` names where to download the upstream release. A build recipe
+  still pins every source it uses by digest.
 
 - Package manifests use KDL 2. The `schema-version 1` header requires `kind="package-manifest"`. Image configuration uses `schema-version 1 kind="image-config"`. Its paths resolve relative to the configuration file. It also accepts `architecture "x86_64"`, facet rules such as `facet "doc.man" #false`, and variants such as `variant "container" #true`. See [package selection](../client/configuration.md#facets-and-variants-on-an-existing-image).
 - Set `architecture="x86_64"` on the `package` node for a package that targets one architecture, or pass `--architecture x86_64` to `manifest generate`. Only matching packages participate in dependency resolution and publisher ordering. The signed catalog and manifest must agree, and a source build and its attestation must declare the same target. Omit the package property for portable packages or manifests with per-action `arch` selectors. Package IDs are unique within a repository, so publishing the same name and version for two architectures requires separate repositories.
@@ -123,7 +138,7 @@ content with variants. Both apply to `file`, `dir`, `symlink`, and
 file "usr/include/sqlite3.h" mode="0644" uid=0 gid=0 facet="devel"
 symlink "usr/lib/libsqlite3.so" target="libsqlite3.so.0" uid=0 gid=0 facet="devel"
 file "usr/share/locale/fr/LC_MESSAGES/sqlite.mo" mode="0644" uid=0 gid=0 facet="locale.fr"
-file "usr/lib/debug/usr/lib/libsqlite3.so.0.debug" mode="0644" uid=0 gid=0 facet="debug.sqlite"
+file "usr/lib/debug/.build-id/87/8fa85a7e413fb286f8caa40d1d5d63f1680a04.debug" mode="0644" uid=0 gid=0 facet="debug.symbols"
 file "usr/lib32/libsqlite3.so.0" mode="0755" uid=0 gid=0 facet="isa.i686"
 symlink "lib64" target="usr/lib" uid=0 gid=0 arch="x86_64"
 symlink "etc/init.conf" target="../usr/lib/init/container.conf" uid=0 gid=0 variant.container="true"
@@ -163,7 +178,10 @@ symlink "etc/init.conf" target="../usr/lib/init/metal.conf" uid=0 gid=0 variant.
 | Variant | A mutually exclusive image property selects between alternative content. | `arch`, a container or bare-metal variant, a debug build |
 
 Ship 32-bit multilib objects as `isa.*` facets of the 64-bit package, the
-way illumos ships both in one package. A header package that would only
+way illumos ships both in one package. `cps build` ships split debug
+information as the `debug.symbols` facet of the package that contains the
+stripped object, so there are no separate debug packages. See
+[stripping and debug information](builds.md#stripping-and-debug-information). A header package that would only
 pull in other headers is still a facet: a client can apply a per-package
 facet rule to the package's dependencies too. See
 [per-package facet rules](../client/configuration.md#per-package-facet-rules).
