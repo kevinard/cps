@@ -205,8 +205,8 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
 #[test]
 fn signed_profile_freezes_follow_staged_roots_and_require_explicit_unfreezing() -> Result<()> {
     use crate::{
-        create_configured_image, image::Image, list_freezes, publish_release,
-        stage_boot_environment,
+        boot::stage_directory_copy as stage_boot_environment, create_configured_image,
+        image::Image, list_freezes, publish_release,
     };
     let f = Fixture::new()?;
     let name = "desktop/base";
@@ -268,19 +268,6 @@ publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
     )?;
     apply(&f.root, &plan(&f.root, Request::InstallProfile)?)?;
     apply(&f.root, &plan(&f.root, freeze(name.into()))?)?;
-    fs::create_dir(f.root.join("boot"))?;
-    fs::write(f.root.join("boot/vmlinuz"), "fixture kernel")?;
-    let esp = f._dir.path().join("esp");
-    fs::create_dir(&esp)?;
-    let mut activation = crate::Activation {
-        root_partuuid: "7adff456-af50-498f-b39a-dcf87cb4a7c1".into(),
-        kernel: "boot/vmlinuz".into(),
-        initrd: None,
-        options: String::new(),
-        tries: 2,
-        known_good: true,
-    };
-    let base_id = crate::activate_boot_environment(&f.root, &esp, &activation)?;
     let freezes = list_freezes(&f.root)?;
     let mut held_back = Vec::new();
     assert!(
@@ -339,15 +326,6 @@ publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
     assert_eq!(after.id, staged.id);
     assert_eq!(after.boot_parent, staged.boot_parent);
     assert_eq!(after.revision, staged.revision + 1);
-    activation.known_good = false;
-    activation.root_partuuid = "b52060cf-81ab-4b8a-ad84-3aa69000ed49".into();
-    let next_id = crate::activate_boot_environment(&next_root, &esp, &activation)?;
-    assert!(
-        crate::list_boot_environments(&esp)?
-            .iter()
-            .any(|entry| entry.id == next_id && entry.is_default)
-    );
-    assert_eq!(crate::rollback_boot_environment(&esp, None)?, base_id);
     assert_eq!(fs::read_to_string(next_root.join(COMPOSITOR))?, "base 2");
     assert_eq!(list_freezes(&f.root)?, freezes);
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "base 1");

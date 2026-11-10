@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
     os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
@@ -9,16 +9,18 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use rustix::{
-    fs::{AtFlags, FlockOperation, Mode, OFlags, RenameFlags, flock, open, renameat_with, statat},
+    fs::{
+        AtFlags, FallocateFlags, FlockOperation, Mode, OFlags, RenameFlags, SeekFrom as Whence,
+        fallocate, flock, open, renameat_with, seek, statat,
+    },
     io::Errno,
 };
 use serde::Deserialize;
 use tempfile::TempDir;
 
-use super::{artifact_helper, root_label, systemd_boot::canonical_partuuid};
+use super::{artifact_helper, systemd_boot::canonical_partuuid};
 use crate::{
     image::root::Root,
-    kdl_format::boot_export::ExportReceipt,
     model::{NIL_UUID, digest_reader},
 };
 
@@ -28,20 +30,7 @@ pub(super) const SECTOR_SIZE: u64 = 512;
 const LINUX_FILESYSTEM: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
 const EFI_SYSTEM: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 
-/// Deploy an exported root to one partition in a new offline GPT disk image.
-pub fn deploy_boot_environment(
-    disk: &Path,
-    root_image: &Path,
-    root_partuuid: &str,
-    output: &Path,
-) -> Result<String> {
-    let partuuid = canonical_partuuid(root_partuuid)?;
-    let stage = DiskStage::new(disk, output)?;
-    let actual = stage.disk.write_root(&partuuid, root_image, None)?;
-    stage.publish()?;
-    Ok(actual)
-}
-
+/// A private clone of an offline GPT disk, published under a new name once checked.
 pub(super) struct DiskStage<'a> {
     pub disk: OfflineDisk,
     stage: Root,
@@ -56,22 +45,22 @@ impl<'a> DiskStage<'a> {
         let name = output
             .file_name()
             .context("expected a new disk file name")?;
-        let parent_path = fs::canonicalize(
+        let parent_path = std::fs::canonicalize(
             output
                 .parent()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or(Path::new(".")),
         )
-        .context("opening the deployment destination directory")?;
+        .context("opening the disk destination directory")?;
         let parent = Root::open(&parent_path)?;
         match statat(parent.as_file(), name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(_) => anyhow::bail!("the deployment destination already exists"),
+            Ok(_) => anyhow::bail!("the disk destination already exists"),
             Err(Errno::NOENT) => {}
-            Err(error) => return Err(error).context("checking the deployment destination"),
+            Err(error) => return Err(error).context("checking the disk destination"),
         }
         let source = offline_file(source)?;
         let temp = tempfile::Builder::new()
-            .prefix(".cps-deploy-")
+            .prefix(".cps-disk-")
             .tempdir_in(Root::fd_path(parent.as_file()))?;
         let stage = Root::open(temp.path())?;
         let directory = Root::fd_path(stage.as_file());
@@ -131,7 +120,7 @@ impl<'a> DiskStage<'a> {
             self.name,
             RenameFlags::NOREPLACE,
         )
-        .context("publishing the deployed disk image")?;
+        .context("publishing the disk image")?;
         self.parent.as_file().sync_all()?;
         Ok(())
     }
@@ -193,10 +182,6 @@ pub(super) struct OfflineDisk {
 }
 
 impl OfflineDisk {
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::from_file(offline_file(path)?)
-    }
-
     fn from_file(file: File) -> Result<Self> {
         let bytes = file.metadata()?.len();
         Self::from_sized_file(file, bytes)
@@ -235,8 +220,25 @@ impl OfflineDisk {
         Ok(partition)
     }
 
-    pub fn esp(&self, partuuid: &str) -> Result<&PartitionExtent> {
-        self.partition(&canonical_partuuid(partuuid)?, EFI_SYSTEM)
+    /// The disk's only EFI System Partition.
+    pub fn esp(&self) -> Result<&PartitionExtent> {
+        let mut found = self
+            .partitions
+            .values()
+            .filter(|part| part.kind.eq_ignore_ascii_case(EFI_SYSTEM));
+        let esp = found
+            .next()
+            .context("the disk has no GPT EFI System Partition")?;
+        ensure!(
+            found.next().is_none(),
+            "the disk has more than one GPT EFI System Partition"
+        );
+        Ok(esp)
+    }
+
+    /// The Linux filesystem partition that will hold the root.
+    pub fn root(&self, partuuid: &str) -> Result<&PartitionExtent> {
+        self.partition(&canonical_partuuid(partuuid)?, LINUX_FILESYSTEM)
     }
 
     pub fn check_device_extents(
@@ -267,22 +269,6 @@ impl OfflineDisk {
             .context("mounted filesystem does not match a GPT EFI System Partition")
     }
 
-    pub fn write_root(
-        &self,
-        partuuid: &str,
-        root_image: &Path,
-        receipt: Option<&ExportReceipt>,
-    ) -> Result<String> {
-        let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
-        let (mut payload, expected) = checked_payload(root_image, partition.bytes, receipt)?;
-        let actual = self.write_partition(partition, &mut payload)?;
-        ensure!(
-            actual == expected && payload.metadata()?.len() == partition.bytes,
-            "deployed partition does not match the checked root payload"
-        );
-        Ok(actual)
-    }
-
     pub fn read_partition(&self, part: &PartitionExtent, output: &mut File) -> Result<()> {
         let mut disk = &self.file;
         disk.seek(SeekFrom::Start(part.offset))?;
@@ -294,114 +280,59 @@ impl OfflineDisk {
         Ok(())
     }
 
-    pub fn write_partition(&self, part: &PartitionExtent, payload: &mut File) -> Result<String> {
+    pub fn write_partition(&self, part: &PartitionExtent, payload: &File) -> Result<String> {
         write_extent(&self.file, part.offset, part.bytes, payload)
     }
-
-    pub fn verify_payload(&self, partuuid: &str, bytes: u64, sha256: &str) -> Result<()> {
-        let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
-        ensure!(
-            partition.bytes == bytes
-                && digest_extent(&self.file, partition.offset, partition.bytes)? == sha256,
-            "deployed partition {partuuid} does not match the root export receipt"
-        );
-        Ok(())
-    }
-
-    pub fn verify_filesystem(&self, partuuid: &str, image: &str, revision: u64) -> Result<()> {
-        let partition = self.partition(partuuid, LINUX_FILESYSTEM)?;
-        verify_filesystem_at(
-            &self.file,
-            partition.offset,
-            partition.bytes,
-            partuuid,
-            image,
-            revision,
-        )
-    }
 }
 
-pub(super) fn checked_payload(
-    root_image: &Path,
-    bytes: u64,
-    receipt: Option<&ExportReceipt>,
-) -> Result<(File, String)> {
-    let mut payload = offline_file(root_image)?;
+/// Write a payload of exactly `bytes` at `offset`, keeping its holes sparse,
+/// and return the SHA-256 of the written extent.
+pub(super) fn write_extent(disk: &File, offset: u64, bytes: u64, payload: &File) -> Result<String> {
     ensure!(
         payload.metadata()?.len() == bytes,
-        "root payload size must match the target partition ({bytes} bytes)"
+        "the payload size differs from its partition"
     );
-    let expected = digest_extent(&payload, 0, bytes)?;
-    if let Some(receipt) = receipt {
-        ensure!(
-            receipt.bytes == bytes && receipt.sha256 == expected,
-            "root payload does not match the root export receipt"
-        );
+    // Zero the old extent first. Payload holes then need no writes.
+    let sparse = match fallocate(
+        disk,
+        FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+        offset,
+        bytes,
+    ) {
+        Ok(()) => true,
+        Err(Errno::OPNOTSUPP) => false,
+        Err(error) => return Err(error).context("clearing the target partition"),
+    };
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut position = 0;
+    while position < bytes {
+        let (start, end) = if sparse {
+            let start = match seek(payload, Whence::Data(position)) {
+                Ok(start) => start.min(bytes),
+                Err(Errno::NXIO) => bytes,
+                Err(error) => return Err(error).context("reading the partition payload"),
+            };
+            let end = seek(payload, Whence::Hole(start))
+                .context("reading the partition payload")?
+                .min(bytes);
+            (start, end)
+        } else {
+            (position, bytes)
+        };
+        let mut cursor = start;
+        while cursor < end {
+            let len = buffer.len().min(usize::try_from(end - cursor)?);
+            payload.read_exact_at(&mut buffer[..len], cursor)?;
+            disk.write_all_at(&buffer[..len], offset + cursor)?;
+            cursor += len as u64;
+        }
+        position = end.max(start);
+        if start == bytes {
+            break;
+        }
     }
-    let status = artifact_helper("e2fsck", Path::new("/"))
-        .stdin(Stdio::from(payload.try_clone()?))
-        .stdout(Stdio::null())
-        .args(["-f", "-n", "/proc/self/fd/0"])
-        .status()
-        .context("checking the root payload with e2fsck")?;
-    ensure!(status.success(), "e2fsck failed with {status}");
-    payload.rewind()?;
-    Ok((payload, expected))
-}
-
-pub(super) fn write_extent(
-    mut disk: &File,
-    offset: u64,
-    bytes: u64,
-    payload: &mut File,
-) -> Result<String> {
-    disk.seek(SeekFrom::Start(offset))?;
-    let written = io::copy(&mut payload.take(bytes), &mut disk)?;
-    ensure!(
-        written == bytes,
-        "partition payload was truncated during deployment"
-    );
     disk.sync_all()?;
     digest_extent(disk, offset, bytes)
-}
-
-pub(super) fn verify_filesystem_at(
-    disk: &File,
-    offset: u64,
-    bytes: u64,
-    partuuid: &str,
-    image: &str,
-    revision: u64,
-) -> Result<()> {
-    let output = artifact_helper("blkid", Path::new("/"))
-        .env("BLKID_CONF", "/dev/null")
-        .stdin(Stdio::from(disk.try_clone()?))
-        .args(["--probe", "--offset", &offset.to_string()])
-        .args(["--size", &bytes.to_string()])
-        .args([
-            "--output",
-            "export",
-            "--match-tag",
-            "UUID",
-            "--match-tag",
-            "TYPE",
-            "--match-tag",
-            "LABEL",
-        ])
-        .arg("/proc/self/fd/0")
-        .output()
-        .context("probing the deployed filesystem with blkid")?;
-    let tags = std::str::from_utf8(&output.stdout)?;
-    let uuid = format!("UUID={image}");
-    let label = format!("LABEL={}", root_label(revision));
-    ensure!(
-        output.status.success()
-            && tags.lines().any(|line| line == "TYPE=ext4")
-            && tags.lines().any(|line| line == uuid)
-            && tags.lines().any(|line| line == label),
-        "partition {partuuid} does not contain the expected ext4 filesystem {image} at revision {revision}"
-    );
-    Ok(())
 }
 
 pub(super) fn digest_extent(mut disk: &File, offset: u64, bytes: u64) -> Result<String> {

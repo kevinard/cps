@@ -582,7 +582,7 @@ fn hardlinks_follow_target_updates_and_resume_offline() -> Result<()> {
     assert_eq!(apply(&f.root, &install)?, 1);
     let old_inode = check_links(&f.root, "version one")?;
     let copy = f.root.with_extension("clone");
-    crate::stage_boot_environment(&f.root, &copy, &plan_for(Request::Update)?)?;
+    crate::boot::stage_directory_copy(&f.root, &copy, &plan_for(Request::Update)?)?;
     assert_ne!(old_inode, check_links(&copy, "version one")?);
 
     let unowned = f.root.with_extension("unowned");
@@ -1243,7 +1243,7 @@ fn boot_environment_keeps_its_own_image_state() -> Result<()> {
     f.package(name, "2.0.0-0", f.file(COMPOSITOR, "trial", "0755", "")?)?;
     let staged = f.root.with_extension("staged");
     let update = plan(&f.root, Request::Update)?;
-    crate::stage_boot_environment(&f.root, &staged, &update)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &update)?;
     assert_eq!(fs::read(f.root.join(database))?, base_state);
     assert_ne!(fs::read(staged.join(database))?, base_state);
     for (root, payload) in [(&f.root, "previous"), (&staged, "trial")] {
@@ -1314,7 +1314,7 @@ fn publisher_changes_invalidate_plans_without_changing_boot_lineage() -> Result<
     );
     let staged = base.root.with_extension("staged");
     assert!(
-        crate::stage_boot_environment(&base.root, &staged, &stale)
+        crate::boot::stage_directory_copy(&base.root, &staged, &stale)
             .unwrap_err()
             .to_string()
             .contains("publisher configuration changed")
@@ -1332,7 +1332,7 @@ fn publisher_changes_invalidate_plans_without_changing_boot_lineage() -> Result<
     );
     assert_eq!(current.id, before.id);
     assert_eq!(current.revision, before.revision);
-    crate::stage_boot_environment(&base.root, &staged, &fresh)?;
+    crate::boot::stage_directory_copy(&base.root, &staged, &fresh)?;
     assert!(!base.root.join(PLUGIN).exists());
     assert_eq!(fs::read_to_string(staged.join(PLUGIN))?, "extra");
     let staged_settings = settings(&staged)?;
@@ -1852,7 +1852,7 @@ fn autoremove_preserves_installed_roots_and_resumes_offline() -> Result<()> {
         Some("library/left is configured for staged changes")
     );
     let staged = f._dir.path().join("staged-cleanup");
-    crate::stage_boot_environment(&f.root, &staged, &cleanup)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &cleanup)?;
     assert!(!staged.join(LIBRARY).exists());
     assert!(f.root.join(LIBRARY).exists());
     interrupt_apply_at(
@@ -3026,7 +3026,7 @@ fn changes_facets_without_resolving_new_packages_and_recovers_offline() -> Resul
     assert!(enable.summary().contains(&format!("Add {MANPAGE}")));
     assert!(enable.catalogs.is_empty());
     let staged = f._dir.path().join("staged");
-    crate::stage_boot_environment(&f.root, &staged, &enable)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &enable)?;
     assert!(!f.root.join(MANPAGE).exists());
     assert_eq!(fs::read_to_string(staged.join(MANPAGE))?, "manpage 1");
     assert!(local_facets(&staged)?.is_empty());
@@ -3636,7 +3636,7 @@ fn reconciles_preserved_config_metadata_atomically() -> Result<()> {
 
 #[test]
 fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
-    use crate::{ConfigChoice, fetch_plan, list_config_updates, stage_boot_environment};
+    use crate::{ConfigChoice, fetch_plan, list_config_updates};
 
     const OPTIONAL: &str = "etc/canopa/optional.conf";
     const RESTORE: &str = "etc/canopa/restore.conf";
@@ -3667,7 +3667,7 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
     package("2.0.0-0", "vendor version two")?;
     let staged = f._dir.path().join("staged");
     let upgrade = plan(&f.root, Request::Update)?;
-    stage_boot_environment(&f.root, &staged, &upgrade)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &upgrade)?;
     let proposals = list_config_updates(&staged)?;
     assert_eq!(proposals.len(), 3);
     assert!(
@@ -3826,7 +3826,7 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
 fn relocates_preserved_configuration_across_releases_and_resumes_offline() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    use crate::{list_config_updates, stage_boot_environment};
+    use crate::list_config_updates;
 
     const OLD: [&str; 3] = [CONFIG, "etc/canopa/optional", "etc/canopa/pristine"];
     const MIDDLE: [&str; 3] = ["etc/mid/main", "etc/mid/optional", "etc/mid/pristine"];
@@ -3868,7 +3868,7 @@ fn relocates_preserved_configuration_across_releases_and_resumes_offline() -> Re
     assert_eq!(list_config_updates(&f.root)?.len(), 2);
     package("desktop/settings", "3.0.0-0", &MIDDLE, "v3", "0644", true)?;
     let intermediate = f._dir.path().join("intermediate");
-    stage_boot_environment(&f.root, &intermediate, &plan(&f.root, Request::Update)?)?;
+    crate::boot::stage_directory_copy(&f.root, &intermediate, &plan(&f.root, Request::Update)?)?;
 
     package("desktop/preferences", "4.0.0-0", &NEW, "v4", "0600", true)?;
     let request = Request::ExactInstall {
@@ -3910,7 +3910,7 @@ fn relocates_preserved_configuration_across_releases_and_resumes_offline() -> Re
     };
 
     let moved_twice = f._dir.path().join("moved-twice");
-    stage_boot_environment(
+    crate::boot::stage_directory_copy(
         &intermediate,
         &moved_twice,
         &plan(&intermediate, request.clone())?,
@@ -3937,7 +3937,7 @@ fn relocates_preserved_configuration_across_releases_and_resumes_offline() -> Re
             .contains(&format!("Move config {} to {}", OLD[0], NEW[0]))
     );
     let staged = f._dir.path().join("skipped-version");
-    stage_boot_environment(&f.root, &staged, &direct)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &direct)?;
     check_result(&staged)?;
     assert_eq!(
         fs::read_to_string(f.root.join(OLD[0]))?,
