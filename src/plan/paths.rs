@@ -14,6 +14,12 @@ use crate::{
 pub(super) struct PathConflict {
     message: String,
     pub owners: [String; 2],
+    /// Package patterns of the rules applied with dependencies that could
+    /// change which actions of the owners apply. When it is empty, the owners
+    /// conflict in every selection that contains them both.
+    pub inheritable: BTreeSet<String>,
+    /// Whether the conflict is independent of facets, such as an unset variant.
+    fixed: bool,
 }
 
 impl PathConflict {
@@ -23,9 +29,15 @@ impl PathConflict {
         } else {
             format!("path conflict for {path} between {first} and {second}")
         };
+        Self::between(message, first, second)
+    }
+
+    fn between(message: String, first: &str, second: &str) -> Self {
         Self {
             message,
             owners: [first.to_owned(), second.to_owned()],
+            inheritable: BTreeSet::new(),
+            fixed: false,
         }
     }
 }
@@ -89,9 +101,37 @@ pub(crate) fn select_paths(
     implicit_directory: Node,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
-    let arch = selection.arch;
     let facets = resolve_facets(selection, installed)?;
-    let offers = mediator_offers(&facets, installed);
+    let mut result = compose_paths(&facets, preferences, implicit_directory, installed);
+    // Rules inherited through a dependency closure make a conflict depend on
+    // the other selected packages, so the resolver must not treat it as a
+    // property of the two owners alone.
+    if let Err(error) = &mut result
+        && let Some(conflict) = error.downcast_mut::<PathConflict>()
+        && !conflict.fixed
+    {
+        for owner in &conflict.owners {
+            let manifest = &installed[owner].published.manifest;
+            conflict.inheritable.extend(
+                facets
+                    .inheritable(owner, manifest)
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+        }
+    }
+    result
+}
+
+fn compose_paths(
+    facets: &Resolved<'_>,
+    preferences: &BTreeMap<String, String>,
+    implicit_directory: Node,
+    installed: &BTreeMap<String, Installed>,
+) -> Result<BTreeMap<String, Managed>> {
+    let selection = facets.selection;
+    let arch = selection.arch;
+    let offers = mediator_offers(facets, installed);
     let winners = choose_mediators(&offers, preferences);
     let mut paths: BTreeMap<String, Managed> = BTreeMap::new();
     let mut sizes = BTreeMap::new();
@@ -104,11 +144,9 @@ pub(crate) fn select_paths(
         for action in &package.published.manifest.action {
             // An unset variant rules out this candidate, so the solver can try others.
             if let Err(error) = selection.check_variants(name, action) {
-                return Err(PathConflict {
-                    message: error.to_string(),
-                    owners: [name.clone(), name.clone()],
-                }
-                .into());
+                let mut conflict = PathConflict::between(error.to_string(), name, name);
+                conflict.fixed = true;
+                return Err(conflict.into());
             }
             if !facets.applies(name, action) {
                 continue;
@@ -134,12 +172,13 @@ pub(crate) fn select_paths(
                 if let Some((owner, previous)) =
                     config_names.insert((publisher, identity.clone()), (name, path))
                 {
-                    return Err(PathConflict {
-                        message: format!(
+                    return Err(PathConflict::between(
+                        format!(
                             "configuration identity {publisher}/{identity} is selected at both {previous} and {path}"
                         ),
-                        owners: [owner.clone(), name.clone()],
-                    }
+                        owner,
+                        name,
+                    )
                     .into());
                 }
             }

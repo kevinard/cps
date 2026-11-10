@@ -163,7 +163,11 @@ closure as well. The closure follows `require`, `require-capability`,
 skips recommendations, incorporations, and exclusions. A dependency's own
 rule beats an inherited one, and `cps facet --package` shows an inherited
 rule as `RULE (dependency of PACKAGE)`. The closure follows later installs
-and removals. Two inherited rules that disagree about the same dependency
+and removals, so the packages a plan selects decide which rules reach which
+dependencies. When the files of two packages collide only under the rules
+they inherit, a plan looks for another choice of versions or alternatives
+that keeps them apart. It never adds a package that nothing requires just
+to hide a collision. Two inherited rules that disagree about the same dependency
 stop the plan; add a rule for that dependency to settle it.
 
 On an image that follows a signed release profile, image-wide facets and

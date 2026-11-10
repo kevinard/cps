@@ -669,3 +669,164 @@ publisher "canopa" {{
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
     Ok(())
 }
+
+const SHARED_DOC: &str = "usr/share/doc/shared";
+
+/// Two libraries collide only where their documentation applies. The image
+/// sets `doc` to `image_doc`, and `apps/r:doc` applies the opposite value with
+/// dependencies, so whether `lib/a` and `lib/b` conflict depends on whether
+/// `apps/r` is selected.
+fn inherited_collision(top: &str, image_doc: bool) -> Result<Fixture> {
+    let f = Fixture::new()?;
+    for (name, text) in [("lib/a", "a docs"), ("lib/b", "b docs")] {
+        f.package(
+            name,
+            "1.0.0-0",
+            f.file(SHARED_DOC, text, "0644", "facet=\"doc\"")?,
+        )?;
+    }
+    let libraries = "    require \"lib/a\"\n    require \"lib/b\"\n";
+    f.package("apps/r", "1.0.0-0", libraries.into())?;
+    f.package("apps/s", "1.0.0-0", String::new())?;
+    f.package("apps/x", "1.0.0-0", String::new())?;
+    f.package("apps/top", "1.0.0-0", format!("{libraries}{top}"))?;
+    let mut policy = ImagePolicy::default();
+    policy.insert_facet("doc", image_doc, false)?;
+    policy.insert_facet("apps/r:doc", !image_doc, true)?;
+    create_image(&f.root, &f.repo, "canopa", &f.trust, "x86_64", policy)?;
+    Ok(f)
+}
+
+fn install_packages(f: &Fixture, packages: &[&str]) -> Result<Vec<String>> {
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: packages.iter().map(|&name| name.into()).collect(),
+        },
+    )?;
+    apply(&f.root, &install)?;
+    assert!(!f.root.join(SHARED_DOC).exists());
+    Ok(
+        crate::query::list_packages(&f.root, crate::query::Scope::Installed)?
+            .into_iter()
+            .map(|row| row.name)
+            .collect(),
+    )
+}
+
+fn either(first: &str, second: &str) -> String {
+    format!("    require-any {{\n        package {first:?}\n        package {second:?}\n    }}\n")
+}
+
+#[test]
+fn inherited_path_conflicts_leave_other_alternatives_open() -> Result<()> {
+    // apps/r enables the colliding documentation, so only apps/s fits.
+    for (first, second) in [("apps/r", "apps/s"), ("apps/s", "apps/r")] {
+        let f = inherited_collision(&either(first, second), false)?;
+        assert_eq!(
+            install_packages(&f, &["apps/top"])?,
+            ["apps/s", "apps/top", "lib/a", "lib/b"],
+            "{first} before {second}"
+        );
+    }
+    // apps/r disables it, so only apps/r fits.
+    for (first, second) in [("apps/r", "apps/s"), ("apps/s", "apps/r")] {
+        let f = inherited_collision(&either(first, second), true)?;
+        assert_eq!(
+            install_packages(&f, &["apps/top"])?,
+            ["apps/r", "apps/top", "lib/a", "lib/b"],
+            "{first} before {second}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn inherited_path_conflicts_reject_only_the_recommendation_that_causes_them() -> Result<()> {
+    let f = inherited_collision(
+        "    recommends \"apps/r\"\n    recommends \"apps/x\"\n",
+        false,
+    )?;
+    assert_eq!(
+        install_packages(&f, &["apps/top"])?,
+        ["apps/top", "apps/x", "lib/a", "lib/b"]
+    );
+    Ok(())
+}
+
+#[test]
+fn unavoidable_inherited_path_conflicts_are_explained() -> Result<()> {
+    let expect_conflict = |f: &Fixture, packages: &[&str]| {
+        let error = plan(
+            &f.root,
+            Request::Install {
+                packages: packages.iter().map(|&name| name.into()).collect(),
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        for detail in [
+            "cannot satisfy package constraints",
+            SHARED_DOC,
+            "lib/a",
+            "lib/b",
+        ] {
+            assert!(message.contains(detail), "missing {detail} in {message}");
+        }
+    };
+    let f = inherited_collision("    require \"apps/r\"\n", false)?;
+    expect_conflict(&f, &["apps/top"]);
+    // A package whose rule would hide the conflict is never added unrequested.
+    let f = inherited_collision("", true)?;
+    expect_conflict(&f, &["lib/a", "lib/b"]);
+    Ok(())
+}
+
+#[test]
+fn solver_picks_the_intermediate_version_that_keeps_inherited_facets_apart() -> Result<()> {
+    // apps/r enables documentation for its closure. lib/m 2 would put lib/a in
+    // that closure next to lib/b, so the solver keeps lib/m 1 instead.
+    let f = Fixture::new()?;
+    for (name, text) in [("lib/a", "a docs"), ("lib/b", "b docs")] {
+        f.package(
+            name,
+            "1.0.0-0",
+            f.file(SHARED_DOC, text, "0644", "facet=\"doc\"")?,
+        )?;
+    }
+    f.package("lib/m", "1.0.0-0", String::new())?;
+    f.package("lib/m", "2.0.0-0", "    require \"lib/a\"\n".into())?;
+    f.package(
+        "apps/r",
+        "1.0.0-0",
+        "    require \"lib/m\"\n    require \"lib/b\"\n".into(),
+    )?;
+    f.package(
+        "apps/top",
+        "1.0.0-0",
+        "    require \"lib/a\"\n    require \"apps/r\"\n".into(),
+    )?;
+    let mut policy = ImagePolicy::default();
+    policy.insert_facet("doc", false, false)?;
+    policy.insert_facet("apps/r:doc", true, true)?;
+    create_image(&f.root, &f.repo, "canopa", &f.trust, "x86_64", policy)?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/top".into()],
+        },
+    )?;
+    assert!(
+        install.summary().contains("Install lib/m 1.0.0-0"),
+        "{}",
+        install.summary()
+    );
+    apply(&f.root, &install)?;
+    assert_eq!(fs::read_to_string(f.root.join(SHARED_DOC))?, "b docs");
+    assert_eq!(rule(&f.root, Some("lib/a"), "doc")?, (false, "doc".into()));
+    assert_eq!(
+        rule(&f.root, Some("lib/b"), "doc")?,
+        (true, "apps/r:doc (dependency of apps/r)".into())
+    );
+    Ok(())
+}

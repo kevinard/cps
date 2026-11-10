@@ -89,6 +89,11 @@ fn facet_specificity(pattern: &str, facet: &str) -> Option<usize> {
         .then_some(prefix.len() + 1)
 }
 
+/// Return whether a package name or `prefix/*` glob names `package`.
+pub(crate) fn package_pattern_matches(pattern: &str, package: &str) -> bool {
+    package_specificity(pattern, package).is_some()
+}
+
 /// Return how specifically `pattern` names `package`, or `None` when it does not match.
 fn package_specificity(pattern: &str, package: &str) -> Option<usize> {
     if pattern == package {
@@ -449,6 +454,30 @@ impl Resolved<'_> {
                 .selectors()
                 .facet
                 .is_none_or(|facet| self.facet(package, facet).0)
+    }
+
+    /// Package patterns of the rules applied with dependencies that could decide
+    /// a facet of `manifest`'s actions, in any selection of packages. The
+    /// package's own rules take precedence, so the facets they decide are fixed.
+    pub(crate) fn inheritable(&self, package: &str, manifest: &Manifest) -> BTreeSet<&'_ str> {
+        let mut patterns = BTreeSet::new();
+        for (pattern, rules) in self.selection.packages {
+            if patterns.contains(pattern.as_str()) {
+                continue;
+            }
+            let reaches = manifest.action.iter().any(|action| {
+                action.selectors().facet.is_some_and(|facet| {
+                    self.selection.package_facet(package, facet).is_none()
+                        && rules.iter().any(|(rule, entry)| {
+                            entry.with_dependencies && facet_specificity(rule, facet).is_some()
+                        })
+                })
+            });
+            if reaches {
+                patterns.insert(pattern.as_str());
+            }
+        }
+        patterns
     }
 
     /// Facet patterns of the per-package rules, direct or inherited, that reach `package`.
