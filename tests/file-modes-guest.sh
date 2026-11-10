@@ -25,7 +25,7 @@ root=$work/image
 probe=/usr/local/libexec/mode-probe
 cps=/usr/bin/cps
 repo=/repository
-"$cps" image-create --root "$work/groups" --repo "$repo" --publisher modetest --trust-key /public.der
+"$cps" image-create --root "$work/groups" --repo "$repo" --publisher modetest --trust-root /trust.json
 "$cps" plan --root "$work/groups" --output "$work/groups.json" install test/groups
 if "$probe" no-fsetid "$cps" apply --root "$work/groups" "$work/groups.json" > "$work/group-denied" 2>&1; then exit 1; fi
 rejection=$("$bb" cat "$work/group-denied")
@@ -33,7 +33,7 @@ case "$rejection" in *'did not retain the requested ownership and mode'*) ;; *) 
 test ! -e "$work/groups/var/shared"
 test "$("$cps" transaction status --root "$work/groups")" = "$(printf 'Image revision 0\nNo pending transaction')"
 "$cps" verify --root "$work/groups" --pristine
-"$cps" image-create --root "$root" --repo "$repo" --publisher modetest --trust-key /public.der
+"$cps" image-create --root "$root" --repo "$repo" --publisher modetest --trust-root /trust.json
 "$cps" plan --root "$root" --output "$work/install.json" install test/modes@1.0.0-0
 if "$probe" no-fsetid "$cps" apply --root "$root" "$work/install.json" > "$work/denied" 2>&1; then exit 1; fi
 rejection=$("$bb" cat "$work/denied")

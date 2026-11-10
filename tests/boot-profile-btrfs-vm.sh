@@ -35,20 +35,22 @@ for pair in "canopa:$cps_fixture" "canopa-kernel:$kernel_fixture" \
     publisher=${pair%%:*}
     fixture=${pair#*:}
     cp -a -- "$fixture/repo" "repos/$publisher"
-    cp -- "$fixture/release-public.der" "$publisher-public.der"
+    cp -- "$fixture/release.trust.json" "$publisher.trust.json"
     if [[ $publisher != canopa-usr-base ]]; then
         cp -- "$fixture/builder-public.der" "$publisher-builder.der"
     fi
 done
+# Each key is the 1-of-1 trust root of the publisher's repository, pinned
+# through PUBLISHER.trust.json.
 keypair() {
     openssl genpkey -algorithm ED25519 -outform DER -out "$1-private.der"
-    openssl pkey -inform DER -in "$1-private.der" -pubout -outform DER -out "$1-public.der"
+    "$cps" repo trust init --repo "repos/$1" --publisher "$1" --key "$1-private.der" >/dev/null
+    cp -- "repos/$1/trust/1.json" "$1.trust.json"
 }
 keypair vm-test
 keypair vm-profile
-keypair canopa-kernel
 mv repos/canopa-kernel original-kernel-repo
-mkdir repos/canopa-kernel
+keypair canopa-kernel
 cp "$next_kernel_fixture/builder-public.der" canopa-kernel-next-builder.der
 {
     printf 'schema-version 1 kind="publish-policy"\npublisher "canopa-kernel" {\n'
@@ -56,7 +58,7 @@ cp "$next_kernel_fixture/builder-public.der" canopa-kernel-next-builder.der
     for fixture in "$kernel_fixture" "$next_kernel_fixture"; do
         package=$(cat "$fixture/kernel-package")
         "$cps" repo attestation --repo "$fixture/repo" --publisher canopa-kernel \
-            --trust-key "$fixture/release-public.der" "$package" > /dev/null
+            --trust-root "$fixture/release.trust.json" "$package" > /dev/null
         recipe=$(sha256sum "$fixture/build.kdl"); recipe=${recipe%% *}
         printf '    approve "system/kernel-qemu" version="%s" sha256="%s"\n' "${package##*@}" "$recipe"
     done
@@ -137,7 +139,7 @@ refresh_profile() {
         printf '    profile "boot" architecture="%s" {\n        package "test/btrfs-stack@%s"\n        facet "devel" #false\n' "$(uname -m)" "$1"
         for publisher in "${publishers[@]}"; do
             printf '        publisher "%s" catalog="%s" {\n' "$publisher" "$(cat "repos/$publisher/current")"
-            printf '            repository "../%s"\n            trust-key "../../%s-public.der"\n' "$publisher" "$publisher"
+            printf '            repository "../%s"\n            trust-root "../../%s.trust.json"\n' "$publisher" "$publisher"
             if [[ -f $publisher-builder.der ]]; then
                 printf '            build-trust {\n                builder-key "../../%s-builder.der"\n' "$publisher"
                 if [[ $publisher == canopa-kernel ]]; then
@@ -157,7 +159,7 @@ refresh_profile 1.0.0-0
 {
     printf 'schema-version 1 kind="image-config"\nfacet "devel" #false\nrelease-profile "boot"\n'
     for publisher in vm-profile "${publishers[@]}"; do
-        printf 'publisher "%s" { repository "repos/%s"; trust-key "%s-public.der"; }\n' "$publisher" "$publisher" "$publisher"
+        printf 'publisher "%s" { repository "repos/%s"; trust-root "%s.trust.json"; }\n' "$publisher" "$publisher" "$publisher"
     done
 } > image.kdl
 mkdir files

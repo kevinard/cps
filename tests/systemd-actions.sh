@@ -31,7 +31,7 @@ fi
 
 mkdir -p proto/etc proto/usr/lib/{sysusers.d,tmpfiles.d,systemd/system,systemd/system-preset}
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
 
 write_unit() {
     cat > "proto/usr/lib/systemd/system/$1" <<UNIT
@@ -61,7 +61,7 @@ publish() {
     "$cps" publish --repo repo --proto proto --signing-key private.der package.kdl
 }
 publish
-"$cps" image-create --root base --repo repo --publisher canopa --trust-key public.der
+"$cps" image-create --root base --repo repo --publisher canopa --trust-root repo/trust/1.json
 "$cps" plan --root base --output install.json install test/systemd-actions
 "$cps" apply --root base install.json
 
@@ -230,7 +230,7 @@ package "test/optional-tmpfiles" publisher="canopa" version="1.0.0-0" {
 }
 MANIFEST
 publish
-"$cps" image-create --root facet-base --repo repo --publisher canopa --trust-key public.der --facet optional=false
+"$cps" image-create --root facet-base --repo repo --publisher canopa --trust-root repo/trust/1.json --facet optional=false
 "$cps" plan --root facet-base --output facet-install.json install test/optional-tmpfiles
 "$cps" apply --root facet-base facet-install.json
 "$cps" plan --root facet-base --output facet-enable.json change-facet optional=default | tee facet-preview.log

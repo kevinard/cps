@@ -18,11 +18,11 @@ chmod 0755 proto/bin/tool
 ln proto/bin/tool proto/bin/alias
 ln -s tool proto/bin/link
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher test --key private.der >/dev/null
 "$cps" manifest generate --proto proto --publisher test --version 1.0.0-0 \
     --uid "$(id -u)" --gid "$(id -g)" test/payload > manifest.kdl
 "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
-created=$("$cps" image-create --root image --repo repo --publisher test --trust-key public.der)
+created=$("$cps" image-create --root image --repo repo --publisher test --trust-root repo/trust/1.json)
 id=${created#Created image }
 id=${id%% at *}
 "$cps" plan --root image --output install.json install test/payload

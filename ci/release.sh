@@ -28,6 +28,25 @@ catalog_from_output() {
     printf '%s\n' "$hash"
 }
 
+# CPS_RELEASE_SIGNING_KEY lists one catalog key per line, enough to meet the
+# trust root's catalog threshold. Each line is PATH, file:PATH, or
+# command:DESCRIPTOR, and every key stays outside the publishing repository.
+signing_keys() {
+    local line source
+    signing=()
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        # A command: source names an external signer descriptor instead of a key file.
+        source=${line#command:}
+        source=$(realpath -e -- "${source#file:}") || fail 'Cannot find a publisher signing key'
+        [[ -f $source && $source != "$(realpath -e -- "$repo")/"* ]] ||
+            fail 'Keep the publisher signing keys outside the publishing repository'
+        if [[ $line == command:* ]]; then line=command:$source; else line=$source; fi
+        signing+=(--signing-key "$line")
+    done <<< "${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}"
+    (( ${#signing[@]} > 0 )) || fail 'Set CPS_RELEASE_SIGNING_KEY'
+}
+
 deploy_catalog() {
     local marker
     [[ $(current) == "$1" ]] || fail 'The repository advanced before deployment'
@@ -45,8 +64,8 @@ deploy_catalog() {
 }
 
 widen_catalog() {
-    local base=$1 profile=$2 percentage=$3 key gate message hash
-    key=${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}
+    local base=$1 profile=$2 percentage=$3 gate message hash
+    signing_keys
     gate=${CPS_RELEASE_ROLLOUT_GATE:?Set CPS_RELEASE_ROLLOUT_GATE to the cohort health adapter}
     [[ $gate = /* && -x $gate ]] || fail 'Use an absolute executable path for the rollout gate'
     [[ $(current) == "$base" ]] || fail 'The requested rollout catalog is stale'
@@ -59,7 +78,7 @@ widen_catalog() {
         fail 'Rollout health gate failed'
     fi
     message=$("$cps" repo widen-rollout --repo "$repo" --publisher "$publisher" \
-        --signing-key "$key" --base "$base" --profile "$profile" --percentage "$percentage") || return
+        "${signing[@]}" --base "$base" --profile "$profile" --percentage "$percentage") || return
     hash=$(catalog_from_output "$message" Published) || return
     deploy_catalog "$hash"
 }
@@ -70,17 +89,11 @@ case ${1:-} in
         [[ $# == 3 && $2 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] ||
             fail 'Expected prepare REQUEST EXPORT_DIRECTORY or promote REQUEST REHEARSED_SHA256'
         inputs=${CPS_RELEASE_INPUTS:?Set CPS_RELEASE_INPUTS to the release requests directory}
-        key=${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}
         [[ $inputs = /* ]] || fail 'Use an absolute release requests directory'
-        # A command: source names an external signer descriptor instead of a key file.
-        source=${key#command:}
-        source=$(realpath -e -- "${source#file:}")
-        [[ -f $source && $source != "$(realpath -e -- "$repo")/"* ]] ||
-            fail 'Keep the publisher signing key outside the publishing repository'
-        if [[ $key == command:* ]]; then key=command:$source; else key=$source; fi
+        signing_keys
         request="$inputs/$2/release.kdl"
         [[ -f $request ]] || fail 'Release request needs release.kdl'
-        publish=("$cps" repo publish-release --repo "$repo" --signing-key "$key")
+        publish=("$cps" repo publish-release --repo "$repo" "${signing[@]}")
         if [[ -n ${CPS_RELEASE_SOURCE_CACHE:-} ]]; then
             publish+=(--source-cache "$CPS_RELEASE_SOURCE_CACHE")
         fi

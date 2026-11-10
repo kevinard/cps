@@ -28,7 +28,8 @@ chmod +x root/init
 printf 'root:x:0:0:root:/root:/bin/sh\n' > root/etc/passwd
 printf 'root:x:0:\n' > root/etc/group
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out root/public.der
+"$cps" repo trust init --repo root/repository --publisher modetest --key private.der >/dev/null
+cp root/repository/trust/1.json root/trust.json
 printf 'protected\n' > proto/tmp/root-owned
 for version in 1 2 3 4; do
     case $version in 1) mode=6755 ;; 2) mode=4755 ;; 3) mode=2755 ;; 4) mode=0755 ;; esac

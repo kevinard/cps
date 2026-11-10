@@ -12,7 +12,7 @@ uid=$(id -u)
 gid=$(id -g)
 mkdir -p runtime/usr/lib app/usr/bin shadow/usr/override loader/usr/lib
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
 
 printf 'int answer(void) { return 42; }\n' > library.c
 printf 'extern int answer(void); void _start(void) { answer(); }\n' > app.c
@@ -28,7 +28,7 @@ publish() {
     "$cps" publish --repo repo --proto "$1" --signing-key private.der generated.kdl
 }
 install_base() {
-    "$cps" image-create --root "$1" --repo repo --publisher canopa --trust-key public.der \
+    "$cps" image-create --root "$1" --repo repo --publisher canopa --trust-root repo/trust/1.json \
         --arch "$arch"
     "$cps" plan --root "$1" --output base.json install demo/app demo/loader demo/runtime@1.0.0-0
     "$cps" apply --root "$1" base.json

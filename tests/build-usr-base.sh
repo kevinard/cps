@@ -14,7 +14,7 @@ cd -- "$output"
 
 original="$work/original"
 "$cps" image-create --root "$original" --repo "$runtime/runtime-seed" \
-    --publisher canopa-runtime-seed --trust-key "$runtime/runtime-seed-public.der"
+    --publisher canopa-runtime-seed --trust-root "$runtime/runtime-seed.trust.json"
 "$cps" plan --root "$original" --output "$work/original.json" install \
     cps://canopa-runtime-seed/system/elf-runtime
 "$cps" apply --root "$original" "$work/original.json"
@@ -22,6 +22,8 @@ original="$work/original"
 
 openssl genpkey -algorithm ED25519 -outform DER -out "$work/release.der"
 openssl pkey -inform DER -in "$work/release.der" -pubout -outform DER -out release-public.der
+"$cps" repo trust init --repo repo --publisher canopa-usr-base --key "$work/release.der" >/dev/null
+cp -- repo/trust/1.json release.trust.json
 mkdir "$work/proto"
 uid=$(id -u)
 gid=$(id -g)
@@ -34,7 +36,7 @@ done
 for package in filesystem elf-runtime; do
     "$cps" publish --repo repo --proto "$work/proto" --signing-key "$work/release.der" "$package.kdl"
 done
-"$cps" image-create --root image --repo repo --publisher canopa-usr-base --trust-key release-public.der
+"$cps" image-create --root image --repo repo --publisher canopa-usr-base --trust-root release.trust.json
 "$cps" plan --root image --output install.json install cps://canopa-usr-base/system/elf-runtime@1.0.0-1
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine

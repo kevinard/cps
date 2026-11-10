@@ -14,15 +14,21 @@ work=$(mktemp -d "$output/.private.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$output"
 
+# KEY [REPOSITORY PUBLISHER] creates a key pair. With a repository, the key
+# also becomes the repository's 1-of-1 trust root, copied to KEY.trust.json.
 keypair() {
     openssl genpkey -algorithm ED25519 -outform DER -out "$work/$1.der"
     openssl pkey -inform DER -in "$work/$1.der" -pubout -outform DER -out "$1-public.der"
+    if [[ $# == 3 ]]; then
+        "$cps" repo trust init --repo "$2" --publisher "$3" --key "$work/$1.der" >/dev/null
+        cp -- "$2/trust/1.json" "$1.trust.json"
+    fi
 }
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 
-keypair toolchain
+keypair toolchain toolchain seed
 keypair builder
-keypair release
+keypair release repo canopa-util-linux
 bash "$project/tests/seed-native-c.sh" "$work/native-util-linux" --util-linux
 "$cps" manifest generate --proto "$work/native-util-linux" --publisher seed --version 1.0.0-0 \
     build/native-util-linux > native-util-linux.kdl
@@ -32,14 +38,14 @@ bash "$project/tests/seed-native-c.sh" "$work/native-util-linux" --util-linux
 recipe="$project/packaging/util-linux"
 sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/util-linux.kdl" > util-linux.kdl
 sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
-    -e "s/@KEY_SHA256@/$(tail -c 32 -- toolchain-public.der | sha256sum | cut -d' ' -f1)/g" \
+    -e "s/@KEY_SHA256@/$(sha256sum < toolchain.trust.json | cut -d' ' -f1)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha util-linux.kdl)/g" "$recipe/build.kdl.in" > build.kdl
 "$cps" source import --from "$sources" --cache sources build.kdl
-"$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \
+"$cps" build --repo toolchain --publisher seed --trust-root toolchain.trust.json \
     --source-cache sources --output bundle --check-reproducible \
     --builder-signing-key "$work/builder.der" build.kdl
 
-mkdir repo
+mkdir -p repo
 cp builder-public.der repo/
 reviewed=$(sha build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
@@ -52,11 +58,11 @@ POLICY
 "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$reviewed" bundle
 package=cps://canopa-util-linux/system/util-linux@2.42.4-1
-"$cps" repo attestation --repo repo --publisher canopa-util-linux --trust-key release-public.der \
+"$cps" repo attestation --repo repo --publisher canopa-util-linux --trust-root release.trust.json \
     "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa-util-linux --trust-key release-public.der
-"$cps" publisher add --root image --repo "$base/repo" --trust-key "$base/release-public.der" canopa-usr-base
+"$cps" image-create --root image --repo repo --publisher canopa-util-linux --trust-root release.trust.json
+"$cps" publisher add --root image --repo "$base/repo" --trust-root "$base/release.trust.json" canopa-usr-base
 "$cps" plan --root image --output install.json install "$package"
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine

@@ -194,8 +194,8 @@ def main():
 
     subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519",
                     "-outform", "DER", "-out", "private.der"], check=True)
-    subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", "private.der",
-                    "-pubout", "-outform", "DER", "-out", "public.der"], check=True)
+    subprocess.run([str(cps), "repo", "trust", "init", "--repo", "repo", "--publisher",
+                    PUBLISHER, "--key", "private.der"], check=True, stdout=subprocess.DEVNULL)
     uid, gid = os.getuid(), os.getgid()
     manifests = Path("manifests")
     manifests.mkdir()
@@ -230,7 +230,7 @@ def main():
     for version in range(1, options.versions):
         publish_version(version, everything, f"publish_version_{version}")
     run("image-create", "--root", "image", "--repo", "repo",
-        "--publisher", PUBLISHER, "--trust-key", "public.der")
+        "--publisher", PUBLISHER, "--trust-root", "repo/trust/1.json")
     run("plan", "--root", "image", "--output", "install.json",
         "install", package_name(workload), label="plan_install")
     run("apply", "--root", "image", "install.json", label="apply_install")
@@ -258,11 +258,11 @@ def main():
     run(*lookup, label="file_search_index")
     if not options.skip_mirror:
         run("repo", "export", "--repo", "repo", "--publisher", PUBLISHER,
-            "--trust-key", "public.der", "--output", "targets", label="export")
+            "--trust-root", "repo/trust/1.json", "--output", "targets", label="export")
         mirror = subprocess.check_output([tuf, "targets", "mirror", "1"], text=True).strip()
         sync = ("repo", "sync", "--repo", "cache", "--root", "mirror/root.json",
                 "--metadata", mirror + "metadata/", "--targets", mirror + "targets/",
-                "--publisher", PUBLISHER, "--trust-key", "public.der", "--index-only")
+                "--publisher", PUBLISHER, "--trust-root", "repo/trust/1.json", "--index-only")
         run(*sync, label="refresh_empty_cache")
         run(*sync, label="refresh_existing_cache")
     print(json.dumps({

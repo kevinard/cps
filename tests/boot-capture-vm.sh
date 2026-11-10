@@ -60,7 +60,7 @@ if [[ -n $kernel_fixture ]]; then
     trial_release=$(cat "$kernel_fixture/kernel-release")
     grep -Fx 'CONFIG_BTRFS_FS=y' "$kernel_fixture/image/usr/lib/modules/$trial_release/config"
     "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
-        --trust-key "$kernel_fixture/release-public.der" "$kernel_package" >/dev/null
+        --trust-root "$kernel_fixture/release.trust.json" "$kernel_package" >/dev/null
     test "$trial_release" != "${CPS_VM_KERNEL_RELEASE:-$(uname -r)}"
 fi
 root_device=/dev/vda
@@ -71,7 +71,8 @@ cd "$work"
 
 mkdir -p proto/etc
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher test --key private.der >/dev/null
+cp repo/trust/1.json public.trust.json
 publish() {
     printf '%s\n' "$1" > proto/etc/cps-capture-version
     "$cps" manifest generate --proto proto --publisher test --version "$1" \
@@ -89,7 +90,7 @@ publish() {
 base_packages=(test/live-root)
 if [[ $git_installs == 1 ]]; then
     CPS_GIT_BUILD_BUSYBOX="$busybox" bash "$project/tests/seed-git-build.sh" "$cps" \
-        "$work/git-build" "$work/private.der" "$work/public.der"
+        "$work/git-build" "$work/private.der"
     "$cps" manifest generate --proto git-build --publisher test --version 1.0.0-0 \
         --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
     "$cps" publish --repo repo --proto git-build --signing-key private.der git-build.kdl
@@ -98,7 +99,7 @@ fi
 publish 1.0.0-0
 mkdir files
 root="$work/files/@"
-"$cps" image-create --root "$root" --repo "$work/repo" --publisher test --trust-key public.der
+"$cps" image-create --root "$root" --repo "$work/repo" --publisher test --trust-root public.trust.json
 "$cps" plan --root "$root" --output install.json install "${base_packages[@]}"
 "$cps" apply --root "$root" install.json
 if [[ -n $kernel_fixture ]]; then
@@ -109,7 +110,7 @@ build-trust {
 }
 POLICY
     "$cps" publisher add --root "$root" --repo "$kernel_fixture/repo" \
-        --trust-key "$kernel_fixture/release-public.der" --build-trust kernel-builders.kdl canopa-kernel
+        --trust-root "$kernel_fixture/release.trust.json" --build-trust kernel-builders.kdl canopa-kernel
 fi
 if [[ $system_commands == 1 ]]; then
     mkdir -p app/usr/bin service/usr/{bin,lib/systemd/system}
@@ -175,7 +176,7 @@ if [[ $native_boot == 1 ]]; then
     setup_systemd_guest "$root"
     if [[ $system_commands == 1 ]]; then
         mkdir -p "$root/etc/cps"
-        cp public.der "$root/etc/cps/test.der"
+        cp public.trust.json "$root/etc/cps/test.trust.json"
         cp catalog-{1.0.0-0,2.0.0-0} "$root/repository/"
         cp repo/current "$root/repository/catalog-base-upgrade"
         install -m755 "$project/tests/system-workflow-guest.sh" "$root/usr/local/libexec/cps-system-workflow"
@@ -183,7 +184,7 @@ if [[ $native_boot == 1 ]]; then
 schema-version 1 kind="image-config"
 publisher "test" {
     repository "/repository"
-    trust-key "test.der"
+    trust-root "test.trust.json"
 }
 boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid" options="rw console=ttyS0 loglevel=3 init=/init-systemd"
 CONFIG
@@ -375,7 +376,7 @@ if [ -f /etc/cps-btrfs-discard-failed ]; then
 schema-version 1 kind="image-config"
 publisher "test" {
     repository "/repository"
-    trust-key "/etc/cps/test.der"
+    trust-root "/etc/cps/test.trust.json"
 }
 boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid"
 CONFIG

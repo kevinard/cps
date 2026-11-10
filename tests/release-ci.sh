@@ -6,14 +6,23 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
 export CPS_RELEASE_REPO=$work/repo CPS_RELEASE_PUBLISHER=canopa
-export CPS_RELEASE_INPUTS=$work/requests CPS_RELEASE_SIGNING_KEY=$work/key.der
+# Two catalog keys meet a 2-of-2 catalog threshold, one per line.
+export CPS_RELEASE_INPUTS=$work/requests CPS_RELEASE_SIGNING_KEY=$work/key.der$'\n'$work/key2.der
 export CPS_RELEASE_VM_GATE=$work/vm-gate CPS_RELEASE_ROLLOUT_GATE=$work/rollout-gate
 export CPS_RELEASE_DEPLOY=$work/deploy CPS_TEST_LOG=$work/checks
 export CPS_RELEASE_ROLLOUT_PLAN=$work/rollout.json
 openssl genpkey -algorithm ED25519 -outform DER -out key.der
 openssl pkey -inform DER -in key.der -pubout -outform DER -out public.der
+openssl genpkey -algorithm ED25519 -outform DER -out key2.der
+openssl pkey -inform DER -in key2.der -pubout -outform DER -out key2-public.der
 openssl genpkey -algorithm ED25519 -outform DER -out extra.der
-openssl pkey -inform DER -in extra.der -pubout -outform DER -out extra-public.der
+"$CPS_BIN" repo trust init --repo extra --publisher extra --key extra.der >/dev/null
+cp extra/trust/1.json extra.trust.json
+"$CPS_BIN" repo trust init --repo repo --publisher canopa --key key.der >/dev/null
+cp repo/trust/1.json canopa.trust.json
+"$CPS_BIN" repo trust rotate --repo repo --key key.der \
+    --catalog-key public.der --catalog-key key2-public.der --catalog-threshold 2 >/dev/null
+signing=(--signing-key key.der --signing-key key2.der)
 mkdir -p proto/usr/share requests/next/cases/desktop
 echo 'local addition' > proto/usr/share/extra
 "$CPS_BIN" manifest generate --proto proto --publisher extra --version 1.0.0-0 \
@@ -25,7 +34,7 @@ for version in 1 2 3; do
     echo "$version" > proto/usr/share/cps-test
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$version.0.0-0" \
         --uid "$(id -u)" --gid "$(id -g)" desktop/base > manifest.kdl
-    "$CPS_BIN" publish --repo repo --proto proto --signing-key key.der manifest.kdl
+    "$CPS_BIN" publish --repo repo --proto proto "${signing[@]}" manifest.kdl
 done
 policy() {
     cat > repo/publish-policy.kdl <<POLICY
@@ -36,7 +45,7 @@ publisher "canopa" {
         package "desktop/base@$1.0.0-0"
         publisher "extra" catalog="$extra_pin" {
             repository "$work/extra"
-            trust-key "$work/extra-public.der"
+            trust-root "$work/extra.trust.json"
         }
     }
 }
@@ -45,7 +54,7 @@ POLICY
 for version in 1 2; do
     policy "$version" 100
     printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
-    "$CPS_BIN" repo publish-release --repo repo --signing-key key.der baseline.kdl
+    "$CPS_BIN" repo publish-release --repo repo "${signing[@]}" baseline.kdl
     if [[ $version == 1 ]]; then
         cat repo/current > requests/next/cases/desktop/baselines
     fi
@@ -57,8 +66,8 @@ cat > requests/next/cases/desktop/image.kdl <<CONFIG
 schema-version 1 kind="image-config"
 architecture "$(uname -m)"
 release-profile "desktop"
-publisher "canopa" { repository "$work/repo"; trust-key "$work/public.der"; }
-publisher "extra" { repository "$work/extra"; trust-key "$work/extra-public.der"; }
+publisher "canopa" { repository "$work/repo"; trust-root "$work/canopa.trust.json"; }
+publisher "extra" { repository "$work/extra"; trust-root "$work/extra.trust.json"; }
 CONFIG
 cat > requests/next/cases/desktop/before-upgrade <<'HOOK'
 #!/usr/bin/env bash
@@ -115,7 +124,10 @@ reject() {
     fi
 }
 reject release promote next
-ln -s "$CPS_RELEASE_SIGNING_KEY" "repo/catalogs/$(printf '%064d' 0)"
+# One catalog key alone does not meet the threshold.
+CPS_RELEASE_SIGNING_KEY=$work/key.der reject release prepare next "$work/rejected-snapshot"
+[[ ! -e $work/rejected-snapshot ]]
+ln -s "$work/key2.der" "repo/catalogs/$(printf '%064d' 0)"
 reject release prepare next "$work/rejected-snapshot"
 [[ ! -e $work/rejected-snapshot && $(cat repo/current) == "$base" ]]
 rm "repo/catalogs/$(printf '%064d' 0)"

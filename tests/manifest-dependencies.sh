@@ -9,18 +9,20 @@ cd -- "$work"
 
 for publisher in runtime tools; do
     openssl genpkey -algorithm ED25519 -outform DER -out "$publisher.der"
-    openssl pkey -inform DER -in "$publisher.der" -pubout -outform DER -out "$publisher-public.der"
+    "$cps" repo trust init --repo "$publisher-repo" --publisher "$publisher" \
+        --key "$publisher.der" >/dev/null
+    cp "$publisher-repo/trust/1.json" "$publisher.trust.json"
 done
 cat > image.kdl <<CONFIG
 schema-version 1 kind="image-config"
 architecture "$(uname -m)"
 publisher "runtime" {
     repository "runtime-repo"
-    trust-key "runtime-public.der"
+    trust-root "runtime.trust.json"
 }
 publisher "tools" {
     repository "tools-repo"
-    trust-key "tools-public.der"
+    trust-root "tools.trust.json"
 }
 CONFIG
 mkdir -p app/usr/bin runtime/usr/{bin,lib/demo} tools/usr/local/bin

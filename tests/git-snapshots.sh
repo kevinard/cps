@@ -21,7 +21,7 @@ git -C upstream tag -a release -m "Annotated release"
 printf 'uncommitted\n' > upstream/hello
 
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher demo --key private.der >/dev/null
 mkdir proto
 cat > template.kdl <<'KDL'
 schema-version 1 kind="package-manifest"
@@ -47,7 +47,7 @@ snapshot_from() {
     local output=$1
     shift
     "$cps" source git-snapshot --git-repo "${git_repo:-$work/upstream}" --repo repo \
-        --trust-key public.der --output "$output" "$@" template.build.kdl
+        --trust-root repo/trust/1.json --output "$output" "$@" template.build.kdl
 }
 
 snapshot() {

@@ -9,7 +9,7 @@ trap 'rm -rf -- "$work"' EXIT
 cd "$work"
 mkdir -p proto/usr/share/cps-test
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
 publish() {
     printf '%s\n' "$1" > proto/usr/share/cps-test/version
     cat > manifest.kdl <<MANIFEST
@@ -21,7 +21,7 @@ MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
 }
 publish 1.0.0-0
-"$cps" image-create --root image --repo repo --publisher canopa --trust-key public.der
+"$cps" image-create --root image --repo repo --publisher canopa --trust-root repo/trust/1.json
 "$cps" plan --root image --output install.json install test/tool
 "$cps" apply --root image install.json
 mv repo offline-repo

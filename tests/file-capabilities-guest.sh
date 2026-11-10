@@ -8,10 +8,10 @@ root=$work/image
 probe=$root/bin/raw-probe
 alias=$root/bin/raw-probe-alias
 repo=/usr/lib/cps-cap-test/repo
-trust=/usr/lib/cps-cap-test/public.der
+trust=/usr/lib/cps-cap-test/trust.json
 
 /bin/busybox mkdir -p "$work"
-"$cps" image-create --root "$root" --repo "$repo" --publisher captest --trust-key "$trust"
+"$cps" image-create --root "$root" --repo "$repo" --publisher captest --trust-root "$trust"
 "$cps" plan --root "$root" --output "$work/install.json" install cps://captest/test/raw-probe@1.0.0-0
 if error=$(/usr/bin/setpriv --bounding-set=-setfcap "$cps" apply --root "$root" "$work/install.json" 2>&1); then
     printf '%s\n' 'A capability-bearing install succeeded without CAP_SETFCAP' >&2

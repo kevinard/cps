@@ -101,16 +101,18 @@ echo 'Verified atomic GPT deployment and byte-for-byte preservation outside the 
 
 mkdir -p proto/etc esp
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 publish() {
     local publisher=$1 repo=$2 version=$3
+    if [[ ! -e $repo/trust/1.json ]]; then
+        "$cps" repo trust init --repo "$repo" --publisher "$publisher" --key private.der >/dev/null
+    fi
     printf '%s\n' "$version" > proto/etc/version
     "$cps" manifest generate --proto proto --publisher "$publisher" --version "$version" \
         --uid "$(id -u)" --gid "$(id -g)" test/root > package.kdl
     "$cps" publish --repo "$repo" --proto proto --signing-key private.der package.kdl
 }
 publish test repo 1.0.0-0
-"$cps" image-create --root base --repo repo --publisher test --trust-key public.der
+"$cps" image-create --root base --repo repo --publisher test --trust-root repo/trust/1.json
 "$cps" plan --root base --output install.json install test/root
 "$cps" apply --root base install.json
 mkdir -p base/boot
@@ -161,7 +163,7 @@ deploy template.raw different-revision.ext4 "$base" different-revision.raw
 
 publish extra extras 1.0.0-0
 cp -a base different-state
-"$cps" publisher add --root different-state --repo extras --trust-key public.der extra
+"$cps" publisher add --root different-state --repo extras --trust-root extras/trust/1.json extra
 reject_activation 'image state differs from the root export receipt' \
     different-state base.raw "$base" base.kdl --known-good
 
