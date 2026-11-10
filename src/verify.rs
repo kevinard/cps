@@ -371,11 +371,30 @@ fn check_state(
         // Triggers own what their output patterns cover, and their contents
         // are not part of any manifest.
         let generated = crate::triggers::active_outputs(&state.installed, &expected);
+        let var = crate::image::VAR_DIRECTORY;
+        if !root.inspect(var)?.as_ref().is_some_and(Node::is_dir) {
+            findings.push(Finding {
+                is_error: true,
+                message: format!("missing directory {var:?}, the mount point of /var"),
+            });
+        }
         root.walk(Some(crate::image::STATE_DIRECTORY), |path, entry, info| {
             let kind = FileType::from_raw_mode(info.st_mode);
             let Some(managed) = expected.get(path) else {
-                if kind == FileType::Directory && crate::image::STATE_ANCESTORS.contains(&path) {
+                if kind == FileType::Directory
+                    && (crate::image::STATE_ANCESTORS.contains(&path) || path == var)
+                {
                     return Ok(true);
+                }
+                if crate::model::under_var(path) {
+                    findings.push(Finding {
+                        is_error: true,
+                        message: format!(
+                            "unexpected path {path:?}: an inactive root leaves /var empty for \
+                             tmpfiles.d to populate at boot"
+                        ),
+                    });
+                    return Ok(false);
                 }
                 if crate::triggers::generated(&generated, path) {
                     return Ok(false);

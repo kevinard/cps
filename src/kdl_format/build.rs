@@ -238,6 +238,11 @@ fn collect_rule(node: &KdlNode) -> Result<CollectRule> {
         pattern.split('/').next() != Some(".cps"),
         "reserved image path {pattern}"
     );
+    ensure!(
+        !crate::model::under_var(&pattern),
+        "collect rule {pattern} is under /var: {}",
+        crate::model::VAR_ADVICE
+    );
     let mode = fields.string("mode")?;
     if let Some(mode) = &mode {
         parse_mode(mode)?;

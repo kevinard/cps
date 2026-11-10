@@ -95,6 +95,12 @@ pub(crate) fn excluded_subvolumes(extra: &[String]) -> Result<Vec<String>> {
             !state.starts_with(&format!("{path}/")),
             "excluded subvolume {path} contains the CPS image state"
         );
+        ensure!(
+            path != crate::image::VAR_DIRECTORY,
+            "a nested /var subvolume cannot be excluded, because new roots would start without \
+             its data. Make /var a sibling of the root subvolume, mounted at /var from \
+             /etc/fstab, so that every boot environment shares it"
+        );
         paths.insert(path.to_owned());
     }
     Ok(paths.into_iter().collect())
@@ -492,6 +498,12 @@ pub(super) fn destroy_by_id(volume: &Root, subvolid: u64) -> Result<()> {
 fn check_snapshot_tree(root: &Root) -> Result<()> {
     root.walk(None, |path, _, info| {
         ensure!(
+            !(path == crate::image::VAR_DIRECTORY && is_stub(info)),
+            "the root's /var is a nested Btrfs subvolume, which a snapshot omits. Make it a \
+             sibling of the root subvolume below the Btrfs top level, and mount it at /var from \
+             /etc/fstab, so that every boot environment shares it"
+        );
+        ensure!(
             !is_stub(info),
             "capture omits nested Btrfs subvolume {path:?}. Add `exclude-subvolume \"{path}\"` \
              to boot-btrfs, or pass --exclude-subvolume {path}, to start new roots with an empty \
@@ -586,7 +598,15 @@ mod tests {
             excluded_subvolumes(&["/var/lib/docker/".into(), "var/lib/machines".into()])?,
             ["var/lib/docker", "var/lib/machines", "var/lib/portables"]
         );
-        for invalid in ["", "/", "var/../etc", "var/lib/cps", "var"] {
+        for invalid in [
+            "",
+            "/",
+            "var/../etc",
+            "var",
+            "/var/",
+            "usr",
+            "usr/lib/sysimage",
+        ] {
             assert!(
                 excluded_subvolumes(&[invalid.into()]).is_err(),
                 "{invalid} was accepted"

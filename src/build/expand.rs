@@ -120,6 +120,20 @@ fn shared_directory(first: &Action, second: &Action) -> Result<bool> {
     )
 }
 
+/// Indented lines naming the first paths, and a count of the rest.
+fn listing(paths: &[&str]) -> String {
+    let mut text = paths
+        .iter()
+        .take(UNPACKAGED_SHOWN)
+        .map(|path| format!("\n  {path}"))
+        .collect::<String>();
+    let more = paths.len().saturating_sub(UNPACKAGED_SHOWN);
+    if more > 0 {
+        text.push_str(&format!("\n  ... and {more} more"));
+    }
+    text
+}
+
 /// The first collected path of an inode, which later collected paths of the
 /// same inode may hard-link to.
 struct LinkTarget {
@@ -170,8 +184,20 @@ pub(crate) fn expand(
     let mut claimed = BTreeMap::<usize, Vec<(&str, &Entry, &CollectRule)>>::new();
     let mut used = BTreeSet::new();
     let mut unpackaged = Vec::new();
+    let mut var = Vec::new();
     for (path, entry) in tree {
         if matches!(entry, Entry::Dir) || explicit.contains_key(path.as_str()) {
+            continue;
+        }
+        let discarded = || {
+            discard
+                .iter()
+                .any(|pattern| pattern::matches(pattern, path))
+        };
+        if crate::model::under_var(path) {
+            if !discarded() {
+                var.push(path.as_str());
+            }
             continue;
         }
         let mut owners = templates
@@ -189,30 +215,28 @@ pub(crate) fn expand(
                 claimed.entry(index).or_default().push((path, entry, rule));
             }
             (None, _) => {
-                if !discard
-                    .iter()
-                    .any(|pattern| pattern::matches(pattern, path))
-                {
+                if !discarded() {
                     unpackaged.push(path.as_str());
                 }
             }
         }
     }
-    if !unpackaged.is_empty() {
-        let shown = unpackaged
-            .iter()
-            .take(UNPACKAGED_SHOWN)
-            .map(|path| format!("\n  {path}"))
-            .collect::<String>();
-        let more = unpackaged.len().saturating_sub(UNPACKAGED_SHOWN);
+    if !var.is_empty() {
         bail!(
-            "the build installed {} file(s) that no output claims; add collect or file actions, or a recipe discard pattern:{shown}{}",
+            "the build installed {} file(s) under $DESTDIR/var, which packages never ship: every \
+             boot environment shares /var, and systemd populates it at boot. Declare what the \
+             package needs there with a tmpfiles.d rule in usr/lib/tmpfiles.d and accounts with \
+             sysusers.d, then stop the install step from writing these files, or drop them with a \
+             recipe discard pattern such as \"var/**\":{}",
+            var.len(),
+            listing(&var)
+        );
+    }
+    if !unpackaged.is_empty() {
+        bail!(
+            "the build installed {} file(s) that no output claims; add collect or file actions, or a recipe discard pattern:{}",
             unpackaged.len(),
-            if more > 0 {
-                format!("\n  ... and {more} more")
-            } else {
-                String::new()
-            }
+            listing(&unpackaged)
         );
     }
     for (index, template) in templates.iter().enumerate() {
@@ -548,6 +572,49 @@ package "runtime/libcc" publisher="canopa" {
     }
 
     #[test]
+    fn installed_var_content_fails_the_build_unless_discarded() -> Result<()> {
+        let recipe = recipe("    discard \"usr/share/info/**\"\n    discard \"**/*.la\"");
+        let templates = templates(&recipe);
+        let mut tree = tree();
+        tree.insert("var".into(), Entry::Dir);
+        tree.insert("var/lib/cc".into(), Entry::Dir);
+        tree.insert("var/lib/cc/state".into(), file(false, 10));
+        tree.insert("var/run".into(), Entry::Symlink("../run".into()));
+        let message = format!(
+            "{:#}",
+            expand(&templates, &recipe.discard, &tree).unwrap_err()
+        );
+        assert!(
+            message.contains("2 file(s) under $DESTDIR/var")
+                && message.contains("tmpfiles.d")
+                && message.contains("\n  var/lib/cc/state")
+                && message.contains("\n  var/run"),
+            "{message}"
+        );
+
+        // Empty directories are not package content, and a discard drops the rest.
+        let discarded = self::recipe(
+            "    discard \"usr/share/info/**\"\n    discard \"**/*.la\"\n    discard \"var/**\"",
+        );
+        let outputs = expand(&templates, &discarded.discard, &tree)?;
+        assert!(
+            outputs
+                .iter()
+                .flat_map(|output| &output.action)
+                .all(|action| !action.path().starts_with("var"))
+        );
+
+        // A collect rule cannot name /var at all.
+        let error = parse_template(
+            "schema-version 1 kind=\"package-manifest\"\npackage \"devel/state\" publisher=\"canopa\" {\n    collect \"var/lib/**\"\n}\n",
+            &recipe,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("tmpfiles.d"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
     fn unclaimed_and_doubly_claimed_paths_fail_the_build() {
         let info = recipe("    discard \"usr/share/info/**\"");
         let error = expand(&templates(&info), &info.discard, &tree()).unwrap_err();
@@ -724,15 +791,15 @@ package "runtime/libcc" publisher="canopa" {
 
         // A preserved alias with its own mode stays a file.
         let state = template(
-            "    collect \"usr/share/a/**\"\n    collect \"var/lib/a/state\" preserve=#true mode=\"0600\"\n",
+            "    collect \"usr/share/a/**\"\n    collect \"etc/a/state\" preserve=#true mode=\"0600\"\n",
         );
         let tree = Tree::from([
             ("usr/share/a/x".into(), file(false, 1)),
-            ("var/lib/a/state".into(), file(false, 1)),
+            ("etc/a/state".into(), file(false, 1)),
         ]);
         let output = &expand(std::slice::from_ref(&state), &[], &tree)?[0];
         assert!(matches!(
-            action(output, "var/lib/a/state"),
+            action(output, "etc/a/state"),
             Action::File { mode, preserve: true, .. } if mode == "0600"
         ));
         check_expansion(&state, output, false)?;

@@ -49,7 +49,7 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 fn staging_is_empty(root: &Path) -> Result<bool> {
-    Ok(fs::read_dir(root.join("var/lib/cps/image/stage"))?
+    Ok(fs::read_dir(root.join("usr/lib/sysimage/cps/stage"))?
         .next()
         .is_none())
 }
@@ -545,7 +545,7 @@ fn assert_committed_release(f: &Fixture) -> Result<()> {
         0o755
     );
     assert!(!root.join("usr/share/canopa/new").exists());
-    assert!(!root.join("var/lib/cps/image/config-updates/2").exists());
+    assert!(!root.join("usr/lib/sysimage/cps/config-updates/2").exists());
     let status = crate::transaction_status(root)?;
     assert_eq!(status.revision, 1);
     assert!(status.pending.is_none());

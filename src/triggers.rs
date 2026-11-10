@@ -63,6 +63,7 @@ const HIDDEN: &[&str] = &[
     "dev",
     "run",
     "tmp",
+    "var",
     "home",
     "root",
     "boot",
@@ -114,6 +115,10 @@ impl Trigger {
         );
         for watch in &self.watch {
             pattern::validate(watch).with_context(|| format!("trigger {name} watch"))?;
+            ensure!(
+                !crate::model::under_var(watch),
+                "trigger {name} watches {watch:?} under /var, where packages ship nothing"
+            );
         }
         for output in &self.outputs {
             validate_output(output).with_context(|| format!("trigger {name} output"))?;
@@ -184,11 +189,18 @@ fn validate_output(output: &str) -> Result<()> {
     let base = static_base(output);
     ensure!(
         !base.is_empty() && !STATE_ANCESTORS.contains(&base.as_str()),
-        "output {output:?} must name a file inside a directory below the image root, outside var and var/lib"
+        "output {output:?} must name a file inside a directory below the image root, outside {}",
+        STATE_ANCESTORS.join(", ")
     );
     ensure!(
         output.split('/').next() != Some(".cps") && !intersects(output, STATE_DIRECTORY),
         "output {output:?} covers reserved image state"
+    );
+    ensure!(
+        !crate::model::under_var(output),
+        "output {output:?} is under /var, which is shared by every boot environment and outside \
+         the image. Generate the file below /usr or /etc instead, or let a service build it in \
+         /var at boot"
     );
     let top = output.split('/').next().unwrap_or_default();
     ensure!(
@@ -1043,9 +1055,8 @@ fn execute(
             command.arg("--ro-bind").arg(source).arg(destination);
         }
     }
-    let state = STATE_ANCESTORS[STATE_ANCESTORS.len() - 1];
-    if path.join(state).is_dir() {
-        let hidden = format!("/{state}");
+    if path.join(STATE_DIRECTORY).is_dir() {
+        let hidden = format!("/{STATE_DIRECTORY}");
         command.args(["--tmpfs", &hidden, "--remount-ro", &hidden]);
     }
     for layer in layers {
@@ -1066,6 +1077,10 @@ fn execute(
         "/tmp",
         "--tmpfs",
         "/run",
+        // The shared /var is not part of the image, and an offline image
+        // leaves it empty, so every handler sees the same empty /var.
+        "--tmpfs",
+        "/var",
         "--remount-ro",
         "/",
         "--chdir",
@@ -1349,8 +1364,11 @@ mod tests {
             "usr/lib/modules/*/initrd",
             "usr/lib/modules/6.1/initrd"
         ));
-        assert!(covers("var/cache/fontconfig", "var/cache/fontconfig/a/b"));
-        assert!(!covers("var/cache/fontconfig", "var/cache"));
+        assert!(covers(
+            "usr/lib/fontconfig/cache",
+            "usr/lib/fontconfig/cache/a/b"
+        ));
+        assert!(!covers("usr/lib/fontconfig/cache", "usr/lib/fontconfig"));
         assert!(!covers(
             "usr/share/icons/*/icon-theme.cache",
             "usr/share/icons/hicolor"
@@ -1372,8 +1390,8 @@ mod tests {
             "usr/lib/udev/hwdb.d/*.hwdb"
         ));
         assert!(intersects(
-            "var/cache/fontconfig",
-            "var/cache/fontconfig/*.cache-9"
+            "usr/lib/fontconfig/cache",
+            "usr/lib/fontconfig/cache/*.cache-9"
         ));
     }
 
@@ -1485,18 +1503,26 @@ for kind in (socket.SOCK_STREAM, socket.SOCK_SEQPACKET):
             static_base("usr/share/icons/*/icon-theme.cache"),
             "usr/share/icons"
         );
-        assert_eq!(static_base("var/cache/fontconfig"), "var/cache");
+        assert_eq!(
+            static_base("usr/lib/fontconfig/cache"),
+            "usr/lib/fontconfig"
+        );
         for invalid in [
             "run/cache/x",
             "hwdb.bin",
             "*/x",
-            "var/x",
-            "var/lib/x",
-            "var/lib/cps/image/x",
-            "var/lib/**",
+            "usr/x",
+            "usr/lib/x",
+            "usr/lib/sysimage/x",
+            "usr/lib/sysimage/cps/x",
+            "usr/lib/**",
+            "var/cache/fontconfig",
+            "var/lib/x/y",
+            "var/**",
         ] {
             assert!(validate_output(invalid).is_err(), "accepted {invalid}");
         }
-        validate_output("var/cache/fontconfig").unwrap();
+        validate_output("usr/lib/fontconfig/cache").unwrap();
+        validate_output("usr/lib/sysimage/other/x").unwrap();
     }
 }

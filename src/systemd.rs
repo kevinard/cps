@@ -195,7 +195,11 @@ pub(crate) fn run(
                 "--exclude-prefix=/sys",
             ]);
         } else {
-            tool.arg("-E");
+            // An inactive root leaves /var empty: in a boot environment it
+            // is the mount point of the /var that every environment shares,
+            // and systemd-tmpfiles-setup.service creates these paths there
+            // at boot, like the paths under /dev, /proc, /run and /sys.
+            tool.args(["-E", "--exclude-prefix=/var"]);
         }
         run_tool(
             tool.arg("--create")

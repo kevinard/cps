@@ -253,9 +253,9 @@ impl Root {
     }
 
     pub(crate) fn open_image_state(&self) -> Result<Self> {
-        let state = self
-            .subdir(STATE_DIRECTORY)
-            .context("opening image state under /var/lib/cps/image on the image filesystem")?;
+        let state = self.subdir(STATE_DIRECTORY).with_context(|| {
+            format!("opening image state under /{STATE_DIRECTORY} on the image filesystem")
+        })?;
         let metadata = state.as_file().metadata()?;
         let device = self.0.metadata()?.dev();
         ensure!(
