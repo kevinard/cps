@@ -1719,6 +1719,14 @@ fn build_with_update_diagnostics(
     )?;
     plan.triggers = planned.run;
     plan.retired_triggers = planned.retire;
+    // A regenerated initramfs must reach the prepared boot artifacts.
+    if plan.kernel_install.is_none()
+        && let Some(selected) = kernel::selected(&installed, &paths)?
+        && selected.generated_initrd
+        && triggers::regenerates(&plan.triggers, &installed, &selected.kernel.initrd_path())?
+    {
+        plan.kernel_install = Some(selected);
+    }
     plan.payload_bytes = payloads(&plan.writes)
         .values()
         .try_fold(0_u64, |total, node| {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exercise file-pattern triggers on offline images: coalesced and ordered
 # runs, confinement to declared outputs, journaled recovery, facet
-# recomposition, and removal of generated paths.
+# recomposition, removal of generated paths, and a generated initramfs.
 set -euo pipefail
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cps=${CPS_BIN:-$project/target/debug/cps}
@@ -218,4 +218,69 @@ test ! -e escape/usr/bin/escape
 test ! -e escape/etc-escape
 test ! -e escape/var/lib/cps/image/escape
 
+# A trigger can generate a kernel's initramfs. The boot artifacts follow
+# each regeneration, and a prepackaged initrd keeps working without one.
+if command -v kernel-install >/dev/null && [[ -x /usr/lib/kernel/install.d/90-loaderentry.install ]]; then
+    release=6.0.0-test
+    mkdir -p "proto/usr/lib/modules/$release/kernel" proto/usr/lib/firmware
+    echo kernel > "proto/usr/lib/modules/$release/vmlinuz"
+    echo base > "proto/usr/lib/modules/$release/kernel/base.ko"
+    echo extra > "proto/usr/lib/modules/$release/extra.ko"
+    publish test/kernel "    file \"usr/lib/modules/$release/vmlinuz\" mode=\"0644\" $owner
+    file \"usr/lib/modules/$release/kernel/base.ko\" mode=\"0644\" $owner
+    kernel-install \"$release\"
+"
+    publish test/module "    file \"usr/lib/modules/$release/extra.ko\" mode=\"0644\" $owner
+"
+    publish test/mkinitrd "    require \"test/runtime\"
+$(script usr/libexec/test-mkinitrd <<'HANDLER'
+#!/usr/bin/bash
+set -eu
+shopt -s nullglob globstar
+for kernel in /usr/lib/modules/*/vmlinuz; do
+    directory=${kernel%/vmlinuz}
+    {
+        echo "initramfs for ${directory##*/}"
+        for module in "$directory"/**/*.ko; do echo "${module#"$directory"/}"; done
+        [[ ! -e /etc/crypttab ]] || cat /etc/crypttab
+    } > "$directory/initrd"
+done
+HANDLER
+)
+    trigger \"initramfs\" {
+        run \"usr/libexec/test-mkinitrd\"
+        watch \"usr/lib/modules/**\"
+        watch \"usr/lib/firmware/**\"
+        watch \"etc/crypttab\"
+        output \"usr/lib/modules/*/initrd\"
+    }
+"
+    "$cps" image-create --root boot --repo repo --publisher canopa --trust-root repo/trust/1.json
+    plan_apply boot install test/kernel test/mkinitrd
+    rg -Fx "Prepare Linux $release with kernel-install" plan.log
+    printf 'initramfs for %s\nkernel/base.ko\n' "$release" | cmp - "boot/usr/lib/modules/$release/initrd"
+    prepared() {
+        local dir
+        dir=$(ls -d boot/var/lib/cps/image/kernel-*)
+        test "$(sha256sum < "$dir/initrd" | cut -d' ' -f1)" = "$(cat "$dir/initrd.sha256")"
+        cmp "$dir/initrd" "boot/usr/lib/modules/$release/initrd"
+    }
+    prepared
+    plan_apply boot install test/module
+    rg -Fx 'Run trigger test/mkinitrd:initramfs' plan.log
+    rg -Fx "Prepare Linux $release with kernel-install" plan.log
+    rg -Fx extra.ko "boot/usr/lib/modules/$release/initrd"
+    prepared
+    "$cps" verify --root boot --pristine
+    plan_apply boot remove test/mkinitrd
+    test ! -e "boot/usr/lib/modules/$release/initrd"
+    without=0
+    for dir in boot/var/lib/cps/image/kernel-*; do
+        [[ -e $dir/initrd ]] || without=$((without + 1))
+    done
+    test "$without" -eq 1
+    "$cps" verify --root boot --pristine
+else
+    echo 'Skipping the generated initramfs: kernel-install and its BLS plugin are unavailable'
+fi
 echo 'Verified ordered, confined, journaled, and removable trigger outputs'

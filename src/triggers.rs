@@ -586,6 +586,20 @@ fn check_cycles(edges: &BTreeMap<Key<'_>, BTreeSet<Key<'_>>>) -> Result<()> {
     Ok(())
 }
 
+/// Whether a planned run generates the path.
+pub(crate) fn regenerates(
+    runs: &[TriggerRun],
+    installed: &BTreeMap<String, Installed>,
+    path: &str,
+) -> Result<bool> {
+    for run in runs {
+        if run.find(installed)?.generates(path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The services that live triggers reload and restart.
 pub(crate) fn actuators(
     runs: &[TriggerRun],

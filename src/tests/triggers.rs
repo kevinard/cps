@@ -249,6 +249,62 @@ fn trigger_cycles_are_rejected() -> Result<()> {
 }
 
 #[test]
+fn boot_artifact_outputs_require_staging_and_refresh_the_kernel() -> Result<()> {
+    let f = Fixture::new()?;
+    let release = "6.0.0-test";
+    f.package(
+        "system/kernel",
+        "1.0.0-0",
+        f.file(
+            &format!("usr/lib/modules/{release}/vmlinuz"),
+            "kernel",
+            "0644",
+            "",
+        )? + &format!("    kernel-install {release:?}\n"),
+    )?;
+    f.package(
+        "system/initramfs",
+        "1.0.0-0",
+        handler(&f, "usr/libexec/mkinitrd")?
+            + &trigger(
+                "initramfs",
+                "        run \"usr/libexec/mkinitrd\"\n        watch \"usr/lib/modules/**\"\n        watch \"etc/crypttab\"\n        output \"usr/lib/modules/*/initrd\"\n",
+            ),
+    )?;
+    f.package(
+        "system/packaged-initrd",
+        "1.0.0-0",
+        f.file(
+            &format!("usr/lib/modules/{release}/vmlinuz"),
+            "kernel",
+            "0644",
+            "",
+        )? + &f.file(
+            &format!("usr/lib/modules/{release}/initrd"),
+            "initrd",
+            "0644",
+            "",
+        )? + &format!("    kernel-install {release:?} initrd=#true\n"),
+    )?;
+    f.create()?;
+    let install = install_plan(&f.root, &["system/kernel", "system/initramfs"])?;
+    assert_eq!(runs(&install), ["system/initramfs:initramfs"]);
+    assert!(install.triggers[0].boot);
+    let artifacts = install.kernel_install.as_ref().expect("kernel preparation");
+    assert!(artifacts.generated_initrd);
+    assert_eq!(
+        install.boot_reason(&Default::default()).as_deref(),
+        Some("the transaction changes the boot kernel or initramfs")
+    );
+    // A prepackaged initramfs is a package path, so a generator cannot cover it.
+    let error = install_plan(&f.root, &["system/packaged-initrd", "system/initramfs"]).unwrap_err();
+    assert!(format!("{error:#}").contains("path conflict for usr/lib/modules/6.0.0-test/initrd"));
+    let packaged = install_plan(&f.root, &["system/packaged-initrd"])?;
+    assert!(!packaged.kernel_install.unwrap().generated_initrd);
+    Ok(())
+}
+
+#[test]
 fn live_triggers_reload_running_services_after_they_run() -> Result<()> {
     let f = Fixture::new()?;
     f.package(
