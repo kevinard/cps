@@ -307,11 +307,20 @@ impl Root {
     pub(crate) fn walk(
         &self,
         skip: Option<&str>,
+        visit: impl FnMut(&str, &File, &Stat) -> Result<bool>,
+    ) -> Result<()> {
+        self.walk_skipping(skip.as_slice(), visit)
+    }
+
+    /// Walk like `walk`, without visiting the `skip` paths or their descendants.
+    pub(crate) fn walk_skipping(
+        &self,
+        skip: &[&str],
         mut visit: impl FnMut(&str, &File, &Stat) -> Result<bool>,
     ) -> Result<()> {
         let mut pending = child_paths(&self.0, "")?;
         while let Some(path) = pending.pop() {
-            if skip == Some(path.as_str()) {
+            if skip.contains(&path.as_str()) {
                 continue;
             }
             let entry = self

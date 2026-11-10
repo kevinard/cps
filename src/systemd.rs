@@ -132,10 +132,7 @@ pub(crate) fn validate_tmpfiles(bytes: &[u8]) -> Result<()> {
         if let Some(kind) = line.split_ascii_whitespace().next() {
             ensure!(
                 kind.starts_with('#')
-                    || matches!(
-                        kind,
-                        "d" | "f" | "L" | "C" | "d!" | "f!" | "L!" | "C!"
-                    ),
+                    || matches!(kind, "d" | "f" | "L" | "C" | "d!" | "f!" | "L!" | "C!"),
                 "tmpfiles line {} uses unsupported offline rule {kind:?}; use d, f, L, or C",
                 index + 1
             );
@@ -802,7 +799,12 @@ mod tests {
               L /etc/example - - - - /usr/lib/example\nC /var/lib/example/seed.db\nd! /run/x\n",
         )
         .unwrap();
-        for rule in ["z /var/lib/example", "R /var/lib", "C+ /var/lib/example", "x /tmp/*"] {
+        for rule in [
+            "z /var/lib/example",
+            "R /var/lib",
+            "C+ /var/lib/example",
+            "x /tmp/*",
+        ] {
             let error = super::validate_tmpfiles(rule.as_bytes()).unwrap_err();
             assert!(error.to_string().contains("use d, f, L, or C"), "{rule}");
         }

@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     path::Path,
 };
 
 use anyhow::{Context, Result, ensure};
-use rustix::fs::FileType;
+use rustix::{fs::FileType, io::Errno};
 
 use crate::{
     image::{
@@ -372,67 +373,83 @@ fn check_state(
         // are not part of any manifest.
         let generated = crate::triggers::active_outputs(&state.installed, &expected);
         let var = crate::image::VAR_DIRECTORY;
-        if !root.inspect(var)?.as_ref().is_some_and(Node::is_dir) {
-            findings.push(Finding {
-                is_error: true,
-                message: format!("missing directory {var:?}, the mount point of /var"),
-            });
-        }
-        root.walk(Some(crate::image::STATE_DIRECTORY), |path, entry, info| {
-            let kind = FileType::from_raw_mode(info.st_mode);
-            let Some(managed) = expected.get(path) else {
-                if kind == FileType::Directory
-                    && (crate::image::STATE_ANCESTORS.contains(&path) || path == var)
-                {
-                    return Ok(true);
-                }
-                if crate::model::under_var(path) {
+        match root.dir(var) {
+            Ok(directory) => {
+                for entry in fs::read_dir(Root::fd_path(&directory))? {
+                    let name = entry?.file_name();
                     findings.push(Finding {
                         is_error: true,
                         message: format!(
-                            "unexpected path {path:?}: an inactive root leaves /var empty for \
-                             tmpfiles.d to populate at boot"
+                            "unexpected path \"{var}/{}\": an inactive root leaves /var empty \
+                             for tmpfiles.d to populate at boot",
+                            name.to_string_lossy()
                         ),
                     });
-                    return Ok(false);
                 }
-                if crate::triggers::generated(&generated, path) {
-                    return Ok(false);
-                }
-                findings.push(Finding {
-                    is_error: true,
-                    message: format!("unmanaged path {path:?}"),
-                });
-                return Ok(false);
-            };
-            let file = match &managed.node {
-                Node::Hardlink { target } => expected.get(target).unwrap_or(managed),
-                _ => managed,
-            };
-            let links = 1 + aliases.get(path).map_or(0, Vec::len);
-            if kind == FileType::RegularFile
-                && !matches!(managed.node, Node::Hardlink { .. })
-                && info.st_nlink as usize != links
+            }
+            // An installer may already have mounted the /var subvolume
+            // there. It is outside the image, so its contents are skipped.
+            Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::XDEV) => {}
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<Errno>(),
+                    Some(&(Errno::NOENT | Errno::NOTDIR | Errno::LOOP))
+                ) =>
             {
                 findings.push(Finding {
                     is_error: true,
-                    message: format!(
-                        "unexpected hard link count at {path:?}: expected {links}, found {}",
-                        info.st_nlink
-                    ),
+                    message: format!("missing directory {var:?}, the mount point of /var"),
                 });
             }
-            if matches!(kind, FileType::RegularFile | FileType::Directory)
-                && Root::has_xattrs(entry, file.node.capabilities().is_some())
-                    .with_context(|| format!("listing attributes at {path:?}"))?
-            {
-                findings.push(Finding {
-                    is_error: true,
-                    message: format!("unexpected extended attributes at {path:?}"),
-                });
-            }
-            Ok(true)
-        })?;
+            Err(error) => return Err(error).context("inspecting the /var mount point"),
+        }
+        root.walk_skipping(
+            &[crate::image::STATE_DIRECTORY, var],
+            |path, entry, info| {
+                let kind = FileType::from_raw_mode(info.st_mode);
+                let Some(managed) = expected.get(path) else {
+                    if kind == FileType::Directory && crate::image::STATE_ANCESTORS.contains(&path)
+                    {
+                        return Ok(true);
+                    }
+                    if crate::triggers::generated(&generated, path) {
+                        return Ok(false);
+                    }
+                    findings.push(Finding {
+                        is_error: true,
+                        message: format!("unmanaged path {path:?}"),
+                    });
+                    return Ok(false);
+                };
+                let file = match &managed.node {
+                    Node::Hardlink { target } => expected.get(target).unwrap_or(managed),
+                    _ => managed,
+                };
+                let links = 1 + aliases.get(path).map_or(0, Vec::len);
+                if kind == FileType::RegularFile
+                    && !matches!(managed.node, Node::Hardlink { .. })
+                    && info.st_nlink as usize != links
+                {
+                    findings.push(Finding {
+                        is_error: true,
+                        message: format!(
+                            "unexpected hard link count at {path:?}: expected {links}, found {}",
+                            info.st_nlink
+                        ),
+                    });
+                }
+                if matches!(kind, FileType::RegularFile | FileType::Directory)
+                    && Root::has_xattrs(entry, file.node.capabilities().is_some())
+                        .with_context(|| format!("listing attributes at {path:?}"))?
+                {
+                    findings.push(Finding {
+                        is_error: true,
+                        message: format!("unexpected extended attributes at {path:?}"),
+                    });
+                }
+                Ok(true)
+            },
+        )?;
     }
     Ok(Checked {
         findings,
