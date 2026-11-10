@@ -4,7 +4,9 @@ build architecture="x86_64" epoch=1789987631 {
         publisher "seed" catalog="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
         package "build/native-util-linux"
     }
+    version "2.42.4-1" upstream="2.42.4"
     manifest "util-linux.kdl" sha256="@MANIFEST_SHA256@"
+    discard "usr/lib/*.la"
     source "util-linux-2.42.4.tar.xz" size=10729748 sha256="fbd62a100ab7bb8746ba0661255c3c48185b1e9021507c624da01fbc696330ec" url="https://cdn.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.4.tar.xz"
     script """
     tar -xJf "$CPS_SOURCES/util-linux-2.42.4.tar.xz"
@@ -14,19 +16,10 @@ build architecture="x86_64" epoch=1789987631 {
         --disable-all-programs --enable-libblkid --enable-libmount --enable-mount --enable-blkid \\
         --enable-fdisks=check --enable-libfdisk --enable-libsmartcols --enable-libuuid \\
         --disable-static --disable-nls --disable-asciidoc --disable-poman --disable-bash-completion \\
-        --without-systemd --without-udev --without-python
-    make -j4 mount umount blkid sfdisk libmount/mount.pc libblkid/blkid.pc
-
-    for tool in mount umount blkid sfdisk; do
-        install -Dm755 ".libs/$tool" "$DESTDIR/usr/bin/$tool"
-    done
-    for library in libblkid libmount libfdisk libsmartcols libuuid; do
-        install -Dm644 ".libs/$library.so.1" "$DESTDIR/usr/lib/$library.so.1"
-    done
-    install -Dm644 libblkid/src/blkid.h "$DESTDIR/usr/include/blkid/blkid.h"
-    install -Dm644 libmount/src/libmount.h "$DESTDIR/usr/include/libmount/libmount.h"
-    install -Dm644 libblkid/blkid.pc "$DESTDIR/usr/lib/pkgconfig/blkid.pc"
-    install -Dm644 libmount/mount.pc "$DESTDIR/usr/lib/pkgconfig/mount.pc"
+        --without-systemd --without-udev --without-python \\
+        --disable-makeinstall-chown --disable-makeinstall-setuid
+    make
+    make DESTDIR="$DESTDIR" install
     for license in BSD-3-Clause GPL-2.0-or-later LGPL-2.1-or-later; do
         install -Dm644 "Documentation/licenses/COPYING.$license" "$DESTDIR/usr/share/licenses/util-linux/$license.txt"
     done

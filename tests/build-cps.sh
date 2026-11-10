@@ -27,9 +27,11 @@ git -C "$project" archive --format=tar --prefix=cps/ "$revision" | gzip -n > "$w
 tar -xzf "$work/sources/cps.tar.gz" -C "$work"
 source_tree="$work/cps"
 source "$source_tree/tests/build-toolchain.sh"
+# A recipe's version node, or the package node's version in a manifest.
 manifest_version() {
     local version
-    version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$1")
+    version=$(sed -n -e 's/^package .* version="\([^"]*\)".*/\1/p' \
+        -e 's/^    version "\([^"]*\)".*/\1/p' "$1")
     [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || {
         echo "Could not determine the package version in $1" >&2
         return 1
@@ -62,7 +64,7 @@ if [[ -f $trust_manifest ]]; then
 fi
 cd -- "$output"
 printf '%s\n' "$revision" > source-revision
-sqlite_version=$(manifest_version "$source_tree/packaging/runtime/sqlite.kdl")
+sqlite_version=$(manifest_version "$source_tree/packaging/runtime/sqlite.build.kdl.in")
 seccomp_version=$(manifest_version "$source_tree/packaging/runtime/libseccomp.kdl")
 seed_version=1.0.0-0
 runtime_version=1.0.0-1

@@ -8,7 +8,7 @@ build architecture="@ARCH@" epoch=1782864000 {
     cd libseccomp-2.6.1
     test -s src/syscalls.perf.c
     CFLAGS=-O2 GPERF=false ./configure --prefix=/usr --disable-static --disable-python
-    make -j2 -C src -o syscalls.perf -o syscalls.perf.c
+    make -C src -o syscalls.perf -o syscalls.perf.c
     install -Dm755 src/.libs/libseccomp.so.2 "$DESTDIR/usr/lib/libseccomp.so.2"
     install -Dm644 include/seccomp.h "$DESTDIR/usr/include/seccomp.h"
     install -Dm644 include/seccomp-syscalls.h "$DESTDIR/usr/include/seccomp-syscalls.h"

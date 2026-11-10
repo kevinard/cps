@@ -19,7 +19,7 @@ build architecture="x86_64" epoch=1793361987 {
     done < "$CPS_SOURCES/vm.config"
     release=$(make -s kernelrelease)
     test "$release" = @KERNEL_RELEASE@
-    make -j4 bzImage
+    make bzImage
     install -Dm644 arch/x86/boot/bzImage "$DESTDIR/usr/lib/modules/$release/vmlinuz"
     install -Dm644 .config "$DESTDIR/usr/lib/modules/$release/config"
     install -Dm644 LICENSES/preferred/GPL-2.0 "$DESTDIR/usr/share/licenses/kernel-qemu/GPL-2.0"

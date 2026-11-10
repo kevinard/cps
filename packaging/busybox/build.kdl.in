@@ -38,7 +38,7 @@ build architecture="@ARCH@" epoch=1778641860 {
     while IFS= read -r setting; do
         grep -Fx "$setting" .config >/dev/null
     done < boot.config
-    make -s -j2 busybox
+    make -s busybox
     install -Dm755 busybox "$DESTDIR/@BUSYBOX_PATH@"
     install -Dm644 LICENSE "$DESTDIR/usr/share/licenses/busybox/LICENSE"
     """

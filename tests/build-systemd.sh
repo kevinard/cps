@@ -20,7 +20,8 @@ case $seccomp_version in
 esac
 if [[ -n $util_linux ]]; then
     util_linux=$(realpath -- "$util_linux")
-    util_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$util_linux/util-linux.kdl")
+    util_version=$(sed -n -e 's/^package .* version="\([^"]*\)".*/\1/p' \
+        -e 's/^    version "\([^"]*\)".*/\1/p' "$util_linux/util-linux.kdl" "$util_linux/build.kdl")
     case $util_version in 2.42.4-0|2.42.4-1) ;; *) echo 'Unsupported util-linux fixture' >&2; exit 2 ;; esac
     util_package=cps://canopa-util-linux/system/util-linux@$util_version
     systemd_version=262.1.0-2
