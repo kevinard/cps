@@ -6,20 +6,25 @@
 .HP 4
 .B \&cps publish\-bundle [OPTIONS] \-\-repo <REPO> \-\-signing\-key <KEY> \-\-builder\-key <BUILDER_KEY> \-\-recipe\-sha256 <RECIPE_SHA256> <BUNDLE>
 .SH ARGUMENTS
-.PP
+.TP
 .B \&<BUNDLE>
+\&Build bundle from cps build \-\-builder\-signing\-key
 .SH OPTIONS
-.PP
+.TP
 .B \&\-\-repo <REPO>
+\&Local repository to publish into
 .TP
 .B \&\-\-signing\-key <KEY>
 \&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
-.PP
+.TP
 .B \&\-\-builder\-key <BUILDER_KEY>
-.PP
+\&Public key of the build worker that signed the bundle's attestation
+.TP
 .B \&\-\-recipe\-sha256 <RECIPE_SHA256>
-.PP
+\&SHA\-256 of the reviewed build recipe
+.TP
 .B \&\-\-witness <KEY=ATTESTATION>
+\&Another worker's public key and its attestation for the same build
 .TP
 .B \&\-\-source\-cache <SOURCE_CACHE>
 \&Cache of verified source files to include in the publication

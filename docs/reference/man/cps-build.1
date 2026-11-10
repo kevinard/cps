@@ -6,33 +6,43 @@
 .HP 4
 .B \&cps build [OPTIONS] \-\-output <OUTPUT> <RECIPE>
 .SH ARGUMENTS
-.PP
+.TP
 .B \&<RECIPE>
+\&Build recipe to run
 .SH OPTIONS
-.PP
+.TP
 .B \&\-\-repo <REPO>
-.PP
+\&Local repository of the toolchain publisher
+.TP
 .B \&\-\-publisher <PUBLISHER>
-.PP
+\&Toolchain publisher, when the recipe pins one publisher
+.TP
 .B \&\-\-trust\-root <TRUST_ROOT>
+\&Trust root file that matches the recipe's key\-sha256 pin
 .TP
 .B \&\-\-toolchain\-config <TOOLCHAIN_CONFIG>
 \&Worker\-local repository and trust key locations for the pinned publishers
-.PP
+.TP
 .B \&\-\-sources <SOURCES>
-.PP
+\&Directory of the recipe's source inputs at their recipe paths
+.TP
 .B \&\-\-source\-cache <SOURCE_CACHE>
-.PP
+\&Source cache filled by cps source fetch or cps source import
+.TP
 .B \&\-\-worker\-config <WORKER_CONFIG>
+\&Build worker limits: time, scratch space, file, output, and log sizes, and jobs
 .TP
 .B \&\-\-option <NAME=VALUE>
 \&Override a build option declared in the recipe
-.PP
+.TP
 .B \&\-\-output <OUTPUT>
-.PP
+\&New directory for the build bundle: recipe, templates, manifests, and proto tree
+.TP
 .B \&\-\-check\-reproducible
-.PP
-.B \&\-\-builder\-signing\-key <BUILDER_SIGNING_KEY>
+\&Build twice in fresh sandboxes and require identical outputs
+.TP
+.B \&\-\-builder\-signing\-key <KEY>
+\&Sign a build attestation with this key: PATH, file:PATH, or command:DESCRIPTOR (requires \-\-check\-reproducible)
 .TP
 .B \&\-h, \-\-help
 \&Print help
