@@ -8,7 +8,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
         manifest_text, parse_manifest,
     },
     model::{Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name},
-    repo::{MANIFEST_LIMIT, read_key, read_limited, trust_root_keys},
+    repo::{MANIFEST_LIMIT, Purpose, SigningKey, read_key, read_limited, trust_root_keys},
 };
 
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
@@ -300,8 +300,9 @@ impl VerifiedBuild {
     }
 }
 
+/// Sign a build statement with a builder key held in a file or by an external signer.
 pub(crate) fn sign(
-    key: &Ed25519KeyPair,
+    key: &SigningKey,
     manifest: &Manifest,
     manifest_bytes: &[u8],
     recipe: &BuildRecipe,
@@ -336,9 +337,8 @@ pub(crate) fn sign(
         },
     };
     let payload = serde_json::to_vec(&statement)?;
-    let signature = key.sign(&pae(&payload));
-    let builder = digest(key.public_key().as_ref());
-    envelope(&payload, [(builder.as_str(), signature.as_ref())])
+    let signature = key.sign(Purpose::Attestation, &pae(&payload))?;
+    envelope(&payload, [(key.key_id().as_str(), signature.as_slice())])
 }
 
 fn envelope<'a>(
@@ -633,6 +633,7 @@ fn subjects(input: Vec<Subject>) -> Result<BTreeMap<String, FileDigest>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
     fn rejects_older_predicates_even_with_a_valid_builder_signature() -> Result<()> {
@@ -655,7 +656,7 @@ build architecture="x86_64" epoch=1700000000 {{
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
         let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let bytes = sign(
-            &key,
+            &Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap().into(),
             &manifest,
             manifest_bytes,
             &recipe,

@@ -29,6 +29,7 @@ pub(crate) type PublicKey = [u8; 32];
 pub(crate) enum Purpose {
     Catalog,
     TrustRoot,
+    Attestation,
 }
 
 impl Purpose {
@@ -36,6 +37,7 @@ impl Purpose {
         match self {
             Self::Catalog => "catalog",
             Self::TrustRoot => "trust-root",
+            Self::Attestation => "attestation",
         }
     }
 }
@@ -462,6 +464,53 @@ pub(crate) mod tests {
         Ed25519KeyPair::from_pkcs8(document.as_ref())
             .expect("read generated key")
             .into()
+    }
+
+    #[test]
+    fn external_signers_learn_what_they_sign() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: openssl is unavailable");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let private = dir.path().join("builder.der");
+        std::fs::write(&private, document.as_ref())?;
+        let local = SigningKey::from(Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap());
+        std::fs::write(dir.path().join("builder.pub"), hex::encode(local.public))?;
+        let script = dir.path().join("sign.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\n[ \"$CPS_SIGNER_CONTEXT\" = attestation ] && [ \"$CPS_SIGNER_KEY_ID\" = {} ] || exit 3\nmessage=$(mktemp)\ntrap 'rm -f \"$message\"' EXIT\ncat > \"$message\"\nopenssl pkeyutl -sign -rawin -inkey {} -keyform DER -in \"$message\"\n",
+                local.key_id(),
+                private.display()
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let descriptor = dir.path().join("builder.signer.kdl");
+        std::fs::write(
+            &descriptor,
+            format!(
+                "schema-version 1 kind=\"signer\"\ncommand \"{}\"\npublic-key \"builder.pub\"\ntimeout-seconds 5\n",
+                script.display()
+            ),
+        )?;
+        let external = SigningKey::open(Path::new(&format!("command:{}", descriptor.display())))?;
+        assert_eq!(external.public_key(), local.public_key());
+        assert_eq!(
+            external.sign(Purpose::Attestation, b"statement")?,
+            local.sign(Purpose::Attestation, b"statement")?
+        );
+        // The helper refuses other contexts, and the failure is reported.
+        assert!(external.sign(Purpose::Catalog, b"statement").is_err());
+        assert!(external.sign(Purpose::TrustRoot, b"statement").is_err());
+        Ok(())
     }
 
     #[test]

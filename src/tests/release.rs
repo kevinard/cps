@@ -20,7 +20,7 @@ use crate::{
     publish_bundle, publish_release,
     query::{Scope, Status, list_packages, package_manifest},
     read_attestation, release as mirror_release,
-    repo::{read_signing_key, read_trust_root, snapshot},
+    repo::{read_trust_root, snapshot},
     withdraw_package,
 };
 
@@ -91,7 +91,7 @@ fn attach_evidence(
     let payload = fs::read(fixture.proto.join(COMPOSITOR))?;
     let recipe_model = build::parse(&recipe)?;
     let envelope = attestation::sign(
-        &read_signing_key(&builder.private)?,
+        &crate::repo::SigningKey::open(&builder.private)?,
         &manifest,
         &manifest_bytes,
         &recipe_model,
@@ -212,7 +212,7 @@ publisher "tools" {{ repository {:?}; trust-root {:?}; }}
             package_manifests.insert(library.to_owned(), package(library, version));
         }
         let envelope = attestation::sign(
-            &read_signing_key(&builder.private)?,
+            &crate::repo::SigningKey::open(&builder.private)?,
             &parse_manifest(std::str::from_utf8(manifest)?)?,
             manifest,
             &build::parse(&recipe)?,
@@ -2559,7 +2559,7 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
     fs::write(bundle.join("build.kdl"), &recipe)?;
     fs::write(bundle.join("manifest.kdl"), manifest)?;
     let envelope = attestation::sign(
-        &read_signing_key(&builder.private)?,
+        &crate::repo::SigningKey::open(&builder.private)?,
         &parse_manifest(std::str::from_utf8(manifest)?)?,
         manifest,
         &build::parse(&recipe)?,

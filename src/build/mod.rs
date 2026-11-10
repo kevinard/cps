@@ -32,7 +32,7 @@ use crate::{
     model::{FileDigest, Node, digest, digest_reader},
     plan::{CandidateSet, Candidates, resolve_packages, select_paths},
     repo::{
-        MANIFEST_LIMIT, read_limited, read_signing_key, read_trust_root,
+        MANIFEST_LIMIT, SigningKey, read_limited, read_trust_root,
         release::{compressed_payload_name, copy_compressed_payload, fetch_repository_payloads},
         snapshot, stage_blob,
     },
@@ -239,7 +239,7 @@ pub fn build_with_recipe_options(
     }
     if let Some(key) = builder_signing_key {
         let bytes = attestation::sign(
-            &read_signing_key(key)?,
+            &SigningKey::open(key)?,
             &manifest,
             &manifest_bytes,
             &recipe,

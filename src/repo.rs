@@ -42,8 +42,7 @@ use keys::{
     PublicKey, Signers,
     trust::{self, Freshness, TrustChain},
 };
-#[cfg(test)]
-use keys::{Purpose, SigningKey};
+pub(crate) use keys::{Purpose, SigningKey};
 pub(crate) mod profiles;
 mod rebuild;
 pub mod release;

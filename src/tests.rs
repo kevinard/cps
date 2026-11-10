@@ -1427,9 +1427,7 @@ fn build_receipts_survive_offline_transaction_recovery_and_follow_installed_pack
         audit_publisher_builds,
         kdl_format::{build, parse_manifest},
         model::FileDigest,
-        publish_bundle,
-        repo::read_signing_key,
-        set_publisher_build_trust,
+        publish_bundle, set_publisher_build_trust,
     };
 
     let f = Fixture::new()?;
@@ -1467,7 +1465,7 @@ build architecture="x86_64" epoch=1700000000 {{
         )]),
     };
     let evidence = sign(
-        &read_signing_key(&worker.private)?,
+        &crate::repo::SigningKey::open(&worker.private)?,
         &parse_manifest(&manifest)?,
         manifest.as_bytes(),
         &recipe_model,
