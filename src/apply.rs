@@ -854,9 +854,18 @@ fn abort_pending(
     let services = live.then(|| systemd::LiveServices::plan(&inverse, &next, base));
     match (&services, &pending.journal().abort) {
         (_, None) => {
+            // Services that the transaction stopped because it removed
+            // their units start again once the abort restores those units.
+            // They are journaled with the abort before anything changes.
             let live_jobs = services
                 .as_ref()
-                .map(systemd::LiveServices::active_jobs)
+                .map(|services| -> Result<_> {
+                    let mut jobs = services.active_jobs()?;
+                    if let Some(forward) = &pending.journal().live_jobs {
+                        jobs.start_stopped_by(forward);
+                    }
+                    Ok(jobs)
+                })
                 .transpose()?;
             pending.journal_mut().abort = Some(AbortProgress {
                 files_ready: false,

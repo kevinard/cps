@@ -766,3 +766,48 @@ fn library_symlinks_never_dangle_during_an_upgrade() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn aborting_a_unit_removal_plans_to_start_the_stopped_services() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "app/daemon",
+        "1.0.0-0",
+        f.file(
+            "usr/lib/systemd/system/app.service",
+            "[Service]\n",
+            "0644",
+            "",
+        )? + &f.file(
+            "usr/lib/systemd/system/worker@.service",
+            "[Service]\n",
+            "0644",
+            "",
+        )?,
+    )?;
+    f.create()?;
+    install_all(&f.root, &["app/daemon"])?;
+    let (forward, next, _) = crate::plan::plan_image(
+        &f.root,
+        Request::Remove {
+            packages: vec!["app/daemon".into()],
+        },
+        crate::PlanOptions::default(),
+        None,
+    )?;
+    let base = crate::image::Image::open_query(&f.root)?.state()?;
+    let inverse = forward.inverse(&base, &next)?;
+    let stop = "Stop active services matching app.service, worker@.service";
+    assert!(
+        crate::systemd::LiveServices::plan(&forward, &base, &next)
+            .preview()
+            .iter()
+            .any(|line| line == stop)
+    );
+    // The abort restores both units, so the services that the forward
+    // transaction stopped are among those it may start.
+    let restart = "Restart active services matching app.service, worker@.service";
+    let preview = crate::systemd::LiveServices::plan(&inverse, &next, &base).preview();
+    assert!(preview.iter().any(|line| line == restart), "{preview:?}");
+    Ok(())
+}

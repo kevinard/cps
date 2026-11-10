@@ -223,8 +223,9 @@ restores services:
   and a generated initramfs match the committed packages.
 - It reloads systemd and restarts the affected services that were running,
   including those that the triggers reload or restart.
-- A service that the transaction stopped because it removed its unit is not
-  started again. Start it with `systemctl start` once the abort finishes.
+- It starts again each service that the transaction stopped because it
+  removed its unit. The transaction journals those services before it stops
+  them, so an abort after any interruption knows them.
 
 Once an abort starts, the transaction only goes back. `cps status` reports
 `Transaction … is being aborted. Run cps transaction abort.` Run that
