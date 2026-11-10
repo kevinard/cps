@@ -273,12 +273,14 @@
 .B \&cps plan \-\-root <ROOT> \-\-output <OUTPUT> repair [OPTIONS] [PACKAGES]...
 .PP
 .B Arguments
-.PP
+.TP
 .B \&[PACKAGES]...
+\&Repair the paths of these installed packages (default: every package)
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-path <PATH>
+\&Repair only this managed path, absolute or relative to the image root (repeat for each path)
 .TP
 .B \&\-\-no\-install\-recommends
 \&Skip recommended packages when resolving the plan
@@ -291,8 +293,9 @@
 .B \&cps plan \-\-root <ROOT> \-\-output <OUTPUT> revert [OPTIONS] <PATH>...
 .PP
 .B Arguments
-.PP
+.TP
 .B \&<PATH>...
+\&Preserved configuration file to restore, absolute or relative to the image root
 .PP
 .B Options
 .TP

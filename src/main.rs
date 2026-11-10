@@ -133,8 +133,10 @@ enum Command {
         /// Prepare a verified recovery root for separate activation
         #[arg(long)]
         prepare_only: bool,
+        /// Repair only this managed path, absolute or relative to the image root (repeat for each path)
         #[arg(long = "path", value_name = "PATH", conflicts_with = "packages")]
         paths: Vec<String>,
+        /// Repair the paths of these installed packages (default: every package)
         packages: Vec<String>,
     },
     /// Restore vendor defaults for preserved configuration on the running system
@@ -144,6 +146,7 @@ enum Command {
         /// Prepare a verified recovery root for separate activation
         #[arg(long)]
         prepare_only: bool,
+        /// Preserved configuration file to restore, absolute or relative to the image root
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<String>,
     },
@@ -743,7 +746,7 @@ enum GitSignedArg {
 enum PublisherCommand {
     /// Show configured publishers in search order
     List {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
     },
     /// Verify and append a publisher to the image's search order
@@ -778,14 +781,14 @@ enum PublisherCommand {
     },
     /// Replace one or more local repository paths as a single change
     SetRepository {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         #[arg(long, required = true, value_name = "PUBLISHER=PATH", value_parser = parse_repository)]
         repo: Vec<(String, PathBuf)>,
     },
     /// Replace a publisher's locally configured builder keys and threshold
     SetBuildTrust {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         #[arg(long)]
         policy: PathBuf,
@@ -796,19 +799,19 @@ enum PublisherCommand {
     },
     /// Check installed packages against the configured builder policy
     AuditBuilds {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         name: String,
     },
     /// Search this publisher first when selecting new packages
     Prefer {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         name: String,
     },
     /// Remove a publisher that has no installed packages
     Remove {
-        #[arg(long)]
+        #[arg(long, default_value = "/")]
         root: PathBuf,
         name: String,
     },
@@ -1455,12 +1458,15 @@ enum PlanCommand {
     },
     /// Restore damaged paths from the installed package versions
     Repair {
+        /// Repair only this managed path, absolute or relative to the image root (repeat for each path)
         #[arg(long = "path", value_name = "PATH", conflicts_with = "packages")]
         paths: Vec<String>,
+        /// Repair the paths of these installed packages (default: every package)
         packages: Vec<String>,
     },
     /// Restore installed vendor defaults for the specified preserved files
     Revert {
+        /// Preserved configuration file to restore, absolute or relative to the image root
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<String>,
     },

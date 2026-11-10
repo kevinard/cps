@@ -67,7 +67,8 @@ appending the publisher. `publisher prefer` moves it to the front of its
 group. `publisher remove` requires that no installed package comes from that
 publisher and at least one publisher remains. These changes invalidate
 outstanding plans for the image and preserve its boot environment identity.
-They are local to the named image root.
+They are local to the named image root. Without `--root`, every `publisher`
+command acts on the running system at `/`.
 
 On an image that follows a signed release profile, the profile fixes its
 publishers and their order. Local publishers come after the signed ones, and
