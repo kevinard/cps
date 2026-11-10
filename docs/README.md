@@ -24,6 +24,7 @@ image. If CPS already manages your machine, go directly to the
 - [Pin sources and build a reproducible package](maintainer/builds.md)
 - [Enable direct installation from Git](maintainer/git.md)
 - [Declare systemd and kernel actions](maintainer/systemd.md)
+- [Regenerate shared caches with triggers](maintainer/triggers.md)
 - [Order recipe builds, plan rebuilds, and repin toolchains](maintainer/orchestration.md)
 
 ## [Publishers](publisher/README.md)

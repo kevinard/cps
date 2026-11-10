@@ -18,6 +18,7 @@ image. One person can fill all these roles in a local test setup.
 | **Selector** | The name, version, or publisher qualification supplied to a command. An exact version such as `apps/editor@1.0.0-0` keeps publisher search order. |
 | **Manifest** | Package metadata that describes dependencies, filesystem actions, and any systemd or kernel actions. The signed catalog authenticates it by digest. |
 | **Action** | An operation declared by a manifest, such as creating a file, directory, symlink, or hard link at an image-relative path. |
+| **Trigger** | A handler that a package ships and declares to rebuild derived files, such as a cache, when watched paths change in any package. CPS runs it once per transaction, confined to its declared **generated paths**, which the package owns. |
 | **Prototype tree** | A staging directory laid out like the destination filesystem. `publish --proto` reads package file contents from this tree. |
 | **Payload** | File contents identified by their SHA-256 digest. The manifest records the digest and length. |
 | **Build recipe** | KDL that pins a manifest, sources, and a toolchain and supplies the build script. A **bundle** carries the recipe, manifest, and built payloads. |
@@ -74,6 +75,13 @@ pins, package changes, and actions. Fetch stages the required payloads in
 the cache. Apply checks the plan and payloads before writing package files,
 records a **transaction journal**, and commits the new image state when
 the changes finish. Use resume to complete a journaled transaction.
+
+After writing files, a transaction runs the triggers whose watched paths
+changed, in an order derived from what each one generates and watches. A
+trigger replaces a package script: it runs a fixed command under Bubblewrap,
+and CPS publishes only the paths it declares as outputs. CPS records each
+finished trigger in the journal, so resume runs only the remaining ones.
+[Regenerate shared caches with triggers](maintainer/triggers.md)
 
 An **explicit request** records that the user asked to keep a package.
 An **automatic** package was selected to satisfy dependencies or

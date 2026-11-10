@@ -52,6 +52,7 @@ write to a fresh destination for deployment.
 | Image state, publisher trust, and transaction history | [`src/image/`](../../src/image) |
 | Saved plans, dependency selection, and update policy | [`src/plan/`](../../src/plan) |
 | Staging, apply, and installed-state verification | [`src/apply.rs`](../../src/apply.rs) and [`src/verify.rs`](../../src/verify.rs) |
+| Trigger planning, sandboxed handlers, and generated paths | [`src/triggers.rs`](../../src/triggers.rs) |
 | Signed catalogs, build evidence, and mirror sync | [`src/repo.rs`](../../src/repo.rs), [`src/attestation.rs`](../../src/attestation.rs), and [`src/repo/release/`](../../src/repo/release) |
 | Pinned builds, sandboxing, and Git installs | [`src/build/`](../../src/build) and [`src/git_install.rs`](../../src/git_install.rs) |
 | KDL input and boot layouts | [`src/kdl_format.rs`](../../src/kdl_format.rs) and [`src/boot/`](../../src/boot) |
@@ -78,6 +79,7 @@ prerequisites depend on the workflow.
 | --- | --- |
 | Package identity, dependency inference, or freezes | [`package-identity.sh`](../../tests/package-identity.sh), [`manifest-dependencies.sh`](../../tests/manifest-dependencies.sh), [`package-freezes.sh`](../../tests/package-freezes.sh) |
 | Apply preflight, progress, or offline systemd | [`elf-transactions.sh`](../../tests/elf-transactions.sh), [`transaction-progress.sh`](../../tests/transaction-progress.sh), [`systemd-actions.sh`](../../tests/systemd-actions.sh) |
+| Triggers and generated paths, with Bubblewrap | [`triggers.sh`](../../tests/triggers.sh), [`hwdb-trigger.sh`](../../tests/hwdb-trigger.sh) |
 | Isolated builds or source pinning | [`build.sh`](../../tests/build.sh), [`build-outputs.sh`](../../tests/build-outputs.sh), [`sources.sh`](../../tests/sources.sh), [`systemd-build-worker.sh`](../../tests/systemd-build-worker.sh) |
 | Release gates or mirror sync | [`release-ci.sh`](../../tests/release-ci.sh), [`sharded-mirror.sh`](../../tests/sharded-mirror.sh), [`deploy-mirror.sh`](../../tests/deploy-mirror.sh) |
 | Boot deployment, fallback, or blessing | [VM and disk tests](boot-tests.md) |

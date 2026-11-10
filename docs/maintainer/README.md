@@ -11,6 +11,9 @@ reviews the resulting package and controls admission to a signed catalog.
    [Write a manifest](manifests.md)
 2. Declare service presets, account or state creation, or kernel artifacts if
    your package needs them. [Declare systemd and kernel actions](systemd.md)
+   If your package ships a tool that rebuilds a cache from files that other
+   packages install, declare a trigger.
+   [Regenerate shared caches with triggers](triggers.md)
 3. Pin the manifest, sources, and toolchain. Build twice in isolated sandboxes
    and sign the matching build evidence when your publisher requires it.
    [Build from pinned sources](builds.md)

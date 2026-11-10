@@ -26,19 +26,20 @@ and masks. When a vendor unit is removed, CPS cleans persistent enablement
 links that point directly to it. It also clears stale links to newly installed
 vendor units before applying their presets. [systemd presets](https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html)
 
-`hwdb "90-device.hwdb"` declares an input to the hardware database.
-Deliver the corresponding immutable file under `usr/lib/udev/hwdb.d`
-in the same package. CPS queues the rebuild when an active input is added,
-changed, or removed. Multiple changed inputs run one
-`systemd-hwdb --strict update` against the target root after file writes.
-It can run again when an interrupted transaction resumes. The generated
-`etc/udev/hwdb.bin` belongs to the system rather than a package.
+These actions are declarations that systemd applies to the files they name.
+To rebuild a file derived from what many packages install, such as the
+hardware database `etc/udev/hwdb.bin`, the package that ships the tool
+declares a trigger. The systemd package declares the `hwdb` trigger, which
+runs `systemd-hwdb --strict update` once per transaction when
+`usr/lib/udev/hwdb.d` changes. [Regenerate shared caches with triggers](triggers.md)
 
 Run `cargo build` followed by [`tests/systemd-actions.sh`](../../tests/systemd-actions.sh) to exercise the real helpers against a staged root. The test also checks recovery from a failed tmpfiles step after sysusers has run.
 
 ## Kernel packages
 
-An image can select one kernel from its package manifests. The kernel release identifies the `usr/lib/modules` directory and the packaged kernel image. An optional prebuilt initrd goes in the same directory.
+An image can select one kernel from its package manifests. The kernel release identifies the `usr/lib/modules` directory and the packaged kernel image. An optional prebuilt initrd goes in the same directory. Without one, an
+installed [initramfs trigger](triggers.md#generate-an-initramfs) can generate
+`usr/lib/modules/RELEASE/initrd` instead.
 
 ```kdl
 schema-version 1 kind="package-manifest"
