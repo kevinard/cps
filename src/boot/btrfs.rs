@@ -107,7 +107,7 @@ pub(crate) fn backup_running_btrfs(output: &Path, excluded: &[String]) -> Result
 }
 
 /// Make a read-only environment writable before it is booted.
-pub(super) fn make_writable(root: &Root) -> Result<()> {
+pub(crate) fn make_writable(root: &Root) -> Result<()> {
     let flags = subvolume_flags(root)?;
     if flags & READ_ONLY == 0 {
         return Ok(());

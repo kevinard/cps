@@ -239,6 +239,28 @@ fn shutdown_merge_carries_local_changes_into_the_staged_root() -> Result<()> {
     assert!(report.conflicts.is_empty());
     assert_eq!(read(trial, "etc/local/new")?, "newer");
 
+    // A later conflict is saved beside the first run's, which stays.
+    fs::write(f.root.join("etc/hostname"), "renamed")?;
+    let report = merge(&f, trial, |_| Ok(()))?.unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(
+        read(trial, &format!("{STASH}/etc/hostname"))?,
+        "workstation\n"
+    );
+    assert_eq!(read(trial, &format!("{STASH}-2/etc/hostname"))?, "renamed");
+    let saved: Vec<_> = crate::saved_etc_versions(trial)?
+        .into_iter()
+        .map(|(revision, path, _)| (revision, path))
+        .collect();
+    assert_eq!(
+        saved,
+        [
+            (2, VENDOR.to_owned()),
+            (2, "etc/hostname".to_owned()),
+            (2, "etc/hostname".to_owned())
+        ]
+    );
+
     // The next transaction in the staged root works with the merged state.
     let review = plan(
         trial,

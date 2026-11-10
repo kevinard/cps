@@ -137,7 +137,8 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     test -n "$backup"
     found=false
     for directory in /volume/@captures/backup-*/root; do
-        btrfs property get "$directory" ro | $bb grep -Fx 'ro=true'
+        # Registered backups are writable, so the boot menu can start them.
+        btrfs property get "$directory" ro | $bb grep -Fx 'ro=false'
         found=true
     done
     test "$found" = true

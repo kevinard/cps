@@ -219,14 +219,16 @@ and carries each local change into the trial:
   mode, owner, extended attributes, symlink target, creation, or removal.
 - `passwd`, `group`, `shadow`, `gshadow`, `subuid`, and `subgid` merge record
   by record when both sides changed different entries, so a user added
-  locally and a system user added by the upgrade both stay.
+  locally and a system user added by the upgrade both stay. If both sides
+  gave a new account the same UID or GID, the file is a conflict instead.
 - A preserved file that both sides changed keeps the local edit, and the
   upgrade's version waits as a
   [pending configuration update](configuration.md#reviewing-configuration-updates),
   as if you had edited it before staging.
 - Otherwise a path that both sides changed keeps the trial's version, and the
   running version is saved below `usr/lib/sysimage/cps/config-updates/etc-merge/`
-  in the trial. A local change to a package file that is not preserved is
+  in the trial, in one directory per merge, so a later merge into the same
+  trial keeps what an earlier one saved. A local change to a package file that is not preserved is
   [drift](images.md#repair-files-or-restore-vendor-defaults), so it is saved
   the same way, and a removed package file stays.
 

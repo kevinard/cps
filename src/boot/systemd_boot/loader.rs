@@ -68,22 +68,29 @@ pub(super) fn binary_version(bytes: &[u8]) -> Result<Option<LoaderVersion>> {
 /// The systemd-boot binaries on the ESP that firmware can start, by path on the
 /// ESP, with their releases.
 ///
-/// Other loaders, such as shim, carry no systemd-boot marker and are skipped.
+/// Every `EFI/*/*.efi` file is a candidate, since a firmware boot option can
+/// name any of them, as `EFI/systemd`, `EFI/BOOT`, and vendor directories do.
+/// CPS's own boot files and unified kernel images are skipped. Other loaders,
+/// such as shim, carry no systemd-boot marker and are skipped too.
 pub(super) fn esp_loaders(esp: &Path) -> Result<Vec<(PathBuf, LoaderVersion)>> {
     let mut loaders = Vec::new();
     let Some(efi) = child(esp, "EFI")? else {
         return Ok(loaders);
     };
-    for (directory, prefix) in [("systemd", "systemd-boot"), ("boot", "boot")] {
-        let Some(directory) = child(&efi, directory)? else {
-            continue;
-        };
+    let mut directories = Vec::new();
+    for entry in fs::read_dir(&efi)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if entry.file_type()?.is_dir() && !matches!(name.as_str(), "cps" | "cps-uefi" | "linux") {
+            directories.push(entry.path());
+        }
+    }
+    directories.sort();
+    for directory in directories {
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if !(name.starts_with(prefix) && name.ends_with(".efi"))
-                || !entry.file_type()?.is_file()
-            {
+            if !name.ends_with(".efi") || !entry.file_type()?.is_file() {
                 continue;
             }
             let mut bytes = Vec::new();
@@ -146,7 +153,7 @@ pub(in crate::boot) fn check_preferred(esp: &Path, efivars: Option<&Path>) -> Re
         let running = efivars.map(running_version).transpose()?.flatten();
         let Some(version) = running else {
             bail!(
-                "found no systemd-boot binary in EFI/systemd or EFI/BOOT on {}. {update}",
+                "found no systemd-boot binary under EFI on {}. {update}",
                 esp.display()
             );
         };
@@ -294,6 +301,19 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("version 262"), "{message}");
+
+        // A vendor directory counts too; CPS's own boot files do not.
+        fs::write(esp.path().join("efi/BOOT/BOOTX64.EFI"), loader("262.1"))?;
+        fs::create_dir_all(esp.path().join("efi/cps/cps-x-1"))?;
+        fs::write(esp.path().join("efi/cps/cps-x-1/uki.efi"), loader("200"))?;
+        check_preferred(esp.path(), None)?;
+        fs::create_dir_all(esp.path().join("efi/canopa"))?;
+        fs::write(esp.path().join("efi/canopa/grubx64.efi"), loader("257.9"))?;
+        let message = check_preferred(esp.path(), None).unwrap_err().to_string();
+        assert!(
+            message.contains("efi/canopa/grubx64.efi on the ESP is systemd-boot 257.9"),
+            "{message}"
+        );
         Ok(())
     }
 }

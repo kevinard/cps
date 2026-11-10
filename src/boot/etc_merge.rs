@@ -138,6 +138,10 @@ pub(crate) struct Manifest {
     /// The contents of the account databases, for the record merge.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     records: BTreeMap<String, String>,
+    /// In a merge base: the stash directories of completed merges, which a
+    /// later merge into the same trial must keep.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    stashes: BTreeSet<String>,
 }
 
 impl Manifest {
@@ -168,7 +172,11 @@ enum Action {
     /// version for review as a pending configuration update.
     ConfigUpdate,
     /// Write account databases merged record by record.
-    Records { content: Vec<u8> },
+    Records {
+        content: Vec<u8>,
+        /// Keep the running file's metadata, which only it changed.
+        running_metadata: bool,
+    },
     /// Keep the trial's version and save the running one for review.
     Conflict(Reason),
     /// Keep the trial's version without saving anything.
@@ -261,6 +269,20 @@ pub(crate) fn remove_leftovers(root: &Root) -> Result<()> {
     remove_tree(&root.open_image_state()?, SCRATCH)
 }
 
+/// The stash directory for this merge: `REVISION`, or `REVISION-N` when an
+/// earlier, completed merge into the same trial revision saved versions
+/// already, so a later run never replaces them. A retry of an interrupted
+/// run gets the same name, since its stash is not recorded as completed.
+fn stash_name(completed: &BTreeSet<String>, revision: u64) -> String {
+    (1u32..)
+        .map(|attempt| match attempt {
+            1 => revision.to_string(),
+            n => format!("{revision}-{n}"),
+        })
+        .find(|name| !completed.contains(name))
+        .expect("the stash names are unbounded")
+}
+
 /// The report of the last merge into a root.
 pub fn last_report(root: &Path) -> Result<Option<EtcMergeReport>> {
     let state = Root::open(root)?.open_image_state()?;
@@ -325,6 +347,7 @@ pub(crate) fn finalize_with(
         write_private(state_dir, REPORT, &serde_json::to_vec_pretty(&report)?)?;
         return Ok(Some(report));
     }
+    let stash_name = stash_name(&base.stashes, revision);
     let scratch = state_dir.ensure_dir(SCRATCH)?;
     let changes_tree = actions.values().any(|action| {
         matches!(
@@ -340,7 +363,7 @@ pub(crate) fn finalize_with(
         theirs: &theirs.manifest,
         links: BTreeMap::new(),
         dir_owner: (state.settings.uid, state.settings.gid),
-        stash_prefix: format!("{CONFIG_UPDATES_DIRECTORY}/{STASH}/{revision}"),
+        stash_prefix: format!("{CONFIG_UPDATES_DIRECTORY}/{STASH}/{stash_name}"),
         report: &mut report,
     };
     if changes_tree {
@@ -361,13 +384,13 @@ pub(crate) fn finalize_with(
             (state.settings.uid, state.settings.gid),
             0o755,
         )?;
-        let name = revision.to_string();
-        remove_entry_tree(&parent, &name)?;
+        // A stash that an interrupted run of this merge saved is replaced.
+        remove_entry_tree(&parent, &stash_name)?;
         renameat_with(
             scratch.as_file(),
             "stash",
             &parent,
-            name.as_str(),
+            stash_name.as_str(),
             RenameFlags::NOREPLACE,
         )
         .context("saving the running versions of conflicting paths")?;
@@ -389,8 +412,18 @@ pub(crate) fn finalize_with(
     }
     step(Step::Exchanged)?;
 
-    // Later runs only need the edits made after this one.
-    write_private(state_dir, BASE, &serde_json::to_vec(&ours.manifest)?)?;
+    // Later runs only need the edits made after this one, and keep the
+    // versions this one saved.
+    let mut rebased = ours.manifest;
+    rebased.stashes = base.stashes;
+    if report
+        .conflicts
+        .iter()
+        .any(|conflict| conflict.saved.is_some())
+    {
+        rebased.stashes.insert(stash_name);
+    }
+    write_private(state_dir, BASE, &serde_json::to_vec(&rebased)?)?;
     write_private(state_dir, REPORT, &serde_json::to_vec_pretty(&report)?)?;
     step(Step::Rebased)?;
     drop(scratch);
@@ -449,8 +482,13 @@ fn plan(
                 }
             } else if t == b {
                 Action::Take
-            } else if let Some(content) = merge_record_file(path, base, ours, theirs)? {
-                Action::Records { content }
+            } else if let Some((content, running_metadata)) =
+                merge_record_file(path, base, ours, theirs)?
+            {
+                Action::Records {
+                    content,
+                    running_metadata,
+                }
             } else if managed.preserve && matches_node(t, &managed.node) {
                 Action::ConfigUpdate
             } else {
@@ -458,8 +496,13 @@ fn plan(
             }
         } else if t == b {
             Action::Take
-        } else if let Some(content) = merge_record_file(path, base, ours, theirs)? {
-            Action::Records { content }
+        } else if let Some((content, running_metadata)) =
+            merge_record_file(path, base, ours, theirs)?
+        {
+            Action::Records {
+                content,
+                running_metadata,
+            }
         } else {
             Action::Conflict(Reason::BothChanged)
         };
@@ -470,10 +513,12 @@ fn plan(
 
 /// Whether the trial's package state accepts the running version of a managed path.
 ///
-/// Preserved files accept any contents with the manifest's metadata. Other
-/// paths must match their manifest exactly, as verification requires.
+/// Preserved files accept any contents with the manifest's metadata. A
+/// directory that packages only create implicitly accepts any metadata, as
+/// verification does. Other paths must match their manifest exactly.
 fn acceptable(ours: Option<&Entry>, managed: &Managed) -> bool {
     match (ours, &managed.node) {
+        (Some(Entry::Dir { .. }), _) if managed.implicit => true,
         (
             Some(Entry::File {
                 mode,
@@ -544,12 +589,15 @@ fn matches_node(entry: Option<&Entry>, node: &Node) -> bool {
 }
 
 /// Merge an account database changed on both sides, if its records allow it.
+///
+/// Returns the merged contents, and whether the running file's metadata
+/// replaces the trial's because only the running system changed it.
 fn merge_record_file(
     path: &str,
     base: &Manifest,
     ours: &Manifest,
     theirs: &Manifest,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(Vec<u8>, bool)>> {
     if !RECORDS.contains(&path) {
         return Ok(None);
     }
@@ -561,14 +609,34 @@ fn merge_record_file(
     };
     // Only the contents merge. Metadata changed on both sides is a conflict.
     let b_meta = base.entries.get(path).and_then(Entry::metadata);
-    if o_meta != t_meta && b_meta != Some(t_meta) {
+    if o_meta != t_meta && b_meta != Some(o_meta) && b_meta != Some(t_meta) {
         return Ok(None);
     }
+    let running_metadata = o_meta != t_meta && b_meta == Some(t_meta);
     let base_text = base.record(path)?.unwrap_or_default();
     let (Some(ours_text), Some(theirs_text)) = (ours.record(path)?, theirs.record(path)?) else {
         return Ok(None);
     };
-    Ok(merge_records(&base_text, &ours_text, &theirs_text))
+    let Some(merged) = merge_records(&base_text, &ours_text, &theirs_text) else {
+        return Ok(None);
+    };
+    // Accounts that each side added on its own can take the same free ID.
+    if matches!(path, "etc/passwd" | "etc/group") && !unique_ids(&merged) {
+        return Ok(None);
+    }
+    Ok(Some((merged, running_metadata)))
+}
+
+/// Whether no two records share the numeric ID in their third field.
+fn unique_ids(text: &[u8]) -> bool {
+    let mut ids = BTreeSet::new();
+    text.split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .all(|line| {
+            line.split(|byte| *byte == b':')
+                .nth(2)
+                .is_some_and(|id| ids.insert(id))
+        })
 }
 
 type Records<'a> = Vec<(&'a [u8], &'a [u8])>;
@@ -737,8 +805,11 @@ impl Builder<'_> {
                     self.report.config_updates.push(path.clone());
                     config_updates.push(path.clone());
                 }
-                Action::Records { content } => {
-                    self.write_records(path, content)?;
+                Action::Records {
+                    content,
+                    running_metadata,
+                } => {
+                    self.write_records(path, content, *running_metadata)?;
                     self.report.merged.push(path.clone());
                 }
                 Action::Conflict(reason) => self.conflict(path, *reason)?,
@@ -885,10 +956,13 @@ impl Builder<'_> {
 
     /// Replace a merged file with merged account records, keeping the
     /// metadata the merge selected.
-    fn write_records(&self, path: &str, content: &[u8]) -> Result<()> {
-        let (Some(Entry::File { mode, uid, gid, .. }), Some(theirs)) =
-            (self.pick(path), self.theirs.entries.get(path))
-        else {
+    fn write_records(&self, path: &str, content: &[u8], running_metadata: bool) -> Result<()> {
+        let picked = if running_metadata {
+            self.ours.manifest.entries.get(path)
+        } else {
+            self.theirs.entries.get(path)
+        };
+        let Some(picked @ Entry::File { mode, uid, gid, .. }) = picked else {
             bail!("expected regular files at {path}");
         };
         let (target, leaf) = parent(self.scratch.as_file(), path)?
@@ -904,28 +978,20 @@ impl Builder<'_> {
         (&file).write_all(content)?;
         fchown(&file, Some(Uid::from_raw(*uid)), Some(Gid::from_raw(*gid)))?;
         fchmod(&file, Mode::from_raw_mode(*mode))?;
-        // The record merge keeps the trial's attributes, such as a security label.
-        let (source, name) = parent(self.trial.as_file(), path)?
-            .with_context(|| format!("{path} disappeared from the trial"))?;
-        if !theirs.xattrs().is_empty() {
+        // The attributes, such as a security label, come from the same side
+        // as the rest of the metadata.
+        let side = if running_metadata {
+            self.running
+        } else {
+            self.trial
+        };
+        let (source, name) = parent(side.as_file(), path)?
+            .with_context(|| format!("{path} disappeared during the merge"))?;
+        if !picked.xattrs().is_empty() {
             copy_xattrs(&source, name, &target, leaf, path)?;
         }
         file.sync_all()?;
         Ok(())
-    }
-
-    /// The side whose metadata a record merge keeps: the running one when
-    /// only it changed the metadata.
-    fn pick(&self, path: &str) -> Option<&Entry> {
-        let ours = self.ours.manifest.entries.get(path)?;
-        let theirs = self.theirs.entries.get(path)?;
-        // `merge_record_file` only merges differing metadata when the trial
-        // kept the base's.
-        Some(if ours.metadata() != theirs.metadata() {
-            ours
-        } else {
-            theirs
-        })
     }
 }
 
@@ -1346,10 +1412,15 @@ pub fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
     let mut saved = Vec::new();
     for revision in fs::read_dir(Root::fd_path(&stash))? {
         let revision = revision?;
-        let Some(number) = revision
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u64>().ok())
+        let file_name = revision.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(number) = name
+            .split_once('-')
+            .map_or(name, |(number, _)| number)
+            .parse::<u64>()
+            .ok()
         else {
             continue;
         };
@@ -1366,7 +1437,7 @@ pub fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
         visit(&top, ETC, info.st_dev, false, false, &mut scan)?;
         for (path, entry) in scan.manifest.entries {
             if !entry.is_dir() {
-                saved.push((number, path.clone(), format!("{prefix}/{number}/{path}")));
+                saved.push((number, path.clone(), format!("{prefix}/{name}/{path}")));
             }
         }
     }
@@ -1593,7 +1664,8 @@ mod tests {
         assert_eq!(
             plan(&base, &ours, &theirs, &policy)?["etc/group"],
             Action::Records {
-                content: b"wheel:x:10:alice\nsysd:x:9:\nalice:x:1000:\n".to_vec()
+                content: b"wheel:x:10:alice\nsysd:x:9:\nalice:x:1000:\n".to_vec(),
+                running_metadata: false,
             }
         );
         // Mode changed on the running system makes the package file drift.
@@ -1603,6 +1675,102 @@ mod tests {
             plan(&base, &ours, &theirs, &policy)?["etc/group"],
             Action::Conflict(Reason::Drift)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn account_merges_keep_the_changed_metadata_and_unique_ids() -> Result<()> {
+        let accounts = |text: &str, mode: u32| -> (Entry, String) {
+            (file_with(text, mode), STANDARD.encode(text))
+        };
+        let paths = BTreeMap::new();
+        let policy = Policy {
+            paths: &paths,
+            generated: Vec::new(),
+        };
+        let root = "root:x:0:0::/root:/bin/sh\n";
+        let case = |ours: (&str, u32), theirs: (&str, u32)| -> Result<Action> {
+            let mut manifests = [manifest(&[]), manifest(&[]), manifest(&[])];
+            for (manifest, (text, mode)) in manifests.iter_mut().zip([(root, 0o644), ours, theirs])
+            {
+                let (entry, record) = accounts(text, mode);
+                manifest.entries.insert("etc/passwd".into(), entry);
+                manifest.records.insert("etc/passwd".into(), record);
+            }
+            let [base, ours, theirs] = &manifests;
+            Ok(plan(base, ours, theirs, &policy)?
+                .remove("etc/passwd")
+                .unwrap())
+        };
+        let alice = format!("{root}alice:x:1000:1000::/home/alice:/bin/sh\n");
+        let sysd = format!("{root}sysd:x:999:999::/:/bin/false\n");
+        let merged =
+            format!("{root}sysd:x:999:999::/:/bin/false\nalice:x:1000:1000::/home/alice:/bin/sh\n");
+        // Only the trial changed the mode: the merge keeps the trial's.
+        assert_eq!(
+            case((&alice, 0o644), (&sysd, 0o640))?,
+            Action::Records {
+                content: merged.clone().into_bytes(),
+                running_metadata: false,
+            }
+        );
+        // Only the running system changed it: the merge keeps the running one's.
+        assert_eq!(
+            case((&alice, 0o600), (&sysd, 0o644))?,
+            Action::Records {
+                content: merged.into_bytes(),
+                running_metadata: true,
+            }
+        );
+        // Both changed it differently.
+        assert_eq!(
+            case((&alice, 0o600), (&sysd, 0o640))?,
+            Action::Conflict(Reason::BothChanged)
+        );
+        // Each side gave a new account the same free UID.
+        let backup = format!("{root}backup:x:999:999::/:/bin/false\n");
+        assert_eq!(
+            case((&backup, 0o644), (&sysd, 0o644))?,
+            Action::Conflict(Reason::BothChanged)
+        );
+        assert!(unique_ids(b"a:x:1:\nb:x:2:\n"));
+        assert!(!unique_ids(b"a:x:1:\nb:x:1:\n"));
+        assert!(!unique_ids(b"a:x\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_directories_take_local_metadata() -> Result<()> {
+        let paths = BTreeMap::from([(
+            "etc/ssh".to_owned(),
+            Managed {
+                node: Node::Dir {
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                },
+                owners: BTreeSet::from(["system/base".to_owned()]),
+                preserve: false,
+                implicit: true,
+                original_name: None,
+            },
+        )]);
+        let policy = Policy {
+            paths: &paths,
+            generated: Vec::new(),
+        };
+        let base = manifest(&[("etc/ssh", dir())]);
+        let mut ours = base.clone();
+        ours.entries.insert(
+            "etc/ssh".into(),
+            Entry::Dir {
+                mode: 0o750,
+                uid: 0,
+                gid: 0,
+                xattrs: BTreeMap::new(),
+            },
+        );
+        assert_eq!(plan(&base, &ours, &base, &policy)?["etc/ssh"], Action::Take);
         Ok(())
     }
 

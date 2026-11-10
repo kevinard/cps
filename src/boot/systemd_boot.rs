@@ -786,6 +786,13 @@ fn activate_as(
         );
     } else if backup && existing_entry.is_none() {
         pin_before_backup = backup_selection(policy.as_ref(), &existing, &btrfs, direct)?;
+        if pin_before_backup.is_some() {
+            // Once pinned, every later trial is selected with `preferred`.
+            loader::require_preferred(&esp).context(
+                "a backup pins the boot selection, and later updates then need a loader that \
+                 reads `preferred`; update systemd-boot, or set live-backup=#false in boot-btrfs",
+            )?;
+        }
     } else if existing_entry.is_none() {
         ensure!(
             existing.is_empty(),

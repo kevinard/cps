@@ -382,16 +382,20 @@ discarded before the shutdown is not merged.
 
 A change that does not need a reboot applies to the running root. Before
 it starts, CPS takes a read-only snapshot of the root in
-`environments/backup-IMAGE-REVISION/root`, gives it a new image identity, and
-registers it as a known-good environment titled `Canopa backup`. The backup
+`environments/backup-IMAGE-REVISION/root`, gives it a new image identity,
+registers it as a known-good environment titled `Canopa backup`, and then
+makes it writable, so it boots like any root when it is picked from the boot
+menu. The backup
 has no fallback and is never selected automatically. If `loader.conf` still
 selects the newest entry with `default cps-*.conf`, CPS first pins the running
-environment, because the backup would be the newest. With direct UEFI boot,
+environment, because the backup would be the newest. Later trials are then
+selected with the `preferred` key, so this needs systemd-boot 262 or newer;
+CPS refuses the backup on an older loader. With direct UEFI boot,
 CPS creates the backup's firmware boot option without changing `BootOrder`.
 
 To return to the system as it was before a live change, select the backup
-and reboot. Rollback makes the backup's subvolume writable before it selects
-it, because a running root must be writable.
+and reboot, or pick `Canopa backup` in the boot menu. CPS checks the change
+can run on the running root before it saves the backup.
 
 ```sh
 sudo cps boot-env list --esp /efi

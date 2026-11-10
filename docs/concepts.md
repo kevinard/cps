@@ -227,7 +227,7 @@ registered boot entry on the **EFI System Partition** (ESP). The entry
 records the root's image identity and revision, so the boot always uses the
 root's committed package state and configuration together. The root lives
 on Btrfs. A staged environment is a writable snapshot of its parent root, and
-a backup is a read-only one. Every environment mounts the same `/var`
+a backup is a snapshot taken before a live change. Every environment mounts the same `/var`
 subvolume, so logs and application data survive rollback and pruning.
 
 | Term | Meaning in CPS |
@@ -235,7 +235,7 @@ subvolume, so logs and application data survive rollback and pruning.
 | **Staging** | Applying a plan to a new root instead of the running one, for changes that need a reboot. |
 | **Trial** | A staged environment selected for the next boot with a limited number of attempts: two by default with systemd-boot, and one with direct UEFI boot. |
 | **Known good** | An environment that booted and passed its health checks, or that was registered with `--known-good` to bootstrap the ESP. A healthy boot **blesses** a trial. Otherwise the next boot returns to the trial's **fallback**, the known-good parent it was staged from. |
-| **Backup** | On Btrfs, a read-only snapshot of the running root that CPS registers as a known-good environment before each live change, without selecting it. Rollback can select it. |
+| **Backup** | On Btrfs, a snapshot of the running root that CPS registers as a known-good environment before each live change, without selecting it. Rollback can select it. |
 | **/etc merge** | When the running Btrfs system shuts down with a trial selected, CPS carries the `/etc` changes made since staging into the trial. Changes that conflict with the trial's own stay aside for review. |
 | **Rollback** | Selects a known-good environment, by default the fallback of the current selection, for the next boot. |
 | **Failed trial** | A trial whose attempts are exhausted. An **abandoned trial** still has attempts left but is no longer selected, for example after a rollback. |

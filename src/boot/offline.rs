@@ -97,7 +97,10 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
         names == expected,
         "the volume directory must contain only the root, environments, and /var directories"
     );
-    for (name, option) in [(Some(&environments), "environments"), (var.as_ref(), "/var")] {
+    for (name, option) in [
+        (Some(&environments), "environments"),
+        (var.as_ref(), "/var"),
+    ] {
         let Some(name) = name else { continue };
         let path = volume.join(name);
         ensure!(
@@ -181,7 +184,10 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
             .arg(format!("rw:{root_name}"))
             .arg("--subvol")
             .arg(format!("rw:{environments}"))
-            .args(var.iter().flat_map(|var| ["--subvol".into(), format!("rw:{var}")]))
+            .args(
+                var.iter()
+                    .flat_map(|var| ["--subvol".into(), format!("rw:{var}")]),
+            )
             .arg(FILESYSTEM),
         "formatting the root filesystem with mkfs.btrfs",
     )?;
@@ -253,7 +259,10 @@ fn mounts_var(fstab: &str, name: &str) -> bool {
         .map(|line| line.split('#').next().unwrap_or_default())
         .filter_map(|line| {
             let fields: Vec<_> = line.split_ascii_whitespace().collect();
-            (fields.len() >= 4 && fields[1] == "/var" && fields[2] == "btrfs").then(|| fields[3])
+            match fields[..] {
+                [_, "/var", "btrfs", options, ..] => Some(options),
+                _ => None,
+            }
         })
         .any(|options| {
             options.split(',').any(|option| {
@@ -574,8 +583,14 @@ fs uuid 11111111-2222-4333-8444-555555555555
         assert!(mounts_var(fstab, "@var"));
         assert!(mounts_var("UUID=x /var btrfs subvol=@var 0 0", "@var"));
         assert!(!mounts_var(fstab, "@other"));
-        assert!(!mounts_var("# PARTUUID=x /var btrfs subvol=/@var 0 0", "@var"));
-        assert!(!mounts_var("UUID=x /var/log btrfs subvol=/@var 0 0", "@var"));
+        assert!(!mounts_var(
+            "# PARTUUID=x /var btrfs subvol=/@var 0 0",
+            "@var"
+        ));
+        assert!(!mounts_var(
+            "UUID=x /var/log btrfs subvol=/@var 0 0",
+            "@var"
+        ));
         assert!(!mounts_var("tmpfs /var tmpfs subvol=/@var 0 0", "@var"));
     }
 

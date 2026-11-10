@@ -88,8 +88,8 @@ identity and revision. For an entry that boots by PARTUUID, CPS reads the
 parent GPT disk of the mounted ESP and checks that the Btrfs device is that
 partition, so it needs read access to the disk.
 
-A read-only Btrfs [backup](btrfs.md#backups-before-live-changes) becomes
-writable when rollback selects it. Rollback then writes the target as
+For a Btrfs [backup](btrfs.md#backups-before-live-changes), rollback first
+clears the read-only flag if an interrupted backup left it set. It then writes the target as
 `default` in `loader.conf` and removes any `preferred` trial selection. With direct UEFI boot, it instead cancels a
 pending `BootNext`, marks that trial as exhausted, and moves the target to the
 front of `BootOrder`. Rollback keeps every environment and its files.

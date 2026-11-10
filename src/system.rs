@@ -17,9 +17,9 @@ use crate::{
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
     apply::{PublisherFetchError, abort_live, apply_live, repair_pending_live, resume_live},
     boot::{
-        backup_running_btrfs, discard_btrfs_trial, entry_id, etc_merge, pending_trial,
-        prune_btrfs_boot_environments, rollback_btrfs_boot_environment, stage_running_btrfs,
-        with_running_environment,
+        backup_running_btrfs, discard_btrfs_trial, entry_id, etc_merge, make_writable,
+        pending_trial, prune_btrfs_boot_environments, rollback_btrfs_boot_environment,
+        stage_running_btrfs, with_running_environment,
     },
     fetch_plan,
     git_install::{GitBuild, GitSource, GitStore},
@@ -613,6 +613,13 @@ impl System {
             // A repair or revert restores package files on a root that fails
             // verification, so its snapshot could not boot as known-good.
             if boot.live_backup && change.plan.has_changes() && !change.plan.is_recovery() {
+                // Refuse a live change that cannot run before saving a backup for it.
+                with_running_environment(
+                    &boot.volume,
+                    &boot.esp,
+                    boot.activation.root_partuuid.as_deref(),
+                    |_, _, _| Ok(()),
+                )?;
                 let id = self.backup_running().context(
                     "creating the backup boot environment before the live change. Remove old \
                      environments with `cps boot-env prune`, or set live-backup=#false in \
@@ -654,7 +661,7 @@ impl System {
         Ok(Some(id))
     }
 
-    /// Snapshot the running root as a read-only known-good environment.
+    /// Snapshot the running root as a known-good environment.
     ///
     /// A retry after an interrupted backup or an aborted live change reuses
     /// the backup of the same revision. Callers hold the environments lock.
@@ -672,6 +679,8 @@ impl System {
                 .iter()
                 .any(|entry| entry.id == id && !entry.is_retiring)
             {
+                // An interrupted backup may have stopped before this step.
+                make_writable(&Root::open(&root)?)?;
                 return Ok(id);
             }
         } else {
@@ -688,6 +697,11 @@ impl System {
             .activation
             .register_btrfs_backup(&root, &boot.volume, &boot.esp, boot.uki, boot.uefi)
             .with_context(|| format!("registering the backup at {}", root.display()))?;
+        // The snapshot stays read-only until it is verified and registered.
+        // The boot menu can start it, so it must then be writable like any
+        // other root.
+        make_writable(&Root::open(&root)?)
+            .with_context(|| format!("making the backup at {} writable", root.display()))?;
         if boot.auto_prune {
             self.prune_quietly(Some(boot.keep_environments), None);
         }
