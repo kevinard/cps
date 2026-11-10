@@ -67,6 +67,7 @@ pub fn generate_manifest_for_architecture(
         action: Vec::new(),
         mediated_links: BTreeMap::new(),
         systemd: Vec::new(),
+        triggers: Vec::new(),
         kernel: None,
         requires_reboot: false,
     };

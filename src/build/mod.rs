@@ -1,7 +1,7 @@
 pub(crate) mod cgroup;
 pub(crate) mod expand;
 pub(crate) mod pattern;
-mod sandbox;
+pub(crate) mod sandbox;
 pub(crate) mod snapshot;
 pub(crate) mod sources;
 mod strip;

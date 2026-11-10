@@ -26,6 +26,7 @@ use crate::{
         stage_blob,
     },
     systemd::{self, Action as SystemdAction},
+    triggers::{self, TriggerRun},
     verify::{Checked, Contents, check_transaction_state, manifest_paths_since},
 };
 
@@ -45,6 +46,13 @@ struct Journal {
     files_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     live_jobs: Option<systemd::LiveJobs>,
+    /// How many of the plan's triggers have run and published their outputs.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    triggers_done: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 #[derive(Deserialize, Serialize)]
@@ -59,6 +67,9 @@ struct PendingWork<'a> {
     writes: &'a [Write],
     next: &'a StateDelta,
     systemd: &'a [SystemdAction],
+    triggers: &'a [TriggerRun],
+    retired_triggers: &'a [TriggerRun],
+    triggers_done: usize,
     kernel_install: Option<&'a Artifacts>,
     files_ready: bool,
 }
@@ -81,6 +92,9 @@ impl PendingRecord {
             writes: &journal.plan.writes,
             next: &journal.next,
             systemd: &journal.plan.systemd,
+            triggers: &journal.plan.triggers,
+            retired_triggers: &journal.plan.retired_triggers,
+            triggers_done: journal.triggers_done,
             kernel_install: journal.plan.kernel_install.as_ref(),
             files_ready: journal.files_ready,
         }
@@ -89,6 +103,12 @@ impl PendingRecord {
     fn mark_files_ready(&mut self) {
         match self {
             Self::Journaled(journal) | Self::Live(journal) => journal.files_ready = true,
+        }
+    }
+
+    fn mark_triggers_done(&mut self, count: usize) {
+        match self {
+            Self::Journaled(journal) | Self::Live(journal) => journal.triggers_done = count,
         }
     }
 
@@ -508,6 +528,7 @@ pub(crate) fn apply_to_image(
             AfterFiles::Live(jobs) => Some(jobs.clone()),
             _ => None,
         },
+        triggers_done: 0,
     });
     let pending = if live.is_some() {
         PendingRecord::Live(journal)
@@ -732,7 +753,11 @@ enum AfterFiles {
 
 impl AfterFiles {
     fn offline(root: &Root, plan: &Plan) -> Result<Self> {
-        if plan.systemd.is_empty() && plan.kernel_install.is_none() {
+        if plan.systemd.is_empty()
+            && plan.triggers.is_empty()
+            && plan.retired_triggers.is_empty()
+            && plan.kernel_install.is_none()
+        {
             Ok(Self::None)
         } else {
             Ok(Self::Offline(systemd::offline_path(root)?))
@@ -802,6 +827,19 @@ fn finish(
         if !work.systemd.is_empty() {
             systemd::run(&image.root, path, work.systemd, next, pending.is_live())?;
         }
+        if !work.triggers.is_empty() || !work.retired_triggers.is_empty() {
+            // Retiring and pruning are idempotent. Each completed trigger is
+            // journaled, so a resumed transaction runs only the rest.
+            triggers::retire(&image.root, work.retired_triggers, base, next)?;
+            let runs = work.triggers.to_vec();
+            for (index, run) in runs.iter().enumerate().skip(work.triggers_done) {
+                triggers::run(&image.root, stage, path, run, next)?;
+                pending.mark_triggers_done(index + 1);
+                image.update_pending(&pending)?;
+            }
+            triggers::prune(&image.root, pending.work().writes, next)?;
+        }
+        let work = pending.work();
         if let Some(kernel) = work.kernel_install {
             kernel.prepare(image, path, &next.settings)?;
         }
@@ -842,7 +880,7 @@ fn finish(
     let journal = pending.journal();
     let written = written.iter().map(String::as_str).collect();
     image.commit(
-        work.id,
+        &journal.id,
         &journal.next,
         next,
         &written,

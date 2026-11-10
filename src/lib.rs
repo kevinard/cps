@@ -15,6 +15,7 @@ mod repo;
 pub mod system;
 mod systemd;
 mod transport;
+mod triggers;
 mod verify;
 
 pub use apply::{

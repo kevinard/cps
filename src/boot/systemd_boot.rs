@@ -636,7 +636,7 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
             kernel,
             initrd,
             artifacts.linux_sha256.clone(),
-            artifacts.initrd_sha256.clone(),
+            artifacts.prepared_initrd_sha256(&image.state_dir)?,
         )
     } else {
         let mut kernel = image

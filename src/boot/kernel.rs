@@ -43,9 +43,14 @@ impl Kernel {
         format!("usr/lib/modules/{}/vmlinuz", self.release)
     }
 
+    /// Where the kernel's initramfs is, whether packaged or generated.
+    pub fn initrd_path(&self) -> String {
+        format!("usr/lib/modules/{}/initrd", self.release)
+    }
+
+    /// The packaged initramfs, if the kernel package ships one.
     pub fn initrd(&self) -> Option<String> {
-        self.initrd
-            .then(|| format!("usr/lib/modules/{}/initrd", self.release))
+        self.initrd.then(|| self.initrd_path())
     }
 }
 
@@ -55,13 +60,21 @@ pub(crate) struct Artifacts {
     pub kernel: Kernel,
     pub(super) linux_sha256: String,
     pub(super) initrd_sha256: Option<String>,
+    /// An installed trigger generates the initramfs. Its digest is known
+    /// only after the trigger runs, so the prepared artifacts record it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) generated_initrd: bool,
 }
+
+/// The digest of a generated initramfs, recorded in its prepared artifacts.
+const GENERATED_INITRD_DIGEST: &str = "initrd.sha256";
 
 pub(crate) fn selected(
     installed: &BTreeMap<String, Installed>,
     paths: &BTreeMap<String, Managed>,
 ) -> Result<Option<Artifacts>> {
     let mut selected = None;
+    let outputs = crate::triggers::active_outputs(installed, paths);
     for (name, package) in installed {
         let Some(kernel) = &package.published.manifest.kernel else {
             continue;
@@ -86,10 +99,14 @@ pub(crate) fn selected(
             selected.is_none(),
             "multiple kernels selected for the boot environment"
         );
+        // A packaged initramfs conflicts with any trigger output that covers it.
+        let generated_initrd =
+            initrd_sha256.is_none() && crate::triggers::generated(&outputs, &kernel.initrd_path());
         selected = Some(Artifacts {
             kernel: kernel.clone(),
             linux_sha256,
             initrd_sha256,
+            generated_initrd,
         });
     }
     Ok(selected)
@@ -124,12 +141,27 @@ impl Artifacts {
         let linux = checked_file(state, &format!("{dir}/linux"), &self.linux_sha256)
             .with_context(|| format!("opening prepared kernel {}", self.kernel.release))?;
         let initrd = self
-            .initrd_sha256
-            .as_ref()
-            .map(|hash| checked_file(state, &format!("{dir}/initrd"), hash))
+            .prepared_initrd_sha256(state)?
+            .map(|hash| checked_file(state, &format!("{dir}/initrd"), &hash))
             .transpose()
             .with_context(|| format!("opening prepared initrd for {}", self.kernel.release))?;
         Ok((linux, initrd))
+    }
+
+    /// The digest of the prepared initramfs, packaged or generated.
+    pub fn prepared_initrd_sha256(&self, state: &Root) -> Result<Option<String>> {
+        if !self.generated_initrd {
+            return Ok(self.initrd_sha256.clone());
+        }
+        let path = format!("{}/{GENERATED_INITRD_DIGEST}", self.directory()?);
+        let recorded = String::from_utf8(state.read_file(&path).with_context(|| {
+            format!(
+                "opening the generated initramfs digest for {}",
+                self.kernel.release
+            )
+        })?)?;
+        crate::model::validate_digest(&recorded)?;
+        Ok(Some(recorded))
     }
 
     pub fn prepare(&self, image: &Image, path: &Path, settings: &Settings) -> Result<()> {
@@ -139,26 +171,50 @@ impl Artifacts {
         let state_path = path.join(crate::image::STATE_DIRECTORY);
         let state_dir = image.state_dir.as_file();
         let final_path = state_path.join(&directory);
-        match fs::symlink_metadata(&final_path) {
-            Ok(_) => {
-                self.open_prepared(&image.state_dir)?;
-                state_dir.sync_all()?;
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        let exists = match fs::symlink_metadata(&final_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
+        };
+        // A generated initramfs changes whenever its trigger runs, so its
+        // prepared artifacts are rebuilt from the image's current output.
+        let generated = self
+            .generated_initrd
+            .then(|| -> Result<String> {
+                let path = self.kernel.initrd_path();
+                let hash = digest_reader(
+                    root.file(&path)
+                        .with_context(|| format!("opening the generated initramfs at {path}"))?,
+                )?;
+                Ok(hash)
+            })
+            .transpose()?;
+        if exists
+            && generated.as_ref().is_none_or(|hash| {
+                self.prepared_initrd_sha256(&image.state_dir)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    == Some(hash)
+            })
+        {
+            self.open_prepared(&image.state_dir)?;
+            state_dir.sync_all()?;
+            return Ok(());
         }
 
         let image = self.kernel.image();
         checked_file(root, &image, &self.linux_sha256)?;
-        let initrd = self.kernel.initrd();
+        let initrd = self
+            .kernel
+            .initrd()
+            .or(generated.as_ref().map(|_| self.kernel.initrd_path()));
+        let initrd_sha256 = self.initrd_sha256.clone().or(generated);
         if let Some(path) = &initrd {
             checked_file(
                 root,
                 path,
-                self.initrd_sha256
-                    .as_deref()
-                    .context("missing initrd digest")?,
+                initrd_sha256.as_deref().context("missing initrd digest")?,
             )?;
         }
 
@@ -213,8 +269,14 @@ impl Artifacts {
         let prepared_path = boot.join("cps").join(&self.kernel.release);
         let prepared = Root::open(&prepared_path)?;
         checked_file(&prepared, "linux", &self.linux_sha256)?.sync_all()?;
-        if let Some(hash) = &self.initrd_sha256 {
+        if let Some(hash) = &initrd_sha256 {
             checked_file(&prepared, "initrd", hash)?.sync_all()?;
+        }
+        if self.generated_initrd {
+            let hash = initrd_sha256.as_deref().context("missing initrd digest")?;
+            let mut record = File::create_new(prepared_path.join(GENERATED_INITRD_DIGEST))?;
+            std::io::Write::write_all(&mut record, hash.as_bytes())?;
+            record.sync_all()?;
         }
         let prepared_parent = File::open(boot.join("cps"))?;
         File::open(&prepared_path)?.sync_all()?;
@@ -222,11 +284,16 @@ impl Artifacts {
             &prepared_parent,
             self.kernel.release.as_str(),
             state_dir,
-            directory,
-            RenameFlags::NOREPLACE,
+            directory.as_str(),
+            if exists {
+                RenameFlags::EXCHANGE
+            } else {
+                RenameFlags::NOREPLACE
+            },
         )
         .context("publishing prepared kernel artifacts")?;
         state_dir.sync_all()?;
+        // The scratch tree now holds the replaced artifacts, if any.
         Ok(())
     }
 }

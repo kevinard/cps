@@ -44,11 +44,15 @@ jobs:
           persist-credentials: false
       - name: Build the pinned test environment
         run: docker build --target transactions -t cps-ci ci
+      - name: Allow unprivileged Bubblewrap sandboxes for trigger handlers
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build and test
         run: |
           mkdir -p "$RUNNER_TEMP/cps-cargo"
           run_ci() {
             docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
+              --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+              --security-opt systempaths=unconfined \
               --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
               --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$PWD" "$@"
           }
@@ -61,7 +65,7 @@ jobs:
               python3 docs/reference/generate-man.py --cps target/debug/cps --check
               export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
               export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
-              for test in package-identity elf-transactions systemd-actions hwdb-trigger mediators \
+              for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
                   package-freezes git-snapshots release-ci release-notes sharded-mirror boot-export \
                   recipe-orchestration; do
                 bash "tests/$test.sh"

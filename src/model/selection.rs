@@ -747,6 +747,7 @@ mod tests {
             action: Vec::new(),
             mediated_links: BTreeMap::new(),
             systemd: Vec::new(),
+            triggers: Vec::new(),
             kernel: None,
             requires_reboot: false,
         }
