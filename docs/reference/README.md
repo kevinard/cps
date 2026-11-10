@@ -51,6 +51,7 @@ formatted output.
 | Apply and verify an image change | [plan](man/cps-plan.1), [fetch](man/cps-fetch.1), [validate](man/cps-validate.1), [apply](man/cps-apply.1), [transaction](man/cps-transaction.1), [verify](man/cps-verify.1) | [Inactive images](../client/images.md) |
 | Configure trust | [publisher](man/cps-publisher.1) | [Trusted publishers](../client/publishers.md) |
 | Prepare and build packages | [manifest](man/cps-manifest.1), [source](man/cps-source.1), [build](man/cps-build.1), [develop](man/cps-develop.1) | [Package maintainers](../maintainer/README.md) |
+| Order recipe builds, plan rebuilds, and repin toolchains | [build-order](man/cps-build-order.1), [rebuild-plan](man/cps-rebuild-plan.1), [recipe](man/cps-recipe.1) | [Plan builds across recipes](../maintainer/orchestration.md) |
 | Publish, export, or sync a catalog | [publish](man/cps-publish.1), [publish-bundle](man/cps-publish-bundle.1), [repo](man/cps-repo.1) | [Publishers](../publisher/README.md) · [Mirror clients](../client/mirrors.md) |
 | Stage, activate, or roll back a root | [boot-env](man/cps-boot-env.1) | [Boot setup guides](../setups/README.md) |
 

@@ -2888,7 +2888,12 @@ fn stage_manifest(
             Ok((path.to_owned(), file))
         })
         .collect::<Result<_>>()?;
-    let manifest = manifest.with_payloads(&artifacts)?;
+    // Generated ELF declarations come from the stored blobs, the bytes that
+    // the catalog publishes.
+    let blobs = Root::open(repo)?;
+    let manifest = crate::generate::elf::published_manifest(manifest, &artifacts, |_, file| {
+        blobs.file(&format!("blobs/{}", file.sha256))
+    })?;
     let unchanged_manifest = if let Some(existing) = catalog.entries.get(&id) {
         let previous = read_package(repo, &catalog.publisher, &id, existing)?;
         ensure!(

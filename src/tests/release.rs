@@ -69,6 +69,7 @@ fn attach_evidence(
                 size: payload.len() as u64,
             },
         )]),
+        &crate::image::root::Root::open(&fixture.proto)?,
     )?;
     fs::write(bundle.join("build.kdl"), &recipe)?;
     fs::write(bundle.join("manifest.kdl"), manifest_bytes)?;
@@ -177,6 +178,7 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
                 package_manifests,
             },
             &BTreeMap::new(),
+            &crate::image::root::Root::open(&bundle.join("proto"))?,
         )?;
         fs::write(bundle.join("attestation.json"), envelope)?;
         Ok(())
@@ -2538,6 +2540,7 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
                 size: bytes.len() as u64,
             },
         )]),
+        &crate::image::root::Root::open(&bundle.join("proto"))?,
     )?;
     fs::write(bundle.join("attestation.json"), &envelope)?;
     fs::create_dir(&f.repo)?;

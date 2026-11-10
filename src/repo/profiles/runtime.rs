@@ -63,9 +63,9 @@ pub(super) fn check(
         machine,
         &profile.elf_library_dirs,
         elf_at,
-        |source, provider| {
+        |source, provider, capabilities| {
             if profile.elf_require_declarations {
-                check_declared_provider(installed, paths, source, provider)?;
+                check_declared_provider(installed, paths, source, provider, capabilities)?;
             }
             Ok(())
         },
@@ -95,7 +95,7 @@ pub(crate) fn audit_installed(
         machine(arch)?,
         library_dirs,
         |path| files.get(path),
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     )
 }
 
@@ -104,7 +104,7 @@ fn check_paths<'a>(
     machine: u16,
     library_dirs: &[String],
     elf_at: impl Fn(&str) -> Option<&'a Elf>,
-    dependency: impl Fn(&str, &str) -> Result<()>,
+    dependency: impl Fn(&str, &str, &[String]) -> Result<()>,
 ) -> Result<()> {
     for (path, managed) in paths {
         let source = match &managed.node {
@@ -130,7 +130,7 @@ fn check_paths<'a>(
                     compatible_interpreter(&paths[target].node, elf_at(target), machine),
                     "incompatible ELF interpreter {interpreter}"
                 );
-                dependency(path, target)?;
+                dependency(path, target, &[])?;
             }
             let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
             let origin = format!("/{dir}");
@@ -139,7 +139,9 @@ fn check_paths<'a>(
                 let (target, _) = find_library(paths, needed, &origin, &search)?
                     .with_context(|| format!("missing ELF dependency {needed}"))?;
                 check_library(info, machine, needed, target, elf_at(target))?;
-                dependency(path, target)?;
+                // A generated capability requirement declares the library.
+                let capabilities = elf::needed_capabilities(info, needed).unwrap_or_default();
+                dependency(path, target, &capabilities)?;
             }
             Ok(())
         };
@@ -153,6 +155,7 @@ fn check_declared_provider(
     paths: &BTreeMap<String, Managed>,
     source: &str,
     target: &str,
+    capabilities: &[String],
 ) -> Result<()> {
     let consumer = paths[source]
         .owners
@@ -168,10 +171,17 @@ fn check_declared_provider(
     let consumer = &installed[consumer].published.manifest;
     let provider = &installed[provider].published.manifest;
     for dependency in &consumer.dependency {
-        if let Dependency::Require(requirement) = dependency
-            && requirement.package == provider.name
-            && requirement.matches(&provider.version)?
-        {
+        let declared = match dependency {
+            Dependency::Require(requirement) => {
+                requirement.package == provider.name && requirement.matches(&provider.version)?
+            }
+            Dependency::RequireCapability(requirement) => {
+                capabilities.contains(&requirement.package)
+                    && requirement.matches_capability(provider)?
+            }
+            _ => false,
+        };
+        if declared {
             return Ok(());
         }
     }

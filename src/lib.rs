@@ -8,6 +8,7 @@ mod git_install;
 mod image;
 mod kdl_format;
 mod model;
+pub mod orchestrate;
 mod plan;
 pub mod query;
 mod repo;
@@ -39,7 +40,7 @@ pub use build::{
 };
 pub use generate::{
     check_manifest_dependencies, generate_manifest, generate_manifest_for_architecture,
-    suggest_dependencies,
+    generated_dependencies, suggest_dependencies,
 };
 pub use image::diff::{ImageChange, ImageDiff, ImageMetadata, ImagePackage, ImagePath, image_diff};
 pub use image::history::{

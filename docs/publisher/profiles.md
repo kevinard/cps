@@ -95,10 +95,18 @@ relocation, libraries loaded with `dlopen`, inherited search paths, and
 loader state from the running system are outside its scope.
 
 Set `require-declarations=#true` on the `elf-check` block to also require
-a matching direct `require` for each external package supplying a managed
-ELF interpreter or shared library. The publisher checks the actual provider
-in the signed composition. This requirement carries forward to later
-catalogs for the profile.
+a declaration for each external package supplying a managed ELF interpreter
+or shared library. An interpreter needs a matching direct `require`. A
+library is declared by a matching `require` or by the
+[generated capability requirement](../maintainer/manifests.md#generated-shared-library-dependencies)
+for that library, which the provider satisfies. The publisher checks the
+actual provider in the signed composition. This requirement carries forward
+to later catalogs for the profile.
+
+Generated capabilities let the profile solver skip a provider version that
+lost a required soname or version node, so the gate inspects compositions
+that already resolve. The gate still checks the profile's own ordered
+library directories, interpreters, and content selected by facets.
 
 The gate applies to the fresh composition and the result of a checked
 upgrade. The signed profile records its library directories and version

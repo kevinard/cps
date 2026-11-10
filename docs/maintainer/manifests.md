@@ -9,7 +9,8 @@ the generated KDL, then test the package in an [inactive image](../client/images
 ## On this page
 
 - [Generating a manifest from a prototype](#generating-a-manifest-from-a-prototype)
-  - [Suggesting runtime dependencies](#suggesting-runtime-dependencies)
+  - [Generated shared-library dependencies](#generated-shared-library-dependencies)
+  - [Reviewing runtime dependencies](#reviewing-runtime-dependencies)
 - [Package metadata and version constraints](#package-metadata-and-version-constraints)
 - [Facets and variants](#facets-and-variants)
   - [Choosing between a facet, a package, and a variant](#choosing-between-a-facet-a-package-and-a-variant)
@@ -43,7 +44,73 @@ directories. Review the manifest and add dependency, configuration, and
 systemd declarations before publishing. Publication derives the payload
 hashes and lengths. [IPS prototype manifest generation](https://docs.oracle.com/cd/E88353_01/html/E37839/pkgsend-1.html)
 
-### Suggesting runtime dependencies
+### Generated shared-library dependencies
+
+Publication reads the ELF payloads of each package and adds its
+shared-library declarations to the signed manifest. You do not write them.
+
+- A package that ships a shared object at `DIR/SONAME`, where `SONAME` is
+  the object's `DT_SONAME` and `DIR` is a library directory, provides
+  `cap/elf/ABI/SONAME`. It also provides `cap/elf/ABI/SONAME/VERSION` for
+  each GNU version node that the object defines.
+- A package whose ELF objects name a `DT_NEEDED` library that the package
+  does not supply itself requires the matching capability. When the object
+  requires GNU version nodes from that library, the package requires
+  `cap/elf/ABI/SONAME/VERSION` for each non-weak node instead, because a
+  version node implies its soname. A library that the object finds in its
+  own package, through its `DT_RUNPATH`, `DT_RPATH`, or the library
+  directories, needs no declaration.
+
+`ABI` names the machine, class, and byte order of the ELF object:
+`x86_64`, `i686`, `x32`, `aarch64`, `aarch64_be`, `arm`, `riscv64`,
+`riscv32`, `ppc64le`, `ppc64`, `s390x`, or `loongarch64`. Other objects use
+`elfCLASSORDER-MACHINE`, such as `elf32be-8`. A 32-bit and a 64-bit library
+with one soname therefore never satisfy each other.
+
+```kdl
+provides "cap/elf/x86_64/libsqlite3.so.0"
+require-capability "cap/elf/x86_64/libc.so.6/GLIBC_2.34"
+require-capability "cap/elf/x86_64/libstdc++.so.6/GLIBCXX_3.4.29"
+```
+
+The library directories are `/usr/lib`, `/lib`, `/usr/lib64`, `/lib64`,
+`/usr/lib32`, `/lib32`, and the `x86_64-linux-gnu`, `i386-linux-gnu`,
+`aarch64-linux-gnu`, and `arm-linux-gnueabihf` directories under `/usr/lib`
+and `/lib`. The set is fixed so that every builder and the publisher derive
+the same declarations. A library elsewhere, such as `/usr/lib/app/`, is
+private to its package. A consumer in another package that reaches it
+through `DT_RUNPATH` gets a requirement that nothing provides, so ship the
+library in a library directory or ship both in one package. A library
+without `DT_SONAME` provides nothing. Interpreters and `DT_NEEDED` names
+spelled as paths stay path-based, because one file must exist at that path.
+Declare those with `require`.
+
+Only actions without a facet or variant take part. The package-level
+architecture counts as unconditional, so `arch="x86_64"` on an action in an
+`x86_64` package does too. Facets and variants never gate dependencies, so
+content they select neither provides nor requires a capability. Put content
+with its own library needs in a separate package.
+
+The `cap/elf/` namespace is reserved. Publication rejects a manifest that
+declares it, so generated lines in a published manifest are always
+generated. `cps publish` derives them from the stored payload blobs. A build
+derives them from its output tree and signs the digest of the resulting
+published manifest in its attestation. Publication derives them again and
+requires the same digest, and the signed catalog binds the manifest and its
+dependency summary. The solver uses these capabilities like any other. It
+refuses to remove or replace the last provider of a required soname or
+version node, and an update keeps a provider until a replacement provides
+the same capabilities. The [transaction check](../client/images.md#shared-library-regressions)
+remains the safety net for interpreters, facet changes, shadowing through
+`DT_RUNPATH`, and content selected by facets or variants.
+
+Preview the declarations for a prototype tree.
+
+```sh
+cps manifest generated --proto proto tool.kdl
+```
+
+### Reviewing runtime dependencies
 
 Review the generated manifest against the catalogs for the target image
 before publishing it.
@@ -51,8 +118,7 @@ before publishing it.
 ```sh
 cps manifest dependencies --proto proto --config image.kdl \
     --catalog "canopa=$canopa_catalog_sha256" \
-    --catalog "extras=$extras_catalog_sha256" \
-    --library-dir /usr/lib --library-dir /lib64 tool.kdl
+    --catalog "extras=$extras_catalog_sha256" tool.kdl
 ```
 
 Supply one exact signed catalog digest per publisher in the image config.
@@ -61,26 +127,38 @@ architecture, variants, and facet rules. It considers the newest active version 
 package name from the first eligible publisher. It reads the pinned
 catalogs even if the repositories have since advanced.
 
-The scan reads ELF interpreters and needed libraries, including search
-paths relative to `$ORIGIN`. For executable scripts it reads absolute
-shebangs, including `env NAME` and simple unquoted `env -S NAME ARGS`
-forms. Use repeated `--path-dir` options to set the target command search
-order for `env`. The default is `/usr/bin`, then `/bin`. Paths delivered
-by the prototype itself satisfy requirements locally.
+Standard output starts with comments that list the generated declarations
+and, for each generated requirement, the catalog packages that provide it.
+Do not copy those lines. A generated requirement without a provider in the
+pinned catalogs produces a diagnostic, which names any catalog package that
+ships a matching file outside the library directories.
 
-Standard output contains KDL `require` suggestions with exact versions,
-provider IDs, and the files that led to each suggestion. Review the lines
-alongside existing dependencies before copying them into the package
-block. Missing or ambiguous providers and unsupported inputs produce
-diagnostics and a nonzero exit status, with any resolved suggestions still
-printed. This is a direct path lookup against signed manifests. Use the
-release profile ELF check to validate the final composition and ABI.
+The command then suggests path-based `require` lines for what publication
+cannot generate. It reads ELF interpreters, `DT_NEEDED` names spelled as
+paths, and the needed libraries of content selected by a facet or variant,
+with search paths relative to `$ORIGIN`. For executable scripts it reads
+absolute shebangs, including `env NAME` and simple unquoted `env -S NAME
+ARGS` forms. Use repeated `--path-dir` options to set the target command
+search order for `env`. The default is `/usr/bin`, then `/bin`. Paths
+delivered by the prototype itself satisfy requirements locally.
+Interpreters are files at fixed paths, so a direct `require` on the package
+that ships the file is the declaration. A capability would need every
+package to advertise its executables in the catalog.
+
+Each suggestion has an exact version, the provider ID, and the files that
+led to it. Review the lines alongside existing dependencies before copying
+them into the package block. Missing or ambiguous providers and
+unsupported inputs produce diagnostics and a nonzero exit status, with any
+resolved suggestions still printed. This is a direct path lookup against
+signed manifests. Use the release profile ELF check to validate the final
+composition and ABI.
 
 Pass `--check` in package CI before publishing to require a matching direct
-`require` for every external provider found against the pinned catalogs.
-The command prints only missing requirements and fails for missing or ambiguous
-providers, unsupported inputs, and declared version ranges that exclude the
-detected provider. Use the ELF profile gate to test runtime ABI compatibility.
+`require` for every external path-based provider found against the pinned
+catalogs, and a provider for every generated requirement. The command prints
+only missing requirements and fails for missing or ambiguous providers,
+unsupported inputs, and declared version ranges that exclude the detected
+provider. Use the ELF profile gate to test runtime ABI compatibility.
 
 ## Package metadata and version constraints
 
@@ -197,7 +275,9 @@ A consumer can require the capability by name.
 require-capability "cap/mail-transport" version=">=2.0.0-0"
 ```
 
-Capability names begin with `cap/`. The version on `provides` describes the
+Capability names begin with `cap/`. Names under `cap/elf/` are reserved for
+[generated shared-library dependencies](#generated-shared-library-dependencies).
+The version on `provides` describes the
 capability independently of the package version. A requirement with a version
 constraint needs a matching versioned provider. Omit the constraint to accept
 any declared version or an unversioned provider.

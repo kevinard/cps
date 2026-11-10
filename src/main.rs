@@ -200,6 +200,35 @@ enum Command {
         #[command(subcommand)]
         command: ManifestCommand,
     },
+    /// Print recipes in dependency order for building
+    BuildOrder {
+        /// Show the recipes that each recipe follows and why
+        #[arg(long)]
+        explain: bool,
+        /// Recipe files or directories to search for recipes
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
+    /// List the packages and recipes to rebuild after packages change
+    RebuildPlan {
+        /// Image configuration with target architecture and local publisher paths
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact signed catalog digest for each configured publisher
+        #[arg(long = "catalog", required = true, value_name = "PUBLISHER=SHA256")]
+        catalogs: Vec<String>,
+        /// Changed package, compared with its previous version
+        #[arg(long = "changed", required = true, value_name = "PACKAGE[@VERSION]")]
+        changed: Vec<String>,
+        /// Recipe files or directories that produce the packages
+        #[arg(long = "recipes", value_name = "PATH")]
+        recipes: Vec<PathBuf>,
+    },
+    /// Maintain build recipes
+    Recipe {
+        #[command(subcommand)]
+        command: RecipeCommand,
+    },
     /// Publish manifests and their payloads to a local repository in one signed catalog update
     Publish {
         #[arg(long)]
@@ -651,7 +680,7 @@ enum ManifestCommand {
         gid: u32,
         name: String,
     },
-    /// Suggest runtime dependencies from ELF and shebangs using pinned local catalogs
+    /// Review generated library capabilities and suggest path-based requires using pinned catalogs
     Dependencies {
         #[arg(long)]
         proto: PathBuf,
@@ -661,9 +690,6 @@ enum ManifestCommand {
         /// Exact signed catalog digest for each configured publisher
         #[arg(long = "catalog", required = true, value_name = "PUBLISHER=SHA256")]
         catalogs: Vec<String>,
-        /// Default ELF library directory in search order
-        #[arg(long = "library-dir", required = true, value_name = "PATH")]
-        library_dirs: Vec<String>,
         /// Target PATH directory for env shebangs, in search order
         #[arg(long = "path-dir", default_values = ["/usr/bin", "/bin"], value_name = "PATH")]
         path_dirs: Vec<String>,
@@ -671,6 +697,32 @@ enum ManifestCommand {
         #[arg(long)]
         check: bool,
         manifest: PathBuf,
+    },
+    /// Show the shared-library capabilities that publication generates
+    Generated {
+        #[arg(long)]
+        proto: PathBuf,
+        manifest: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecipeCommand {
+    /// Rewrite toolchain catalog pins in recipes, keeping their formatting
+    Repin {
+        /// New catalog digest for a toolchain publisher
+        #[arg(
+            long = "toolchain-catalog",
+            required = true,
+            value_name = "PUBLISHER=SHA256"
+        )]
+        catalogs: Vec<String>,
+        /// Print the changes without writing them
+        #[arg(long)]
+        dry_run: bool,
+        /// Recipe files or directories to search for recipes
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
     },
 }
 
@@ -2253,7 +2305,6 @@ fn run(command: Command) -> Result<ExitCode> {
                 proto,
                 config,
                 catalogs,
-                library_dirs,
                 path_dirs,
                 check,
                 manifest,
@@ -2263,20 +2314,90 @@ fn run(command: Command) -> Result<ExitCode> {
                 } else {
                     suggest_dependencies
                 };
-                let (suggestions, diagnostics) = inspect(
-                    &proto,
-                    &manifest,
-                    &config,
-                    &catalogs,
-                    &library_dirs,
-                    &path_dirs,
-                )?;
+                let (suggestions, diagnostics) =
+                    inspect(&proto, &manifest, &config, &catalogs, &path_dirs)?;
                 std::io::stdout().lock().write_all(suggestions.as_bytes())?;
                 if !diagnostics.is_empty() {
                     for diagnostic in diagnostics {
                         eprintln!("cps: {diagnostic}");
                     }
                     return Ok(ExitCode::FAILURE);
+                }
+            }
+            ManifestCommand::Generated { proto, manifest } => {
+                let text = cps::generated_dependencies(&proto, &manifest)?;
+                std::io::stdout().lock().write_all(text.as_bytes())?;
+            }
+        },
+        Command::BuildOrder { explain, paths } => {
+            let order = cps::orchestrate::build_order(&paths)?;
+            for warning in &order.warnings {
+                eprintln!("cps: {warning}");
+            }
+            for queued in order.recipes {
+                println!("{}", queued.recipe.display());
+                if explain {
+                    for (recipe, reason) in queued.after {
+                        println!("    after {}: {reason}", recipe.display());
+                    }
+                }
+            }
+        }
+        Command::RebuildPlan {
+            config,
+            catalogs,
+            changed,
+            recipes,
+        } => {
+            let plan = cps::orchestrate::rebuild_plan(&config, &catalogs, &changed, &recipes)?;
+            for warning in &plan.warnings {
+                eprintln!("cps: {warning}");
+            }
+            for change in plan.changed {
+                match change.previous {
+                    Some(previous) => println!("changed {} from {previous}", change.id),
+                    None => println!("changed {}", change.id),
+                }
+                for name in change.removed {
+                    println!("    removes {name}");
+                }
+                for name in change.added {
+                    println!("    adds {name}");
+                }
+            }
+            for rebuild in plan.rebuilds {
+                let kind = if rebuild.breaks { "breaks" } else { "rebuild" };
+                println!("{kind} {}", rebuild.id);
+                for reason in rebuild.reasons {
+                    println!("    {reason}");
+                }
+                if let Some(recipe) = rebuild.recipe {
+                    println!("    recipe {}", recipe.display());
+                }
+            }
+            for recipe in plan.recipes {
+                println!("recipe {}", recipe.display());
+            }
+        }
+        Command::Recipe { command } => match command {
+            RecipeCommand::Repin {
+                catalogs,
+                dry_run,
+                paths,
+            } => {
+                for repin in cps::orchestrate::repin_recipes(&paths, &catalogs, dry_run)? {
+                    let verb = if dry_run { "would repin" } else { "repinned" };
+                    print!(
+                        "{verb} {} {} {} -> {}",
+                        repin.recipe.display(),
+                        repin.publisher,
+                        repin.from,
+                        repin.to
+                    );
+                    match repin.recipe_sha256 {
+                        Some(hash) => println!(" (recipe sha256 {hash})"),
+                        None => println!(),
+                    }
                 }
             }
         },

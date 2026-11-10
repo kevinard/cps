@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
+    generate::elf::{LIBRARY_DIRS, Payloads, unconditional},
     image::root::Root,
     kdl_format::{
         ImageDefinition, parse_manifest, publish_policy::validate_elf_dirs, read_image_definition,
@@ -29,23 +30,19 @@ use crate::{
 type Package<'a> = (&'a str, &'a Version, &'a str);
 
 /// Generate reviewable KDL require lines and diagnostics using only local inputs.
+///
+/// Publication generates shared-library capabilities itself. This review
+/// shows them with their providers in the pinned catalogs and suggests
+/// path-based `require` lines for what it cannot generate: ELF interpreters,
+/// shebang interpreters, path-named libraries, and facet or variant content.
 pub fn suggest_dependencies(
     proto: &Path,
     manifest: &Path,
     config: &Path,
     pins: &[String],
-    library_dirs: &[String],
     path_dirs: &[String],
 ) -> Result<(String, Vec<String>)> {
-    inspect_dependencies(
-        proto,
-        manifest,
-        config,
-        pins,
-        library_dirs,
-        path_dirs,
-        false,
-    )
+    inspect_dependencies(proto, manifest, config, pins, path_dirs, false)
 }
 
 /// Check that every detected external provider has a direct manifest requirement.
@@ -54,10 +51,34 @@ pub fn check_manifest_dependencies(
     manifest: &Path,
     config: &Path,
     pins: &[String],
-    library_dirs: &[String],
     path_dirs: &[String],
 ) -> Result<(String, Vec<String>)> {
-    inspect_dependencies(proto, manifest, config, pins, library_dirs, path_dirs, true)
+    inspect_dependencies(proto, manifest, config, pins, path_dirs, true)
+}
+
+/// Print the declarations that publication would generate from a prototype.
+pub fn generated_dependencies(proto: &Path, manifest: &Path) -> Result<String> {
+    let manifest = read_manifest(manifest)?;
+    let root = Root::open(proto)?;
+    Ok(
+        Payloads::scan(&manifest, |path| prototype_elf(&root, path))?
+            .declarations()?
+            .text(),
+    )
+}
+
+fn read_manifest(path: &Path) -> Result<Manifest> {
+    let bytes = read_limited(File::open(path)?, MANIFEST_LIMIT)?;
+    let manifest = parse_manifest(std::str::from_utf8(&bytes)?)?;
+    manifest.validate(false)?;
+    Ok(manifest)
+}
+
+fn prototype_elf(root: &Root, path: &str) -> Result<Option<elf::Elf>> {
+    let mut file = root.file(path)?;
+    let mut prefix = Vec::new();
+    file.by_ref().take(5).read_to_end(&mut prefix)?;
+    elf::inspect_header(&mut file, &prefix)
 }
 
 fn inspect_dependencies(
@@ -65,17 +86,13 @@ fn inspect_dependencies(
     manifest: &Path,
     config: &Path,
     pins: &[String],
-    library_dirs: &[String],
     path_dirs: &[String],
     check: bool,
 ) -> Result<(String, Vec<String>)> {
     let config = read_image_definition(config)?;
     let machine = machine(&config.arch)?;
-    validate_elf_dirs(&config.arch, library_dirs)?;
     validate_elf_dirs(&config.arch, path_dirs).context("invalid interpreter search directories")?;
-    let bytes = read_limited(File::open(manifest)?, MANIFEST_LIMIT)?;
-    let manifest = parse_manifest(std::str::from_utf8(&bytes)?)?;
-    manifest.validate(false)?;
+    let manifest = read_manifest(manifest)?;
     manifest.check_architecture(&config.arch)?;
     let root = Root::open(proto)?;
     let providers = load_providers(&config, pins, &manifest.name)?;
@@ -88,8 +105,11 @@ fn inspect_dependencies(
     let mut report = Report {
         paths,
         suggestions: BTreeMap::new(),
+        generated: String::new(),
         diagnostics: Vec::new(),
     };
+    let payloads = Payloads::scan(&manifest, |path| prototype_elf(&root, path))?;
+    report.generated(&payloads, &providers, check)?;
     let selection = config.policy.selection(&config.arch);
     for action in &manifest.action {
         if !selection.applies(&manifest.name, action) {
@@ -121,7 +141,8 @@ fn inspect_dependencies(
         };
         match scan() {
             Ok((Some(info), _)) => {
-                if let Err(error) = report.elf(path, &info, machine, library_dirs) {
+                let generated = unconditional(&manifest, action);
+                if let Err(error) = report.elf(path, &info, machine, generated) {
                     report.diagnostics.push(format!("{path:?}: {error:#}"));
                 }
             }
@@ -303,10 +324,66 @@ fn package_id((name, version, publisher): Package<'_>) -> String {
 struct Report<'a> {
     paths: Paths<'a>,
     suggestions: BTreeMap<Package<'a>, BTreeSet<String>>,
+    generated: String,
     diagnostics: Vec<String>,
 }
 
 impl Report<'_> {
+    /// Show the generated declarations and find a catalog provider for each
+    /// generated requirement.
+    fn generated(
+        &mut self,
+        payloads: &Payloads<'_>,
+        providers: &[Published],
+        check: bool,
+    ) -> Result<()> {
+        use std::fmt::Write;
+
+        let declarations = payloads.declarations()?;
+        if !check && (!declarations.provides.is_empty() || !declarations.requires.is_empty()) {
+            self.generated
+                .push_str("// Publication generates these declarations from the ELF payloads:\n");
+            for name in &declarations.provides {
+                writeln!(self.generated, "// provides {name:?}").unwrap();
+            }
+        }
+        for (name, paths) in &declarations.requires {
+            let found: Vec<_> = providers
+                .iter()
+                .filter(|provider| provider.manifest.provides.contains_key(name))
+                .map(|provider| provider.manifest.id())
+                .collect();
+            let paths: Vec<_> = paths.iter().collect();
+            if found.is_empty() {
+                let soname = name.split('/').nth(3).unwrap_or_default();
+                let suffix = format!("/{soname}");
+                let mut diagnostic =
+                    format!("{paths:?} need {name}: no provider in pinned catalogs");
+                for (path, offers) in &self.paths.0 {
+                    if path.ends_with(&suffix)
+                        && let Some(package) = offers.iter().find_map(|offer| offer.package)
+                    {
+                        write!(
+                            diagnostic,
+                            "; {} ships /{path} outside the library directories, which keeps it private",
+                            package_id(package)
+                        )
+                        .unwrap();
+                    }
+                }
+                self.diagnostics.push(diagnostic);
+            } else if !check {
+                writeln!(
+                    self.generated,
+                    "// require-capability {name:?} from {} for {paths:?}",
+                    found.join(", ")
+                )
+                .unwrap();
+            }
+        }
+        Ok(())
+    }
+
     fn check_requirements(&mut self, manifest: &Manifest) -> Result<()> {
         let declared = manifest
             .dependency
@@ -371,13 +448,10 @@ impl Report<'_> {
         ));
     }
 
-    fn elf(
-        &mut self,
-        path: &str,
-        info: &elf::Elf,
-        machine: u16,
-        library_dirs: &[String],
-    ) -> Result<()> {
+    /// Suggest path-based requirements for what publication cannot
+    /// generate. The libraries of a `generated` object become capabilities,
+    /// except names spelled as paths.
+    fn elf(&mut self, path: &str, info: &elf::Elf, machine: u16, generated: bool) -> Result<()> {
         ensure!(
             native(info, machine),
             "ELF does not match the configured architecture"
@@ -392,8 +466,17 @@ impl Report<'_> {
         }
         let (dir, _) = path.rsplit_once('/').unwrap_or(("", path));
         let origin = format!("/{dir}");
-        let search = library_search(info, &origin, library_dirs)?;
-        for name in &info.needed {
+        let needed: Vec<_> = info
+            .needed
+            .iter()
+            .filter(|name| !generated || name.contains(['/', '$']))
+            .collect();
+        if needed.is_empty() {
+            return Ok(());
+        }
+        let library_dirs = LIBRARY_DIRS.map(str::to_owned);
+        let search = library_search(info, &origin, &library_dirs)?;
+        for name in needed {
             ensure!(!name.is_empty(), "empty ELF dependency");
             let candidates = if name.contains(['/', '$']) {
                 vec![expand_absolute(name, &origin)?]
@@ -464,7 +547,7 @@ impl Report<'_> {
     fn finish(self) -> (String, Vec<String>) {
         use std::fmt::Write;
 
-        let mut text = String::new();
+        let mut text = self.generated;
         for (package @ (name, version, _), reasons) in self.suggestions {
             writeln!(text, "// {}", package_id(package)).unwrap();
             for reason in reasons {

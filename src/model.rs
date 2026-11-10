@@ -85,11 +85,35 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Capabilities that publication derives from ELF payloads. Authored
+/// manifests cannot declare them.
+pub(crate) const ELF_CAPABILITY_PREFIX: &str = "cap/elf/";
+
 fn validate_capability(name: &str) -> Result<()> {
+    if let Some(suffix) = name.strip_prefix(ELF_CAPABILITY_PREFIX) {
+        // cap/elf/ABI/SONAME or cap/elf/ABI/SONAME/VERSION, where sonames and
+        // GNU version names keep their case and characters such as `+`.
+        let parts: Vec<_> = suffix.split('/').collect();
+        ensure!(
+            matches!(parts.len(), 2 | 3)
+                && name_component(parts[0])
+                && parts[1..].iter().all(|part| elf_name_component(part)),
+            "invalid ELF capability name {name:?}"
+        );
+        return Ok(());
+    }
     let suffix = name
         .strip_prefix("cap/")
         .context("capability names must begin with cap/")?;
     validate_name(suffix).with_context(|| format!("invalid capability name {name:?}"))
+}
+
+pub(crate) fn elf_name_component(part: &str) -> bool {
+    (1..=255).contains(&part.len())
+        && !matches!(part, "." | "..")
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
 }
 
 pub fn validate_publisher(publisher: &str) -> Result<()> {
@@ -734,6 +758,25 @@ impl Manifest {
         }
         for dependency in &self.dependency {
             dependency.validate()?;
+        }
+        if !published {
+            let generated = self
+                .provides
+                .keys()
+                .chain(
+                    self.dependency
+                        .iter()
+                        .filter_map(|dependency| match dependency {
+                            Dependency::RequireCapability(target) => Some(&target.package),
+                            _ => None,
+                        }),
+                )
+                .find(|name| name.starts_with(ELF_CAPABILITY_PREFIX));
+            if let Some(name) = generated {
+                bail!(
+                    "{name} is reserved for declarations that publication generates from ELF payloads"
+                );
+            }
         }
         for optional in &self.optional_dependencies {
             optional

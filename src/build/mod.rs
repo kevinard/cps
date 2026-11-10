@@ -246,6 +246,7 @@ pub fn build_with_recipe_options(
             &recipe_bytes,
             resolved_toolchain,
             &artifacts,
+            &Root::open(&proto)?,
         )?;
         let path = stage.path().join("attestation.json");
         fs::write(&path, bytes)?;
