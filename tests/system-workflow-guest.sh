@@ -5,6 +5,15 @@ bb=/bin/busybox
 export PATH=/usr/bin:/bin
 trap 'echo "CPS_VM_SYSTEM: failed"; $bb poweroff -f' EXIT
 
+# Boot environments without the backups that each live change adds.
+environments() {
+    cps boot-env list --esp /efi | $bb grep -vF 'Canopa backup'
+}
+
+newest_backup() {
+    cps boot-env list --esp /efi | $bb awk -F '\t' '$5 ~ /^Canopa backup/ { print $3; exit }'
+}
+
 verify_service() {
     attempts=0
     until [ -f /run/cps-demo-version ] && [ "$($bb cat /run/cps-demo-version)" = "$1" ]; do
@@ -25,6 +34,11 @@ if [ "$version" = 2.0.0-0 ]; then
     cps verify --root /
     systemctl is-active --quiet cps-boot-health.service
     systemctl is-active --quiet systemd-bless-boot.service
+    # The shutdown merge carried edits made after staging into the trial.
+    test "$($bb cat /etc/cps-vm-after-staging)" = 'edited after staging'
+    $bb grep -Fx 'alice:x:1000:1000::/home/alice:/bin/sh' /etc/passwd
+    test ! -e /run/cps/finalize-trial
+    echo 'CPS_VM_SYSTEM: /etc edits made after staging reached the trial'
     progress=$(cps status --plan /volume/@captures/upgrade.json)
     printf '%s\n' "$progress" | $bb grep -F '"phase": "booted_known_good"'
     printf '%s\n' "$progress" | $bb grep -F "$($bb cat /volume/@captures/upgrade-plan-id)"
@@ -61,6 +75,37 @@ if [ -f /etc/cps-btrfs-base-kernel ]; then
     test "$($bb uname -r)" = "$($bb cat /etc/cps-btrfs-base-kernel)"
     echo "CPS_VM_BTRFS_KERNEL: previous $($bb uname -r)"
 fi
+if [ -f /volume/@captures/cli-upgrade ] && [ -f /volume/@captures/backup-rollback ] &&
+    [ ! -f /volume/@captures/backup-booted ]; then
+    # Running the backup taken before the live removal.
+    test "$($bb cat /run/cps-vm-id)" = "$($bb cat /volume/@captures/backup-rollback)"
+    test "$(cps-demo)" = 2.0.0-0
+    btrfs property get / ro | $bb grep -Fx 'ro=false'
+    cps verify --root /
+    cps status | $bb grep -Fx 'No reboot pending.'
+    echo 'CPS_VM_SYSTEM: booted the backup taken before a live removal'
+    : > /volume/@captures/backup-booted
+    cps boot-env rollback --esp /efi --btrfs-volume /volume "$($bb cat /volume/@captures/main-id)"
+    $bb sync
+    exec $bb reboot -f
+fi
+if [ -f /volume/@captures/backup-booted ]; then
+    test "$($bb cat /run/cps-vm-id)" = "$($bb cat /volume/@captures/main-id)"
+    test ! -e /usr/bin/cps-demo
+    test -e /usr/bin/cps-demo-service
+    $bb mv /repository/current /repository/offline-current
+    printf '%s\n' 'mirror "test" root="missing-tuf-root.json" metadata="file:///missing/metadata/" targets="file:///missing/targets/"' >> /etc/cps/image.kdl
+    before=$(environments)
+    printf '%s\n' 'stage-package "test/cps-demo-service"' >> /etc/cps/image.kdl
+    cps autoremove --dry-run | $bb grep -Fx 'A reboot will be required because test/cps-demo-service is configured for staged changes.'
+    test "$(environments)" = "$before"
+    cps autoremove --yes
+    test -e /usr/bin/cps-demo-service
+    cps status | $bb grep -F 'Reboot pending into '
+    : > /volume/@captures/cli-autoremove
+    $bb sync
+    exec $bb reboot -f
+fi
 if [ -f /volume/@captures/cli-upgrade ]; then
     test "$(cps-demo)" = 2.0.0-0
     cps verify --root /
@@ -69,9 +114,10 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     echo 'CPS_VM_SYSTEM: rolled back to the base with the live package'
 
     # Removals must use installed state even when a configured mirror is unavailable.
+    $bb cp /etc/cps/image.kdl /run/cps-image.kdl
     $bb mv /repository/current /repository/offline-current
     printf '%s\n' 'mirror "test" root="missing-tuf-root.json" metadata="file:///missing/metadata/" targets="file:///missing/targets/"' >> /etc/cps/image.kdl
-    before=$(cps boot-env list --esp /efi)
+    before=$(environments)
     test "$(cps autoremove --dry-run)" = 'Nothing to do.'
     if cps remove --dry-run test/cps-demo-service > /run/rejected 2>&1; then exit 1; fi
     $bb grep -F 'removal would break installed dependencies' /run/rejected
@@ -84,15 +130,26 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     cps remove --yes test/cps-demo
     test ! -e /usr/bin/cps-demo
     test -e /usr/bin/cps-demo-service
-    test "$(cps boot-env list --esp /efi)" = "$before"
+    test "$(environments)" = "$before"
 
-    printf '%s\n' 'stage-package "test/cps-demo-service"' >> /etc/cps/image.kdl
-    cps autoremove --dry-run | $bb grep -Fx 'A reboot will be required because test/cps-demo-service is configured for staged changes.'
-    test "$(cps boot-env list --esp /efi)" = "$before"
-    cps autoremove --yes
-    test -e /usr/bin/cps-demo-service
-    cps status | $bb grep -F 'Reboot pending into '
-    : > /volume/@captures/cli-autoremove
+    # The live removal left a backup with the package. Boot it, then return.
+    backup=$(newest_backup)
+    test -n "$backup"
+    found=false
+    for directory in /volume/@captures/backup-*/root; do
+        btrfs property get "$directory" ro | $bb grep -Fx 'ro=true'
+        found=true
+    done
+    test "$found" = true
+    cps boot-env list --esp /efi | $bb grep -F "$backup" | $bb grep -F 'known-good'
+    if cps boot-env list --esp /efi | $bb grep -F "$backup" | $bb grep -q '^\*'; then exit 1; fi
+    $bb cat /run/cps-vm-id > /volume/@captures/main-id
+    printf '%s\n' "$backup" > /volume/@captures/backup-rollback
+    # Undo the configuration edits on this root; the autoremove phase repeats them.
+    $bb cp /run/cps-image.kdl /etc/cps/image.kdl
+    $bb mv /repository/offline-current /repository/current
+    cps boot-env rollback --esp /efi --btrfs-volume /volume "$backup"
+    echo 'CPS_VM_SYSTEM: removed a package live after saving a backup environment'
     $bb sync
     exec $bb reboot -f
 fi
@@ -100,15 +157,20 @@ fi
 if [ ! -f /volume/@captures/live-upgrade.json ]; then
     $bb cp /repository/catalog-1.0.0-0 /repository/current
     cps search cps-demo | $bb grep -F 'test/cps-demo@'
-    before=$(cps boot-env list --esp /efi)
+    before=$(environments)
     cps install --dry-run test/cps-demo
     cps install --stage --dry-run test/cps-demo | $bb grep -Fx 'A reboot will be required because --stage was requested.'
-    test "$(cps boot-env list --esp /efi)" = "$before"
+    test "$(environments)" = "$before"
     test ! -e /usr/bin/cps-demo
     cps install --yes --save-plan /run/cps-install.json test/cps-demo
     cps status --plan /run/cps-install.json | $bb grep -F '"phase": "applied"'
     test "$(cps-demo)" = 1.0.0-0
-    test "$(cps boot-env list --esp /efi)" = "$before"
+    test "$(environments)" = "$before"
+    # The live install saved the previous root without selecting it.
+    test -n "$(newest_backup)"
+    $bb grep -Fx "default $($bb cat /volume/@captures/base-id).conf" /efi/loader/loader.conf
+    test ! -e /run/cps/finalize-trial
+    echo 'CPS_VM_SYSTEM: a live install saved a backup environment'
     systemctl start cps-demo.service
     verify_service 1.0.0-0
     printf 'damaged\n' > /usr/bin/cps-demo
@@ -125,7 +187,7 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     $bb rmdir "${recovery%/root}"
     cps repair --yes --path /usr/bin/cps-demo
     test "$(cps-demo)" = 1.0.0-0
-    test "$(cps boot-env list --esp /efi)" = "$before"
+    test "$(environments)" = "$before"
     echo 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image'
     report=$(cps check-updates --no-refresh --json)
     printf '%s\n' "$report" | $bb grep -F '"status": "up_to_date"'
@@ -144,7 +206,7 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     printf '%s\n' "$report" | $bb grep -F '"name": "test/cps-demo"'
     printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
     cps upgrade --stage --dry-run | $bb grep -Fx 'A reboot will be required because --stage was requested.'
-    test "$(cps boot-env list --esp /efi)" = "$before"
+    test "$(environments)" = "$before"
     test "$(cps-demo)" = 1.0.0-0
     cps upgrade --dry-run --save-plan /volume/@captures/live-upgrade.json
     $bb sync
@@ -155,18 +217,18 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     if systemctl is-active --quiet cps-demo.service; then exit 1; fi
     exec $bb reboot -nf
 fi
-before=$(cps boot-env list --esp /efi)
+before=$(environments)
 cps resume
 cps status --plan /volume/@captures/live-upgrade.json | $bb grep -F '"phase": "applied"'
 echo 'CPS_VM_SYSTEM: resumed a failed live restart after reboot'
 test "$(cps-demo)" = 2.0.0-0
 verify_service 2.0.0-0
-test "$(cps boot-env list --esp /efi)" = "$before"
+test "$(environments)" = "$before"
 
 $bb cp /repository/catalog-base-upgrade /repository/current
 report=$(cps check-updates --json)
 printf '%s\n' "$report" | $bb grep -F '"reboot_required": true'
-test "$(cps boot-env list --esp /efi)" = "$before"
+test "$(environments)" = "$before"
 if [ -f /etc/cps-btrfs-trial-kernel ]; then
     cps upgrade --dry-run | $bb grep -F 'changes the boot kernel or initramfs'
 else
@@ -191,5 +253,15 @@ if cps install --yes test/cps-demo > /run/rejected 2>&1; then exit 1; fi
 $bb grep -F 'a trial is pending' /run/rejected
 : > /volume/@captures/cli-upgrade
 echo 'CPS_VM_SYSTEM: installed and upgraded in place, then staged the base upgrade'
+# Edits made after staging reach the trial through the merge at shutdown.
+test -e /run/cps/finalize-trial
+attempts=0
+until systemctl is-active --quiet cps-finalize-trial.service; do
+    attempts=$((attempts + 1))
+    test "$attempts" -lt 100
+    $bb sleep 0.1
+done
+printf 'edited after staging\n' > /etc/cps-vm-after-staging
+printf 'alice:x:1000:1000::/home/alice:/bin/sh\n' >> /etc/passwd
 $bb sync
-exec $bb reboot -f
+exec systemctl reboot

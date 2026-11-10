@@ -180,6 +180,20 @@ if [[ $native_boot == 1 ]]; then
         cp catalog-{1.0.0-0,2.0.0-0} "$root/repository/"
         cp repo/current "$root/repository/catalog-base-upgrade"
         install -m755 "$project/tests/system-workflow-guest.sh" "$root/usr/local/libexec/cps-system-workflow"
+        # The shutdown merge needs a real systemd shutdown and the CPS units.
+        systemd=${CPS_VM_SYSTEMD_DIR:-/usr/lib/systemd}
+        cp -L "$systemd/systemd-shutdown" "$root/usr/lib/systemd/"
+        copy_runtime_deps "$root" "$systemd/systemd-shutdown"
+        for unit in final.target reboot.target umount.target systemd-reboot.service; do
+            cp -L "$systemd/system/$unit" "$root/usr/lib/systemd/system/"
+        done
+        cp "$project/packaging/systemd/"cps-finalize-trial.{path,service} "$root/usr/lib/systemd/system/"
+        mkdir -p "$root/usr/lib/systemd/system/multi-user.target.wants" \
+            "$root/etc/systemd/system/cps-finalize-trial.service.d"
+        ln -s ../cps-finalize-trial.path "$root/usr/lib/systemd/system/multi-user.target.wants/"
+        # The guest mounts the ESP and the volume before systemd starts.
+        printf '[Unit]\nRequiresMountsFor=/efi /volume\n' > \
+            "$root/etc/systemd/system/cps-finalize-trial.service.d/mounts.conf"
         cat > "$root/etc/cps/image.kdl" <<CONFIG
 schema-version 1 kind="image-config"
 publisher "test" {
@@ -755,11 +769,16 @@ if [[ $native_boot == 1 ]]; then
         grep -Fx 'CPS_VM_GIT: tracked package advanced and pinned package stayed at its commit' uefi.log.clean
         grep -Fx 'CPS_VM_GIT: rollback restored the tracked commit and payload' uefi.log.clean
     elif [[ $system_commands == 1 ]]; then
+        grep -Fx 'CPS_VM_SYSTEM: a live install saved a backup environment' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: resumed a failed live restart after reboot' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: installed and upgraded in place, then staged the base upgrade' uefi.log.clean
+        grep -E '^Merged /etc into cps-[0-9a-f-]+: [1-9][0-9]* applied' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: /etc edits made after staging reached the trial' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: staged upgrade booted with the live package' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: rolled back to the base with the live package' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: removed a package live after saving a backup environment' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: booted the backup taken before a live removal' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: staged autoremove booted with the dependency removed' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: forced install staged without changing the running root' uefi.log.clean
     else
