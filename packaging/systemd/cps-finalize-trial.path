@@ -1,0 +1,9 @@
+[Unit]
+Description=Request the /etc merge into the staged CPS trial at shutdown
+
+[Path]
+# CPS creates this flag after it selects a trial for the next boot.
+PathExists=/run/cps/finalize-trial
+
+[Install]
+WantedBy=multi-user.target
