@@ -12,12 +12,12 @@ use tempfile::TempDir;
 
 use crate::{
     image::root::Root,
-    kdl_format::{build, manifest_text},
+    kdl_format::build,
     model::{FileDigest, Version, digest, digest_reader},
     repo::{MANIFEST_LIMIT, assign_git_version, lock_snapshot_series, read_key},
 };
 
-use super::{parent, read_recipe_manifest};
+use super::{parent, read_templates};
 
 pub(crate) const ARCHIVE: &str = "git.tar";
 
@@ -83,7 +83,14 @@ pub fn prepare_git_snapshot_ref(
     }
     let key = read_key(trust_key)?;
     let (template, recipe) = build::read(recipe_path)?;
-    let (_, mut manifest) = read_recipe_manifest(recipe_path, &recipe)?;
+    ensure!(
+        recipe.version.is_none(),
+        "Git snapshots assign the package version; remove the recipe's version node"
+    );
+    let mut inputs = read_templates(&Root::open(parent(recipe_path))?, &recipe)?;
+    ensure!(inputs.len() == 1, "Git snapshots build exactly one package");
+    let input = inputs.remove(0);
+    let mut manifest = input.template.manifest;
     let stage = TempDir::new_in(&destination)?;
     let sources = stage.path().join("sources");
     fs::create_dir(&sources)?;
@@ -101,7 +108,8 @@ pub fn prepare_git_snapshot_ref(
         digest(format!("{upstream}\n{}\n{}", archive.sha256, digest(&template)).as_bytes())
     };
     manifest.version = assign_git_version(repo, &key, &manifest, tag_version, &fingerprint)?;
-    let manifest_text = manifest_text(&manifest);
+    let manifest_text =
+        build::set_template_version(&input.bytes, &manifest.version, &upstream, &recipe)?;
     ensure!(
         manifest_text.len() as u64 <= MANIFEST_LIMIT,
         "snapshot manifest exceeds the size limit"

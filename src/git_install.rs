@@ -465,10 +465,13 @@ impl GitBuild {
         fs::write(path.join("manifest.kdl"), manifest)?;
         fs::write(path.join("build.kdl"), recipe)?;
         build_package(path, toolchain)?;
+        // The expanded manifest also lists the split debug information.
         publish(
             &store.repo(),
             &path.join("worker/bundle/proto"),
-            &path.join("manifest.kdl"),
+            &path
+                .join("worker/bundle")
+                .join(crate::build::expanded_manifest_path(&self.manifest.name)),
             &store.private_key(),
         )
     }

@@ -38,7 +38,8 @@ for utility in coreutils grep; do
     "$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der \
         --source-cache sources --output "$utility.bundle" --check-reproducible \
         --builder-signing-key "$work/builder.der" "$utility.build.kdl"
-    version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$utility.kdl")
+    version=$(sed -n -e 's/^package .* version="\([^"]*\)".*/\1/p' \
+        -e 's/^    version "\([^"]*\)".*/\1/p' "$utility.kdl" "$utility.build.kdl")
     reviewed=$(sha "$utility.build.kdl")
     sed -i "/^}$/i\\    approve \"system/$utility\" version=\"$version\" sha256=\"$reviewed\"" repo/publish-policy.kdl
     "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \

@@ -11,7 +11,7 @@ build architecture="x86_64" epoch=1744301157 {
     cd grep-3.12
     CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=3" LDFLAGS="-Wl,-z,relro,-z,now" \\
         ./configure --prefix=/usr --disable-nls --disable-perl-regexp
-    make -j4 all
+    make all
     install -Dm755 src/grep "$DESTDIR/usr/bin/grep"
     install -Dm644 COPYING "$DESTDIR/usr/share/licenses/grep/COPYING"
     """

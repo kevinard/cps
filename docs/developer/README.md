@@ -78,7 +78,7 @@ prerequisites depend on the workflow.
 | --- | --- |
 | Package identity, dependency inference, or freezes | [`package-identity.sh`](../../tests/package-identity.sh), [`manifest-dependencies.sh`](../../tests/manifest-dependencies.sh), [`package-freezes.sh`](../../tests/package-freezes.sh) |
 | Apply preflight, progress, or offline systemd | [`elf-transactions.sh`](../../tests/elf-transactions.sh), [`transaction-progress.sh`](../../tests/transaction-progress.sh), [`systemd-actions.sh`](../../tests/systemd-actions.sh) |
-| Isolated builds or source pinning | [`build.sh`](../../tests/build.sh), [`sources.sh`](../../tests/sources.sh), [`systemd-build-worker.sh`](../../tests/systemd-build-worker.sh) |
+| Isolated builds or source pinning | [`build.sh`](../../tests/build.sh), [`build-outputs.sh`](../../tests/build-outputs.sh), [`sources.sh`](../../tests/sources.sh), [`systemd-build-worker.sh`](../../tests/systemd-build-worker.sh) |
 | Release gates or mirror sync | [`release-ci.sh`](../../tests/release-ci.sh), [`sharded-mirror.sh`](../../tests/sharded-mirror.sh), [`deploy-mirror.sh`](../../tests/deploy-mirror.sh) |
 | Boot deployment, fallback, or blessing | [VM and disk tests](boot-tests.md) |
 

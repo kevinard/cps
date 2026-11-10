@@ -5,9 +5,10 @@
 ## Rebuilding a published package
 
 Set `archive-build-inputs=#true` on the publishing policy's `publisher` node
-to make reviewed recipes and their input manifests available to rebuilders.
-CPS requires version 1 build provenance and signs the digests of both exact
-documents into the catalog. Once the archive is in use, later releases keep
+to make reviewed recipes and their pinned manifest templates available to
+rebuilders. CPS requires version 1 build provenance and signs the digests of
+the exact documents into the catalog. Every package of a recipe that builds
+several packages records the same recipe and templates. Once the archive is in use, later releases keep
 existing records and include inputs for new packages. For a previously
 published version, republish the original bundle with its original
 attestation to add its inputs.
@@ -78,8 +79,9 @@ offline. The same `--catalog` pin selects a historical archived release.
 
 `repo rebuild-inputs` verifies the signed catalog, archived bytes, and
 their binding to the admitted attestation before writing a new directory.
-The command prints the recipe path, preserves the manifest's relative path,
-and writes the original attestation alongside the recipe directory. Use
+The command prints the recipe path, preserves each template's relative path,
+and writes the original attestation alongside the recipe directory. Any
+package of a multi-package build selects the same inputs. Use
 `--catalog SHA256` to select a cached historical catalog.
 
 Both full and index-only mirror sync carry the archived inputs, including
@@ -132,10 +134,15 @@ with an explicit `--catalog` pin. The archive includes required source
 targets, and `--include-sources` adds optional sources recorded by the
 archived catalog.
 
-`repo verify-rebuild` compares the exact recipe and reviewed manifest in
-the bundle, the reconstructed published manifest, and every payload's
-length and digest against the signed release. It rejects undeclared
-entries in the payload tree. It works offline with the catalog and its
+`repo verify-rebuild` compares the exact recipe and templates in the
+bundle, each package's expanded manifest and reconstructed published
+manifest, and every payload's length and digest against the signed release.
+It rejects undeclared entries in the payload tree. The admitted attestation
+covers every package that the recipe builds, so verifying any one of them
+checks all of them: the rebuild must reproduce every package, and each
+package's catalog entry must name the same attestation, which proves the
+packages came from one build. `repo archive-sources` attaches the shared
+sources to every package of the build. It works offline with the catalog and its
 version 1 attestation, including for packages published before recipe
 archiving. It accepts the same `--catalog` pin as input extraction.
 
@@ -169,7 +176,9 @@ applying a saved plan. With `--toolchain-config`, CPS checks selected inputs
 before materializing the toolchain. The signatures must be from distinct
 configured builders, separate from the publisher's current and retired keys.
 The version 1 attestation covers the exact published manifest and
-payload digests. Cached evidence works offline.
+payload digests. For a recipe that builds several packages, one attestation
+names all of them, and CPS checks the statement entries for the package
+being installed. Cached evidence works offline.
 
 Use `image-create --config` to provision this policy on a new image. CPS
 stores the public keys in the image state.

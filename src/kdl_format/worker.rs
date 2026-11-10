@@ -36,6 +36,7 @@ fn parse(text: &str) -> Result<BuildWorker> {
             "file-bytes",
             "output-bytes",
             "log-bytes",
+            "jobs",
         ],
         true,
     )?;
@@ -91,8 +92,13 @@ fn parse(text: &str) -> Result<BuildWorker> {
             .integer("output-bytes")?
             .unwrap_or(defaults.output_bytes),
         log_bytes: fields.integer("log-bytes")?.unwrap_or(defaults.log_bytes),
+        jobs: fields.integer("jobs")?,
         cgroup,
     };
+    ensure!(
+        worker.jobs.is_none_or(|jobs| (1..=1024).contains(&jobs)),
+        "jobs must be between 1 and 1024"
+    );
     ensure!(
         (1..=7 * 24 * 60 * 60).contains(&worker.timeout_secs),
         "timeout-seconds must be between one second and seven days"

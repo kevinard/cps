@@ -12,6 +12,13 @@
 - [Building GNU tools for boot preparation](#building-gnu-tools-for-boot-preparation)
 - [Testing a source-built BusyBox](#testing-a-source-built-busybox)
 
+The fixture recipes take their parallelism from the worker: plain `make` reads
+`MAKEFLAGS`, and Ninja and Cargo receive `CPS_BUILD_JOBS`. CPS strips the ELF
+outputs with the seeded toolchain's `objcopy` and ships their debug
+information under the `debug.symbols` facet. See
+[parallel jobs](../maintainer/builds.md#parallel-jobs) and
+[stripping](../maintainer/builds.md#stripping-and-debug-information).
+
 ## Building CPS itself
 
 On an x86-64 Arch Linux worker with Rust, the native GCC toolchain, jq, zstd, and
@@ -152,11 +159,14 @@ CPS_UTIL_LINUX_SOURCE_DIR=/path/to/verified-sources \
 tests/build-util-linux.sh target/util-linux-fixture target/usr-base-fixture
 ```
 
-The fixture builds `mount`, `umount`, `blkid`, `sfdisk`, and their libraries twice
-offline. It publishes the matching outputs with signed build evidence, then
-installs the package into the signed merged base and runs the tools with its
-loader. The package also delivers the headers and linker inputs under the
-`devel` facet.
+The fixture configures `mount`, `umount`, `blkid`, `fdisk`, `sfdisk`, and their
+libraries, runs `make install`, and builds twice offline. Its template collects
+the installed tree instead of naming each file, and the recipe discards the
+libtool archives. It publishes the matching outputs with signed build evidence,
+then installs the package into the signed merged base and runs the tools with
+its loader. The package also delivers the headers and linker inputs under the
+`devel` facet, the manual pages under `doc.man`, and split debug information
+under `debug.symbols`.
 
 Set `CPS_SYSTEMD_UTIL_LINUX_FIXTURE=target/util-linux-fixture` when running
 `tests/build-systemd.sh`. The build uses util-linux, libseccomp, and ELF
@@ -188,7 +198,8 @@ tests/build-gnu-tools.sh target/gnu-tools-fixture target/usr-base-fixture
 
 The KDL recipes pin each archive's size and SHA-256 digest. The fixture
 builds the GNU coreutils commands as one binary with command symlinks and
-builds GNU grep separately. Both builds run twice in the isolated CPS
+builds GNU grep separately. The coreutils template collects the installed
+binary, command symlinks, and `libstdbuf.so` with three patterns. Both builds run twice in the isolated CPS
 environment before publication with manifest-bound builder evidence.
 The installation check resolves libraries from the signed merged base and
 exercises `install`, file modes, and the GNU grep `-G` behavior used by

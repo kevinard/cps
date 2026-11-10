@@ -1438,10 +1438,10 @@ build architecture="x86_64" epoch=1700000000 {{
             },
         )]),
     };
+    crate::build::write_explicit_outputs(bundle, &[("manifest.kdl", manifest.as_bytes())])?;
     let evidence = sign(
         &read_signing_key(&worker.private)?,
-        &parse_manifest(&manifest)?,
-        manifest.as_bytes(),
+        &[parse_manifest(&manifest)?],
         &recipe_model,
         recipe.as_bytes(),
         toolchain,

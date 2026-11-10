@@ -2244,7 +2244,7 @@ fn run(command: Command) -> Result<ExitCode> {
             recipe,
         } => {
             let inputs = inputs.prepare()?;
-            let id = build_with_recipe_options(
+            let ids = build_with_recipe_options(
                 &recipe,
                 inputs.toolchain,
                 BuildSettings {
@@ -2257,7 +2257,9 @@ fn run(command: Command) -> Result<ExitCode> {
                 &inputs.worker,
                 &inputs.overrides,
             )?;
-            println!("Built {id} at {}", output.display());
+            for id in ids {
+                println!("Built {id} at {}", output.display());
+            }
         }
         Command::Develop {
             inputs,
@@ -2420,18 +2422,17 @@ fn run(command: Command) -> Result<ExitCode> {
             source_cache,
             bundle,
         } => {
-            println!(
-                "Published {}",
-                publish_witnessed_bundle_with_sources(
-                    &repo,
-                    &bundle,
-                    &signing_key,
-                    &builder_key,
-                    &recipe_sha256,
-                    &witness,
-                    source_cache.as_deref(),
-                )?
-            );
+            for id in publish_witnessed_bundle_with_sources(
+                &repo,
+                &bundle,
+                &signing_key,
+                &builder_key,
+                &recipe_sha256,
+                &witness,
+                source_cache.as_deref(),
+            )? {
+                println!("Published {id}");
+            }
         }
         Command::Repo { command } => match command {
             RepoCommand::WidenRollout {

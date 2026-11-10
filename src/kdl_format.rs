@@ -192,6 +192,17 @@ fn document(text: &str) -> Result<KdlDocument> {
 }
 
 pub fn parse_manifest(text: &str) -> Result<Manifest> {
+    parse_package(text, |_| Ok(false), None).map(|(manifest, _)| manifest)
+}
+
+/// Parse a package manifest document. `extra` may consume package child nodes
+/// that only build templates accept. With a `default_version`, the package may
+/// omit `version`, and the result reports whether it declared one.
+pub(crate) fn parse_package(
+    text: &str,
+    mut extra: impl FnMut(&KdlNode) -> Result<bool>,
+    default_version: Option<&crate::model::Version>,
+) -> Result<(Manifest, bool)> {
     let doc = document(text)?;
     schema_version(&doc, MANIFEST_FORMAT, MANIFEST_KIND)?;
     let package = one(&doc, "package")?;
@@ -209,17 +220,29 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             "architecture",
             "requires-reboot",
             "summary",
+            "license",
+            "homepage",
+            "source-url",
         ],
         true,
     )?;
+    let declared = fields.properties.contains_key("version");
+    let version = match (fields.string("version")?, default_version) {
+        (Some(version), _) => version.parse()?,
+        (None, Some(version)) => version.clone(),
+        (None, None) => bail!("missing version property"),
+    };
     let mut manifest = Manifest {
         format: MANIFEST_FORMAT,
         name: fields.string_arg(0)?,
         publisher: fields.required_string("publisher")?,
-        version: fields.required_string("version")?.parse()?,
+        version,
         upstream_version: fields.string("upstream-version")?,
         architecture: fields.string("architecture")?,
         summary: fields.string("summary")?,
+        license: fields.string("license")?,
+        homepage: fields.string("homepage")?,
+        source_url: fields.string("source-url")?,
         dependency: Vec::new(),
         provides: BTreeMap::new(),
         optional_dependencies: Vec::new(),
@@ -308,10 +331,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
                     initrd,
                 });
             }
-            _ => bail!("unknown package node {name}"),
+            _ => ensure!(extra(node)?, "unknown package node {name}"),
         }
     }
-    Ok(manifest)
+    Ok((manifest, declared))
 }
 
 fn parse_target(node: &KdlNode) -> Result<DependencyTarget> {
@@ -492,6 +515,15 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     }
     if let Some(summary) = &manifest.summary {
         package.insert("summary", summary.as_str());
+    }
+    for (key, value) in [
+        ("license", &manifest.license),
+        ("homepage", &manifest.homepage),
+        ("source-url", &manifest.source_url),
+    ] {
+        if let Some(value) = value {
+            package.insert(key, value.as_str());
+        }
     }
     let children = package.ensure_children().nodes_mut();
     for dependency in &manifest.dependency {
