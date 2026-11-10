@@ -1890,6 +1890,107 @@ fn ordered_writes(
     Ok(ordered)
 }
 
+impl Plan {
+    /// A plan that returns every path this plan journals to its state
+    /// before the plan, for aborting it. Applied to the image in any mix of
+    /// before and after states, it leaves the committed revision `base`.
+    ///
+    /// Each write runs backwards. Local configuration copied by a move or a
+    /// metadata change is copied back from where the plan put it, aliases
+    /// declared as hard links in `base` are linked again to their restored
+    /// targets, and other files come from package payloads. Systemd actions
+    /// are those of the change from `next` back to `base`; kernel
+    /// preparation is not repeated, since `base` already prepared its kernel.
+    pub(crate) fn inverse(&self, base: &State, next: &State) -> Result<Self> {
+        let mut writes = BTreeMap::new();
+        let mut retired = BTreeSet::new();
+        for write in &self.writes {
+            if write.before == write.after && !write.detach {
+                continue;
+            }
+            let before = match &write.after {
+                // A hard link reads as its target's inode.
+                Some(Node::Hardlink { target }) => Some(
+                    next.paths
+                        .get(target)
+                        .with_context(|| format!("missing hard link target {target}"))?
+                        .node
+                        .clone(),
+                ),
+                other => other.clone(),
+            };
+            let after = match base.paths.get(&write.path) {
+                Some(
+                    managed @ Managed {
+                        node: Node::Hardlink { .. },
+                        ..
+                    },
+                ) if write.before.is_some() => Some(managed.node.clone()),
+                _ => write.before.clone(),
+            };
+            if let Some(migration) = &write.config_move
+                && migration.from != write.path
+            {
+                retired.insert(write.path.as_str());
+            }
+            writes.insert(
+                write.path.clone(),
+                Write {
+                    path: write.path.clone(),
+                    before,
+                    after,
+                    detach: false,
+                    local_config: write.local_config,
+                    config_move: None,
+                },
+            );
+        }
+        // A moved configuration's local contents go back to their source.
+        for write in &self.writes {
+            if let Some(migration) = &write.config_move
+                && migration.local.is_some()
+                && migration.from != write.path
+                && let Some(source) = writes.get_mut(&migration.from)
+            {
+                let local = write
+                    .after
+                    .clone()
+                    .context("moved configuration has no destination contents")?;
+                source.config_move = Some(ConfigMove {
+                    from: write.path.clone(),
+                    local: Some(local),
+                });
+            }
+        }
+        for (path, managed) in &base.paths {
+            if let Node::Hardlink { target } = &managed.node {
+                ensure!(
+                    !writes.get(target).is_some_and(Write::replaces_file)
+                        || writes.contains_key(path),
+                    "aborting would leave {path} linked to the replaced {target}"
+                );
+            }
+        }
+        let mut writes: Vec<_> = writes.into_values().collect();
+        WriteOrder::new(
+            (&next.installed, &next.paths),
+            (&base.installed, &base.paths),
+            &retired,
+        )
+        .sort(&mut writes);
+        let mut inverse = self.clone();
+        inverse.writes = writes;
+        inverse.systemd = systemd::plan_actions(next, &base.installed, &base.paths);
+        inverse.kernel_install = None;
+        inverse.transfers.clear();
+        inverse.preserved.clear();
+        for change in &mut inverse.package_changes {
+            std::mem::swap(&mut change.from, &mut change.to);
+        }
+        Ok(inverse)
+    }
+}
+
 impl Write {
     pub(crate) fn boot_sensitive(&self) -> bool {
         let path = Path::new(&self.path);

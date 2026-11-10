@@ -19,7 +19,7 @@ use cps::system::{self, System, UpdateStatus};
 use cps::{
     Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, GitSnapshotRef,
     MarkChoice, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, RootDeployment,
-    SourceLayout, activate_boot_environment, activate_boot_environment_on_disk,
+    SourceLayout, abort_transaction, activate_boot_environment, activate_boot_environment_on_disk,
     activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
     add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
     build_with_recipe_options, capture_boot_environment, create_image,
@@ -477,7 +477,7 @@ enum Command {
         root: PathBuf,
         plan: PathBuf,
     },
-    /// Inspect or resume an interrupted image transaction
+    /// Inspect, resume, or abort an interrupted image transaction
     Transaction {
         #[command(subcommand)]
         command: TransactionCommand,
@@ -1359,6 +1359,17 @@ enum TransactionCommand {
         /// Restore damaged managed paths from verified local payloads before retrying final actions
         #[arg(long)]
         repair: bool,
+    },
+    /// Undo an interrupted transaction and keep the committed revision
+    Abort {
+        /// Abort the transaction of this inactive image instead of the running system
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long, default_value = system::CONFIG, conflicts_with = "root")]
+        config: PathBuf,
+        /// Download missing package payloads from each publisher's mirror first
+        #[arg(long)]
+        fetch: bool,
     },
     /// List completed transactions, most recent first
     History {
@@ -2336,10 +2347,17 @@ fn run(command: Command) -> Result<ExitCode> {
             let status = transaction_status(Path::new("/"))?;
             println!("Running {running}, package revision {}", status.revision);
             if let Some(pending) = status.pending {
-                println!(
-                    "Transaction {} is incomplete. Run cps resume.",
-                    pending.plan_id
-                );
+                if pending.aborting {
+                    println!(
+                        "Transaction {} is being aborted. Run cps transaction abort.",
+                        pending.plan_id
+                    );
+                } else {
+                    println!(
+                        "Transaction {} is incomplete. Run cps resume, or cps transaction abort to undo it.",
+                        pending.plan_id
+                    );
+                }
             }
             if let Some(next) = entries
                 .iter()
@@ -2362,13 +2380,20 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Resume { config, repair } => {
             let system = System::load(&config)?;
             let _lock = system.lock()?;
+            let aborting = transaction_status(Path::new("/"))?
+                .pending
+                .is_some_and(|pending| pending.aborting);
             let revision = if repair {
                 system.resume_with_repair()?
             } else {
                 system.resume()?
             };
             if let Some(revision) = revision {
-                println!("Recovered the live transaction at package revision {revision}.");
+                if aborting {
+                    println!("Aborted the live transaction; package revision {revision} remains.");
+                } else {
+                    println!("Recovered the live transaction at package revision {revision}.");
+                }
             } else {
                 println!("No pending transaction.");
             }
@@ -3613,20 +3638,31 @@ fn run(command: Command) -> Result<ExitCode> {
                         "Pending plan {} targets revision {}",
                         pending.plan_id, pending.target_revision
                     );
-                    println!(
-                        "{}",
-                        if pending.files_ready && pending.live {
-                            "Live actions pending"
-                        } else if pending.files_ready {
-                            "Offline actions pending"
+                    if pending.aborting {
+                        println!("Abort in progress");
+                        if pending.live {
+                            println!("Finish with cps transaction abort");
                         } else {
-                            "File writes pending"
+                            println!("Finish with transaction abort");
                         }
-                    );
-                    if pending.live {
-                        println!("Recover with cps resume");
                     } else {
-                        println!("Recover with transaction resume");
+                        println!(
+                            "{}",
+                            if pending.files_ready && pending.live {
+                                "Live actions pending"
+                            } else if pending.files_ready {
+                                "Offline actions pending"
+                            } else {
+                                "File writes pending"
+                            }
+                        );
+                        if pending.live {
+                            println!("Recover with cps resume, or undo with cps transaction abort");
+                        } else {
+                            println!(
+                                "Recover with transaction resume, or undo with transaction abort"
+                            );
+                        }
                     }
                 } else {
                     println!("Image revision {}", status.revision);
@@ -3634,12 +3670,37 @@ fn run(command: Command) -> Result<ExitCode> {
                 }
             }
             TransactionCommand::Resume { root, repair } => {
+                let aborting = transaction_status(&root)?
+                    .pending
+                    .is_some_and(|pending| pending.aborting);
                 let revision = if repair {
                     repair_pending_transaction(&root)?
                 } else {
                     resume_transaction(&root)?
                 };
                 if let Some(revision) = revision {
+                    if aborting {
+                        println!("Aborted the pending transaction");
+                    }
+                    println!("Image revision {revision}");
+                } else {
+                    println!("No pending transaction");
+                }
+            }
+            TransactionCommand::Abort {
+                root,
+                config,
+                fetch,
+            } => {
+                let revision = if let Some(root) = root {
+                    abort_transaction(&root, fetch)?
+                } else {
+                    let system = System::load(&config)?;
+                    let _lock = system.lock()?;
+                    system.abort(fetch)?
+                };
+                if let Some(revision) = revision {
+                    println!("Aborted the pending transaction");
                     println!("Image revision {revision}");
                 } else {
                     println!("No pending transaction");

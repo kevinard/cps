@@ -48,3 +48,21 @@ if "$cps" transaction progress --root other one.json; then
     echo 'a plan from an unrelated image must fail' >&2
     exit 1
 fi
+
+# An apply that stops after recording its journal can be aborted.
+"$cps" plan --root image --output three.json install test/two
+chmod a-w image
+if "$cps" apply --root image three.json 2>/dev/null; then
+    echo 'apply must fail on a read-only image root' >&2
+    exit 1
+fi
+chmod u+w image
+"$cps" transaction status --root image | grep -qx 'File writes pending'
+progress three.json | jq -e '.phase == "applying"'
+"$cps" transaction abort --root image | grep -qx 'Aborted the pending transaction'
+"$cps" transaction status --root image | grep -qx 'No pending transaction'
+test ! -e image/two
+progress three.json | jq -e '.phase == "planned" and .revision == 1'
+"$cps" transaction abort --root image | grep -qx 'No pending transaction'
+"$cps" apply --root image three.json
+progress three.json | jq -e '.phase == "applied" and .revision == 2'

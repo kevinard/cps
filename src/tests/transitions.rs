@@ -1,9 +1,10 @@
-//! Directory and leaf transitions and the dependency order of writes.
+//! Directory and leaf transitions, aborting pending transactions, and the
+//! dependency order of writes.
 
 use std::os::unix::fs::MetadataExt;
 
 use super::*;
-use crate::{TransactionPhase, resume_transaction, transaction_progress};
+use crate::{TransactionPhase, abort_transaction, resume_transaction, transaction_progress};
 
 fn ids() -> (u32, u32) {
     (geteuid().as_raw(), getegid().as_raw())
@@ -28,14 +29,17 @@ fn position(plan: &Plan, path: &str) -> usize {
         .unwrap_or_else(|| panic!("plan does not write {path}"))
 }
 
-/// Interrupt a worker applying `plan` at a transition step, optionally
-/// without RENAME_EXCHANGE.
-fn interrupt_step(f: &Fixture, plan: &Plan, step: &str, fallback: bool) -> Result<()> {
+/// Interrupt a worker applying `plan`, or aborting with `abort`, at a
+/// transition step, optionally without RENAME_EXCHANGE.
+fn interrupt_step(f: &Fixture, plan: &Plan, step: &str, fallback: bool, abort: bool) -> Result<()> {
     let saved = f._dir.path().join("transition.json");
     fs::write(&saved, serde_json::to_vec(plan)?)?;
     let mut env = vec![("CPS_TEST_INTERRUPT_STEP", step)];
     if fallback {
         env.push(("CPS_TEST_NO_EXCHANGE", "1"));
+    }
+    if abort {
+        env.push(("CPS_TEST_ABORT", "1"));
     }
     interrupt_worker(&f.root, &saved, &env)
 }
@@ -89,7 +93,7 @@ fn assert_merged(root: &Path) -> Result<()> {
 }
 
 #[test]
-fn directory_becomes_a_symlink_and_every_step_resumes() -> Result<()> {
+fn directory_becomes_a_symlink_and_every_step_resumes_or_aborts() -> Result<()> {
     let (f, update) = usrmerge()?;
     let summary = update.summary();
     assert!(
@@ -101,11 +105,7 @@ fn directory_becomes_a_symlink_and_every_step_resumes() -> Result<()> {
     assert!(position(&update, "bin") > position(&update, "usr/bin/tool"));
     assert!(position(&update, "bin") > position(&update, "usr/bin/sub/data"));
 
-    // Interrupt each step, with and without RENAME_EXCHANGE, and resume.
-    // The downgrade turns the symlink back into a directory tree.
-    let downgrade = Request::Install {
-        packages: vec!["base/filesystem@1.0.0-0".into()],
-    };
+    // Interrupt each step, with and without RENAME_EXCHANGE, and abort.
     for (step, fallback) in [
         ("staged", false),
         ("exchanged", false),
@@ -113,9 +113,7 @@ fn directory_becomes_a_symlink_and_every_step_resumes() -> Result<()> {
         ("displaced", true),
         ("published", true),
     ] {
-        let update = plan(&f.root, Request::Update)?;
-        let revision = update.base_revision + 1;
-        interrupt_step(&f, &update, step, fallback)?;
+        interrupt_step(&f, &update, step, fallback, false)?;
         let bin = f.root.join("bin");
         match step {
             "staged" => assert!(fs::symlink_metadata(&bin)?.is_dir()),
@@ -126,12 +124,57 @@ fn directory_becomes_a_symlink_and_every_step_resumes() -> Result<()> {
             transaction_progress(&f.root, &update, false)?.phase,
             TransactionPhase::Applying
         );
+        assert_eq!(abort_transaction(&f.root, false)?, Some(1), "{step}");
+        assert_split(&f.root)?;
+        assert_eq!(abort_transaction(&f.root, false)?, None);
+    }
+
+    // An interrupted abort finishes through either command.
+    for (step, fallback, finish_with_resume) in [
+        ("staged", false, true),
+        ("exchanged", false, false),
+        ("displaced", true, true),
+        ("published", true, false),
+    ] {
+        interrupt_step(&f, &update, "exchanged", false, false)?;
+        interrupt_step(&f, &update, step, fallback, true)?;
+        let status = crate::transaction_status(&f.root)?;
+        assert!(
+            status
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.aborting)
+        );
+        assert_eq!(
+            transaction_progress(&f.root, &update, false)?.phase,
+            TransactionPhase::Aborting
+        );
+        let error = apply(&f.root, &update).unwrap_err();
+        assert!(error.to_string().contains("being aborted"), "{error:#}");
+        let revision = if finish_with_resume {
+            resume_transaction(&f.root)?
+        } else {
+            abort_transaction(&f.root, false)?
+        };
+        assert_eq!(revision, Some(1), "{step}");
+        assert_split(&f.root)?;
+    }
+
+    // Each forward intermediate state also resumes forward, and so does
+    // each state of the downgrade, which turns the symlink back into a tree.
+    let downgrade = Request::Install {
+        packages: vec!["base/filesystem@1.0.0-0".into()],
+    };
+    for (step, fallback) in [("staged", false), ("exchanged", false), ("displaced", true)] {
+        let update = plan(&f.root, Request::Update)?;
+        let revision = update.base_revision + 1;
+        interrupt_step(&f, &update, step, fallback, false)?;
         assert_eq!(resume_transaction(&f.root)?, Some(revision), "{step}");
         assert_merged(&f.root)?;
         assert_eq!(resume_transaction(&f.root)?, None);
         let restore = plan(&f.root, downgrade.clone())?;
         assert!(restore.summary().contains("Replace bin with a directory"));
-        interrupt_step(&f, &restore, step, fallback)?;
+        interrupt_step(&f, &restore, step, fallback, false)?;
         assert_eq!(resume_transaction(&f.root)?, Some(revision + 1), "{step}");
         assert_split(&f.root)?;
     }
@@ -169,34 +212,29 @@ fn symlink_becomes_a_directory_tree_with_links_inside() -> Result<()> {
         assert!(staging_is_empty(root)?);
         Ok(())
     };
-    let downgrade = Request::Install {
-        packages: vec!["base/loader@1.0.0-0".into()],
-    };
     for (step, fallback) in [
         ("staged", false),
         ("exchanged", false),
         ("displaced", true),
         ("published", true),
     ] {
-        let update = plan(&f.root, Request::Update)?;
-        interrupt_step(&f, &update, step, fallback)?;
-        assert_eq!(
-            resume_transaction(&f.root)?,
-            Some(update.base_revision + 1),
-            "{step}"
-        );
-        check_tree(&f.root)?;
-        let restore = plan(&f.root, downgrade.clone())?;
-        interrupt_step(&f, &restore, step, fallback)?;
-        assert_eq!(
-            resume_transaction(&f.root)?,
-            Some(restore.base_revision + 1),
-            "{step}"
-        );
+        interrupt_step(&f, &update, step, fallback, false)?;
+        assert_eq!(abort_transaction(&f.root, false)?, Some(1), "{step}");
         assert!(is_symlink(&f.root.join("lib64")));
         assert!(verify(&f.root)?.is_empty());
         assert!(staging_is_empty(&f.root)?);
     }
+    // Abort a completed transition, interrupted inside its own exchange.
+    interrupt_step(&f, &update, "published", true, false)?;
+    interrupt_step(&f, &update, "exchanged", false, true)?;
+    assert!(is_symlink(&f.root.join("lib64")));
+    assert_eq!(resume_transaction(&f.root)?, Some(1));
+    assert!(is_symlink(&f.root.join("lib64")));
+    assert!(verify(&f.root)?.is_empty());
+
+    interrupt_step(&f, &update, "displaced", true, false)?;
+    assert_eq!(apply(&f.root, &update)?, 2);
+    check_tree(&f.root)?;
     Ok(())
 }
 
@@ -279,8 +317,19 @@ fn replacing_a_directory_refuses_to_discard_unmanaged_or_local_content() -> Resu
         summary.contains("Replace etc/keep with a file"),
         "{summary}"
     );
-    interrupt_step(&f, &update, "exchanged", false)?;
-    assert_eq!(resume_transaction(&f.root)?, Some(2));
+    interrupt_step(&f, &update, "exchanged", false, false)?;
+    assert_eq!(abort_transaction(&f.root, false)?, Some(1));
+    assert_eq!(
+        fs::read_to_string(f.root.join("etc/app/main.conf"))?,
+        "local app edit"
+    );
+    assert!(!f.root.join("etc/app.conf").exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("etc/keep/vendor.txt"))?,
+        "vendor"
+    );
+    let update = plan(&f.root, Request::Update)?;
+    assert_eq!(apply(&f.root, &update)?, 2);
     assert_eq!(fs::read_to_string(f.root.join("etc/keep"))?, "single file");
     assert_eq!(
         fs::read_to_string(f.root.join("etc/app.conf"))?,
@@ -323,6 +372,205 @@ fn replacing_a_file_with_a_directory_keeps_local_configuration() -> Result<()> {
         fs::read_to_string(f.root.join("etc/settings/main.conf"))?,
         "vendor 2"
     );
+    Ok(())
+}
+
+/// Two releases of a compositor and its library, with a locally edited
+/// configuration, a hard link, and a directory whose mode changes.
+fn upgrade_fixture() -> Result<(Fixture, Plan)> {
+    const ALIAS: &str = "usr/bin/compositor-alias";
+    let f = Fixture::new()?;
+    let (uid, gid) = ids();
+    f.package(
+        "library/libdisplay",
+        "1.0.0-0",
+        f.file(LIBRARY, "display ABI 1", "0644", "")?,
+    )?;
+    let release = |version: &str, content: &str, mode: &str| -> Result<String> {
+        Ok(dependency("require", "library/libdisplay", version)
+            + &f.file(COMPOSITOR, content, "0755", "")?
+            + &format!("    hardlink {ALIAS:?} target={COMPOSITOR:?}\n")
+            + &f.file(
+                CONFIG,
+                &format!("vendor config {version}"),
+                "0644",
+                "preserve=#true",
+            )?
+            + &format!("    dir \"usr/share/canopa\" mode={mode:?} uid={uid} gid={gid}\n"))
+    };
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        release("1.0.0-0", "compositor 1", "0755")?,
+    )?;
+    f.create()?;
+    install_all(&f.root, &["desktop/compositor"])?;
+    fs::write(f.root.join(CONFIG), "administrator edit")?;
+    f.package(
+        "library/libdisplay",
+        "2.0.0-0",
+        f.file(LIBRARY, "display ABI 2", "0644", "")?,
+    )?;
+    let actions = release("2.0.0-0", "compositor 2", "0700")?
+        + &f.file("usr/share/canopa/new", "new", "0644", "")?;
+    f.package("desktop/compositor", "2.0.0-0", actions)?;
+    let update = plan(&f.root, Request::Update)?;
+    Ok((f, update))
+}
+
+fn assert_committed_release(f: &Fixture) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = &f.root;
+    assert_eq!(fs::read_to_string(root.join(LIBRARY))?, "display ABI 1");
+    assert_eq!(fs::read_to_string(root.join(COMPOSITOR))?, "compositor 1");
+    assert_eq!(
+        fs::metadata(root.join(COMPOSITOR))?.ino(),
+        fs::metadata(root.join("usr/bin/compositor-alias"))?.ino()
+    );
+    assert_eq!(fs::read_to_string(root.join(CONFIG))?, "administrator edit");
+    assert_eq!(
+        fs::metadata(root.join("usr/share/canopa"))?
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    assert!(!root.join("usr/share/canopa/new").exists());
+    assert!(!root.join("var/lib/cps/image/config-updates/2").exists());
+    let status = crate::transaction_status(root)?;
+    assert_eq!(status.revision, 1);
+    assert!(status.pending.is_none());
+    let findings = verify(root)?;
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].message.contains("locally modified config"));
+    assert!(staging_is_empty(root)?);
+    Ok(())
+}
+
+#[test]
+fn abort_restores_the_committed_revision_from_any_interruption() -> Result<()> {
+    let (f, update) = upgrade_fixture()?;
+    // Dependencies go first: the new library before the new compositor.
+    assert!(position(&update, LIBRARY) < position(&update, COMPOSITOR));
+    let paths: Vec<&str> = update
+        .writes
+        .iter()
+        .filter(|write| write.before != write.after)
+        .map(|write| write.path.as_str())
+        .collect();
+    let last = *paths.last().expect("changed paths");
+    let saved = f._dir.path().join("update.json");
+    for path in &paths {
+        interrupt_apply_at(&f.root, &saved, &update, path)?;
+        assert_eq!(abort_transaction(&f.root, false)?, Some(1), "{path}");
+        assert_committed_release(&f)?;
+    }
+    // Interrupt the abort itself after each path it restores.
+    for path in &paths {
+        interrupt_apply_at(&f.root, &saved, &update, last)?;
+        let saved = f._dir.path().join("abort.json");
+        fs::write(&saved, serde_json::to_vec(&update)?)?;
+        let worker = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::install_upgrade_and_resume_offline",
+                "--nocapture",
+            ])
+            .env("CPS_TEST_IMAGE", &f.root)
+            .env("CPS_TEST_PLAN", &saved)
+            .env("CPS_TEST_AFTER_PATH", path)
+            .env("CPS_TEST_ABORT", "1")
+            .output()?;
+        if worker.status.code() != Some(INTERRUPTED) {
+            // Nothing to restore at this path, so the abort finished.
+            assert!(worker.status.success() || worker.status.code() == Some(101));
+            if crate::transaction_status(&f.root)?.pending.is_none() {
+                assert_committed_release(&f)?;
+                continue;
+            }
+        }
+        assert!(
+            crate::transaction_status(&f.root)?
+                .pending
+                .is_some_and(|pending| pending.aborting)
+        );
+        assert_eq!(abort_transaction(&f.root, false)?, Some(1), "{path}");
+        assert_committed_release(&f)?;
+    }
+    assert_eq!(apply(&f.root, &update)?, 2);
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 2");
+    Ok(())
+}
+
+#[test]
+fn abort_lists_missing_payloads_and_local_contents_before_changing_anything() -> Result<()> {
+    let (f, update) = upgrade_fixture()?;
+    let saved = f._dir.path().join("update.json");
+    interrupt_apply_at(&f.root, &saved, &update, COMPOSITOR)?;
+    let offline = f.repo.with_extension("offline");
+    fs::rename(&f.repo, &offline)?;
+    let error = abort_transaction(&f.root, false).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&format!(
+            "{LIBRARY}: payload sha256 {}",
+            digest(b"display ABI 1")
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("from cps://canopa/library/libdisplay@1.0.0-0"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "{COMPOSITOR}: payload sha256 {}",
+            digest(b"compositor 1")
+        )),
+        "{message}"
+    );
+    assert!(message.contains("--fetch"), "{message}");
+    // Nothing changed, and the transaction can still go forward.
+    assert!(
+        !crate::transaction_status(&f.root)?
+            .pending
+            .unwrap()
+            .aborting
+    );
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 2");
+    let error = abort_transaction(&f.root, true).unwrap_err();
+    assert!(format!("{error:#}").contains("no TUF mirror"), "{error:#}");
+    fs::rename(&offline, &f.repo)?;
+    assert_eq!(abort_transaction(&f.root, false)?, Some(1));
+    assert_committed_release(&f)?;
+
+    // Restoring vendor configuration discards the local edit, which no
+    // payload holds, so only resume can finish that transaction.
+    let revert = plan(
+        &f.root,
+        Request::Revert {
+            paths: vec![CONFIG.into()],
+        },
+    )?;
+    interrupt_apply_at(&f.root, &saved, &revert, CONFIG)?;
+    let error = abort_transaction(&f.root, false).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&format!(
+            "{CONFIG}: local contents sha256 {} that the transaction replaced",
+            digest(b"administrator edit")
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("finish the transaction with resume"),
+        "{message}"
+    );
+    // Putting the contents back from a backup lets the abort finish.
+    fs::write(f.root.join(CONFIG), "administrator edit")?;
+    assert_eq!(abort_transaction(&f.root, false)?, Some(1));
+    assert_committed_release(&f)?;
     Ok(())
 }
 

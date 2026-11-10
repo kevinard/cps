@@ -18,9 +18,9 @@ mod transport;
 mod verify;
 
 pub use apply::{
-    PendingTransaction, TransactionPhase, TransactionProgress, TransactionStatus, apply,
-    fetch_plan, fetch_plan_with_archives, repair_pending_transaction, resume_transaction,
-    transaction_progress, transaction_status, validate_plan,
+    PendingTransaction, TransactionPhase, TransactionProgress, TransactionStatus,
+    abort_transaction, apply, fetch_plan, fetch_plan_with_archives, repair_pending_transaction,
+    resume_transaction, transaction_progress, transaction_status, validate_plan,
 };
 pub use boot::{
     Activation, BootEnvironment, RootDeployment, activate_boot_environment,

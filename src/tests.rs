@@ -3944,7 +3944,8 @@ fn interrupt_apply_at(root: &Path, saved: &Path, plan: &Plan, path: &str) -> Res
     interrupt_worker(root, saved, &[("CPS_TEST_AFTER_PATH", path)])
 }
 
-/// Run an apply in a worker process that exits at the interruption point that `env` selects: after writing
+/// Run an apply, or with `CPS_TEST_ABORT` an abort, in a worker process
+/// that exits at the interruption point that `env` selects: after writing
 /// `CPS_TEST_AFTER_PATH`, or at the transition step `CPS_TEST_INTERRUPT_STEP`.
 /// `CPS_TEST_NO_EXCHANGE` makes transitions use the fallback without
 /// RENAME_EXCHANGE.
@@ -3975,6 +3976,10 @@ fn interrupt_apply_worker(root: &Path, saved: &Path) -> Result<()> {
             std::process::exit(INTERRUPTED);
         }
     };
+    if std::env::var_os("CPS_TEST_ABORT").is_some() {
+        crate::apply::abort_with(root, stop)?;
+        panic!("abort did not reach the interruption point");
+    }
     let plan: Plan = serde_json::from_slice(&fs::read(saved)?)?;
     apply_with(root, &plan, stop)?;
     panic!("apply did not reach the interruption point");

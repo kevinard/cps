@@ -45,6 +45,21 @@ struct Journal {
     files_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     live_jobs: Option<systemd::LiveJobs>,
+    /// Progress of an abort. Once recorded, the transaction only goes back:
+    /// resume and abort both finish returning to the committed revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    abort: Option<AbortProgress>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AbortProgress {
+    /// Every journaled path is back in its state before the transaction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    files_ready: bool,
+    /// Live service jobs that the abort runs around its writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_jobs: Option<systemd::LiveJobs>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -72,6 +87,16 @@ impl PendingRecord {
         match self {
             Self::Journaled(journal) | Self::Live(journal) => journal,
         }
+    }
+
+    fn journal_mut(&mut self) -> &mut Journal {
+        match self {
+            Self::Journaled(journal) | Self::Live(journal) => journal,
+        }
+    }
+
+    fn aborting(&self) -> bool {
+        self.journal().abort.is_some()
     }
 
     fn work(&self) -> PendingWork<'_> {
@@ -130,6 +155,8 @@ pub struct PendingTransaction {
     pub files_ready: bool,
     pub plan_summary: String,
     pub live: bool,
+    /// An abort has started and must be finished.
+    pub aborting: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -139,6 +166,7 @@ pub enum TransactionPhase {
     PayloadValidated,
     Blocked,
     Applying,
+    Aborting,
     Applied,
     Superseded,
     PreparedForBoot,
@@ -177,6 +205,7 @@ pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
                 files_ready: work.files_ready,
                 plan_summary,
                 live: pending.is_live(),
+                aborting: pending.aborting(),
             })
         })
         .transpose()?;
@@ -208,7 +237,9 @@ pub fn transaction_progress(
                     settings.id == work.next.settings.id,
                     "pending transaction targets a different image"
                 );
-                if work.id == plan_id {
+                if work.id == plan_id && pending.aborting() {
+                    TransactionPhase::Aborting
+                } else if work.id == plan_id {
                     TransactionPhase::Applying
                 } else {
                     TransactionPhase::Blocked
@@ -454,6 +485,10 @@ pub(crate) fn apply_to_image(
             pending.work().id == id,
             "a different plan is pending; use transaction status to identify it"
         );
+        ensure!(
+            !pending.aborting(),
+            "this plan is being aborted; finish with transaction abort, then apply it again"
+        );
         let state = image.state()?;
         return resume_pending(
             &mut image,
@@ -508,6 +543,7 @@ pub(crate) fn apply_to_image(
             AfterFiles::Live(jobs) => Some(jobs.clone()),
             _ => None,
         },
+        abort: None,
     });
     let pending = if live.is_some() {
         PendingRecord::Live(journal)
@@ -617,6 +653,10 @@ fn resume_image(
         discard_stage(&image);
         return Ok(None);
     };
+    if pending.aborting() {
+        // An abort that started is the only way out of this transaction.
+        return abort_pending(&mut image, &state, pending, live, false, |_| {}).map(Some);
+    }
     resume_pending(&mut image, &state, pending, live, repair, |_| {}).map(Some)
 }
 
@@ -714,6 +754,367 @@ fn resume_pending(
         repair,
         after_write,
     )
+}
+
+/// Abort the pending transaction of an inactive image.
+///
+/// Every journaled write runs backwards, so the image returns to the
+/// committed revision, which the abort leaves unchanged. Returns that
+/// revision, or `None` without a pending transaction. With `fetch`, missing
+/// package payloads are downloaded from each publisher's mirror first.
+pub fn abort_transaction(path: &Path, fetch: bool) -> Result<Option<u64>> {
+    abort_image(Image::open_for_apply(path)?, false, fetch, |_| {})
+}
+
+pub(crate) fn abort_live(image: Image, fetch: bool) -> Result<Option<u64>> {
+    abort_image(image, true, fetch, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn abort_with(path: &Path, after_write: impl FnMut(&Write)) -> Result<Option<u64>> {
+    abort_image(Image::open_for_apply(path)?, false, false, after_write)
+}
+
+fn abort_image(
+    mut image: Image,
+    live: bool,
+    fetch: bool,
+    after_write: impl FnMut(&Write),
+) -> Result<Option<u64>> {
+    let state = image.state()?;
+    let Some(pending) = image.pending::<PendingRecord>()? else {
+        discard_stage(&image);
+        return Ok(None);
+    };
+    abort_pending(&mut image, &state, pending, live, fetch, after_write).map(Some)
+}
+
+/// Return every journaled path to its committed state and drop the pending record.
+///
+/// The abort is recorded in the pending record before it changes anything,
+/// and from then on both resume and abort finish it. Its writes are the
+/// plan's writes reversed, checked like any other: each path must be in its
+/// state after the transaction, before it, or for a transition in one of
+/// the recognized intermediate states, so an interrupted abort resumes.
+fn abort_pending(
+    image: &mut Image,
+    base: &State,
+    mut pending: PendingRecord,
+    live: bool,
+    fetch: bool,
+    mut after_write: impl FnMut(&Write),
+) -> Result<u64> {
+    ensure!(
+        pending.is_live() == live,
+        if pending.is_live() {
+            "the pending transaction changed the running system; abort it with cps transaction abort without --root"
+        } else {
+            "the pending transaction belongs to an inactive image; abort it with cps transaction abort --root"
+        }
+    );
+    let plan = pending.recorded_plan()?.clone();
+    let work = pending.work();
+    validate_digest(work.id)?;
+    let next = work
+        .next
+        .apply(base)
+        .context("rebuilding the pending state from the committed revision")?;
+    let inverse = plan.inverse(base, &next)?;
+    let stage = image.stage()?;
+    let mut payloads = abort_payloads(&image.root, &stage, &inverse, base)?;
+    if fetch && !payloads.missing.is_empty() {
+        fetch_abort_payloads(&image.root, &payloads.missing)?;
+        payloads = abort_payloads(&image.root, &stage, &inverse, base)?;
+    }
+    payloads.check()?;
+    let services = live.then(|| systemd::LiveServices::plan(&inverse, &next, base));
+    match (&services, &pending.journal().abort) {
+        (_, None) => {
+            let live_jobs = services
+                .as_ref()
+                .map(systemd::LiveServices::active_jobs)
+                .transpose()?;
+            pending.journal_mut().abort = Some(AbortProgress {
+                files_ready: false,
+                live_jobs,
+            });
+            image.update_pending(&pending)?;
+        }
+        (Some(services), Some(progress)) => services.check_jobs(
+            progress
+                .live_jobs
+                .as_ref()
+                .context("live abort has no service jobs")?,
+        )?,
+        (None, Some(_)) => {}
+    }
+    payloads.stage(&image.root, &stage)?;
+    let progress = pending
+        .journal_mut()
+        .abort
+        .as_mut()
+        .expect("recorded abort");
+    let mut jobs = progress.live_jobs.clone();
+    // ExecStop can need the very files that the abort will remove.
+    if let Some(jobs) = &mut jobs
+        && jobs.stop_removed_units()?
+    {
+        progress.live_jobs = Some(jobs.clone());
+        image.update_pending(&pending)?;
+    }
+    let files_ready = pending
+        .journal()
+        .abort
+        .as_ref()
+        .is_some_and(|abort| abort.files_ready);
+    if !files_ready {
+        write_files(
+            &image.root,
+            &stage,
+            &inverse.writes,
+            &base.paths,
+            false,
+            None,
+            &mut after_write,
+        )?;
+    }
+    systemd::clean_enablement(&image.root, &inverse.writes, &base.paths)?;
+    let actions = live || !inverse.systemd.is_empty();
+    if actions && !files_ready {
+        pending
+            .journal_mut()
+            .abort
+            .as_mut()
+            .expect("recorded abort")
+            .files_ready = true;
+        image.update_pending(&pending)?;
+    }
+    let mut observed = BTreeMap::new();
+    if actions {
+        let path = if live {
+            PathBuf::from("/")
+        } else {
+            systemd::offline_path(&image.root)?
+        };
+        if !inverse.systemd.is_empty() {
+            systemd::run(&image.root, &path, &inverse.systemd, base, live)?;
+        }
+        // A recovery plan's paths return to the damage it was repairing.
+        let journaled: BTreeSet<&str> = inverse
+            .writes
+            .iter()
+            .map(|write| write.path.as_str())
+            .collect();
+        let records = image.file_records(None)?;
+        let checked = check_transaction_state(
+            &image.root,
+            base,
+            Contents::Fingerprints(&records),
+            &base.installed,
+            |path| !plan.is_recovery() || !journaled.contains(path),
+        )?;
+        if let Some(finding) = checked.errors().next() {
+            anyhow::bail!(
+                "aborting left an inconsistent image: {}; correct it and abort again",
+                finding.message
+            );
+        }
+        observed = checked.observed;
+        if let Some(jobs) = &jobs {
+            jobs.run()?;
+        }
+    }
+    let written = plan
+        .writes
+        .iter()
+        .map(|write| write.path.as_str())
+        .collect();
+    image.abort_pending(&written, &observed, base)?;
+    discard_stage(image);
+    Ok(base.settings.revision)
+}
+
+/// Where the contents that an abort restores come from.
+enum AbortSource<'a> {
+    /// Already staged and verified.
+    Staged,
+    /// A path that the abort already restored, so its contents are verified.
+    Image(&'a str),
+    /// A publisher's payload cache or repository.
+    Cache(&'a Publisher),
+}
+
+struct MissingPayload<'a> {
+    path: &'a str,
+    node: &'a Node,
+    /// The committed package that declares these contents, if any.
+    owner: Option<(&'a Publisher, String)>,
+}
+
+struct AbortPayloads<'a> {
+    found: BTreeMap<&'a str, (&'a Node, AbortSource<'a>)>,
+    missing: Vec<MissingPayload<'a>>,
+}
+
+fn abort_payloads<'a>(
+    root: &Root,
+    stage: &Root,
+    inverse: &'a Plan,
+    base: &'a State,
+) -> Result<AbortPayloads<'a>> {
+    let mut needed = BTreeMap::<&str, (&Node, Vec<&str>)>::new();
+    for write in inverse.writes.iter().filter(|write| write.needs_blob()) {
+        let Some(node @ Node::File { sha256, .. }) = &write.after else {
+            unreachable!("only file replacements require a payload");
+        };
+        needed
+            .entry(sha256.as_str())
+            .or_insert((node, Vec::new()))
+            .1
+            .push(write.path.as_str());
+    }
+    let mut payloads = AbortPayloads {
+        found: BTreeMap::new(),
+        missing: Vec::new(),
+    };
+    'payloads: for (hash, (node, paths)) in needed {
+        let Node::File { size, .. } = node else {
+            unreachable!("payloads contain only files");
+        };
+        if checked_payload(stage, node).is_ok() {
+            payloads.found.insert(hash, (node, AbortSource::Staged));
+            continue;
+        }
+        for &path in &paths {
+            if root.inspect(path)?.as_ref() == Some(node) {
+                payloads
+                    .found
+                    .insert(hash, (node, AbortSource::Image(path)));
+                continue 'payloads;
+            }
+        }
+        let owner = paths.iter().find_map(|path| {
+            let managed = base
+                .paths
+                .get(*path)
+                .filter(|managed| managed.node == *node)?;
+            let package = &base
+                .installed
+                .get(managed.owners.first()?)?
+                .published
+                .manifest;
+            Some((base.publishers.get(&package.publisher)?, package.id()))
+        });
+        let candidates = owner
+            .iter()
+            .map(|(publisher, _)| *publisher)
+            .chain(base.publishers.as_slice());
+        for publisher in candidates {
+            if crate::repo::release::cached_object(
+                &publisher.repo,
+                &format!("blobs/{hash}"),
+                hash,
+                *size,
+            )? {
+                payloads
+                    .found
+                    .insert(hash, (node, AbortSource::Cache(publisher)));
+                continue 'payloads;
+            }
+        }
+        payloads.missing.push(MissingPayload {
+            path: paths[0],
+            node,
+            owner,
+        });
+    }
+    Ok(payloads)
+}
+
+impl AbortPayloads<'_> {
+    /// Refuse to start, or continue, an abort that cannot restore every path.
+    fn check(&self) -> Result<()> {
+        if self.missing.is_empty() {
+            return Ok(());
+        }
+        let mut lines = vec![
+            "cannot abort the pending transaction; the contents that restore these paths are unavailable:"
+                .to_owned(),
+        ];
+        for missing in &self.missing {
+            let Node::File { sha256, size, .. } = missing.node else {
+                unreachable!("payloads contain only files");
+            };
+            lines.push(match &missing.owner {
+                Some((_, package)) => format!(
+                    "  {}: payload sha256 {sha256}, {size} bytes, from {package}",
+                    missing.path
+                ),
+                None => format!(
+                    "  {}: local contents sha256 {sha256} that the transaction replaced",
+                    missing.path
+                ),
+            });
+        }
+        if self.missing.iter().any(|missing| missing.owner.is_some()) {
+            lines.push(
+                "Abort again with --fetch to download the package payloads from each publisher's mirror; \
+                 the committed manifests pin their digests and sizes."
+                    .to_owned(),
+            );
+        }
+        if self.missing.iter().any(|missing| missing.owner.is_none()) {
+            lines.push(
+                "No package payload holds local contents. Restore those paths from a backup and abort \
+                 again, or finish the transaction with resume."
+                    .to_owned(),
+            );
+        }
+        anyhow::bail!(lines.join("\n"))
+    }
+
+    fn stage(&self, root: &Root, stage: &Root) -> Result<()> {
+        let dir = Root::fd_path(stage.as_file());
+        for (hash, (node, source)) in &self.found {
+            let mut file = NamedTempFile::new_in(&dir)?;
+            match source {
+                AbortSource::Staged => continue,
+                AbortSource::Image(path) => {
+                    copy_payload(&root.file(path)?, node, file.as_file_mut())
+                        .with_context(|| format!("staging the restored contents of {path}"))?
+                }
+                AbortSource::Cache(publisher) => {
+                    stage_blob(&publisher.repo, node, file.as_file_mut()).with_context(|| {
+                        format!("staging payload {hash} from {}", publisher.name)
+                    })?
+                }
+            }
+            file.as_file().sync_all()?;
+            file.persist(dir.join(hash))?;
+        }
+        Ok(stage.as_file().sync_all()?)
+    }
+}
+
+fn fetch_abort_payloads(root: &Root, missing: &[MissingPayload<'_>]) -> Result<()> {
+    let mut by_publisher = BTreeMap::<&str, (&Publisher, Vec<_>)>::new();
+    for missing in missing {
+        let (Some((publisher, _)), Node::File { sha256, size, .. }) =
+            (&missing.owner, missing.node)
+        else {
+            continue;
+        };
+        by_publisher
+            .entry(publisher.name.as_str())
+            .or_insert((publisher, Vec::new()))
+            .1
+            .push((sha256.as_str(), *size, None));
+    }
+    for (publisher, blobs) in by_publisher.into_values() {
+        fetch_payloads(publisher, root, blobs)
+            .with_context(|| PublisherFetchError(publisher.name.clone()))?;
+    }
+    Ok(())
 }
 
 /// The committed and next states of a transaction being finished.
@@ -1115,8 +1516,16 @@ impl<'a, F: FnMut(&Write)> Writer<'a, F> {
             }
             return Ok(());
         }
+        // A path holding exactly the contents and metadata of its hard link
+        // target can be linked to it without losing anything. An abort finds
+        // aliases still linked to the target's old inode in this state once
+        // it has restored the target.
+        let same_as_target = write
+            .hardlink_target()
+            .and_then(|target| self.paths.get(target))
+            .is_some_and(|target| observed.as_ref() == Some(&target.node));
         ensure!(
-            &observed == before,
+            &observed == before || same_as_target,
             "unexpected state at {}; pending transaction retained",
             write.path
         );

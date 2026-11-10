@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::{
     BootEnvironment, GitSnapshotRef, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions,
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
-    apply::{PublisherFetchError, apply_live, repair_pending_live, resume_live},
+    apply::{PublisherFetchError, abort_live, apply_live, repair_pending_live, resume_live},
     boot::{
         discard_btrfs_trial, entry_id, prune_btrfs_boot_environments, stage_running_btrfs,
         with_running_environment,
@@ -692,6 +692,20 @@ impl System {
                     resume_live(image)
                 }
             },
+        )?;
+        self.prune_after_transaction();
+        Ok(revision)
+    }
+
+    /// Abort the interrupted live transaction, returning the running root
+    /// to its committed package revision.
+    pub fn abort(&self, fetch: bool) -> Result<Option<u64>> {
+        let boot = self.boot();
+        let revision = with_running_environment(
+            &boot.volume,
+            &boot.esp,
+            boot.activation.root_partuuid.as_deref(),
+            |root, id, revision| abort_live(Image::open_for_live_apply(root, id, revision)?, fetch),
         )?;
         self.prune_after_transaction();
         Ok(revision)

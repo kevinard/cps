@@ -856,7 +856,20 @@ impl Root {
         let Node::Dir { mode: old_mode, .. } = *before else {
             anyhow::bail!("expected directory metadata at {path}");
         };
-        let Node::Dir { uid, gid, .. } = *after else {
+        let Node::Dir {
+            uid,
+            gid,
+            mode: new_mode,
+        } = *after
+        else {
+            anyhow::bail!("expected directory metadata at {path}");
+        };
+        let Node::Dir {
+            uid: old_uid,
+            gid: old_gid,
+            ..
+        } = *before
+        else {
             anyhow::bail!("expected directory metadata at {path}");
         };
         let file = self
@@ -869,13 +882,20 @@ impl Root {
         }
         // Linux chown preserves directory mode bits. A crash between chown
         // and chmod can leave the new owner with the original permissions.
+        // Aborting such a change runs the same steps the other way, so the
+        // old owner with the new permissions is also a half-way state.
         let intermediate = Node::Dir {
             uid,
             gid,
             mode: old_mode,
         };
+        let reverted = Node::Dir {
+            uid: old_uid,
+            gid: old_gid,
+            mode: new_mode,
+        };
         ensure!(
-            observed == *before || observed == intermediate,
+            observed == *before || observed == intermediate || observed == reverted,
             "unexpected state at {path}; pending transaction retained"
         );
         Self::set_directory_metadata(&file, after)?;
