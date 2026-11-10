@@ -73,6 +73,65 @@ fn usrmerge() -> Result<(Fixture, Plan)> {
     Ok((f, update))
 }
 
+/// The usrmerge fixture with a trigger that watches the merged directory,
+/// so each transaction prunes after its triggers.
+fn usrmerge_with_trigger() -> Result<(Fixture, Plan)> {
+    let f = Fixture::new()?;
+    let split = f.file("bin/tool", "tool 1", "0755", "")?
+        + &f.file("bin/sub/data", "data 1", "0644", "")?
+        + &f.file("usr/bin/other", "other 1", "0755", "")?;
+    f.package("base/filesystem", "1.0.0-0", split)?;
+    f.package(
+        "base/watch",
+        "1.0.0-0",
+        "    trigger \"tools\" {\n        watch \"usr/bin/**\"\n        watch \"bin/**\"\n        reload \"example.service\"\n    }\n".to_owned(),
+    )?;
+    f.create()?;
+    assert_eq!(install_all(&f.root, &["base/filesystem", "base/watch"])?, 1);
+    fs::remove_dir_all(f.proto.join("bin"))?;
+    let merged = f.file("usr/bin/tool", "tool 2", "0755", "")?
+        + &f.file("usr/bin/sub/data", "data 2", "0644", "")?
+        + &f.file("usr/bin/other", "other 1", "0755", "")?
+        + &symlink_action("bin", "usr/bin");
+    f.package("base/filesystem", "2.0.0-0", merged)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(!update.triggers.is_empty());
+    Ok((f, update))
+}
+
+#[test]
+fn directory_becomes_a_symlink_in_a_transaction_with_triggers() -> Result<()> {
+    let (f, update) = usrmerge_with_trigger()?;
+    // Interrupted after the exchange, the forward transaction aborts.
+    interrupt_step(&f, &update, "exchanged", false, false)?;
+    assert_eq!(abort_transaction(&f.root, false)?, Some(1));
+    assert_split(&f.root)?;
+    // Interrupted after its triggers, it resumes forward.
+    interrupt_step(&f, &update, "triggers", false, false)?;
+    assert!(is_symlink(&f.root.join("bin")));
+    assert_eq!(resume_transaction(&f.root)?, Some(2));
+    assert_merged(&f.root)?;
+    // The downgrade turns the symlink back into a tree, and aborting it
+    // after its triggers restores the symlink.
+    let downgrade = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["base/filesystem@1.0.0-0".into()],
+        },
+    )?;
+    assert!(!downgrade.triggers.is_empty());
+    interrupt_step(&f, &downgrade, "triggers", false, false)?;
+    assert!(fs::symlink_metadata(f.root.join("bin"))?.is_dir());
+    assert_eq!(abort_transaction(&f.root, false)?, Some(2));
+    assert_merged(&f.root)?;
+    assert_eq!(apply(&f.root, &downgrade)?, 3);
+    assert_split(&f.root)?;
+    // Applying the merge in one go also succeeds.
+    let update = plan(&f.root, Request::Update)?;
+    assert_eq!(apply(&f.root, &update)?, 4);
+    assert_merged(&f.root)
+}
+
 fn assert_split(root: &Path) -> Result<()> {
     assert!(fs::symlink_metadata(root.join("bin"))?.is_dir());
     assert_eq!(fs::read_to_string(root.join("bin/tool"))?, "tool 1");

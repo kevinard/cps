@@ -618,6 +618,9 @@ pub(crate) fn actuators(
     Ok((reload, restart))
 }
 
+/// The type of the object at a path, without following symlinks. A path
+/// beneath a file or a symlink is absent: CPS never generates or removes
+/// anything through a link.
 fn kind(root: &Root, path: &str) -> Result<Option<FileType>> {
     validate_path(path)?;
     let (parent, leaf) = match path.rsplit_once('/') {
@@ -626,7 +629,7 @@ fn kind(root: &Root, path: &str) -> Result<Option<FileType>> {
             Err(error)
                 if matches!(
                     error.downcast_ref::<Errno>(),
-                    Some(&(Errno::NOENT | Errno::NOTDIR))
+                    Some(&(Errno::NOENT | Errno::NOTDIR | Errno::LOOP))
                 ) =>
             {
                 return Ok(None);
@@ -777,11 +780,24 @@ fn remove_unclaimed(
 
 /// Finish directory removals that generated outputs prevented. A generated
 /// path inside a directory that no package ships any more is orphaned.
+///
+/// A directory beneath a transition left with the old tree when the
+/// transition replaced it, so only removals outside transitions remain.
 pub(crate) fn prune(root: &Root, writes: &[Write], next: &State) -> Result<()> {
     let outputs = active_outputs(&next.installed, &next.paths);
+    let transitions: Vec<&str> = writes
+        .iter()
+        .filter(|write| write.transition().is_some())
+        .map(|write| write.path.as_str())
+        .collect();
     let mut removed: Vec<_> = writes
         .iter()
-        .filter(|write| write.removes_directory())
+        .filter(|write| {
+            write.removes_directory()
+                && !transitions
+                    .iter()
+                    .any(|transition| write.beneath(transition))
+        })
         .map(|write| write.path.as_str())
         .collect();
     removed.sort_unstable_by(|a, b| b.cmp(a));
