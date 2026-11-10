@@ -12,21 +12,27 @@
 .B \&[COMMAND]...
 \&Run this command instead of starting an interactive shell
 .SH OPTIONS
-.PP
+.TP
 .B \&\-\-repo <REPO>
-.PP
+\&Local repository of the toolchain publisher
+.TP
 .B \&\-\-publisher <PUBLISHER>
-.PP
+\&Toolchain publisher, when the recipe pins one publisher
+.TP
 .B \&\-\-trust\-root <TRUST_ROOT>
+\&Trust root file that matches the recipe's key\-sha256 pin
 .TP
 .B \&\-\-toolchain\-config <TOOLCHAIN_CONFIG>
 \&Worker\-local repository and trust key locations for the pinned publishers
-.PP
+.TP
 .B \&\-\-sources <SOURCES>
-.PP
+\&Directory of the recipe's source inputs at their recipe paths
+.TP
 .B \&\-\-source\-cache <SOURCE_CACHE>
-.PP
+\&Source cache filled by cps source fetch or cps source import
+.TP
 .B \&\-\-worker\-config <WORKER_CONFIG>
+\&Build worker limits: time, scratch space, file, output, and log sizes, and jobs
 .TP
 .B \&\-\-option <NAME=VALUE>
 \&Override a build option declared in the recipe

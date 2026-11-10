@@ -29,24 +29,29 @@
 .B \&cps manifest generate [OPTIONS] \-\-proto <PROTO> \-\-publisher <PUBLISHER> \-\-version <VERSION> <NAME>
 .PP
 .B Arguments
-.PP
+.TP
 .B \&<NAME>
+\&Package name, such as apps/tool
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-proto <PROTO>
-.PP
+\&Staged prototype tree to describe
+.TP
 .B \&\-\-publisher <PUBLISHER>
-.PP
+\&Publisher of the package
+.TP
 .B \&\-\-version <VERSION>
-.PP
+\&Package version, such as 1.0.0\-0
+.TP
 .B \&\-\-architecture <ARCHITECTURE>
+\&Restrict the package to one architecture, such as x86_64
 .TP
 .B \&\-\-uid <UID>
-\&[default: 0]
+\&Owner UID for every generated action [default: 0]
 .TP
 .B \&\-\-gid <GID>
-\&[default: 0]
+\&Owner GID for every generated action [default: 0]
 .TP
 .B \&\-h, \-\-help
 \&Print help

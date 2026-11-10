@@ -149,7 +149,9 @@ package "system/sqlite" publisher="canopa" summary="SQL database engine library"
 `cps build` turns each installed regular file and symlink that a rule
 matches into an explicit `file` or `symlink` action. A file that shares its
 inode with an earlier collected file of the same package becomes a
-`hardlink`. Explicit actions in the template keep their exact form and take
+`hardlink` when its own rule gives it the same mode, owner, facet, and
+variants as that file and does not preserve it. Otherwise it stays a `file`
+with its own rule's metadata. Explicit actions in the template keep their exact form and take
 precedence over patterns, so a template can collect `usr/bin/*` and still
 declare `file "usr/bin/su" mode="4755" uid=0 gid=0`. Within one template the
 first matching rule wins. Directories are never collected; declare `dir`
@@ -299,7 +301,9 @@ The rules for several packages:
 - Every package of one recipe belongs to one publisher, and no name repeats.
 - One sandboxed build runs, and its installed tree is partitioned among the
   templates. A path belongs to one package only: an explicit action or
-  collect rule in two templates for the same path fails the build.
+  collect rule in two templates for the same path fails the build. The
+  exception is a `dir` action that several templates declare with the same
+  mode, owner, and group.
 - Two packages cannot ship ELF objects with the same build ID, because their
   debug information can belong to only one package.
 - The bundle holds every expanded manifest, one attestation covers them

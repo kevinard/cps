@@ -12,14 +12,11 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    build::{
-        TEMPLATES, TemplateInput, expand::check_expansion, expanded_manifest_path, load_templates,
-        read_templates,
-    },
+    build::{TEMPLATES, TemplateInput, load_templates, read_expanded_output, read_templates},
     image::root::Root,
     kdl_format::{
         build::{BuildRecipe, PublisherPin, RECIPE_LIMIT, TemplatePin, parse},
-        manifest_text, parse_manifest,
+        manifest_text,
     },
     model::{Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name},
     repo::{MANIFEST_LIMIT, Purpose, SigningKey, read_key, read_limited, trust_root_keys},
@@ -521,16 +518,7 @@ fn expanded_outputs(
 ) -> Result<Vec<Manifest>> {
     let manifests = templates
         .iter()
-        .map(|input| {
-            let name = &input.template.manifest.name;
-            let bytes = read_limited(bundle.file(&expanded_manifest_path(name))?, MANIFEST_LIMIT)
-                .with_context(|| format!("reading the expanded manifest for {name}"))?;
-            let manifest = parse_manifest(std::str::from_utf8(&bytes)?)?;
-            manifest.validate(false)?;
-            manifest.check_architecture(&recipe.arch)?;
-            check_expansion(&input.template, &manifest, recipe.strip)?;
-            Ok(manifest)
-        })
+        .map(|input| read_expanded_output(bundle, recipe, &input.template))
         .collect::<Result<Vec<_>>>()?;
     ensure!(
         manifests
@@ -731,6 +719,7 @@ fn subjects(input: Vec<Subject>) -> Result<BTreeMap<String, FileDigest>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kdl_format::parse_manifest;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]

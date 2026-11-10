@@ -347,6 +347,23 @@ pub(crate) fn expanded_manifest_path(name: &str) -> String {
     format!("manifests/{name}.kdl")
 }
 
+/// Read one output's expanded manifest from a bundle without following
+/// symlinks, and check that its template produces it.
+pub(crate) fn read_expanded_output(
+    bundle: &Root,
+    recipe: &BuildRecipe,
+    template: &Template,
+) -> Result<Manifest> {
+    let name = &template.manifest.name;
+    let bytes = read_limited(bundle.file(&expanded_manifest_path(name))?, MANIFEST_LIMIT)
+        .with_context(|| format!("reading the expanded manifest for {name}"))?;
+    let manifest = crate::kdl_format::parse_manifest(std::str::from_utf8(&bytes)?)?;
+    manifest.validate(false)?;
+    manifest.check_architecture(&recipe.arch)?;
+    expand::check_expansion(template, &manifest, recipe.strip)?;
+    Ok(manifest)
+}
+
 /// Write explicit manifests into a test bundle as both the pinned templates and
 /// their expansions.
 #[cfg(test)]

@@ -53,7 +53,11 @@ Administrators can set `git-toolchain-config "toolchains.kdl"` in
 
 The running Btrfs system needs Git and Bubblewrap. Invoke CPS through
 `sudo` from an unprivileged account with read access to the toolchain
-configuration, its keys, and the pinned toolchain payloads.
+configuration, its keys, and the pinned toolchain payloads. The build runs as
+that account. Root then reads the build output without following symlinks and
+publishes it only when the expanded manifest is exactly what `cps.kdl`
+declares, so the build account cannot add files or change their modes or
+owners.
 
 ## Install and track a branch
 

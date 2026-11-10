@@ -113,6 +113,24 @@ fn first_rule<'a>(template: &'a Template, path: &str) -> Option<&'a CollectRule>
         .find(|rule| pattern::matches(&rule.pattern, path))
 }
 
+fn shared_directory(first: &Action, second: &Action) -> Result<bool> {
+    Ok(
+        matches!((first, second), (Action::Dir { .. }, Action::Dir { .. }))
+            && first.node()? == second.node()?,
+    )
+}
+
+/// The first collected path of an inode, which later collected paths of the
+/// same inode may hard-link to.
+struct LinkTarget {
+    path: String,
+    facet: Option<String>,
+    variants: BTreeMap<String, String>,
+    mode: String,
+    uid: u32,
+    gid: u32,
+}
+
 /// Expand every template against the tree and check that each installed
 /// file and symlink belongs to one output or matches a discard pattern.
 pub(crate) fn expand(
@@ -121,18 +139,24 @@ pub(crate) fn expand(
     tree: &Tree,
 ) -> Result<Vec<Manifest>> {
     let name = |index: usize| &templates[index].manifest.name;
-    let mut explicit = BTreeMap::<&str, usize>::new();
+    let mut explicit = BTreeMap::<&str, (usize, &Action)>::new();
     for (index, template) in templates.iter().enumerate() {
         for action in &template.manifest.action {
             let path = action.path();
-            if let Some(&other) = explicit.get(path).filter(|&&other| other != index) {
+            if let Some(&(other, existing)) =
+                explicit.get(path).filter(|(other, _)| *other != index)
+            {
+                // Packages may share a directory that they declare with the same metadata.
+                if shared_directory(existing, action)? {
+                    continue;
+                }
                 bail!(
                     "{path} belongs to both {} and {}; a path may belong to only one output",
                     name(other),
                     name(index)
                 );
             }
-            explicit.insert(path, index);
+            explicit.insert(path, (index, action));
             if matches!(action, Action::File { .. }) {
                 ensure!(
                     matches!(tree.get(path), Some(Entry::File { .. })),
@@ -205,8 +229,7 @@ pub(crate) fn expand(
     let mut outputs = Vec::with_capacity(templates.len());
     for (index, template) in templates.iter().enumerate() {
         let mut manifest = template.manifest.clone();
-        let mut inodes =
-            BTreeMap::<(u64, u64), (String, Option<String>, BTreeMap<String, String>)>::new();
+        let mut inodes = BTreeMap::<(u64, u64), LinkTarget>::new();
         for (path, entry, rule) in claimed.remove(&index).unwrap_or_default() {
             let facet = rule_facet(rule, path, matches!(entry, Entry::Symlink(_)));
             let variants = rule.variants.clone();
@@ -220,31 +243,39 @@ pub(crate) fn expand(
                     variants,
                 },
                 Entry::File { executable, inode } => {
+                    let mode = file_mode(rule, *executable);
                     // A collected hard link shares the first collected path of its inode
-                    // when every image that selects the alias also selects that path.
+                    // when every image that selects the alias also selects that path and
+                    // the alias's own rule gives it the same metadata.
                     match inodes.get(inode) {
-                        Some((target, target_facet, target_variants))
-                            if (target_facet.is_none() || target_facet == &facet)
-                                && target_variants == &variants =>
+                        Some(link)
+                            if (link.facet.is_none() || link.facet == facet)
+                                && link.variants == variants
+                                && !rule.preserve
+                                && (&link.mode, link.uid, link.gid)
+                                    == (&mode, rule.uid, rule.gid) =>
                         {
                             Action::Hardlink {
                                 path: path.to_owned(),
-                                target: target.clone(),
+                                target: link.path.clone(),
                                 facet,
                                 variants,
                             }
                         }
                         _ => {
                             if !rule.preserve {
-                                inodes.entry(*inode).or_insert((
-                                    path.to_owned(),
-                                    facet.clone(),
-                                    variants.clone(),
-                                ));
+                                inodes.entry(*inode).or_insert_with(|| LinkTarget {
+                                    path: path.to_owned(),
+                                    facet: facet.clone(),
+                                    variants: variants.clone(),
+                                    mode: mode.clone(),
+                                    uid: rule.uid,
+                                    gid: rule.gid,
+                                });
                             }
                             Action::File {
                                 path: path.to_owned(),
-                                mode: file_mode(rule, *executable),
+                                mode,
                                 uid: rule.uid,
                                 gid: rule.gid,
                                 preserve: rule.preserve,
@@ -316,7 +347,9 @@ pub(crate) fn check_expansion(template: &Template, expanded: &Manifest, strip: b
                         && original_name.is_none()
                 }
                 Action::Symlink { uid, gid, .. } => (*uid, *gid) == (rule.uid, rule.gid),
-                Action::Hardlink { .. } => !rule.preserve,
+                Action::Hardlink { target, .. } => {
+                    !rule.preserve && link_matches_rule(&expanded.action, target, rule)
+                }
                 Action::Dir { .. } => false,
             };
         ensure!(
@@ -327,6 +360,17 @@ pub(crate) fn check_expansion(template: &Template, expanded: &Manifest, strip: b
         );
     }
     Ok(())
+}
+
+/// A collected hard link gets its target's metadata, so the target must be a
+/// file with the metadata that the alias's own collect rule gives it.
+fn link_matches_rule(actions: &[Action], target: &str, rule: &CollectRule) -> bool {
+    actions.iter().any(|action| {
+        matches!(action, Action::File { path, mode, uid, gid, preserve: false, .. }
+            if path == target
+                && (mode == &file_mode(rule, true) || mode == &file_mode(rule, false))
+                && (*uid, *gid) == (rule.uid, rule.gid))
+    })
 }
 
 /// The path of the split debug information for an ELF build ID.
@@ -617,6 +661,116 @@ package "runtime/libcc" publisher="canopa" {
         let mut changed = compiler.clone();
         changed.action.remove(0);
         assert!(check_expansion(&templates[0], &changed, true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn outputs_may_share_identical_directories() -> Result<()> {
+        let recipe = recipe("");
+        let template = |name: &str, dir: &str| {
+            parse_template(
+                &format!(
+                    "schema-version 1 kind=\"package-manifest\"\npackage \"{name}\" publisher=\"canopa\" {{\n    {dir}\n    collect \"usr/lib/{name}/**\"\n}}\n"
+                ),
+                &recipe,
+            )
+            .unwrap()
+        };
+        let tree = Tree::from([
+            ("usr/lib/a/x".into(), file(false, 1)),
+            ("usr/lib/b/y".into(), file(false, 2)),
+        ]);
+        let shared = "dir \"usr/lib/plugins\" mode=\"0755\" uid=0 gid=0";
+        let templates = [template("a", shared), template("b", shared)];
+        let outputs = expand(&templates, &[], &tree)?;
+        for (template, output) in templates.iter().zip(&outputs) {
+            assert_eq!(output.action[0].path(), "usr/lib/plugins");
+            check_expansion(template, output, false)?;
+        }
+        let templates = [
+            template("a", shared),
+            template("b", &shared.replace("0755", "0750")),
+        ];
+        let message = format!("{:#}", expand(&templates, &[], &tree).unwrap_err());
+        assert!(message.contains("belongs to both a and b"), "{message}");
+        let templates = [
+            template("a", shared),
+            template("b", "symlink \"usr/lib/plugins\" target=\"x\" uid=0 gid=0"),
+        ];
+        assert!(expand(&templates, &[], &tree).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_aliases_keep_their_own_collect_rule() -> Result<()> {
+        let recipe = recipe("");
+        let template = |rules: &str| {
+            parse_template(
+                &format!(
+                    "schema-version 1 kind=\"package-manifest\"\npackage \"devel/compiler\" publisher=\"canopa\" {{\n{rules}}}\n"
+                ),
+                &recipe,
+            )
+            .unwrap()
+        };
+        let action = |manifest: &Manifest, path: &str| {
+            manifest
+                .action
+                .iter()
+                .find(|action| action.path() == path)
+                .cloned()
+                .unwrap()
+        };
+
+        // A preserved alias with its own mode stays a file.
+        let state = template(
+            "    collect \"usr/share/a/**\"\n    collect \"var/lib/a/state\" preserve=#true mode=\"0600\"\n",
+        );
+        let tree = Tree::from([
+            ("usr/share/a/x".into(), file(false, 1)),
+            ("var/lib/a/state".into(), file(false, 1)),
+        ]);
+        let output = &expand(std::slice::from_ref(&state), &[], &tree)?[0];
+        assert!(matches!(
+            action(output, "var/lib/a/state"),
+            Action::File { mode, preserve: true, .. } if mode == "0600"
+        ));
+        check_expansion(&state, output, false)?;
+
+        // A setuid alias keeps its mode.
+        let helper =
+            template("    collect \"usr/bin/*\"\n    collect \"usr/sbin/helper\" mode=\"4755\"\n");
+        let tree = Tree::from([
+            ("usr/bin/x".into(), file(true, 2)),
+            ("usr/sbin/helper".into(), file(true, 2)),
+        ]);
+        let output = &expand(std::slice::from_ref(&helper), &[], &tree)?[0];
+        assert!(matches!(
+            action(output, "usr/sbin/helper"),
+            Action::File { mode, .. } if mode == "4755"
+        ));
+        check_expansion(&helper, output, false)?;
+
+        // An alias with the target's metadata still becomes a hard link.
+        let same = template("    collect \"usr/bin/*\"\n    collect \"usr/sbin/helper\"\n");
+        let linked = &expand(std::slice::from_ref(&same), &[], &tree)?[0];
+        assert!(matches!(
+            action(linked, "usr/sbin/helper"),
+            Action::Hardlink { target, .. } if target == "usr/bin/x"
+        ));
+        check_expansion(&same, linked, false)?;
+
+        // The consistency check rejects a hard link whose target has other metadata.
+        assert!(check_expansion(&helper, linked, false).is_err());
+        let mut changed = linked.clone();
+        if let Some(Action::File { uid, .. }) = changed
+            .action
+            .iter_mut()
+            .find(|action| action.path() == "usr/bin/x")
+        {
+            *uid = 1;
+        }
+        assert!(check_expansion(&same, &changed, false).is_err());
         Ok(())
     }
 

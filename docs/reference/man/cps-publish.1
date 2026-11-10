@@ -6,13 +6,16 @@
 .HP 4
 .B \&cps publish \-\-repo <REPO> \-\-proto <PROTO> \-\-signing\-key <KEY> <MANIFESTS>...
 .SH ARGUMENTS
-.PP
+.TP
 .B \&<MANIFESTS>...
+\&Manifests to publish
 .SH OPTIONS
-.PP
+.TP
 .B \&\-\-repo <REPO>
-.PP
+\&Local repository to publish into
+.TP
 .B \&\-\-proto <PROTO>
+\&Prototype tree that holds the manifests' payloads at their action paths
 .TP
 .B \&\-\-signing\-key <KEY>
 \&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)

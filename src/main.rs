@@ -178,12 +178,16 @@ enum Command {
     Build {
         #[command(flatten)]
         inputs: BuildInputs,
+        /// New directory for the build bundle: recipe, templates, manifests, and proto tree
         #[arg(long)]
         output: PathBuf,
+        /// Build twice in fresh sandboxes and require identical outputs
         #[arg(long)]
         check_reproducible: bool,
-        #[arg(long, requires = "check_reproducible")]
+        /// Sign a build attestation with this key: PATH, file:PATH, or command:DESCRIPTOR (requires --check-reproducible)
+        #[arg(long, value_name = "KEY", requires = "check_reproducible")]
         builder_signing_key: Option<PathBuf>,
+        /// Build recipe to run
         recipe: PathBuf,
     },
     /// Run a shell or command with a recipe's verified toolchain and sources
@@ -234,32 +238,40 @@ enum Command {
     },
     /// Publish manifests and their payloads to a local repository in one signed catalog update
     Publish {
+        /// Local repository to publish into
         #[arg(long)]
         repo: PathBuf,
+        /// Prototype tree that holds the manifests' payloads at their action paths
         #[arg(long)]
         proto: PathBuf,
         /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
         #[arg(long, value_name = "KEY", required = true)]
         signing_key: Vec<PathBuf>,
+        /// Manifests to publish
         #[arg(required = true)]
         manifests: Vec<PathBuf>,
     },
     /// Publish a reproducible build bundle after verifying its worker signature and reviewed recipe
     PublishBundle {
+        /// Local repository to publish into
         #[arg(long)]
         repo: PathBuf,
         /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
         #[arg(long, value_name = "KEY", required = true)]
         signing_key: Vec<PathBuf>,
+        /// Public key of the build worker that signed the bundle's attestation
         #[arg(long)]
         builder_key: PathBuf,
+        /// SHA-256 of the reviewed build recipe
         #[arg(long)]
         recipe_sha256: String,
+        /// Another worker's public key and its attestation for the same build
         #[arg(long, value_name = "KEY=ATTESTATION", value_parser = parse_witness)]
         witness: Vec<BuildWitness>,
         /// Cache of verified source files to include in the publication
         #[arg(long)]
         source_cache: Option<PathBuf>,
+        /// Build bundle from cps build --builder-signing-key
         bundle: PathBuf,
     },
     /// Export or synchronize a signed repository release
@@ -516,19 +528,25 @@ enum Command {
 
 #[derive(Args)]
 struct BuildInputs {
+    /// Local repository of the toolchain publisher
     #[arg(long, required_unless_present = "toolchain_config")]
     repo: Option<PathBuf>,
+    /// Toolchain publisher, when the recipe pins one publisher
     #[arg(long, required_unless_present = "toolchain_config")]
     publisher: Option<String>,
+    /// Trust root file that matches the recipe's key-sha256 pin
     #[arg(long, required_unless_present = "toolchain_config")]
     trust_root: Option<PathBuf>,
     /// Worker-local repository and trust key locations for the pinned publishers
     #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_root"])]
     toolchain_config: Option<PathBuf>,
+    /// Directory of the recipe's source inputs at their recipe paths
     #[arg(long, required_unless_present = "source_cache")]
     sources: Option<PathBuf>,
+    /// Source cache filled by cps source fetch or cps source import
     #[arg(long, conflicts_with = "sources")]
     source_cache: Option<PathBuf>,
+    /// Build worker limits: time, scratch space, file, output, and log sizes, and jobs
     #[arg(long)]
     worker_config: Option<PathBuf>,
     /// Override a build option declared in the recipe
@@ -674,18 +692,25 @@ enum SourceCommand {
 enum ManifestCommand {
     /// Generate KDL from a staged prototype tree
     Generate {
+        /// Staged prototype tree to describe
         #[arg(long)]
         proto: PathBuf,
+        /// Publisher of the package
         #[arg(long)]
         publisher: String,
+        /// Package version, such as 1.0.0-0
         #[arg(long)]
         version: String,
+        /// Restrict the package to one architecture, such as x86_64
         #[arg(long)]
         architecture: Option<String>,
+        /// Owner UID for every generated action
         #[arg(long, default_value_t = 0)]
         uid: u32,
+        /// Owner GID for every generated action
         #[arg(long, default_value_t = 0)]
         gid: u32,
+        /// Package name, such as apps/tool
         name: String,
     },
     /// Review generated library capabilities and suggest path-based requires using pinned catalogs
@@ -4147,6 +4172,90 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("cps: {error:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::Cli;
+
+    /// The full command tree needs more stack than a test thread has.
+    fn with_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn command_line_is_consistent() {
+        with_stack(|| Cli::command().debug_assert());
+    }
+
+    #[test]
+    fn builder_signing_requires_a_reproducibility_check() {
+        with_stack(builder_signing);
+    }
+
+    fn builder_signing() {
+        let build = |extra: &[&str]| {
+            let mut args = vec![
+                "cps",
+                "build",
+                "--toolchain-config",
+                "t.kdl",
+                "--sources",
+                "s",
+                "--output",
+                "o",
+                "--builder-signing-key",
+                "k.der",
+            ];
+            args.extend_from_slice(extra);
+            args.push("r.kdl");
+            Cli::try_parse_from(args)
+        };
+        let error = build(&[])
+            .err()
+            .expect("signing without a check was accepted");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(build(&["--check-reproducible"]).is_ok());
+    }
+
+    #[test]
+    fn build_publish_and_generate_flags_have_help() {
+        with_stack(flags_have_help);
+    }
+
+    fn flags_have_help() {
+        let mut cli = Cli::command();
+        for path in [
+            &["build"][..],
+            &["publish"],
+            &["publish-bundle"],
+            &["manifest", "generate"],
+        ] {
+            let mut command = &mut cli;
+            for name in path {
+                command = command.find_subcommand_mut(name).unwrap();
+            }
+            for arg in command.get_arguments() {
+                if !matches!(arg.get_id().as_str(), "help" | "version") {
+                    assert!(
+                        arg.get_help().is_some(),
+                        "{path:?} {} has no help",
+                        arg.get_id()
+                    );
+                }
+            }
         }
     }
 }

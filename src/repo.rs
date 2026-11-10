@@ -2446,6 +2446,21 @@ pub fn publish_batch(
     publish_manifests(repo, &Root::open(proto)?, manifests, &key, None)
 }
 
+/// Publish checked manifests whose payloads come from an opened proto tree.
+pub(crate) fn publish_from_root(
+    repo: &Path,
+    proto: &Root,
+    manifests: Vec<Manifest>,
+    key: &(impl KeySpecs + ?Sized),
+) -> Result<Vec<String>> {
+    let key = Publication::open(repo, key)?;
+    let manifests = manifests
+        .into_iter()
+        .map(|manifest| (manifest, None))
+        .collect();
+    publish_manifests(repo, proto, manifests, &key, None)
+}
+
 fn exact_publisher(id: &str) -> Result<&str> {
     let spec = PackageSpec::parse(id)?;
     spec.publisher

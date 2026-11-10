@@ -101,7 +101,30 @@ pub(crate) fn needed_capabilities(consumer: &Elf, needed: &str) -> Result<Vec<St
     }
 }
 
-pub(crate) fn inspect(mut file: File, size: u64, hash: &str) -> Result<Option<Elf>> {
+pub(crate) fn inspect(file: File, size: u64, hash: &str) -> Result<Option<Elf>> {
+    inspect_with(file, size, hash, inspect_header)
+}
+
+/// Like `inspect`, but a file whose ELF structure does not parse is not a
+/// loadable object. Generated declarations use this, so that a deliberately
+/// malformed ELF file, such as a test fixture, does not block a build or a
+/// publication. The size and digest checks still apply.
+pub(crate) fn inspect_loadable(file: File, size: u64, hash: &str) -> Result<Option<Elf>> {
+    inspect_with(file, size, hash, loadable_header)
+}
+
+/// Like `inspect_header`, but an ELF structure that does not parse is not a
+/// loadable object.
+pub(crate) fn loadable_header(file: &mut File, prefix: &[u8]) -> Result<Option<Elf>> {
+    Ok(inspect_header(file, prefix).ok().flatten())
+}
+
+fn inspect_with(
+    mut file: File,
+    size: u64,
+    hash: &str,
+    header: impl FnOnce(&mut File, &[u8]) -> Result<Option<Elf>>,
+) -> Result<Option<Elf>> {
     let before = file.metadata()?;
     ensure!(before.len() == size, "payload size differs from manifest");
     let mut magic = [0; 5];
@@ -112,7 +135,7 @@ pub(crate) fn inspect(mut file: File, size: u64, hash: &str) -> Result<Option<El
         digest_reader(file.by_ref().take(size.saturating_add(1)))? == hash,
         "payload digest differs from manifest"
     );
-    let info = inspect_header(&mut file, &magic[..prefix])?;
+    let info = header(&mut file, &magic[..prefix])?;
     let after = file.metadata()?;
     ensure!(
         (before.ctime(), before.ctime_nsec(), size)
