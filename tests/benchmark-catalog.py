@@ -250,7 +250,8 @@ def main():
         "install", package_name(options.packages), label="plan_install_after_publish")
 
     run("verify", "--root", "image", "--pristine", label="verify_offline")
-    lookup = ("search", "--root", "image", "--file", f"pkg-{workload:06}")
+    lookup = ("search", "--root", "image", "--file",
+              f"/usr/share/bench/pkg-{workload:06}/file-000")
     run(*lookup, label="file_search_manifests")
     run("repo", "index-files", "--repo", "repo", "--publisher", PUBLISHER,
         "--signing-key", "private.der", label="publish_file_index")
