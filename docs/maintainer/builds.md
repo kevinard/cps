@@ -62,7 +62,10 @@ such as the digest in its `current` file when you prepare the recipe.
 `key-sha256` is the SHA-256 of the publisher trust root file that the worker
 pins, such as `sha256sum canopa.trust.json`. Replace the template and
 source hashes with their SHA-256 digests and set `size` to the source's
-byte count. The template path is relative to the recipe, and source paths
+byte count. After the first time, let
+[`cps recipe repin`](orchestration.md#refresh-recipe-pins) recompute them:
+`cps recipe repin --manifests --local-sources --trust-root canopa.trust.json hello.build.kdl`
+refreshes the template, source, and key pins from the files. The template path is relative to the recipe, and source paths
 are relative to `--sources` or the source cache. The toolchain package must
 provide the shell, compiler, and utilities through its dependencies.
 
@@ -441,8 +444,8 @@ CPS verifies each trust root against its pin and reads the exact signed
 catalog from its local repository. Build evidence records the ordered pins
 and each selected package's publisher, version, and manifest digest. When a
 new toolchain catalog is published,
-[`cps recipe repin`](orchestration.md#repin-toolchain-catalogs) moves
-recipes to it.
+[`cps recipe repin --toolchain-catalog`](orchestration.md#refresh-recipe-pins)
+moves recipes to it.
 
 ## Preparing a source cache
 
@@ -464,7 +467,10 @@ checks the local directory for uncached inputs and uses the recipe URLs for
 missing files. A local file that fails verification stops the fetch.
 
 `cps source import --from sources --cache source-cache hello.build.kdl`
-fills the same cache offline. Builds read the cache offline and verify each
+fills the same cache offline. When a source changes, such as a new release
+archive or an edited patch, `cps recipe repin --sources sources` or
+`--local-sources` recomputes its `size` and `sha256` from the file, as
+`updpkgsums` does. Builds read the cache offline and verify each
 input again before staging it under its recipe path. The `--sources` build
 option accepts a directory laid out by recipe path.
 

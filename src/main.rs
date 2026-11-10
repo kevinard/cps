@@ -741,18 +741,35 @@ enum ManifestCommand {
 
 #[derive(Subcommand)]
 enum RecipeCommand {
-    /// Rewrite toolchain catalog pins in recipes, keeping their formatting
+    /// Refresh toolchain, manifest, and source pins in recipes, keeping their formatting
+    #[command(group(
+        clap::ArgGroup::new("pins")
+            .required(true)
+            .multiple(true)
+            .args(["catalogs", "trust_roots", "manifests", "local_sources", "sources"])
+    ))]
     Repin {
         /// New catalog digest for a toolchain publisher
-        #[arg(
-            long = "toolchain-catalog",
-            required = true,
-            value_name = "PUBLISHER=SHA256"
-        )]
+        #[arg(long = "toolchain-catalog", value_name = "PUBLISHER=SHA256")]
         catalogs: Vec<String>,
-        /// Print the changes without writing them
+        /// Set key-sha256 of the toolchain publisher that this trust root names
+        #[arg(long = "trust-root", value_name = "PATH")]
+        trust_roots: Vec<PathBuf>,
+        /// Recompute manifest digests from the templates next to each recipe
         #[arg(long)]
+        manifests: bool,
+        /// Recompute source sizes and digests from files in each recipe's directory
+        #[arg(long)]
+        local_sources: bool,
+        /// Recompute source sizes and digests from this directory laid out by source path (repeatable, searched in order)
+        #[arg(long, value_name = "DIR")]
+        sources: Vec<PathBuf>,
+        /// Print the changes without writing them
+        #[arg(long, conflicts_with = "check")]
         dry_run: bool,
+        /// Write nothing, print stale pins, and fail if any pin is stale
+        #[arg(long)]
+        check: bool,
         /// Recipe files or directories to search for recipes
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<PathBuf>,
@@ -2654,22 +2671,57 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Recipe { command } => match command {
             RecipeCommand::Repin {
                 catalogs,
+                trust_roots,
+                manifests,
+                local_sources,
+                sources,
                 dry_run,
+                check,
                 paths,
             } => {
-                for repin in cps::orchestrate::repin_recipes(&paths, &catalogs, dry_run)? {
-                    let verb = if dry_run { "would repin" } else { "repinned" };
-                    print!(
-                        "{verb} {} {} {} -> {}",
-                        repin.recipe.display(),
-                        repin.publisher,
-                        repin.from,
-                        repin.to
-                    );
-                    match repin.recipe_sha256 {
-                        Some(hash) => println!(" (recipe sha256 {hash})"),
-                        None => println!(),
+                let request = cps::orchestrate::RepinRequest {
+                    catalogs,
+                    trust_roots,
+                    manifests,
+                    local_sources,
+                    sources,
+                };
+                let report =
+                    cps::orchestrate::repin_recipes(&paths, &request, !(dry_run || check))?;
+                for warning in &report.warnings {
+                    eprintln!("cps: {warning}");
+                }
+                let verb = if check {
+                    "stale"
+                } else if dry_run {
+                    "would repin"
+                } else {
+                    "repinned"
+                };
+                let mut stale = 0;
+                for recipe in &report.recipes {
+                    for change in &recipe.changes {
+                        stale += 1;
+                        println!(
+                            "{verb} {} {} {} -> {}",
+                            recipe.recipe.display(),
+                            change.pin,
+                            change.from,
+                            change.to
+                        );
                     }
+                    if let Some(hash) = &recipe.recipe_sha256
+                        && !check
+                    {
+                        println!("recipe {} sha256 {hash}", recipe.recipe.display());
+                    }
+                }
+                if check && stale > 0 {
+                    eprintln!(
+                        "cps: {stale} pin(s) in {} recipe(s) are stale; run cps recipe repin without --check to update them",
+                        report.recipes.len()
+                    );
+                    return Ok(ExitCode::FAILURE);
                 }
             }
         },

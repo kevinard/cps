@@ -91,8 +91,14 @@ fn recipe_candidate(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    // A build bundle stores its recipe as build.kdl next to its outputs.
-    name != "build.kdl" && (name.ends_with(".kdl") || name.ends_with(".kdl.in"))
+    name.ends_with(".kdl") || name.ends_with(".kdl.in")
+}
+
+/// A build bundle stores its effective recipe as `build.kdl` next to its
+/// expanded manifests and proto tree. Searching skips bundles, so a recipe
+/// tree that keeps build outputs beside its recipes orders only the recipes.
+fn is_bundle(dir: &Path) -> bool {
+    dir.join("build.kdl").is_file() && dir.join("manifests").is_dir() && dir.join("proto").is_dir()
 }
 
 fn discover(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -102,7 +108,7 @@ fn discover(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
             let path = entry.path();
             let kind = entry.file_type()?;
             if kind.is_dir() {
-                if !entry.file_name().to_string_lossy().starts_with('.') {
+                if !entry.file_name().to_string_lossy().starts_with('.') && !is_bundle(&path) {
                     walk(&path, found)?;
                 }
             } else if kind.is_file() && recipe_candidate(&path) && is_recipe(&path)? {
@@ -114,6 +120,11 @@ fn discover(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut found = BTreeSet::new();
     for path in paths {
         if path.is_dir() {
+            ensure!(
+                !is_bundle(path),
+                "{} is a build bundle; name its build.kdl to include it",
+                path.display()
+            );
             walk(path, &mut found)?;
         } else {
             ensure!(is_recipe(path)?, "{} is not a build recipe", path.display());
@@ -678,21 +689,137 @@ pub fn rebuild_plan(
     Ok(plan)
 }
 
-/// One rewritten toolchain pin.
-#[derive(Debug)]
-pub struct Repin {
-    pub recipe: PathBuf,
-    pub publisher: String,
+/// The pins that `cps recipe repin` refreshes. Each field selects one kind
+/// of pin; the others stay as written.
+#[derive(Debug, Default)]
+pub struct RepinRequest {
+    /// New toolchain catalog digests, each `PUBLISHER=SHA256`.
+    pub catalogs: Vec<String>,
+    /// Publisher trust root files whose SHA-256 becomes the `key-sha256` of
+    /// the toolchain publisher that each one names.
+    pub trust_roots: Vec<PathBuf>,
+    /// Recompute `manifest` digests from the templates next to each recipe.
+    pub manifests: bool,
+    /// Search each recipe's own directory for its sources, before `sources`.
+    pub local_sources: bool,
+    /// Directories laid out by source path, searched in order, from which
+    /// `source` sizes and digests are recomputed.
+    pub sources: Vec<PathBuf>,
+}
+
+/// One rewritten pin, such as `toolchain seed catalog` or
+/// `source busybox-1.38.0.tar.bz2 size`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PinChange {
+    pub pin: String,
     pub from: String,
     pub to: String,
+}
+
+/// A recipe whose pins changed.
+#[derive(Debug)]
+pub struct RepinnedRecipe {
+    pub recipe: PathBuf,
+    pub changes: Vec<PinChange>,
     /// The digest of the rewritten recipe, for publish-policy approvals.
     /// Templates have none.
     pub recipe_sha256: Option<String>,
 }
 
-/// Rewrite the toolchain catalog pins of every recipe under `paths`,
-/// keeping comments and formatting. With `dry_run` nothing is written.
-pub fn repin_recipes(paths: &[PathBuf], pins: &[String], dry_run: bool) -> Result<Vec<Repin>> {
+#[derive(Debug, Default)]
+pub struct RepinReport {
+    pub recipes: Vec<RepinnedRecipe>,
+    /// Pins that could not be checked, such as a source found in no directory.
+    pub warnings: Vec<String>,
+}
+
+/// The pins of one recipe as parsed. Placeholders read as `None` or as a
+/// string that is not a digest, and are never rewritten.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Pins {
+    toolchain: Vec<(String, Option<String>, Option<String>)>,
+    manifests: Vec<(String, Option<String>)>,
+    sources: Vec<(String, Option<String>, Option<i128>)>,
+}
+
+impl Pins {
+    fn read(doc: &KdlDocument) -> Self {
+        let mut pins = Self::default();
+        let string = |node: &KdlNode, key: &str| {
+            node.get(key)
+                .and_then(KdlValue::as_string)
+                .map(str::to_owned)
+        };
+        for node in doc.get("build").into_iter().flat_map(children) {
+            let name = argument(node).map(str::to_owned);
+            match (node.name().value(), name) {
+                ("toolchain", _) => {
+                    for publisher in children(node).filter(|n| n.name().value() == "publisher") {
+                        if let Some(name) = argument(publisher) {
+                            pins.toolchain.push((
+                                name.to_owned(),
+                                string(publisher, "catalog"),
+                                string(publisher, "key-sha256"),
+                            ));
+                        }
+                    }
+                }
+                ("manifest", Some(name)) => pins.manifests.push((name, string(node, "sha256"))),
+                ("source", Some(name)) => pins.sources.push((
+                    name,
+                    string(node, "sha256"),
+                    node.get("size").and_then(KdlValue::as_integer),
+                )),
+                _ => {}
+            }
+        }
+        pins
+    }
+}
+
+/// A textual replacement of one property value on the line of one node.
+struct Edit {
+    /// The start of the node's line, such as `source "a.tar.gz"`.
+    node: String,
+    /// The property and its current literal, such as `size=123`.
+    from: String,
+    to: String,
+}
+
+impl Edit {
+    fn string(node: &str, name: &str, property: &str, from: &str, to: &str) -> Self {
+        Self {
+            node: format!("{node} {name:?}"),
+            from: format!("{property}=\"{from}\""),
+            to: format!("{property}=\"{to}\""),
+        }
+    }
+
+    /// Replace the property on `line` if the line declares the node and
+    /// spells the property as one whole token.
+    fn apply(&self, line: &str) -> Option<String> {
+        let rest = line.trim_start().strip_prefix(&self.node)?;
+        if !rest.starts_with([' ', '\t']) {
+            return None;
+        }
+        let mut offset = line.len() - rest.len();
+        while let Some(found) = line[offset..].find(&self.from) {
+            let start = offset + found;
+            let end = start + self.from.len();
+            let before = line[..start].chars().next_back();
+            let after = line[end..].chars().next();
+            if before.is_some_and(char::is_whitespace)
+                && after.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '}' | '/' | '\\'))
+            {
+                return Some(format!("{}{}{}", &line[..start], self.to, &line[end..]));
+            }
+            offset = end;
+        }
+        None
+    }
+}
+
+fn parse_publisher_pins(pins: &[String]) -> Result<BTreeMap<&str, &str>> {
     let mut catalogs = BTreeMap::new();
     for pin in pins {
         let (publisher, hash) = pin.split_once('=').context("expected PUBLISHER=SHA256")?;
@@ -703,48 +830,195 @@ pub fn repin_recipes(paths: &[PathBuf], pins: &[String], dry_run: bool) -> Resul
             "duplicate toolchain catalog for {publisher}"
         );
     }
+    Ok(catalogs)
+}
+
+/// The size and SHA-256 of a source file.
+fn file_pin(path: &Path) -> Result<(i128, String)> {
+    struct Counting<R>(R, u64);
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.0.read(buf)?;
+            self.1 += read as u64;
+            Ok(read)
+        }
+    }
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = Counting(file, 0);
+    let sha256 = crate::model::digest_reader(&mut reader)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok((i128::from(reader.1), sha256))
+}
+
+/// Refresh the selected pins of every recipe under `paths`, keeping
+/// comments and formatting. With `write` false nothing is written, which
+/// serves both dry runs and staleness checks.
+pub fn repin_recipes(
+    paths: &[PathBuf],
+    request: &RepinRequest,
+    write: bool,
+) -> Result<RepinReport> {
+    let catalogs = parse_publisher_pins(&request.catalogs)?;
+    let mut keys = BTreeMap::new();
+    for path in &request.trust_roots {
+        let pinned = read_trust_root(path)?;
+        let publisher = crate::repo::trust_root_publisher(&pinned)?;
+        ensure!(
+            keys.insert(publisher.clone(), digest(&pinned)).is_none(),
+            "two trust roots given for publisher {publisher}"
+        );
+    }
     ensure!(
-        !catalogs.is_empty(),
-        "repin needs at least one --toolchain-catalog"
+        !catalogs.is_empty()
+            || !keys.is_empty()
+            || request.manifests
+            || request.local_sources
+            || !request.sources.is_empty(),
+        "repin needs at least one kind of pin to refresh"
     );
-    let mut changes = Vec::new();
+    let mut report = RepinReport::default();
     // Every rewrite is computed and validated before any recipe changes, so
     // one recipe that repin cannot rewrite leaves the whole tree as it was.
     let mut writes = Vec::new();
     for path in discover(paths)? {
         let text = read_text(&path, RECIPE_LIMIT)?;
-        let pins = toolchain_pins(&parse_document(&path, RECIPE_LIMIT)?);
+        let pins = Pins::read(&parse_document(&path, RECIPE_LIMIT)?);
+        let dir = path.parent().unwrap_or(Path::new("."));
         let mut expected = pins.clone();
-        let mut rewritten = Vec::new();
-        for (name, from) in &mut expected {
-            if let Some(&to) = catalogs.get(name.as_str())
-                // Placeholders such as @CATALOG_SHA256@ belong to the template.
+        let mut edits = Vec::new();
+        let mut changes = Vec::new();
+        let mut change = |edit: Edit, pin: String, from: String, to: String| {
+            edits.push(edit);
+            changes.push(PinChange { pin, from, to });
+        };
+        // Placeholders such as @CATALOG_SHA256@ belong to the template, so
+        // only values that are already digests are rewritten.
+        let concrete = |value: &Option<String>| {
+            value
+                .as_deref()
+                .filter(|value| validate_digest(value).is_ok())
+                .map(str::to_owned)
+        };
+        for (name, catalog, key) in &mut expected.toolchain {
+            if let (Some(from), Some(&to)) = (concrete(catalog), catalogs.get(name.as_str()))
                 && from != to
-                && validate_digest(from).is_ok()
             {
-                rewritten.push((name.clone(), std::mem::replace(from, to.to_owned()), to));
+                change(
+                    Edit::string("publisher", name, "catalog", &from, to),
+                    format!("toolchain {name} catalog"),
+                    from,
+                    to.to_owned(),
+                );
+                *catalog = Some(to.to_owned());
+            }
+            if let (Some(from), Some(to)) = (concrete(key), keys.get(name.as_str()))
+                && &from != to
+            {
+                change(
+                    Edit::string("publisher", name, "key-sha256", &from, to),
+                    format!("toolchain {name} key-sha256"),
+                    from,
+                    to.clone(),
+                );
+                *key = Some(to.clone());
             }
         }
-        if rewritten.is_empty() {
+        if request.manifests {
+            for (name, sha256) in &mut expected.manifests {
+                let Some(from) = concrete(sha256) else {
+                    continue;
+                };
+                crate::model::validate_path(name)
+                    .with_context(|| format!("{}: manifest {name}", path.display()))?;
+                let manifest = dir.join(&*name);
+                if !manifest.is_file() {
+                    report.warnings.push(format!(
+                        "{}: manifest {name} is not next to the recipe, so its pin is unchecked",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let to = digest(&read_limited(
+                    File::open(&manifest)
+                        .with_context(|| format!("opening {}", manifest.display()))?,
+                    MANIFEST_LIMIT,
+                )?);
+                if from != to {
+                    change(
+                        Edit::string("manifest", name, "sha256", &from, &to),
+                        format!("manifest {name} sha256"),
+                        from,
+                        to.clone(),
+                    );
+                    *sha256 = Some(to);
+                }
+            }
+        }
+        if request.local_sources || !request.sources.is_empty() {
+            let search: Vec<&Path> = request
+                .local_sources
+                .then_some(dir)
+                .into_iter()
+                .chain(request.sources.iter().map(PathBuf::as_path))
+                .collect();
+            for (name, sha256, size) in &mut expected.sources {
+                let (Some(from), Some(from_size)) = (concrete(sha256), *size) else {
+                    continue;
+                };
+                crate::model::validate_path(name)
+                    .with_context(|| format!("{}: source {name}", path.display()))?;
+                let Some(file) = search
+                    .iter()
+                    .map(|root| root.join(&*name))
+                    .find(|file| file.is_file())
+                else {
+                    report.warnings.push(format!(
+                        "{}: source {name} is in no source directory, so its pin is unchecked",
+                        path.display()
+                    ));
+                    continue;
+                };
+                let (to_size, to) = file_pin(&file)?;
+                if from != to {
+                    change(
+                        Edit::string("source", name, "sha256", &from, &to),
+                        format!("source {name} sha256"),
+                        from,
+                        to.clone(),
+                    );
+                    *sha256 = Some(to);
+                }
+                if from_size != to_size {
+                    change(
+                        Edit {
+                            node: format!("source {name:?}"),
+                            from: format!("size={from_size}"),
+                            to: format!("size={to_size}"),
+                        },
+                        format!("source {name} size"),
+                        from_size.to_string(),
+                        to_size.to_string(),
+                    );
+                    *size = Some(to_size);
+                }
+            }
+        }
+        if edits.is_empty() {
             continue;
         }
         // Edit the pin text in place so comments, spacing, and template
         // placeholders stay as they are, then confirm the parsed result.
+        let mut pending: Vec<Option<Edit>> = edits.into_iter().map(Some).collect();
         let mut output = String::with_capacity(text.len());
         for line in text.split_inclusive('\n') {
-            let pin = rewritten.iter().find(|(name, from, _)| {
-                line.trim_start()
-                    .starts_with(&format!("publisher {name:?} "))
-                    && line.contains(&format!("catalog=\"{from}\""))
-            });
-            match pin {
-                Some((_, from, to)) => output.push_str(&line.replacen(
-                    &format!("catalog=\"{from}\""),
-                    &format!("catalog=\"{to}\""),
-                    1,
-                )),
-                None => output.push_str(line),
+            let mut line = line.to_owned();
+            for slot in &mut pending {
+                if let Some(edited) = slot.as_ref().and_then(|edit| edit.apply(&line)) {
+                    line = edited;
+                    *slot = None;
+                }
             }
+            output.push_str(&line);
         }
         let mut check = output.clone();
         if is_template(&path) {
@@ -754,8 +1028,8 @@ pub fn repin_recipes(paths: &[PathBuf], pins: &[String], dry_run: bool) -> Resul
             .parse()
             .map_err(|error: kdl::KdlError| anyhow::anyhow!("invalid KDL: {error:?}"))?;
         ensure!(
-            toolchain_pins(&parsed) == expected,
-            "{} spells a toolchain pin in a form that repin does not rewrite; edit it by hand",
+            pending.iter().all(Option::is_none) && Pins::read(&parsed) == expected,
+            "{} spells a pin in a form that repin does not rewrite; edit it by hand",
             path.display()
         );
         let recipe_sha256 = if is_template(&path) {
@@ -765,37 +1039,19 @@ pub fn repin_recipes(paths: &[PathBuf], pins: &[String], dry_run: bool) -> Resul
                 .with_context(|| format!("validating repinned {}", path.display()))?;
             Some(digest(output.as_bytes()))
         };
-        changes.extend(rewritten.into_iter().map(|(publisher, from, to)| Repin {
+        report.recipes.push(RepinnedRecipe {
             recipe: path.clone(),
-            publisher,
-            from,
-            to: to.to_owned(),
-            recipe_sha256: recipe_sha256.clone(),
-        }));
+            changes,
+            recipe_sha256,
+        });
         writes.push((path, output));
     }
-    if !dry_run {
+    if write {
         for (path, output) in writes {
             write_replacing(&path, output.as_bytes())?;
         }
     }
-    Ok(changes)
-}
-
-fn toolchain_pins(doc: &KdlDocument) -> Vec<(String, String)> {
-    doc.get("build")
-        .into_iter()
-        .flat_map(children)
-        .filter(|node| node.name().value() == "toolchain")
-        .flat_map(children)
-        .filter(|node| node.name().value() == "publisher")
-        .filter_map(|node| {
-            Some((
-                argument(node)?.to_owned(),
-                node.get("catalog")?.as_string()?.to_owned(),
-            ))
-        })
-        .collect()
+    Ok(report)
 }
 
 fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -869,6 +1125,13 @@ mod tests {
         Ok(())
     }
 
+    fn catalogs(pins: &[String]) -> RepinRequest {
+        RepinRequest {
+            catalogs: pins.to_vec(),
+            ..RepinRequest::default()
+        }
+    }
+
     #[test]
     fn repin_rewrites_digests_and_keeps_formatting() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -876,16 +1139,27 @@ mod tests {
         let file = dir.path().join("app.build.kdl.in");
         let before = fs::read_to_string(&file)?;
         let new = "1".repeat(64);
-        let dry = repin_recipes(&[dir.path().to_owned()], &[format!("seed={new}")], true)?;
-        assert_eq!(dry.len(), 1);
+        let request = catalogs(&[format!("seed={new}")]);
+        let dry = repin_recipes(&[dir.path().to_owned()], &request, false)?;
+        assert_eq!(dry.recipes.len(), 1);
+        assert_eq!(
+            dry.recipes[0].changes,
+            [PinChange {
+                pin: "toolchain seed catalog".into(),
+                from: "0".repeat(64),
+                to: new.clone(),
+            }]
+        );
         assert_eq!(fs::read_to_string(&file)?, before);
-        repin_recipes(&[dir.path().to_owned()], &[format!("seed={new}")], false)?;
+        repin_recipes(&[dir.path().to_owned()], &request, true)?;
         assert_eq!(
             fs::read_to_string(&file)?,
             before.replace(&"0".repeat(64), &new)
         );
         assert!(
-            repin_recipes(&[dir.path().to_owned()], &[format!("seed={new}")], false)?.is_empty()
+            repin_recipes(&[dir.path().to_owned()], &request, true)?
+                .recipes
+                .is_empty()
         );
         Ok(())
     }
@@ -902,12 +1176,130 @@ mod tests {
         let split = fs::read_to_string(&bad)?.replace(" catalog=", " \\\n            catalog=");
         fs::write(&bad, &split)?;
         let new = "1".repeat(64);
-        let error = repin_recipes(&[dir.path().to_owned()], &[format!("seed={new}")], false)
-            .unwrap_err()
-            .to_string();
+        let error = repin_recipes(
+            &[dir.path().to_owned()],
+            &catalogs(&[format!("seed={new}")]),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("edit it by hand"), "{error}");
         assert_eq!(fs::read_to_string(&good)?, before);
         assert_eq!(fs::read_to_string(&bad)?, split);
+        Ok(())
+    }
+
+    /// A concrete recipe named build.kdl with a manifest, a checked-in
+    /// patch, a downloaded archive, and a source whose pin is a placeholder
+    /// in a sibling template.
+    fn concrete_recipe(dir: &Path) -> Result<PathBuf> {
+        let zero = "0".repeat(64);
+        fs::write(
+            dir.join("hello.kdl"),
+            "schema-version 1 kind=\"package-manifest\"\npackage \"apps/hello\" publisher=\"canopa\" version=\"1.0.0-0\" {\n    collect \"usr/bin/*\"\n}\n",
+        )?;
+        fs::write(dir.join("fix.patch"), "--- a\n+++ b\n")?;
+        let recipe = dir.join("build.kdl");
+        fs::write(
+            &recipe,
+            format!(
+                "schema-version 1 kind=\"build-recipe\"\n// Reviewed\nbuild architecture=\"x86_64\" epoch=1 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog=\"{zero}\" key-sha256=\"{zero}\"\n        package \"build/cc\"\n    }}\n    manifest \"hello.kdl\"   sha256=\"{zero}\" // template\n    source \"hello-1.0.tar.gz\" size=1 sha256=\"{zero}\" url=\"https://example.org/hello-1.0.tar.gz\"\n    source \"fix.patch\" sha256=\"{zero}\" size=12\n    source \"missing.tar.gz\" size=3 sha256=\"{zero}\"\n    script \"\"\"\n    source \"hello-1.0.tar.gz\" size=1\n    \"\"\"\n}}\n"
+            ),
+        )?;
+        Ok(recipe)
+    }
+
+    #[test]
+    fn repin_refreshes_manifest_and_source_pins() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let recipes = dir.path().join("recipes/hello");
+        let distfiles = dir.path().join("distfiles");
+        fs::create_dir_all(&recipes)?;
+        fs::create_dir(&distfiles)?;
+        let recipe = concrete_recipe(&recipes)?;
+        fs::write(distfiles.join("hello-1.0.tar.gz"), "archive")?;
+        // A stale copy in a later directory loses to the recipe directory.
+        fs::write(distfiles.join("fix.patch"), "stale")?;
+        let before = fs::read_to_string(&recipe)?;
+        let request = RepinRequest {
+            manifests: true,
+            local_sources: true,
+            sources: vec![distfiles.clone()],
+            ..RepinRequest::default()
+        };
+        let paths = [dir.path().join("recipes")];
+        let check = repin_recipes(&paths, &request, false)?;
+        assert_eq!(fs::read_to_string(&recipe)?, before);
+        let pins: Vec<_> = check.recipes[0]
+            .changes
+            .iter()
+            .map(|change| change.pin.as_str())
+            .collect();
+        assert_eq!(
+            pins,
+            [
+                "manifest hello.kdl sha256",
+                "source hello-1.0.tar.gz sha256",
+                "source hello-1.0.tar.gz size",
+                "source fix.patch sha256",
+            ]
+        );
+        assert_eq!(check.warnings.len(), 1, "{:?}", check.warnings);
+        assert!(check.warnings[0].contains("missing.tar.gz"));
+
+        let report = repin_recipes(&paths, &request, true)?;
+        let after = fs::read_to_string(&recipe)?;
+        let manifest = digest(&fs::read(recipes.join("hello.kdl"))?);
+        let archive = digest(b"archive");
+        let patch = digest(&fs::read(recipes.join("fix.patch"))?);
+        let zero = "0".repeat(64);
+        let expected = before
+            .replacen(
+                &format!("sha256=\"{zero}\" // template"),
+                &format!("sha256=\"{manifest}\" // template"),
+                1,
+            )
+            .replacen(
+                &format!("size=1 sha256=\"{zero}\""),
+                &format!("size=7 sha256=\"{archive}\""),
+                1,
+            )
+            .replacen(
+                &format!("sha256=\"{zero}\" size=12"),
+                &format!("sha256=\"{patch}\" size=12"),
+                1,
+            );
+        assert_eq!(after, expected);
+        // The script text and the toolchain pins stay as written.
+        assert!(after.contains("    source \"hello-1.0.tar.gz\" size=1\n    \"\"\""));
+        assert_eq!(
+            report.recipes[0].recipe_sha256.as_deref(),
+            Some(digest(after.as_bytes()).as_str())
+        );
+        crate::kdl_format::build::parse(&after)?;
+        assert!(repin_recipes(&paths, &request, false)?.recipes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_finds_build_kdl_recipes_and_skips_bundles() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let recipes = dir.path().join("hello");
+        fs::create_dir(&recipes)?;
+        let recipe = concrete_recipe(&recipes)?;
+        let bundle = dir.path().join("hello.bundle");
+        fs::create_dir_all(bundle.join("manifests"))?;
+        fs::create_dir(bundle.join("proto"))?;
+        fs::copy(&recipe, bundle.join("build.kdl"))?;
+        assert_eq!(discover(&[dir.path().to_owned()])?, [recipe]);
+        let error = discover(std::slice::from_ref(&bundle))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is a build bundle"), "{error}");
+        assert_eq!(
+            discover(&[bundle.join("build.kdl")])?,
+            [bundle.join("build.kdl")]
+        );
         Ok(())
     }
 

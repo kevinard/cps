@@ -35,7 +35,7 @@ guides use. If CPS already manages your machine, go directly to the
 
 - [Write a manifest and review its generated dependencies](maintainer/manifests.md)
 - [Build one or more packages from a pinned recipe](maintainer/builds.md)
-- [Order recipe builds, plan rebuilds, and repin toolchains](maintainer/orchestration.md)
+- [Order recipe builds, plan rebuilds, and refresh recipe pins](maintainer/orchestration.md)
 - [Enable direct installation from Git](maintainer/git.md)
 - [Declare systemd and kernel actions](maintainer/systemd.md)
 - [Regenerate shared caches with triggers](maintainer/triggers.md)

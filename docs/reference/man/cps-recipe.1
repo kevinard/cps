@@ -8,7 +8,7 @@
 .SH COMMANDS
 .TP
 .B \&repin
-\&Rewrite toolchain catalog pins in recipes, keeping their formatting
+\&Refresh toolchain, manifest, and source pins in recipes, keeping their formatting
 .TP
 .B \&help
 \&Print this message or the help of the given subcommand(s)
@@ -18,9 +18,9 @@
 \&Print help
 .SH SUBCOMMAND REFERENCE
 .SS "\&cps recipe repin"
-\&Rewrite toolchain catalog pins in recipes, keeping their formatting
+\&Refresh toolchain, manifest, and source pins in recipes, keeping their formatting
 .PP
-.B \&cps recipe repin [OPTIONS] \-\-toolchain\-catalog <PUBLISHER=SHA256> <PATH>...
+.B \&cps recipe repin [OPTIONS] <\-\-toolchain\-catalog <PUBLISHER=SHA256>|\-\-trust\-root <PATH>|\-\-manifests|\-\-local\-sources|\-\-sources <DIR>> <PATH>...
 .PP
 .B Arguments
 .TP
@@ -32,8 +32,23 @@
 .B \&\-\-toolchain\-catalog <PUBLISHER=SHA256>
 \&New catalog digest for a toolchain publisher
 .TP
+.B \&\-\-trust\-root <PATH>
+\&Set key\-sha256 of the toolchain publisher that this trust root names
+.TP
+.B \&\-\-manifests
+\&Recompute manifest digests from the templates next to each recipe
+.TP
+.B \&\-\-local\-sources
+\&Recompute source sizes and digests from files in each recipe's directory
+.TP
+.B \&\-\-sources <DIR>
+\&Recompute source sizes and digests from this directory laid out by source path (repeatable, searched in order)
+.TP
 .B \&\-\-dry\-run
 \&Print the changes without writing them
+.TP
+.B \&\-\-check
+\&Write nothing, print stale pins, and fail if any pin is stale
 .TP
 .B \&\-h, \-\-help
 \&Print help

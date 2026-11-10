@@ -5,7 +5,7 @@
 A distribution keeps many [build recipes](builds.md) that depend on each
 other's packages. Three commands plan work across them: `cps build-order`
 sorts recipes, `cps rebuild-plan` lists what a change forces you to
-rebuild, and `cps recipe repin` moves recipes to a new toolchain catalog.
+rebuild, and `cps recipe repin` refreshes the digests that recipes pin.
 None of them builds, schedules, or publishes. Run `cps build` and
 `cps publish-bundle` yourself, or from your CI, in the order they print.
 
@@ -13,7 +13,7 @@ None of them builds, schedules, or publishes. Run `cps build` and
 
 - [Order recipe builds](#order-recipe-builds)
 - [Plan rebuilds after a change](#plan-rebuilds-after-a-change)
-- [Repin toolchain catalogs](#repin-toolchain-catalogs)
+- [Refresh recipe pins](#refresh-recipe-pins)
 
 ## Order recipe builds
 
@@ -36,8 +36,10 @@ packaging/cps-build.kdl.in
 
 A directory is searched recursively for `.kdl` and `.kdl.in` files whose
 `schema-version` header has `kind="build-recipe"`. Hidden directories are
-skipped, and so are files named `build.kdl`, the recipe copy inside a build
-bundle; name such a file directly to include it. Each recipe produces the
+skipped, and so are build bundles, directories that hold a `build.kdl`
+recipe copy next to `manifests/` and `proto/`. Name a bundle's `build.kdl`
+directly to include it. A recipe tree can therefore name each recipe
+`build.kdl` in its own directory. Each recipe produces the
 packages of its `manifest` nodes, so a
 [recipe with several packages](builds.md#building-several-packages-from-one-recipe)
 counts as the producer of each. Templates ending in `.in` may contain
@@ -131,38 +133,71 @@ and the final `recipe` lines list those recipes in
 [build order](#order-recipe-builds). A package that no given recipe
 produces gets a warning.
 
-## Repin toolchain catalogs
+## Refresh recipe pins
 
-A recipe pins an exact toolchain catalog digest for each toolchain
-publisher. After a new toolchain catalog is published, move recipes to it
-with `cps recipe repin`.
+A recipe pins everything it reads by digest: each toolchain publisher's
+catalog and trust root, each manifest template, and each source's size and
+SHA-256. `cps recipe repin` recomputes the pins you select and rewrites
+them in place, so a template edit or a new toolchain catalog does not mean
+editing hashes by hand across the tree.
 
 ```sh
 cps recipe repin --dry-run --toolchain-catalog "seed=$(cat toolchain/current)" packaging
-cps recipe repin --toolchain-catalog "seed=$(cat toolchain/current)" packaging
+cps recipe repin --toolchain-catalog "seed=$(cat toolchain/current)" \
+    --trust-root toolchain.trust.json packaging
+cps recipe repin --manifests --local-sources --sources distfiles recipes
 ```
 
 ```text
-repinned packaging/runtime/sqlite.build.kdl seed 3f2a… -> 9c41… (recipe sha256 71d0…)
+repinned recipes/system/sqlite/build.kdl toolchain seed catalog 3f2a… -> 9c41…
+repinned recipes/system/sqlite/build.kdl manifest sqlite.kdl sha256 5be0… -> 0d17…
+recipe recipes/system/sqlite/build.kdl sha256 71d0…
 ```
 
-Repeat `--toolchain-catalog PUBLISHER=SHA256` for each publisher to move.
-CPS finds recipes the same way as `build-order` and changes only the
-`catalog` property of matching `publisher` entries in toolchain blocks. It
-edits the text in place, so comments, spacing, and other properties stay as
-written, and it confirms the parsed result of every file before writing
-any of them. A pin spelled in a form it cannot rewrite exactly is an error,
-and then no recipe changes. A placeholder such as `@CATALOG_SHA256@` is
-left for the template. Each file is replaced atomically and keeps its
-permissions. `--dry-run` writes nothing and prints
-`would repin` in place of `repinned`.
+Choose at least one kind of pin:
 
-A repinned recipe has a new digest, which the output prints for concrete
-recipes. Update the `approve` entries of the
+| Option | Rewrites |
+| --- | --- |
+| `--toolchain-catalog PUBLISHER=SHA256` | `catalog` of that toolchain publisher. Repeat for each publisher to move. |
+| `--trust-root PATH` | `key-sha256` of the toolchain publisher that the trust root names, set to the file's SHA-256. CPS verifies the file as a trust root first. Repeat for each publisher. |
+| `--manifests` | `sha256` of each `manifest`, from the template at its path next to the recipe. |
+| `--local-sources` | `size` and `sha256` of each `source` found at its path in the recipe's own directory, such as a checked-in patch. |
+| `--sources DIR` | `size` and `sha256` of each `source` found at its path under `DIR`, a directory laid out like `cps build --sources`. Repeat to search several directories in order, after the recipe's directory with `--local-sources`. |
+
+This is the counterpart of `updpkgsums`: download or update a source, then
+repin it from the file. A content-addressed `--source-cache` cannot refresh
+pins, because it finds each object by the pin itself; `cps source fetch`
+and `cps build` verify cached objects against their pins. A selected
+manifest or source that CPS cannot find is left as written with a warning
+that its pin is unchecked.
+
+CPS finds recipes the same way as `build-order` and changes only the
+selected properties of matching `publisher`, `manifest`, and `source`
+nodes. It edits the text in place, so comments, spacing, and other
+properties stay as written, and it confirms the parsed result of every file
+before writing any of them. A pin spelled in a form it cannot rewrite
+exactly, such as a node split over several lines, is an error, and then no
+recipe changes. A placeholder such as `@CATALOG_SHA256@` is left for the
+template. Each file is replaced atomically and keeps its permissions.
+
+Each change prints one `repinned` line with the recipe, the pin, and the
+old and new values. A concrete recipe then gets a `recipe PATH sha256`
+line with its new digest. `--dry-run` writes nothing and prints
+`would repin`. `--check` writes nothing, prints each stale pin as a
+`stale` line, and exits with status 1 when any pin is stale, which suits
+CI:
+
+```sh
+cps recipe repin --check --manifests --local-sources \
+    --trust-root seed.trust.json --toolchain-catalog "seed=$seed_catalog" recipes
+```
+
+A repinned recipe has a new digest. Update the `approve` entries of the
 [publish policy](../publisher/publishing.md#publishing-policy) and rebuild
-the recipes, in build order, before publishing. Repinning does not change
-`key-sha256`. A key rotation needs a reviewed recipe change.
+the recipes, in build order, before publishing. A changed `key-sha256`
+means the toolchain publisher rotated its trust root; review that change
+like any other recipe change.
 
 Run [`tests/recipe-orchestration.sh`](../../tests/recipe-orchestration.sh)
-after `cargo build` to exercise build order, cycle reports, repinning, and a
+after `cargo build` to exercise build order, cycle reports, pin refreshes and checks, and a
 soname rebuild plan.

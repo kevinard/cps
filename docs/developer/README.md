@@ -83,7 +83,7 @@ module.
 | Rebuild inputs, source archives, and Git snapshots | [`src/repo/rebuild.rs`](../../src/repo/rebuild.rs), [`src/repo/source_archive.rs`](../../src/repo/source_archive.rs), [`src/repo/git_snapshots.rs`](../../src/repo/git_snapshots.rs) |
 | Build attestations and builder trust | [`src/attestation.rs`](../../src/attestation.rs) |
 | Pinned builds, sandboxing, collected file lists, stripping, and Git installs | [`src/build/`](../../src/build) and [`src/git_install.rs`](../../src/git_install.rs) |
-| Build order, rebuild plans, and recipe repinning across recipes | [`src/orchestrate.rs`](../../src/orchestrate.rs) |
+| Build order, rebuild plans, and recipe pin refreshes across recipes | [`src/orchestrate.rs`](../../src/orchestrate.rs) |
 | Boot environments: ext4 export and deployment, Btrfs staging, ESP edits, kernels, UKIs | [`src/boot/`](../../src/boot) |
 | systemd-boot entries, `loader.conf` ownership, direct UEFI boot, destruction, and retention | [`src/boot/systemd_boot.rs`](../../src/boot/systemd_boot.rs) with [`policy.rs`](../../src/boot/systemd_boot/policy.rs), [`uefi.rs`](../../src/boot/systemd_boot/uefi.rs), [`destroy.rs`](../../src/boot/systemd_boot/destroy.rs), and [`prune.rs`](../../src/boot/systemd_boot/prune.rs) |
 | Bounded HTTPS transfers and file capabilities | [`src/transport.rs`](../../src/transport.rs), [`src/file_caps.rs`](../../src/file_caps.rs) |
@@ -197,7 +197,7 @@ Every scenario uses OpenSSL to create disposable keys.
 | [`build.sh`](../../tests/build.sh) | Isolated builds, reproducibility, signed provenance, and installation | A C compiler, `make`, Python 3 |
 | [`build-outputs.sh`](../../tests/build-outputs.sh) | One build with several packages, collected file lists, the unpackaged-file check, split debug information, and job counts | A C compiler, binutils, Python 3 |
 | [`systemd-build-worker.sh`](../../tests/systemd-build-worker.sh) | `build.sh` inside a delegated systemd user scope with cgroup limits | A systemd user session |
-| [`recipe-orchestration.sh`](../../tests/recipe-orchestration.sh) | Build order, cycle reports, toolchain repinning, and soname rebuild plans | A C compiler |
+| [`recipe-orchestration.sh`](../../tests/recipe-orchestration.sh) | Build order, cycle reports, pin refreshes and checks, and soname rebuild plans | A C compiler |
 | [`release-ci.sh`](../../tests/release-ci.sh) | Prepare, promote, widen, deploy, and refresh with a 2-of-2 catalog threshold and test adapters | `jq`, `rg` |
 | [`release-notes.sh`](../../tests/release-notes.sh) | Signed mirror release notes and publication retries with a local GitHub CLI fixture | `jq`, `rg`, `ssh-keygen`, Python 3 |
 | [`sharded-mirror.sh`](../../tests/sharded-mirror.sh) | The deployment adapter with sharded targets, signer state checks, and sync | `jq`, `flock`, the TUF fixture |
