@@ -102,15 +102,17 @@
 .SS "\&cps repo sign\-export"
 \&Sign an exported mirror with sharded TUF targets metadata
 .PP
-.B \&cps repo sign\-export [OPTIONS] \-\-root <ROOT> \-\-targets\-key <KEY> \-\-snapshot\-key <KEY> \-\-timestamp\-key <KEY> \-\-version <VERSION> \-\-release\-expires <RELEASE_EXPIRES> \-\-timestamp\-expires <TIMESTAMP_EXPIRES> \-\-output <OUTPUT> <EXPORT>
+.B \&cps repo sign\-export [OPTIONS] \-\-root <ROOT> \-\-targets\-key <KEY> \-\-snapshot\-key <KEY> \-\-timestamp\-key <KEY> \-\-version <VERSION> \-\-release\-expires <TIME> \-\-timestamp\-expires <TIME> \-\-output <OUTPUT> <EXPORT>
 .PP
 .B Arguments
-.PP
+.TP
 .B \&<EXPORT>
+\&Directory written by `cps repo export`
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&The mirror's active signed TUF root metadata
 .TP
 .B \&\-\-targets\-key <KEY>
 \&Targets role key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the threshold)
@@ -126,25 +128,30 @@
 .TP
 .B \&\-\-objects\-threshold <OBJECTS_THRESHOLD>
 \&Signatures required on each objects\-* delegation [default: 1]
-.PP
+.TP
 .B \&\-\-version <VERSION>
-.PP
-.B \&\-\-release\-expires <RELEASE_EXPIRES>
-.PP
-.B \&\-\-timestamp\-expires <TIMESTAMP_EXPIRES>
-.PP
+\&Version of the new targets, snapshot, and timestamp metadata, above every published version
+.TP
+.B \&\-\-release\-expires <TIME>
+\&Targets and snapshot expiry: an RFC 3339 time, such as 2027\-01\-01T00:00:00Z
+.TP
+.B \&\-\-timestamp\-expires <TIME>
+\&Timestamp expiry: an RFC 3339 time, such as 2026\-12\-08T00:00:00Z
+.TP
 .B \&\-\-output <OUTPUT>
+\&New directory for the signed metadata and targets
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps repo refresh\-metadata"
 \&Re\-sign the timestamp, and optionally the snapshot, of a published mirror
 .PP
-.B \&cps repo refresh\-metadata [OPTIONS] \-\-root <ROOT> \-\-snapshot <SNAPSHOT> \-\-timestamp\-key <KEY> \-\-version <VERSION> \-\-timestamp\-expires <TIMESTAMP_EXPIRES> \-\-output <OUTPUT>
+.B \&cps repo refresh\-metadata [OPTIONS] \-\-root <ROOT> \-\-snapshot <SNAPSHOT> \-\-timestamp\-key <KEY> \-\-version <VERSION> \-\-timestamp\-expires <TIME> \-\-output <OUTPUT>
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&The mirror's active signed TUF root metadata
 .TP
 .B \&\-\-snapshot <SNAPSHOT>
 \&The published versioned snapshot metadata, such as 7.snapshot.json
@@ -154,12 +161,15 @@
 .TP
 .B \&\-\-snapshot\-key <KEY>
 \&Also re\-sign the snapshot with this key (repeatable)
-.PP
-.B \&\-\-snapshot\-expires <SNAPSHOT_EXPIRES>
-.PP
+.TP
+.B \&\-\-snapshot\-expires <TIME>
+\&Expiry of the re\-signed snapshot: an RFC 3339 time, such as 2027\-01\-01T00:00:00Z
+.TP
 .B \&\-\-version <VERSION>
-.PP
-.B \&\-\-timestamp\-expires <TIMESTAMP_EXPIRES>
+\&Version of the new timestamp and any re\-signed snapshot, above the snapshot's version and every published timestamp version
+.TP
+.B \&\-\-timestamp\-expires <TIME>
+\&Timestamp expiry: an RFC 3339 time, such as 2026\-12\-08T00:00:00Z
 .TP
 .B \&\-\-output <OUTPUT>
 \&New directory for timestamp.json and any re\-signed snapshot
@@ -284,17 +294,19 @@
 .B \&\-\-repo <REPO>
 .TP
 .B \&\-\-publisher <PUBLISHER>
-\&Publisher name; required for the first version
+\&Publisher name, which must match the repository's trust root
 .TP
 .B \&\-\-root\-key <PUBLIC_KEY>
 \&Root key: a public key file or command:DESCRIPTOR (repeat; replaces the root keys)
-.PP
+.TP
 .B \&\-\-root\-threshold <ROOT_THRESHOLD>
+\&Root key signatures required (default: the previous version's, or 1)
 .TP
 .B \&\-\-catalog\-key <PUBLIC_KEY>
 \&Catalog key: a public key file or command:DESCRIPTOR (repeat; replaces the catalog keys)
-.PP
+.TP
 .B \&\-\-catalog\-threshold <CATALOG_THRESHOLD>
+\&Catalog key signatures required (default: the previous version's, or 1)
 .TP
 .B \&\-\-expires <EXPIRES>
 \&RFC 3339 UTC expiry, such as 2027\-01\-01T00:00:00Z (default: one year from now)
@@ -314,17 +326,19 @@
 .B \&\-\-repo <REPO>
 .TP
 .B \&\-\-publisher <PUBLISHER>
-\&Publisher name; required for the first version
+\&Publisher name: required for a repository's first version, and otherwise must match its trust root
 .TP
 .B \&\-\-root\-key <PUBLIC_KEY>
 \&Root key: a public key file or command:DESCRIPTOR (repeat; replaces the root keys)
-.PP
+.TP
 .B \&\-\-root\-threshold <ROOT_THRESHOLD>
+\&Root key signatures required (default: the previous version's, or 1)
 .TP
 .B \&\-\-catalog\-key <PUBLIC_KEY>
 \&Catalog key: a public key file or command:DESCRIPTOR (repeat; replaces the catalog keys)
-.PP
+.TP
 .B \&\-\-catalog\-threshold <CATALOG_THRESHOLD>
+\&Catalog key signatures required (default: the previous version's, or 1)
 .TP
 .B \&\-\-expires <EXPIRES>
 \&RFC 3339 UTC expiry, such as 2027\-01\-01T00:00:00Z (default: one year from now)
