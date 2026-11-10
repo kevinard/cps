@@ -17,8 +17,9 @@ mod selection;
 mod version;
 
 pub(crate) use selection::{
-    ARCH_VARIANT, DEFAULT_FACETS, Resolved, Selection, facet_pattern_covers, validate_facet,
-    validate_facet_pattern, validate_policy, validate_variant,
+    ARCH_VARIANT, DEFAULT_FACETS, Resolved, Selection, facet_pattern_covers,
+    package_pattern_matches, validate_facet, validate_facet_pattern, validate_policy,
+    validate_variant,
 };
 pub use selection::{FacetSource, ImagePolicy, PackageFacet, PackageFacets};
 pub use version::Version;

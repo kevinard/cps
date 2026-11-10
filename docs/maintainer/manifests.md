@@ -142,8 +142,10 @@ meaning: version constraints, upgrades, downgrade checks, obsoletion
 cutoffs, and the revisions that Git builds allocate. Identity uses the
 spelling: a package ID, an `@VERSION` selector, a freeze, and a signed
 composition name one exact spelling, so `@2.0.0` and `@2.0.0-0` are distinct
-packages. An upgrade never replaces an installed package with another
-spelling of the same release. Pick one spelling convention, such as always
+packages. A plan never replaces an installed package with another spelling
+of the same release unless an `@VERSION` selector or a freeze names that
+spelling. When the installed package cannot stay, the plan holds back or
+fails instead. Pick one spelling convention, such as always
 writing the revision, and keep it.
 
 ## Dependencies
@@ -166,11 +168,17 @@ choose files inside packages that resolution already selected. Content with
 its own dependencies belongs in a [separate package](#choosing-between-a-facet-a-package-and-a-variant).
 
 Plans resolve dependencies with [Resolvo](https://github.com/prefix-dev/resolvo),
-a SAT solver with a 60-second time limit, and report incompatible
+a SAT solver whose work is bounded by a fixed number of solver steps, so a
+plan resolves the same way on every machine, and report incompatible
 requirements. When selected file actions collide, CPS excludes the
-conflicting version or pair of versions and retries. Saved plans record the
-selected catalog for each publisher and whether to install recommendations,
-and apply checks the selection against them.
+conflicting version or pair of versions and retries. When facet rules
+inherited [with dependencies](../client/configuration.md#per-package-facet-rules)
+decide whether the colliding actions apply, CPS excludes the pair only
+together with the selected packages that pass those rules on, or that could
+pull in another package that does, so a different choice among them stays
+possible. Saved plans record the selected catalog for each publisher and
+whether to install recommendations, and apply checks the selection against
+them.
 [IPS dependency types](https://docs.oracle.com/cd/E53394_01/html/E54820/dependtypes.html)
 
 ### Version constraints
@@ -252,7 +260,9 @@ recommends "desktop/editor-help" version=">=2.0.0-0"
 
 CPS resolves required packages first, then tries recommendations without
 changing the selected versions. It skips recommendations that are
-unavailable or conflict with the selection. Recommendations added in a new
+unavailable or conflict with the selection. When two recommendations
+conflict with each other, the one declared first is installed, and the
+others are still tried. Recommendations added in a new
 version are tried on upgrade. One that was skipped or removed stays omitted
 until its declaration changes or another package pulls it in.
 

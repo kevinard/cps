@@ -17,7 +17,9 @@ use resolvo::{
 use super::Package;
 use crate::{
     image::Installed,
-    model::{Dependency, DependencyTarget, Manifest, Version, VersionConstraint},
+    model::{
+        Dependency, DependencyTarget, Manifest, Version, VersionConstraint, package_pattern_matches,
+    },
     plan::paths::PathConflict,
 };
 
@@ -48,7 +50,26 @@ impl Filter {
 }
 
 impl VersionSet for Filter {
-    type V = usize;
+    type V = Record;
+}
+
+/// What a solvable stands for.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum Record {
+    /// A candidate package, by its index in the universe.
+    Package(usize),
+    /// One way to avoid a conflict that depends on other packages, by its
+    /// index in the rejections.
+    Escape(usize),
+}
+
+impl Display for Record {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Package(index) => write!(f, "package {index}"),
+            Self::Escape(index) => write!(f, "escape {index}"),
+        }
+    }
 }
 
 impl Display for Filter {
@@ -169,7 +190,8 @@ impl<'a> Universe<'a> {
                         }
                     }
                 }
-                solvables.push(universe.pool.intern_solvable(name, universe.packages.len()));
+                let record = Record::Package(universe.packages.len());
+                solvables.push(universe.pool.intern_solvable(name, record));
                 universe.packages.push((package, dependencies));
             }
             universe.candidates.insert(
@@ -184,8 +206,151 @@ impl<'a> Universe<'a> {
         Ok(universe)
     }
 
+    fn record(&self, id: SolvableId) -> Record {
+        self.pool.resolve_solvable(id).record
+    }
+
+    /// The package of a solvable, or `None` for an escape.
+    fn candidate(&self, id: SolvableId) -> Option<Package<'a>> {
+        match self.record(id) {
+            Record::Package(index) => Some(self.packages[index].0),
+            Record::Escape(_) => None,
+        }
+    }
+
     fn package(&self, id: SolvableId) -> Package<'a> {
-        self.packages[self.pool.resolve_solvable(id).record].0
+        self.candidate(id).expect("an escape is not a package")
+    }
+
+    /// The selected packages that a conflict between `targets` depends on,
+    /// besides the targets themselves, when rules applied with dependencies
+    /// from packages matching `patterns` can change their actions.
+    ///
+    /// A rule reaches a package through the content dependencies that
+    /// `Resolved` follows, so the packages on a dependency path, in any
+    /// version, from a matching name to a target can pass a rule on. Those
+    /// that are selected must stay as they are. Those that are not must stay
+    /// out, so the selected packages that could pull one in also stay, along
+    /// with the alternatives and capability providers they chose. Every other
+    /// selection is still possible. Returns `None` when no rule can reach the
+    /// targets, so they conflict whatever else is selected.
+    fn contingency(
+        &self,
+        patterns: &BTreeSet<String>,
+        targets: [&str; 2],
+        selected: &BTreeMap<&str, SolvableId>,
+    ) -> Option<BTreeSet<SolvableId>> {
+        let mut providers = BTreeMap::<&str, BTreeSet<&str>>::new();
+        for (package, _) in &self.packages {
+            for capability in package.provides().keys() {
+                providers
+                    .entry(capability.as_str())
+                    .or_default()
+                    .insert(package.name());
+            }
+        }
+        let providers_of = |capability: &str| {
+            providers
+                .get(capability)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        // Content dependencies, and the predicates that can pull in a
+        // conditional target.
+        let mut edges = BTreeMap::<&str, BTreeSet<&str>>::new();
+        let mut pulls = BTreeMap::<&str, BTreeSet<&str>>::new();
+        for (package, _) in &self.packages {
+            let name = package.name();
+            edges.entry(name).or_default();
+            for dependency in package.dependencies() {
+                let next: Vec<&str> = match dependency {
+                    Dependency::Require(target) => vec![&target.package],
+                    Dependency::Conditional { target, predicate } => {
+                        pulls
+                            .entry(&predicate.package)
+                            .or_default()
+                            .insert(&target.package);
+                        vec![&target.package]
+                    }
+                    Dependency::RequireAny { alternatives } => alternatives
+                        .iter()
+                        .map(|target| target.package.as_str())
+                        .collect(),
+                    Dependency::RequireCapability(target) => providers_of(&target.package),
+                    Dependency::Recommend(_)
+                    | Dependency::Incorporate(_)
+                    | Dependency::Exclude(_) => continue,
+                };
+                edges.entry(name).or_default().extend(next);
+            }
+        }
+        let reverse = |graphs: &[&BTreeMap<&'a str, BTreeSet<&'a str>>]| {
+            let mut reversed = BTreeMap::<&str, BTreeSet<&str>>::new();
+            for graph in graphs {
+                for (&from, targets) in *graph {
+                    for &to in targets {
+                        reversed.entry(to).or_default().insert(from);
+                    }
+                }
+            }
+            reversed
+        };
+        let walk = |start: Vec<&'a str>, graph: &BTreeMap<&'a str, BTreeSet<&'a str>>| {
+            let mut seen = BTreeSet::new();
+            let mut pending = start;
+            while let Some(name) = pending.pop() {
+                if seen.insert(name) {
+                    pending.extend(graph.get(name).into_iter().flatten().copied());
+                }
+            }
+            seen
+        };
+        let roots = edges
+            .keys()
+            .copied()
+            .filter(|name| {
+                patterns
+                    .iter()
+                    .any(|pattern| package_pattern_matches(pattern, name))
+            })
+            .collect();
+        let from_roots = walk(roots, &edges);
+        let targets = targets.map(|target| {
+            edges
+                .get_key_value(target)
+                .map(|(&name, _)| name)
+                .expect("conflict owners are candidates")
+        });
+        let mut passing = walk(targets.to_vec(), &reverse(&[&edges]));
+        passing.retain(|name| from_roots.contains(name) && !targets.contains(name));
+        if passing.is_empty() {
+            return None;
+        }
+        let (present, absent): (Vec<_>, Vec<_>) = passing
+            .into_iter()
+            .partition(|name| selected.contains_key(name));
+        let mut members: BTreeSet<_> = present.iter().map(|name| selected[name]).collect();
+        let pulling = walk(absent, &reverse(&[&edges, &pulls]));
+        for name in pulling {
+            let Some(&id) = selected.get(name) else {
+                continue;
+            };
+            members.insert(id);
+            for dependency in self.package(id).dependencies() {
+                let chosen = match dependency {
+                    Dependency::RequireAny { alternatives } => alternatives
+                        .iter()
+                        .map(|target| target.package.as_str())
+                        .collect(),
+                    Dependency::RequireCapability(target) => providers_of(&target.package),
+                    _ => continue,
+                };
+                members.extend(chosen.into_iter().filter_map(|name| selected.get(name)));
+            }
+        }
+        Some(members)
     }
 
     fn exact(&self, id: SolvableId) -> ConditionalRequirement {
@@ -467,11 +632,19 @@ mod tests {
     }
 }
 
+/// Conflicts found by composing earlier selections, as clauses for later solves.
 #[derive(Default)]
 struct Rejections {
     excluded: BTreeMap<SolvableId, StringId>,
     constraints: BTreeMap<SolvableId, Vec<VersionSetId>>,
     pairs: BTreeSet<(SolvableId, SolvableId)>,
+    /// Requirements on escapes, which hold for the first owner of a conflict.
+    requirements: BTreeMap<SolvableId, Vec<ConditionalRequirement>>,
+    /// The candidates of each escape name, one per member of its conflict.
+    escapes: BTreeMap<NameId, Candidates>,
+    /// A label and the dependencies of each escape candidate.
+    records: Vec<(String, KnownDependencies)>,
+    combinations: BTreeSet<Vec<SolvableId>>,
 }
 
 impl Rejections {
@@ -488,6 +661,12 @@ impl Rejections {
         let b = *selected
             .get(other.as_str())
             .context("missing file owner in solver selection")?;
+        if !conflict.inheritable.is_empty()
+            && let Some(members) =
+                universe.contingency(&conflict.inheritable, [owner, other], selected)
+        {
+            return self.combination(universe, a, b, members, conflict);
+        }
         if a == b {
             let reason = universe.pool.intern_string(conflict.to_string());
             ensure!(
@@ -499,19 +678,109 @@ impl Rejections {
                 self.pairs.insert((a.min(b), a.max(b))),
                 "solver selected a rejected candidate pair"
             );
-            let version = universe.package(b).version();
-            let filter = Filter {
-                expression: Some(format!("={version} ({conflict})")),
-                constraint: VersionConstraint::exact(version.clone()),
-                exclude: true,
-                capability: None,
-            };
-            let name = universe.pool.resolve_solvable(b).name;
-            let exclusion = universe.pool.intern_version_set(name, filter);
+            let exclusion = without(universe, b, Some(conflict));
             self.constraints.entry(a).or_default().push(exclusion);
         }
         Ok(())
     }
+
+    /// Rule out `a` and `b` together with the selected packages that the
+    /// conflict depends on. Inherited rules can enable or disable the
+    /// conflicting actions, so a selection that replaces or drops any of these
+    /// packages remains possible. The clause `¬a ∨ ¬b ∨ ¬m…` is encoded as a
+    /// requirement of `a` on an escape name whose candidates each rule out
+    /// one other member.
+    fn combination(
+        &mut self,
+        universe: &Universe<'_>,
+        a: SolvableId,
+        b: SolvableId,
+        members: impl IntoIterator<Item = SolvableId>,
+        conflict: &PathConflict,
+    ) -> Result<()> {
+        let mut others = BTreeSet::from([b]);
+        others.extend(members);
+        others.remove(&a);
+        let mut key = Vec::from_iter(others.iter().copied());
+        key.push(a);
+        key.sort_unstable();
+        ensure!(
+            self.combinations.insert(key),
+            "solver selected a rejected combination of candidates"
+        );
+        let short = |id: SolvableId| {
+            let package = universe.package(id);
+            format!("{}@{}", package.name(), package.version())
+        };
+        let [first, second] = &conflict.owners;
+        let context = others
+            .iter()
+            .filter(|&&id| {
+                let name = universe.package(id).name();
+                name != first && name != second
+            })
+            .map(|&id| short(id))
+            .collect::<Vec<_>>();
+        let mut label = if context.is_empty() {
+            conflict.to_string()
+        } else {
+            format!("{conflict} with {}", context.join(", "))
+        };
+        // Each clause needs its own name, because a name selects one candidate.
+        let base = label.clone();
+        let mut count = 1;
+        while universe.pool.lookup_package_name(&label).is_some() {
+            count += 1;
+            label = format!("{base} ({count})");
+        }
+        let name = universe.pool.intern_package_name(label.as_str());
+        let mut candidates = Vec::with_capacity(others.len());
+        for id in others {
+            let mut dependencies = KnownDependencies::default();
+            dependencies.constrains.push(without(universe, id, None));
+            let record = Record::Escape(self.records.len());
+            self.records
+                .push((format!("without {}", short(id)), dependencies));
+            candidates.push(universe.pool.intern_solvable(name, record));
+        }
+        self.escapes.insert(
+            name,
+            Candidates {
+                candidates,
+                hint_dependencies_available: HintDependenciesAvailable::All,
+                ..Candidates::default()
+            },
+        );
+        let escape = universe.pool.intern_version_set(
+            name,
+            Filter {
+                expression: Some("avoided".into()),
+                ..Filter::default()
+            },
+        );
+        self.requirements
+            .entry(a)
+            .or_default()
+            .push(Requirement::from(escape).into());
+        Ok(())
+    }
+}
+
+/// A constraint that rules out the version of `id`.
+fn without(universe: &Universe<'_>, id: SolvableId, reason: Option<&PathConflict>) -> VersionSetId {
+    let version = universe.package(id).version();
+    let expression = match reason {
+        Some(conflict) => format!("={version} ({conflict})"),
+        None => format!("={version}"),
+    };
+    let filter = Filter {
+        expression: Some(expression),
+        constraint: VersionConstraint::exact(version.clone()),
+        exclude: true,
+        capability: None,
+    };
+    let name = universe.pool.resolve_solvable(id).name;
+    universe.pool.intern_version_set(name, filter)
 }
 
 struct Provider<'u, 'a> {
@@ -525,7 +794,10 @@ impl Interner for Provider<'_, '_> {
     type SolvableId = SolvableId;
 
     fn display_solvable(&self, id: SolvableId) -> impl Display + '_ {
-        self.universe.package(id).version()
+        match self.universe.record(id) {
+            Record::Package(_) => self.universe.package(id).version().to_string(),
+            Record::Escape(index) => self.rejections.records[index].0.clone(),
+        }
     }
 
     fn display_name(&self, id: NameId) -> impl Display + '_ {
@@ -568,11 +840,21 @@ impl DependencyProvider for Provider<'_, '_> {
         candidates
             .iter()
             .copied()
-            .filter(|&id| filter.accepts(self.universe.package(id)) != inverse)
+            .filter(|&id| {
+                // An escape name has no versions, so every filter on it is "any version".
+                let accepted = self
+                    .universe
+                    .candidate(id)
+                    .is_none_or(|package| filter.accepts(package));
+                accepted != inverse
+            })
             .collect()
     }
 
     async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+        if let Some(escapes) = self.rejections.escapes.get(&name) {
+            return Some(escapes.clone());
+        }
         let mut candidates = self.universe.candidates.get(&name)?.clone();
         candidates
             .excluded
@@ -591,12 +873,18 @@ impl DependencyProvider for Provider<'_, '_> {
     }
 
     async fn get_dependencies(&self, id: SolvableId) -> Dependencies {
-        let mut dependencies = self.universe.packages
-            [self.universe.pool.resolve_solvable(id).record]
-            .1
-            .clone();
+        let index = match self.universe.record(id) {
+            Record::Package(index) => index,
+            Record::Escape(index) => {
+                return Dependencies::Known(self.rejections.records[index].1.clone());
+            }
+        };
+        let mut dependencies = self.universe.packages[index].1.clone();
         if let Some(constraints) = self.rejections.constraints.get(&id) {
             dependencies.constrains.extend(constraints);
+        }
+        if let Some(requirements) = self.rejections.requirements.get(&id) {
+            dependencies.requirements.extend(requirements);
         }
         Dependencies::Known(dependencies)
     }
@@ -778,7 +1066,7 @@ fn select<'a, T>(
         };
         let selected = ids
             .into_iter()
-            .map(|id| (universe.package(id).name(), id))
+            .filter_map(|id| Some((universe.candidate(id)?.name(), id)))
             .collect::<BTreeMap<_, _>>();
         let manifests = selected
             .iter()
