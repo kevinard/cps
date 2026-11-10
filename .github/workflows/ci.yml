@@ -49,11 +49,19 @@ jobs:
       - name: Build and test
         run: |
           mkdir -p "$RUNNER_TEMP/cps-cargo" "$RUNNER_TEMP/cps-tmp"
+          # The runner's UID needs an account in the container: ssh-keygen
+          # refuses to run without one.
+          docker run --rm cps-ci cat /etc/passwd > "$RUNNER_TEMP/cps-passwd"
+          docker run --rm cps-ci cat /etc/group > "$RUNNER_TEMP/cps-group"
+          printf 'runner:x:%s:%s::/tmp:/usr/bin/bash\n' "$(id -u)" "$(id -g)" >> "$RUNNER_TEMP/cps-passwd"
+          printf 'runner:x:%s:\n' "$(id -g)" >> "$RUNNER_TEMP/cps-group"
           run_ci() {
             # Tests keep their images on the runner's disk: overlayfs, the
             # container's own /tmp, cannot hold a trigger handler's overlay.
             docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
               --env TMPDIR="$RUNNER_TEMP/cps-tmp" \
+              --volume "$RUNNER_TEMP/cps-passwd:/etc/passwd:ro" \
+              --volume "$RUNNER_TEMP/cps-group:/etc/group:ro" \
               --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
               --security-opt systempaths=unconfined \
               --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
@@ -90,11 +98,19 @@ jobs:
       - name: Build the pinned kernel and exercise boot recovery
         run: |
           mkdir -p "$RUNNER_TEMP/cps-cargo" "$RUNNER_TEMP/cps-tmp"
+          # The runner's UID needs an account in the container: ssh-keygen
+          # refuses to run without one.
+          docker run --rm cps-ci cat /etc/passwd > "$RUNNER_TEMP/cps-passwd"
+          docker run --rm cps-ci cat /etc/group > "$RUNNER_TEMP/cps-group"
+          printf 'runner:x:%s:%s::/tmp:/usr/bin/bash\n' "$(id -u)" "$(id -g)" >> "$RUNNER_TEMP/cps-passwd"
+          printf 'runner:x:%s:\n' "$(id -g)" >> "$RUNNER_TEMP/cps-group"
           run_ci() {
             # Tests keep their images on the runner's disk: overlayfs, the
             # container's own /tmp, cannot hold a trigger handler's overlay.
             docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
               --env TMPDIR="$RUNNER_TEMP/cps-tmp" \
+              --volume "$RUNNER_TEMP/cps-passwd:/etc/passwd:ro" \
+              --volume "$RUNNER_TEMP/cps-group:/etc/group:ro" \
               --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
               --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$PWD" "$@"
           }
