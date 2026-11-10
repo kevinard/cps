@@ -16,7 +16,7 @@ use crate::{
     boot::kernel::Artifacts,
     image::{
         Image, Managed, Publisher, Settings, State, StateDelta,
-        root::{DirSyncs, Fingerprint, ReplacementSource, Root},
+        root::{self, DirSyncs, Fingerprint, ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
     plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, pending_repairs},
@@ -935,64 +935,151 @@ fn write_files(
         };
         payloads.insert(sha256.as_str(), fingerprint);
     }
-    let staged_payload = |node: &Node| -> Result<File> {
+    let mut writer = Writer {
+        root,
+        stage,
+        paths,
+        repair,
+        payloads,
+        syncs: DirSyncs::default(),
+        copied_from: BTreeSet::new(),
+        checked_target: None,
+        groups: if writes.iter().any(|write| write.detach) {
+            hardlink_groups(paths)
+        } else {
+            BTreeMap::new()
+        },
+        after_write,
+    };
+    let transitions: Vec<&str> = writes
+        .iter()
+        .filter(|write| write.transition().is_some())
+        .map(|write| write.path.as_str())
+        .collect();
+    for write in writes {
+        // A transition carries every write beneath its path.
+        if transitions.iter().any(|directory| write.beneath(directory)) {
+            continue;
+        }
+        if write.transition().is_some() {
+            let children = writes
+                .iter()
+                .filter(|child| child.beneath(&write.path))
+                .collect();
+            writer.transition(write, children)?;
+        } else {
+            writer.write(write)?;
+        }
+    }
+    // Every directory entry must be durable before the journal records the
+    // files as ready or commits the transaction.
+    root.sync_dirs(&mut writer.syncs, Some(stage.as_file()))?;
+    debug_assert!(writer.syncs.is_empty());
+    Ok(())
+}
+
+/// Executes a transaction's writes against the image root.
+struct Writer<'a, F> {
+    root: &'a Root,
+    stage: &'a Root,
+    paths: &'a BTreeMap<String, Managed>,
+    repair: bool,
+    payloads: BTreeMap<&'a str, Fingerprint>,
+    syncs: DirSyncs,
+    // Local configuration copied to a new path must be durable before its
+    // source path changes, or a crash could lose it.
+    copied_from: BTreeSet<&'a str>,
+    checked_target: Option<(&'a str, File)>,
+    groups: BTreeMap<&'a str, Vec<&'a str>>,
+    after_write: &'a mut F,
+}
+
+impl<'a, F: FnMut(&Write)> Writer<'a, F> {
+    fn staged_payload(&self, node: &Node) -> Result<File> {
         let Node::File { sha256, .. } = node else {
             anyhow::bail!("expected a file payload");
         };
-        let fingerprint = payloads
+        let fingerprint = self
+            .payloads
             .get(sha256.as_str())
             .with_context(|| format!("missing staged blob {sha256}"))?;
-        stage.file_matching(sha256, fingerprint)
-    };
-    let mut syncs = DirSyncs::default();
-    // Local configuration copied to a new path must be durable before its
-    // source path changes, or a crash could lose it.
-    let mut copied_from = BTreeSet::new();
-    let mut checked_target: Option<(&str, File)> = None;
-    let groups = if writes.iter().any(|write| write.detach) {
-        hardlink_groups(paths)
-    } else {
-        BTreeMap::new()
-    };
-    for write in writes {
-        if write.hardlink_target().is_some() || copied_from.contains(write.path.as_str()) {
+        self.stage.file_matching(sha256, fingerprint)
+    }
+
+    /// Open a verified hard link target. A target inside a directory tree
+    /// that is still being assembled in staging is opened there.
+    fn hardlink_source(&mut self, target: &'a str, tree: Option<(&Root, &str)>) -> Result<File> {
+        let managed = self
+            .paths
+            .get(target)
+            .with_context(|| format!("missing hard link target {target}"))?;
+        if let Some((tree, directory)) = tree
+            && let Some(relative) = target
+                .strip_prefix(directory)
+                .and_then(|rest| rest.strip_prefix('/'))
+        {
+            return tree.checked_hardlink_target(relative, &managed.node);
+        }
+        if self
+            .checked_target
+            .as_ref()
+            .is_none_or(|(name, _)| *name != target)
+        {
+            self.checked_target = Some((
+                target,
+                self.root.checked_hardlink_target(target, &managed.node)?,
+            ));
+        }
+        let (_, file) = self.checked_target.as_ref().expect("checked target");
+        Ok(file.try_clone()?)
+    }
+
+    fn source(
+        &mut self,
+        write: &'a Write,
+        tree: Option<(&Root, &str)>,
+    ) -> Result<Option<ReplacementSource<'a>>> {
+        Ok(match &write.after {
+            Some(node @ Node::File { .. }) => Some(match write.local_config_source() {
+                Some((path, before)) => ReplacementSource::LocalConfig { path, before },
+                None => ReplacementSource::Staged(self.staged_payload(node)?),
+            }),
+            Some(Node::Hardlink { target }) => Some(ReplacementSource::Staged(
+                self.hardlink_source(target, tree)?,
+            )),
+            _ => None,
+        })
+    }
+
+    fn write(&mut self, write: &'a Write) -> Result<()> {
+        let root = self.root;
+        if write.hardlink_target().is_some() || self.copied_from.contains(write.path.as_str()) {
             // A hard link publishes the target's new inode, so the target's
             // rename must be durable first.
-            root.sync_dirs(&mut syncs, Some(stage.as_file()))?;
+            root.sync_dirs(&mut self.syncs, Some(self.stage.as_file()))?;
         }
         if let Some((source, _)) = write.local_config_source()
             && source != write.path
         {
-            copied_from.insert(source);
+            self.copied_from.insert(source);
         }
-        let link_source = if let Some(target) = write.hardlink_target() {
-            if checked_target
-                .as_ref()
-                .is_none_or(|(name, _)| *name != target)
-            {
-                let managed = paths
-                    .get(target)
-                    .with_context(|| format!("missing hard link target {target}"))?;
-                checked_target =
-                    Some((target, root.checked_hardlink_target(target, &managed.node)?));
-            }
-            checked_target.as_ref().map(|(_, file)| file)
-        } else {
-            None
+        let link_source = match write.hardlink_target() {
+            Some(target) => Some(self.hardlink_source(target, None)?),
+            None => None,
         };
-        if let Some(source) = link_source
+        if let Some(source) = &link_source
             && root.shares_inode(&write.path, source)?
         {
-            syncs.parent_of(&write.path);
-            syncs.mark_staging();
-            continue;
+            self.syncs.parent_of(&write.path);
+            self.syncs.mark_staging();
+            return Ok(());
         }
         let observed = root.inspect(&write.path)?;
         // Only restore immutable paths still owned by the pending composition.
         // Removals and edits to preserved or locally moved config remain strict.
-        let before = if repair
+        let before = if self.repair
             && observed != write.after
-            && let Some(managed) = paths.get(&write.path)
+            && let Some(managed) = self.paths.get(&write.path)
             && !managed.preserve
             && write.after.as_ref() == Some(&managed.node)
             && observed.as_ref().is_none_or(|node| {
@@ -1007,24 +1094,26 @@ fn write_files(
             && before != after
         {
             if root.repair_directory(&write.path, before, after)? {
-                after_write(write);
+                (self.after_write)(write);
             }
-            continue;
+            return Ok(());
         }
         let detach = write.detach
             && observed == write.after
             && root.has_other_links(
                 &write.path,
-                groups.get(write.path.as_str()).map_or(&[], Vec::as_slice),
+                self.groups
+                    .get(write.path.as_str())
+                    .map_or(&[], Vec::as_slice),
             )?;
         if observed == write.after && !detach {
             if write.before != write.after || write.detach {
                 // An interrupted run may have published this path without
                 // syncing its directory.
-                syncs.parent_of(&write.path);
-                syncs.mark_staging();
+                self.syncs.parent_of(&write.path);
+                self.syncs.mark_staging();
             }
-            continue;
+            return Ok(());
         }
         ensure!(
             &observed == before,
@@ -1032,53 +1121,186 @@ fn write_files(
             write.path
         );
         if write.removes_directory() {
-            if root.remove_empty_dir(&write.path, &mut syncs)? {
-                after_write(write);
+            if root.remove_empty_dir(&write.path, &mut self.syncs)? {
+                (self.after_write)(write);
             }
-            continue;
+            return Ok(());
         }
         match &write.after {
             Some(node) => {
-                let payload = match node {
-                    Node::File { .. } => Some(match write.local_config_source() {
-                        Some((path, before)) => ReplacementSource::LocalConfig { path, before },
-                        None => ReplacementSource::Staged(staged_payload(node)?),
-                    }),
-                    Node::Hardlink { .. } => Some(ReplacementSource::Staged(
-                        link_source
-                            .context("missing hard link target")?
-                            .try_clone()?,
-                    )),
-                    _ => None,
+                let payload = match (node, link_source) {
+                    (Node::Hardlink { .. }, Some(source)) => {
+                        Some(ReplacementSource::Staged(source))
+                    }
+                    (Node::Hardlink { .. }, None) => anyhow::bail!("missing hard link target"),
+                    _ => self.source(write, None)?,
                 };
                 root.replace(
                     &write.path,
                     node,
                     payload,
-                    stage.as_file(),
+                    self.stage.as_file(),
                     write.config_move.is_some(),
-                    &mut syncs,
+                    &mut self.syncs,
                 )?;
             }
-            None => root.remove_file_deferred(&write.path, &mut syncs)?,
+            None => root.remove_file_deferred(&write.path, &mut self.syncs)?,
         }
-        after_write(write);
+        (self.after_write)(write);
+        Ok(())
     }
-    // Every directory entry must be durable before the journal records the
-    // files as ready or commits the transaction.
-    root.sync_dirs(&mut syncs, Some(stage.as_file()))?;
-    debug_assert!(syncs.is_empty());
-    Ok(())
+
+    /// Replace a directory with a file or symlink, or the reverse, together
+    /// with every write beneath the path.
+    ///
+    /// The new object, including a complete new directory tree, is built
+    /// under a private staging name and exchanged with the old object, so
+    /// the path never goes missing on a filesystem that supports
+    /// RENAME_EXCHANGE. Resume and abort recognize every intermediate state:
+    ///
+    /// - The path is in its old state: anything under the staging names is
+    ///   an incomplete replacement, which is rebuilt.
+    /// - The path is in its new state: the staging names hold the old
+    ///   object, which is removed.
+    /// - The path is absent after the fallback for filesystems without
+    ///   RENAME_EXCHANGE moved the old object aside: whichever object the
+    ///   write wants is renamed into place.
+    fn transition(&mut self, write: &'a Write, children: Vec<&'a Write>) -> Result<()> {
+        let (root, stage) = (self.root, self.stage);
+        let path = write.path.as_str();
+        let into_directory = write.transition() == Some(true);
+        let id = &crate::model::digest(path.as_bytes())[..32];
+        let (swap, old) = (format!("swap-{id}"), format!("old-{id}"));
+        let observed = root.inspect(path)?;
+        let mut changed = true;
+        if observed == write.after {
+            changed = false;
+        } else if observed == write.before {
+            if !into_directory {
+                check_replaced_tree(root, write, &children)?;
+            }
+            // Configuration copied out of the old tree and link targets of
+            // the new one must be durable before the old object goes.
+            root.sync_dirs(&mut self.syncs, Some(stage.as_file()))?;
+            self.stage_replacement(write, &children, &swap)?;
+            root::test_point("staged");
+            root.exchange(path, stage.as_file(), &swap, &old)?;
+        } else if observed.is_none() {
+            let displaced = stage.inspect(&old)?;
+            ensure!(
+                displaced.is_some(),
+                "unexpected state at {path}; pending transaction retained"
+            );
+            if displaced == write.before {
+                self.stage_replacement(write, &children, &swap)?;
+                root.publish_staged(path, stage.as_file(), &swap)?;
+            } else if displaced == write.after {
+                root.publish_staged(path, stage.as_file(), &old)?;
+            } else {
+                anyhow::bail!("unexpected state at {path}; pending transaction retained");
+            }
+        } else {
+            anyhow::bail!("unexpected state at {path}; pending transaction retained");
+        }
+        for name in [&swap, &old] {
+            if stage.remove_staged(name)? {
+                self.syncs.mark_staging();
+            }
+        }
+        if changed {
+            (self.after_write)(write);
+        }
+        if into_directory {
+            // The new tree is in place, so each write beneath it now
+            // finds its new state, or an earlier one if the tree was
+            // published before an interruption completed it.
+            for child in children {
+                self.write(child)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the replacement object for a transition as the staging entry `name`.
+    fn stage_replacement(
+        &mut self,
+        write: &'a Write,
+        children: &[&'a Write],
+        name: &str,
+    ) -> Result<()> {
+        let (root, stage) = (self.root, self.stage);
+        let path = write.path.as_str();
+        let node = write
+            .after
+            .as_ref()
+            .context("transition has no new object")?;
+        if write.transition() == Some(false) {
+            let payload = self.source(write, None)?;
+            root.stage_object(stage.as_file(), name, path, node, payload)?;
+            return Ok(stage.as_file().sync_all()?);
+        }
+        root.stage_object(stage.as_file(), name, path, node, None)?;
+        let tree = stage.subdir(name)?;
+        let mut built: Vec<&Write> = Vec::new();
+        for &child in children {
+            ensure!(
+                child.before.is_none(),
+                "unexpected journaled state beneath {path}"
+            );
+            if child.after.is_some() {
+                built.push(child);
+            }
+        }
+        // Parents before their entries, and link targets before links.
+        built.sort_by_cached_key(|child| {
+            (
+                child.hardlink_target().is_some(),
+                child.path.bytes().filter(|b| *b == b'/').count(),
+                child.path.clone(),
+            )
+        });
+        let mut syncs = DirSyncs::default();
+        for child in built {
+            let relative = &child.path[path.len() + 1..];
+            let payload = self.source(child, Some((&tree, path)))?;
+            let node = child.after.as_ref().expect("built children have contents");
+            root.replace_beneath(&tree, relative, node, payload, stage.as_file(), &mut syncs)?;
+        }
+        tree.sync_dirs(&mut syncs, None)?;
+        tree.as_file().sync_all()?;
+        Ok(stage.as_file().sync_all()?)
+    }
+}
+
+/// Check that a directory about to be replaced holds only the journaled
+/// paths beneath it, each still in its state before the transaction.
+fn check_replaced_tree(root: &Root, write: &Write, children: &[&Write]) -> Result<()> {
+    let expected: BTreeMap<&str, &Write> = children
+        .iter()
+        .map(|child| (child.path.as_str(), *child))
+        .collect();
+    root.walk_beneath(&write.path, |path, _| {
+        let child = expected.get(path).with_context(|| {
+            format!(
+                "unexpected path {path} beneath {}; pending transaction retained",
+                write.path
+            )
+        })?;
+        ensure!(
+            child.after.is_none() && root.inspect(path)? == child.before,
+            "unexpected state at {path}; pending transaction retained"
+        );
+        Ok(true)
+    })
 }
 
 fn clear_stage(stage: &Root) -> Result<()> {
     for entry in fs::read_dir(Root::fd_path(stage.as_file()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir(entry.path())?;
-        } else {
-            fs::remove_file(entry.path())?;
-        }
+        let name = entry?.file_name();
+        let name = name
+            .to_str()
+            .with_context(|| format!("non-UTF-8 staging entry {name:?}"))?;
+        stage.remove_staged(name)?;
     }
     Ok(())
 }

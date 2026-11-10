@@ -1681,7 +1681,8 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
     f.package(
         "test/layout",
         "2.0.0-0",
-        f.file("opt/layout", "replacement", "0644", "")?,
+        // Path type transitions are allowed; changed directory metadata is not.
+        "    dir \"opt/layout\" mode=\"0700\" uid=0 gid=0\n".to_owned(),
     )?;
     f.package("test/retire", "1.0.0-0", String::new())?;
     let old = fs::read_to_string(f.repo.join("current"))?;
@@ -1715,7 +1716,7 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
     let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
     let message = format!("{error:#}");
     assert!(
-        message.contains("cannot change between directory and leaf actions at opt/layout"),
+        message.contains("directory or metadata conflict at opt/layout"),
         "{message}"
     );
     assert_eq!(fs::read_to_string(f.repo.join("current"))?, old);
@@ -1995,7 +1996,8 @@ fn upgrade_profile_reuses_signed_baseline_roots_and_companions() -> Result<()> {
         "1.0.0-0",
         format!("{runtime_requirement}{root_dir}"),
     )?;
-    let replacement = f.file("opt/pinned-root", "replacement", "0644", "")?;
+    // Path type transitions are allowed; changed directory metadata is not.
+    let replacement = format!("    dir \"opt/pinned-root\" mode=\"0700\" uid={uid} gid={gid}\n");
     f.package(
         "desktop/compositor",
         "2.0.0-0",
@@ -2148,7 +2150,7 @@ publisher "seed" {{
     write_policy("2.0.0-0", &old_pin, "", "")?;
     rejected(
         &refresh,
-        "cannot change between directory and leaf actions at opt/pinned-root",
+        "directory or metadata conflict at opt/pinned-root",
     )?;
     // The older catalog would select 2.0 in its baseline, so only the
     // mandatory check from the signed profile at 1.0 detects the transition.
@@ -2156,7 +2158,7 @@ publisher "seed" {{
     write_policy("2.0.0-0", &old_pin, &older, "")?;
     rejected(
         &refresh,
-        "cannot change between directory and leaf actions at opt/pinned-root",
+        "directory or metadata conflict at opt/pinned-root",
     )?;
 
     // Withdraw the rejected 2.0 layout so the next release can update the companion alone.
@@ -2168,7 +2170,8 @@ publisher "seed" {{
             signed_base.trim()
         ),
     )?;
-    let replacement = seed.file("opt/pinned-companion", "replacement", "0644", "")?;
+    let replacement =
+        format!("    dir \"opt/pinned-companion\" mode=\"0700\" uid={uid} gid={gid}\n");
     seed.package_as("seed", "library/runtime", "2.0.0-0", replacement)?;
     let new_pin = fs::read_to_string(seed.repo.join("current"))?;
     write_policy(
@@ -2181,7 +2184,7 @@ publisher "seed" {{
     write_policy("1.0.0-0", &new_pin, "", "")?;
     rejected(
         &retire_newer,
-        "cannot change between directory and leaf actions at opt/pinned-companion",
+        "directory or metadata conflict at opt/pinned-companion",
     )?;
 
     seed.package_as("seed", "library/runtime", "3.0.0-0", companion_dir)?;

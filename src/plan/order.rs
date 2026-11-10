@@ -91,6 +91,15 @@ impl<'a> WriteOrder<'a> {
         let key = |class, rank, kind, depth, target: &str| {
             (class, rank, kind, depth, target.to_owned(), path.to_owned())
         };
+        match write.transition() {
+            // A new directory tree replaces a file or symlink after the
+            // files it can link to, and before links into it.
+            Some(true) => return key(2, 0, 0, depth, ""),
+            // A file or symlink replaces a directory tree after everything
+            // the old tree's contents moved to, such as its symlink target.
+            Some(false) => return key(5, 0, 0, depth, ""),
+            None => {}
+        }
         if write.removes_directory() {
             key(7, 0, 0, usize::MAX - depth, "")
         } else if self.retired.contains(path) {

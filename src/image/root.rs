@@ -360,7 +360,7 @@ impl Root {
         validate_path(path)?;
         match self.open_relative(path, OFlags::PATH | OFlags::NOFOLLOW) {
             Ok(file) if file.metadata()?.is_file() => Ok(Some(file)),
-            Ok(_) | Err(Errno::NOENT) => Ok(None),
+            Ok(_) | Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => Ok(None),
             Err(error) => Err(error).with_context(|| format!("opening hard link path {path}")),
         }
     }
@@ -452,7 +452,9 @@ impl Root {
         };
         let (parent, leaf) = match self.parent(path) {
             Ok(entry) => entry,
-            Err(Errno::NOENT) => return Ok(absent),
+            // A symlink or non-directory ancestor means the path does not
+            // exist beneath the root without following a link.
+            Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(absent),
             Err(err) => return Err(err.into()),
         };
         let info = match statat(&parent, leaf, AtFlags::SYMLINK_NOFOLLOW) {
@@ -529,24 +531,56 @@ impl Root {
         // A crash can leave an incomplete temporary object. The destination
         // is either untouched or has the complete object after rename.
         const TEMP: &str = "write";
-        match statat(staging, TEMP, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(info) => unlinkat(
-                staging,
-                TEMP,
-                if FileType::from_raw_mode(info.st_mode) == FileType::Directory {
-                    AtFlags::REMOVEDIR
-                } else {
-                    AtFlags::empty()
-                },
-            )?,
-            Err(Errno::NOENT) => {}
-            Err(err) => return Err(err.into()),
+        self.stage_object(staging, TEMP, path, node, payload)?;
+        if require_absent {
+            renameat_with(staging, TEMP, &parent, leaf, RenameFlags::NOREPLACE)
+                .with_context(|| format!("publishing new path {path}"))?;
+        } else {
+            renameat(staging, TEMP, &parent, leaf)?;
         }
+        syncs.parent_of(path);
+        syncs.staging = true;
+        Ok(())
+    }
+
+    /// Create `node` at `relative` inside `tree`, a directory tree being
+    /// assembled in staging. Local configuration is copied from this root.
+    pub(crate) fn replace_beneath(
+        &self,
+        tree: &Root,
+        relative: &str,
+        node: &Node,
+        payload: Option<ReplacementSource<'_>>,
+        staging: &File,
+        syncs: &mut DirSyncs,
+    ) -> Result<()> {
+        validate_path(relative)?;
+        let (parent, leaf) = tree.parent(relative)?;
+        const TEMP: &str = "write";
+        self.stage_object(staging, TEMP, relative, node, payload)?;
+        renameat_with(staging, TEMP, &parent, leaf, RenameFlags::NOREPLACE)
+            .with_context(|| format!("assembling {relative}"))?;
+        syncs.parent_of(relative);
+        Ok(())
+    }
+
+    /// Materialize `node` as the private staging entry `name`, replacing any
+    /// stale entry an interrupted run left there. Files are synced; the
+    /// caller syncs the staging directory.
+    pub(crate) fn stage_object(
+        &self,
+        staging: &File,
+        name: &str,
+        path: &str,
+        node: &Node,
+        payload: Option<ReplacementSource<'_>>,
+    ) -> Result<()> {
+        remove_entry(staging, name)?;
         match node {
             Node::File { .. } => {
                 let temp = openat2(
                     staging,
-                    TEMP,
+                    name,
                     OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
                     Mode::RUSR | Mode::WUSR,
                     ResolveFlags::NO_SYMLINKS,
@@ -563,10 +597,10 @@ impl Root {
                     .with_context(|| format!("preparing file metadata for {path}"))?;
             }
             Node::Dir { .. } => {
-                mkdirat(staging, TEMP, Mode::RWXU)?;
+                mkdirat(staging, name, Mode::RWXU)?;
                 let temp = openat2(
                     staging,
-                    TEMP,
+                    name,
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                     Mode::empty(),
                     ResolveFlags::NO_SYMLINKS,
@@ -575,12 +609,12 @@ impl Root {
                 Self::set_directory_metadata(&temp, node)?;
             }
             Node::Symlink { target, uid, gid } => {
-                symlinkat(target.as_str(), staging, TEMP)?;
-                let info = statat(staging, TEMP, AtFlags::SYMLINK_NOFOLLOW)?;
+                symlinkat(target.as_str(), staging, name)?;
+                let info = statat(staging, name, AtFlags::SYMLINK_NOFOLLOW)?;
                 if (info.st_uid, info.st_gid) != (*uid, *gid) {
                     chownat(
                         staging,
-                        TEMP,
+                        name,
                         Some(Uid::from_raw(*uid)),
                         Some(Gid::from_raw(*gid)),
                         AtFlags::SYMLINK_NOFOLLOW,
@@ -597,20 +631,89 @@ impl Root {
                     CWD,
                     Self::fd_path(&source),
                     staging,
-                    TEMP,
+                    name,
                     AtFlags::SYMLINK_FOLLOW,
                 )?;
             }
             Node::Special => anyhow::bail!("cannot materialize special file {path}"),
         }
-        if require_absent {
-            renameat_with(staging, TEMP, &parent, leaf, RenameFlags::NOREPLACE)
-                .with_context(|| format!("publishing new path {path}"))?;
-        } else {
-            renameat(staging, TEMP, &parent, leaf)?;
+        Ok(())
+    }
+
+    /// Remove a private staging entry and, for a directory, everything
+    /// beneath it, without following symlinks or crossing a mount.
+    pub(crate) fn remove_staged(&self, name: &str) -> Result<bool> {
+        remove_entry(&self.0, name)
+    }
+
+    /// Atomically swap the staging entry `swap` with the object at `path`.
+    ///
+    /// The replacement can be of another type, such as a symlink replacing a
+    /// populated directory, so a plain rename cannot publish it. With
+    /// RENAME_EXCHANGE the path always names either object, and the old
+    /// object ends up at `swap`. Some filesystems do not support the flag.
+    /// Then the old object first moves to the staging entry `old`, leaving
+    /// the path briefly absent, and the replacement is renamed into place.
+    /// Each step is synced before the next, so a crash leaves the old object
+    /// at the path, the new object at the path, or the old object at `old`
+    /// with the path absent.
+    pub(crate) fn exchange(&self, path: &str, staging: &File, swap: &str, old: &str) -> Result<()> {
+        validate_path(path)?;
+        let (parent, leaf) = self.parent(path)?;
+        if !exchange_unsupported() {
+            match renameat_with(staging, swap, &parent, leaf, RenameFlags::EXCHANGE) {
+                Ok(()) => {
+                    parent.sync_all()?;
+                    staging.sync_all()?;
+                    test_point("exchanged");
+                    return Ok(());
+                }
+                Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("exchanging {path}"));
+                }
+            }
         }
-        syncs.parent_of(path);
-        syncs.staging = true;
+        remove_entry(staging, old)?;
+        renameat_with(&parent, leaf, staging, old, RenameFlags::NOREPLACE)
+            .with_context(|| format!("moving {path} aside"))?;
+        parent.sync_all()?;
+        staging.sync_all()?;
+        test_point("displaced");
+        self.publish_staged(path, staging, swap)
+    }
+
+    /// Rename the staging entry `name` to `path`, which must be absent.
+    pub(crate) fn publish_staged(&self, path: &str, staging: &File, name: &str) -> Result<()> {
+        validate_path(path)?;
+        let (parent, leaf) = self.parent(path)?;
+        renameat_with(staging, name, &parent, leaf, RenameFlags::NOREPLACE)
+            .with_context(|| format!("publishing {path}"))?;
+        parent.sync_all()?;
+        staging.sync_all()?;
+        test_point("published");
+        Ok(())
+    }
+
+    /// Visit the entries beneath a directory in sorted depth-first order,
+    /// like `walk`, with paths relative to this root.
+    pub(crate) fn walk_beneath(
+        &self,
+        path: &str,
+        mut visit: impl FnMut(&str, &Stat) -> Result<bool>,
+    ) -> Result<()> {
+        let directory = self.dir(path)?;
+        let mut pending = child_paths(&directory, &format!("{path}/"))?;
+        while let Some(path) = pending.pop() {
+            let entry = self
+                .open_relative(&path, OFlags::PATH | OFlags::NOFOLLOW)
+                .with_context(|| format!("opening tree entry {path:?}"))?;
+            let info = fstat(&entry)?;
+            if visit(&path, &info)? && FileType::from_raw_mode(info.st_mode) == FileType::Directory
+            {
+                pending.extend(child_paths(&entry, &format!("{path}/"))?);
+            }
+        }
         Ok(())
     }
 
@@ -685,7 +788,12 @@ impl Root {
             }
             match self.open_relative(path, OFlags::RDONLY | OFlags::DIRECTORY) {
                 Ok(directory) => return Ok(directory.sync_all()?),
-                Err(Errno::NOENT) => path = path.rsplit_once('/').map_or("", |(parent, _)| parent),
+                // A transition can replace a queued directory, or one of its
+                // ancestors, with a file or symlink. The nearest surviving
+                // directory recorded that change.
+                Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => {
+                    path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                }
                 Err(error) => {
                     return Err(error).with_context(|| format!("syncing directory {path}"));
                 }
@@ -778,6 +886,61 @@ impl Root {
         Ok(true)
     }
 }
+
+/// Remove a directory entry and everything beneath it. Directories are
+/// opened beneath their parent without following symlinks or crossing a
+/// mount, and every other entry is unlinked without being followed.
+fn remove_entry(parent: &File, name: &str) -> Result<bool> {
+    let info = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(info) => info,
+        Err(Errno::NOENT) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if FileType::from_raw_mode(info.st_mode) == FileType::Directory {
+        let directory: File = openat2(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        )?
+        .into();
+        let names = fs::read_dir(Root::fd_path(&directory))?
+            .map(|entry| Ok(entry?.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        for child in names {
+            let child = child
+                .to_str()
+                .with_context(|| format!("non-UTF-8 name {child:?} in staging"))?;
+            remove_entry(&directory, child)?;
+        }
+        unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    } else {
+        unlinkat(parent, name, AtFlags::empty())?;
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+fn exchange_unsupported() -> bool {
+    std::env::var_os("CPS_TEST_NO_EXCHANGE").is_some()
+}
+
+#[cfg(not(test))]
+fn exchange_unsupported() -> bool {
+    false
+}
+
+/// Stop a test worker at a named step of a path transition.
+#[cfg(test)]
+pub(crate) fn test_point(step: &str) {
+    if std::env::var("CPS_TEST_INTERRUPT_STEP").is_ok_and(|value| value == step) {
+        std::process::exit(crate::tests::INTERRUPTED);
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn test_point(_step: &str) {}
 
 fn child_paths(directory: &File, prefix: &str) -> Result<Vec<String>> {
     let mut children = Vec::new();
@@ -972,6 +1135,98 @@ mod tests {
             Some(Node::File { ref sha256, .. }) if *sha256 == crate::model::digest(b"DATA")
         ));
         assert!(root.file_matching("file", &observed.fingerprint).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exchanges_objects_of_different_types_and_never_follows_the_new_symlink() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Root::open(temp.path())?;
+        fs::create_dir_all(temp.path().join("bin/sub"))?;
+        fs::write(temp.path().join("bin/sub/tool"), "tool")?;
+        fs::create_dir_all(temp.path().join("usr/bin"))?;
+        fs::create_dir(temp.path().join("stage"))?;
+        let stage = Root::open(&temp.path().join("stage"))?;
+        let metadata = fs::metadata(temp.path())?;
+        let link = Node::Symlink {
+            target: "usr/bin".into(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        root.stage_object(stage.as_file(), "swap", "bin", &link, None)?;
+        root.exchange("bin", stage.as_file(), "swap", "old")?;
+        assert_eq!(root.inspect("bin")?, Some(link.clone()));
+        // The old tree is now private to staging.
+        assert_eq!(
+            fs::read_to_string(temp.path().join("stage/swap/sub/tool"))?,
+            "tool"
+        );
+        // Paths beneath the new symlink do not exist without following it,
+        // and writes beneath it refuse to follow it.
+        assert_eq!(root.inspect("bin/sub/tool")?, None);
+        let mut syncs = DirSyncs::default();
+        assert!(
+            root.replace("bin/new", &link, None, stage.as_file(), false, &mut syncs)
+                .is_err()
+        );
+        assert!(!temp.path().join("usr/bin/new").exists());
+        // Queued syncs beneath the replaced directory fall back to its parent.
+        syncs.parent_of("bin/sub/tool");
+        root.sync_dirs(&mut syncs, None)?;
+        assert!(stage.remove_staged("swap")?);
+        assert!(!stage.remove_staged("swap")?);
+        Ok(())
+    }
+
+    #[test]
+    fn exchange_falls_back_to_moving_the_old_object_aside() -> Result<()> {
+        // Exchanged in-process, so the fallback is selected explicitly.
+        let temp = tempfile::tempdir()?;
+        let root = Root::open(temp.path())?;
+        fs::write(temp.path().join("config"), "file")?;
+        fs::create_dir(temp.path().join("stage"))?;
+        let stage = Root::open(&temp.path().join("stage"))?;
+        let metadata = fs::metadata(temp.path())?;
+        let dir = Node::Dir {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: 0o755,
+        };
+        root.stage_object(stage.as_file(), "swap", "config", &dir, None)?;
+        let (parent, leaf) = root.parent("config")?;
+        renameat_with(
+            &parent,
+            leaf,
+            stage.as_file(),
+            "old",
+            RenameFlags::NOREPLACE,
+        )?;
+        // The path is absent and the old object waits in staging.
+        assert_eq!(root.inspect("config")?, None);
+        assert!(matches!(stage.inspect("old")?, Some(Node::File { .. })));
+        root.publish_staged("config", stage.as_file(), "swap")?;
+        assert_eq!(root.inspect("config")?, Some(dir));
+        assert!(stage.remove_staged("old")?);
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_staged_tree_never_follows_its_symlinks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir_all(temp.path().join("stage/tree/nested"))?;
+        fs::create_dir(temp.path().join("outside"))?;
+        fs::write(temp.path().join("outside/keep"), "keep")?;
+        std::os::unix::fs::symlink(
+            temp.path().join("outside"),
+            temp.path().join("stage/tree/nested/link"),
+        )?;
+        let stage = Root::open(&temp.path().join("stage"))?;
+        assert!(stage.remove_staged("tree")?);
+        assert!(!temp.path().join("stage/tree").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("outside/keep"))?,
+            "keep"
+        );
         Ok(())
     }
 

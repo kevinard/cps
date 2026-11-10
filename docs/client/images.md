@@ -11,6 +11,7 @@ a package into an image you can use with these commands.
 
 - [Plan, fetch, validate, and apply](#plan-fetch-validate-and-apply)
 - [Resume a transaction and inspect its history](#resume-a-transaction-and-inspect-its-history)
+- [Replace a directory with a file or symlink](#replace-a-directory-with-a-file-or-symlink)
 - [Verify an image and locate its state](#verify-an-image-and-locate-its-state)
 - [Reconcile or remove packages](#reconcile-or-remove-packages)
 - [Repair files or restore vendor defaults](#repair-files-or-restore-vendor-defaults)
@@ -91,6 +92,39 @@ request, package changes, catalog digests, and planned action counts. The record
 commits with the image state, works offline, and follows the source image's
 history when staging a boot environment. History uses commit order within a revision and omits wall-clock
 timestamps so independently provisioned images can still match byte for byte.
+
+## Replace a directory with a file or symlink
+
+A release can turn a directory into a file or symlink, as in a merged `/usr`
+where `bin` becomes a link to `usr/bin`, or turn a file or symlink into a
+directory. CPS refuses the plan when the directory holds anything the
+transaction does not remove, and lists those paths; see the
+[manifest rules](../maintainer/manifests.md#package-metadata-and-version-constraints). Nothing is moved or
+deleted until the plan is changed or the paths are cleared.
+
+CPS builds the replacement in the image's private staging directory: the
+new file or symlink, or the complete new directory tree with its files,
+links, and subdirectories. It syncs it and swaps it with the old object with
+`renameat2(RENAME_EXCHANGE)`, so the path names either the old or the new
+object at every moment. The writes that the new target needs, such as the
+files of `usr/bin`, come first. The old object, now in staging, is then
+removed without following its symlinks. Paths are resolved beneath the
+image root without following symlinks or crossing mounts, so no write can
+pass through a symlink that a transition created, and a mount point inside a
+replaced directory stops the plan.
+
+Some filesystems do not support `RENAME_EXCHANGE`. There CPS first renames
+the old object into staging, syncs, and then renames the replacement into
+place, so the path is briefly absent. Each rename is synced before the next
+step.
+
+Resume recognizes every intermediate state:
+
+| On-disk state | Resume |
+| --- | --- |
+| Old object in place, partial replacement in staging | Rebuilds the replacement and swaps it in |
+| New object in place, old object in staging | Removes the old object |
+| Path absent, old object in staging (fallback only) | Renames the replacement into place |
 
 ## Verify an image and locate its state
 

@@ -14,8 +14,8 @@ use crate::{
     kdl_format::publish_policy::{Companion, Profile},
     model::{Node, PackageSpec, Selection, Version, VersionConstraint},
     plan::{
-        CandidateSet, Candidates, Renames, Retention, check_directory, check_path_type,
-        resolve_packages, select_paths,
+        CandidateSet, Candidates, Renames, Retention, check_directory, resolve_packages,
+        select_paths,
     },
 };
 
@@ -630,11 +630,14 @@ fn check_upgrade(
         kernel::selected(&after, &new_paths)?,
     )?;
     for (path, old) in old_paths {
-        if let Some(new) = new_paths.get(&path) {
-            check_path_type(&path, &old, new)?;
-            if new.node.is_dir() && &old != new {
-                check_directory(&path, &old.node, new)?;
-            }
+        // A directory can become a file or symlink, and the reverse, when
+        // the transaction removes its contents; clients check that on disk.
+        if let Some(new) = new_paths.get(&path)
+            && new.node.is_dir()
+            && old.node.is_dir()
+            && &old != new
+        {
+            check_directory(&path, &old.node, new)?;
         }
     }
     Ok((after, new_paths))
