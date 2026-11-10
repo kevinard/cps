@@ -1656,6 +1656,30 @@ pub(crate) fn read_current_catalog(
     Ok((catalog, hash))
 }
 
+/// Read a catalog a mirror advertises as current, whose trust root must be
+/// unexpired. `key` is the client's pinned trust root.
+pub(crate) fn read_fresh_catalog(
+    repo: &Path,
+    hash: &str,
+    publisher: &str,
+    key: &[u8],
+) -> Result<Catalog> {
+    read_catalog_with_freshness(repo, hash, publisher, key, Freshness::Current)
+}
+
+/// The trust root version the repository's current catalog is signed under,
+/// verified against the client's pinned trust root without loading shards.
+/// It may have expired.
+pub(crate) fn current_trust_root(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+) -> Result<trust::TrustRoot> {
+    let hash = read_current(repo)?;
+    let catalog = read_root(repo, &hash, publisher, key, Freshness::Pinned)?;
+    Ok(catalog.trust.verify(publisher)?.current().clone())
+}
+
 fn read_catalog_with_freshness(
     repo: &Path,
     hash: &str,

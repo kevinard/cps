@@ -5985,6 +5985,113 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
 }
 
 #[test]
+fn expired_trust_roots_stop_mirror_sync_and_deferral() -> Result<()> {
+    let defer = mirror_release::RefreshPolicy {
+        defer_unavailable_hours: Some(24),
+    };
+    // Setup signs two releases and can be slow under load. Retry with a
+    // longer trust root lifetime if it expired before the first sync.
+    let mut attempt = None;
+    for seconds in [10, 60, 240] {
+        let f = Fixture::new()?;
+        let expires = Timestamp::now()
+            .checked_add(jiff::Span::new().seconds(seconds))?
+            .round(jiff::Unit::Second)?;
+        fs::remove_dir_all(f.repo.join("trust"))?;
+        fs::copy(
+            crate::init_trust(&f.repo, "canopa", &f.private, Some(&expires.to_string()))?,
+            &f.trust,
+        )?;
+        let work = f._dir.path();
+        let anchor = work.join("root.json");
+        let tuf_key = work.join("tuf-key.der");
+        sign_root(&anchor, &tuf_key, None)?;
+        let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+        for (version, mirror) in [(1, "first"), (2, "second")] {
+            f.package(
+                "desktop/compositor",
+                &format!("{version}.0.0-0"),
+                String::new(),
+            )?;
+            sign_release(&f, &work.join(mirror), version, fresh, &anchor, &tuf_key)?;
+        }
+        let cache = work.join("cache");
+        let sync = |mirror: &str| {
+            let mirror = work.join(mirror);
+            mirror_release::sync(
+                &cache,
+                &anchor,
+                Url::from_directory_path(mirror.join("metadata"))
+                    .unwrap()
+                    .as_str(),
+                Url::from_directory_path(mirror.join("targets"))
+                    .unwrap()
+                    .as_str(),
+                "canopa",
+                &f.trust,
+            )
+        };
+        let Ok(first) = sync("first") else { continue };
+        fs::write(
+            cache.join(".tuf/refreshed"),
+            format!("{}\n", Timestamp::now().as_second()),
+        )?;
+        let publisher = crate::image::Publisher {
+            name: "canopa".to_owned(),
+            repo: cache.clone(),
+            key: fs::read(&f.trust)?,
+            build_trust: None,
+            git: None,
+        };
+        let deferral = mirror_release::check_deferral(&publisher, defer, "unavailable");
+        if Timestamp::now() < expires {
+            let state = deferral?;
+            assert_eq!(state.trust_root_expires, Some(expires.to_string()));
+            assert!(!state.beyond_policy);
+            let work = work.to_owned();
+            attempt = Some((expires, first, publisher, f, work, anchor));
+            break;
+        }
+    }
+    let (expires, first, publisher, f, work, anchor) =
+        attempt.expect("trust root setup kept expiring");
+    while Timestamp::now() <= expires {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let cache = &publisher.repo;
+
+    // The second release is validly signed for TUF, but its catalog's trust
+    // root has expired. It must not become current or the rollback anchor.
+    let mirror = work.join("second");
+    let error = mirror_release::sync(
+        cache,
+        &anchor,
+        Url::from_directory_path(mirror.join("metadata"))
+            .unwrap()
+            .as_str(),
+        Url::from_directory_path(mirror.join("targets"))
+            .unwrap()
+            .as_str(),
+        "canopa",
+        &f.trust,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("expired"), "{error:#}");
+    assert_eq!(fs::read_to_string(cache.join("current"))?.trim(), first);
+    assert_eq!(
+        fs::read_to_string(cache.join(".tuf/catalog"))?.trim(),
+        first
+    );
+
+    // An outage cannot extend use of the cached catalog past its trust root.
+    let error = mirror_release::check_deferral(&publisher, defer, "unavailable").unwrap_err();
+    assert!(format!("{error:#}").contains("expired at"), "{error:#}");
+    let report = mirror_release::freshness(&publisher, defer)?;
+    assert!(report.beyond_policy);
+    Ok(())
+}
+
+#[test]
 fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()> {
     use crate::query::{Scope, list_packages, package_manifest};
 

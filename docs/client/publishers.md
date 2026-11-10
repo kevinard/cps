@@ -239,13 +239,15 @@ usable until the earlier of `max-staleness-hours` after its last successful
 refresh and the expiry of the trust root its current catalog is signed under.
 
 `cps status` and `cps check-updates` show each mirror publisher's last
-successful refresh, the expiry of its verified TUF timestamp, and its
-policy, for example
-`Publisher extras: refreshed 5 hours ago, metadata expires 2026-11-11T00:00:00Z, fail when unavailable`.
+successful refresh, the expiry of its verified TUF timestamp, the expiry of
+the trust root its cached current catalog is signed under, and its policy,
+for example
+`Publisher extras: refreshed 5 hours ago, metadata expires 2026-11-11T00:00:00Z, trust root expires 2027-06-01T00:00:00Z, fail when unavailable`.
 The JSON report of `check-updates` lists them in `publisher_freshness` with
-`last_refreshed` as Unix seconds, `age_seconds`, `metadata_expires`, the
-policy's `defer_unavailable_hours`, and `beyond_policy`, which is true
-when the cache is too old to defer or its age is unknown. For a publisher
+`last_refreshed` as Unix seconds, `age_seconds`, `metadata_expires`,
+`trust_root_expires`, the policy's `defer_unavailable_hours`, and
+`beyond_policy`, which is true when the cache is too old to defer, its
+trust root has expired, or its age or trust root is unknown. For a publisher
 with a defer policy, the text report then ends with `(stale beyond policy)`.
 
 ## Require build evidence
