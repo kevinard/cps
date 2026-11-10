@@ -273,4 +273,33 @@ jq -e --argjson version "$((before + 4))" '.signed.version == $version' public/m
 trust_target "$((before + 4))" repo/trust/2.json
 cmp original-descriptor.json public/publisher.json
 sync_mirror "$third"
-printf '%s\n' 'Verified mirror publication, timestamp refresh, root rotation, 2-of-3 key revocation, and catalog key rotation'
+
+# The descriptor advances to a later trust root of the catalog's history, so
+# new clients bootstrap from the newest version.
+cp repo/trust/2.json newest-trust-root.json
+CPS_MIRROR_TRUST_ROOT=$work/newest-trust-root.json deploy "$third"
+cmp newest-trust-root.json <(jq -er '.trust_root' public/publisher.json | base64 -d)
+cmp <(jq -S 'del(.trust_root)' original-descriptor.json) <(jq -S 'del(.trust_root)' public/publisher.json)
+cp public/publisher.json newest-descriptor.json
+"$CPS_BIN" repo sync --repo bootstrapped-cache --root root.json --publisher canopa \
+    --trust-root newest-trust-root.json --metadata "$mirror_url/metadata/" --targets "$mirror_url/targets/" \
+    --require-catalog "$third"
+# It never moves back to an older version ...
+if deploy "$third" 2>deploy.err; then
+    echo 'The publisher descriptor moved back to an older trust root' >&2
+    exit 1
+fi
+rg -q 'advertises trust root version 2' deploy.err
+cmp newest-descriptor.json public/publisher.json
+# ... and an advertised trust root outside the catalog's history is rejected.
+openssl genpkey -algorithm ED25519 -outform DER -out foreign-private.der
+"$CPS_BIN" repo trust init --repo foreign --publisher canopa --key foreign-private.der >/dev/null
+jq --arg trust_root "$(base64 -w0 foreign/trust/1.json)" '.trust_root = $trust_root' \
+    newest-descriptor.json > public/publisher.json
+if CPS_MIRROR_TRUST_ROOT=$work/newest-trust-root.json deploy "$third" 2>deploy.err; then
+    echo 'A foreign advertised trust root was replaced' >&2
+    exit 1
+fi
+rg -q 'trust root outside the history' deploy.err
+cp newest-descriptor.json public/publisher.json
+printf '%s\n' 'Verified mirror publication, timestamp refresh, root rotation, 2-of-3 key revocation, catalog key rotation, and descriptor trust root updates'

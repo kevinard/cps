@@ -25,6 +25,11 @@ RUN set -eu; \
     rm rust-dist.sha256
 ENV PATH="/opt/cps-rust/bin:${PATH}"
 
+# tests/deploy-mirror.sh signs TUF roots with tuftool, built from its published lock file.
+RUN cargo install --locked --root /opt/cps-tools tuftool@0.17.0 \
+    && rm -rf /root/.cargo
+ENV PATH="/opt/cps-tools/bin:${PATH}"
+
 FROM transactions AS boot
 RUN pacman -S --noconfirm --needed bc btrfs-progs cmake cpio edk2-ovmf elfutils \
         mkinitcpio-busybox qemu-system-x86 \

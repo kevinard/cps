@@ -381,11 +381,14 @@ and a new or re-signed catalog, deploy that catalog as usual. The export's
 `trust-root.json` target then carries the newest version for clients that
 add the publisher by URL.
 
-Keep `CPS_MIRROR_TRUST_ROOT` pointing to the trust root file that the
-mirror first published. The adapter publishes `publisher.json` once and
-refuses to replace it with different bootstrap material. Any version in the
-catalog's history verifies the catalog, so an older pin keeps working after
-rotation.
+Point `CPS_MIRROR_TRUST_ROOT` at the newest trust root version so that new
+clients bootstrap from it. The adapter replaces the trust root in
+`publisher.json` only with a later version from the history of the catalog it
+deploys, and only after that catalog's timestamp is published. It refuses any
+other change to the bootstrap material, an older version than the one the
+mirror advertises, and an advertised version outside the catalog's history.
+Any version in the catalog's history verifies the catalog, so clients that
+pinned an older version keep working after rotation.
 
 ## Rotating a mirror's TUF root
 

@@ -294,10 +294,34 @@ jq -n --arg publisher "$publisher" --rawfile tuf_root "$stage/bootstrap-root.jso
     --arg trust_root "$(base64 -w0 -- "$stage/trust-root.json")" \
     '{schema_version: 1, kind: "publisher-bootstrap", publisher: $publisher, tuf_root: ($tuf_root | @base64), trust_root: $trust_root}' \
     > "$stage/publisher.json"
+trust_version() {
+    local version
+    version=$("$cps" repo trust show "$1" | sed -n 's/^Version: \([1-9][0-9]*\)$/\1/p')
+    [[ $version =~ ^[1-9][0-9]{0,14}$ ]] || fail "Invalid trust root $1"
+    printf '%s\n' "$version"
+}
+# The descriptor may advance to a later trust root version of the same history.
+replace_descriptor=
 if [[ -e $mirror/publisher.json || -L $mirror/publisher.json ]]; then
-    [[ -f $mirror/publisher.json && ! -L $mirror/publisher.json ]] &&
-        cmp -s -- "$stage/publisher.json" "$mirror/publisher.json" ||
-        fail 'The mirror already advertises different publisher bootstrap material'
+    [[ -f $mirror/publisher.json && ! -L $mirror/publisher.json &&
+        $(stat -c %s -- "$mirror/publisher.json") -le 1048576 ]] ||
+        fail 'Invalid mirror publisher.json'
+    if ! cmp -s -- "$stage/publisher.json" "$mirror/publisher.json"; then
+        jq -e --slurpfile next "$stage/publisher.json" \
+            'del(.trust_root) == ($next[0] | del(.trust_root))' "$mirror/publisher.json" >/dev/null &&
+            jq -er '.trust_root' "$mirror/publisher.json" | base64 -d > "$stage/advertised-trust-root.json" ||
+            fail 'The mirror already advertises different publisher bootstrap material'
+        # The deployed catalog's history holds both versions unchanged, so they
+        # share version 1 and every version between them.
+        "$cps" repo withdrawals --repo "$repo" --publisher "$publisher" \
+            --trust-root "$stage/advertised-trust-root.json" >/dev/null ||
+            fail 'The mirror advertises a trust root outside the history of the catalog'
+        advertised_version=$(trust_version "$stage/advertised-trust-root.json")
+        trust_root_version=$(trust_version "$stage/trust-root.json")
+        (( trust_root_version > advertised_version )) ||
+            fail "The mirror advertises trust root version $advertised_version. Set CPS_MIRROR_TRUST_ROOT to it or a later version."
+        replace_descriptor=1
+    fi
 fi
 
 release_expiry=$(date -u -d "+$targets_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
@@ -341,7 +365,9 @@ for file in "$stage/roots/"*.root.json; do
         publish_immutable "$file" "$metadata/$filename"
     fi
 done
-publish_immutable "$stage/publisher.json" "$mirror/publisher.json"
+if [[ -z $replace_descriptor ]]; then
+    publish_immutable "$stage/publisher.json" "$mirror/publisher.json"
+fi
 install -m 0644 -- "$stage/signed/metadata/timestamp.json" "$stage/timestamp.next"
 sync -f -- "$stage"
 # The new root may revoke the old timestamp key. Publish it just before the timestamp.
@@ -349,6 +375,15 @@ publish_immutable "$stage/roots/$active_filename" "$metadata/$active_filename"
 sync -- "$metadata/$active_filename" "$metadata"
 mv -T -- "$stage/timestamp.next" "$timestamp"
 sync -f -- "$mirror"
+if [[ -n $replace_descriptor ]]; then
+    # Advertise the later trust root once a catalog carrying it is current.
+    # An interrupted replacement leaves the earlier version, which still
+    # verifies, and the next deployment replaces it.
+    install -m 0644 -- "$stage/publisher.json" "$stage/publisher.next"
+    sync -- "$stage/publisher.next"
+    mv -T -- "$stage/publisher.next" "$mirror/publisher.json"
+    sync -f -- "$mirror"
+fi
 state_tmp=$(mktemp "$repo/.ci-tuf-state.XXXXXXXX")
 record_state "$publication"
 state_tmp=

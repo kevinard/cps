@@ -66,7 +66,7 @@ jobs:
               export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
               export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
               for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
-                  package-freezes git-snapshots release-ci release-notes sharded-mirror boot-export \
+                  package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror boot-export \
                   recipe-orchestration; do
                 bash "tests/$test.sh"
               done
