@@ -1374,7 +1374,12 @@ fn builder_policy_changes_are_atomic_and_wait_for_transaction_recovery() -> Resu
         COMPOSITOR,
     )?;
     let error = set_publisher_build_trust(&f.root, "canopa", &policy, true).unwrap_err();
-    assert!(error.to_string().contains("incomplete transaction"));
+    let message = error.to_string();
+    assert!(message.contains("incomplete transaction"), "{message}");
+    assert!(
+        message.contains("cps transaction resume") && message.contains("cps transaction abort"),
+        "{message}"
+    );
     apply(&f.root, &install)?;
 
     let settings = || Image::open(&f.root, false)?.settings();
