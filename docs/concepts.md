@@ -118,8 +118,11 @@ Use a qualified selector to choose a particular source for a new package.
 ## Images and transactions
 
 An **image** is a managed filesystem root and its CPS state. The state records
-installed packages, path ownership, and the committed **revision**. Every
-change goes through the same steps:
+installed packages, path ownership, and the committed **revision**. It lives
+in `/usr/lib/sysimage/cps` inside the image, next to the files it describes.
+Packages never ship anything in `/var`: an image starts with `var` as an
+empty mount point, and the packages' tmpfiles.d and sysusers.d declarations
+populate `/var` at boot. Every change goes through the same steps:
 
 | Term | Meaning in CPS |
 | --- | --- |
@@ -222,7 +225,9 @@ A **boot environment** pairs a root with its boot artifacts and its
 registered boot entry on the **EFI System Partition** (ESP). The entry
 records the root's image identity and revision, so the boot always uses the
 root's committed package state and configuration together. A staged Btrfs
-environment is a writable snapshot of its parent root. An ext4 environment is
+environment is a writable snapshot of its parent root. Every Btrfs
+environment mounts the same `/var` subvolume, so logs and application data
+survive rollback and pruning. An ext4 environment is
 an exported root written to a dedicated partition, its **root slot**.
 
 | Term | Meaning in CPS |

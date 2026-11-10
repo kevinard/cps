@@ -37,12 +37,26 @@ the inactive image as their alternate root. It installs the package files
 first, then provisions accounts, creates state, and applies presets. New or
 changed sysusers and tmpfiles declarations are processed by name, with
 target-local replacements and masks taking precedence. For example, a
-tmpfiles rule of `d /var/lib/example 0750 example example -` can use the
+tmpfiles rule of `d /srv/example 0750 example example -` can use the
 account created earlier in the same transaction. A declared tmpfiles file
-may contain only `d`, `f`, and `L` creation rules, and publication rejects
-other rule types. Boot-only rules, such as `d!`, and paths under `/dev`,
-`/proc`, `/run`, and `/sys` are deferred to boot.
+may contain only the `d`, `f`, `L`, and `C` rules, which create missing
+paths, and publication rejects other rule types. Boot-only rules, such as
+`d!`, and paths under `/dev`, `/proc`, `/run`, and `/sys` are deferred to
+boot.
 [systemd-tmpfiles](https://www.freedesktop.org/software/systemd/man/latest/systemd-tmpfiles.html)
+
+Packages never ship `/var`. They declare what they need there with these
+rules, as described in
+[Packages never ship /var](manifests.md#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd).
+On the running system, CPS runs the tmpfiles rules against the mounted
+`/var`, so a newly installed service finds its directories without a
+reboot. In an inactive image, such as a staged boot environment or a root
+being assembled, `var` is the empty mount point of a `/var` that the image
+does not contain, so CPS defers rules for `/var` to boot, where
+`systemd-tmpfiles-setup.service` applies them to whichever `/var` the system
+mounts. A rule such as `d /var/lib/example 0750 example example -` then
+resolves `example` from the accounts that sysusers already wrote into the
+image's `/etc/passwd`.
 
 Presets apply the image's enablement policy to newly installed units. CPS
 preserves enablement during upgrades and honors local unit overrides and

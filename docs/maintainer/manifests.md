@@ -21,6 +21,8 @@ patterns. Then test the package in an [inactive image](../client/images.md).
 - [Generated shared-library dependencies](#generated-shared-library-dependencies)
   - [Reviewing runtime dependencies](#reviewing-runtime-dependencies)
 - [Filesystem actions](#filesystem-actions)
+  - [Packages never ship /var; declare it with tmpfiles.d and sysusers.d](#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd)
+  - [Service accounts with static IDs](#service-accounts-with-static-ids)
   - [Filesystem permissions](#filesystem-permissions)
   - [Linux file capabilities](#linux-file-capabilities)
 - [Facets and variants](#facets-and-variants)
@@ -295,7 +297,9 @@ Ownership defaults to UID and GID zero; `--uid` and `--gid` set other owners.
 It captures Linux file capabilities from executable inodes. It rejects
 namespaced capability sets, hard-linked symlinks, unsupported permission
 bits and filesystem objects, and other extended attributes on regular files
-or directories. Add dependencies, metadata, facets, configuration, and
+or directories. It also rejects a prototype that contains `var`; see
+[Packages never ship /var](#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd).
+Add dependencies, metadata, facets, configuration, and
 systemd declarations before publishing.
 [IPS prototype manifest generation](https://docs.oracle.com/cd/E88353_01/html/E37839/pkgsend-1.html)
 
@@ -446,7 +450,7 @@ A file marked `preserve=#true` keeps local edits through an upgrade,
 including a package ownership transfer at the same path. Removing the
 package leaves a modified file in place and records its identity, so a
 reinstall can reclaim it. When the vendor file changes, CPS stages the new
-copy under `/var/lib/cps/image/config-updates/<revision>/` inside the image.
+copy under `/usr/lib/sysimage/cps/config-updates/<revision>/` inside the image.
 
 Directories that several packages declare must have identical metadata.
 Directories that no package declares are created as needed. When ownership
@@ -463,6 +467,91 @@ depends on, including providers of `require-capability` and generated
 executables last, and removals run in reverse order after every new file is
 in place. Declare runtime dependencies completely, so that a program
 started during a live upgrade finds the libraries it needs.
+
+### Packages never ship /var; declare it with tmpfiles.d and sysusers.d
+
+No action may name `var` or a path below it, and CPS rejects such a
+manifest wherever it enters: when it is parsed or validated, when
+`manifest generate --proto` finds `var` in the prototype, when a build
+installs files under `$DESTDIR/var`, and when it is published. Trigger
+outputs and watches cannot name `/var` either.
+
+`/var` holds the machine's own data: logs, databases, spools, and caches.
+On a Btrfs system it is one subvolume that every
+[boot environment](../setups/btrfs.md#share-var-between-boot-environments)
+mounts, so that data survives a rollback and the removal of old
+environments. It is not part of any image, and CPS never writes there. An
+image starts with `var` as an empty directory, the mount point.
+
+Describe what the package needs in `/var` as systemd declarations that the
+package ships in `/usr`:
+
+```kdl
+schema-version 1 kind="package-manifest"
+package "service/example" publisher="canopa" version="1.0.0-0" {
+    file "usr/lib/sysusers.d/example.conf" mode="0644" uid=0 gid=0
+    sysusers "example.conf"
+    file "usr/lib/tmpfiles.d/example.conf" mode="0644" uid=0 gid=0
+    tmpfiles "example.conf"
+    file "usr/share/factory/var/lib/example/seed.db" mode="0644" uid=0 gid=0
+}
+```
+
+```text
+# usr/lib/sysusers.d/example.conf
+u example - "Example daemon" /var/lib/example
+
+# usr/lib/tmpfiles.d/example.conf
+d /var/lib/example 0750 example example -
+d /var/log/example 0750 example example -
+```
+
+`systemd-sysusers.service` and `systemd-tmpfiles-setup.service` apply these
+at every boot, before services start, so a new environment, a rolled-back
+one, and a freshly created empty `/var` subvolume all get the paths they
+need. On the running system, an installation also creates them at once; see
+[offline systemd actions](systemd.md#offline-systemd-actions). A staged or
+offline root defers its `/var` rules to its first boot. To seed `/var` with
+initial content, ship it under `usr/share/factory/var` and copy it at boot
+with a tmpfiles.d `C` rule, which tmpfiles applies only while the target is
+missing. Services can also create their own state with systemd's
+`StateDirectory=`, `CacheDirectory=`, and `LogsDirectory=`.
+
+Because `/var` outlives the environment that wrote it, an older environment
+can boot against data that a newer version of the service already
+migrated. Keep the on-disk format readable by the previous version until the
+trial is accepted, as described in
+[shared state](../setups/btrfs.md#health-checks-and-shared-state).
+
+A [trigger](triggers.md) cannot write to `/var`, so a cache that a trigger
+rebuilds goes below `/usr` or `/etc`, as the
+[common triggers](triggers.md#common-triggers) show for font and manual page
+caches.
+
+### Service accounts with static IDs
+
+Manifests record owners as numeric `uid` and `gid`, and CPS writes package
+files before it runs the transaction's sysusers declarations. A service
+account that owns or groups a packaged file therefore needs a fixed ID, the
+same in the sysusers.d line and in the manifest:
+
+```text
+# usr/lib/sysusers.d/example.conf
+g example 815
+u example 815:815 "Example daemon" /var/lib/example
+```
+
+```kdl
+file "etc/example/secret.conf" mode="0640" uid=0 gid=815 preserve=#true
+```
+
+Take these IDs from a registry that the distribution keeps, in the lower part
+of the system range. sysusers allocates IDs for accounts declared with `-`
+from the top of the system range (`SYS_UID_MAX`, usually 999) downwards, so
+the two never collide. An account that owns only paths in `/var` can use a
+dynamic ID: tmpfiles.d resolves names when it runs, after sysusers.
+[sysusers.d](https://www.freedesktop.org/software/systemd/man/latest/sysusers.d.html) ·
+[UIDs and GIDs in systemd](https://systemd.io/UIDS-GIDS/)
 
 ### Filesystem permissions
 

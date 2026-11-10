@@ -124,6 +124,10 @@ catalog keys.
 cps publish --repo repo --proto proto --signing-key private.der hello.kdl
 ```
 
+Publication validates each manifest and rejects actions under `var`, which
+[packages never ship](../maintainer/manifests.md#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd),
+and in the CPS image state under `usr/lib/sysimage/cps`.
+
 The signed catalog digest appears in `repo/current`. For a protected
 repository, set the [publishing policy](#publishing-policy) before the first
 publication. To distribute the catalog, [export and sign a mirror](mirrors.md).

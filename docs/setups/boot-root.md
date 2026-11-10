@@ -19,7 +19,13 @@ while assembling and verifying the image.
 The root layout depends on the deployment.
 
 - For Btrfs, use a new, empty named root subvolume under the mounted
-  top level. Keep the CPS image state and managed paths in that subvolume.
+  top level. CPS keeps the image state and managed paths in that subvolume.
+  Create the `/var` subvolume beside it, as described in
+  [Share /var between boot environments](btrfs.md#share-var-between-boot-environments),
+  and add its line to the root's `/etc/fstab`. `image-create` makes `var`
+  the empty mount point, or accepts the new, empty `/var` subvolume already
+  mounted there. The packages' tmpfiles.d declarations populate it on the
+  first boot.
 - For ext4, use an empty directory on a single filesystem. Export the
   assembled root to ext4 before writing the target partition.
 

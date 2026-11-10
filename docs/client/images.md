@@ -402,7 +402,8 @@ was set back.
 
 `--pristine` checks a freshly assembled offline root. It checks all package
 paths, including preserved configuration and implicit directories, and
-reports unmanaged paths outside the image state. It also rejects unexpected
+reports unmanaged paths outside the image state. That includes anything in
+`var`, which an inactive root leaves empty, and a missing `var` directory. It also rejects unexpected
 hard links to regular files and undeclared extended attributes on managed
 regular files and directories. Use regular `verify` after provisioning or
 booting, when the system can generate files outside package ownership.
@@ -412,13 +413,26 @@ Use `verify --package NAME` or `verify --path /path` to limit on-disk
 checks to the selected managed files while still authenticating image
 metadata. Both also accept `--quick`.
 
-Images keep the package database, transaction staging, and prepared kernel
-files under `/var/lib/cps/image/` inside the image. The SQLite database
+Images keep the package database, transaction staging, prepared kernel
+files, and [vendor configuration proposals](../maintainer/manifests.md#filesystem-actions)
+under `/usr/lib/sysimage/cps/` inside the image, the location that other
+distributions use for their package databases. The SQLite database
 `state.sqlite` records image format 1 and uses the application ID `CPSI`.
-On Btrfs, this directory and its ancestors must be part of the root subvolume.
-Keep `/var` on that subvolume so each boot environment carries the package
+The directory must be on the image root's own filesystem, and on Btrfs on
+the root subvolume, so each boot environment snapshot carries the package
 state that matches its files. After a transaction commits or aborts, CPS
-clears its recovery copies in `/var/lib/cps/image/stage`.
+clears its recovery copies in `/usr/lib/sysimage/cps/stage`.
+
+`/var` is not part of an image. `image-create` makes `var` an empty
+directory, the mount point of a `/var` that the
+[boot environments share](../setups/btrfs.md#share-var-between-boot-environments),
+and no package can ship anything in it. CPS never writes there in an
+inactive image: offline systemd actions defer their tmpfiles rules for `/var`
+to boot, and trigger handlers see an empty `/var`.
+[Packages never ship /var](../maintainer/manifests.md#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd)
+explains what packages declare instead. `image-create` needs an empty
+directory, or one that holds only an empty `var` directory, such as a newly
+created `/var` subvolume that an installer mounted there first.
 
 ## Reconcile or remove packages
 
