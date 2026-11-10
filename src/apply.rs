@@ -902,11 +902,15 @@ fn abort_pending(
         .as_ref()
         .is_some_and(|abort| abort.files_ready);
     if !files_ready {
+        let generated = triggers::outputs_of(&next, base);
         write_files(
             &image.root,
             &stage,
             &inverse.writes,
-            &base.paths,
+            Target {
+                paths: &base.paths,
+                generated: &generated,
+            },
             false,
             None,
             &mut after_write,
@@ -1246,11 +1250,15 @@ fn finish(
         } else {
             staged
         };
+        let generated = triggers::outputs_of(base, next);
         write_files(
             &image.root,
             stage,
             work.writes,
-            &next.paths,
+            Target {
+                paths: &next.paths,
+                generated: &generated,
+            },
             repair.is_some(),
             staged,
             &mut after_write,
@@ -1376,7 +1384,12 @@ fn restore_pending_paths(
         }
     }
     restore_pending_payloads(stage, &writes, next)?;
-    write_files(root, stage, &writes, &next.paths, false, None, &mut |_| {})?;
+    let generated = triggers::active_outputs(&next.installed, &next.paths);
+    let target = Target {
+        paths: &next.paths,
+        generated: &generated,
+    };
+    write_files(root, stage, &writes, target, false, None, &mut |_| {})?;
     Ok(writes.into_iter().map(|write| write.path).collect())
 }
 
@@ -1401,11 +1414,22 @@ fn restore_pending_payloads(stage: &Root, writes: &[Write], next: &State) -> Res
 /// Fingerprints of payloads that this process staged and hashed.
 type StagedPayloads = BTreeMap<String, Fingerprint>;
 
+/// The state that a transaction's writes lead to.
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    paths: &'a BTreeMap<String, Managed>,
+    /// Output patterns of the triggers active before or after the writes.
+    /// Generated paths inside a directory that a transition replaces
+    /// leave with the old tree, and the triggers' next run regenerates
+    /// whatever they still declare.
+    generated: &'a [&'a str],
+}
+
 fn write_files(
     root: &Root,
     stage: &Root,
     writes: &[Write],
-    paths: &BTreeMap<String, Managed>,
+    target: Target<'_>,
     repair: bool,
     staged: Option<&StagedPayloads>,
     after_write: &mut impl FnMut(&Write),
@@ -1428,10 +1452,12 @@ fn write_files(
         };
         payloads.insert(sha256.as_str(), fingerprint);
     }
+    let Target { paths, generated } = target;
     let mut writer = Writer {
         root,
         stage,
         paths,
+        generated,
         repair,
         payloads,
         syncs: DirSyncs::default(),
@@ -1476,6 +1502,7 @@ struct Writer<'a, F> {
     root: &'a Root,
     stage: &'a Root,
     paths: &'a BTreeMap<String, Managed>,
+    generated: &'a [&'a str],
     repair: bool,
     payloads: BTreeMap<&'a str, Fingerprint>,
     syncs: DirSyncs,
@@ -1678,7 +1705,7 @@ impl<'a, F: FnMut(&Write)> Writer<'a, F> {
             changed = false;
         } else if observed == write.before {
             if !into_directory {
-                check_replaced_tree(root, write, &children)?;
+                check_replaced_tree(root, write, &children, self.generated)?;
             }
             // Configuration copied out of the old tree and link targets of
             // the new one must be durable before the old object goes.
@@ -1774,13 +1801,22 @@ impl<'a, F: FnMut(&Write)> Writer<'a, F> {
 }
 
 /// Check that a directory about to be replaced holds only the journaled
-/// paths beneath it, each still in its state before the transaction.
-fn check_replaced_tree(root: &Root, write: &Write, children: &[&Write]) -> Result<()> {
+/// paths beneath it, each still in its state before the transaction, and
+/// generated trigger outputs, which leave with the old tree.
+fn check_replaced_tree(
+    root: &Root,
+    write: &Write,
+    children: &[&Write],
+    generated: &[&str],
+) -> Result<()> {
     let expected: BTreeMap<&str, &Write> = children
         .iter()
         .map(|child| (child.path.as_str(), *child))
         .collect();
     root.walk_beneath(&write.path, |path, _| {
+        if !expected.contains_key(path) && triggers::generated(generated, path) {
+            return Ok(false);
+        }
         let child = expected.get(path).with_context(|| {
             format!(
                 "unexpected path {path} beneath {}; pending transaction retained",

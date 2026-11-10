@@ -1761,8 +1761,9 @@ fn build_with_update_diagnostics(
             },
         );
     }
+    let generated = triggers::active_outputs(&state.installed, &state.paths);
     for directory in &replaced_directories {
-        check_replaced_directory(root, directory, &state, &writes)?;
+        check_replaced_directory(root, directory, &state, &writes, &generated)?;
     }
     let order = WriteOrder::new(
         (&state.installed, &state.paths),
@@ -1857,7 +1858,8 @@ fn within(path: &str, directories: &BTreeSet<&str>) -> bool {
 /// Refuse to replace a directory whose contents would not all leave with it.
 ///
 /// Every entry beneath the directory must be a managed path that this
-/// transaction removes. CPS never discards unmanaged files or locally
+/// transaction removes, or a path that a committed trigger generated, which
+/// leaves with the old tree. CPS never discards unmanaged files or locally
 /// modified configuration, and it does not move them elsewhere either: the
 /// administrator decides where they belong before the directory goes away.
 fn check_replaced_directory(
@@ -1865,12 +1867,16 @@ fn check_replaced_directory(
     directory: &str,
     committed: &State,
     writes: &BTreeMap<String, Write>,
+    generated: &[&str],
 ) -> Result<()> {
     const LISTED: usize = 20;
     let mut kept = Vec::new();
     root.walk_beneath(directory, |path, _| {
         if writes.get(path).is_some_and(|write| write.after.is_none()) {
             return Ok(true);
+        }
+        if !committed.paths.contains_key(path) && triggers::generated(generated, path) {
+            return Ok(false);
         }
         kept.push(match committed.paths.get(path) {
             Some(managed) if managed.preserve => format!("{path} (locally modified configuration)"),

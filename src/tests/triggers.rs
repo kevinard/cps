@@ -711,3 +711,83 @@ fn interrupted_abort_runs_each_remaining_trigger_once() -> Result<()> {
     }
     Ok(())
 }
+
+/// A package whose handler writes `cache` into `directory`, and the
+/// actions that ship it.
+fn cache_generator(f: &Fixture, name: &str, directory: &str) -> Result<String> {
+    Ok(dependency("require", "test/runtime", "1.0.0-0")
+        + &f.file(
+            &format!("usr/libexec/{name}"),
+            &format!("#!/usr/bin/bash\nset -eu\necho generated > /{directory}/cache\n"),
+            "0755",
+            "",
+        )?
+        + &trigger(
+            "cache",
+            &format!(
+                "        run \"usr/libexec/{name}\"\n        watch \"{directory}/*.item\"\n        output \"{directory}/cache\"\n"
+            ),
+        ))
+}
+
+#[test]
+fn transitions_carry_generated_outputs_away_with_the_old_tree() -> Result<()> {
+    if !sandbox_available() {
+        return Ok(());
+    }
+    let f = Fixture::new()?;
+    let owner = format!("uid={} gid={}", geteuid().as_raw(), getegid().as_raw());
+    f.package("test/runtime", "1.0.0-0", runtime(&f, &["/usr/bin/bash"])?)?;
+    f.package(
+        "test/gen",
+        "1.0.0-0",
+        format!("    dir \"usr/share/gen\" mode=\"0755\" {owner}\n")
+            + &f.file("usr/share/gen/a.item", "a", "0644", "")?
+            + &cache_generator(&f, "gen", "usr/share/gen")?,
+    )?;
+    f.package(
+        "test/conf",
+        "1.0.0-0",
+        f.file("usr/share/conf", "plain", "0644", "")?,
+    )?;
+    f.create()?;
+    apply(&f.root, &install_plan(&f.root, &["test/gen", "test/conf"])?)?;
+    assert_eq!(read(&f, "usr/share/gen/cache")?, "generated\n");
+
+    // The directory holding generated outputs becomes a symlink, and the
+    // release drops the trigger. The outputs leave with the old tree.
+    fs::remove_dir_all(f.proto.join("usr/share/gen"))?;
+    f.package(
+        "test/gen",
+        "2.0.0-0",
+        f.file("usr/lib/gen/a.item", "a", "0644", "")?
+            + &format!("    symlink \"usr/share/gen\" target=\"../lib/gen\" {owner}\n"),
+    )?;
+    let update = install_plan(&f.root, &["test/gen@2.0.0-0"])?;
+    assert_eq!(update.retired_triggers.len(), 1);
+    // Aborting it after its triggers brings the tree and its outputs back.
+    abort_after_triggers(&f, &update)?;
+    assert_eq!(read(&f, "usr/share/gen/cache")?, "generated\n");
+    apply(&f.root, &update)?;
+    assert!(fs::symlink_metadata(f.root.join("usr/share/gen"))?.is_symlink());
+    assert!(!f.root.join("usr/lib/gen/cache").exists());
+    assert!(verify::verify_pristine(&f.root)?.is_empty());
+
+    // A file becomes a directory that a new trigger writes into. Aborting
+    // turns the directory, with its outputs, back into the file.
+    fs::remove_file(f.proto.join("usr/share/conf"))?;
+    f.package(
+        "test/conf",
+        "2.0.0-0",
+        f.file("usr/share/conf/a.item", "a", "0644", "")?
+            + &cache_generator(&f, "conf", "usr/share/conf")?,
+    )?;
+    let update = install_plan(&f.root, &["test/conf@2.0.0-0"])?;
+    assert_eq!(runs(&update), ["test/conf:cache"]);
+    abort_after_triggers(&f, &update)?;
+    assert_eq!(read(&f, "usr/share/conf")?, "plain");
+    apply(&f.root, &update)?;
+    assert_eq!(read(&f, "usr/share/conf/cache")?, "generated\n");
+    assert!(verify::verify_pristine(&f.root)?.is_empty());
+    Ok(())
+}

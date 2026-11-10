@@ -370,6 +370,15 @@ pub(crate) fn active_outputs<'a>(
         .collect()
 }
 
+/// The output patterns of the triggers active in either of two states.
+pub(crate) fn outputs_of<'a>(from: &'a State, to: &'a State) -> Vec<&'a str> {
+    let mut outputs = active_outputs(&from.installed, &from.paths);
+    outputs.extend(active_outputs(&to.installed, &to.paths));
+    outputs.sort_unstable();
+    outputs.dedup();
+    outputs
+}
+
 /// Whether an active trigger generates a path.
 pub(crate) fn generated(outputs: &[&str], path: &str) -> bool {
     outputs.iter().any(|output| covers(output, path))

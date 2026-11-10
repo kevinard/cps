@@ -328,7 +328,11 @@ The reasons are `not managed by CPS`, `locally modified configuration`,
 this transaction`. Move or remove those paths, or
 [revert](#repair-files-or-restore-vendor-defaults) the configuration to its
 vendor default, and plan again. Locally edited configuration that the
-release moves to a path outside the directory moves with its edits.
+release moves to a path outside the directory moves with its edits. Paths
+that a [trigger](../maintainer/triggers.md) generated are no obstacle: they
+leave with the old directory, and the trigger regenerates whatever it still
+declares. The same holds when an abort turns a directory back into a file
+or symlink after a trigger wrote into it.
 [Change the file layout between versions](../maintainer/manifests.md#change-the-file-layout-between-versions)
 describes what a package declares.
 
