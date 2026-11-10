@@ -2229,6 +2229,100 @@ fn recommendations_can_be_skipped_and_upgrades_consider_new_recommendations() ->
     Ok(())
 }
 
+/// Install an editor recommending `order`, and return the names installed
+/// besides the editor.
+fn admitted_recommendations(f: &Fixture, order: &[&str]) -> Result<Vec<String>> {
+    let recommends: String = order
+        .iter()
+        .map(|name| format!("    recommends {name:?}\n"))
+        .collect();
+    f.package("apps/editor", "1.0.0-0", recommends)?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/editor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    assert!(verify(&f.root)?.is_empty());
+    Ok(
+        crate::query::list_packages(&f.root, crate::query::Scope::Installed)?
+            .into_iter()
+            .map(|row| row.name)
+            .filter(|name| name != "apps/editor")
+            .collect(),
+    )
+}
+
+#[test]
+fn earlier_recommendations_win_path_conflicts_with_later_ones() -> Result<()> {
+    for (order, winner) in [
+        (
+            ["extras/first", "extras/second", "extras/third"],
+            "extras/first",
+        ),
+        (
+            ["extras/second", "extras/first", "extras/third"],
+            "extras/second",
+        ),
+    ] {
+        let f = Fixture::new()?;
+        for name in ["extras/first", "extras/second"] {
+            f.package(name, "1.0.0-0", f.file(PLUGIN, name, "0644", "")?)?;
+        }
+        f.package("extras/third", "1.0.0-0", String::new())?;
+        assert_eq!(
+            admitted_recommendations(&f, &order)?,
+            [winner, "extras/third"],
+            "{order:?}"
+        );
+        assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, winner);
+    }
+    Ok(())
+}
+
+#[test]
+fn earlier_recommendations_win_version_conflicts_with_later_ones() -> Result<()> {
+    for (order, winner, core) in [
+        (
+            ["extras/old-api", "extras/new-api", "extras/third"],
+            "extras/old-api",
+            "1.0.0-0",
+        ),
+        (
+            ["extras/new-api", "extras/old-api", "extras/third"],
+            "extras/new-api",
+            "2.0.0-0",
+        ),
+    ] {
+        let f = Fixture::new()?;
+        for version in ["1.0.0-0", "2.0.0-0"] {
+            f.package(
+                "library/core",
+                version,
+                f.file(LIBRARY, version, "0644", "")?,
+            )?;
+        }
+        f.package(
+            "extras/old-api",
+            "1.0.0-0",
+            dependency("require", "library/core", "1.0.0-0"),
+        )?;
+        f.package(
+            "extras/new-api",
+            "1.0.0-0",
+            dependency("require", "library/core", "2.0.0-0"),
+        )?;
+        f.package("extras/third", "1.0.0-0", String::new())?;
+        let mut expected = vec![winner, "extras/third", "library/core"];
+        expected.sort_unstable();
+        assert_eq!(admitted_recommendations(&f, &order)?, expected, "{order:?}");
+        assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, core);
+    }
+    Ok(())
+}
+
 #[test]
 fn conditional_dependency_tracks_the_selected_runtime_version() -> Result<()> {
     let f = Fixture::new()?;

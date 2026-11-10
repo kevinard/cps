@@ -258,7 +258,9 @@ recommends "desktop/editor-help" version=">=2.0.0-0"
 
 CPS resolves required packages first, then tries recommendations without
 changing the selected versions. It skips recommendations that are
-unavailable or conflict with the selection. Recommendations added in a new
+unavailable or conflict with the selection. When two recommendations
+conflict with each other, the one declared first is installed, and the
+others are still tried. Recommendations added in a new
 version are tried on upgrade. One that was skipped or removed stays omitted
 until its declaration changes or another package pulls it in.
 
