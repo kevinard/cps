@@ -10,9 +10,9 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 mkdir -p proto/bin
-mkdir -p proto/tmp proto/var/shared
+mkdir -p proto/tmp proto/srv/shared
 chmod 1777 proto/tmp
-chmod 2775 proto/var/shared
+chmod 2775 proto/srv/shared
 printf 'managed data\n' > proto/bin/tool
 chmod 0755 proto/bin/tool
 ln proto/bin/tool proto/bin/alias
@@ -33,7 +33,7 @@ printf 'local data\n' > image/local-state
 printf 'local executable data\n' > image/local-setid
 chmod 6755 image/local-setid
 setfattr -n user.cps -v exported image/local-state
-source_state=$(sha256sum image/var/lib/cps/image/state.sqlite)
+source_state=$(sha256sum image/usr/lib/sysimage/cps/state.sqlite)
 
 export_root() {
     "$cps" boot-env export --root image --output "$1" --size-mib "${2:-64}"
@@ -43,11 +43,11 @@ test "$result" = "Exported cps-$id-1 to root.ext4"
 test "$(stat -c '%s:%a' root.ext4)" = '67108864:600'
 test "$(debugfs -R 'cat /bin/tool' root.ext4 2>/dev/null)" = 'managed data'
 test "$(debugfs -R 'cat /local-state' root.ext4 2>/dev/null)" = 'local data'
-debugfs -R 'dump /var/lib/cps/image/state.sqlite exported-state.sqlite' root.ext4 >/dev/null 2>&1
-cmp image/var/lib/cps/image/state.sqlite exported-state.sqlite
+debugfs -R 'dump /usr/lib/sysimage/cps/state.sqlite exported-state.sqlite' root.ext4 >/dev/null 2>&1
+cmp image/usr/lib/sysimage/cps/state.sqlite exported-state.sqlite
 debugfs -R 'stat /' root.ext4 2>/dev/null | grep -E 'Mode: +0750'
 debugfs -R 'stat /tmp' root.ext4 2>/dev/null | grep -E 'Mode: +0?1777'
-debugfs -R 'stat /var/shared' root.ext4 2>/dev/null | grep -E 'Mode: +0?2775'
+debugfs -R 'stat /srv/shared' root.ext4 2>/dev/null | grep -E 'Mode: +0?2775'
 debugfs -R 'stat /local-setid' root.ext4 2>/dev/null | grep -E 'Mode: +0?6755'
 debugfs -R 'ea_list /' root.ext4 2>/dev/null | grep -F 'user.cps-root (9) = "root-data"'
 debugfs -R 'stat /bin/link' root.ext4 2>/dev/null | grep -Fx 'Fast link dest: "tool"'
@@ -56,7 +56,7 @@ inode() { debugfs -R "stat /bin/$1" root.ext4 2>/dev/null | awk '/^Inode:/ {prin
 test -n "$(inode tool)"
 test "$(inode tool)" = "$(inode alias)"
 dumpe2fs -h root.ext4 2>/dev/null | grep -E "^Filesystem UUID: +$id$"
-test "$(sha256sum image/var/lib/cps/image/state.sqlite)" = "$source_state"
+test "$(sha256sum image/usr/lib/sysimage/cps/state.sqlite)" = "$source_state"
 
 epoch=1735689600
 printf 'invalid mke2fs config\n' > caller-mke2fs.conf
@@ -73,7 +73,7 @@ grep -E ' tree-sha256="[0-9a-f]{64}"$' repro-first.kdl
 TZ=UTC dumpe2fs -h repro-first.ext4 2>/dev/null | grep -E 'Filesystem created: +Wed Jan  1 00:00:00 2025$'
 debugfs -R 'ea_list /' repro-first.ext4 2>/dev/null | grep -F 'user.cps-root (9) = "root-data"'
 debugfs -R 'ea_list /local-state' repro-first.ext4 2>/dev/null | grep -F 'user.cps (8) = "exported"'
-test "$(sha256sum image/var/lib/cps/image/state.sqlite)" = "$source_state"
+test "$(sha256sum image/usr/lib/sysimage/cps/state.sqlite)" = "$source_state"
 for invalid in '' '2025-01-01' -1 4294967296; do
     if repro_export "$invalid" invalid-epoch.ext4 > rejected.log 2>&1; then
         echo 'Export accepted an invalid SOURCE_DATE_EPOCH' >&2
@@ -163,10 +163,10 @@ test "$(debugfs -R 'cat /bin/tool' prepared/root.ext4 2>/dev/null)" = 'updated d
 test "$(cat prepared/root/local-state)" = 'local data'
 test "$(stat -c '%s:%a' prepared/root.ext4)" = '16777216:600'
 test "$(stat -c '%a' prepared/receipt.kdl)" = 600
-state_hash=$(sha256sum prepared/root/var/lib/cps/image/state.sqlite | cut -d' ' -f1)
+state_hash=$(sha256sum prepared/root/usr/lib/sysimage/cps/state.sqlite | cut -d' ' -f1)
 payload_hash=$(sha256sum prepared/root.ext4 | cut -d' ' -f1)
 grep -F "state-sha256=\"$state_hash\" bytes=16777216 sha256=\"$payload_hash\"" prepared/receipt.kdl
-test "$(sha256sum image/var/lib/cps/image/state.sqlite)" = "$source_state"
+test "$(sha256sum image/usr/lib/sysimage/cps/state.sqlite)" = "$source_state"
 test "$(cat image/bin/tool)" = 'managed data'
 reject_prepare 'destination already exists' prepared
 test "$(sha256sum prepared/root.ext4 | cut -d' ' -f1)" = "$payload_hash"

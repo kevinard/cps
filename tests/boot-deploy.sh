@@ -237,7 +237,7 @@ for change in kernel config mode hardlink symlink xattr root-xattr; do
         xattr) setfattr -n user.cps -v changed "$changed/etc/local.conf" ;;
         root-xattr) setfattr -n user.cps -v changed "$changed" ;;
     esac
-    cmp staged/var/lib/cps/image/state.sqlite "$changed/var/lib/cps/image/state.sqlite"
+    cmp staged/usr/lib/sysimage/cps/state.sqlite "$changed/usr/lib/sysimage/cps/state.sqlite"
     reject_activation 'root tree differs from the root export receipt' "$changed" staged.raw "$trial" staged.kdl
     diff -r esp-before esp
 done

@@ -165,7 +165,7 @@ fi
 "$bb" grep -F 'operation requires an inactive image root' /tmp/rejected
 mount -t ext4 /dev/vdd /installed-copy
 : > /installed-copy/.write-probe
-state_dir=var/lib/cps/image
+state_dir=usr/lib/sysimage/cps
 before=$("$bb" sha256sum "/installed-copy/$state_dir/state.sqlite")
 if cps apply --root /installed-copy /scratch/upgrade.json > /tmp/rejected 2>&1; then
     echo 'CPS_VM_DEVICE: applied a plan to a deployed root'

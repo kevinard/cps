@@ -82,7 +82,7 @@ reject 'Btrfs subvolume identity differs' "$base"
 $bb cat /run/original-entry > "$entry"
 
 $bb mkfifo /run/release-destroy
-state_dir=var/lib/cps/image
+state_dir=usr/lib/sysimage/cps
 if [ -d /volume/@/.cps ]; then state_dir=.cps; fi
 flock --shared "/volume/@/$state_dir/lock" sh -c ': > /run/destroy-locked; read released < /run/release-destroy' &
 holding=$!

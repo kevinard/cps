@@ -602,7 +602,7 @@ if [[ $tuf_mirrors == 1 ]]; then
     test -z "$(find mirror-cache -path '*/blobs/*' -type f -print -quit)"
 fi
 "$cps" image-create --root base --config image.kdl
-state_dir=var/lib/cps/image
+state_dir=usr/lib/sysimage/cps
 if ! $profiled && [[ -n $cps_fixture ]]; then
     "$cps" publisher add --root base --repo "$cps_fixture/repo" \
         --trust-root "$cps_fixture/release.trust.json" canopa
