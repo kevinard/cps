@@ -43,6 +43,14 @@ reject() {
     "$cps" transaction status --root image | grep -Fx 'No pending transaction'
     "$cps" verify --root image --pristine
 }
+library_capability="cap/elf/$arch/libcps-abi.so.1/CPS_ABI_1"
+reject_plan() {
+    if "$cps" plan --root image --output rejected.json "$@" > rejected.log 2>&1; then
+        echo "The solver accepted a plan without the required library: $*" >&2
+        exit 1
+    fi
+    grep -F "$library_capability" rejected.log
+}
 
 library libcps-abi.so.1 good.map runtime/usr/lib/libcps-abi.so.1.0
 ln -s libcps-abi.so.1.0 runtime/usr/lib/libcps-abi.so.1
@@ -54,35 +62,62 @@ publish app 1.0.0-0 demo/app
 publish loader 1.0.0-0 demo/loader
 publish runtime 1.0.0-0 demo/runtime
 install_base image
-install_base drifted
 
-missing='missing ELF dependency libcps-abi.so.1 previously provided at usr/lib/libcps-abi.so.1.0'
-"$cps" plan --root image --output remove.json remove demo/runtime
-reject remove.json "$missing"
-"$cps" plan --root image --output loader.json remove demo/loader
-reject loader.json 'missing ELF interpreter /usr/lib/cps-test-loader previously provided at usr/lib/cps-test-loader'
-
+# Publication generated the soname and version requirements of demo/app,
+# so the solver refuses to drop their provider.
+"$cps" info --root image demo/app | grep -Fx "    require-capability \"$library_capability\""
+reject_plan remove demo/runtime
 "$cps" plan --root image --output mark.json mark automatic demo/runtime
 "$cps" apply --root image mark.json
 "$cps" plan --root image --output autoremove.json autoremove
-reject autoremove.json "$missing"
+"$cps" apply --root image autoremove.json
+"$cps" verify --root image --pristine
+test -L image/usr/lib/libcps-abi.so.1
 
-install_base facet_image
+# Interpreters stay path-based, so the transaction check guards them.
+"$cps" plan --root image --output loader.json remove demo/loader
+reject loader.json 'missing ELF interpreter /usr/lib/cps-test-loader previously provided at usr/lib/cps-test-loader'
+
+# Facet content provides no capability, because facets never gate dependencies.
+missing='missing ELF dependency libcps-abi.so.1 previously provided at usr/lib/libcps-abi.so.1.0'
 "$cps" manifest generate --proto runtime --publisher canopa --version 1.1.0-0 \
     --uid "$uid" --gid "$gid" demo/runtime |
     sed '/^    symlink /s/$/ facet="runtime.library"/' > generated.kdl
 "$cps" publish --repo repo --proto runtime --signing-key private.der generated.kdl
-"$cps" plan --root facet_image --output facet-provider.json install demo/runtime@1.1.0-0
+reject_plan install demo/runtime@1.1.0-0
+
+# A consumer selected by a facet has no generated requirement, so the
+# transaction check still protects its working library.
+mkdir -p plugin/usr/bin
+cp app/usr/bin/demo plugin/usr/bin/demo-plugin
+"$cps" manifest generate --proto plugin --publisher canopa --version 1.0.0-0 \
+    --uid "$uid" --gid "$gid" demo/plugin |
+    sed '/^    file /s/$/ facet="plugin.demo"/' > generated.kdl
+"$cps" publish --repo repo --proto plugin --signing-key private.der generated.kdl
+"$cps" image-create --root facet_image --repo repo --publisher canopa --trust-key public.der \
+    --arch "$arch"
+"$cps" plan --root facet_image --output facet-provider.json install demo/loader demo/plugin \
+    demo/runtime@1.1.0-0
 "$cps" apply --root facet_image facet-provider.json
 "$cps" plan --root facet_image --output facet.json change-facet runtime.library=false
 if "$cps" apply --root facet_image facet.json > rejected.log 2>&1; then
     echo 'Disabling a facet removed the working managed library' >&2
     exit 1
 fi
-grep -F "$missing" rejected.log
+grep -F "cps://canopa/demo/plugin@1.0.0-0: usr/bin/demo-plugin: $missing" rejected.log
 "$cps" transaction status --root facet_image | grep -Fx 'No pending transaction'
 
-"$cps" plan --root facet_image --output remove-both.json remove demo/runtime demo/app
+# A symlink already missing on disk was not a working baseline lookup.
+rm -- facet_image/usr/lib/libcps-abi.so.1
+"$cps" plan --root facet_image --output facet.json change-facet runtime.library=false
+"$cps" apply --root facet_image facet.json
+if "$cps" verify --root facet_image --runtime > rejected.log 2>&1; then
+    echo 'Runtime audit accepted an image without a required library' >&2
+    exit 1
+fi
+grep -F 'missing ELF dependency libcps-abi.so.1' rejected.log
+
+"$cps" plan --root facet_image --output remove-both.json remove demo/runtime demo/plugin
 "$cps" apply --root facet_image remove-both.json
 "$cps" verify --root facet_image --pristine
 
@@ -98,28 +133,20 @@ grep -F 'does not provide required version CPS_ABI_1' rejected.log
 reject shadow.json 'ELF dependency libcps-abi.so.1 at usr/override/libcps-abi.so.1 does not provide required version CPS_ABI_1'
 test ! -e image/usr/override/libcps-abi.so.1
 
+# A soname bump no longer provides the required capability, so updates keep
+# the old provider and an explicit upgrade has no solution.
 rm -- runtime/usr/lib/libcps-abi.so.1{,.0}
 library libcps-abi.so.2 good.map runtime/usr/lib/libcps-abi.so.2
 publish runtime 2.0.0-0 demo/runtime
-"$cps" plan --root image --output upgrade.json update
-reject upgrade.json "$missing"
+reject_plan install demo/runtime@2.0.0-0
 test ! -e image/usr/lib/libcps-abi.so.2
-if "$cps" boot-env stage --source image --root staged upgrade.json > rejected.log 2>&1; then
-    echo 'Staging accepted a transaction that breaks the managed library' >&2
+"$cps" plan --root image --output loader.json remove demo/loader
+if "$cps" boot-env stage --source image --root staged loader.json > rejected.log 2>&1; then
+    echo 'Staging accepted a transaction that breaks the managed interpreter' >&2
     exit 1
 fi
-grep -F 'missing ELF dependency libcps-abi.so.1' rejected.log
+grep -F 'missing ELF interpreter /usr/lib/cps-test-loader' rejected.log
 test ! -e staged
-
-# A symlink already missing on disk was not a working baseline lookup.
-rm -- drifted/usr/lib/libcps-abi.so.1
-"$cps" plan --root drifted --output drifted.json update
-"$cps" apply --root drifted drifted.json
-if "$cps" verify --root drifted --runtime > rejected.log 2>&1; then
-    echo 'Runtime audit accepted an image without a required library' >&2
-    exit 1
-fi
-grep -F 'missing ELF dependency libcps-abi.so.1' rejected.log
 
 rm -- runtime/usr/lib/libcps-abi.so.2
 printf 'int answer(void) { return 43; }\n' > library.c
@@ -132,4 +159,4 @@ test "$(readlink image/usr/lib/libcps-abi.so.1)" = libcps-abi.so.1.0
 "$cps" apply --root image compatible.json
 test "$(readlink image/usr/lib/libcps-abi.so.1)" = libcps-abi.so.1.1
 "$cps" verify --root image --pristine
-printf '%s\n' 'Verified transaction ELF regressions, pre-existing drift, and compatible upgrades'
+printf '%s\n' 'Verified generated library requirements, transaction ELF regressions, pre-existing drift, and compatible upgrades'

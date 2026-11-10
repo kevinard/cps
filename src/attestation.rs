@@ -292,6 +292,8 @@ impl VerifiedBuild {
     }
 }
 
+// The proto tree supplies the payload bytes for generated ELF declarations.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sign(
     key: &Ed25519KeyPair,
     manifest: &Manifest,
@@ -300,12 +302,13 @@ pub(crate) fn sign(
     recipe_bytes: &[u8],
     toolchain: Toolchain,
     artifacts: &BTreeMap<String, FileDigest>,
+    proto: &Root,
 ) -> Result<Vec<u8>> {
     let mut subject = vec![
         Subject::new("manifest.kdl".to_owned(), &file_digest(manifest_bytes)),
         Subject::new(
             PUBLISHED_MANIFEST.to_owned(),
-            &published_manifest_digest(manifest, artifacts)?,
+            &published_manifest_digest(manifest, artifacts, proto)?,
         ),
     ];
     subject.extend(
@@ -385,8 +388,12 @@ fn file_digest(bytes: &[u8]) -> FileDigest {
 fn published_manifest_digest(
     manifest: &Manifest,
     artifacts: &BTreeMap<String, FileDigest>,
+    proto: &Root,
 ) -> Result<FileDigest> {
-    let published = manifest.clone().with_payloads(artifacts)?;
+    let published =
+        crate::generate::elf::published_manifest(manifest.clone(), artifacts, |path, _| {
+            proto.file(path)
+        })?;
     let bytes = manifest_text(&published);
     ensure!(
         bytes.len() as u64 <= MANIFEST_LIMIT,
@@ -505,11 +512,12 @@ fn claimed_artifacts(
             .with_context(|| format!("build attestation omits output {path}"))?;
         artifacts.insert(path.to_owned(), file);
     }
-    let published_manifest = published_manifest_digest(manifest, &artifacts)?;
-    ensure!(
-        subjects.remove(PUBLISHED_MANIFEST).as_ref() == Some(&published_manifest),
-        "build attestation does not cover the exact published manifest"
-    );
+    // The published manifest carries declarations generated from the
+    // payload bytes. Publication derives it again from the stored payloads
+    // and requires this digest, and the signed catalog binds it afterwards.
+    let published_manifest = subjects
+        .remove(PUBLISHED_MANIFEST)
+        .context("build attestation does not cover the exact published manifest")?;
     ensure!(
         subjects.is_empty(),
         "build attestation contains undeclared outputs"
@@ -664,6 +672,7 @@ build architecture="x86_64" epoch=1700000000 {{
                 )]),
             },
             &BTreeMap::new(),
+            &Root::open(&std::env::temp_dir())?,
         )?;
         let (payload, _) = verify_envelope(&bytes, key.public_key().as_ref())?;
         let mut statement = parse_statement(&payload)?;

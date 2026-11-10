@@ -138,6 +138,13 @@ for immutable managed ELF consumers, using the default search directories
 or the ordered `--library-dir` arguments. It reports already missing
 dependencies and works without the repository.
 
-Run `bash tests/elf-transactions.sh` to exercise an install that shadows a
-working library, an incompatible upgrade, removals, a facet change, and a
-compatible replacement.
+Packages carry [generated shared-library capabilities](../maintainer/manifests.md#generated-shared-library-dependencies),
+so the solver already refuses a removal, autoremove, or upgrade that drops
+the last provider of a required soname or GNU version node. This check
+remains the safety net for interpreters, facet changes, libraries shadowed
+through `DT_RUNPATH`, and consumers selected by a facet or variant.
+
+Run `bash tests/elf-transactions.sh` to exercise solver refusals of
+removals and soname bumps, an install that shadows a working library,
+interpreter removal, a facet change, pre-existing drift, and a compatible
+replacement.

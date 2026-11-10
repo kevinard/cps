@@ -14,7 +14,7 @@ for publisher in canopa runtime; do
     openssl genpkey -algorithm ED25519 -outform DER -out "$publisher.der"
     openssl pkey -inform DER -in "$publisher.der" -pubout -outform DER -out "$publisher-public.der"
 done
-mkdir -p app/usr/bin runtime/usr/lib/demo
+mkdir -p app/usr/bin runtime/usr/lib64
 printf 'int answer(void) { return 42; }\n' > library.c
 printf 'extern int answer(void); void _start(void) { answer(); }\n' > app.c
 cat > current.map <<'MAP'
@@ -24,12 +24,12 @@ MAP
 printf 'CPS_DEMO_1.0 { global: answer; local: *; };\n' > old.map
 cc -shared -fPIC -nostdlib -Wl,-soname,libcps-demo.so.1 \
     -Wl,--version-script,current.map \
-    -o runtime/usr/lib/demo/libcps-demo.so.1.0 library.c
+    -o runtime/usr/lib64/libcps-demo.so.1.0 library.c
 cc -pie -nostdlib -Wl,-e,_start,--dynamic-linker,/lib64/cps-loader.so \
-    -Wl,-rpath,'$ORIGIN/../lib/demo' -o app/usr/bin/demo app.c \
-    runtime/usr/lib/demo/libcps-demo.so.1.0
+    -o app/usr/bin/demo app.c runtime/usr/lib64/libcps-demo.so.1.0
 objcopy --strip-section-headers app/usr/bin/demo
-objcopy --strip-section-headers runtime/usr/lib/demo/libcps-demo.so.1.0
+objcopy --strip-section-headers runtime/usr/lib64/libcps-demo.so.1.0
+ln -s libcps-demo.so.1.0 runtime/usr/lib64/libcps-demo.so.1
 cat > app.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/app" publisher="canopa" version="1.0.0-0" {
@@ -81,56 +81,69 @@ reject_refresh() {
     grep -F "$1" rejected.log || { cat rejected.log >&2; exit 1; }
     test "$(cat repo/current)" = "$base"
 }
+library_capability="cap/elf/$arch/libcps-demo.so.1/CPS_DEMO_2.0"
 
+# The runtime provides the generated library capability from /usr/lib64,
+# so the solver accepts the composition and the profile gate inspects it.
 publish_runtime 1.0.0-0
 write_policy
 reject_refresh 'missing ELF interpreter /lib64/cps-loader.so'
 
 # A native ET_DYN fixture supplies the interpreter path for static inspection.
-cp runtime/usr/lib/demo/libcps-demo.so.1.0 runtime/usr/lib/cps-loader.so
+mkdir -p runtime/usr/lib
+cp runtime/usr/lib64/libcps-demo.so.1.0 runtime/usr/lib/cps-loader.so
 ln -s /usr/lib runtime/lib64
 publish_runtime 2.0.0-0
 write_policy
+# The profile searches only /usr/lib, which the gate enforces.
 reject_refresh 'missing ELF dependency libcps-demo.so.1'
 
-ln -s libcps-demo.so.1.0 runtime/usr/lib/demo/libcps-demo.so.1
+mv runtime/usr/lib64/libcps-demo.so.1* runtime/usr/lib/
+rmdir runtime/usr/lib64
 publish_runtime 3.0.0-0
 write_policy
-library_hash=$(sha256sum runtime/usr/lib/demo/libcps-demo.so.1.0 | cut -d' ' -f1)
+library_hash=$(sha256sum runtime/usr/lib/libcps-demo.so.1.0 | cut -d' ' -f1)
 library_blob="companion/blobs/$library_hash"
 cp -- "$library_blob" saved-library
 printf x | dd of="$library_blob" bs=1 seek=0 conv=notrunc status=none
 reject_refresh 'payload digest differs from manifest'
 mv -- saved-library "$library_blob"
+# The generated capability requirement declares the library, but the
+# path-based interpreter still needs a direct require.
 sed -i 's/demo\/app@1.0.0-0/demo\/app@2.0.0-0/' repo/publish-policy.kdl
-reject_refresh 'needs a direct require for cps://runtime/demo/runtime@3.0.0-0'
+reject_refresh 'needs a direct require for cps://runtime/demo/runtime@3.0.0-0 via usr/lib/cps-loader.so'
 write_policy
 refresh
 base=$(cat repo/current)
 sed -i 's/ require-declarations=#true//' repo/publish-policy.kdl
 reject_refresh 'release drops ELF dependency declaration checking'
-
-mv runtime/usr/lib/demo/libcps-demo.so.1 runtime/usr/lib/demo/old-link
-printf 'not an ELF library\n' > runtime/usr/lib/demo/libcps-demo.so.1
-publish_runtime 4.0.0-0
 write_policy
-reject_refresh 'incompatible ELF dependency libcps-demo.so.1'
-rm -- runtime/usr/lib/demo/libcps-demo.so.1
-ln -s libcps-demo.so.1.0/ runtime/usr/lib/demo/libcps-demo.so.1
-publish_runtime 5.0.0-0
-write_policy
-reject_refresh 'missing ELF dependency libcps-demo.so.1'
-rm -- runtime/usr/lib/demo/libcps-demo.so.1
-ln -s libcps-demo.so.1.0 runtime/usr/lib/demo/libcps-demo.so.1
-cc -shared -fPIC -nostdlib -Wl,-soname,libcps-demo.so.1 \
-    -Wl,--version-script,old.map \
-    -o runtime/usr/lib/demo/libcps-demo.so.1.0 library.c
-objcopy --strip-section-headers runtime/usr/lib/demo/libcps-demo.so.1.0
-publish_runtime 6.0.0-0
-write_policy
-reject_refresh 'does not provide required version CPS_DEMO_2.0'
 sed -i '/elf-check .*{/,/        }/d' repo/publish-policy.kdl
 reject_refresh 'release drops ELF checking for signed profile desktop'
+
+# Runtimes without a compatible library provide no capability, so the
+# profile solver keeps the newest runtime that still provides it.
+mv runtime/usr/lib/libcps-demo.so.1 runtime/usr/lib/old-link
+printf 'not an ELF library\n' > runtime/usr/lib/libcps-demo.so.1
+publish_runtime 4.0.0-0
+rm -- runtime/usr/lib/libcps-demo.so.1
+ln -s libcps-demo.so.1.0/ runtime/usr/lib/libcps-demo.so.1
+publish_runtime 5.0.0-0
+rm -- runtime/usr/lib/libcps-demo.so.1
+ln -s libcps-demo.so.1.0 runtime/usr/lib/libcps-demo.so.1
+cc -shared -fPIC -nostdlib -Wl,-soname,libcps-demo.so.1 \
+    -Wl,--version-script,old.map \
+    -o runtime/usr/lib/libcps-demo.so.1.0 library.c
+objcopy --strip-section-headers runtime/usr/lib/libcps-demo.so.1.0
+publish_runtime 6.0.0-0
+"$cps" manifest generated --proto runtime runtime.kdl > generated.kdl
+if grep -F "$library_capability" generated.kdl; then
+    echo 'a library without CPS_DEMO_2.0 provided its capability' >&2
+    exit 1
+fi
+grep -Fx "provides \"cap/elf/$arch/libcps-demo.so.1/CPS_DEMO_1.0\"" generated.kdl
+write_policy
+refresh
 
 cat > image.kdl <<CONFIG
 schema-version 1 kind="image-config"
@@ -149,5 +162,6 @@ CONFIG
 "$cps" plan --root image --output install.json install-profile
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine --runtime
-test -L image/usr/lib/demo/libcps-demo.so.1
-echo 'Verified the signed ELF profile with a merged /usr and a companion publisher'
+test -L image/usr/lib/libcps-demo.so.1
+"$cps" info --root image demo/runtime | grep -F 'version="3.0.0-0"'
+echo 'Verified generated library capabilities and the signed ELF profile with a merged /usr and a companion publisher'

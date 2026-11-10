@@ -1,6 +1,7 @@
 mod dependencies;
+pub(crate) mod elf;
 
-pub use dependencies::{check_manifest_dependencies, suggest_dependencies};
+pub use dependencies::{check_manifest_dependencies, generated_dependencies, suggest_dependencies};
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},

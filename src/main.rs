@@ -651,7 +651,7 @@ enum ManifestCommand {
         gid: u32,
         name: String,
     },
-    /// Suggest runtime dependencies from ELF and shebangs using pinned local catalogs
+    /// Review generated library capabilities and suggest path-based requires using pinned catalogs
     Dependencies {
         #[arg(long)]
         proto: PathBuf,
@@ -661,15 +661,18 @@ enum ManifestCommand {
         /// Exact signed catalog digest for each configured publisher
         #[arg(long = "catalog", required = true, value_name = "PUBLISHER=SHA256")]
         catalogs: Vec<String>,
-        /// Default ELF library directory in search order
-        #[arg(long = "library-dir", required = true, value_name = "PATH")]
-        library_dirs: Vec<String>,
         /// Target PATH directory for env shebangs, in search order
         #[arg(long = "path-dir", default_values = ["/usr/bin", "/bin"], value_name = "PATH")]
         path_dirs: Vec<String>,
         /// Fail when a detected external provider lacks a matching direct require
         #[arg(long)]
         check: bool,
+        manifest: PathBuf,
+    },
+    /// Show the shared-library capabilities that publication generates
+    Generated {
+        #[arg(long)]
+        proto: PathBuf,
         manifest: PathBuf,
     },
 }
@@ -2253,7 +2256,6 @@ fn run(command: Command) -> Result<ExitCode> {
                 proto,
                 config,
                 catalogs,
-                library_dirs,
                 path_dirs,
                 check,
                 manifest,
@@ -2263,14 +2265,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 } else {
                     suggest_dependencies
                 };
-                let (suggestions, diagnostics) = inspect(
-                    &proto,
-                    &manifest,
-                    &config,
-                    &catalogs,
-                    &library_dirs,
-                    &path_dirs,
-                )?;
+                let (suggestions, diagnostics) =
+                    inspect(&proto, &manifest, &config, &catalogs, &path_dirs)?;
                 std::io::stdout().lock().write_all(suggestions.as_bytes())?;
                 if !diagnostics.is_empty() {
                     for diagnostic in diagnostics {
@@ -2278,6 +2274,10 @@ fn run(command: Command) -> Result<ExitCode> {
                     }
                     return Ok(ExitCode::FAILURE);
                 }
+            }
+            ManifestCommand::Generated { proto, manifest } => {
+                let text = cps::generated_dependencies(&proto, &manifest)?;
+                std::io::stdout().lock().write_all(text.as_bytes())?;
             }
         },
         Command::Publish {

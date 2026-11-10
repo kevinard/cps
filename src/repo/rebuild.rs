@@ -199,7 +199,20 @@ pub fn verify_rebuild(
         let envelope = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
         build.check_witness(&envelope, &key)?;
     }
-    verify_artifacts(&bundle.subdir("proto")?, &build.artifacts)?;
+    let proto = bundle.subdir("proto")?;
+    verify_artifacts(&proto, &build.artifacts)?;
+    // The published manifest includes ELF declarations generated from the
+    // payload bytes, so reconstruct it from the rebuilt tree.
+    let published = crate::generate::elf::published_manifest(
+        crate::kdl_format::parse_manifest(std::str::from_utf8(&manifest)?)?,
+        &build.artifacts,
+        |path, _| proto.file(path),
+    )?;
+    ensure!(
+        crate::model::digest(crate::kdl_format::manifest_text(&published).as_bytes())
+            == published_hash,
+        "rebuilt payloads produce a different published manifest for {id}"
+    );
     Ok(build.artifacts.len())
 }
 

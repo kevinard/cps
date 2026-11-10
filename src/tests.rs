@@ -1452,6 +1452,7 @@ build architecture="x86_64" epoch=1700000000 {{
                 size: bytes.len() as u64,
             },
         )]),
+        &crate::image::root::Root::open(&f.proto)?,
     )?;
     fs::write(bundle.join("attestation.json"), evidence)?;
     publish_bundle(

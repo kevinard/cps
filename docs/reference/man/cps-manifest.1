@@ -11,7 +11,10 @@
 \&Generate KDL from a staged prototype tree
 .TP
 .B \&dependencies
-\&Suggest runtime dependencies from ELF and shebangs using pinned local catalogs
+\&Review generated library capabilities and suggest path\-based requires using pinned catalogs
+.TP
+.B \&generated
+\&Show the shared\-library capabilities that publication generates
 .TP
 .B \&help
 \&Print this message or the help of the given subcommand(s)
@@ -48,9 +51,9 @@
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps manifest dependencies"
-\&Suggest runtime dependencies from ELF and shebangs using pinned local catalogs
+\&Review generated library capabilities and suggest path\-based requires using pinned catalogs
 .PP
-.B \&cps manifest dependencies [OPTIONS] \-\-proto <PROTO> \-\-config <CONFIG> \-\-catalog <PUBLISHER=SHA256> \-\-library\-dir <PATH> <MANIFEST>
+.B \&cps manifest dependencies [OPTIONS] \-\-proto <PROTO> \-\-config <CONFIG> \-\-catalog <PUBLISHER=SHA256> <MANIFEST>
 .PP
 .B Arguments
 .PP
@@ -66,14 +69,26 @@
 .B \&\-\-catalog <PUBLISHER=SHA256>
 \&Exact signed catalog digest for each configured publisher
 .TP
-.B \&\-\-library\-dir <PATH>
-\&Default ELF library directory in search order
-.TP
 .B \&\-\-path\-dir <PATH>
 \&Target PATH directory for env shebangs, in search order [default: /usr/bin /bin]
 .TP
 .B \&\-\-check
 \&Fail when a detected external provider lacks a matching direct require
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps manifest generated"
+\&Show the shared\-library capabilities that publication generates
+.PP
+.B \&cps manifest generated \-\-proto <PROTO> <MANIFEST>
+.PP
+.B Arguments
+.PP
+.B \&<MANIFEST>
+.PP
+.B Options
+.PP
+.B \&\-\-proto <PROTO>
 .TP
 .B \&\-h, \-\-help
 \&Print help
