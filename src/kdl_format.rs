@@ -20,7 +20,6 @@ use crate::{
     triggers::Trigger,
 };
 
-pub(crate) mod boot_export;
 pub(crate) mod build;
 pub(crate) mod publish_policy;
 pub(crate) mod publish_release;
@@ -895,7 +894,7 @@ pub(crate) struct BtrfsConfig {
     pub volume: PathBuf,
     pub environments: PathBuf,
     pub esp: PathBuf,
-    pub activation: crate::boot::Activation<Option<String>>,
+    pub activation: crate::boot::Activation,
     pub uki: bool,
     pub uefi: bool,
     /// Known-good environments retained beyond the protected ones.

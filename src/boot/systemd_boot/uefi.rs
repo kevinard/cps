@@ -97,8 +97,8 @@ impl Firmware {
         let mut preferred = None;
         for entry in entries {
             ensure!(
-                entry.btrfs.is_some() && entry.uki.is_some(),
-                "direct UEFI entries require signed Btrfs UKIs"
+                entry.uki.is_some(),
+                "direct UEFI entries require signed UKIs"
             );
             if entry.tries.is_some() {
                 let armed = self.armed_boot(Some(entry))?;
@@ -682,12 +682,12 @@ mod tests {
             title: id.to_owned(),
             root: BootRoot::Btrfs(device().uuid),
             parent: trial.then(|| BASE.to_owned()),
-            btrfs: Some(BtrfsRecord {
+            btrfs: BtrfsRecord {
                 fsid: device().uuid,
                 uuid: device().uuid,
                 subvolid: if trial { 257 } else { 256 },
                 path: id.to_owned(),
-            }),
+            },
             uki: Some(BootUki {
                 sha256: String::new(),
                 cmdline: String::new(),

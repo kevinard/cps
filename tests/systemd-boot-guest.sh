@@ -19,253 +19,84 @@ copy_runtime_deps() {
     done < <(awk '/=> \// { print $3 } /^[[:space:]]*\// { print $1 }' <<< "$links")
 }
 
-# Boot a rescue root with the inputs on a read-only disk.
-# The writable disk is the one later booted through systemd-boot.
-run_device_guest() {
-    local mode=$1 source=$2 output=$3 stage=${4:-}
-    local payload=${5:-$stage.ext4} receipt=${6:-$stage.kdl}
-    local inputs="device-$mode-inputs"
-    local program binary name repository key data_args=() scratch_args=()
-    local programs=(mount sfdisk blkid e2fsck)
-    mkdir -p "$inputs"/{bin,usr/bin,dev,proc,sys,tmp,esp,fallback}
-    cp -L -- "$busybox" "$inputs/bin/busybox"
-    copy_runtime_deps "$inputs" "$busybox"
-    ln -s busybox "$inputs/bin/sh"
-    strip --strip-debug -o "$inputs/usr/bin/cps" "$cps"
-    copy_runtime_deps "$inputs" "$cps"
-    if [[ $mode == installed ]]; then programs+=(cp mke2fs); fi
-    for program in "${programs[@]}"; do
-        binary=$(command -v "$program")
-        cp -L -- "$binary" "$inputs/usr/bin/$program"
-        copy_runtime_deps "$inputs" "$binary"
+# Build a read-only rescue system for maintenance steps on an offline disk.
+# It holds CPS and the tools staging needs. The image database records
+# absolute repository locations, so the repositories keep their host paths.
+prepare_rescue() {
+    local tree=rescue-tree program binary path
+    mkdir -p "$tree"/{bin,etc,usr/bin,dev,proc,sys,run,volume,efi}
+    printf 'root:x:0:0:root:/root:/bin/sh\n' > "$tree/etc/passwd"
+    printf 'root:x:0:\n' > "$tree/etc/group"
+    cp -L -- "$busybox" "$tree/bin/busybox"
+    copy_runtime_deps "$tree" "$busybox"
+    ln -s busybox "$tree/bin/sh"
+    strip --strip-debug -o "$tree/usr/bin/cps" "$cps"
+    copy_runtime_deps "$tree" "$cps"
+    # kernel-install and its BLS plugin prepare manifest-managed kernels.
+    for program in mount umount insmod sfdisk kernel-install install chown mkdir grep tr stat rm cp \
+        sqlite3 bwrap; do
+        binary=$(command -v "$program") || continue
+        cp -L -- "$binary" "$tree/usr/bin/$program"
+        copy_runtime_deps "$tree" "$binary"
     done
-    if [[ $mode == installed ]]; then
-        # The image database records absolute repository locations.
-        mkdir -p "$inputs$PWD" "$inputs/scratch" "$inputs/installed-copy"
-        cp -a -- profile-repo profile.trust.json "$inputs$PWD/"
-        while read -r name repository key; do
-            cp -a -- "$repository" "$key" "$inputs$PWD/"
-        done < <(profile_companions)
-        truncate -s "$((root_mib * 2 + 128))M" scratch.raw
-        mke2fs -q -F -t ext4 scratch.raw
-        dd if="$source" of=installed-copy.raw bs=1M skip="$trial_mib" count="$root_mib" \
-            conv=sparse status=none
-        scratch_args=(-drive if=virtio,format=raw,file=scratch.raw
-                      -drive if=virtio,format=raw,file=installed-copy.raw)
-    elif [[ $mode != rollback ]]; then
-        cp -a -- "$stage" "$inputs/staged"
-        cp --sparse=always -- "$payload" "$inputs/staged.ext4"
-        cp -- "$receipt" "$inputs/staged.kdl"
-        if [[ $mode != bootstrap ]]; then cp -- base.kdl "$inputs/"; fi
+    if [[ -f /usr/lib/kernel/install.d/90-loaderentry.install ]]; then
+        mkdir -p "$tree/usr/lib/kernel/install.d"
+        cp /usr/lib/kernel/install.d/90-loaderentry.install "$tree/usr/lib/kernel/install.d/"
     fi
-    {
-        printf '#!/bin/sh\nset -eu\nbase_uuid=%q\ntrial_uuid=%q\noptions=%q\n' \
-            "$base_uuid" "$trial_uuid" "$options"
-        cat <<'GUEST'
-trap '/bin/busybox poweroff -f' EXIT
-export PATH=/usr/bin:/bin
+    prepare_fat_modules "$tree" "${CPS_VM_KERNEL_RELEASE:-$(uname -r)}" "${CPS_VM_KERNEL_MODULES_ROOT:-/}"
+    mkdir -p "$tree$PWD"
+    for path in "$@"; do
+        if [[ -e $path ]]; then cp -al -- "$path" "$tree$PWD/"; fi
+    done
+    cat > "$tree/init" <<'GUEST'
+#!/bin/sh
+bb=/bin/busybox
+export PATH=/usr/bin:/bin TMPDIR=/run
 mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-mount -t tmpfs tmpfs /tmp
-mount -t vfat /dev/vda1 /esp
-activate() {
-    cps boot-env activate-device --root /staged --options "$options" "$@"
+mount -t tmpfs tmpfs /run
+while read -r module name; do insmod "$module"; done < "/vm-modules/$($bb uname -r)/load"
+mount -t btrfs -o subvolid=5 /dev/vda2 /volume
+mount -t vfat /dev/vda1 /efi
+tr -d '\000' < /dev/vdc > /run/step
+$bb sh -eu /run/step
+umount /efi
+umount /volume
+$bb sync
+$bb poweroff -f
+GUEST
+    chmod 0755 "$tree/init"
+    truncate -s 4G rescue.btrfs
+    "${CPS_VM_MKFS_BTRFS:-mkfs.btrfs}" -q -f --rootdir "$tree" --shrink rescue.btrfs
 }
-reject() {
-    expected=$1
-    shift
-    if activate "$@" > /tmp/rejected 2>&1; then
-        echo "CPS_VM_DEVICE: unexpected activation"
-        exit 1
-    fi
-    /bin/busybox cat /tmp/rejected
-    /bin/busybox grep -Fq "$expected" /tmp/rejected
-}
-GUEST
-        if [[ $mode == bootstrap ]]; then
-            cat <<'GUEST'
-if cps boot-env activate --known-good --root /staged --esp /esp \
-    --root-partuuid "$base_uuid" --options "$options" > /tmp/rejected 2>&1; then
-    echo 'CPS_VM_DEVICE: unchecked activation wrote the mounted ESP'
-    exit 1
-fi
-/bin/busybox grep -F 'use boot-env activate-device for a mounted VFAT ESP' /tmp/rejected
-set -- --esp /esp --device /dev/vda2 --root-partuuid "$base_uuid" --receipt /staged.kdl
-reject 'use --known-good to bootstrap' "$@" --root-image /staged.ext4
-reject 'root payload size must match' "$@" --known-good --root-image /staged.kdl
-test ! -e /esp/loader
-result=$(activate "$@" --known-good --root-image /staged.ext4)
-reject 'environment is already registered' "$@" --known-good --root-image /staged.ext4
-test "$(activate "$@" --known-good)" = "$result"
-printf 'CPS_VM_BOOTSTRAP: %s\n' "${result#Activated }"
-GUEST
-        elif [[ $mode == initial ]]; then
-            cat <<'GUEST'
-mount -t ext4 -o ro,noload /dev/vda2 /fallback
-reject 'claiming the target root partition exclusively' --esp /esp --device /dev/vda2 \
-    --root-partuuid "$base_uuid" --receipt /staged.kdl --root-image /staged.ext4
-/bin/busybox umount /fallback
-reject 'distinct root PARTUUID' --esp /esp --device /dev/vda2 \
-    --root-partuuid "$base_uuid" --receipt /staged.kdl --root-image /staged.ext4
-reject 'does not match GPT root PARTUUID' --esp /esp --device /dev/vda3 \
-    --root-partuuid "$base_uuid" --receipt /staged.kdl --root-image /staged.ext4
-reject 'must name the root of a mounted EFI partition' --esp /esp/EFI --device /dev/vda3 \
-    --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4
-reject 'receipt is for a different image or revision' --esp /esp --device /dev/vda3 \
-    --root-partuuid "$trial_uuid" --receipt /base.kdl --root-image /staged.ext4
-mount -t ext4 -o ro,noload /dev/vda2 /fallback
-activate --esp /esp --device /dev/vda3 \
-    --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4
-reject 'environment is already registered' --esp /esp --device /dev/vda3 \
-    --root-partuuid "$trial_uuid" --receipt /staged.kdl --root-image /staged.ext4
-activate --esp /esp --device /dev/vda3 \
-    --root-partuuid "$trial_uuid" --receipt /staged.kdl
-GUEST
-        elif [[ $mode == rollback ]]; then
-            printf 'base_id=%q\n' "$base_id"
-            cat <<'GUEST'
-bb=/bin/busybox
-mount -t ext4 -o ro,noload /dev/vda2 /fallback
-entry="/esp/loader/entries/$base_id.conf"
-before=$("$bb" sha256sum /esp/loader/loader.conf)
-reject_rollback() {
-    expected=$1
-    shift
-    if cps boot-env rollback "$@" > /tmp/rejected 2>&1; then
-        echo 'CPS_VM_DEVICE: unexpected rollback'
-        exit 1
-    fi
-    "$bb" grep -F "$expected" /tmp/rejected
-    test "$("$bb" sha256sum /esp/loader/loader.conf)" = "$before"
-}
-reject_rollback 'must name the root of a mounted EFI partition' --esp /esp/EFI "$base_id"
-"$bb" cp "$entry" /tmp/entry.conf
-"$bb" sed "s/root=PARTUUID=$base_uuid/root=PARTUUID=$trial_uuid/" /tmp/entry.conf > "$entry"
-reject_rollback 'does not contain the expected ext4 filesystem' --esp /esp "$base_id"
-"$bb" cat /tmp/entry.conf > "$entry"
-result=$(cps boot-env rollback --esp /esp)
-test "$result" = "Selected $base_id for the next boot"
-printf '%s\n' "$result"
-GUEST
-        elif [[ $mode == installed ]]; then
-            printf 'base_id=%q\nroot_mib=%q\n' "$base_id" "$root_mib"
-            cat <<'GUEST'
-bb=/bin/busybox
-mount -t ext4 -o ro,noload /dev/vda3 /fallback
-mount -t ext4 /dev/vdc /scratch
-test "$("$bb" cat /fallback/etc/cps-vm-booted-source)" = booted
-cps verify --root /fallback
-cps plan --root /fallback --output /scratch/upgrade.json update > /tmp/plan
-"$bb" grep -F 'test/boot-state 2.0.0-0 -> 3.0.0-0' /tmp/plan
-if cps apply --root / /scratch/upgrade.json > /tmp/rejected 2>&1; then
-    echo 'CPS_VM_DEVICE: applied a plan to the running root'
-    exit 1
-fi
-"$bb" grep -F 'operation requires an inactive image root' /tmp/rejected
-mount -t ext4 /dev/vdd /installed-copy
-: > /installed-copy/.write-probe
-state_dir=var/lib/cps/image
-before=$("$bb" sha256sum "/installed-copy/$state_dir/state.sqlite")
-if cps apply --root /installed-copy /scratch/upgrade.json > /tmp/rejected 2>&1; then
-    echo 'CPS_VM_DEVICE: applied a plan to a deployed root'
-    exit 1
-fi
-"$bb" grep -F 'use boot-env stage to prepare package changes from a deployed ext4 root' /tmp/rejected
-test "$("$bb" sha256sum "/installed-copy/$state_dir/state.sqlite")" = "$before"
-test "$("$bb" cat /installed-copy/etc/cps-vm-state)" = trial
-"$bb" umount /installed-copy
-mount --bind /fallback/etc /fallback/run
-if cps boot-env stage --source /fallback --root /scratch/recycled /scratch/upgrade.json > /tmp/rejected 2>&1; then
-    echo 'CPS_VM_DEVICE: staged a root with a nested bind mount'
-    exit 1
-fi
-"$bb" grep -F 'opening tree entry "run"' /tmp/rejected
-test ! -e /scratch/recycled
-"$bb" umount /fallback/run
-result=$(cps boot-env stage --source /fallback --root /scratch/recycled /scratch/upgrade.json)
-id=${result#Staged }
-id=${id%% at *}
-test "$("$bb" cat /scratch/recycled/etc/cps-vm-booted-source)" = booted
-test "$("$bb" cat /scratch/recycled/etc/cps-vm.conf)" = administrator-setting
-test "$("$bb" cat /scratch/recycled/etc/cps-vm-policy.conf)" = administrator-policy
-test "$("$bb" stat -c %a /fallback/etc/cps-vm-policy.conf)" = 644
-test "$("$bb" stat -c %a /scratch/recycled/etc/cps-vm-policy.conf)" = 600
-cps plan --root /scratch/recycled --output /scratch/config.json resolve-config etc/cps-vm.conf --take vendor
-cps apply --root /scratch/recycled /scratch/config.json
-cps plan --root /scratch/recycled --output /scratch/policy.json resolve-config etc/cps-vm-policy.conf --take local
-cps apply --root /scratch/recycled /scratch/policy.json
-test "$(cps config list --root /scratch/recycled)" = 'No pending configuration updates'
-cps boot-env export --receipt --root /scratch/recycled --output /scratch/recycled.ext4 \
-    --size-mib "$root_mib" > /scratch/recycled.kdl
-cps boot-env activate-device --root /scratch/recycled --esp /esp --device /dev/vda2 \
-    --root-partuuid "$base_uuid" --receipt /scratch/recycled.kdl --root-image /scratch/recycled.ext4 \
-    --replace "$base_id" --options "$options"
-"$bb" umount /scratch
-echo "CPS_VM_INSTALLED_STAGE: $id"
-GUEST
-        else
-            printf 'mode=%q\nbase_id=%q\ntrial_id=%q\n' "$mode" "$base_id" "$trial_id"
-            cat <<'GUEST'
-mount -t ext4 -o ro,noload /dev/vda3 /fallback
-old="/esp/loader/entries/$base_id.conf"
-marker="/esp/loader/entries/$base_uuid.cps-retired"
-set -- --esp /esp --device /dev/vda2 --root-partuuid "$base_uuid" --receipt /staged.kdl
-reject 'cannot replace the known-good base' "$@" --replace "$trial_id" --root-image /staged.ext4
-reject 'distinct root PARTUUID' "$@" --root-image /staged.ext4
-reject 'root payload size must match' "$@" --replace "$base_id" --root-image /base.kdl
-test -f "$old"
-test ! -e "$marker"
-if [ "$mode" = resume ]; then
-    printf '%s\n' "$base_id" > "$marker"
-    reject 'unsupported CPS slot retirement format' "$@" --replace "$base_id" --root-image /staged.ext4
-    printf 'cps slot retirement v2\n%s\n' "$base_id" > "$marker"
-    reject 'unsupported CPS slot retirement format' "$@" --replace "$base_id" --root-image /staged.ext4
-    test -f "$old"
-    # Recreate the durable state after retirement and an interrupted root write.
-    printf 'cps slot retirement v1\n%s\n' "$base_id" > "$marker"
-    /bin/busybox rm "$old"
-    /bin/busybox sync
-    /bin/busybox dd if=/dev/zero of=/dev/vda2 bs=1M count=1 conv=fsync
-    cps boot-env list --esp /esp > /tmp/environments
-    /bin/busybox grep -F "$trial_id" /tmp/environments | /bin/busybox grep '^\*'
-    if /bin/busybox grep -F "$base_id" /tmp/environments; then
-        exit 1
-    fi
-    reject 'an interrupted slot replacement' "$@" --root-image /staged.ext4
-    echo 'CPS_VM_DEVICE: resuming after a partial root write'
-fi
-activate "$@" --replace "$base_id" --root-image /staged.ext4
-test ! -e "$old"
-test ! -e "$marker"
-test ! -e "/esp/EFI/cps/$base_id"
-GUEST
-        fi
-        if [[ $mode != bootstrap ]]; then printf '/bin/busybox umount /fallback\n'; fi
-        cat <<'GUEST'
-/bin/busybox umount /esp
-echo 'CPS_VM_DEVICE: operation completed'
-GUEST
-    } > "$inputs/init"
-    chmod 0755 "$inputs/init"
-    truncate -s "$((root_mib + 256))M" "$inputs.raw"
-    mke2fs -q -F -t ext4 -d "$inputs" "$inputs.raw"
-    cp --reflink=auto --sparse=always "$source" "$output"
+
+# Run a shell step from standard input in the rescue system, against the
+# Btrfs volume at /volume and the ESP at /efi of the disk.
+run_rescue() {
+    local name=$1 disk=$2 data_args=()
+    {
+        printf 'bb=/bin/busybox\n'
+        cat
+        printf "echo 'CPS_VM_RESCUE: step completed'\n"
+    } > "rescue-$name.sh"
+    cp -- "rescue-$name.sh" "rescue-$name.step"
+    truncate -s 1M "rescue-$name.step"
     if [[ -n $qemu_data ]]; then data_args=(-L "$qemu_data"); fi
     timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${data_args[@]}" \
         -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
-        -serial "file:device-$mode.log" -kernel "$trial_kernel" \
-        -append 'root=/dev/vdb rootfstype=ext4 rootwait ro console=ttyS0 loglevel=3 init=/init' \
-        -drive "if=virtio,format=raw,file=$output" \
-        -drive "if=virtio,format=raw,readonly=on,file=$inputs.raw" "${scratch_args[@]}" || {
-        tail -80 "device-$mode.log" >&2
+        -serial "file:rescue-$name.serial" -kernel "$rescue_kernel" \
+        -append 'root=/dev/vdb rootfstype=btrfs rootwait ro console=ttyS0 loglevel=3 init=/init' \
+        -drive "if=virtio,format=raw,file=$disk" \
+        -drive if=virtio,format=raw,readonly=on,file=rescue.btrfs \
+        -drive "if=virtio,format=raw,readonly=on,file=rescue-$name.step" || {
+        tail -80 "rescue-$name.serial" >&2
         return 1
     }
-    tr -d '\r' < "device-$mode.log" > "device-$mode-activation.log"
-    cat "device-$mode-activation.log"
-    grep -Fxq 'CPS_VM_DEVICE: operation completed' "device-$mode-activation.log"
-    if [[ $mode == resume ]]; then
-        grep -Fxq 'CPS_VM_DEVICE: resuming after a partial root write' "device-$mode-activation.log"
+    tr -d '\r' < "rescue-$name.serial" > "rescue-$name.log"
+    if ! grep -Fxq 'CPS_VM_RESCUE: step completed' "rescue-$name.log"; then
+        tail -80 "rescue-$name.log" >&2
+        return 1
     fi
 }
 
@@ -375,6 +206,11 @@ setup_systemd_guest() {
             cp -L "$systemd/system/$unit" "$root/usr/lib/systemd/system/"
         done
         copy_runtime_deps "$root" "$(command -v blkid)" # systemd's ESP discovery loads libblkid
+        # systemd's private libraries load each other through the executable's
+        # RUNPATH, which the manifest generator does not follow. Expose them by soname.
+        for binary in "$root"/usr/lib/systemd/lib*.so; do
+            [[ -e $binary ]] && ln -sfn "systemd/${binary##*/}" "$root/usr/lib/${binary##*/}"
+        done
     else
         touch "$root/etc/cps-vm-assert-built-systemd"
     fi
@@ -422,15 +258,16 @@ while read -r module name; do
     printf '%s\n' "$name" >> /run/cps-vm-loaded-modules
 done < "/vm-modules/$release/load"
 "$mount" -t vfat /dev/vda1 /efi
-root_arg=
+# Every environment shares the root partition. Its subvolume names the entry.
+flags=
 for arg in $("$bb" cat /proc/cmdline); do
-    case "$arg" in root=PARTUUID=*) root_arg=$arg ;; esac
+    case "$arg" in rootflags=subvolid=*) flags=$arg ;; esac
 done
-[ -n "$root_arg" ]
+[ -n "$flags" ]
 for entry in /efi/loader/entries/cps-*+*.conf; do
     [ -f "$entry" ] || continue
     while IFS= read -r line; do
-        case "$line" in "options $root_arg "*) : > /run/cps-vm-counted; break ;; esac
+        case "$line" in "options "*" $flags "*) : > /run/cps-vm-counted; break ;; esac
     done < "$entry"
 done
 exec /usr/lib/systemd/systemd
@@ -472,15 +309,6 @@ if [ -f /etc/cps-vm-assert-facet ]; then
         [ "$facets" = "$(printf 'RULE\tVALUE\tSOURCE\ndebug.*\tfalse\tdefault\nisa.*\tfalse\tdefault\ndevel\tfalse\tlocal\ndoc.man\tfalse\tlocal')" ]
         printf 'CPS_VM_FACET: previous docs absent\n'
     fi
-fi
-if [ -f /etc/cps-vm-assert-installed-stage ] && [ "$state" = trial ]; then
-    printf 'booted\n' > /etc/cps-vm-booted-source
-fi
-if [ -f /etc/cps-vm.conf ]; then
-    printf 'CPS_VM_CONFIG: %s %s\n' "$state" "$("$bb" cat /etc/cps-vm.conf)"
-fi
-if [ -f /etc/cps-vm-policy.conf ]; then
-    printf 'CPS_VM_POLICY: %s %s\n' "$state" "$("$bb" cat /etc/cps-vm-policy.conf)"
 fi
 if [ -f /etc/cps-vm-assert-merged-usr ]; then
     for path in /bin /sbin /lib /lib64 /usr/sbin /usr/lib64; do [ -L "$path" ]; done
@@ -564,7 +392,7 @@ if [ -f /etc/cps-vm-assert-package-intent ]; then
     fi
     rejection=$("$bb" cat /run/mark-rejected.log)
     case "$rejection" in
-        *'use boot-env stage to prepare package changes from an installed root'*) ;;
+        *'to prepare package changes from an installed root'*) ;;
         *) printf '%s\n' "$rejection" >&2; exit 1 ;;
     esac
     printf 'CPS_VM_PACKAGE_INTENT: %s verified\n' "$state"

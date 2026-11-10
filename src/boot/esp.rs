@@ -10,10 +10,8 @@ use anyhow::{Context, Result, bail, ensure};
 use rustix::process::geteuid;
 
 use super::{
-    Activation, BootEnvironment, artifact_helper,
-    deploy::{DiskStage, OfflineDisk, PartitionExtent},
-    list_boot_environments, source_date_epoch,
-    systemd_boot::{self, Deployment, RetiredEntry, RootDeployment},
+    artifact_helper,
+    disk::{OfflineDisk, PartitionExtent},
 };
 use crate::model::digest_reader;
 
@@ -23,112 +21,13 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const FAT32_BOOT_FLAGS: usize = 65;
 const FAT_DIRTY: u8 = 0x01;
 const FAT_EPOCH: u32 = 315532800; // 1980-01-01 00:00:00 UTC
+/// Directory of trusted disk tools for unprivileged callers.
+pub(super) const TOOLS_DIR: &str = "CPS_DISK_TOOLS_DIR";
 
-/// Read the boot inventory from the EFI System Partition of an offline disk.
-pub fn list_boot_environments_on_disk(
-    disk: &Path,
-    esp_partuuid: &str,
-) -> Result<Vec<BootEnvironment>> {
-    let disk = OfflineDisk::open(disk)?;
-    let temp = tempfile::tempdir()?;
-    let esp = Esp::read(&disk, disk.esp(esp_partuuid)?, temp.path(), None)?;
-    list_boot_environments(&esp.tree)
-}
-
-/// Register a boot environment on a new copy of an offline GPT disk.
-pub fn activate_boot_environment_on_disk(
-    root: &Path,
-    activation: &Activation,
-    disk: &Path,
-    esp_partuuid: &str,
-    receipt: &Path,
-    output: &Path,
-) -> Result<String> {
-    activate_disk(root, activation, disk, esp_partuuid, receipt, output, None)
-}
-
-/// Deploy and activate a root together, optionally recycling a registered slot.
-pub fn deploy_and_activate_boot_environment(
-    root: &Path,
-    activation: &Activation,
-    disk: &Path,
-    esp_partuuid: &str,
-    receipt: &Path,
-    output: &Path,
-    install: RootDeployment<'_>,
-) -> Result<String> {
-    activate_disk(
-        root,
-        activation,
-        disk,
-        esp_partuuid,
-        receipt,
-        output,
-        Some(install),
-    )
-}
-
-fn activate_disk(
-    root: &Path,
-    activation: &Activation,
-    disk: &Path,
-    esp_partuuid: &str,
-    receipt: &Path,
-    output: &Path,
-    install: Option<RootDeployment<'_>>,
-) -> Result<String> {
-    let epoch = source_date_epoch()?;
-    let stage = DiskStage::new(disk, output)?;
-    let partition = stage.disk.esp(esp_partuuid)?;
-    let esp = Esp::read(&stage.disk, partition, &stage.directory(), epoch)?;
-    esp.read_boot_files()?;
-    let deployment = Deployment {
-        disk: &stage.disk,
-        receipt,
-        root: install,
-        target: None,
-    };
-    let update = systemd_boot::activate(
-        root,
-        &esp.tree,
-        activation,
-        Some(deployment),
-        None,
-        systemd_boot::BootMode::Split,
-    )?;
-    if let Some(retired) = &update.retired {
-        esp.remove_entry(retired)?;
-    }
-    esp.write(
-        &stage.disk,
-        partition,
-        update.files.iter().map(String::as_str),
-    )?;
-    stage.publish()?;
-    Ok(update.id)
-}
-
-/// Select a known-good boot environment on a new copy of an offline GPT disk.
-pub fn rollback_boot_environment_on_disk(
-    disk: &Path,
-    esp_partuuid: &str,
-    id: Option<&str>,
-    output: &Path,
-) -> Result<String> {
-    let epoch = source_date_epoch()?;
-    let stage = DiskStage::new(disk, output)?;
-    let partition = stage.disk.esp(esp_partuuid)?;
-    let esp = Esp::read(&stage.disk, partition, &stage.directory(), epoch)?;
-    esp.read_boot_files()?;
-    let id = systemd_boot::rollback(&esp.tree, id, Some(&stage.disk), None)?;
-    esp.write(&stage.disk, partition, ["loader/loader.conf"])?;
-    stage.publish()?;
-    Ok(id)
-}
-
-struct Esp {
+/// A checked private copy of an offline EFI System Partition, and the files read from it.
+pub(super) struct Esp {
+    pub tree: PathBuf,
     work: PathBuf,
-    tree: PathBuf,
     epoch: Option<u32>,
 }
 
@@ -138,7 +37,7 @@ struct FatEntry {
 }
 
 impl Esp {
-    fn read(
+    pub fn read(
         disk: &OfflineDisk,
         partition: &PartitionExtent,
         work: &Path,
@@ -211,7 +110,7 @@ impl Esp {
     }
 
     fn check(&self) -> Result<()> {
-        let output = esp_helper("fsck.fat", &self.work)?
+        let output = disk_helper("fsck.fat", &self.work)?
             .args(["-n", FAT])
             .output()
             .context("checking the EFI partition with fsck.fat")?;
@@ -250,21 +149,34 @@ impl Esp {
         Ok(())
     }
 
-    fn read_boot_files(&self) -> Result<()> {
-        if !self.has_directory("", "EFI")? || !self.has_directory("EFI", "cps")? {
+    /// Refuse an ESP that already holds CPS boot files.
+    pub fn require_no_boot_files(&self) -> Result<()> {
+        if self.has_directory("", "EFI")? {
+            for name in ["cps", "cps-uefi"] {
+                ensure!(
+                    !self.has_directory("EFI", name)?,
+                    "the EFI partition already has CPS boot files in EFI/{name}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy out the systemd-boot binaries that firmware can start.
+    pub fn read_loaders(&self) -> Result<()> {
+        if !self.has_directory("", "EFI")? {
             return Ok(());
         }
-        for entry in self.children("EFI/cps")? {
-            if entry.name.to_ascii_lowercase().starts_with("cps-") {
-                ensure!(
-                    entry.directory && safe_name(&entry.name),
-                    "invalid CPS boot files directory {:?}",
-                    entry.name
-                );
-                let dir = format!("EFI/cps/{}", entry.name);
-                self.read_file_if_present(&dir, "vmlinuz.efi", MAX_ESP_BYTES)?;
-                self.read_file_if_present(&dir, "initramfs.img", MAX_ESP_BYTES)?;
-                self.read_file_if_present(&dir, "uki.efi", MAX_ESP_BYTES)?;
+        for (directory, prefix) in [("systemd", "systemd-boot"), ("BOOT", "boot")] {
+            if !self.has_directory("EFI", directory)? {
+                continue;
+            }
+            let directory = format!("EFI/{directory}");
+            for entry in self.children(&directory)? {
+                let name = entry.name.to_ascii_lowercase();
+                if !entry.directory && name.starts_with(prefix) && name.ends_with(".efi") {
+                    self.copy_out(&format!("{directory}/{}", entry.name), MAX_ESP_BYTES)?;
+                }
             }
         }
         Ok(())
@@ -346,7 +258,7 @@ impl Esp {
             .collect())
     }
 
-    fn write<'a>(
+    pub fn write<'a>(
         &self,
         disk: &OfflineDisk,
         partition: &PartitionExtent,
@@ -368,7 +280,7 @@ impl Esp {
         let expected = digest_reader(&mut fat)?;
         fat.rewind()?;
         ensure!(
-            disk.write_partition(partition, &mut fat)? == expected,
+            disk.write_partition(partition, &fat)? == expected,
             "the deployed EFI partition differs from the checked FAT image"
         );
         Ok(())
@@ -433,51 +345,8 @@ impl Esp {
         Ok(())
     }
 
-    fn remove_entry(&self, retired: &RetiredEntry) -> Result<()> {
-        self.delete_file("loader/entries", &retired.file)?;
-        if self.has_directory("EFI/cps", &retired.id)? {
-            let directory = format!("EFI/cps/{}", retired.id);
-            for artifact in ["vmlinuz.efi", "initramfs.img"] {
-                if self
-                    .children(&directory)?
-                    .iter()
-                    .any(|entry| entry.name.eq_ignore_ascii_case(artifact))
-                {
-                    self.delete_file(&directory, artifact)?;
-                }
-            }
-            if self.children(&directory)?.is_empty() {
-                let status = self
-                    .fat_command("mrd", &[])?
-                    .arg(format!("::/{directory}"))
-                    .status()?;
-                ensure!(
-                    status.success() && !self.has_directory("EFI/cps", &retired.id)?,
-                    "could not remove the retired EFI directory {directory}"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn delete_file(&self, directory: &str, name: &str) -> Result<()> {
-        let status = self
-            .fat_command("mdel", &[])?
-            .arg(format!("::/{directory}/{name}"))
-            .status()?;
-        ensure!(
-            status.success()
-                && !self
-                    .children(directory)?
-                    .iter()
-                    .any(|entry| entry.name.eq_ignore_ascii_case(name)),
-            "could not remove the retired EFI file {directory}/{name}"
-        );
-        Ok(())
-    }
-
     fn fat_command(&self, program: &str, flags: &[&str]) -> Result<Command> {
-        let mut command = esp_helper(program, &self.work)?;
+        let mut command = disk_helper(program, &self.work)?;
         command
             .env("MTOOLSRC", "/dev/null")
             .args(flags)
@@ -498,12 +367,13 @@ fn safe_name(name: &str) -> bool {
         })
 }
 
-fn esp_helper(program: &str, work: &Path) -> Result<Command> {
-    let program = if let Some(path) = std::env::var_os("CPS_ESP_TOOLS_DIR") {
+/// Run a disk tool from `CPS_DISK_TOOLS_DIR`, or else from the system path.
+pub(super) fn disk_helper(program: &str, work: &Path) -> Result<Command> {
+    let program = if let Some(path) = std::env::var_os(TOOLS_DIR) {
         let path = PathBuf::from(path);
         ensure!(
             !geteuid().is_root() && path.is_absolute(),
-            "CPS_ESP_TOOLS_DIR requires an unprivileged caller and an absolute path"
+            "{TOOLS_DIR} requires an unprivileged caller and an absolute path"
         );
         path.join(program)
     } else {

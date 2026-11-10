@@ -17,25 +17,20 @@ use cps::query::{
 };
 use cps::system::{self, System, UpdateStatus};
 use cps::{
-    Activation, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice, GitSnapshotRef,
-    MarkChoice, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request, RootDeployment,
-    SourceLayout, abort_transaction, activate_boot_environment, activate_boot_environment_on_disk,
-    activate_deployed_boot_environment, activate_device_boot_environment, add_publisher_from_url,
-    add_publisher_with_build_trust, apply, archive_build_sources, audit_publisher_builds,
-    build_with_recipe_options, capture_boot_environment, create_image,
-    deploy_and_activate_boot_environment, deploy_boot_environment, destroy_btrfs_boot_environment,
-    export_boot_environment, export_boot_environment_receipt, export_rebuild_inputs,
-    fetch_build_sources, fetch_plan_with_archives, fetch_sources, fetch_sources_with_local,
-    fetch_toolchain, generate_manifest_for_architecture, import_sources, list_boot_environments,
-    list_boot_environments_on_disk, list_config_updates, list_freezes, list_obsoletions,
-    list_publishers, list_withdrawals, plan_with_options, prefer_publisher,
-    prepare_boot_environment, prepare_git_snapshot_ref, publish_witnessed_bundle_with_sources,
-    read_attestation, read_worker_config, release, remove_publisher, repair_pending_transaction,
-    resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
+    Activation, BootImage, BuildSettings, BuildToolchain, BuildWitness, ConfigChoice,
+    GitSnapshotRef, MarkChoice, PackageChange, PhasedUpdateDeferred, Plan, PlanOptions, Request,
+    SourceLayout, abort_transaction, add_publisher_from_url, add_publisher_with_build_trust, apply,
+    archive_build_sources, audit_publisher_builds, build_with_recipe_options,
+    capture_boot_environment, create_boot_image, create_image, destroy_btrfs_boot_environment,
+    export_rebuild_inputs, fetch_build_sources, fetch_plan_with_archives, fetch_sources,
+    fetch_sources_with_local, fetch_toolchain, generate_manifest_for_architecture, import_sources,
+    list_boot_environments, list_config_updates, list_freezes, list_obsoletions, list_publishers,
+    list_withdrawals, plan_with_options, prefer_publisher, prepare_git_snapshot_ref,
+    publish_witnessed_bundle_with_sources, read_attestation, read_worker_config, release,
+    remove_publisher, repair_pending_transaction, resume_transaction,
     rollback_btrfs_boot_environment, set_publisher_build_trust, set_publisher_repositories,
-    stage_boot_environment, stage_btrfs_boot_environment, suggest_dependencies,
-    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
-    verify_rebuild, withdraw_package,
+    stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
+    transaction_status, verify, verify_pristine, verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -1586,35 +1581,19 @@ enum BootCommand {
     /// List registered boot environments and the configured default
     List {
         /// Mount point of the EFI System Partition
-        #[arg(long, required_unless_present = "disk", conflicts_with = "disk")]
-        esp: Option<PathBuf>,
-        /// Offline GPT disk image to read instead of a mounted ESP
-        #[arg(long, requires = "esp_partuuid")]
-        disk: Option<PathBuf>,
-        /// GPT PARTUUID of the EFI System Partition on the disk
-        #[arg(long, requires = "disk")]
-        esp_partuuid: Option<String>,
+        #[arg(long)]
+        esp: PathBuf,
     },
     /// Select a known-good environment for the next boot
     Rollback {
         /// Mount point of the EFI System Partition
-        #[arg(long, required_unless_present = "disk", conflicts_with = "disk")]
-        esp: Option<PathBuf>,
-        /// Offline GPT disk image to change instead of a mounted ESP
-        #[arg(long, requires_all = ["esp_partuuid", "output_disk"])]
-        disk: Option<PathBuf>,
-        /// GPT PARTUUID of the EFI System Partition on the disk
-        #[arg(long, requires = "disk")]
-        esp_partuuid: Option<String>,
-        /// Publish the rollback in a new disk file
-        #[arg(long, requires = "disk")]
-        output_disk: Option<PathBuf>,
-        /// Mounted Btrfs top-level volume for checking a subvolume root
-        #[arg(long, requires = "esp", conflicts_with = "disk")]
-        btrfs_volume: Option<PathBuf>,
-        /// Compare the configured default with the rollback root without changing boot
-        /// selection. Requires --esp and --btrfs-volume.
-        #[arg(long, requires_all = ["esp", "btrfs_volume"])]
+        #[arg(long)]
+        esp: PathBuf,
+        /// Mounted Btrfs top-level volume holding the rollback root
+        #[arg(long)]
+        btrfs_volume: PathBuf,
+        /// Compare the configured default with the rollback root without changing boot selection
+        #[arg(long)]
         dry_run: bool,
         /// Include managed file actions and ownership in the preview. Requires --dry-run.
         #[arg(long, requires = "dry_run")]
@@ -1659,121 +1638,35 @@ enum BootCommand {
         #[arg(long, default_value = system::CONFIG)]
         config: PathBuf,
     },
-    /// Clone the base image and apply a saved plan in a new directory
-    Stage {
+    /// Write an inactive root and its known-good boot entry to a new copy of a GPT disk
+    Image {
+        /// Directory that becomes the Btrfs top level. It holds only the root and environments.
         #[arg(long)]
-        source: PathBuf,
-        #[arg(long)]
-        root: PathBuf,
-        plan: PathBuf,
-    },
-    /// Stage and export a saved plan as one directory for explicit activation
-    Prepare {
-        #[arg(long)]
-        source: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-        #[arg(long, value_name = "MIB")]
-        size_mib: u64,
-        plan: PathBuf,
-    },
-    /// Export an inactive root to a new ext4 partition image
-    Export {
+        btrfs_volume: PathBuf,
+        /// Inactive CPS root in the volume directory, written as the root subvolume
         #[arg(long)]
         root: PathBuf,
+        /// Empty directory in the volume directory, written as the environments subvolume
         #[arg(long)]
-        output: PathBuf,
-        #[arg(long, value_name = "MIB")]
-        size_mib: u64,
-        /// Write the KDL export receipt to standard output
-        #[arg(long)]
-        receipt: bool,
-    },
-    /// Deploy an exported root to a partition in a new offline GPT disk image
-    Deploy {
+        environments: PathBuf,
+        /// GPT disk with a systemd-boot ESP and the target Linux filesystem partition
         #[arg(long)]
         disk: PathBuf,
-        #[arg(long)]
-        root_image: PathBuf,
+        /// GPT PARTUUID of the partition that receives the Btrfs filesystem
         #[arg(long)]
         root_partuuid: String,
+        /// New disk file to write
         #[arg(long)]
         output: PathBuf,
-    },
-    /// Verify or write an inactive GPT root partition and publish its boot entry
-    ActivateDevice {
-        #[arg(long)]
-        root: PathBuf,
-        /// Mount point of the writable EFI System Partition
-        #[arg(long)]
-        esp: PathBuf,
-        /// Inactive Linux filesystem partition on the same disk
-        #[arg(long)]
-        device: PathBuf,
-        #[arg(long)]
-        root_partuuid: String,
-        /// KDL receipt produced by boot-env export --receipt
-        #[arg(long)]
-        receipt: PathBuf,
-        /// Write this export before activation. Without it, verify the existing bytes.
-        #[arg(long)]
-        root_image: Option<PathBuf>,
-        /// Retire this environment before writing its inactive root partition
-        #[arg(long, requires = "root_image")]
-        replace: Option<String>,
+        /// Kernel path in the root, for images without kernel-install artifacts
         #[arg(long, default_value = "boot/vmlinuz")]
         kernel: String,
+        /// Initramfs path in the root, for images without kernel-install artifacts
         #[arg(long)]
         initrd: Option<String>,
+        /// Kernel arguments that the installation requires
         #[arg(long, default_value = "")]
         options: String,
-        #[arg(long, default_value_t = 2)]
-        tries: u32,
-        /// Bootstrap the first entry using an already known-good base image
-        #[arg(long, conflicts_with = "replace")]
-        known_good: bool,
-    },
-    /// Publish a systemd-boot entry for a verified environment
-    Activate {
-        #[arg(long)]
-        root: PathBuf,
-        #[arg(
-            long,
-            required_unless_present = "output_disk",
-            conflicts_with = "output_disk"
-        )]
-        esp: Option<PathBuf>,
-        #[arg(long)]
-        root_partuuid: String,
-        /// Offline GPT disk holding the deployed root
-        #[arg(long, requires = "receipt")]
-        disk: Option<PathBuf>,
-        /// KDL receipt produced by boot-env export --receipt
-        #[arg(long, requires = "disk")]
-        receipt: Option<PathBuf>,
-        /// GPT PARTUUID of the EFI System Partition on the disk
-        #[arg(long, requires = "output_disk")]
-        esp_partuuid: Option<String>,
-        /// Publish the activation in a new disk file
-        #[arg(long, requires_all = ["disk", "receipt", "esp_partuuid"])]
-        output_disk: Option<PathBuf>,
-        /// Deploy this root payload in the same transaction as activation
-        #[arg(long, requires = "output_disk")]
-        root_image: Option<PathBuf>,
-        /// Recycle the root slot of this inactive boot environment
-        #[arg(long, requires = "root_image")]
-        replace: Option<String>,
-        #[arg(long, default_value = "boot/vmlinuz")]
-        kernel: String,
-        #[arg(long)]
-        initrd: Option<String>,
-        #[arg(long, default_value = "")]
-        options: String,
-        #[arg(long, default_value_t = 2)]
-        tries: u32,
-        /// Bootstrap the first entry using an already known-good base image
-        #[arg(long)]
-        known_good: bool,
     },
 }
 
@@ -3832,19 +3725,8 @@ fn run(command: Command) -> Result<ExitCode> {
             }
         }
         Command::BootEnv { command } => match command {
-            BootCommand::List {
-                esp,
-                disk,
-                esp_partuuid,
-            } => {
-                let environments = match (esp.as_deref(), disk.as_deref(), esp_partuuid.as_deref())
-                {
-                    (Some(esp), None, None) => list_boot_environments(esp)?,
-                    (None, Some(disk), Some(partuuid)) => {
-                        list_boot_environments_on_disk(disk, partuuid)?
-                    }
-                    _ => anyhow::bail!("specify --esp or both --disk and --esp-partuuid"),
-                };
+            BootCommand::List { esp } => {
+                let environments = list_boot_environments(&esp)?;
                 if environments.is_empty() {
                     println!("No boot environments registered");
                 } else {
@@ -3898,9 +3780,6 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             BootCommand::Rollback {
                 esp,
-                disk,
-                esp_partuuid,
-                output_disk,
                 btrfs_volume,
                 dry_run,
                 paths,
@@ -3908,13 +3787,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 id,
             } => {
                 if dry_run {
-                    // clap requires --esp and --btrfs-volume with --dry-run.
-                    let (target, diff) = cps::preview_btrfs_rollback(
-                        esp.as_deref().context("missing --esp")?,
-                        btrfs_volume.as_deref().context("missing --btrfs-volume")?,
-                        id.as_deref(),
-                        paths,
-                    )?;
+                    let (target, diff) =
+                        cps::preview_btrfs_rollback(&esp, &btrfs_volume, id.as_deref(), paths)?;
                     if json {
                         serde_json::to_writer_pretty(
                             io::stdout().lock(),
@@ -3927,24 +3801,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     }
                     return Ok(ExitCode::SUCCESS);
                 }
-                let id = match (
-                    esp.as_deref(),
-                    disk.as_deref(),
-                    esp_partuuid.as_deref(),
-                    output_disk.as_deref(),
-                ) {
-                    (Some(esp), None, None, None) => {
-                        if let Some(volume) = btrfs_volume.as_deref() {
-                            rollback_btrfs_boot_environment(esp, volume, id.as_deref())?
-                        } else {
-                            rollback_boot_environment(esp, id.as_deref())?
-                        }
-                    }
-                    (None, Some(disk), Some(partuuid), Some(output)) => {
-                        rollback_boot_environment_on_disk(disk, partuuid, id.as_deref(), output)?
-                    }
-                    _ => anyhow::bail!("specify --esp or the offline disk and output options"),
-                };
+                let id = rollback_btrfs_boot_environment(&esp, &btrfs_volume, id.as_deref())?;
                 println!("Selected {id} for the next boot");
             }
             BootCommand::ActivateBtrfs {
@@ -4018,10 +3875,6 @@ fn run(command: Command) -> Result<ExitCode> {
                 let id = capture_boot_environment(&source, &output, &exclude_subvolume)?;
                 println!("Captured {id} at {}", output.display());
             }
-            BootCommand::Stage { source, root, plan } => {
-                let id = stage_boot_environment(&source, &root, &load_plan(&plan)?)?;
-                println!("Staged {id} at {}", root.display());
-            }
             BootCommand::StageBtrfs {
                 source,
                 output,
@@ -4036,141 +3889,29 @@ fn run(command: Command) -> Result<ExitCode> {
                 )?;
                 println!("Staged {id} at {}", output.join("root").display());
             }
-            BootCommand::Prepare {
-                source,
-                output,
-                size_mib,
-                plan,
-            } => {
-                let id = prepare_boot_environment(&source, &output, &load_plan(&plan)?, size_mib)?;
-                println!("Prepared {id} at {}", output.display());
-            }
-            BootCommand::Export {
+            BootCommand::Image {
+                btrfs_volume,
                 root,
-                output,
-                size_mib,
-                receipt,
-            } => {
-                if receipt {
-                    let receipt = export_boot_environment_receipt(&root, &output, size_mib)?;
-                    std::io::stdout().lock().write_all(receipt.as_bytes())?;
-                } else {
-                    let id = export_boot_environment(&root, &output, size_mib)?;
-                    println!("Exported {id} to {}", output.display());
-                }
-            }
-            BootCommand::Deploy {
+                environments,
                 disk,
-                root_image,
                 root_partuuid,
                 output,
-            } => {
-                let hash = deploy_boot_environment(&disk, &root_image, &root_partuuid, &output)?;
-                println!(
-                    "Deployed root to {root_partuuid} in {} (SHA-256 {hash})",
-                    output.display()
-                );
-            }
-            BootCommand::ActivateDevice {
-                root,
-                esp,
-                device,
-                root_partuuid,
-                receipt,
-                root_image,
-                replace,
                 kernel,
                 initrd,
                 options,
-                tries,
-                known_good,
             } => {
-                let activation = Activation {
-                    root_partuuid,
+                let id = create_boot_image(BootImage {
+                    volume: &btrfs_volume,
+                    root: &root,
+                    environments: &environments,
+                    disk: &disk,
+                    root_partuuid: &root_partuuid,
+                    output: &output,
                     kernel,
                     initrd,
                     options,
-                    tries,
-                    known_good,
-                };
-                let id = activate_device_boot_environment(
-                    &root,
-                    &esp,
-                    &activation,
-                    &device,
-                    &receipt,
-                    root_image.as_deref().map(|image| RootDeployment {
-                        image,
-                        replace: replace.as_deref(),
-                    }),
-                )?;
-                println!("Activated {id}");
-            }
-            BootCommand::Activate {
-                root,
-                esp,
-                root_partuuid,
-                disk,
-                receipt,
-                esp_partuuid,
-                output_disk,
-                root_image,
-                replace,
-                kernel,
-                initrd,
-                options,
-                tries,
-                known_good,
-            } => {
-                let activation = Activation {
-                    root_partuuid,
-                    kernel,
-                    initrd,
-                    options,
-                    tries,
-                    known_good,
-                };
-                let id = match (
-                    esp.as_deref(),
-                    disk.as_deref(),
-                    receipt.as_deref(),
-                    esp_partuuid.as_deref(),
-                    output_disk.as_deref(),
-                ) {
-                    (Some(esp), Some(disk), Some(receipt), None, None) => {
-                        activate_deployed_boot_environment(&root, esp, &activation, disk, receipt)?
-                    }
-                    (Some(esp), None, None, None, None) => {
-                        activate_boot_environment(&root, esp, &activation)?
-                    }
-                    (None, Some(disk), Some(receipt), Some(partuuid), Some(output)) => {
-                        if let Some(image) = root_image.as_deref() {
-                            deploy_and_activate_boot_environment(
-                                &root,
-                                &activation,
-                                disk,
-                                partuuid,
-                                receipt,
-                                output,
-                                RootDeployment {
-                                    image,
-                                    replace: replace.as_deref(),
-                                },
-                            )?
-                        } else {
-                            activate_boot_environment_on_disk(
-                                &root,
-                                &activation,
-                                disk,
-                                partuuid,
-                                receipt,
-                                output,
-                            )?
-                        }
-                    }
-                    _ => anyhow::bail!("specify --esp or the offline disk and output options"),
-                };
-                println!("Activated {id}");
+                })?;
+                println!("Wrote {id} to {}", output.display());
             }
         },
     }
@@ -4277,11 +4018,25 @@ mod tests {
         let mut command = Cli::command();
         let boot = command.find_subcommand_mut("boot-env").unwrap();
         for (name, args) in [
-            ("list", ["esp", "disk", "esp_partuuid"].as_slice()),
+            ("list", ["esp"].as_slice()),
             ("destroy-btrfs", &["id", "esp", "btrfs_volume", "dry_run"]),
             (
                 "rollback",
-                &["esp", "disk", "esp_partuuid", "dry_run", "paths", "json"],
+                &["esp", "btrfs_volume", "dry_run", "paths", "json"],
+            ),
+            (
+                "image",
+                &[
+                    "btrfs_volume",
+                    "root",
+                    "environments",
+                    "disk",
+                    "root_partuuid",
+                    "output",
+                    "kernel",
+                    "initrd",
+                    "options",
+                ],
             ),
         ] {
             let subcommand = boot.find_subcommand(name).unwrap();

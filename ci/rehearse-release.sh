@@ -90,7 +90,8 @@ for config in "$cases"/*/image.kdl; do
         fi
         "$cps" plan --root "$before" --output "$work/transaction.json" update --force-phased-update
         "$cps" validate --root "$before" "$work/transaction.json"
-        "$cps" boot-env stage --source "$before" --root "$after" "$work/transaction.json"
+        cp -a --reflink=auto -- "$before" "$after"
+        "$cps" apply --root "$after" "$work/transaction.json"
         [[ $(check_pin "$after" "$candidate") == "$profile" ]]
         "$gate" upgrade "$profile" "$candidate" "$hash" "$after" "$before"
     done

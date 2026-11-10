@@ -221,9 +221,8 @@ provisioning.
 A **boot environment** pairs a root with its boot artifacts and its
 registered boot entry on the **EFI System Partition** (ESP). The entry
 records the root's image identity and revision, so the boot always uses the
-root's committed package state and configuration together. A staged Btrfs
-environment is a writable snapshot of its parent root. An ext4 environment is
-an exported root written to a dedicated partition, its **root slot**.
+root's committed package state and configuration together. The root lives
+on Btrfs, and a staged environment is a writable snapshot of its parent root.
 
 | Term | Meaning in CPS |
 | --- | --- |
@@ -232,12 +231,12 @@ an exported root written to a dedicated partition, its **root slot**.
 | **Known good** | An environment that booted and passed its health checks, or that was registered with `--known-good` to bootstrap the ESP. A healthy boot **blesses** a trial. Otherwise the next boot returns to the trial's **fallback**, the known-good parent it was staged from. |
 | **Rollback** | Selects a known-good environment, by default the fallback of the current selection, for the next boot. |
 | **Failed trial** | A trial whose attempts are exhausted. An **abandoned trial** still has attempts left but is no longer selected, for example after a rollback. |
-| **Discard** | On Btrfs, `cps boot-env discard-trial` cancels a pending or running trial, selects its fallback, and removes failed and abandoned trials. |
-| **Prune** | On Btrfs, removes failed and abandoned trials and the known-good environments that the retention policy no longer keeps. System package commands prune automatically before staging. An ext4 slot is reused by replacing its environment instead. |
+| **Discard** | `cps boot-env discard-trial` cancels a pending or running trial, selects its fallback, and removes failed and abandoned trials. |
+| **Prune** | Removes failed and abandoned trials and the known-good environments that the retention policy no longer keeps. System package commands prune automatically before staging. |
 
 **systemd-boot** loads either separate kernel and initramfs files or a signed
 **unified kernel image** (UKI). CPS owns only the boot selection keys in its
-`loader.conf`. On Btrfs, UEFI firmware can also launch each signed UKI
+`loader.conf`. UEFI firmware can also launch each signed UKI
 directly, without a boot loader. A filesystem UUID identifies a filesystem,
 while a **PARTUUID** identifies a partition in the partition table. Use the
 identifier each setup or command asks for.

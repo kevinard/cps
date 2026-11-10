@@ -84,8 +84,8 @@ module.
 | Build attestations and builder trust | [`src/attestation.rs`](../../src/attestation.rs) |
 | Pinned builds, sandboxing, collected file lists, stripping, and Git installs | [`src/build/`](../../src/build) and [`src/git_install.rs`](../../src/git_install.rs) |
 | Build order, rebuild plans, and recipe repinning across recipes | [`src/orchestrate.rs`](../../src/orchestrate.rs) |
-| Boot environments: ext4 export and deployment, Btrfs staging, ESP edits, kernels, UKIs | [`src/boot/`](../../src/boot) |
-| systemd-boot entries, `loader.conf` ownership, direct UEFI boot, destruction, and retention | [`src/boot/systemd_boot.rs`](../../src/boot/systemd_boot.rs) with [`policy.rs`](../../src/boot/systemd_boot/policy.rs), [`uefi.rs`](../../src/boot/systemd_boot/uefi.rs), [`destroy.rs`](../../src/boot/systemd_boot/destroy.rs), and [`prune.rs`](../../src/boot/systemd_boot/prune.rs) |
+| Boot environments: Btrfs staging, offline Btrfs disk images, ESP edits, kernels, UKIs | [`src/boot/`](../../src/boot) |
+| systemd-boot entries, `loader.conf` ownership, the loader version check, direct UEFI boot, destruction, and retention | [`src/boot/systemd_boot.rs`](../../src/boot/systemd_boot.rs) with [`policy.rs`](../../src/boot/systemd_boot/policy.rs), [`loader.rs`](../../src/boot/systemd_boot/loader.rs), [`uefi.rs`](../../src/boot/systemd_boot/uefi.rs), [`destroy.rs`](../../src/boot/systemd_boot/destroy.rs), and [`prune.rs`](../../src/boot/systemd_boot/prune.rs) |
 | Bounded HTTPS transfers and file capabilities | [`src/transport.rs`](../../src/transport.rs), [`src/file_caps.rs`](../../src/file_caps.rs) |
 | Cross-module tests | [`src/tests.rs`](../../src/tests.rs) and [`src/tests/`](../../src/tests) |
 
@@ -170,11 +170,10 @@ CI sets both CPS variables to the same binary and runs this set:
 export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
 export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
 for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
-    package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror boot-export \
+    package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror boot-image \
     recipe-orchestration; do
   bash "tests/$test.sh"
 done
-bash tests/boot-deploy.sh --esp
 bash tests/transaction-progress.sh
 ```
 
@@ -185,7 +184,7 @@ Every scenario uses OpenSSL to create disposable keys.
 | [`package-identity.sh`](../../tests/package-identity.sh) | Upstream version spelling, package IDs, and architectures | |
 | [`manifest-dependencies.sh`](../../tests/manifest-dependencies.sh) | Generated library capabilities, offline dependency suggestions, and direct requirement checks | A C compiler, Python 3 |
 | [`package-freezes.sh`](../../tests/package-freezes.sh) | Offline freezes, version constraints, staged unfreezing | |
-| [`mediators.sh`](../../tests/mediators.sh) | Mediated defaults, preferences, boot staging, and reprovisioning | `jq` |
+| [`mediators.sh`](../../tests/mediators.sh) | Mediated defaults, preferences, a cloned root, and reprovisioning | `jq` |
 | [`transaction-progress.sh`](../../tests/transaction-progress.sh) | Plan validation, progress, read-only roots, and aborting a journaled apply | `jq` |
 | [`elf-transactions.sh`](../../tests/elf-transactions.sh) | Generated requirements, transaction ELF regressions, drift, and compatible upgrades | A C compiler |
 | [`elf-profile.sh`](../../tests/elf-profile.sh) | The signed ELF profile gate with a merged `/usr` and a companion publisher | A C compiler, GNU `objcopy` with `--strip-section-headers` |
@@ -202,13 +201,12 @@ Every scenario uses OpenSSL to create disposable keys.
 | [`release-notes.sh`](../../tests/release-notes.sh) | Signed mirror release notes and publication retries with a local GitHub CLI fixture | `jq`, `rg`, `ssh-keygen`, Python 3 |
 | [`sharded-mirror.sh`](../../tests/sharded-mirror.sh) | The deployment adapter with sharded targets, signer state checks, and sync | `jq`, `flock`, the TUF fixture |
 | [`deploy-mirror.sh`](../../tests/deploy-mirror.sh) | Mirror publication, refresh with only the timestamp key, an external timestamp signer, TUF root rotation and 2-of-3 revocation, publisher catalog key rotation, and descriptor trust root updates | `tuftool`, `jq`, `flock`, `rg` |
-| [`boot-export.sh`](../../tests/boot-export.sh) | Atomic ext4 export, late failure cleanup, and concurrent preparation | e2fsprogs with `debugfs`, `setfattr` |
-| [`boot-deploy.sh`](../../tests/boot-deploy.sh) | GPT deployment, partition isolation, and damaged layouts. With `--esp`, raw-disk activation and rollback. | e2fsprogs, `sfdisk`, `blkid`, `setfattr`, Python 3. With `--esp`, dosfstools (`mkfs.fat`, `fsck.fat`) and mtools. |
+| [`boot-image.sh`](../../tests/boot-image.sh) | Offline Btrfs disk images: layout, registration, metadata, reproducibility, the systemd-boot version check, rejections, and failure cleanup | btrfs-progs, dosfstools (`mkfs.fat`, `fsck.fat`), mtools, `sfdisk`, `setfattr` |
 
-An unprivileged caller can set `CPS_ESP_TOOLS_DIR` to the absolute path of a
-directory with trusted `fsck.fat` and mtools binaries. CPS then runs those
-instead of the ones on `PATH` when it edits an ESP inside a disk image,
-which also applies to `boot-deploy.sh --esp`.
+An unprivileged caller can set `CPS_DISK_TOOLS_DIR` to the absolute path of
+a directory with trusted btrfs-progs, `fsck.fat`, and mtools binaries. CPS
+then runs those instead of the ones on `PATH` when it writes a disk image,
+which also applies to `boot-image.sh`.
 
 The VM and disk tests and the signed fixture builders are described in
 [Test boot and rollback in a VM](boot-tests.md) and

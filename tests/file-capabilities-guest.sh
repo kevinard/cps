@@ -70,7 +70,8 @@ repair
 run_probe "$alias"
 
 "$cps" plan --root "$root" --output "$work/clone.json" install cps://captest/test/raw-probe@1.0.0-0
-"$cps" boot-env stage --source "$root" --root "$work/clone" "$work/clone.json"
+cp -a --reflink=auto -- "$root" "$work/clone"
+"$cps" apply --root "$work/clone" "$work/clone.json"
 "$cps" verify --root "$work/clone" --pristine
 run_probe "$work/clone/bin/raw-probe-alias"
 

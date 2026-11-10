@@ -640,7 +640,10 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
 
 #[test]
 fn phased_profile_updates_defer_widen_and_allow_a_saved_override() -> Result<()> {
-    use crate::{PhasedUpdateDeferred, PlanOptions, plan_with_options, stage_boot_environment};
+    use crate::{
+        PhasedUpdateDeferred, PlanOptions, boot::stage_directory_copy as stage_boot_environment,
+        plan_with_options,
+    };
 
     let f = Fixture::new()?;
     let companion = Fixture::new()?;
@@ -1021,7 +1024,7 @@ publisher "seed" {{ repository {:?}; trust-root {:?}; }}
     fs::rename(&offline, &f.repo)?;
     let upgrade = plan(&f.root, Request::Update)?;
     let staged = f._dir.path().join("staged");
-    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "next");
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "previous");
     fs::rename(&f.repo, &offline)?;
@@ -1191,7 +1194,7 @@ publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
     let staged = f._dir.path().join("staged");
     let upgrade = plan(&f.root, Request::Update)?;
     assert!(upgrade.summary().contains("Remove library/legacy 1.0.0-0"));
-    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(f.root.join(default))?, "old");
     assert!(f.root.join(legacy).is_file());
     let interrupted = plan(&exact_root, Request::Update)?;
@@ -1614,7 +1617,7 @@ publisher "seed" {{ repository {:?}; trust-root {:?}; }}
     let base_only = serde_json::from_slice(&serde_json::to_vec(&base_only)?)?;
     fetch_plan(&main.root, &base_only)?;
     let base_upgrade = work.join("base-only-upgrade");
-    crate::stage_boot_environment(&main.root, &base_upgrade, &base_only)?;
+    crate::boot::stage_directory_copy(&main.root, &base_upgrade, &base_only)?;
     assert!(verify(&base_upgrade)?.is_empty());
     assert!(
         list_packages(&base_upgrade, Scope::Installed)?
@@ -1632,7 +1635,7 @@ publisher "seed" {{ repository {:?}; trust-root {:?}; }}
     assert_eq!(upgrade.catalogs["seed"], pin.trim());
     let staged = main._dir.path().join("upgrade");
     fetch_plan(&main.root, &upgrade)?;
-    crate::stage_boot_environment(&main.root, &staged, &upgrade)?;
+    crate::boot::stage_directory_copy(&main.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "2.0.0-0");
     let installed = list_packages(&staged, Scope::Installed)?;
     assert!(
@@ -1765,7 +1768,7 @@ fn signed_renames_upgrade_in_one_transaction_and_preserve_install_intent() -> Re
     };
     apply(&f.root, &plan(&f.root, install(&[old, launcher]))?)?;
     let conflicting = f._dir.path().join("conflicting-publisher");
-    crate::stage_boot_environment(
+    crate::boot::stage_directory_copy(
         &f.root,
         &conflicting,
         &plan(&f.root, install(&["cps://other/apps/text-editor"]))?,
@@ -1819,7 +1822,7 @@ fn signed_renames_upgrade_in_one_transaction_and_preserve_install_intent() -> Re
     let error = plan(&conflicting, Request::Update).unwrap_err();
     assert!(format!("{error:#}").contains("reserved for a different publisher"));
     let staged = f._dir.path().join("pinned-rename");
-    crate::stage_boot_environment(&f.root, &staged, &saved)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &saved)?;
     assert_eq!(fs::read_to_string(staged.join(COMPOSITOR))?, "intermediate");
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
     let current = fs::read_to_string(f.repo.join("current"))?;
@@ -2241,7 +2244,7 @@ publisher "seed" {{
     assert_eq!(upgrade.request, Request::UpdateProfile);
     assert_eq!(upgrade.catalogs["seed"], latest_pin.trim());
     let staged = f._dir.path().join("staged");
-    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &upgrade)?;
     assert!(staged.join("opt/pinned-root").is_dir());
     assert!(staged.join("opt/pinned-companion").is_dir());
     package_manifest(&staged, "cps://seed/library/runtime@3.0.0-0", false)?;
@@ -2475,7 +2478,7 @@ publisher "canopa" {{
     let upgrade = plan(&f.root, Request::Update)?;
     assert_eq!(upgrade.catalogs["seed"], rotated_pin);
     let staged = f._dir.path().join("staged");
-    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &upgrade)?;
     assert_eq!(fs::read_to_string(staged.join(payload))?, "new");
     assert_eq!(fs::read_to_string(f.root.join(payload))?, "old");
     Ok(())
@@ -3762,7 +3765,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     assert_eq!(update.request, Request::UpdateProfile);
     assert_eq!(update.catalogs["seed"], latest.trim());
     let staged = work.join("staged-profile");
-    crate::stage_boot_environment(&f.root, &staged, &update)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &update)?;
     assert_eq!(fs::read(staged.join(payload))?, b"latest");
     assert_eq!(fs::read(f.root.join(payload))?, b"old");
     Ok(())
@@ -5703,7 +5706,7 @@ publisher "seed" {{
     assert_eq!(upgrade.catalogs["canopa"], second);
     fetch_plan(&f.root, &upgrade)?;
     let staged = f._dir.path().join("staged");
-    crate::stage_boot_environment(&f.root, &staged, &upgrade)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &upgrade)?;
     assert!(crate::audit_publisher_builds(&f.root, "seed").is_err());
     apply(&f.root, &upgrade)?;
 

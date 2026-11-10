@@ -41,7 +41,8 @@ fi
 grep -F 'Validate tool compatibility' rejected.log
 test ! -e rejected.json
 "$cps" plan --root image --output keep.json freeze --reason 'Validate tool compatibility' test/tool
-"$cps" boot-env stage --source image --root staged keep.json
+cp -a --reflink=auto -- image staged
+"$cps" apply --root staged keep.json
 cmp frozen.txt <("$cps" freeze --root staged)
 mv repo offline-repo
 "$cps" plan --root staged --output unfreeze.json unfreeze test/tool

@@ -131,7 +131,7 @@ fn directory_special_modes_survive_updates_offline_recovery_repair_and_staging()
             packages: vec!["system/filesystem".into()],
         },
     )?;
-    crate::stage_boot_environment(&f.root, &staged, &keep)?;
+    crate::boot::stage_directory_copy(&f.root, &staged, &keep)?;
     assert_eq!(mode(&staged.join("tmp"))?, 0o1770);
     assert_eq!(mode(&staged.join("var/shared"))?, 0o3770);
     assert_eq!(

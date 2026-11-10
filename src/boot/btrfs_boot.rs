@@ -29,7 +29,7 @@ const FSID: &str = "# cps-btrfs-fsid ";
 const UUID: &str = "# cps-btrfs-uuid ";
 const SUBVOLUME: &str = "# cps-btrfs-subvolid ";
 const PATH: &str = "# cps-btrfs-path ";
-const REGISTRATION: &str = "user.cps.boot-environment";
+pub(super) const REGISTRATION: &str = "user.cps.boot-environment";
 
 pub(super) fn registered(root: &Root) -> Result<bool> {
     Ok(registration(root)?.is_some())
@@ -435,26 +435,26 @@ pub fn activate_btrfs_boot_environment(
     activation: &Activation,
 ) -> Result<String> {
     let volume = BtrfsVolume::open(volume)?;
-    Ok(systemd_boot::activate(root, esp, activation, None, Some(&volume), BootMode::Split)?.id)
+    systemd_boot::activate(root, esp, activation, &volume, BootMode::Split)
 }
 
-impl Activation<Option<String>> {
+impl Activation {
     /// Activate a Btrfs root, using the mounted filesystem UUID when no PARTUUID is supplied.
     pub fn activate_btrfs(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
         let volume = BtrfsVolume::open(volume)?;
-        Ok(systemd_boot::activate(root, esp, self, None, Some(&volume), BootMode::Split)?.id)
+        systemd_boot::activate(root, esp, self, &volume, BootMode::Split)
     }
 
     /// Build and sign a UKI for the exact Btrfs subvolume being activated.
     pub fn activate_btrfs_uki(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
         let volume = BtrfsVolume::open(volume)?;
-        Ok(systemd_boot::activate(root, esp, self, None, Some(&volume), BootMode::Uki)?.id)
+        systemd_boot::activate(root, esp, self, &volume, BootMode::Uki)
     }
 
     /// Activate a signed UKI using the firmware's one-shot boot selection.
     pub fn activate_btrfs_uefi(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
         let volume = BtrfsVolume::open(volume)?;
-        Ok(systemd_boot::activate(root, esp, self, None, Some(&volume), BootMode::Uefi)?.id)
+        systemd_boot::activate(root, esp, self, &volume, BootMode::Uefi)
     }
 }
 
@@ -468,7 +468,7 @@ pub fn rollback_btrfs_boot_environment(
     id: Option<&str>,
 ) -> Result<String> {
     let volume = BtrfsVolume::open(volume)?;
-    systemd_boot::rollback(esp, id, None, Some(&volume))
+    systemd_boot::rollback(esp, id, &volume)
 }
 
 /// Preview rollback from the configured default without changing boot selection.
@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn ext4_entries_have_no_btrfs_record() -> anyhow::Result<()> {
+    fn entries_without_identity_fields_have_no_btrfs_record() -> anyhow::Result<()> {
         assert!(BtrfsRecord::parse("title Canopa\n", "root=PARTUUID=old")?.is_none());
         assert!(BtrfsRecord::parse("# cps-btrfs-subvolid 277\n", "").is_err());
         Ok(())

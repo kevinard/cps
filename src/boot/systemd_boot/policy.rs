@@ -372,7 +372,7 @@ pub(super) struct BootEntry {
     pub title: String,
     pub root: BootRoot,
     pub parent: Option<String>,
-    pub btrfs: Option<BtrfsRecord>,
+    pub btrfs: BtrfsRecord,
     pub uki: Option<BootUki>,
 }
 
@@ -429,7 +429,7 @@ pub(in crate::boot) enum BootRoot {
 }
 
 impl BootRoot {
-    fn parse(options: &str, btrfs: Option<&BtrfsRecord>) -> Result<Self> {
+    fn parse(options: &str, btrfs: &BtrfsRecord) -> Result<Self> {
         let mut roots = options
             .split_ascii_whitespace()
             .filter(|arg| *arg == "root" || arg.starts_with("root="));
@@ -444,12 +444,11 @@ impl BootRoot {
         if let Some(uuid) = root.strip_prefix("PARTUUID=") {
             return Ok(Self::Partition(canonical_partuuid(uuid)?));
         }
-        let record = btrfs.context("CPS boot entry is missing its root PARTUUID")?;
         ensure!(
-            !options.contains('"') && root.strip_prefix("UUID=") == Some(record.fsid.as_str()),
+            !options.contains('"') && root.strip_prefix("UUID=") == Some(btrfs.fsid.as_str()),
             "Btrfs root UUID differs from the recorded filesystem"
         );
-        Ok(Self::Btrfs(record.fsid.clone()))
+        Ok(Self::Btrfs(btrfs.fsid.clone()))
     }
 
     pub fn partuuid(&self) -> Result<&str> {
@@ -539,12 +538,9 @@ pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
         Some(uki) => uki.cmdline.as_str(),
         None => boot_field(&description, "options")?.context("CPS boot entry has no options")?,
     };
-    let btrfs = BtrfsRecord::parse(&description, options)?;
-    ensure!(
-        uki.is_none() || btrfs.is_some(),
-        "UKI boot entries require a Btrfs root"
-    );
-    let root = BootRoot::parse(options, btrfs.as_ref())?;
+    let btrfs = BtrfsRecord::parse(&description, options)?
+        .with_context(|| format!("boot entry {id} does not record a Btrfs root"))?;
+    let root = BootRoot::parse(options, &btrfs)?;
     if matches!(root, BootRoot::Btrfs(_)) && uki.is_none() {
         ensure!(
             boot_field(&description, "initrd")?.is_some_and(|path| !path.is_empty()),

@@ -3,9 +3,9 @@
 [Documentation](../README.md) · [Setup guides](README.md)
 
 These commands work the same way for every boot mode once an ESP holds CPS
-boot entries. For prerequisites and installation, see the [Btrfs](btrfs.md)
-and [ext4](ext4.md) setup guides. The terms are defined in
-[Boot environments](../concepts.md#boot-environments).
+boot entries. For prerequisites and installation, see the
+[Btrfs setup guide](btrfs.md) and [offline disk images](disk-image.md). The
+terms are defined in [Boot environments](../concepts.md#boot-environments).
 
 ## On this page
 
@@ -22,13 +22,6 @@ and [ext4](ext4.md) setup guides. The terms are defined in
 cps boot-env list --esp /efi
 ```
 
-For an offline disk file, list the entries that systemd-boot sees in the
-disk's ESP.
-
-```sh
-cps boot-env list --disk bootable-next.raw --esp-partuuid "$esp_partuuid"
-```
-
 Each line shows one environment, newest first.
 
 | Column | Meaning |
@@ -36,7 +29,7 @@ Each line shows one environment, newest first.
 | `DEFAULT` | `*` marks the environment selected for the next boot. |
 | `STATUS` | `known-good`, `trial (N left)` for a trial with N boot attempts left, `exhausted` for a failed trial, or `retiring` for an environment whose removal was interrupted. |
 | `ID` | `cps-IMAGE-REVISION`, from the root's image identity and revision. |
-| `ROOT` | The root partition's PARTUUID. When any entry selects a Btrfs root by filesystem UUID, the column shows `UUID=` or `PARTUUID=` before each identifier. |
+| `ROOT` | The PARTUUID of the root's Btrfs partition. When any entry selects its root by Btrfs filesystem UUID, the column shows `UUID=` or `PARTUUID=` before each identifier. |
 | `TITLE` | The entry title, which includes the Linux release for manifest-managed kernels. |
 
 CPS entries declare their metadata format with `# cps-boot-entry-version 1`
@@ -53,8 +46,8 @@ known-good environment it was staged from.
   `tries` key in `boot-btrfs` sets another number, from 1 to 99. systemd-boot
   decrements the counter on each attempt, and boots the fallback once the
   attempts are used up.
-- With [direct UEFI boot](btrfs.md#direct-uefi-boot-for-btrfs-roots) on
-  Btrfs, CPS sets the firmware's `BootNext` to the trial for exactly one
+- With [direct UEFI boot](btrfs.md#direct-uefi-boot-for-btrfs-roots),
+  CPS sets the firmware's `BootNext` to the trial for exactly one
   attempt. The firmware consumes `BootNext`, so any reset after that boots
   the fallback.
 
@@ -69,7 +62,7 @@ and extend it with readiness checks as described in
 [Health checks and shared state](btrfs.md#health-checks-and-shared-state).
 [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
 
-On a running Btrfs system, while a trial is selected for the next boot,
+On a running system, while a trial is selected for the next boot,
 system package commands such as `cps install` refuse to change the running
 root. Boot the trial, or cancel it with `cps boot-env discard-trial`.
 
@@ -80,28 +73,17 @@ next boot, or of the running direct UEFI trial. Pass a known-good environment
 ID to select a specific root, or when the selection has no recorded fallback.
 
 ```sh
-# A root partition on the same disk as a mounted ESP.
-cps boot-env rollback --esp /efi
-# A Btrfs root, checked through the mounted top-level volume.
 cps boot-env rollback --esp /efi --btrfs-volume /cps
 # A specific known-good environment.
 cps boot-env rollback --esp /efi --btrfs-volume /cps "$environment_id"
-# An offline disk, published as a new disk file.
-cps boot-env rollback --disk bootable-next.raw --esp-partuuid "$esp_partuuid" \
-    --output-disk rolled-back.raw
 ```
 
 Before changing the selection, CPS checks the target's boot files against
-the digests in its entry, then checks the root itself.
-
-- For a Btrfs root, it checks the registered filesystem and subvolume
-  identity on the mounted volume and the root's CPS image identity and
-  revision. `--btrfs-volume` is required for these roots.
-- For a root partition, it checks that the partition's ext4 UUID and revision
-  label match the entry. On a mounted ESP, CPS reads the parent GPT disk and
-  locates the root by PARTUUID, so it needs read access to the disk and write
-  access to the ESP. For a detached ESP directory, the operator supplies the
-  partition mapping.
+the digests in its entry. It then checks the registered filesystem and
+subvolume identity on the mounted top-level volume, and the root's CPS image
+identity and revision. For an entry that boots by PARTUUID, CPS reads the
+parent GPT disk of the mounted ESP and checks that the Btrfs device is that
+partition, so it needs read access to the disk.
 
 Rollback then writes the target as `default` in `loader.conf` and removes any
 `preferred` trial selection. With direct UEFI boot, it instead cancels a
@@ -112,17 +94,11 @@ front of `BootOrder`. Rollback keeps every environment and its files.
 
 Each environment keeps its root and its boot files on the ESP until it is
 removed. Before activation copies boot files, CPS checks that they fit on the
-ESP with a 1 MiB margin, and fails before any change. A slot replacement
-counts the clusters of the entry and boot files it retires as free. With a
-Btrfs volume, the message suggests pruning.
-
-- On Btrfs, `cps boot-env prune` applies the retention policy, system package
-  commands prune automatically before they stage a change, and
-  `cps boot-env discard-trial` cancels a trial and removes failed ones. See
-  [Retention and pruning](btrfs.md#retention-and-pruning).
-- With ext4 root slots, activate the next release into the slot of an
-  inactive environment with `--replace`, which retires the old entry and its
-  boot files. See [Reusing a root slot](ext4.md#reusing-a-root-slot).
+ESP with a 1 MiB margin, and fails before any change with a pointer to
+pruning. `cps boot-env prune` applies the retention policy, system package
+commands prune automatically before they stage a change, and
+`cps boot-env discard-trial` cancels a trial and removes failed ones. See
+[Retention and pruning](btrfs.md#retention-and-pruning).
 
 ## Compare environments
 
@@ -186,6 +162,16 @@ systemd-boot 262 boots the `preferred` entry while its boot counter has
 attempts left, and otherwise boots `default`.
 [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
+Earlier systemd-boot releases ignore `preferred` and would boot the pinned
+default, so the trial would never run. Before it writes `preferred`, CPS
+reads the release from the `#### LoaderInfo: systemd-boot …` marker in each
+systemd-boot binary under `EFI/systemd` and `EFI/BOOT` on the ESP, and
+refuses the activation if any of them is older than 262. When the ESP holds
+no systemd-boot binary, CPS uses the running loader's `LoaderInfo` EFI
+variable instead. Update the loader with `bootctl update` and retry.
+[`boot-env image`](disk-image.md) applies the same check to the template
+ESP, so a new disk can take trials after its first rollback.
+
 The automatic choice therefore depends only on the two owned keys and the CPS
 entry files. A second `default` line would take precedence over the first, so
 CPS rejects duplicates. `timeout menu-force` disables the timeout, so the
@@ -223,7 +209,7 @@ and gives the `bootctl` command that clears it in these cases:
 
 Empty variables, and variables that repeat the CPS selection, are accepted.
 Without efivarfs, without systemd-boot, or for an ESP that did not boot the
-host, such as an offline disk, CPS skips the check. `LoaderEntryOneShot`,
+host, CPS skips the check. `LoaderEntryOneShot`,
 set with `bootctl set-oneshot` or `systemctl reboot --boot-loader-entry`,
 selects an entry for the next boot only and is left to the administrator.
 The SMBIOS OEM string `io.systemd.boot.timeout=`, which a virtual machine

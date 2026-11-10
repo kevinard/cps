@@ -38,12 +38,7 @@ pub(super) fn pending(esp: &Path) -> Result<Vec<BootEntry>> {
             entry.file_type()?.is_file(),
             "invalid boot retirement record"
         );
-        let entry = policy::read_entry(entry.path(), stem)?;
-        ensure!(
-            entry.btrfs.is_some(),
-            "boot retirement record has no Btrfs identity"
-        );
-        entries.push(entry);
+        entries.push(policy::read_entry(entry.path(), stem)?);
     }
     Ok(entries)
 }
@@ -106,10 +101,7 @@ fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) 
     if exhausted && target.tries.is_some() {
         target.tries = Some(0);
     }
-    let record = target
-        .btrfs
-        .as_ref()
-        .context("destroy-btrfs requires a registered Btrfs root")?;
+    let record = &target.btrfs;
     volume.check_fsid(&record.fsid)?;
     volume.check_boot_device(&esp, &esp_lock, &target.root)?;
     let selected = check_selection(&policy, &entries, &target)?;
@@ -117,12 +109,10 @@ fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) 
         firmware.check_removal(id)?;
     }
     for entry in entries.iter().chain(&retiring) {
-        if let Some(other) = &entry.btrfs {
-            ensure!(
-                !record.same_subvolume(other),
-                "another boot entry references the Btrfs root being destroyed"
-            );
-        }
+        ensure!(
+            !record.same_subvolume(&entry.btrfs),
+            "another boot entry references the Btrfs root being destroyed"
+        );
         let artifact_prefix = format!("/EFI/cps/{id}/");
         ensure!(
             !entry
@@ -164,10 +154,7 @@ fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) 
         "cannot destroy the running environment's fallback"
     );
     verify_fallback_artifacts(&esp, selected)?;
-    let selected_record = selected
-        .btrfs
-        .as_ref()
-        .context("the selected environment must have a verified Btrfs root")?;
+    let selected_record = &selected.btrfs;
     volume.check_boot_device(&esp, &esp_lock, &selected.root)?;
     let (image, revision) = policy::entry_identity(&selected.id)?;
     let _selected = volume
@@ -183,10 +170,7 @@ fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) 
             "the selected environment's parent is not known-good"
         );
         verify_fallback_artifacts(&esp, parent)?;
-        let record = parent
-            .btrfs
-            .as_ref()
-            .context("the fallback must have a verified Btrfs root")?;
+        let record = &parent.btrfs;
         volume.check_boot_device(&esp, &esp_lock, &parent.root)?;
         let (image, revision) = policy::entry_identity(&parent.id)?;
         Some(
@@ -397,7 +381,12 @@ mod tests {
             title: String::new(),
             root: policy::BootRoot::Partition("7adff456-af50-498f-b39a-dcf87cb4a7c1".into()),
             parent: parent.map(str::to_owned),
-            btrfs: None,
+            btrfs: crate::boot::btrfs_boot::BtrfsRecord {
+                fsid: "11111111-1111-4111-8111-111111111111".into(),
+                uuid: format!("22222222-2222-4222-8222-{revision:012}"),
+                subvolid: 1000 + revision,
+                path: format!("@environments/{revision}/root"),
+            },
             uki: None,
         }
     }

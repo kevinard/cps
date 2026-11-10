@@ -257,7 +257,7 @@ kernel. Kernel packages then omit `initrd=#true` and do not ship the file.
 A kernel package that ships its own initrd conflicts with the generator, so
 an image uses one or the other. When the trigger runs, CPS prepares the
 selected kernel again with the new initramfs and records its digest with the
-prepared artifacts, and `boot-env activate` checks it like a packaged one.
+prepared artifacts, and `boot-env activate-btrfs` checks it like a packaged one.
 Because the output is under `usr/lib/modules`, changes that run this trigger
 are staged.
 

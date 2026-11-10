@@ -62,8 +62,8 @@ committed `install-profile` consumes the pin, and subsequent plans follow the
 current signed release.
 
 For reproducible release images, also set `image-id` to the release image's
-UUID. This fixes the initial image identity used in saved plans, ext4 exports,
-and boot entries.
+UUID. This fixes the initial image identity used in saved plans, offline
+disk images, and boot entries.
 
 ```kdl
 image-id "a47593c2-e985-42d2-92b6-44c7057e1e96"

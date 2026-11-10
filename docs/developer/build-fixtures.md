@@ -104,7 +104,7 @@ Use the base and next outputs as `CPS_VM_KERNEL_FIXTURE` and
 For the signed-profile rollback test, also set `CPS_VM_KERNEL_FIXTURE` to the
 build output directory. The signed trial installs the kernel and its build
 configuration directly from the fixture repository. This kernel has built-in
-virtio, ext4, Btrfs, and VFAT support and boots the QEMU test root without an initrd.
+virtio, Btrfs, and VFAT support and boots the QEMU test root without an initrd.
 The previous root keeps its original kernel and initrd.
 
 ## Testing source-built systemd and systemd-boot

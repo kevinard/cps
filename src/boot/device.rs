@@ -1,6 +1,5 @@
 use std::{
     fs::{self, File},
-    io::Seek,
     os::unix::{
         ffi::OsStrExt,
         fs::{FileTypeExt, MetadataExt},
@@ -11,11 +10,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{Mode, OFlags, fstatfs, open};
 
-use crate::{image::root::Root, kdl_format::boot_export::ExportReceipt, model::validate_path};
+use crate::{image::root::Root, model::validate_path};
 
-use super::deploy::{
-    OfflineDisk, SECTOR_SIZE, checked_payload, digest_extent, verify_filesystem_at, write_extent,
-};
+use super::disk::{OfflineDisk, SECTOR_SIZE};
 
 pub(super) fn is_fat(file: &File) -> Result<bool> {
     Ok(fstatfs(file)?.f_type == libc::MSDOS_SUPER_MAGIC)
@@ -47,103 +44,6 @@ pub(super) fn mounted_root_disk(
     let disk = esp_part.open_disk()?;
     disk.check_device_extents(partuuid, root_part.extent, esp_part.extent)?;
     Ok(disk)
-}
-
-pub(super) struct DevicePartition {
-    file: File,
-    bytes: u64,
-    esp: File,
-}
-
-impl DevicePartition {
-    pub fn open(
-        device: &Path,
-        esp: &Path,
-        partuuid: &str,
-        write: bool,
-    ) -> Result<(OfflineDisk, Self)> {
-        let esp = fs::canonicalize(esp).context("opening the mounted EFI partition")?;
-        let mount = Root::open(&esp)?;
-        let esp_part = esp_partition(&esp, mount.as_file())?;
-        let target = block_node(device)?;
-        let root_part = KernelPartition::read(target.metadata()?.rdev())
-            .context("identifying the target root partition")?;
-        ensure!(
-            esp_part.disk == root_part.disk,
-            "target root partition and mounted ESP must be on the same GPT disk"
-        );
-        // Claim only the target partition. The fallback and ESP stay accessible.
-        let access = if write { OFlags::RDWR } else { OFlags::RDONLY };
-        let file = File::from(
-            open(
-                Root::fd_path(&target),
-                access | OFlags::EXCL | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .context("claiming the target root partition exclusively")?,
-        );
-        let disk = esp_part.open_disk()?;
-        disk.check_device_extents(partuuid, root_part.extent, esp_part.extent)?;
-        let target = Self {
-            file,
-            bytes: root_part.extent.1,
-            esp: mount.as_file().try_clone()?,
-        };
-        Ok((disk, target))
-    }
-
-    pub fn check_esp(&self, path: &Path, locked: &File) -> Result<()> {
-        let original = self.esp.metadata()?;
-        let current = locked.metadata()?;
-        ensure!(
-            (original.dev(), original.ino()) == (current.dev(), current.ino()),
-            "mounted ESP changed during activation"
-        );
-        check_esp_mount(path, locked)
-    }
-
-    pub fn prepare(&self, image: &Path, partuuid: &str, receipt: &ExportReceipt) -> Result<File> {
-        let (mut payload, _) = checked_payload(image, self.bytes, Some(receipt))?;
-        verify_filesystem_at(
-            &payload,
-            0,
-            self.bytes,
-            partuuid,
-            &receipt.image,
-            receipt.revision,
-        )?;
-        payload.rewind()?;
-        Ok(payload)
-    }
-
-    pub fn write(&self, mut payload: File, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
-        let actual = write_extent(&self.file, 0, self.bytes, &mut payload)?;
-        ensure!(
-            actual == receipt.sha256 && payload.metadata()?.len() == self.bytes,
-            "deployed partition does not match the checked root payload"
-        );
-        self.verify_filesystem(partuuid, receipt)
-    }
-
-    pub fn verify(&self, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
-        ensure!(
-            receipt.bytes == self.bytes
-                && digest_extent(&self.file, 0, self.bytes)? == receipt.sha256,
-            "deployed partition {partuuid} does not match the root export receipt"
-        );
-        self.verify_filesystem(partuuid, receipt)
-    }
-
-    fn verify_filesystem(&self, partuuid: &str, receipt: &ExportReceipt) -> Result<()> {
-        verify_filesystem_at(
-            &self.file,
-            0,
-            self.bytes,
-            partuuid,
-            &receipt.image,
-            receipt.revision,
-        )
-    }
 }
 
 struct KernelPartition {

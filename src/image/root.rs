@@ -48,8 +48,8 @@ pub(crate) enum ReplacementSource<'a> {
 /// st_dev but keeps every inode number and ctime, and its contents are the
 /// source subvolume's at snapshot time, so fingerprints copied with the
 /// image state into a staged snapshot stay valid. Any later change inside
-/// the snapshot sets a new ctime there. A file copy, such as an ext4 slot
-/// populated from another root, gets new inodes and new ctimes, so its
+/// the snapshot sets a new ctime there. A file copy, such as a root written
+/// into an offline disk image, gets new inodes and new ctimes, so its
 /// fingerprints never match and CPS hashes those files again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Fingerprint {

@@ -55,7 +55,7 @@ formatted output.
 | Order recipe builds, plan rebuilds, and repin toolchains | [build-order](man/cps-build-order.1), [rebuild-plan](man/cps-rebuild-plan.1), [recipe](man/cps-recipe.1) | [Plan builds across recipes](../maintainer/orchestration.md) |
 | Publish packages and manage the publisher trust root | [publish](man/cps-publish.1), [publish-bundle](man/cps-publish-bundle.1), [repo](man/cps-repo.1) (`repo trust`, `repo publish-release`, `repo resign`, `repo withdraw`) | [Publish and retire packages](../publisher/publishing.md) |
 | Export, sign, sync, or refresh a mirror | [repo](man/cps-repo.1) (`repo export`, `repo sign-export`, `repo refresh-metadata`, `repo sync`) | [Serve a mirror](../publisher/mirrors.md) · [Mirror clients](../client/mirrors.md) |
-| Stage, activate, prune, or roll back a root | [boot-env](man/cps-boot-env.1) | [Boot setup guides](../setups/README.md) |
+| Stage, activate, prune, or roll back a root, or write an offline disk image | [boot-env](man/cps-boot-env.1) | [Boot setup guides](../setups/README.md) |
 
 ## Configuration and data formats
 
@@ -78,7 +78,6 @@ KDL documents declare `schema-version 1` and a document `kind`.
 | Build provenance predicate, version 1 | [Building and publishing with signed evidence](../maintainer/builds.md#building-and-publishing-with-signed-evidence) |
 | Payload delta, version 1 | [Sharded targets and delta payloads](../publisher/mirrors.md#sharded-targets-and-delta-payloads) |
 | Image lock in JSON, version 1 | [Reproduce a package composition](../client/profiles.md#provisioning-the-same-composition-on-another-machine) |
-| KDL `boot-export-receipt` | [Export and deploy ext4 roots](../setups/ext4.md) |
 | CPS boot entry metadata, version 1 | [Inspect and roll back boot environments](../setups/boot-operations.md) |
 | Publisher bootstrap descriptor in JSON, version 1 | [Signed mirror release notes](../publisher/mirrors.md#publishing-and-verifying-signed-mirror-release-notes) |
 

@@ -141,7 +141,7 @@ pub fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscar
     let cancelled = match pending {
         Some((id, parent)) => {
             let parent = parent.context("the trial has no recorded fallback")?;
-            rollback(esp, Some(&parent), None, Some(&volume))
+            rollback(esp, Some(&parent), &volume)
                 .with_context(|| format!("selecting the fallback {parent} instead of {id}"))?;
             Some(id)
         }
@@ -184,13 +184,8 @@ fn plan(
         entries,
         firmware,
     } = inventory(&esp, &lock, false)?;
-    let on_volume = |entry: &BootEntry| {
-        entry
-            .btrfs
-            .as_ref()
-            .is_some_and(|record| volume.has_fsid(&record.fsid))
-    };
-    let subvolume = |entry: &BootEntry| entry.btrfs.as_ref().map_or(0, |record| record.subvolid);
+    let on_volume = |entry: &BootEntry| volume.has_fsid(&entry.btrfs.fsid);
+    let subvolume = |entry: &BootEntry| entry.btrfs.subvolid;
     let mut planned: Vec<_> = destroy::pending(&esp)?
         .into_iter()
         .filter(on_volume)
@@ -236,13 +231,7 @@ fn resumable_trial<'a>(
     can_resume: impl Fn(&BootEntry) -> Result<bool>,
 ) -> Result<Option<&'a BootEntry>> {
     for entry in entries {
-        if entry.tries.is_some()
-            && entry
-                .btrfs
-                .as_ref()
-                .is_some_and(|record| record.same_subvolume(staged))
-            && can_resume(entry)?
-        {
+        if entry.tries.is_some() && entry.btrfs.same_subvolume(staged) && can_resume(entry)? {
             return Ok(Some(entry));
         }
     }
@@ -399,7 +388,7 @@ mod tests {
             title: String::new(),
             root: BootRoot::Partition("7adff456-af50-498f-b39a-dcf87cb4a7c1".into()),
             parent: parent.map(id),
-            btrfs: None,
+            btrfs: btrfs(1000 + revision, &format!("@environments/{revision}/root")),
             uki: None,
         }
     }
@@ -482,11 +471,11 @@ mod tests {
         let staged = btrfs(300, "@environments/upgrade-plan/root");
         let entries = |trial_tries| {
             let mut base = entry(2, Some(1), None);
-            base.btrfs = Some(btrfs(280, "@environments/upgrade-old/root"));
+            base.btrfs = btrfs(280, "@environments/upgrade-old/root");
             let mut trial = entry(3, Some(2), Some(trial_tries));
-            trial.btrfs = Some(btrfs(300, "@environments/upgrade-plan/root"));
+            trial.btrfs = btrfs(300, "@environments/upgrade-plan/root");
             let mut other = entry(4, Some(2), Some(3));
-            other.btrfs = Some(btrfs(310, "@environments/upgrade-other/root"));
+            other.btrfs = btrfs(310, "@environments/upgrade-other/root");
             [base, trial, other]
         };
         let failed = entries(0);
