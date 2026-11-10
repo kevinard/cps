@@ -207,6 +207,14 @@ only to paths that no package claims. A `collect` rule that matches nothing
 also fails the build, which catches stale templates, and an explicit `file`
 action requires an installed regular file at its path.
 
+Files and symlinks installed under `$DESTDIR/var` fail the build with their
+own message, because
+[packages never ship /var](manifests.md#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd).
+Ship a tmpfiles.d rule that creates the path at boot instead, and stop the
+install step from writing there, or drop what it writes with
+`discard "var/**"`. Empty directories under `$DESTDIR/var` are ignored, and a
+`collect` rule cannot name `var`.
+
 ### Versions in templates
 
 The recipe pins each template by SHA-256, and the build attestation binds

@@ -140,7 +140,7 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         &update,
         COMPOSITOR,
     )?;
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let original: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let mut journal: serde_json::Value = serde_json::from_str(&original)?;

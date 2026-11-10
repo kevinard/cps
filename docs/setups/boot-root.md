@@ -20,7 +20,13 @@ The root lives on Btrfs. Keep the CPS image state and managed paths in the
 root itself, and mount shared data from other subvolumes or filesystems.
 
 - On an installed system, use a new, empty named root subvolume under the
-  mounted top level.
+  mounted top level. CPS keeps the image state and managed paths in that
+  subvolume. Create the `/var` subvolume beside it, as described in
+  [Share /var between boot environments](btrfs.md#share-var-between-boot-environments),
+  and add its line to the root's `/etc/fstab`. `image-create` makes `var`
+  the empty mount point, or accepts the new, empty `/var` subvolume already
+  mounted there. The packages' tmpfiles.d declarations populate it on the
+  first boot.
 - For an [offline disk image](disk-image.md), use an empty directory beside
   an empty environments directory, inside a volume directory that stands for
   the Btrfs top level.

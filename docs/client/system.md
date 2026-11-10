@@ -134,6 +134,10 @@ The preview lists what the change does to running services:
   job that takes longer than two minutes, leaves the transaction pending.
   Correct the cause and [resume](#recover-an-interrupted-change).
 - New services follow the image's preset policy.
+- New tmpfiles.d declarations create their paths in the mounted `/var` at
+  once, so a newly installed service can start without a reboot. Packages
+  never ship files in `/var`; see
+  [shared /var](../setups/btrfs.md#share-var-between-boot-environments).
 
 Live writes follow the packages' [dependency order](images.md#write-order),
 so a program started during the transaction finds each new library before
@@ -157,6 +161,11 @@ So is a change that runs a trigger whose outputs can cover boot paths, such
 as an initramfs generator. CPS selects the new environment for a trial on
 the next reboot and keeps the current one as fallback. CPS reports when a
 reboot is needed and leaves the timing to you.
+
+The new environment shares the running system's `/var`. Staging leaves it
+untouched: the trial's own tmpfiles.d declarations take effect when it
+boots. The trial's logs, including those of a failed trial, stay in `/var`
+after a rollback.
 
 Pass `--stage` to `install`, `upgrade`, `remove`, or `autoremove` to use the trial boot workflow
 for an ordinary package change. The running root keeps its current

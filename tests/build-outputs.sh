@@ -163,6 +163,21 @@ recipe '' "$script" > unpackaged.kdl
 expect_failure 'the build installed 1 file(s) that no output claims' build --output unpackaged unpackaged.kdl
 grep -Fx '  usr/share/doc/app/README' rejected.log
 test ! -e unpackaged
+# Packages never ship /var: tmpfiles.d creates it at boot. Empty directories
+# are not package content, and a discard pattern drops what the install writes.
+var_script="$script
+    mkdir -p \"\$DESTDIR/var/lib/app\" \"\$DESTDIR/var/cache/app\"
+    printf \"state\\n\" > \"\$DESTDIR/var/lib/app/state\""
+recipe '    discard "usr/share/doc/**"' "$var_script" > var.kdl
+expect_failure 'the build installed 1 file(s) under $DESTDIR/var' build --output var var.kdl
+grep -F 'tmpfiles.d' rejected.log
+grep -Fx '  var/lib/app/state' rejected.log
+test ! -e var
+recipe '    discard "usr/share/doc/**"
+    discard "var/**"' "$var_script" > var-discarded.kdl
+build --output var-discarded var-discarded.kdl
+absent '(^| |")var/' var-discarded/manifests/demo/app.kdl
+test ! -e var-discarded/proto/var
 cp app-data.kdl app-data.kdl.saved
 printf 'schema-version 1 kind="package-manifest"\npackage "demo/app-data" publisher="canopa" {\n    collect "usr/**"\n}\n' > app-data.kdl
 recipe '    discard "usr/share/doc/**"' "$script" > overlapping.kdl

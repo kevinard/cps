@@ -747,9 +747,9 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
         |proto| crate::generate_manifest(proto, "canopa", "test/proto", "1.0.0-0", uid, gid);
     let prepare = |proto: &Path, reverse: bool| -> Result<()> {
         let directories = if reverse {
-            ["var/empty", "usr/bin"]
+            ["srv/empty", "usr/bin"]
         } else {
-            ["usr/bin", "var/empty"]
+            ["usr/bin", "srv/empty"]
         };
         for path in directories {
             let directory = proto.join(path);
@@ -807,9 +807,9 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
         fs::read_link(f.root.join("external"))?,
         Path::new("/outside-the-prototype")
     );
-    assert!(fs::read_dir(f.root.join("var/empty"))?.next().is_none());
+    assert!(fs::read_dir(f.root.join("srv/empty"))?.next().is_none());
     assert_eq!(
-        fs::metadata(f.root.join("var/empty"))?.permissions().mode() & 0o777,
+        fs::metadata(f.root.join("srv/empty"))?.permissions().mode() & 0o777,
         0o751
     );
 
@@ -823,6 +823,13 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
             .contains("extends outside the prototype")
     );
     fs::remove_file(hardlink)?;
+    fs::create_dir_all(f.proto.join("var/lib/proto"))?;
+    let error = format!("{:#}", generate(&f.proto).unwrap_err());
+    assert!(
+        error.contains("prototype contains \"var\"") && error.contains("tmpfiles.d"),
+        "{error}"
+    );
+    fs::remove_dir_all(f.proto.join("var"))?;
     fs::set_permissions(&file, fs::Permissions::from_mode(0o1755))?;
     assert!(format!("{:#}", generate(&f.proto).unwrap_err()).contains("sticky bits"));
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
@@ -1237,7 +1244,7 @@ fn boot_environment_keeps_its_own_image_state() -> Result<()> {
         },
     )?;
     apply(&f.root, &install)?;
-    let database = "var/lib/cps/image/state.sqlite";
+    let database = "usr/lib/sysimage/cps/state.sqlite";
     let base_state = fs::read(f.root.join(database))?;
 
     f.package(name, "2.0.0-0", f.file(COMPOSITOR, "trial", "0755", "")?)?;
@@ -1252,20 +1259,58 @@ fn boot_environment_keeps_its_own_image_state() -> Result<()> {
         assert!(crate::verify_pristine(root)?.is_empty());
     }
 
-    f.package(
-        "test/state-collision",
-        "1.0.0-0",
-        f.file(database, "unexpected", "0644", "")?,
-    )?;
-    let error = plan(
-        &f.root,
-        Request::Install {
-            packages: vec!["test/state-collision".into()],
-        },
-    )
-    .expect_err("packages must not own the image state directory");
+    let error = f
+        .package(
+            "test/state-collision",
+            "1.0.0-0",
+            f.file(database, "unexpected", "0644", "")?,
+        )
+        .expect_err("packages must not own the image state directory");
     assert!(format!("{error:#}").contains("reserved image state path"));
     assert_eq!(fs::read(f.root.join(database))?, base_state);
+    Ok(())
+}
+
+#[test]
+fn images_keep_state_in_usr_and_start_with_an_empty_var_mount_point() -> Result<()> {
+    let f = Fixture::new()?;
+    f.create()?;
+    let var = f.root.join("var");
+    assert!(f.root.join("usr/lib/sysimage/cps/state.sqlite").is_file());
+    assert!(var.is_dir() && fs::read_dir(&var)?.next().is_none());
+    assert!(crate::verify_pristine(&f.root)?.is_empty());
+
+    fs::create_dir(var.join("log"))?;
+    let findings = crate::verify_pristine(&f.root)?;
+    assert!(
+        findings.iter().any(|finding| finding.is_error
+            && finding.message.contains("unexpected path \"var/log\"")
+            && finding.message.contains("tmpfiles.d")),
+        "{findings:?}"
+    );
+    fs::remove_dir(var.join("log"))?;
+    fs::remove_dir(&var)?;
+    let findings = crate::verify_pristine(&f.root)?;
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.message.contains("mount point of /var")),
+        "{findings:?}"
+    );
+
+    // An installer may mount a fresh, empty /var subvolume before creating
+    // the image. Anything else in the directory is refused.
+    let create =
+        |root: &Path| create_image(root, &f.repo, "canopa", &f.trust, "x86_64", BTreeMap::new());
+    let mounted = f.root.with_extension("mounted");
+    fs::create_dir_all(mounted.join("var"))?;
+    create(&mounted)?;
+    assert!(crate::verify_pristine(&mounted)?.is_empty());
+    let busy = f.root.with_extension("busy");
+    fs::create_dir_all(busy.join("var/log"))?;
+    let error = create(&busy).unwrap_err();
+    assert!(format!("{error:#}").contains("requires an empty directory"));
+    assert!(!busy.join("usr").exists());
     Ok(())
 }
 
@@ -1538,7 +1583,7 @@ build architecture="x86_64" epoch=1700000000 {{
     assert!(audit.failures.is_empty());
 
     {
-        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+        let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
         assert_eq!(
             db.execute("UPDATE build_receipts SET envelope=x'00'", [])?,
             1
@@ -1555,7 +1600,7 @@ build architecture="x86_64" epoch=1700000000 {{
         },
     )?;
     assert_eq!(apply(&f.root, &remove)?, 2);
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let count: u32 = db.query_row("SELECT count(*) FROM build_receipts", [], |row| row.get(0))?;
     assert_eq!(count, 0);
     Ok(())
@@ -3276,7 +3321,7 @@ fn rejects_development_journals_and_verifies_completed_transactions() -> Result<
         &install,
         COMPOSITOR,
     )?;
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let journal: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let journal: serde_json::Value = serde_json::from_str(&journal)?;
@@ -3505,7 +3550,7 @@ fn install_upgrade_and_resume_offline() -> Result<()> {
     assert_eq!(
         fs::read_to_string(
             f.root
-                .join(format!("var/lib/cps/image/config-updates/3/{CONFIG}"))
+                .join(format!("usr/lib/sysimage/cps/config-updates/3/{CONFIG}"))
         )?,
         "vendor config 2"
     );
@@ -3603,7 +3648,7 @@ fn reconciles_preserved_config_metadata_atomically() -> Result<()> {
     assert_eq!(fs::read_to_string(&alias)?, LOCAL);
     assert!(
         !f.root
-            .join("var/lib/cps/image/stage")
+            .join("usr/lib/sysimage/cps/stage")
             .join(digest(LOCAL.as_bytes()))
             .exists()
     );
@@ -4036,7 +4081,7 @@ fn rejects_the_old_image_state_layout_and_format() -> Result<()> {
     f.package("test/pkg", "1.0.0-0", String::new())?;
     assert!(crate::create_configured_image(&f.root, &config).is_err());
     f.create()?;
-    let state_dir = f.root.join("var/lib/cps/image");
+    let state_dir = f.root.join("usr/lib/sysimage/cps");
     assert_eq!(
         crate::image::Image::open_query(&f.root)?.settings()?.format,
         1
@@ -4113,15 +4158,16 @@ fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> 
     let gid = getegid().as_raw();
     let actions = f.file("opt/example/bin/tool", "tool", "0755", "")?
         + &f.file("opt/shared/vendor-file", "vendor", "0644", "")?
-        + &f.file("var/example/cache/vendor-file", "vendor", "0644", "")?
+        + &f.file("srv/example/cache/vendor-file", "vendor", "0644", "")?
         + &format!(
             "    dir \"opt/example\" mode=\"0755\" uid={uid} gid={gid}\n\
-             dir \"var/changed-mode\" mode=\"0755\" uid={uid} gid={gid}\n\
-             dir \"var/attributes\" mode=\"0755\" uid={uid} gid={gid}\n"
+             dir \"srv/changed-mode\" mode=\"0755\" uid={uid} gid={gid}\n\
+             dir \"srv/attributes\" mode=\"0755\" uid={uid} gid={gid}\n"
         );
     f.package("test/prune", "1.0.0-0", actions)?;
     f.create()?;
     fs::create_dir_all(f.root.join("opt/shared"))?;
+    fs::create_dir(f.root.join("srv"))?;
     let install = plan(
         &f.root,
         Request::Install {
@@ -4129,16 +4175,16 @@ fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> 
         },
     )?;
     apply(&f.root, &install)?;
-    let changed_mode = f.root.join("var/changed-mode");
+    let changed_mode = f.root.join("srv/changed-mode");
     fs::set_permissions(&changed_mode, fs::Permissions::from_mode(0o700))?;
-    let attributes = f.root.join("var/attributes");
+    let attributes = f.root.join("srv/attributes");
     rustix::fs::setxattr(
         &attributes,
         "user.cps-test",
         b"kept",
         rustix::fs::XattrFlags::empty(),
     )?;
-    let local = f.root.join("var/example/cache/local");
+    let local = f.root.join("srv/example/cache/local");
     fs::write(&local, "local data")?;
 
     let request = Request::Remove {
@@ -4167,7 +4213,7 @@ fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> 
     );
     assert!(attributes.is_dir());
     assert_eq!(fs::read_to_string(local)?, "local data");
-    assert!(!f.root.join("var/example/cache/vendor-file").exists());
+    assert!(!f.root.join("srv/example/cache/vendor-file").exists());
     Ok(())
 }
 
@@ -4593,7 +4639,7 @@ fn transactions_record_fingerprints_that_quick_verification_trusts() -> Result<(
     assert!(crate::verify_quick(&f.root)?.is_empty());
 
     // Quick verification believes a matching record instead of hashing.
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let tamper = |sha256: &str| {
         db.execute(
             "UPDATE files SET sha256=?1 WHERE path='usr/share/one'",
@@ -4657,7 +4703,7 @@ fn copied_roots_do_not_trust_the_source_fingerprints() -> Result<()> {
         .arg(&copy)
         .status()?;
     assert!(status.success());
-    let db = rusqlite::Connection::open(copy.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(copy.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let changed = db.execute(
         "UPDATE files SET sha256=?1 WHERE path='usr/share/one'",
         [digest(b"other")],
@@ -4707,7 +4753,7 @@ fn journal_records_only_changes_to_the_committed_state() -> Result<()> {
         &saved,
         "usr/share/two",
     )?;
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let original: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let journal: serde_json::Value = serde_json::from_str(&original)?;

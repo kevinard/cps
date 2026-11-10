@@ -38,11 +38,7 @@ chmod 0750 "$root"
 setfattr -n user.cps-root -v root-data "$root"
 printf 'local data\n' > "$root/local-state"
 setfattr -n user.cps -v kept "$root/local-state"
-state_dir=
-for candidate in usr/lib/sysimage/cps var/lib/cps/image; do
-    if [[ -f $root/$candidate/state.sqlite ]]; then state_dir=$candidate; fi
-done
-test -n "$state_dir"
+state_dir=usr/lib/sysimage/cps
 source_state=$(sha256sum "$root/$state_dir/state.sqlite")
 
 esp_uuid=9a138d0b-f9aa-4a2a-b527-93392ad7e812

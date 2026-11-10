@@ -30,7 +30,7 @@ repo=/repository
 if "$probe" no-fsetid "$cps" apply --root "$work/groups" "$work/groups.json" > "$work/group-denied" 2>&1; then exit 1; fi
 rejection=$("$bb" cat "$work/group-denied")
 case "$rejection" in *'did not retain the requested ownership and mode'*) ;; *) echo "$rejection"; exit 1 ;; esac
-test ! -e "$work/groups/var/shared"
+test ! -e "$work/groups/srv/shared"
 test "$("$cps" transaction status --root "$work/groups")" = "$(printf 'Image revision 0\nNo pending transaction')"
 "$cps" verify --root "$work/groups" --pristine
 "$cps" image-create --root "$root" --repo "$repo" --publisher modetest --trust-root /trust.json
@@ -52,12 +52,12 @@ test "$("$bb" stat -c '%a' "$root/bin/helper")" = 6755
 test "$root/bin/helper" -ef "$root/bin/helper-link"
 "$probe" launch "$root/bin/helper-link" 0 0
 "$probe" sticky "$root/tmp/root-owned"
-"$probe" inherit "$root/var/shared/from-user"
-"$bb" rm "$root/var/shared/from-user"
+"$probe" inherit "$root/srv/shared/from-user"
+"$bb" rm "$root/srv/shared/from-user"
 generated=$("$cps" manifest generate --proto "$root/bin" --publisher modetest --version 1.0.0-0 test/generated)
 case "$generated" in *'mode="6755"'*hardlink*) ;; *) echo "$generated"; exit 1 ;; esac
 chmod 0755 "$root/bin/helper"
-chmod 0777 "$root/tmp" "$root/var/shared"
+chmod 0777 "$root/tmp" "$root/srv/shared"
 if "$cps" verify --root "$root" > "$work/drift" 2>&1; then exit 1; fi
 "$bb" mv /repository-offline "$repo"
 "$cps" plan --root "$root" --output "$work/repair.json" repair
@@ -65,7 +65,7 @@ if "$cps" verify --root "$root" > "$work/drift" 2>&1; then exit 1; fi
 "$cps" verify --root "$root" --pristine
 test "$root/bin/helper" -ef "$root/bin/helper-link"
 test "$("$bb" stat -c '%a' "$root/tmp")" = 1777
-test "$("$bb" stat -c '%a' "$root/var/shared")" = 2777
+test "$("$bb" stat -c '%a' "$root/srv/shared")" = 2777
 "$probe" launch "$root/bin/helper-link" 0 0
 "$cps" plan --root "$root" --output "$work/clone.json" install test/modes@1.0.0-0
 cp -a --reflink=auto -- "$root" "$work/clone"

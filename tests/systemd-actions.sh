@@ -69,14 +69,17 @@ mkdir -p base/etc/{systemd/system,systemd/system-preset,tmpfiles.d}
 ln -s /dev/null "base/etc/systemd/system/$masked"
 printf 'disable %s\n' "$denied" > base/etc/systemd/system-preset/00-local.preset
 cat > "base/etc/tmpfiles.d/$scope.conf" <<RULES
-d /var/lib/$scope-local 0750 $user $user -
+d /srv/$scope-local 0750 $user $user -
+d /var/lib/$scope-state 0750 $user $user -
+C /srv/$scope-copy - - - - /usr/lib/systemd/system-preset/99-fixture.preset
+C /var/lib/$scope-seed - - - - /usr/lib/systemd/system-preset/99-fixture.preset
 d $host_tmpfiles 0750 $user $user -
 d /run/$scope 0755 - - -
 RULES
 
 printf 'g %s %s\nu %s %s:%s\n' "$user" "$account_gid" "$user" "$account_uid" "$account_gid" > "proto/usr/lib/sysusers.d/$scope.conf"
-printf 'd /var/lib/%s-vendor 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$scope.conf"
-printf 'd /var/lib/%s-unrelated 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$scope-unrelated.conf"
+printf 'd /srv/%s-vendor 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$scope.conf"
+printf 'd /srv/%s-unrelated 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$scope-unrelated.conf"
 printf 'enable %s*\ndisable *\n' "$scope" > proto/usr/lib/systemd/system-preset/99-fixture.preset
 for unit in "$existing" "$enabled" "$masked" "$denied"; do write_unit "$unit" "Version 2 of $unit"; done
 : > proto/etc/passwd
@@ -132,11 +135,27 @@ cp -a --reflink=auto -- base staged
 "$cps" verify --root staged
 grep -q "^$user:x:$account_uid:$account_gid:" staged/etc/passwd
 grep -q "^$user:x:$account_gid:" staged/etc/group
-test "$(stat -c '%a %u:%g' "staged/var/lib/$scope-local")" = "750 $account_uid:$account_gid"
+test "$(stat -c '%a %u:%g' "staged/srv/$scope-local")" = "750 $account_uid:$account_gid"
 test -d "staged$host_tmpfiles"
-test ! -e "staged/var/lib/$scope-vendor"
-test ! -e "staged/var/lib/$scope-unrelated"
+cmp staged/usr/lib/systemd/system-preset/99-fixture.preset "staged/srv/$scope-copy"
+test ! -e "staged/srv/$scope-vendor"
+test ! -e "staged/srv/$scope-unrelated"
 test ! -e "staged/run/$scope"
+# An inactive root leaves its /var mount point empty. At boot,
+# systemd-tmpfiles-setup.service creates the declared paths on the /var that
+# every boot environment shares, even a freshly created empty subvolume, with
+# the accounts that sysusers already wrote to the root.
+test -d staged/var && test -z "$(ls -A staged/var)"
+systemd-tmpfiles --root="$work/staged" --boot --create --prefix=/var 2>/dev/null
+test "$(stat -c '%a %u:%g' "staged/var/lib/$scope-state")" = "750 $account_uid:$account_gid"
+cmp staged/usr/lib/systemd/system-preset/99-fixture.preset "staged/var/lib/$scope-seed"
+"$cps" verify --root staged
+if "$cps" verify --root staged --pristine > pristine.log 2>&1; then
+    echo 'Pristine verification accepted a populated /var' >&2
+    exit 1
+fi
+grep -Fq "unexpected path \"var/lib\"" pristine.log
+rm -r staged/var/lib
 wants=etc/systemd/system/multi-user.target.wants
 test "$(readlink "staged/$wants/$enabled")" = "/usr/lib/systemd/system/$enabled"
 test "$(readlink "staged/etc/systemd/system/$masked")" = /dev/null
@@ -145,7 +164,7 @@ for unit in "$existing" "$masked" "$denied"; do test ! -L "staged/$wants/$unit";
 # Fail the native tmpfiles step after sysusers has changed the managed
 # passwd file. The same plan must resume offline without replaying file writes.
 cp -a base recover
-printf 'd /var/lib/%s-retry 0750 %s-missing - -\n' "$scope" "$user" > "recover/etc/tmpfiles.d/$scope.conf"
+printf 'd /srv/%s-retry 0750 %s-missing - -\n' "$scope" "$user" > "recover/etc/tmpfiles.d/$scope.conf"
 if "$cps" apply --root recover upgrade.json > retry.log 2>&1; then
     echo 'Expected tmpfiles to fail on an unknown account' >&2
     exit 1
@@ -164,7 +183,7 @@ grep -Fq 'Recover with transaction resume' recovery-status.log
 # A change after the file phase can still leave plain resume stuck. Explicit
 # repair uses the original journal and verifies the exact recovery payload.
 cp -a base repair-pending
-printf 'd /var/lib/%s-retry 0750 %s-missing - -\n' "$scope" "$user" > "repair-pending/etc/tmpfiles.d/$scope.conf"
+printf 'd /srv/%s-retry 0750 %s-missing - -\n' "$scope" "$user" > "repair-pending/etc/tmpfiles.d/$scope.conf"
 if "$cps" apply --root repair-pending upgrade.json > retry.log 2>&1; then
     echo 'Expected tmpfiles to leave a pending transaction' >&2
     exit 1
@@ -206,7 +225,7 @@ test -L "recover/$wants/$enabled"
 
 test ! -e base/etc/passwd
 test ! -e base/etc/group
-test ! -e "base/var/lib/$scope-local"
+test ! -e "base/srv/$scope-local"
 test ! -e "base/$wants"
 test ! -e "$host_tmpfiles"
 test ! -e "$host_started"
@@ -223,7 +242,7 @@ test ! -L "staged/$wants/$enabled"
 test "$(readlink "staged/etc/systemd/system/$masked")" = /dev/null
 
 facet_rule="$scope-facet.conf"
-printf 'd /var/lib/%s-facet 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$facet_rule"
+printf 'd /srv/%s-facet 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$facet_rule"
 cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/optional-tmpfiles" publisher="canopa" version="1.0.0-0" {
@@ -239,8 +258,8 @@ publish
 grep -Fq "Offline systemd tmpfiles $facet_rule" facet-preview.log
 cp -a --reflink=auto -- facet-base facet-staged
 "$cps" apply --root facet-staged facet-enable.json
-test -d "facet-staged/var/lib/$scope-facet"
-test ! -e "facet-base/var/lib/$scope-facet"
-test ! -e "/var/lib/$scope-facet"
+test -d "facet-staged/srv/$scope-facet"
+test ! -e "facet-base/srv/$scope-facet"
+test ! -e "/srv/$scope-facet"
 "$cps" verify --root facet-staged
 echo 'Verified a newly selected tmpfiles declaration only ran in the staged root'

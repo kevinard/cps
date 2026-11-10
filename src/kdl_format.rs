@@ -1345,7 +1345,7 @@ mod tests {
             format!("{node} auto-prune=1"),
             format!(
                 "{node} {{
-    exclude-subvolume \"var/lib/cps\"
+    exclude-subvolume \"usr/lib/sysimage\"
 }}"
             ),
             format!(
@@ -1392,6 +1392,60 @@ mod tests {
         "#;
         let error = parse_manifest(input).unwrap_err();
         assert!(format!("{error:#}").contains("duplicate file property uid"));
+    }
+
+    #[test]
+    fn packages_cannot_ship_var_or_the_image_state() -> Result<()> {
+        let package = |body: &str| {
+            format!(
+                "schema-version 1 kind=\"package-manifest\"\npackage \"test/example\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{body}\n}}"
+            )
+        };
+        parse_manifest(&package(
+            r#"dir "usr/lib/sysimage" mode="0755" uid=0 gid=0
+               dir "srv/var" mode="0755" uid=0 gid=0
+               symlink "usr/lib/example" target="/var/lib/example" uid=0 gid=0
+               file "usr/lib/tmpfiles.d/example.conf" mode="0644" uid=0 gid=0"#,
+        ))?
+        .validate(false)?;
+        for (body, message) in [
+            (r#"dir "var" mode="0755" uid=0 gid=0"#, "var is under /var"),
+            (
+                r#"dir "var/lib/example" mode="0755" uid=0 gid=0"#,
+                "tmpfiles.d",
+            ),
+            (
+                r#"file "var/lib/example/db" mode="0644" uid=0 gid=0"#,
+                "packages never ship /var",
+            ),
+            (
+                r#"symlink "var/run" target="../run" uid=0 gid=0"#,
+                "var/run is under /var",
+            ),
+            (
+                r#"file "usr/bin/a" mode="0755" uid=0 gid=0
+                   hardlink "var/b" target="usr/bin/a""#,
+                "var/b is under /var",
+            ),
+            (
+                r#"file "etc/example.conf" mode="0644" uid=0 gid=0 preserve=#true original-name="test/old:var/lib/example.conf""#,
+                "is under /var",
+            ),
+            (
+                r#"dir "usr/lib/sysimage/cps" mode="0755" uid=0 gid=0"#,
+                "reserved image state path",
+            ),
+            (
+                r#"file "usr/lib/sysimage/cps/state.sqlite" mode="0644" uid=0 gid=0"#,
+                "reserved image state path",
+            ),
+        ] {
+            let error = parse_manifest(&package(body))
+                .and_then(|manifest| manifest.validate(false))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{body}: {error:#}");
+        }
+        Ok(())
     }
 
     #[test]

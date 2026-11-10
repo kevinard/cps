@@ -40,7 +40,7 @@ package "test/modes" publisher="modetest" version="$version.0.0-0" {
     hardlink "bin/helper-link" target="bin/helper"
     dir "tmp" mode="1777" uid=0 gid=0
     file "tmp/root-owned" mode="0644" uid=0 gid=0
-    dir "var/shared" mode="2777" uid=0 gid=0
+    dir "srv/shared" mode="2777" uid=0 gid=0
 }
 MANIFEST
     "$cps" publish --repo root/repository --proto proto --signing-key private.der modes.kdl
@@ -48,7 +48,7 @@ done
 cat > groups.kdl <<'MANIFEST'
 schema-version 1 kind="package-manifest"
 package "test/groups" publisher="modetest" version="1.0.0-0" {
-    dir "var/shared" mode="2777" uid=0 gid=0
+    dir "srv/shared" mode="2777" uid=0 gid=0
 }
 MANIFEST
 "$cps" publish --repo root/repository --proto proto --signing-key private.der groups.kdl

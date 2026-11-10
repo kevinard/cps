@@ -40,9 +40,17 @@ use crate::{
 pub(crate) const IMAGE_FORMAT: u32 = 1;
 // Development databases also used format 1 but did not set an application ID.
 const IMAGE_APPLICATION_ID: i32 = i32::from_be_bytes(*b"CPSI");
-pub(crate) const STATE_DIRECTORY: &str = "var/lib/cps/image";
-pub(crate) const STATE_ANCESTORS: &[&str] = &["var", "var/lib", "var/lib/cps"];
-pub(crate) const CONFIG_UPDATES_DIRECTORY: &str = "var/lib/cps/image/config-updates";
+/// The image state: the package database, transaction staging, prepared
+/// kernels and vendor configuration proposals. It lives in `/usr`, so each
+/// Btrfs boot environment snapshot carries the state that matches its files,
+/// while `/var` can be a separate mount shared by every environment.
+pub(crate) const STATE_DIRECTORY: &str = "usr/lib/sysimage/cps";
+pub(crate) const STATE_ANCESTORS: &[&str] = &["usr", "usr/lib", "usr/lib/sysimage"];
+pub(crate) const CONFIG_UPDATES_DIRECTORY: &str = "usr/lib/sysimage/cps/config-updates";
+/// The mount point of `/var`. Packages never ship anything at or below it.
+/// An image starts with it as an empty directory, and tmpfiles.d and
+/// sysusers.d populate `/var` at boot or during a live transaction.
+pub(crate) const VAR_DIRECTORY: &str = "var";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -808,10 +816,19 @@ fn initialize(
     };
     fs::create_dir_all(path)?;
     let root = Root::open(path)?;
-    ensure!(
-        fs::read_dir(path)?.next().is_none(),
-        "image-create requires an empty directory"
-    );
+    // An installer may mount a fresh, empty /var subvolume before creating
+    // the image, so an empty `var` directory or mount point is accepted.
+    let mut existing_var = false;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        ensure!(
+            entry.file_name() == VAR_DIRECTORY
+                && entry.file_type()?.is_dir()
+                && fs::read_dir(entry.path())?.next().is_none(),
+            "image-create requires an empty directory"
+        );
+        existing_var = true;
+    }
     let scratch = tempfile::Builder::new()
         .prefix(".cps-init-")
         .tempdir_in(path)?;
@@ -819,6 +836,12 @@ fn initialize(
         let directory = scratch.path().join(ancestor);
         fs::create_dir(&directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
+    }
+    if !existing_var {
+        let var = scratch.path().join(VAR_DIRECTORY);
+        fs::create_dir(&var)?;
+        fs::set_permissions(&var, fs::Permissions::from_mode(0o755))?;
+        File::open(&var)?.sync_all()?;
     }
     let state = scratch.path().join(STATE_DIRECTORY);
     DirBuilder::new().mode(0o700).create(&state)?;
@@ -862,8 +885,20 @@ fn initialize(
     for ancestor in STATE_ANCESTORS.iter().rev() {
         File::open(scratch.path().join(ancestor))?.sync_all()?;
     }
-    let entry = STATE_ANCESTORS[0];
     let source = Root::open(scratch.path())?;
+    // The empty /var mount point goes first. The state goes last, and
+    // publishing it creates the image.
+    if !existing_var {
+        renameat_with(
+            source.as_file(),
+            VAR_DIRECTORY,
+            root.as_file(),
+            VAR_DIRECTORY,
+            RenameFlags::NOREPLACE,
+        )
+        .context("creating the /var mount point")?;
+    }
+    let entry = STATE_ANCESTORS[0];
     renameat_with(
         source.as_file(),
         entry,

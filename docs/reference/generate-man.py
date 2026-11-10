@@ -134,8 +134,9 @@ def manual(binary):
         ".I /etc/cps/image.kdl",
         "Default configuration for system commands.",
         ".TP",
-        ".I /var/lib/cps/image/",
-        "Package database, transaction staging, and prepared kernel files within an image.",
+        ".I /usr/lib/sysimage/cps/",
+        "Package database, transaction staging, prepared kernel files, and vendor configuration "
+        "proposals within an image. Packages never ship /var, which tmpfiles.d populates at boot.",
         ".SH EXAMPLES",
         ".EX",
         roff("cps search editor"),

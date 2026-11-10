@@ -72,6 +72,37 @@ pub fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// The advice given for package content under `/var`.
+pub(crate) const VAR_ADVICE: &str = "packages never ship /var, which every boot environment \
+     shares and systemd populates at boot. Declare its directories and files with a tmpfiles.d \
+     rule in usr/lib/tmpfiles.d, and their accounts with sysusers.d";
+
+/// Whether a root-relative path is `var` or lies beneath it.
+pub(crate) fn under_var(path: &str) -> bool {
+    path.split('/').next() == Some(crate::image::VAR_DIRECTORY)
+}
+
+/// Check a path that a package action names.
+///
+/// Packages cannot ship the reserved `.cps` tree, the CPS image state, or
+/// anything at or below `var`. A mounted `/var` is outside the image's
+/// filesystem, so CPS could not write there, and the mount point must stay
+/// empty in every boot environment.
+pub(crate) fn validate_package_path(path: &str) -> Result<()> {
+    validate_path(path)?;
+    ensure!(
+        path.split('/').next() != Some(".cps"),
+        "reserved image path {path}"
+    );
+    let state = crate::image::STATE_DIRECTORY;
+    ensure!(
+        path != state && !path.starts_with(&format!("{state}/")),
+        "reserved image state path {path}"
+    );
+    ensure!(!under_var(path), "{path} is under /var: {VAR_ADVICE}");
+    Ok(())
+}
+
 fn name_component(part: &str) -> bool {
     part.starts_with(|ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit())
         && part
@@ -532,11 +563,7 @@ impl Action {
 
     fn validate(&self, published: bool) -> Result<()> {
         let path = self.path();
-        validate_path(path)?;
-        ensure!(
-            path.split('/').next() != Some(".cps"),
-            "reserved image path {path}"
-        );
+        validate_package_path(path)?;
         let selectors = self.selectors();
         if let Some(facet) = selectors.facet {
             selection::validate_facet(facet)?;
@@ -577,11 +604,7 @@ impl Action {
                         "original-name must be a package name followed by ':' and a path",
                     )?;
                     validate_name(package)?;
-                    validate_path(path)?;
-                    ensure!(
-                        path.split('/').next() != Some(".cps"),
-                        "reserved image path {path}"
-                    );
+                    validate_package_path(path)?;
                 }
                 if let Some(capabilities) = capabilities {
                     capabilities.validate_declaration()?;
@@ -618,7 +641,7 @@ impl Action {
                 (*uid, *gid)
             }
             Self::Hardlink { target, .. } => {
-                validate_path(target)?;
+                validate_package_path(target)?;
                 ensure!(target != path, "hard link points to itself");
                 return Ok(());
             }

@@ -306,7 +306,7 @@ if [ "$version" = "$trial_version" ] && [ -f /etc/cps-btrfs-fail-health ]; then
 fi
 cps verify --root /
 if [ -f /volume/@captures/rollback-base.sha256 ] && [ ! -f /etc/cps-btrfs-destroy ]; then
-    state_dir=var/lib/cps/image
+    state_dir=usr/lib/sysimage/cps
     if [ -d /.cps ]; then state_dir=.cps; fi
     phase=base
     if [ "$version" = "$trial_version" ]; then phase=trial; fi
@@ -441,7 +441,7 @@ else
 fi
 cps plan --root / --output /captures/upgrade.json update
 printf 'captured local state\n' > /etc/cps-capture-local
-state_dir=var/lib/cps/image
+state_dir=usr/lib/sysimage/cps
 if [ -d /.cps ]; then state_dir=.cps; fi
 before=$(sha256sum "/$state_dir/state.sqlite")
 reject() {
@@ -455,9 +455,9 @@ reject() {
 }
 reject 'requires the root of a Btrfs subvolume' --source /etc --output /captures/wrong-source
 reject 'separate Btrfs subvolume' --source / --output /bad-capture
-if [ "$state_dir" = var/lib/cps/image ]; then
+if [ "$state_dir" = usr/lib/sysimage/cps ]; then
     mount --bind /tmp "/$state_dir"
-    reject 'opening image state under /var/lib/cps/image on the image filesystem' \
+    reject 'opening image state under /usr/lib/sysimage/cps on the image filesystem' \
         --source / --output /captures/shared-state
     umount "/$state_dir"
 fi

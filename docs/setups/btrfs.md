@@ -19,6 +19,7 @@ configuration work as described in [boot operations](boot-operations.md).
 - [Activating Btrfs roots](#activating-btrfs-roots)
   - [Signed UKIs for Btrfs roots](#signed-ukis-for-btrfs-roots)
   - [Direct UEFI boot for Btrfs roots](#direct-uefi-boot-for-btrfs-roots)
+- [Share /var between boot environments](#share-var-between-boot-environments)
 - [Health checks and shared state](#health-checks-and-shared-state)
 - [Nested subvolumes](#nested-subvolumes)
 - [Capturing a running Btrfs root](#capturing-a-running-btrfs-root)
@@ -38,7 +39,7 @@ example, a single-device Btrfs root on a GPT disk can use these settings.
 
 ```kdl
 boot-btrfs volume="/cps" environments="/cps/@environments" esp="/efi" root-partuuid="7adff456-af50-498f-b39a-dcf87cb4a7c1" options="rw" {
-    exclude-subvolume "var/lib/docker"
+    exclude-subvolume "srv/machines"
 }
 stage-package "system/elf-runtime"
 stage-package "system/systemd"
@@ -68,8 +69,10 @@ modules, `/etc/fstab`, and the CPS binary, packages that declare
 
 Use the real partition UUID and package names. Mount the Btrfs top-level
 subvolume read-write at `volume`, create the `environments` subvolume below
-it, and mount the ESP at `esp`. Keep the repository caches at stable paths
-outside the boot roots. Register the initial root with
+it, and mount the ESP at `esp`. Mount `/var` from a
+[shared subvolume](#share-var-between-boot-environments), and keep the
+repository caches at stable paths outside the boot roots, such as
+`/var/lib/cps/NAME` on that subvolume. Register the initial root with
 `boot-env activate-btrfs --known-good` and install the
 [CPS health service](../../packaging/systemd/cps-boot-health.service) for
 trial boot assessment.
@@ -82,12 +85,14 @@ can be assembled and unlocked by the initramfs before it mounts that root.
 - Mount the Btrfs top-level subvolume (ID 5) read-write at `volume`.
   Each boot root must be a named subvolume reachable through that mount.
   Keep the paths of registered roots stable.
-- Place the root's CPS state and managed files in the root subvolume.
-  Store staged roots in a root-owned directory on the same filesystem,
-  beneath the top-level mount and outside the boot roots. Shared data such
-  as `/home`, `/var/log`, or a swapfile can live on sibling subvolumes
-  mounted at ordinary directories in each root. A Btrfs snapshot omits
-  nested subvolume contents. See [Nested subvolumes](#nested-subvolumes).
+- Place the root's managed files and its CPS state, under
+  `/usr/lib/sysimage/cps`, in the root subvolume. Mount `/var` from a
+  [sibling subvolume](#share-var-between-boot-environments) that every
+  environment shares. Store staged roots in a root-owned directory on the
+  same filesystem, beneath the top-level mount and outside the boot roots.
+  Other shared data such as `/home` or a swapfile can live on sibling
+  subvolumes mounted at ordinary directories in each root. A Btrfs snapshot
+  omits nested subvolume contents. See [Nested subvolumes](#nested-subvolumes).
 - Mount the dedicated, writable VFAT systemd-boot ESP at `esp`. CPS reads
   the GPT with the disk's logical block size, so disks with 512-byte and
   4096-byte (4Kn) sectors both work. The ESP can be an automount point, as
@@ -230,6 +235,67 @@ staged change removes the failed trial, or run
 unrelated `BootNext` and reports it if it conflicts with activation or
 rollback.
 
+## Share /var between boot environments
+
+Packages never ship anything in `/var`, and the CPS state lives in
+`/usr/lib/sysimage/cps`, so `/var` holds only the machine's own data: logs,
+databases, spools, and caches. Keep it in one subvolume beside the root
+subvolumes, below the top level, and mount it at `/var` in every
+environment. The root's own `var` directory stays empty as the mount point.
+
+```sh
+mount -t btrfs -o subvolid=5 /dev/mapper/root /cps
+btrfs subvolume create /cps/@var
+```
+
+```text
+# /etc/fstab in the root
+UUID=0b4c6b2e-3f1d-4a8e-9c55-2d7f1e8a6b90  /     btrfs  defaults            0 0
+UUID=0b4c6b2e-3f1d-4a8e-9c55-2d7f1e8a6b90  /var  btrfs  subvol=/@var,noatime 0 0
+```
+
+Use the filesystem UUID that `blkid` reports. The `/` line has no subvolume
+selector, as [Activating Btrfs roots](#activating-btrfs-roots) requires,
+and the `/var` line keeps its selector. Each staged root is a snapshot of the
+running root and inherits the same `/etc/fstab`, so every environment mounts
+the same `/var`.
+
+- **Staging.** A snapshot does not cross mounts, so a staged root has the
+  same empty `var` directory. The staged transaction writes nothing to the
+  shared `/var`: CPS defers tmpfiles.d rules for `/var` to boot, and
+  triggers cannot write there.
+- **Boot.** `systemd-sysusers.service` and `systemd-tmpfiles-setup.service`
+  apply the booted environment's declarations to `/var` before services
+  start. A trial gets the directories its new packages declare, and a newly
+  created, empty `/var` subvolume is populated on its first boot.
+- **Rollback.** The fallback boots with the same `/var`. The failed trial's
+  journal stays in `/var/log/journal`, so `journalctl --list-boots` and
+  `journalctl -b -1` show why it failed. Data that the trial's services
+  changed stays changed; see [shared state](#health-checks-and-shared-state).
+- **Pruning.** Destroying an environment deletes only its root subvolume.
+  `/var` keeps its contents, including directories that only the removed
+  environment's packages declared. Remove those by hand when you no longer
+  need them.
+
+Repository caches in `/var`, such as a synchronized mirror in
+`/var/lib/cps/NAME`, serve every environment. A mirror is persistent state
+rather than a disposable cache in `/var/cache`: it holds the TUF replay
+state that rejects rolled-back metadata, and the payloads that an offline
+abort or repair restores. Payloads are addressed by their digests, and each
+image checks catalogs against its own pinned trust roots and catalog
+checkpoints, so an older environment can use a mirror that a newer one
+refreshed. Pass each environment's root to
+[`cps repo prune-cache`](../client/mirrors.md) with `--keep-image`, or it can
+drop payloads that only another environment's packages use. CPS then
+downloads them again when that environment needs them, for example with
+`transaction abort --fetch`.
+
+Keep `/var` on a mount of its own. A `/var` that is a nested subvolume of a
+root, or that is excluded with `exclude-subvolume`, would stay with the root
+that created it, so CPS rejects both and asks for a sibling subvolume. A
+root that keeps `/var` in its own subvolume still works, but each snapshot
+then copies `/var`, and a rollback reverts its logs and data.
+
 ## Health checks and shared state
 
 `cps-boot-health.service` runs `cps verify --quick --root /` before
@@ -253,8 +319,9 @@ probe of the service itself, and return nonzero if the service cannot serve
 requests. Systemd treats a failing post-start command as a failed health
 service, so the trial stays unblessed.
 
-Boot rollback selects the previous root and its package state. Data mounted
-from a sibling subvolume, another device, or a network service has its own
+Boot rollback selects the previous root and its package state. Data in the
+[shared `/var`](#share-var-between-boot-environments), or mounted from
+another sibling subvolume, another device, or a network service, has its own
 lifecycle. Keep shared state compatible with the previous system until the
 trial is accepted, or coordinate its backup and restore with the application.
 
@@ -263,7 +330,11 @@ trial is accepted, or coordinate its backup and restore with the application.
 A Btrfs snapshot does not descend into nested subvolumes. In the snapshot,
 each one becomes an empty placeholder directory that cannot hold files.
 systemd creates `/var/lib/machines` and `/var/lib/portables` as subvolumes
-on Btrfs, and container storage drivers create others.
+on Btrfs, and container storage drivers create others below `/var`. With a
+[shared `/var`](#share-var-between-boot-environments), those live in the
+`/var` subvolume and need no configuration. Exclusions matter for nested
+subvolumes elsewhere in a root, or below a `/var` kept in the root
+subvolume.
 
 CPS always excludes `var/lib/machines` and `var/lib/portables`. Add more
 paths with `exclude-subvolume` in `boot-btrfs`, or with `--exclude-subvolume`
@@ -278,8 +349,8 @@ root's `/etc/fstab`.
 
 CPS rejects a nested subvolume at any other path and names the path in the
 error. It also rejects an excluded subvolume that contains CPS-managed
-files, or a path that contains the CPS image state, because the new root
-would lose them. `destroy-btrfs` and `prune` refuse to delete a root that
+files, a path that contains the CPS image state, or `var` itself, because
+the new root would lose them. `destroy-btrfs` and `prune` refuse to delete a root that
 still contains nested subvolumes. Delete or move them first.
 
 ## Capturing a running Btrfs root
@@ -287,7 +358,8 @@ still contains nested subvolumes. Delete or move them first.
 `boot-env capture` takes a read-only snapshot of a CPS root subvolume and
 verifies it before publishing a new directory containing `root/`. Use a
 writable sibling subvolume on the same Btrfs filesystem for captures, mounted
-separately from the root subvolume.
+separately from the root subvolume. The shared `/var` subvolume qualifies, as
+in the examples below.
 
 ```sh
 cps boot-env capture --source / --output /var/lib/cps/captures/before-upgrade
@@ -300,7 +372,8 @@ The capture retains the image identity and revision, so a saved plan for
 that revision also applies to the captured baseline. Snapshot creation
 holds the shared CPS image lock. Btrfs supplies a point-in-time view of the
 root subvolume while applications continue to write to the running root.
-Shared data mounted from other filesystems has its own lifecycle. After
+The capture's `var` is the empty mount point. `/var` and other shared data
+mounted from other subvolumes or filesystems have their own lifecycle. After
 handling [nested subvolumes](#nested-subvolumes), CPS verifies the package
 database, installed files, and catalog archives, and makes the capture
 read-only. [Btrfs subvolumes](https://btrfs.readthedocs.io/en/latest/Subvolumes.html)

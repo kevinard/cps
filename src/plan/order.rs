@@ -328,10 +328,10 @@ mod tests {
         };
         assert_eq!(file_kind("usr/bin/sh", &link), 2);
         assert_eq!(
-            config_update_target("var/lib/cps/image/config-updates/12/etc/app.conf"),
+            config_update_target("usr/lib/sysimage/cps/config-updates/12/etc/app.conf"),
             Some("etc/app.conf")
         );
-        assert_eq!(config_update_target("var/lib/cps/image/stage/x"), None);
+        assert_eq!(config_update_target("usr/lib/sysimage/cps/stage/x"), None);
     }
 
     #[test]

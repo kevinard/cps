@@ -67,13 +67,19 @@ package "desktop/glib" publisher="canopa" version="2.86.0-0" {
         ),
         (
             output,
-            r#"output "var/lib/cps/image/cache""#,
+            r#"output "usr/lib/sysimage/cps/cache""#,
             "covers reserved image state",
         ),
         (
             output,
-            r#"output "var/lib/cache""#,
-            "outside var and var/lib",
+            r#"output "usr/lib/cache""#,
+            "outside usr, usr/lib, usr/lib/sysimage",
+        ),
+        (output, r#"output "var/cache/fontconfig""#, "is under /var"),
+        (
+            r#"watch "usr/share/glib-2.0/schemas/*.xml""#,
+            r#"watch "var/lib/schemas/*.xml""#,
+            "under /var",
         ),
         (output, r#"output "cache""#, "below the image root"),
         (

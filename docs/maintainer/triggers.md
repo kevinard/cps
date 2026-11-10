@@ -87,9 +87,11 @@ The declaring package owns every path its outputs cover.
   if two triggers generate paths that can overlap. Ship such a file from the
   trigger package or change the pattern.
 - An output names paths inside a directory other than the image root,
-  `var`, `var/lib`, or `var/lib/cps`. It cannot reach the CPS state under
-  `var/lib/cps/image` or the `proc`, `sys`, `dev`, `run`, and `tmp` trees
-  that the sandbox replaces. Ship the nearest parent directory in the
+  `usr`, `usr/lib`, or `usr/lib/sysimage`. It cannot reach the CPS state
+  under `usr/lib/sysimage/cps`, the `proc`, `sys`, `dev`, `run`, and `tmp`
+  trees that the sandbox replaces, or `var`, which is shared by every boot
+  environment and is not part of the image. Neither outputs nor watches can
+  name a path in `var`. Ship the nearest parent directory in the
   trigger's package, as
   `dir "etc/udev"` does for the hardware database. A handler cannot create
   directories outside its outputs.
@@ -117,10 +119,12 @@ with the image as its root filesystem, so it runs the image's own programs.
 CPS runs Bubblewrap from `/usr/bin/bwrap` on the system that applies the
 transaction, so a package that ships CPS should depend on Bubblewrap.
 
-- The image is read-only. `/proc`, `/dev`, and an empty `/tmp` and `/run`
-  are private to the handler. `/sys`, `/home`, `/root`, `/boot`, `/efi`,
-  `/mnt`, `/media`, `/lost+found`, and the CPS state under `/var/lib/cps`
-  are hidden.
+- The image is read-only. `/proc`, `/dev`, and an empty `/tmp`, `/run`,
+  and `/var` are private to the handler, so a handler sees the same empty
+  `/var` on the running system and in an inactive image, and whatever it
+  writes there is discarded. `/sys`, `/home`, `/root`, `/boot`, `/efi`,
+  `/mnt`, `/media`, `/lost+found`, and the CPS state under
+  `/usr/lib/sysimage/cps` are hidden.
 - Each directory that holds an output is an overlay. After the handler
   exits, CPS publishes only the changes to declared outputs. If the handler
   wrote, removed, or changed anything else, the trigger fails and none of
@@ -176,14 +180,20 @@ prepares that kernel again. See
 | Icon themes | a script that runs `gtk-update-icon-cache` for each theme | `usr/share/icons/**` | `usr/share/icons/*/icon-theme.cache` |
 | MIME database | `usr/bin/update-mime-database` `usr/share/mime` | `usr/share/mime/packages/*.xml` | one `output` for each generated name, such as `usr/share/mime/mime.cache` and `usr/share/mime/application` |
 | Desktop entries | `usr/bin/update-desktop-database` `usr/share/applications` | `usr/share/applications/*.desktop` | `usr/share/applications/mimeinfo.cache` |
-| Fonts | `usr/bin/fc-cache` `--system-only` | `usr/share/fonts/**` | `var/cache/fontconfig` |
+| Fonts | `usr/bin/fc-cache` `--system-only`, with fontconfig built with `--with-cache-dir=/usr/lib/fontconfig/cache` | `usr/share/fonts/**` | `usr/lib/fontconfig/cache` |
 | GIO modules | `usr/bin/gio-querymodules` `usr/lib/gio/modules` | `usr/lib/gio/modules/*.so` | `usr/lib/gio/modules/giomodule.cache` |
 | Pixbuf loaders | `usr/bin/gdk-pixbuf-query-loaders` `--update-cache` | `usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so` | `usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache` |
 | Certificates | `usr/bin/update-ca-trust` | `usr/share/pki/ca-trust-source/**` | `etc/pki/ca-trust/extracted` |
-| Manual pages | `usr/bin/mandb` `--quiet` | `usr/share/man/**` | `var/cache/man` |
+| Manual pages | `usr/bin/mandb` `--quiet`, with `MANDB_MAP /usr/share/man /usr/lib/man-db/index` in `man_db.conf` | `usr/share/man/**` | `usr/lib/man-db/index` |
 | Module dependencies | a script that runs `depmod` for each `usr/lib/modules/*` | `usr/lib/modules/*/kernel/**`, `usr/lib/modules/*/updates/**`, `usr/lib/modules/*/extra/**` | `usr/lib/modules/*/modules.*` |
 | Library cache | `usr/bin/ldconfig` | `usr/lib/*.so.*` | `etc/ld.so.cache` |
 | Hardware database | `usr/bin/systemd-hwdb` `--strict` `update` | `usr/lib/udev/hwdb.d/*.hwdb` | `etc/udev/hwdb.bin` |
+
+Caches that tools keep in `/var` by default, such as the font and manual
+page caches, move below `/usr` as shown, because a trigger cannot write to
+the shared `/var`. A cache that stays in `/var` is rebuilt on the running
+system by a service or timer instead, as `man-db.timer` does for an index in
+`/var/cache/man`.
 
 Images that rely on the runtime linker's default directories need no
 library cache. Images that use `ld.so.conf` directories can declare the

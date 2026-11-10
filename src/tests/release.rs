@@ -3818,7 +3818,7 @@ fn automatic_payload_pruning_keeps_cached_versions_and_registered_roots() -> Res
         )?;
         apply(root, &plan)?;
         assert!(
-            fs::read_dir(root.join("var/lib/cps/image/stage"))?
+            fs::read_dir(root.join("usr/lib/sysimage/cps/stage"))?
                 .next()
                 .is_none()
         );
@@ -4457,7 +4457,7 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
     interrupt_apply_at(&f.root, &saved, &plan, COMPOSITOR)?;
     fs::remove_file(saved)?;
     fs::rename(&f.repo, f.repo.with_extension("offline"))?;
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let status = crate::transaction_status(&f.root)?;
     assert_eq!(status.revision, 1);
     let pending = status.pending.unwrap();
@@ -4501,7 +4501,7 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
     )?;
     let payload = f
         .root
-        .join("var/lib/cps/image/stage")
+        .join("usr/lib/sysimage/cps/stage")
         .join(digest(b"second"));
     fs::write(&payload, b"broken")?;
     let error = crate::resume_transaction(&f.root).unwrap_err();
@@ -4683,7 +4683,7 @@ publisher "seed" {{ repository {:?}; trust-root {:?}; }}
             &read_trust_root(&seed.trust)?,
         )?
         .sequence();
-        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+        let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
         let settings: String =
             db.query_row("SELECT data FROM image WHERE id=1", [], |row| row.get(0))?;
         db.execute(
@@ -5561,7 +5561,7 @@ fn offline_build_audit_requires_the_catalog_admitted_attestation() -> Result<()>
         ),
     )?;
     crate::set_publisher_build_trust(&f.root, "canopa", &policy, false)?;
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     let supplemental: String = db.query_row(
         "SELECT hash FROM build_admission_catalogs WHERE publisher='canopa'",
         [],
@@ -5717,7 +5717,7 @@ publisher "seed" {{
     apply(&f.root, &followup)?;
 
     {
-        let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+        let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
         // The same valid DSSE envelope with different bytes has a different
         // digest and must not stand in for the catalog's admitted object.
         let mut alternative = envelope.clone();
@@ -5789,7 +5789,7 @@ publisher "seed" {{
     assert_eq!(audit.verified, 0);
     assert_eq!(audit.failures.len(), 1);
 
-    let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
+    let db = rusqlite::Connection::open(f.root.join("usr/lib/sysimage/cps/state.sqlite"))?;
     assert_eq!(
         db.execute(
             "UPDATE catalog_archives SET catalog=?1 WHERE publisher='canopa'",

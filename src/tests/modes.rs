@@ -73,7 +73,7 @@ fn directory_special_modes_survive_updates_offline_recovery_repair_and_staging()
             "system/filesystem",
             version,
             format!(
-                "    dir \"tmp\" mode=\"{tmp}\" uid={uid} gid={gid}\n    dir \"var/shared\" mode=\"{shared}\" uid={uid} gid={gid}\n"
+                "    dir \"tmp\" mode=\"{tmp}\" uid={uid} gid={gid}\n    dir \"srv/shared\" mode=\"{shared}\" uid={uid} gid={gid}\n"
             ) + &f.file(COMPOSITOR, content, "0755", "")?,
         )
     };
@@ -90,7 +90,7 @@ fn directory_special_modes_survive_updates_offline_recovery_repair_and_staging()
         )?,
     )?;
     let tmp = f.root.join("tmp");
-    let shared = f.root.join("var/shared");
+    let shared = f.root.join("srv/shared");
     assert_eq!(mode(&tmp)?, 0o1777);
     assert_eq!(mode(&shared)?, 0o2770);
     let inode = fs::metadata(&shared)?.ino();
@@ -104,7 +104,7 @@ fn directory_special_modes_survive_updates_offline_recovery_repair_and_staging()
         &f.root,
         &f._dir.path().join("update.json"),
         &update,
-        "var/shared",
+        "srv/shared",
     )?;
     assert_eq!(mode(&shared)?, 0o3770);
     let offline = f.repo.with_extension("offline");
@@ -133,9 +133,9 @@ fn directory_special_modes_survive_updates_offline_recovery_repair_and_staging()
     )?;
     crate::boot::stage_directory_copy(&f.root, &staged, &keep)?;
     assert_eq!(mode(&staged.join("tmp"))?, 0o1770);
-    assert_eq!(mode(&staged.join("var/shared"))?, 0o3770);
+    assert_eq!(mode(&staged.join("srv/shared"))?, 0o3770);
     assert_eq!(
-        fs::read_to_string(staged.join("var/shared/local"))?,
+        fs::read_to_string(staged.join("srv/shared/local"))?,
         "local state"
     );
     assert!(verify(&staged)?.is_empty());

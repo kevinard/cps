@@ -223,7 +223,11 @@ cd /usr/share/test-escape
 echo declared > declared
 ! echo x 2>/dev/null > /usr/bin/escape || exit 10
 ! echo x 2>/dev/null > /etc-escape || exit 11
-! echo x 2>/dev/null > /var/lib/cps/image/escape || exit 12
+! echo x 2>/dev/null > /usr/lib/sysimage/cps/escape || exit 12
+[[ ! -e /usr/lib/sysimage/cps/state.sqlite ]] || exit 16
+# The shared /var is not part of the image: handlers get a private, empty one.
+[[ -d /var && -z $(ls -A /var) ]] || exit 17
+echo x > /var/scratch || exit 18
 ! (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null || exit 13
 echo x > /tmp/scratch || exit 14
 [[ ${HOME-} == /tmp && -z ${CPS_TEST_SECRET-} ]] || exit 15
@@ -247,7 +251,8 @@ test ! -e escape/usr/share/test-escape/undeclared
 test ! -e escape/usr/share/test-escape/declared
 test ! -e escape/usr/bin/escape
 test ! -e escape/etc-escape
-test ! -e escape/var/lib/cps/image/escape
+test ! -e escape/usr/lib/sysimage/cps/escape
+test -z "$(ls -A escape/var)"
 
 # A trigger can generate a kernel's initramfs. The boot artifacts follow
 # each regeneration, and a prepackaged initrd keeps working without one.
@@ -292,7 +297,7 @@ HANDLER
     printf 'initramfs for %s\nkernel/base.ko\n' "$release" | cmp - "boot/usr/lib/modules/$release/initrd"
     prepared() {
         local dir
-        dir=$(ls -d boot/var/lib/cps/image/kernel-*)
+        dir=$(ls -d boot/usr/lib/sysimage/cps/kernel-*)
         test "$(sha256sum < "$dir/initrd" | cut -d' ' -f1)" = "$(cat "$dir/initrd.sha256")"
         cmp "$dir/initrd" "boot/usr/lib/modules/$release/initrd"
     }
@@ -332,14 +337,14 @@ SHIM
     prepared
     echo base > "boot/usr/lib/modules/$release/kernel/base.ko"
     "$cps" transaction abort --root boot
-    test "$(find boot/var/lib/cps/image -maxdepth 1 -name 'kernel-*' | wc -l)" -eq 1
+    test "$(find boot/usr/lib/sysimage/cps -maxdepth 1 -name 'kernel-*' | wc -l)" -eq 1
     printf 'initramfs for %s\nkernel/base.ko\n' "$release" | cmp - "boot/usr/lib/modules/$release/initrd"
     prepared
     "$cps" verify --root boot --pristine
     plan_apply boot remove test/mkinitrd
     test ! -e "boot/usr/lib/modules/$release/initrd"
     without=0
-    for dir in boot/var/lib/cps/image/kernel-*; do
+    for dir in boot/usr/lib/sysimage/cps/kernel-*; do
         [[ -e $dir/initrd ]] || without=$((without + 1))
     done
     test "$without" -eq 1

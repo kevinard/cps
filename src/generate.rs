@@ -74,6 +74,11 @@ pub fn generate_manifest_for_architecture(
     let mut groups = BTreeMap::new();
     let root = Root::open(proto)?;
     root.walk(None, |path, entry, info| {
+        ensure!(
+            !crate::model::under_var(path),
+            "the prototype contains {path:?}: {}. Remove var from the prototype",
+            crate::model::VAR_ADVICE
+        );
         let kind = FileType::from_raw_mode(info.st_mode);
         let mode = |allow_capability| {
             let mode = info.st_mode & 0o7777;
