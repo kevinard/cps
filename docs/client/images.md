@@ -109,9 +109,14 @@ files, links, and directory metadata to their state before the transaction,
 links hard link aliases to their restored targets, copies moved or adjusted
 local configuration back from where the transaction put it, and removes
 vendor proposals staged under `config-updates`. Completed transitions between
-directories and files or symlinks are undone the same way they were made. It
-then runs the systemd actions of the change back to the committed packages,
-restores the catalog archives and build receipts that the pending record
+directories and files or symlinks are undone the same way they were made.
+
+Abort then runs the systemd actions and [triggers](../maintainer/triggers.md)
+of the change back to the committed packages. Generated caches and a
+generated initramfs are rebuilt from the restored files, and the outputs of
+triggers that the transaction added are removed. When a trigger regenerates
+the committed kernel's initramfs, abort prepares that kernel again. Finally
+it restores the catalog archives and build receipts that the pending record
 replaced, drops the file records of every journaled path, and deletes the
 pending record. The committed revision and history do not change, so the same
 saved plan can be applied again later.
@@ -134,11 +139,17 @@ record first, and from then on the transaction only goes back:
 reports the `aborting` phase, `apply` with the same plan refuses, and both
 `transaction abort` and `transaction resume` finish the abort after an
 interruption. Each restored path is checked against both its state after and
-before the transaction, so finishing an abort is idempotent.
+before the transaction, so finishing an abort is idempotent. Each trigger
+that the abort finished is journaled, so a failed or interrupted handler
+leaves the abort pending, and finishing it runs only the remaining
+triggers.
 
 Abort cannot undo effects outside the managed paths, such as users that an
-offline `sysusers` action already created or a kernel that the transaction
-already prepared. Prepared kernels are stored by content and remain unused.
+offline `sysusers` action already created or a different kernel that the
+transaction already prepared. Prepared kernels are stored by their packaged
+files and remain unused. A committed kernel that the transaction prepared
+again for a regenerated initramfs shares its artifacts with the committed
+revision, so the abort prepares it once more.
 
 ## Replace a directory with a file or symlink
 

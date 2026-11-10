@@ -73,4 +73,27 @@ mv repo offline
 test "$(runs)" -eq 2
 test ! -e image/etc/udev/hwdb.bin
 "$cps" verify --root image --pristine
-echo 'Verified coalesced hardware database rebuilds, removal, and offline journal retry'
+
+# Aborting rebuilds the database from the restored files, and an abort that
+# the helper interrupts finishes on retry.
+mv offline repo
+"$cps" plan --root image --output install.json install test/first test/second > /dev/null
+"$cps" apply --root image install.json
+test "$(runs)" -eq 3
+"$cps" plan --root image --output remove.json remove test/second
+touch image/etc/udev/hwdb-fail
+if "$cps" apply --root image remove.json; then
+    echo 'expected the hardware database helper to fail' >&2
+    exit 1
+fi
+if "$cps" transaction abort --root image; then
+    echo 'expected the hardware database helper to fail during the abort' >&2
+    exit 1
+fi
+"$cps" transaction status --root image | rg -Fx 'Abort in progress'
+rm image/etc/udev/hwdb-fail
+"$cps" transaction abort --root image
+test "$(runs)" -eq 4
+"$tool" --root=image query test:cps:second-device | rg -Fx 'CPS_TEST=second'
+"$cps" verify --root image --pristine
+echo 'Verified coalesced hardware database rebuilds, removal, offline journal retry, and abort'

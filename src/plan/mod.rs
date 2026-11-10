@@ -1779,13 +1779,8 @@ fn build_with_update_diagnostics(
     )?;
     plan.triggers = planned.run;
     plan.retired_triggers = planned.retire;
-    // A regenerated initramfs must reach the prepared boot artifacts.
-    if plan.kernel_install.is_none()
-        && let Some(selected) = kernel::selected(&installed, &paths)?
-        && selected.generated_initrd
-        && triggers::regenerates(&plan.triggers, &installed, &selected.kernel.initrd_path())?
-    {
-        plan.kernel_install = Some(selected);
+    if plan.kernel_install.is_none() {
+        plan.kernel_install = regenerated_initrd(&plan.triggers, &installed, &paths)?;
     }
     plan.payload_bytes = payloads(&plan.writes)
         .values()
@@ -1823,6 +1818,21 @@ fn build_with_update_diagnostics(
     state.installed = installed;
     state.paths = paths;
     Ok((plan, state, receipts))
+}
+
+/// The selected kernel of a composition, when planned triggers regenerate
+/// its generated initramfs. The prepared boot artifacts must follow it.
+fn regenerated_initrd(
+    runs: &[TriggerRun],
+    installed: &BTreeMap<String, Installed>,
+    paths: &BTreeMap<String, Managed>,
+) -> Result<Option<Artifacts>> {
+    let Some(selected) = kernel::selected(installed, paths)? else {
+        return Ok(None);
+    };
+    Ok((selected.generated_initrd
+        && triggers::regenerates(runs, installed, &selected.kernel.initrd_path())?)
+    .then_some(selected))
 }
 
 pub(crate) fn pending_repairs(root: &Root, state: &State) -> Result<Vec<Write>> {
@@ -1975,8 +1985,17 @@ impl Plan {
     /// metadata change is copied back from where the plan put it, aliases
     /// declared as hard links in `base` are linked again to their restored
     /// targets, and other files come from package payloads. Systemd actions
-    /// are those of the change from `next` back to `base`; kernel
-    /// preparation is not repeated, since `base` already prepared its kernel.
+    /// and triggers are those of the change from `next` back to `base`, so
+    /// generated outputs follow the restored files: triggers that `next`
+    /// added are retired, and those it retired or whose inputs it changed
+    /// run again.
+    ///
+    /// The prepared artifacts of a kernel live in a directory named after
+    /// its packaged files, so preparing `base`'s own kernel again for a
+    /// regenerated initramfs replaced them. The abort then prepares that
+    /// kernel again, as it does whenever its triggers regenerate the
+    /// initramfs of `base`'s kernel. A different kernel that the plan
+    /// prepared left `base`'s artifacts untouched.
     pub(crate) fn inverse(&self, base: &State, next: &State) -> Result<Self> {
         let mut writes = BTreeMap::new();
         let mut retired = BTreeSet::new();
@@ -2057,7 +2076,19 @@ impl Plan {
         let mut inverse = self.clone();
         inverse.writes = writes;
         inverse.systemd = systemd::plan_actions(next, &base.installed, &base.paths);
-        inverse.kernel_install = None;
+        let planned = triggers::plan(
+            &next.installed,
+            &next.paths,
+            &base.installed,
+            &base.paths,
+            &inverse.writes,
+        )?;
+        inverse.triggers = planned.run;
+        inverse.retired_triggers = planned.retire;
+        inverse.kernel_install = match kernel::selected(&base.installed, &base.paths)? {
+            Some(selected) if self.kernel_install.as_ref() == Some(&selected) => Some(selected),
+            _ => regenerated_initrd(&inverse.triggers, &base.installed, &base.paths)?,
+        };
         inverse.transfers.clear();
         inverse.preserved.clear();
         for change in &mut inverse.package_changes {

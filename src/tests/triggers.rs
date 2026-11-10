@@ -339,7 +339,320 @@ fn live_triggers_reload_running_services_after_they_run() -> Result<()> {
         services.preview(),
         ["Reload or restart active services systemd-udevd.service after triggers"]
     );
+    // Aborting the live change reloads the same services after its triggers.
+    let (_, inverse, base, next) = with_states(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/rules".into()],
+        },
+    )?;
+    assert_eq!(runs(&inverse), ["system/udev:rules"]);
+    assert_eq!(
+        crate::systemd::LiveServices::plan(&inverse, &next, &base).preview(),
+        ["Reload or restart active services systemd-udevd.service after triggers"]
+    );
     apply(&f.root, &rules)?;
     assert!(verify::verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+/// Copy host executables and their shared library closure into the
+/// prototype tree, so trigger handlers run inside a test image, and return
+/// the file actions that ship them.
+fn runtime(f: &Fixture, executables: &[&str]) -> Result<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut actions = String::new();
+    for executable in executables {
+        let output = Command::new("ldd").arg(executable).output()?;
+        anyhow::ensure!(output.status.success(), "ldd {executable} failed");
+        let libraries = String::from_utf8(output.stdout)?;
+        let paths = std::iter::once(*executable).chain(
+            libraries
+                .lines()
+                .flat_map(|line| line.split_whitespace())
+                .filter(|word| word.starts_with('/')),
+        );
+        for path in paths {
+            if !seen.insert(path.to_owned()) {
+                continue;
+            }
+            let relative = path.trim_start_matches('/');
+            let destination = f.proto.join(relative);
+            fs::create_dir_all(destination.parent().unwrap())?;
+            fs::copy(path, &destination)?;
+            actions += &format!(
+                "    file {relative:?} mode=\"0755\" uid={} gid={}\n",
+                geteuid().as_raw(),
+                getegid().as_raw()
+            );
+        }
+    }
+    Ok(actions)
+}
+
+/// Whether this host can run trigger handlers under Bubblewrap.
+fn sandbox_available() -> bool {
+    let available = Command::new("/usr/bin/bwrap")
+        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        eprintln!("Skipping: trigger handlers need a working /usr/bin/bwrap");
+    }
+    available
+}
+
+const INDEX: &str = "usr/share/items/index";
+const INDEX_RUNS: &str = "usr/share/items/runs";
+const COUNT: &str = "usr/share/summary/count";
+const COUNT_RUNS: &str = "usr/share/summary/runs";
+/// While this exists in the image, the summary handler fails.
+const SUMMARY_FAIL: &str = "etc/summary-fail";
+
+/// An index trigger that joins every item, and a summary trigger that
+/// counts the index. Both handlers record each run in a second output.
+fn running_fixture() -> Result<Fixture> {
+    let f = Fixture::new()?;
+    let owner = format!("uid={} gid={}", geteuid().as_raw(), getegid().as_raw());
+    f.package("test/runtime", "1.0.0-0", runtime(&f, &["/usr/bin/bash"])?)?;
+    f.package(
+        "test/index",
+        "1.0.0-0",
+        dependency("require", "test/runtime", "1.0.0-0")
+            + &format!("    dir \"usr/share/items\" mode=\"0755\" {owner}\n")
+            + &f.file(
+                "usr/libexec/index",
+                "#!/usr/bin/bash\nset -eu\ncd /usr/share/items\nshopt -s nullglob\n: > index\nfor item in *.item; do printf '%s\\n' \"$(<\"$item\")\" >> index; done\necho run >> runs\n",
+                "0755",
+                "",
+            )?
+            + &trigger(
+                "index",
+                &format!(
+                    "        run \"usr/libexec/index\"\n        watch \"usr/share/items/*.item\"\n        output {INDEX:?}\n        output {INDEX_RUNS:?}\n"
+                ),
+            ),
+    )?;
+    f.package(
+        "test/summary",
+        "1.0.0-0",
+        dependency("require", "test/index", "1.0.0-0")
+            + &format!("    dir \"usr/share/summary\" mode=\"0755\" {owner}\n")
+            + &f.file(
+                "usr/libexec/summary",
+                &format!(
+                    "#!/usr/bin/bash\nset -eu\n[[ ! -e /{SUMMARY_FAIL} ]] || exit 42\nmapfile -t lines < /{INDEX}\necho \"${{#lines[@]}}\" > /{COUNT}\necho run >> /{COUNT_RUNS}\n"
+                ),
+                "0755",
+                "",
+            )?
+            + &trigger(
+                "summary",
+                &format!(
+                    "        run \"usr/libexec/summary\"\n        watch {INDEX:?}\n        output {COUNT:?}\n        output {COUNT_RUNS:?}\n"
+                ),
+            ),
+    )?;
+    for (name, item) in [("a", "alpha"), ("b", "bravo")] {
+        f.package(
+            &format!("test/{name}"),
+            "1.0.0-0",
+            f.file(&format!("usr/share/items/{name}.item"), item, "0644", "")?,
+        )?;
+    }
+    f.create()?;
+    Ok(f)
+}
+
+fn read(f: &Fixture, path: &str) -> Result<String> {
+    Ok(fs::read_to_string(f.root.join(path))?)
+}
+
+fn run_count(f: &Fixture, path: &str) -> Result<usize> {
+    Ok(read(f, path)?.lines().count())
+}
+
+/// Plan a request and the plan that aborts it from the committed revision.
+fn with_inverse(root: &Path, request: Request) -> Result<(Plan, Plan)> {
+    let (forward, inverse, _, _) = with_states(root, request)?;
+    Ok((forward, inverse))
+}
+
+/// A plan, its abort, the committed state, and the planned state.
+fn with_states(
+    root: &Path,
+    request: Request,
+) -> Result<(Plan, Plan, crate::image::State, crate::image::State)> {
+    let (forward, next, _) =
+        crate::plan::plan_image(root, request, crate::PlanOptions::default(), None)?;
+    let base = crate::image::Image::open_query(root)?.state()?;
+    let inverse = forward.inverse(&base, &next)?;
+    Ok((forward, inverse, base, next))
+}
+
+/// Leave `plan` pending after its triggers ran, then abort it.
+fn abort_after_triggers(f: &Fixture, plan: &Plan) -> Result<()> {
+    let saved = f._dir.path().join("forward.json");
+    fs::write(&saved, serde_json::to_vec(plan)?)?;
+    interrupt_worker(&f.root, &saved, &[("CPS_TEST_INTERRUPT_STEP", "triggers")])?;
+    let revision = crate::transaction_status(&f.root)?.revision;
+    assert_eq!(crate::abort_transaction(&f.root, false)?, Some(revision));
+    assert!(crate::transaction_status(&f.root)?.pending.is_none());
+    let findings = verify::verify_pristine(&f.root)?;
+    assert!(findings.is_empty(), "{findings:?}");
+    Ok(())
+}
+
+fn install(packages: &[&str]) -> Request {
+    Request::Install {
+        packages: packages.iter().map(|name| (*name).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn abort_regenerates_trigger_outputs_for_the_restored_files() -> Result<()> {
+    if !sandbox_available() {
+        return Ok(());
+    }
+    let f = running_fixture()?;
+    apply(&f.root, &install_plan(&f.root, &["test/index", "test/a"])?)?;
+    assert_eq!(read(&f, INDEX)?, "alpha\n");
+
+    // A changed watched path runs the trigger again over the restored files.
+    let (forward, inverse) = with_inverse(&f.root, install(&["test/b"]))?;
+    assert_eq!(runs(&forward), ["test/index:index"]);
+    assert_eq!(runs(&inverse), ["test/index:index"]);
+    assert!(inverse.retired_triggers.is_empty());
+    abort_after_triggers(&f, &forward)?;
+    assert_eq!(read(&f, INDEX)?, "alpha\n");
+    assert_eq!(run_count(&f, INDEX_RUNS)?, 3);
+
+    // A trigger that the transaction added goes away with its outputs, and
+    // triggers whose inputs did not change do not run.
+    let (forward, inverse) = with_inverse(&f.root, install(&["test/summary"]))?;
+    assert_eq!(runs(&forward), ["test/summary:summary"]);
+    assert!(runs(&inverse).is_empty());
+    assert_eq!(
+        inverse.retired_triggers,
+        [TriggerRun {
+            package: "test/summary".into(),
+            name: "summary".into(),
+            boot: false,
+        }]
+    );
+    abort_after_triggers(&f, &forward)?;
+    assert!(!f.root.join("usr/share/summary").exists());
+    assert_eq!(run_count(&f, INDEX_RUNS)?, 3);
+
+    // A trigger that the transaction removed runs again for its restored package.
+    apply(&f.root, &install_plan(&f.root, &["test/summary"])?)?;
+    let (forward, inverse) = with_inverse(
+        &f.root,
+        Request::Remove {
+            packages: vec!["test/summary".into()],
+        },
+    )?;
+    assert!(runs(&forward).is_empty());
+    assert_eq!(forward.retired_triggers, inverse_runs(&inverse));
+    abort_after_triggers(&f, &forward)?;
+    assert_eq!(read(&f, COUNT)?, "1\n");
+    assert_eq!(run_count(&f, COUNT_RUNS)?, 1);
+    assert_eq!(run_count(&f, INDEX_RUNS)?, 3);
+    Ok(())
+}
+
+fn inverse_runs(inverse: &Plan) -> Vec<TriggerRun> {
+    assert!(inverse.retired_triggers.is_empty());
+    inverse.triggers.clone()
+}
+
+#[test]
+fn interrupted_abort_runs_each_remaining_trigger_once() -> Result<()> {
+    if !sandbox_available() {
+        return Ok(());
+    }
+    let f = running_fixture()?;
+    let base = apply(
+        &f.root,
+        &install_plan(&f.root, &["test/summary", "test/a"])?,
+    )?;
+    let forward = install_plan(&f.root, &["test/b"])?;
+    let saved = f._dir.path().join("forward.json");
+    fs::write(&saved, serde_json::to_vec(&forward)?)?;
+    let finish = |resume: bool| -> Result<Option<u64>> {
+        if resume {
+            crate::resume_transaction(&f.root)
+        } else {
+            crate::abort_transaction(&f.root, false)
+        }
+    };
+    let pending_after_triggers = || -> Result<(usize, usize)> {
+        interrupt_worker(&f.root, &saved, &[("CPS_TEST_INTERRUPT_STEP", "triggers")])?;
+        assert_eq!(read(&f, INDEX)?, "alpha\nbravo\n");
+        assert_eq!(read(&f, COUNT)?, "2\n");
+        Ok((run_count(&f, INDEX_RUNS)?, run_count(&f, COUNT_RUNS)?))
+    };
+    let assert_aborted = |runs: (usize, usize), step: &str| -> Result<()> {
+        assert!(
+            crate::transaction_status(&f.root)?.pending.is_none(),
+            "{step}"
+        );
+        assert_eq!(read(&f, INDEX)?, "alpha\n", "{step}");
+        assert_eq!(read(&f, COUNT)?, "1\n", "{step}");
+        assert_eq!(
+            (run_count(&f, INDEX_RUNS)?, run_count(&f, COUNT_RUNS)?),
+            (runs.0 + 1, runs.1 + 1),
+            "{step}: each trigger runs once per abort"
+        );
+        let findings = verify::verify_pristine(&f.root)?;
+        assert!(findings.is_empty(), "{step}: {findings:?}");
+        Ok(())
+    };
+
+    // A worker stops the abort before and after its trigger phase and
+    // before each trigger. Either command finishes it.
+    let steps = [
+        "abort-retired",
+        "abort-trigger-0",
+        "abort-trigger-1",
+        "abort-pruned",
+    ];
+    for (step, resume) in steps
+        .iter()
+        .flat_map(|step| [(*step, false), (*step, true)])
+    {
+        let runs = pending_after_triggers()?;
+        interrupt_worker(
+            &f.root,
+            &saved,
+            &[("CPS_TEST_INTERRUPT_STEP", step), ("CPS_TEST_ABORT", "1")],
+        )?;
+        assert!(
+            crate::transaction_status(&f.root)?
+                .pending
+                .is_some_and(|pending| pending.aborting),
+            "{step}"
+        );
+        assert_eq!(finish(resume)?, Some(base), "{step}");
+        assert_aborted(runs, step)?;
+    }
+
+    // A failed handler keeps the abort pending after the triggers that finished.
+    for resume in [false, true] {
+        let runs = pending_after_triggers()?;
+        fs::create_dir_all(f.root.join("etc"))?;
+        fs::write(f.root.join(SUMMARY_FAIL), "")?;
+        let error = crate::abort_transaction(&f.root, false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("trigger test/summary:summary failed"),
+            "{error:#}"
+        );
+        assert_eq!(read(&f, INDEX)?, "alpha\n");
+        assert_eq!(read(&f, COUNT)?, "2\n");
+        fs::remove_file(f.root.join(SUMMARY_FAIL))?;
+        fs::remove_dir(f.root.join("etc"))?;
+        assert_eq!(finish(resume)?, Some(base));
+        assert_aborted(runs, "failed handler")?;
+    }
     Ok(())
 }

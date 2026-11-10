@@ -68,6 +68,9 @@ struct AbortProgress {
     /// Live service jobs that the abort runs around its writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     live_jobs: Option<systemd::LiveJobs>,
+    /// How many of the inverse plan's triggers have run and published their outputs.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    triggers_done: usize,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -858,6 +861,7 @@ fn abort_pending(
             pending.journal_mut().abort = Some(AbortProgress {
                 files_ready: false,
                 live_jobs,
+                triggers_done: 0,
             });
             image.update_pending(&pending)?;
         }
@@ -900,7 +904,11 @@ fn abort_pending(
         )?;
     }
     systemd::clean_enablement(&image.root, &inverse.writes, &base.paths)?;
-    let actions = live || !inverse.systemd.is_empty();
+    let actions = live
+        || !inverse.systemd.is_empty()
+        || !inverse.triggers.is_empty()
+        || !inverse.retired_triggers.is_empty()
+        || inverse.kernel_install.is_some();
     if actions && !files_ready {
         pending
             .journal_mut()
@@ -919,6 +927,35 @@ fn abort_pending(
         };
         if !inverse.systemd.is_empty() {
             systemd::run(&image.root, &path, &inverse.systemd, base, live)?;
+        }
+        // Generated outputs follow the restored files, exactly as after
+        // applying a plan from `next` to `base`. Retiring and pruning are
+        // idempotent, and each completed trigger is journaled, so a resumed
+        // abort runs only the rest.
+        if !inverse.triggers.is_empty() || !inverse.retired_triggers.is_empty() {
+            triggers::retire(&image.root, &inverse.retired_triggers, &next, base)?;
+            root::test_point("abort-retired");
+            let done = pending
+                .journal()
+                .abort
+                .as_ref()
+                .map_or(0, |abort| abort.triggers_done);
+            for (index, run) in inverse.triggers.iter().enumerate().skip(done) {
+                root::test_point(&format!("abort-trigger-{index}"));
+                triggers::run(&image.root, &stage, &path, run, base)?;
+                pending
+                    .journal_mut()
+                    .abort
+                    .as_mut()
+                    .expect("recorded abort")
+                    .triggers_done = index + 1;
+                image.update_pending(&pending)?;
+            }
+            triggers::prune(&image.root, &inverse.writes, base)?;
+            root::test_point("abort-pruned");
+        }
+        if let Some(kernel) = &inverse.kernel_install {
+            kernel.prepare(image, &path, &base.settings)?;
         }
         // A recovery plan's paths return to the damage it was repairing.
         let journaled: BTreeSet<&str> = inverse
@@ -1239,6 +1276,7 @@ fn finish(
                 image.update_pending(&pending)?;
             }
             triggers::prune(&image.root, pending.work().writes, next)?;
+            root::test_point("triggers");
         }
         let work = pending.work();
         if let Some(kernel) = work.kernel_install {
