@@ -170,6 +170,9 @@ reject 'not a GPT Linux filesystem partition' other.raw \
     "$cps" boot-env image --btrfs-volume volume --root "$root" --environments volume/@environments \
     --disk template.raw --root-partuuid "$esp_uuid" --output other.raw
 reject 'already has CPS boot files' reused.raw image reused.raw disk.raw
+printf 'MZ#### LoaderInfo: systemd-boot 255.4 ####' > old-loader.efi
+template old-loader.raw old-loader.efi
+reject 'EFI/BOOT/BOOTX64.EFI on the ESP is systemd-boot 255.4' old.raw image old.raw old-loader.raw
 mkfifo "$root/fifo"
 reject 'cannot image special file "fifo"' special.raw image special.raw
 rm "$root/fifo"

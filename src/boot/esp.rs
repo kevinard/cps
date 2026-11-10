@@ -162,6 +162,26 @@ impl Esp {
         Ok(())
     }
 
+    /// Copy out the systemd-boot binaries that firmware can start.
+    pub fn read_loaders(&self) -> Result<()> {
+        if !self.has_directory("", "EFI")? {
+            return Ok(());
+        }
+        for (directory, prefix) in [("systemd", "systemd-boot"), ("BOOT", "boot")] {
+            if !self.has_directory("EFI", directory)? {
+                continue;
+            }
+            let directory = format!("EFI/{directory}");
+            for entry in self.children(&directory)? {
+                let name = entry.name.to_ascii_lowercase();
+                if !entry.directory && name.starts_with(prefix) && name.ends_with(".efi") {
+                    self.copy_out(&format!("{directory}/{}", entry.name), MAX_ESP_BYTES)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn read_file_if_present(&self, directory: &str, name: &str, limit: u64) -> Result<()> {
         if let Some(entry) = self
             .children(directory)?

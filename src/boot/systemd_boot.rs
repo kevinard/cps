@@ -1,4 +1,5 @@
 mod destroy;
+pub(super) mod loader;
 pub(super) mod policy;
 mod prune;
 mod uefi;
@@ -656,6 +657,9 @@ pub(super) fn activate(
     // A pinned selection, as after a rollback, needs `preferred` to try the new entry.
     let prefer_trial =
         firmware.is_none() && select_trial && policy.as_ref() != Some(&LoaderPolicy::Automatic);
+    if prefer_trial {
+        loader::require_preferred(&esp)?;
+    }
     let mut _fallback_lock = None;
     if let Some(fallback) = fallback.as_deref().filter(|_| select_trial) {
         let base = find_known_good(&existing, fallback)

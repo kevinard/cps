@@ -25,7 +25,7 @@ use super::{
     esp::{Esp, disk_helper},
     is_registered_btrfs, source_date_epoch,
     systemd_boot::{
-        Activation, BootFiles, bootstrap_offline, canonical_partuuid, policy::BootRoot,
+        Activation, BootFiles, bootstrap_offline, canonical_partuuid, loader, policy::BootRoot,
     },
     tree,
 };
@@ -134,6 +134,8 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
     let esp_partition = stage.disk.esp()?;
     let esp = Esp::read(&stage.disk, esp_partition, &work, epoch)?;
     esp.require_no_boot_files()?;
+    esp.read_loaders()?;
+    loader::check_preferred(&esp.tree, None)?;
 
     let filesystem = OpenOptions::new()
         .read(true)
