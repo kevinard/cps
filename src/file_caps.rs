@@ -259,8 +259,18 @@ impl fmt::Display for FileCapabilities {
 fn require_unmapped_ids() -> Result<()> {
     // The kernel can translate v3 xattrs to v2 when observed inside the
     // namespace that created them. A boot image needs host-scope metadata.
-    let map = fs::read_to_string("/proc/self/uid_map")
-        .context("checking file capability UID namespace")?;
+    let map = match fs::read_to_string("/proc/self/uid_map") {
+        Ok(map) => map,
+        // A kernel without user namespaces has no uid_map: every process is
+        // in the initial namespace.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::path::Path::new("/proc/self/status").exists() =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("checking file capability UID namespace"),
+    };
     ensure!(
         map.split_ascii_whitespace().eq(["0", "0", "4294967295"]),
         "file capabilities require an unmapped UID namespace"

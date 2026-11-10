@@ -481,6 +481,8 @@ test ! -e /captures/incomplete
 test -z "$(find /captures -maxdepth 1 -name '.cps-capture-*')"
 # The systemd subvolumes are excluded by default, and others on request.
 test ! -e /var/lib/machines
+# Packages ship nothing under /var; systemd-tmpfiles creates /var/lib at boot.
+$bb mkdir -p /var/lib
 btrfs subvolume create /var/lib/machines
 echo 'machine image' > /var/lib/machines/image
 $bb chmod 0710 /var/lib/machines
