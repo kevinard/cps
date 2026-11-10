@@ -141,12 +141,13 @@ publish runtime 2.0.0-0 demo/runtime
 reject_plan install demo/runtime@2.0.0-0
 test ! -e image/usr/lib/libcps-abi.so.2
 "$cps" plan --root image --output loader.json remove demo/loader
-if "$cps" boot-env stage --source image --root staged loader.json > rejected.log 2>&1; then
-    echo 'Staging accepted a transaction that breaks the managed interpreter' >&2
+cp -a --reflink=auto -- image staged
+if "$cps" apply --root staged loader.json > rejected.log 2>&1; then
+    echo 'A copy accepted a transaction that breaks the managed interpreter' >&2
     exit 1
 fi
 grep -F 'missing ELF interpreter /usr/lib/cps-test-loader' rejected.log
-test ! -e staged
+rm -rf -- staged
 
 rm -- runtime/usr/lib/libcps-abi.so.2
 printf 'int answer(void) { return 43; }\n' > library.c

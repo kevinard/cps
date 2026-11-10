@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture a running Btrfs root and boot the staged subvolume and ext4 export.
+# Capture a running Btrfs root and boot the staged subvolume.
 set -euo pipefail
 umask 022
 
@@ -135,7 +135,7 @@ UNIT
     done
 fi
 publish 2.0.0-0
-mkdir -p "$root"/{bin,usr/bin,proc,sys,dev,tmp,captures,scratch,repository} files/@captures
+mkdir -p "$root"/{bin,usr/bin,proc,sys,dev,tmp,captures,repository} files/@captures
 cp -a repo/. "$root/repository/"
 printf '2.0.0-0\n' > "$root/etc/cps-btrfs-trial-version"
 if [[ $staged_transactions == 1 ]]; then
@@ -154,7 +154,7 @@ strip --strip-debug -o "$root/usr/bin/cps" "$cps"
 copy_runtime_deps "$root" "$cps"
 cp "$btrfs" "$root/usr/bin/btrfs"
 copy_runtime_deps "$root" "$btrfs"
-for tool in cp cmp mke2fs e2fsck mount umount find sha256sum sfdisk flock; do
+for tool in cp cmp mount umount find sha256sum sfdisk flock; do
     binary=$(command -v "$tool")
     cp "$binary" "$root/usr/bin/$tool"
     copy_runtime_deps "$root" "$binary"
@@ -331,7 +331,7 @@ if [ "$version" = "$trial_version" ]; then
         cps boot-env list --esp /efi
         before=$(sha256sum /efi/loader/loader.conf)
         if cps boot-env rollback --esp /efi > /run/rejected 2>&1; then exit 1; fi
-        $bb grep -F 'use --btrfs-volume' /run/rejected
+        $bb grep -F -e '--btrfs-volume <BTRFS_VOLUME>' /run/rejected
         test "$(sha256sum /efi/loader/loader.conf)" = "$before"
         parent=$($bb cat /volume/@captures/base-id)
         entry="/efi/loader/entries/$parent.conf"
@@ -430,7 +430,6 @@ if [ -f /etc/cps-btrfs-boot ]; then
     mount -t btrfs -o subvolid=5 "$root_device" /volume
 fi
 mount -t btrfs -o subvol=@captures "$root_device" /captures
-mount -t ext4 /dev/vdb /scratch
 if [ -f /etc/cps-btrfs-boot ]; then
     boot_files=$(sha256sum /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI)
     boot_paths=$(find /boot /efi -print)
@@ -569,8 +568,6 @@ if [ -f /etc/cps-btrfs-trial-kernel ]; then
     done
     test "$found" = true
 fi
-cps boot-env export --root "$stage" --output /scratch/root.ext4 --size-mib 256 \
-    --receipt > /scratch/root.kdl
 test "$($bb cat "$stage/etc/cps-capture-local")" = 'captured local state'
 echo 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root'
 if [ -f /etc/cps-btrfs-boot ]; then
@@ -640,7 +637,6 @@ if [ -f /etc/cps-btrfs-boot ]; then
     umount /efi
     umount /volume
 fi
-umount /scratch
 umount /captures
 $bb sync
 GUEST
@@ -693,8 +689,6 @@ PARTITIONS
     dd if=source.btrfs of=disk.raw bs=1M seek=97 conv=notrunc,sparse status=none
     root_drive=disk.raw
 fi
-truncate -s 768M scratch.ext4
-mke2fs -q -F -t ext4 scratch.ext4
 data_args=()
 if [[ -n ${CPS_VM_QEMU_DATA:-} ]]; then data_args=(-L "$CPS_VM_QEMU_DATA"); fi
 run() {
@@ -707,8 +701,7 @@ run() {
     tr -d '\r' < "$log" > "$log.clean"
     cat "$log.clean"
 }
-run capture.log "$root_drive" "root=$root_device rootfstype=btrfs rootflags=subvol=@ rootwait rw init=/init" \
-    -drive if=virtio,format=raw,file=scratch.ext4
+run capture.log "$root_drive" "root=$root_device rootfstype=btrfs rootflags=subvol=@ rootwait rw init=/init"
 grep -Fx 'CPS_VM_CAPTURE: excluded nested subvolumes became empty directories' capture.log.clean
 grep -Fx 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the running root' capture.log.clean
 if [[ $native_boot == 1 ]]; then
@@ -778,8 +771,4 @@ else
     run original.log source.btrfs 'root=/dev/vda rootfstype=btrfs rootflags=subvol=@ rootwait ro init=/init-original'
     grep -Fx 'CPS_VM_BTRFS_ORIGINAL: booted the previous root after staging its upgrade' original.log.clean
 fi
-debugfs -R "dump /root.ext4 $work/staged.ext4" scratch.ext4
-test -f staged.ext4
-run boot.log staged.ext4 'root=/dev/vda rootfstype=ext4 rootwait ro init=/init-trial'
-grep -Fx 'CPS_VM_CAPTURE_BOOT: booted the upgrade prepared from the running Btrfs root' boot.log.clean
-echo 'Verified live capture, atomic Btrfs staging, native upgrade and previous-root boots, and ext4 export'
+echo 'Verified live capture, atomic Btrfs staging, and native upgrade and previous-root boots'

@@ -52,16 +52,16 @@ package "test/groups" publisher="modetest" version="1.0.0-0" {
 }
 MANIFEST
 "$cps" publish --repo root/repository --proto proto --signing-key private.der groups.kdl
-truncate -s 256M root.ext4
-mke2fs -q -F -t ext4 -d root root.ext4
+truncate -s 256M root.btrfs
+"${CPS_VM_MKFS_BTRFS:-mkfs.btrfs}" -q -f --rootdir root root.btrfs
 data_args=()
 if [[ -n ${CPS_VM_QEMU_DATA:-} ]]; then data_args=(-L "$CPS_VM_QEMU_DATA"); fi
 result=0
 timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${data_args[@]}" \
     -machine q35,accel=tcg -m 512 -smp 2 -nic none -display none -monitor none \
     -serial file:serial.log -kernel "$kernel" \
-    -append 'root=/dev/vda rootfstype=ext4 rootwait rw console=ttyS0 loglevel=3 init=/init' \
-    -drive if=virtio,format=raw,file=root.ext4 || result=$?
+    -append 'root=/dev/vda rootfstype=btrfs rootwait rw console=ttyS0 loglevel=3 init=/init' \
+    -drive if=virtio,format=raw,file=root.btrfs || result=$?
 tr -d '\r' < serial.log > serial.clean
 tail -40 serial.clean
 test "$result" = 0

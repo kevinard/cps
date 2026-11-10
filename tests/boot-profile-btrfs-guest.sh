@@ -24,7 +24,7 @@ if [ "${1:-}" != observe ]; then
     mount -t vfat /dev/vda1 /efi
     mount -t btrfs -o subvolid=5 /dev/vda2 /volume
     mount -t btrfs -o subvol=@environments /dev/vda2 /environments
-    mount -t ext4 -o ro /dev/vdb /repositories
+    mount -t btrfs -o ro /dev/vdb /repositories
     stage=false
     flags=
     for argument in $("$bb" cat /proc/cmdline); do

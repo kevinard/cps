@@ -126,7 +126,9 @@ test ! -e "drifted/usr/lib/systemd/system/$enabled"
 test ! -e drifted/etc/passwd
 "$cps" transaction status --root drifted | grep -Fx 'No pending transaction'
 
-"$cps" boot-env stage --source base --root staged upgrade.json
+cp -a --reflink=auto -- base staged
+
+"$cps" apply --root staged upgrade.json
 "$cps" verify --root staged
 grep -q "^$user:x:$account_uid:$account_gid:" staged/etc/passwd
 grep -q "^$user:x:$account_gid:" staged/etc/group
@@ -235,7 +237,8 @@ publish
 "$cps" apply --root facet-base facet-install.json
 "$cps" plan --root facet-base --output facet-enable.json change-facet optional=default | tee facet-preview.log
 grep -Fq "Offline systemd tmpfiles $facet_rule" facet-preview.log
-"$cps" boot-env stage --source facet-base --root facet-staged facet-enable.json
+cp -a --reflink=auto -- facet-base facet-staged
+"$cps" apply --root facet-staged facet-enable.json
 test -d "facet-staged/var/lib/$scope-facet"
 test ! -e "facet-base/var/lib/$scope-facet"
 test ! -e "/var/lib/$scope-facet"

@@ -204,8 +204,8 @@ mkfs.fat -F 32 esp.fat >/dev/null
 mcopy -s -i esp.fat esp/EFI ::/
 dd if=esp.fat of=disk.raw bs=1M seek=1 conv=notrunc,sparse status=none
 dd if=source.btrfs of=disk.raw bs=1M seek=97 conv=notrunc,sparse status=none
-truncate -s 768M repositories.ext4
-mke2fs -q -F -t ext4 -d repos repositories.ext4
+truncate -s 768M repositories.btrfs
+"$formatter" -q -f --rootdir repos repositories.btrfs
 data_args=()
 if [[ -n ${CPS_VM_QEMU_DATA:-} ]]; then data_args=(-L "$CPS_VM_QEMU_DATA"); fi
 run() {
@@ -214,7 +214,7 @@ run() {
     timeout "${CPS_VM_TIMEOUT:-240}" "$qemu" "${data_args[@]}" \
         -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
         -serial "file:$log" -drive if=virtio,format=raw,file=disk.raw \
-        -drive if=virtio,format=raw,readonly=on,file=repositories.ext4 "$@" || result=$?
+        -drive if=virtio,format=raw,readonly=on,file=repositories.btrfs "$@" || result=$?
     tr -d '\r' < "$log" > "$log.clean"
     tail -30 "$log.clean"
     test "$result" = 0

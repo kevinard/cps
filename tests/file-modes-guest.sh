@@ -68,7 +68,8 @@ test "$("$bb" stat -c '%a' "$root/tmp")" = 1777
 test "$("$bb" stat -c '%a' "$root/var/shared")" = 2777
 "$probe" launch "$root/bin/helper-link" 0 0
 "$cps" plan --root "$root" --output "$work/clone.json" install test/modes@1.0.0-0
-"$cps" boot-env stage --source "$root" --root "$work/clone" "$work/clone.json"
+cp -a --reflink=auto -- "$root" "$work/clone"
+"$cps" apply --root "$work/clone" "$work/clone.json"
 "$cps" verify --root "$work/clone" --pristine
 "$probe" launch "$work/clone/bin/helper-link" 0 0
 for version in 2 3 4; do

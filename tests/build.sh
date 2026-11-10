@@ -962,7 +962,8 @@ test "$(cat image/hello-alias)" = 'hello 2'
 test "$(cat image/platform)" = 'platform'
 test image/hello -ef image/hello-alias
 "$cps" plan --root guarded --output guarded-wave.json update
-"$cps" boot-env stage --source guarded --root guarded-staged guarded-wave.json
+cp -a --reflink=auto -- guarded guarded-staged
+"$cps" apply --root guarded-staged guarded-wave.json
 "$cps" verify --root guarded-staged --pristine
 "$cps" publisher audit-builds --root guarded-staged canopa | grep -F 'Verified build evidence for 2 installed package'
 test "$(cat guarded-staged/hello-alias)" = 'hello 2'

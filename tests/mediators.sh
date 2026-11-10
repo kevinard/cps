@@ -46,7 +46,8 @@ test -f image/usr/bin/editor-basic
 test -f image/usr/bin/editor-advanced
 
 "$cps" plan --root image --output prefer.json set-mediator editor --provider editors/basic
-"$cps" boot-env stage --source image --root staged prefer.json
+cp -a --reflink=auto -- image staged
+"$cps" apply --root staged prefer.json
 assert_links image editor-advanced
 assert_links staged editor-basic
 "$cps" mediator --root staged --json | jq -e '.[0] | .preferred == "editors/basic" and .selected == "editors/basic"'
@@ -66,4 +67,4 @@ assert_links staged editor-basic
 "$cps" plan --root staged --output reset.json set-mediator editor
 "$cps" apply --root staged reset.json
 assert_links staged editor-advanced
-echo 'Verified mediated defaults, persistent preferences, boot staging, and offline reprovisioning'
+echo 'Verified mediated defaults, persistent preferences, a cloned root, and offline reprovisioning'
