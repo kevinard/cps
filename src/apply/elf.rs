@@ -102,7 +102,7 @@ impl<'a> Known<'a> {
     /// Combine recorded fingerprints with the drift check's results. Only
     /// paths that the drift check covered, and whose fingerprint it did not
     /// find stale, are known.
-    pub(super) fn new(records: &'a FileRecords, drift: &'a Checked, plan: &'a Plan) -> Self {
+    pub(super) fn new(records: &'a FileRecords, drift: &'a Checked, plan: &Plan) -> Self {
         let mut files = BTreeMap::new();
         if !super::drift_checked(plan) {
             return Self { files };

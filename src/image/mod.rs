@@ -484,6 +484,45 @@ pub(crate) struct FileRecord {
 
 pub(crate) type FileRecords = BTreeMap<String, FileRecord>;
 
+/// What a transaction learned about unchanged files before writing any.
+///
+/// Fingerprints describe the files on disk rather than the committed state,
+/// so they are saved with the pending record instead of at commit.
+#[derive(Default)]
+pub(crate) struct FileUpdates<'a> {
+    pub(crate) observed: Option<&'a BTreeMap<String, Observation>>,
+    pub(crate) stale: Option<&'a BTreeSet<String>>,
+    /// Cached ELF metadata for files whose fingerprint is unchanged.
+    pub(crate) elf: Vec<(&'a str, &'a Observation, String)>,
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn save_elf(
+    tx: &rusqlite::Transaction<'_>,
+    entries: &[(&str, &Observation, String)],
+) -> Result<()> {
+    let mut update = tx.prepare_cached(
+        "UPDATE files SET elf=?1 WHERE path=?2 AND sha256=?3 AND ino=?4 AND size=?5
+         AND mtime_ns=?6 AND ctime_ns=?7 AND mode=?8 AND uid=?9 AND gid=?10",
+    )?;
+    for (path, observation, elf) in entries {
+        let fingerprint = &observation.fingerprint;
+        update.execute(params![
+            elf,
+            path,
+            observation.sha256,
+            fingerprint.ino as i64,
+            fingerprint.size as i64,
+            fingerprint.mtime_ns,
+            fingerprint.ctime_ns,
+            fingerprint.mode,
+            fingerprint.uid,
+            fingerprint.gid,
+        ])?;
+    }
+    Ok(())
+}
+
 const FILE_COLUMNS: &str =
     "path, sha256, capabilities, ino, size, mtime_ns, ctime_ns, mode, uid, gid, elf";
 
@@ -1099,8 +1138,15 @@ impl Image {
         next: &State,
         receipts: &[BuildReceipt],
         repo_backed: bool,
+        files: &FileUpdates<'_>,
     ) -> Result<()> {
         let tx = self.db.transaction()?;
+        save_file_records(
+            &tx,
+            files.observed.unwrap_or(&BTreeMap::new()),
+            files.stale.unwrap_or(&BTreeSet::new()),
+        )?;
+        save_elf(&tx, &files.elf)?;
         if repo_backed {
             catalogs::save(&tx, next)?;
         }
@@ -1138,53 +1184,6 @@ impl Image {
             }
         }
         Ok(records)
-    }
-
-    /// Record new settled fingerprints and forget ones that no longer match.
-    /// Fingerprints describe the files on disk, not the committed state, so
-    /// they can be saved outside a transaction's commit.
-    pub(crate) fn record_files(
-        &mut self,
-        observed: &BTreeMap<String, Observation>,
-        stale: &BTreeSet<String>,
-    ) -> Result<()> {
-        if observed.is_empty() && stale.is_empty() {
-            return Ok(());
-        }
-        let tx = self.db.transaction()?;
-        save_file_records(&tx, observed, stale)?;
-        Ok(tx.commit()?)
-    }
-
-    /// Cache ELF metadata for files whose recorded fingerprint is unchanged.
-    #[allow(clippy::cast_possible_wrap)]
-    pub(crate) fn record_elf(&mut self, entries: &[(&str, &Observation, String)]) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let tx = self.db.transaction()?;
-        {
-            let mut update = tx.prepare_cached(
-                "UPDATE files SET elf=?1 WHERE path=?2 AND sha256=?3 AND ino=?4 AND size=?5
-                 AND mtime_ns=?6 AND ctime_ns=?7 AND mode=?8 AND uid=?9 AND gid=?10",
-            )?;
-            for (path, observation, elf) in entries {
-                let fingerprint = &observation.fingerprint;
-                update.execute(params![
-                    elf,
-                    path,
-                    observation.sha256,
-                    fingerprint.ino as i64,
-                    fingerprint.size as i64,
-                    fingerprint.mtime_ns,
-                    fingerprint.ctime_ns,
-                    fingerprint.mode,
-                    fingerprint.uid,
-                    fingerprint.gid,
-                ])?;
-            }
-        }
-        Ok(tx.commit()?)
     }
 
     pub fn update_pending(&self, data: &impl Serialize) -> Result<()> {

@@ -53,8 +53,9 @@ pub fn verify(path: &Path) -> Result<Vec<Finding>> {
 
 /// Check an image, trusting recorded file fingerprints that still match.
 ///
-/// Directories, symlinks, hard links, ownership, modes, and the package and
-/// path index are checked as in full verification. A regular file whose
+/// Directories, symlinks, hard links, ownership, modes, and the path index
+/// are checked as in full verification. The stored package manifests are
+/// trusted rather than parsed again from their signed documents. A regular file whose
 /// inode, size, timestamps, mode, and owner still match the fingerprint CPS
 /// recorded when it last hashed the file is not read again. Use full
 /// verification to detect changes made below the filesystem, such as an
@@ -109,8 +110,9 @@ pub fn verify_selected(
     let contents = records
         .as_ref()
         .map_or(Contents::Hash, Contents::Fingerprints);
+    let committed = quick.then_some(&state.installed);
     Ok(
-        check_state(&image.root, &state, false, contents, None, |path| {
+        check_state(&image.root, &state, false, contents, committed, |path| {
             selected.contains(path)
         })?
         .findings,
@@ -197,7 +199,10 @@ fn check_image(image: &Image, pristine: bool, quick: bool) -> Result<Vec<Finding
     let contents = records
         .as_ref()
         .map_or(Contents::Hash, Contents::Fingerprints);
-    Ok(check_state(&image.root, &state, pristine, contents, None, |_| true)?.findings)
+    // Quick verification trusts committed manifest records, which CPS
+    // verified before committing them, instead of parsing every manifest.
+    let committed = quick.then_some(&state.installed);
+    Ok(check_state(&image.root, &state, pristine, contents, committed, |_| true)?.findings)
 }
 
 /// Compute the ownership index from the installed manifests, re-verifying

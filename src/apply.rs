@@ -474,7 +474,6 @@ pub(crate) fn apply_to_image(
     let (checked, mut next, receipts) = check_plan(&image, state, plan)?;
     let records = image.file_records(None)?;
     let drift = check_drift(&image.root, &checked, &next, &base, &records)?;
-    image.record_files(&drift.observed, &drift.stale)?;
     let stage = image.stage()?;
     let after = if let Some(stage_packages) = live {
         check_live_plan(&checked, stage_packages)?;
@@ -484,9 +483,10 @@ pub(crate) fn apply_to_image(
         AfterFiles::offline(&image.root, &checked)?
     };
     let staged = prepare(&image.root, &stage, &checked, &next)?;
+    let mut learned = Vec::new();
     if check_elf {
         let known = elf::Known::new(&records, &drift, &checked);
-        let learned = elf::check(
+        learned = elf::check(
             &image.root,
             stage.as_file(),
             &checked,
@@ -494,7 +494,6 @@ pub(crate) fn apply_to_image(
             &next,
             &known,
         )?;
-        image.record_elf(&learned)?;
     }
     let repo_backed = !checked.catalogs.is_empty();
     let delta = StateDelta::between(&base, &next);
@@ -515,7 +514,14 @@ pub(crate) fn apply_to_image(
     } else {
         PendingRecord::Journaled(journal)
     };
-    image.record_pending(&pending, &next, &receipts, repo_backed)?;
+    // Fingerprints and ELF metadata learned above join the pending record's
+    // SQLite transaction rather than costing syncs of their own.
+    let files = crate::image::FileUpdates {
+        observed: Some(&drift.observed),
+        stale: Some(&drift.stale),
+        elf: learned,
+    };
+    image.record_pending(&pending, &next, &receipts, repo_backed, &files)?;
     let transaction = Transaction {
         base: &base,
         next: &next,
