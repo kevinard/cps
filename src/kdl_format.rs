@@ -901,6 +901,8 @@ pub(crate) struct BtrfsConfig {
     /// Known-good environments retained beyond the protected ones.
     pub keep_environments: usize,
     pub auto_prune: bool,
+    /// Snapshot the running root as a known-good environment before each live change.
+    pub live_backup: bool,
     /// Nested subvolumes that staged roots replace with empty directories.
     pub exclude_subvolumes: Vec<String>,
 }
@@ -1015,6 +1017,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                         "tries",
                         "keep-environments",
                         "auto-prune",
+                        "live-backup",
                     ],
                     true,
                 )?;
@@ -1072,6 +1075,16 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                             value
                                 .as_bool()
                                 .context("auto-prune must be #true or #false")
+                        })
+                        .transpose()?
+                        .unwrap_or(true),
+                    live_backup: fields
+                        .properties
+                        .get("live-backup")
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .context("live-backup must be #true or #false")
                         })
                         .transpose()?
                         .unwrap_or(true),

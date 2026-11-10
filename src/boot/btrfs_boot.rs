@@ -458,6 +458,36 @@ impl Activation<Option<String>> {
     }
 }
 
+impl Activation<Option<String>> {
+    /// Register a backup root as a known-good environment without selecting it.
+    pub(crate) fn register_btrfs_backup(
+        &self,
+        root: &Path,
+        volume: &Path,
+        esp: &Path,
+        uki: bool,
+        uefi: bool,
+    ) -> Result<String> {
+        let volume = BtrfsVolume::open(volume)?;
+        let mode = if uefi {
+            BootMode::Uefi
+        } else if uki {
+            BootMode::Uki
+        } else {
+            BootMode::Split
+        };
+        let activation = Activation {
+            root_partuuid: self.root_partuuid.clone(),
+            kernel: self.kernel.clone(),
+            initrd: self.initrd.clone(),
+            options: self.options.clone(),
+            tries: 1,
+            known_good: true,
+        };
+        systemd_boot::register_backup(root, esp, &activation, &volume, mode)
+    }
+}
+
 pub(crate) fn bless_uefi(esp: &Path, volume: &Path) -> Result<Option<String>> {
     systemd_boot::bless_uefi(esp, &BtrfsVolume::open(volume)?)
 }

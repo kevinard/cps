@@ -59,7 +59,19 @@ pub fn capture_boot_environment(
     output: &Path,
     excluded: &[String],
 ) -> Result<String> {
-    snapshot_environment(source, output, None, false, excluded)
+    snapshot_environment(source, output, Snapshot::Capture, false, excluded)
+}
+
+/// What a snapshot becomes.
+#[derive(Clone, Copy)]
+enum Snapshot<'a> {
+    /// A read-only copy with the source's identity.
+    Capture,
+    /// A writable trial with a saved plan applied.
+    Stage(&'a Plan),
+    /// A read-only known-good environment with its own identity, ready for
+    /// registration.
+    Backup,
 }
 
 /// Stage a saved plan in a new writable Btrfs snapshot of an inactive baseline.
@@ -69,7 +81,7 @@ pub fn stage_btrfs_boot_environment(
     plan: &Plan,
     excluded: &[String],
 ) -> Result<String> {
-    snapshot_environment(source, output, Some(plan), false, excluded)
+    snapshot_environment(source, output, Snapshot::Stage(plan), false, excluded)
 }
 
 pub(crate) fn stage_running_btrfs(
@@ -77,7 +89,35 @@ pub(crate) fn stage_running_btrfs(
     plan: &Plan,
     excluded: &[String],
 ) -> Result<String> {
-    snapshot_environment(Path::new("/"), output, Some(plan), true, excluded)
+    snapshot_environment(
+        Path::new("/"),
+        output,
+        Snapshot::Stage(plan),
+        true,
+        excluded,
+    )
+}
+
+/// Snapshot the running root as a read-only backup environment.
+///
+/// The backup gets a new image identity and its boot registration mark
+/// before it becomes read-only. It returns the backup's entry ID.
+pub(crate) fn backup_running_btrfs(output: &Path, excluded: &[String]) -> Result<String> {
+    snapshot_environment(Path::new("/"), output, Snapshot::Backup, true, excluded)
+}
+
+/// Make a read-only environment writable before it is booted.
+pub(super) fn make_writable(root: &Root) -> Result<()> {
+    let flags = subvolume_flags(root)?;
+    if flags & READ_ONLY == 0 {
+        return Ok(());
+    }
+    let mut flags = flags & !READ_ONLY;
+    const SET_FLAGS: Opcode = opcode::write::<u64>(0x94, 26);
+    // SAFETY: BTRFS_IOC_SUBVOL_SETFLAGS reads one u64 from the provided buffer.
+    unsafe { ioctl(root.as_file(), Updater::<SET_FLAGS, _>::new(&mut flags)) }
+        .context("making the selected backup environment writable")?;
+    root.sync()
 }
 
 /// Normalize configured subvolume exclusions and add the defaults.
@@ -208,10 +248,15 @@ fn largest_initrd(root: &Path) -> Result<Option<u64>> {
 fn snapshot_environment(
     source: &Path,
     output: &Path,
-    plan: Option<&Plan>,
+    kind: Snapshot<'_>,
     from_running: bool,
     excluded: &[String],
 ) -> Result<String> {
+    let plan = match kind {
+        Snapshot::Stage(plan) => Some(plan),
+        Snapshot::Capture | Snapshot::Backup => None,
+    };
+    let backup = matches!(kind, Snapshot::Backup);
     let excluded = excluded_subvolumes(excluded)?;
     let source = fs::canonicalize(source).context("opening the root to capture")?;
     let root = Root::open(&source)?;
@@ -278,6 +323,14 @@ fn snapshot_environment(
             let snapshot = Root::open(&scratch.path().join("root"))?;
             let path = scratch.path().join("root");
             replace_excluded_stubs(&image.root, &snapshot, &path, &excluded)?;
+            if backup {
+                let settings = Image::open(&path, true)?.fork_for_backup()?;
+                super::btrfs_boot::clear_registration(&snapshot)?;
+                super::btrfs_boot::mark_registered(
+                    &snapshot,
+                    &entry_id(&settings.id, settings.boot_revision()),
+                )?;
+            }
             if plan.is_none() {
                 set_read_only(&snapshot)?;
             }
@@ -289,12 +342,17 @@ fn snapshot_environment(
         );
         let captured_settings = captured.settings()?;
         ensure!(
-            captured_settings.id == settings.id && captured_settings.revision == settings.revision,
+            (captured_settings.id == settings.id) != backup
+                && captured_settings.revision == settings.revision,
             "captured image identity or revision changed"
         );
         check_snapshot_tree(&captured.root)?;
         if from_running && plan.is_some_and(Plan::is_recovery) {
             captured.verify_catalog_archives(&captured.state()?)?;
+        } else if backup {
+            // A snapshot shares every inode with the running root, which the
+            // live transaction checks next, so recorded fingerprints hold.
+            crate::verify::require_quick(&captured).context("verifying the backup")?;
         } else {
             check_image_integrity(&captured).context("verifying the captured root")?;
         }
@@ -306,6 +364,8 @@ fn snapshot_environment(
                 settings.as_boot_parent(),
                 plan,
             )?
+        } else if backup {
+            entry_id(&captured_settings.id, captured_settings.boot_revision())
         } else {
             entry_id(&settings.id, settings.revision)
         };

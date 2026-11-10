@@ -34,7 +34,7 @@ use crate::{
     verify::verify_image,
 };
 
-pub(crate) use btrfs::{excluded_subvolumes, stage_running_btrfs};
+pub(crate) use btrfs::{backup_running_btrfs, excluded_subvolumes, stage_running_btrfs};
 pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub use btrfs_boot::{
     activate_btrfs_boot_environment, preview_btrfs_rollback, rollback_btrfs_boot_environment,

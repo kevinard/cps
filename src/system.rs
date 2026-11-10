@@ -17,7 +17,7 @@ use crate::{
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
     apply::{PublisherFetchError, abort_live, apply_live, repair_pending_live, resume_live},
     boot::{
-        discard_btrfs_trial, entry_id, etc_merge, pending_trial,
+        backup_running_btrfs, discard_btrfs_trial, entry_id, etc_merge, pending_trial,
         prune_btrfs_boot_environments, rollback_btrfs_boot_environment, stage_running_btrfs,
         with_running_environment,
     },
@@ -610,6 +610,16 @@ impl System {
             if let Err(error) = etc_merge::remove_leftovers(&Root::open(Path::new(ROOT))?) {
                 eprintln!("Warning: could not remove /etc merge leftovers: {error:#}");
             }
+            // A repair or revert restores package files on a root that fails
+            // verification, so its snapshot could not boot as known-good.
+            if boot.live_backup && change.plan.has_changes() && !change.plan.is_recovery() {
+                let id = self.backup_running().context(
+                    "creating the backup boot environment before the live change. Remove old \
+                     environments with `cps boot-env prune`, or set live-backup=#false in \
+                     boot-btrfs to change the running root without a backup",
+                )?;
+                eprintln!("Saved the running system as boot environment {id}");
+            }
             with_running_environment(
                 &boot.volume,
                 &boot.esp,
@@ -642,6 +652,46 @@ impl System {
         arm_finalize();
         self.prune_after_transaction();
         Ok(Some(id))
+    }
+
+    /// Snapshot the running root as a read-only known-good environment.
+    ///
+    /// A retry after an interrupted backup or an aborted live change reuses
+    /// the backup of the same revision. Callers hold the environments lock.
+    fn backup_running(&self) -> Result<String> {
+        let boot = self.boot();
+        let settings = Image::open_query(Path::new(ROOT))?.settings()?;
+        let output = boot
+            .environments
+            .join(format!("backup-{}-{}", settings.id, settings.revision));
+        let root = output.join("root");
+        if root.try_exists()? {
+            let backup = Image::open_query(&root)?.settings()?;
+            let id = entry_id(&backup.id, backup.boot_revision());
+            if list_boot_environments(&boot.esp)?
+                .iter()
+                .any(|entry| entry.id == id && !entry.is_retiring)
+            {
+                return Ok(id);
+            }
+        } else {
+            if output.try_exists()? {
+                fs::remove_dir(&output).with_context(|| {
+                    format!("removing the empty backup directory {}", output.display())
+                })?;
+            }
+            // Make room on the ESP for the backup's boot files.
+            self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments), None);
+            backup_running_btrfs(&output, &boot.exclude_subvolumes)?;
+        }
+        let id = boot
+            .activation
+            .register_btrfs_backup(&root, &boot.volume, &boot.esp, boot.uki, boot.uefi)
+            .with_context(|| format!("registering the backup at {}", root.display()))?;
+        if boot.auto_prune {
+            self.prune_quietly(Some(boot.keep_environments), None);
+        }
+        Ok(id)
     }
 
     /// Merge the running /etc into the trial selected for the next boot.
@@ -894,7 +944,9 @@ impl System {
             return;
         };
         for child in children.flatten() {
-            if child.file_name().to_string_lossy().starts_with("upgrade-")
+            let name = child.file_name();
+            let name = name.to_string_lossy();
+            if (name.starts_with("upgrade-") || name.starts_with("backup-"))
                 && child.file_type().is_ok_and(|kind| kind.is_dir())
             {
                 // Fails harmlessly while the directory still holds a root.

@@ -456,6 +456,34 @@ mod tests {
     }
 
     #[test]
+    fn backups_count_as_known_good_environments() -> Result<()> {
+        // The running root 5 boots with fallback 3. Live changes left the
+        // backups 6 to 9, which record no parent.
+        let entries: Vec<_> = [3, 6, 7, 8, 9]
+            .into_iter()
+            .map(|revision| entry(revision, None, None))
+            .chain([entry(5, Some(3), None)])
+            .collect();
+        let policy = LoaderPolicy::pinned(&id(5));
+        let protected = protected(Some((id(5), Some(id(3)))), None, None);
+        // The oldest backups retire first, and the running root and its
+        // fallback stay even when they are among the oldest.
+        assert_eq!(
+            removed(&candidates(&entries, &policy, &protected, Some(3))?),
+            [(6, BootRemoval::KnownGood)]
+        );
+        assert_eq!(
+            removed(&candidates(&entries, &policy, &protected, Some(1))?),
+            [
+                (6, BootRemoval::KnownGood),
+                (7, BootRemoval::KnownGood),
+                (8, BootRemoval::KnownGood)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn prune_protects_running_firmware_and_resumable_trials_with_their_fallbacks() -> Result<()> {
         let firmware_trial = entry(5, Some(4), Some(1));
         let staged_trial = entry(7, Some(6), Some(3));

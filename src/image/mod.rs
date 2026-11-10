@@ -1126,6 +1126,23 @@ impl Image {
         Ok(settings)
     }
 
+    /// Give this image a new identity as a known-good backup of its source.
+    ///
+    /// The backup keeps the package revision as its boot revision, so its
+    /// boot entry ID differs from the source's.
+    pub(crate) fn fork_for_backup(&self) -> Result<Settings> {
+        self.require_clean()?;
+        let mut settings = self.settings()?;
+        settings.id = new_identity()?;
+        settings.boot_parent = None;
+        settings.boot_revision = None;
+        self.db.execute(
+            "UPDATE image SET data=?1 WHERE id=1",
+            [serde_json::to_string(&settings)?],
+        )?;
+        Ok(settings)
+    }
+
     /// Record pending configuration updates at the current revision for
     /// preserved files whose vendor copies are already in place.
     pub(crate) fn add_config_updates(&self, paths: &[String]) -> Result<()> {

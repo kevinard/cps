@@ -229,6 +229,12 @@ impl Firmware {
         Ok(())
     }
 
+    /// Create the firmware option of a known-good environment without
+    /// changing the boot selection.
+    pub fn register(&self, id: &str) -> Result<()> {
+        self.ensure_option(id).map(drop)
+    }
+
     pub fn rollback(&self, esp: &Path, id: &str, entries: &[BootEntry]) -> Result<()> {
         self.check_next(entries, true)?;
         let target = self
