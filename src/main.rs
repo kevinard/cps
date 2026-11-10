@@ -1650,7 +1650,7 @@ enum BootCommand {
     },
     /// Write an inactive root and its known-good boot entry to a new copy of a GPT disk
     Image {
-        /// Directory that becomes the Btrfs top level. It holds only the root and environments.
+        /// Directory that becomes the Btrfs top level. It holds only the root, environments, and /var directories.
         #[arg(long)]
         btrfs_volume: PathBuf,
         /// Inactive CPS root in the volume directory, written as the root subvolume
@@ -1659,6 +1659,9 @@ enum BootCommand {
         /// Empty directory in the volume directory, written as the environments subvolume
         #[arg(long)]
         environments: PathBuf,
+        /// Empty directory in the volume directory, written as the shared /var subvolume that the root's /etc/fstab mounts
+        #[arg(long)]
+        var: Option<PathBuf>,
         /// GPT disk with a systemd-boot ESP and the target Linux filesystem partition
         #[arg(long)]
         disk: PathBuf,
@@ -3982,6 +3985,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 btrfs_volume,
                 root,
                 environments,
+                var,
                 disk,
                 root_partuuid,
                 output,
@@ -3993,6 +3997,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     volume: &btrfs_volume,
                     root: &root,
                     environments: &environments,
+                    var: var.as_deref(),
                     disk: &disk,
                     root_partuuid: &root_partuuid,
                     output: &output,

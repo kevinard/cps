@@ -14,9 +14,9 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
-mkdir -p proto/bin proto/boot proto/tmp proto/var/shared
+mkdir -p proto/bin proto/boot proto/tmp proto/srv/shared
 chmod 1777 proto/tmp
-chmod 2775 proto/var/shared
+chmod 2775 proto/srv/shared
 printf 'managed data\n' > proto/bin/tool
 chmod 0755 proto/bin/tool
 ln proto/bin/tool proto/bin/alias
@@ -61,8 +61,10 @@ PARTITIONS
 }
 template template.raw "$efi"
 image() {
+    local output=$1 disk=${2:-template.raw}
+    shift $(($# < 2 ? $# : 2))
     "$cps" boot-env image --btrfs-volume volume --root "$root" --environments volume/@environments \
-        --disk "${2:-template.raw}" --root-partuuid "$root_uuid" --output "$1" --options 'rw quiet'
+        --disk "$disk" --root-partuuid "$root_uuid" --output "$output" --options 'rw quiet' "$@"
 }
 partition() { dd if="$1" of="$2" bs=1M skip=65 count=300 status=none; }
 
@@ -87,7 +89,7 @@ test -z "$(getfattr --absolute-names --only-values -n user.cps.boot-environment 
 mkdir restored
 btrfs restore -S -x -m -r "$root_id" root.btrfs restored >/dev/null 2>&1
 diff -r "$root" restored
-test "$(stat -c %a restored/tmp restored/var/shared)" = $'1777\n2775'
+test "$(stat -c %a restored/tmp restored/srv/shared)" = $'1777\n2775'
 test "$(getfattr --only-values -n user.cps restored/local-state)" = kept
 # btrfs restore copies hard links as separate files. The tree keeps one inode.
 inode_of() {
@@ -151,7 +153,7 @@ grep -F 'destination already exists' rejected.log
 test "$(sha256sum disk.raw)" = "$before"
 reject 'must be outside the volume directory' volume/disk.raw image volume/disk.raw
 touch volume/stray
-reject 'contain only the root and environments' extra.raw image extra.raw
+reject 'contain only the root, environments, and /var' extra.raw image extra.raw
 rm volume/stray
 touch volume/@environments/stray
 reject 'environments directory must be empty' busy.raw image busy.raw
@@ -191,3 +193,27 @@ test "$successes" = 1
 grep -E 'destination already exists|publishing the disk image' race-{first,second}.log
 test -z "$(find . -maxdepth 1 -name '.cps-disk-*' -print)"
 echo 'Verified image rejections, failure cleanup, and a single winner on concurrent writes'
+
+# The shared /var subvolume: empty, a sibling of the root, and mounted by the root's fstab.
+mkdir volume/@var
+var_image() { image "$1" "${2:-template.raw}" --var volume/@var; }
+reject 'no /etc/fstab to mount the shared /var subvolume' no-fstab.raw var_image no-fstab.raw
+mkdir -p "$root/etc"
+printf 'PARTUUID=%s /var/log btrfs subvol=/@var 0 0\n' "$root_uuid" > "$root/etc/fstab"
+reject 'must mount subvolume @var at /var' wrong-fstab.raw var_image wrong-fstab.raw
+printf 'PARTUUID=%s / btrfs defaults 0 0\nPARTUUID=%s /var btrfs noatime,subvol=/@var 0 0\n' \
+    "$root_uuid" "$root_uuid" > "$root/etc/fstab"
+touch volume/@var/stray
+reject 'the /var directory must be empty' busy-var.raw var_image busy-var.raw
+rm volume/@var/stray
+reject 'contain only the root, environments, and /var' no-var.raw image no-var.raw
+reject 'must differ' same.raw image same.raw template.raw --var volume/@environments
+var_image var.raw >/dev/null
+partition var.raw var.btrfs
+btrfs check --readonly var.btrfs >/dev/null 2>&1
+btrfs inspect-internal dump-tree -t root var.btrfs > root-tree.txt
+test -n "$(subvolume_id @var)" -a -n "$(subvolume_id @)" -a -n "$(subvolume_id @environments)"
+mkdir restored-var
+btrfs restore -S -x -m -r "$(subvolume_id @)" var.btrfs restored-var >/dev/null 2>&1
+test -d restored-var/var && test -z "$(ls -A restored-var/var)"
+echo 'Verified the shared /var subvolume beside the root'

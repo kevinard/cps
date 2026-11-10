@@ -447,12 +447,19 @@ if $systemd_guest; then
     fi
 else
     mkdir runtime/dev
+    # Every environment mounts the same /var subvolume, as an installed system does.
+    printf 'PARTUUID=%s /var btrfs subvol=/@var 0 0\n' "$root_uuid" > runtime/etc/fstab
     cat > runtime/init <<'GUEST'
 #!/bin/busybox sh
 set -e
 [ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
 state=$(/bin/busybox cat /etc/cps-vm-boot-state)
 printf 'CPS_VM_BOOT: %s\n' "$state"
+/bin/busybox mount -t btrfs -o rw,subvol=/@var /dev/vda2 /var
+printf '%s\n' "$state" >> /var/cps-vm-boots
+/bin/busybox sync
+printf 'CPS_VM_VAR: %s\n' "$(/bin/busybox tr '\n' ' ' < /var/cps-vm-boots)"
+/bin/busybox umount /var
 if [ -f /etc/cps-vm-assert-kernel ]; then
     printf 'CPS_VM_KERNEL: %s %s\n' "$state" "$(/bin/busybox uname -r)"
 fi
@@ -663,11 +670,16 @@ rm -r esp
 # Write a root as the @ subvolume of a disk. Its volume directory holds only
 # the root and the environments directory while the image is written.
 image_disk() {
-    local root=$1 output=$2 status=0
+    local root=$1 output=$2 status=0 var=()
     mkdir -- "$root.volume" "$root.volume/@environments"
+    # A root whose fstab mounts the shared /var gets its subvolume beside it.
+    if [[ -f $root/etc/fstab ]]; then
+        mkdir -- "$root.volume/@var"
+        var=(--var "$root.volume/@var")
+    fi
     mv -- "$root" "$root.volume/@"
     "$cps" boot-env image --btrfs-volume "$root.volume" --root "$root.volume/@" \
-        --environments "$root.volume/@environments" --disk template.raw \
+        --environments "$root.volume/@environments" "${var[@]}" --disk template.raw \
         --root-partuuid "$root_uuid" --output "$output" --options "$options" || status=$?
     mv -- "$root.volume/@" "$root"
     rm -r -- "$root.volume"
@@ -1116,6 +1128,15 @@ if [[ $boots != "$expected" ]]; then
     printf 'Unexpected boot order:\n%s\n' "$boots" >&2
     tail -80 serial.log >&2
     exit 1
+fi
+if [[ $mode == fallback || $mode == kernel-upgrade ]]; then
+    # The fallback still sees what the failed trial's boots wrote to /var.
+    shared=$(tr -d '\r' < serial.log | grep '^CPS_VM_VAR: ' | tail -1)
+    if [[ $shared != 'CPS_VM_VAR: trial trial previous ' ]]; then
+        printf 'Expected the trial and its fallback to share /var, got: %s\n' "$shared" >&2
+        exit 1
+    fi
+    echo 'Verified the trial and its fallback share one /var subvolume'
 fi
 if [[ $mode == kernel-upgrade || $mode == rollback ]]; then
     kernels=$(tr -d '\r' < serial.log | grep '^CPS_VM_KERNEL: ' || :)

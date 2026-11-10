@@ -6,8 +6,8 @@ Installers and VM tests turn an inactive CPS root into a bootable GPT disk
 file with `cps boot-env image`, without root privileges, mounts, or loop
 devices. The disk gets the same layout as an installed
 [Btrfs system](btrfs.md): a Btrfs top-level volume holding the root
-subvolume and an `environments` subvolume, and a systemd-boot ESP with a
-known-good entry for the root. After the first boot, the
+subvolume, an `environments` subvolume, and the shared `/var` subvolume, and
+a systemd-boot ESP with a known-good entry for the root. After the first boot, the
 [system commands](../client/system.md) stage, activate, and roll back
 environments on it as on any installed Btrfs system.
 
@@ -23,12 +23,15 @@ environments on it as on any installed Btrfs system.
 ## Assemble the volume directory
 
 Create a directory that stands for the Btrfs top level. It must contain only
-the root directory and an empty environments directory, which become
-subvolumes with those names. Assemble the root inside it as described in
-[Assemble a bootable base root](boot-root.md).
+the root directory, an empty environments directory, and an empty `/var`
+directory, which become subvolumes with those names. Assemble the root
+inside it as described in [Assemble a bootable base root](boot-root.md).
+The `/var` subvolume starts empty: on the first boot, the packages'
+tmpfiles.d and sysusers.d declarations populate it, as described in
+[Share /var between boot environments](btrfs.md#share-var-between-boot-environments).
 
 ```sh
-mkdir -p volume/@environments
+mkdir -p volume/@environments volume/@var
 cps image-create --root volume/@ --config image.kdl
 cps plan --root volume/@ --output base.json install-profile
 cps fetch --root volume/@ --plan base.json
@@ -41,8 +44,19 @@ a [`boot-btrfs`](btrfs.md#configure-live-system-commands) node for the
 installed system, for example with `volume="/cps"`,
 `environments="/cps/@environments"`, `esp="/efi"`, and the root partition's
 `root-partuuid`. Its `/etc/fstab` or mount units mount the top level and the
-ESP at those paths. Leave `subvol=` and `subvolid=` off any `/` line, because
-each boot entry selects its subvolume.
+ESP at those paths, and mount the `/var` subvolume at `/var`. Leave `subvol=`
+and `subvolid=` off any `/` line, because each boot entry selects its
+subvolume.
+
+```text
+PARTUUID=ROOT-PARTUUID  /     btrfs  defaults          0 0
+PARTUUID=ROOT-PARTUUID  /var  btrfs  subvol=/@var      0 0
+PARTUUID=ROOT-PARTUUID  /cps  btrfs  subvolid=5        0 0
+PARTUUID=ESP-PARTUUID   /efi  vfat   umask=0077        0 2
+```
+
+With `--var`, `boot-env image` refuses a root whose `/etc/fstab` does not
+mount that subvolume at `/var`.
 
 The image keeps owners, modes, links, extended attributes, and timestamps
 from the directory. Run as root to give the files their declared owners.
@@ -78,16 +92,17 @@ hold CPS boot entries or CPS boot files.
 
 ```sh
 cps boot-env image --btrfs-volume volume --root volume/@ \
-    --environments volume/@environments --disk template.raw \
+    --environments volume/@environments --var volume/@var --disk template.raw \
     --root-partuuid "$root_partuuid" --output disk.raw --options rw
 ```
 
 The command prints the entry ID, `cps-IMAGE-REVISION`, and publishes the new
 disk file. It leaves the template and the volume directory unchanged.
 
-- The Btrfs filesystem UUID is the image identity. The root and environments
-  are subvolumes of the top level, and the top level stays the default
-  subvolume.
+- The Btrfs filesystem UUID is the image identity. The root, environments,
+  and `/var` are subvolumes of the top level, and the top level stays the
+  default subvolume. `--var` is optional; without it, the root keeps `/var`
+  in its own subvolume, which each environment then copies.
 - The root carries the `user.cps.boot-environment` registration that
   [activation](btrfs.md#activating-btrfs-roots) writes on a mounted system.
   CPS sets it on the source directory while `mkfs.btrfs` copies the tree,

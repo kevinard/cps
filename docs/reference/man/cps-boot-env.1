@@ -251,13 +251,16 @@
 .B Options
 .TP
 .B \&\-\-btrfs\-volume <BTRFS_VOLUME>
-\&Directory that becomes the Btrfs top level. It holds only the root and environments
+\&Directory that becomes the Btrfs top level. It holds only the root, environments, and /var directories
 .TP
 .B \&\-\-root <ROOT>
 \&Inactive CPS root in the volume directory, written as the root subvolume
 .TP
 .B \&\-\-environments <ENVIRONMENTS>
 \&Empty directory in the volume directory, written as the environments subvolume
+.TP
+.B \&\-\-var <VAR>
+\&Empty directory in the volume directory, written as the shared /var subvolume that the root's /etc/fstab mounts
 .TP
 .B \&\-\-disk <DISK>
 \&GPT disk with a systemd\-boot ESP and the target Linux filesystem partition

@@ -2,7 +2,7 @@
 //!
 //! The volume directory becomes the Btrfs top level. Its root and
 //! environments directories become subvolumes, laid out like an installed
-//! system. The ESP gets a known-good systemd-boot entry for the root, as
+//! system, and so does an optional shared /var directory. The ESP gets a known-good systemd-boot entry for the root, as
 //! `activate-btrfs --known-good` would write on a mounted system.
 
 use std::{
@@ -44,6 +44,9 @@ pub struct BootImage<'a> {
     pub root: &'a Path,
     /// Empty directory in the volume directory, for the environments subvolume.
     pub environments: &'a Path,
+    /// Empty directory in the volume directory, for the shared /var subvolume
+    /// that the root's `/etc/fstab` mounts.
+    pub var: Option<&'a Path>,
     /// GPT disk with a systemd-boot ESP and the root partition.
     pub disk: &'a Path,
     pub root_partuuid: &'a str,
@@ -73,27 +76,35 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
     );
     let root_name = child_name(&volume, spec.root, "--root")?;
     let environments = child_name(&volume, spec.environments, "--environments")?;
+    let var = spec
+        .var
+        .map(|path| child_name(&volume, path, "--var"))
+        .transpose()?;
+    let mut expected = vec![root_name.clone(), environments.clone()];
+    expected.extend(var.clone());
+    expected.sort();
+    expected.dedup();
     ensure!(
-        root_name != environments,
-        "the root and environments directories must differ"
+        expected.len() == 2 + usize::from(var.is_some()),
+        "the root, environments, and /var directories must differ"
     );
     let mut names = Vec::new();
     for entry in fs::read_dir(&volume)? {
         names.push(entry?.file_name().to_string_lossy().into_owned());
     }
     names.sort();
-    let mut expected = vec![root_name.clone(), environments.clone()];
-    expected.sort();
     ensure!(
         names == expected,
-        "the volume directory must contain only the root and environments directories"
+        "the volume directory must contain only the root, environments, and /var directories"
     );
-    let environments_path = volume.join(&environments);
-    ensure!(
-        fs::symlink_metadata(&environments_path)?.is_dir()
-            && fs::read_dir(&environments_path)?.next().is_none(),
-        "the environments directory must be empty"
-    );
+    for (name, option) in [(Some(&environments), "environments"), (var.as_ref(), "/var")] {
+        let Some(name) = name else { continue };
+        let path = volume.join(name);
+        ensure!(
+            fs::symlink_metadata(&path)?.is_dir() && fs::read_dir(&path)?.next().is_none(),
+            "the {option} directory must be empty"
+        );
+    }
     let output_parent = fs::canonicalize(
         spec.output
             .parent()
@@ -125,6 +136,18 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
     let revision = settings.boot_revision();
     let id = entry_id(&image_id, revision);
     let files = BootFiles::open(&image, &state, &activation)?;
+    if let Some(var) = &var {
+        image
+            .root
+            .regular_entry("etc/fstab")?
+            .context("the root has no /etc/fstab to mount the shared /var subvolume")?;
+        let fstab = image.root.read_file("etc/fstab")?;
+        ensure!(
+            mounts_var(&String::from_utf8_lossy(&fstab), var),
+            "the root's /etc/fstab must mount subvolume {var} at /var, for example\n  \
+             PARTUUID={partuuid} /var btrfs subvol=/{var} 0 0"
+        );
+    }
     check_tree(&image.root)?;
     let fingerprint = tree::digest(&image.root).context("fingerprinting the root")?;
 
@@ -158,6 +181,7 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
             .arg(format!("rw:{root_name}"))
             .arg("--subvol")
             .arg(format!("rw:{environments}"))
+            .args(var.iter().flat_map(|var| ["--subvol".into(), format!("rw:{var}")]))
             .arg(FILESYSTEM),
         "formatting the root filesystem with mkfs.btrfs",
     )?;
@@ -171,7 +195,7 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
         disk_helper("btrfs", &work)?.args(["check", "--readonly", FILESYSTEM]),
         "checking the root filesystem with btrfs check",
     )?;
-    let identity = Identity::read(&work, &root_name, &environments)?;
+    let identity = Identity::read(&work, &root_name, &environments, var.as_deref())?;
     ensure!(
         identity.fsid == image_id,
         "mkfs.btrfs did not apply the filesystem UUID {image_id}"
@@ -220,6 +244,24 @@ pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
     )?;
     stage.publish()?;
     Ok(id)
+}
+
+/// Whether an fstab mounts the top-level subvolume `name` at /var.
+fn mounts_var(fstab: &str, name: &str) -> bool {
+    fstab
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default())
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            (fields.len() >= 4 && fields[1] == "/var" && fields[2] == "btrfs").then(|| fields[3])
+        })
+        .any(|options| {
+            options.split(',').any(|option| {
+                option
+                    .strip_prefix("subvol=")
+                    .is_some_and(|subvol| subvol.trim_start_matches('/') == name)
+            })
+        })
 }
 
 /// The name of a directory directly inside the volume directory.
@@ -314,7 +356,7 @@ struct Identity {
 }
 
 impl Identity {
-    fn read(work: &Path, root: &str, environments: &str) -> Result<Self> {
+    fn read(work: &Path, root: &str, environments: &str, var: Option<&str>) -> Result<Self> {
         let dump = |args: &[&str]| -> Result<String> {
             let output = run(
                 disk_helper("btrfs", work)?
@@ -330,6 +372,10 @@ impl Identity {
         ensure!(
             subvolumes.contains_key(environments),
             "mkfs.btrfs did not create the environments subvolume"
+        );
+        ensure!(
+            var.is_none_or(|var| subvolumes.contains_key(var)),
+            "mkfs.btrfs did not create the /var subvolume"
         );
         let (root_id, root_uuid) = subvolumes
             .get(root)
@@ -518,6 +564,19 @@ fs uuid 11111111-2222-4333-8444-555555555555
             None
         );
         Ok(())
+    }
+
+    #[test]
+    fn fstab_must_mount_the_shared_var_subvolume() {
+        let fstab = "# comment /var btrfs subvol=/@var\n\
+                     PARTUUID=x / btrfs defaults 0 0\n\
+                     PARTUUID=x /var btrfs noatime,subvol=/@var 0 0\n";
+        assert!(mounts_var(fstab, "@var"));
+        assert!(mounts_var("UUID=x /var btrfs subvol=@var 0 0", "@var"));
+        assert!(!mounts_var(fstab, "@other"));
+        assert!(!mounts_var("# PARTUUID=x /var btrfs subvol=/@var 0 0", "@var"));
+        assert!(!mounts_var("UUID=x /var/log btrfs subvol=/@var 0 0", "@var"));
+        assert!(!mounts_var("tmpfs /var tmpfs subvol=/@var 0 0", "@var"));
     }
 
     #[test]
