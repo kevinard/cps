@@ -18,7 +18,7 @@ guides use. If CPS already manages your machine, go directly to the
 
 - [Assemble a bootable base root](setups/boot-root.md)
 - [Set up Btrfs boot environments](setups/btrfs.md)
-- [Deploy ext4 boot environments](setups/ext4.md)
+- [Build an offline Btrfs disk image](setups/disk-image.md)
 - [List, roll back, and clean up boot environments](setups/boot-operations.md)
 
 ## [Clients](client/README.md)

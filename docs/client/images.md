@@ -101,8 +101,9 @@ and extended attribute change, including file capabilities, and programs
 cannot set it back. Files changed within the last two seconds are not
 recorded, because filesystems take that time from a coarse clock. The
 records carry over into a staged Btrfs snapshot, whose files keep their
-inodes and change times. A copied root, such as an ext4 slot, has new
-inodes, so CPS hashes its files once and records them again. After systemd
+inodes and change times. A copied root, such as the root of an
+[offline disk image](../setups/disk-image.md), has new inodes, so CPS hashes
+its files once and records them again. After systemd
 actions, triggers, and kernel preparation, CPS checks every managed path the
 same way, which hashes the files the transaction wrote and any file the
 actions changed. The shared-library check also reuses ELF metadata recorded
@@ -428,8 +429,9 @@ would be removed. Use `plan remove NAME ...` to remove selected packages
 from committed image state while offline. Removal fails if a package that
 remains still requires one of those packages. Both operations preserve
 locally edited files declared with `preserve=#true`. A saved install,
-exact-install, remove, or update plan can also be applied to a clone with
-`boot-env stage`.
+exact-install, remove, or update plan can also be applied to a copy of the
+image, or staged in a Btrfs snapshot with
+[`boot-env stage-btrfs`](../setups/btrfs.md#capturing-a-running-btrfs-root).
 
 Use `cps plan --root image --output cleanup.json autoremove` to preview
 removing unused dependencies. CPS solves from the explicitly installed

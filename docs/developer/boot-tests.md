@@ -2,17 +2,18 @@
 
 [Documentation](../README.md) · [Developers](README.md)
 
-The VM tests boot disposable disks under QEMU with OVMF and check staging,
-activation, blessing, fallback, and rollback end to end. They use regular
-files and software emulation, need no root on the host, and run from the
-checkout root after `cargo build`. The CI `boot` job runs
+The VM tests boot disposable Btrfs disks under QEMU with OVMF and check
+staging, activation, blessing, fallback, and rollback end to end. They use
+regular files and software emulation, need no root on the host, and run from
+the checkout root after `cargo build`. The CI `boot` job runs
 `systemd-boot-vm.sh health-fail` and two `boot-capture-vm.sh`
 configurations. See the [CI workflow](../../.github/workflows/ci.yml).
 
 ## On this page
 
 - [Common settings](#common-settings)
-- [ext4 disk and systemd-boot tests](#ext4-disk-and-systemd-boot-tests)
+- [Offline disk images](#offline-disk-images)
+- [systemd-boot scenarios](#systemd-boot-scenarios)
   - [Signed fixtures and release profiles](#signed-fixtures-and-release-profiles)
 - [Btrfs snapshot and boot tests](#btrfs-snapshot-and-boot-tests)
 - [File modes and capabilities in a guest](#file-modes-and-capabilities-in-a-guest)
@@ -27,6 +28,7 @@ and share these overrides:
 | Variable | Value |
 | --- | --- |
 | `CPS_VM_QEMU` | QEMU executable, default `qemu-system-x86_64` |
+| `CPS_VM_MKFS_BTRFS` | Trusted `mkfs.btrfs` with `--rootdir`, `--subvol`, and `--shrink`, default from the path |
 | `CPS_VM_QEMU_DATA` | Directory passed to QEMU with `-L` for its firmware data |
 | `CPS_VM_OVMF_CODE`, `CPS_VM_OVMF_VARS` | Matching non-Secure-Boot x86-64 OVMF code and variables files |
 | `CPS_VM_SYSTEMD_BOOT` | systemd-boot EFI binary, default `/usr/lib/systemd/boot/efi/systemd-bootx64.efi` |
@@ -36,52 +38,72 @@ and share these overrides:
 | `CPS_VM_TIMEOUT` | Seconds each QEMU run may take |
 
 The defaults match Arch Linux paths. The kernel needs built-in virtio
-block, GPT, ext4, and serial console support. Fixture roots that install a
+block, GPT, Btrfs, and serial console support. `CPS_DISK_TOOLS_DIR` names
+the trusted btrfs-progs, dosfstools, and mtools that `cps boot-env image`
+runs, as described in [offline disk images](../setups/disk-image.md#checks-and-failure-cleanup).
+Fixture roots that install a
 package with a [trigger](../maintainer/triggers.md), such as the signed
 systemd package and its hardware database trigger, run the handler on the
 host, which needs a working `/usr/bin/bwrap`.
 
-## ext4 disk and systemd-boot tests
+## Offline disk images
+
+[`tests/boot-image.sh`](../../tests/boot-image.sh) runs without a VM. It
+writes a root with `cps boot-env image` and checks the Btrfs layout, the
+registration that exists only in the image, owners, modes, links, and
+extended attributes, and the known-good entry on the ESP. It repeats an image
+under `SOURCE_DATE_EPOCH`, and checks the rejections, the systemd-boot
+version check, failure cleanup, and concurrent writes. It needs btrfs-progs,
+dosfstools, mtools, `sfdisk`, OpenSSL, and `setfattr`.
+
+## systemd-boot scenarios
 
 [`tests/systemd-boot-vm.sh SCENARIO`](../../tests/systemd-boot-vm.sh)
-deploys two CPS exports to a GPT disk and activates them in its FAT ESP,
-then boots through OVMF and systemd-boot. The fixture assembles each root
-from signed packages and runs `verify --pristine` before packing it into
-the VM disk. Its runtime package imports prebuilt host binaries, libraries,
-and VFAT and ISO-8859-1 modules into a prototype, then generates the
-manifest and publishes it through CPS.
+assembles a base root from signed packages, runs `verify --pristine`, and
+writes it to a Btrfs disk with `cps boot-env image`. A rescue system then
+boots with the host kernel from a read-only disk holding CPS and the test
+repositories, captures the base, stages the saved upgrade with
+`boot-env stage-btrfs`, and activates it with `boot-env activate-btrfs`,
+as a maintenance boot of an installed system would. The test then boots the
+disk through OVMF and systemd-boot. Its runtime package imports prebuilt host
+binaries, libraries, and VFAT and ISO-8859-1 modules into a prototype, then
+generates the manifest and publishes it through CPS. A plain copy of the base
+with the same plan applied lets the host check the staged files.
 
 | Scenario | Checks |
 | --- | --- |
-| `fallback` (default) | Staging leaves the ESP alone, and the previous root boots after two failed attempts |
+| `fallback` (default) | Activation rejects a missing fallback kernel and repeats idempotently, the previous root boots after two failed attempts, and activation cannot replenish the exhausted counter |
 | `bless` | systemd runs as PID 1, installs the health gate through the CPS package, removes the counter, and boots the blessed root again |
-| `health-fail` | A corrupted managed file in the exported partition makes the health gate block blessing through both attempts |
-| `catalog-health-fail` | A corrupted archived catalog in the trial partition produces the catalog digest error, and systemd-boot falls back after both attempts |
-| `kernel-upgrade` | The kernel and initrd on the ESP, and `uname -r` from both roots |
+| `health-fail` | A managed file changed after activation makes the health gate block blessing through both attempts |
+| `catalog-health-fail` | A corrupted archived catalog in the trial's state fails catalog verification, and systemd-boot falls back after both attempts |
+| `kernel-upgrade` | Activation rejects a corrupted prepared kernel, then the kernel and initrd on the ESP and `uname -r` from both roots |
 | `facet-change` | Staging documentation from the installed manifest and preserving edited configuration while disabling its facet, then the blessed trial and a rollback to the original facet selection |
 | `capabilities` | A signed capability-bearing package in the guest: failed preflight without `CAP_SETFCAP`, raw socket access as an unprivileged user, repair, cloning, and capability removal during an upgrade |
-| `rollback` | A second signed publisher, an upgrade that adds a dependency from it and removes an obsolete one, replay rejection in the staged root, blessing, `boot-env list` and `boot-env rollback` against the disk, and a boot of the previous kernel and dependencies |
+| `rollback` | A second signed publisher, an upgrade that adds a dependency from it and removes an obsolete one, replay rejection, a trial selected with `preferred` after the base was pinned, blessing, `boot-env list` and `boot-env rollback` in the rescue system, a rejected rollback to a corrupt fallback kernel, and a boot of the previous kernel and dependencies |
 
 ```sh
 CPS_VM_OVMF_CODE=/path/to/OVMF_CODE.fd \
 CPS_VM_OVMF_VARS=/path/to/OVMF_VARS.fd \
 CPS_VM_KERNEL=/path/to/vmlinuz \
 CPS_VM_BUSYBOX=/path/to/busybox \
+CPS_VM_MKFS_BTRFS=/path/to/mkfs.btrfs \
 tests/systemd-boot-vm.sh bless
 ```
 
-The script needs `qemu-system-x86_64`, dosfstools (`mkfs.fat`, `fsck.fat`),
-mtools, e2fsprogs, `sfdisk`, `blkid`, OpenSSL, and `timeout`. The health
-scenarios also use `debugfs`, and `catalog-health-fail` uses `sqlite3`. The
+The script needs `qemu-system-x86_64`, btrfs-progs, dosfstools (`mkfs.fat`,
+`fsck.fat`), mtools, `sfdisk`, OpenSSL, binutils `strip`, and `timeout`. The
+rescue system copies the host's util-linux `mount` and `sfdisk`, kmod
+`insmod`, and the GNU tools that `kernel-install` uses, so BusyBox needs only
+`sh` and basic file applets. `catalog-health-fail` uses `sqlite3`. The
 blessing fixture needs the local systemd userspace, util-linux, binutils
-`readelf` and `strip`, kmod, and kernel support for EFI variables and FAT.
+`readelf`, kmod, and kernel support for EFI variables and FAT.
 
 For `kernel-upgrade`, provide the original kernel as `CPS_VM_KERNEL` with
 `CPS_VM_KERNEL_RELEASE`, and the upgrade as `CPS_VM_TRIAL_KERNEL` with
 `CPS_VM_TRIAL_KERNEL_RELEASE`. Both releases must be distinct, and both
 kernels need the built-in storage and console support listed above. This
 scenario also uses `cpio` and the host's `kernel-install` and
-`90-loaderentry.install` plugin.
+`90-loaderentry.install` plugin, which the rescue system runs.
 
 The `capabilities` scenario also requires a C compiler with static libc,
 `setpriv`, `getcap`, and `setcap`.
@@ -89,20 +111,8 @@ The `capabilities` scenario also requires a C compiler with static libc,
 In the `rollback` scenario both kernels need VFAT support. To load modules
 from extracted kernel packages, set `CPS_VM_KERNEL_MODULES_ROOT` and
 `CPS_VM_TRIAL_MODULES_ROOT` to the roots containing their indexed
-`lib/modules` trees. Set `CPS_VM_RECYCLE_SLOT=1` to stage and bless a second
-upgrade on the original root slot, then roll it back to the first upgrade.
-That variant accepts a vendor copy for one setting and keeps another
-administrator edit with tighter permissions, and checks both settings in
-the guest across rollback.
-
-Two related scripts need fewer tools.
-[`tests/boot-export.sh`](../../tests/boot-export.sh) checks the ext4
-payload and failure cleanup with e2fsprogs, OpenSSL, and `setfattr`.
-[`tests/boot-deploy.sh`](../../tests/boot-deploy.sh) also uses `sfdisk` and
-`blkid` to check partition isolation and reject damaged or ambiguous
-layouts, stale receipts, modified payloads, and missing fallback roots. Run
-it with `--esp` and mtools and dosfstools installed to exercise raw-disk
-activation and rollback, including preservation of unrelated EFI files.
+`lib/modules` trees. Set `CPS_VM_FAT_BUILTIN=1` when both kernels build VFAT
+in, such as the [kernel fixtures](build-fixtures.md).
 
 ### Signed fixtures and release profiles
 
@@ -115,14 +125,12 @@ profile with the signed CPS and BusyBox fixtures. The test installs the
 signed base composition, publishes the companion update, and checks that
 the profile still selects the old kernel. It advances the profile through
 the automatic upgrade check before staging and booting the trial. In the
-local repository scenario with slot recycling disabled, the test also moves
-the primary and companion repositories together and checks that the
-previous saved plan is stale. Add `CPS_VM_STAGED_TRANSACTIONS=1`, without
-device activation or slot reuse, to apply a second reviewed transaction, a
-freeze, to the staged root before activation. The test checks that the
-trial keeps its original boot parent, that the guest sees the freeze only
-in the trial, and, with TUF mirrors, that activation rejects the export
-from before the review.
+local repository scenario, the test also moves the primary and companion
+repositories together and checks that the previous saved plan is stale. Add
+`CPS_VM_STAGED_TRANSACTIONS=1` to apply a second reviewed transaction, a
+freeze, to the private staged root in the rescue system before activation.
+The test checks that the trial keeps its original boot parent and that the
+guest sees the freeze only in the trial.
 
 `CPS_VM_TUF_MIRRORS=1`, with the same signed profile fixtures, signs
 separate local TUF mirrors with throwaway keys using the disposable signer
@@ -137,30 +145,16 @@ catalog from the archive and replays the saved profile installation against
 the original cache paths. The test rejects a replayed TUF timestamp and
 verifies that missing or corrupt payloads block promotion with
 `--profile-payloads`. After a successful retry, it takes the mirrors
-offline and prepares the upgrade in one command. It deploys that bundle and
-boots through blessing and rollback. This variant runs without slot reuse.
+offline, so the rescue system stages the upgrade from the prefetched cache,
+and boots through blessing and rollback.
 
-`CPS_VM_DEVICE_ACTIVATION=1`, with the signed kernel fixture, bootstraps
-the base and activates the trial from a rescue VM with a writable virtio
-disk. The test checks rejection of unchecked ESP writes, mounted or
-registered root targets, and incorrect partition or receipt identities. It
-then verifies the written partitions and boots the result through the
-blessing and rollback checks. Rollback runs against the mounted ESP in the
-rescue VM and rejects a mismatched root before selecting and booting the
-original kernel. Combine it with `CPS_VM_RECYCLE_SLOT=1` to also exercise
-direct replacement, recovery from a partial write after retirement, and
-boot and rollback of the recovered upgrade. With those options and
-`CPS_VM_RELEASE_PROFILE=1`, set `CPS_VM_INSTALLED_STAGE=1` to plan and stage
-the second upgrade inside the rescue VM from the first upgrade's read-only
-root partition. This variant checks that state written during the first
-boot reaches the staged tree and that the fallback partition stays
-byte-for-byte intact during deployment. It also checks that `apply`
-rejects a writable copy of the deployed root.
-
-`CPS_VM_REPROVISION=1`, with `CPS_VM_RELEASE_PROFILE=1`, offline disk
-activation, and `SOURCE_DATE_EPOCH` set, installs the signed profile in two
-fresh roots and compares the saved plans, ext4 exports, KDL receipts, and
-full GPT disks before booting the upgrade scenario.
+`CPS_VM_REPROVISION=1`, with `CPS_VM_RELEASE_PROFILE=1` and
+`SOURCE_DATE_EPOCH` set, installs the signed profile in two fresh roots and
+compares their saved plans and disk images before booting the upgrade
+scenario. The images must match apart from the subvolume identities that
+btrfs-progs still randomizes, as described in
+[reproducible images](../setups/disk-image.md#reproducible-images). It also
+needs `btrfs`.
 
 The fixture variables select the signed packages: `CPS_VM_CPS_FIXTURE`,
 `CPS_VM_KERNEL_FIXTURE`, `CPS_VM_SYSTEMD_FIXTURE`, `CPS_VM_USR_BASE_FIXTURE`,
@@ -174,13 +168,13 @@ fixture was built with another revision.
 
 Run [`tests/boot-capture-vm.sh`](../../tests/boot-capture-vm.sh) with
 `CPS_VM_BTRFS` and `CPS_VM_MKFS_BTRFS` set to trusted Btrfs utilities,
-QEMU, and a kernel with built-in Btrfs and ext4 support. The test captures
+QEMU, and a kernel with built-in Btrfs support. The test captures
 its running root, rejects a nested subvolume outside the exclusions, and
 checks that `var/lib/machines` and an `--exclude-subvolume` path become
 empty directories with the source metadata. It verifies that later source
 writes leave the read-only capture intact, and checks failed and concurrent
-staging. It boots the staged Btrfs subvolume, the previous root, and the
-exported ext4 root. For native boot with a custom kernel, set
+staging. It boots the staged Btrfs subvolume and the previous root. For
+native boot with a custom kernel, set
 `CPS_VM_KERNEL_RELEASE` to the guest kernel's release.
 
 These settings extend it:
@@ -222,11 +216,11 @@ the running release on both trial boots and after rollback.
 
 ## File modes and capabilities in a guest
 
-[`tests/file-modes-vm.sh`](../../tests/file-modes-vm.sh) boots a small ext4
+[`tests/file-modes-vm.sh`](../../tests/file-modes-vm.sh) boots a small Btrfs
 root under QEMU and checks privileged execution, sticky deletion, group
 inheritance, offline recovery, repair, clone isolation, and privilege
 removal as root in the guest. It needs a C compiler with static libc,
-`strip`, e2fsprogs, and the common QEMU, kernel, and BusyBox settings.
+`strip`, `mkfs.btrfs`, and the common QEMU, kernel, and BusyBox settings.
 
 ## Rebuild the VM fixtures after packaging changes
 

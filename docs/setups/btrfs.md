@@ -2,8 +2,11 @@
 
 [Documentation](../README.md) · [Setup guides](README.md)
 
-Start with a CPS-managed Btrfs root.
-[Assemble a bootable base root](boot-root.md) if you need to provision one.
+The Canopa root, with `/usr`, `/etc`, and the CPS image state, lives on
+Btrfs and boots with UEFI, systemd-boot, and a VFAT ESP. Other filesystems
+can hold separately mounted data. Start with a CPS-managed Btrfs root.
+[Assemble a bootable base root](boot-root.md) if you need to provision one,
+or write one to a disk file with [`boot-env image`](disk-image.md).
 Each staged change becomes a new environment: a writable snapshot of the
 running root that boots as a trial, with the registered parent as its
 fallback. Choose systemd-boot with Type #1 entries, systemd-boot with signed
@@ -291,8 +294,6 @@ cps boot-env capture --source / --output /var/lib/cps/captures/before-upgrade
 cps plan --root /var/lib/cps/captures/before-upgrade/root \
     --output /scratch/upgrade.json update
 cps fetch --root /var/lib/cps/captures/before-upgrade/root --plan /scratch/upgrade.json
-cps boot-env prepare --source /var/lib/cps/captures/before-upgrade/root \
-    --output /scratch/upgrade --size-mib 2048 /scratch/upgrade.json
 ```
 
 The capture retains the image identity and revision, so a saved plan for
@@ -323,10 +324,8 @@ The command verifies the baseline and its plan,
 subvolume, prepares the selected kernel, and assigns a fresh CPS image
 identity with its recorded parent. It publishes `trial/root/` after
 verification. A failed transaction deletes the private subvolume. The new
-root is writable for configuration review and boot.
-
-Both the captured baseline and a staged Btrfs root can be
-[exported as ext4](ext4.md).
+root is writable for configuration review and boot. Activate it with
+`activate-btrfs` as described in [Activating Btrfs roots](#activating-btrfs-roots).
 
 ## Reclaiming old Btrfs environments
 

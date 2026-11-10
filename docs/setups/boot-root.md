@@ -16,12 +16,14 @@ the root. Keep the configuration, trust keys, and repository paths available
 while assembling and verifying the image.
 [Configure and sync the profile](../client/mirrors.md#synchronizing-a-signed-profile)
 
-The root layout depends on the deployment.
+The root lives on Btrfs. Keep the CPS image state and managed paths in the
+root itself, and mount shared data from other subvolumes or filesystems.
 
-- For Btrfs, use a new, empty named root subvolume under the mounted
-  top level. Keep the CPS image state and managed paths in that subvolume.
-- For ext4, use an empty directory on a single filesystem. Export the
-  assembled root to ext4 before writing the target partition.
+- On an installed system, use a new, empty named root subvolume under the
+  mounted top level.
+- For an [offline disk image](disk-image.md), use an empty directory beside
+  an empty environments directory, inside a volume directory that stands for
+  the Btrfs top level.
 
 Run the package operations with privileges to write the ownership, modes,
 and capabilities declared in the base manifests. Set `root` to the absolute
@@ -56,6 +58,5 @@ covers the root and ESP mounts and the health service.
 
 Register the first known-good root using the guide for your layout.
 
-- [Btrfs with systemd-boot or direct UEFI](btrfs.md#activating-btrfs-roots)
-- [ext4 in a raw GPT disk image](ext4.md#prepare-and-deploy-an-offline-gpt-disk-image)
-- [ext4 on an installed disk](ext4.md#provisioning-the-first-root-on-an-installed-disk)
+- [A mounted Btrfs volume with systemd-boot or direct UEFI](btrfs.md#activating-btrfs-roots)
+- [An offline Btrfs disk image](disk-image.md)

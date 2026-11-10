@@ -490,8 +490,8 @@ the journal. Managed hard links follow their target's permissions.
 Run `tests/file-modes-vm.sh` with the QEMU and kernel overrides to verify
 setuid and setgid execution, sticky deletion rules, group inheritance,
 failure without `CAP_FSETID`, interrupted offline recovery, repair,
-isolated boot clones, and removal of privileges by an upgrade.
-`tests/boot-export.sh` checks the bits in the exported ext4 image.
+isolated root clones, and removal of privileges by an upgrade.
+`tests/boot-image.sh` checks the bits in an offline Btrfs disk image.
 
 ### Linux file capabilities
 

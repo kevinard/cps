@@ -4,7 +4,8 @@
 
 Choose how to assemble or run the image, then choose how to supply its
 packages. An inactive directory is enough for package testing. A bootable
-system also needs a kernel, a root layout, and a boot mechanism. Start by
+Canopa system keeps its root on Btrfs and boots with UEFI, systemd-boot, and
+a VFAT ESP. Other filesystems can hold separately mounted data. Start by
 [assembling a bootable base root](boot-root.md) if you are provisioning one.
 
 | Image setup | Use it when | What you need |
@@ -13,8 +14,7 @@ system also needs a kernel, a root layout, and a boot mechanism. Start by
 | [Installed Btrfs with systemd-boot](btrfs.md#activating-btrfs-roots) | You want live changes, staged trial boots from snapshots, and automatic pruning of old environments | An existing CPS-managed Btrfs root, writable top-level mount, and a dedicated ESP |
 | [Btrfs with signed UKIs and systemd-boot](btrfs.md#signed-ukis-for-btrfs-roots) | You want systemd-boot to select a signed unified kernel image | A Btrfs boot setup, Secure Boot signing material, and the UKI and signing tools |
 | [Btrfs with direct UEFI UKIs](btrfs.md#direct-uefi-boot-for-btrfs-roots) | You want firmware to select each signed UKI directly | A Btrfs boot setup, signed UKIs, writable EFI variables, and the CPS blessing service |
-| [Offline GPT disk or VM image](ext4.md#prepare-and-deploy-an-offline-gpt-disk-image) | You want to assemble and test a bootable disk file | An inactive root, a raw GPT template with separate ext4 root slots, and a systemd-boot ESP |
-| [Installed ext4 disk with dedicated root slots](ext4.md#provisioning-the-first-root-on-an-installed-disk) | You want to provision and upgrade by writing inactive partitions | A dedicated GPT disk with a mounted systemd-boot ESP, unmounted target partition, and scratch storage |
+| [Offline Btrfs disk or VM image](disk-image.md) | You want an installer or VM test to write a bootable disk file without root | An inactive root in a volume directory, btrfs-progs, and a GPT template with a systemd-boot ESP |
 
 Every bootable setup stages changes as [boot environments](../concepts.md#boot-environments)
 that boot first as trials. See [boot operations](boot-operations.md) for

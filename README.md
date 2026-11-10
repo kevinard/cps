@@ -18,12 +18,13 @@ environments, and builds packages reproducibly from pinned inputs.
   interruption. Writes follow the dependency order, directories can turn into
   files or symlinks atomically, and sandboxed triggers regenerate shared caches
   and the initramfs. `cps verify` checks every managed file offline.
-- **Boot environments.** Changes that need a reboot stage into a Btrfs
-  snapshot or an ext4 root slot and boot as a trial with systemd-boot. A
-  trial becomes known good after its health check passes, and otherwise the
-  next boot falls back to the previous root. On Btrfs, CPS can also sign a
-  unified kernel image (UKI) for each environment, have UEFI firmware boot it
-  directly, and prune old environments automatically.
+- **Boot environments.** The root lives on Btrfs. Changes that need a reboot
+  stage into a snapshot and boot as a trial with systemd-boot. A trial
+  becomes known good after its health check passes, and otherwise the next
+  boot falls back to the previous root. CPS can also sign a unified kernel
+  image (UKI) for each environment, have UEFI firmware boot it directly,
+  prune old environments automatically, and write offline disk images for
+  installers.
 - **Reproducible builds.** Offline sandboxed builds from pinned sources and
   toolchains can produce several packages from one recipe and record
   worker-signed attestations that anyone can check with an independent
@@ -36,7 +37,7 @@ environments, and builds packages reproducibly from pinned inputs.
 - [Quickstart](docs/quickstart.md) — publish and install a small package in a disposable image.
 - [Concepts and vocabulary](docs/concepts.md) — packages, catalogs and trust roots, transactions, facets and variants, and boot environments.
 - [Full documentation](docs/README.md) — guides for clients, package maintainers, publishers, and developers.
-- [Setup guides](docs/setups/README.md) — local images, mirror-backed profiles, Btrfs systems, and ext4 deployments.
+- [Setup guides](docs/setups/README.md) — local images, mirror-backed profiles, Btrfs systems, and offline disk images.
 - [CLI reference and man pages](docs/reference/README.md) — command syntax and local manual installation.
 - [Data format reference](docs/reference/README.md#configuration-and-data-formats) — manifests, signed catalogs, image state and locks, saved plans, build provenance, payload deltas, and boot metadata.
 - [HTML documentation](docs/developer/README.md#build-the-html-manual) — build a searchable site from the same guides.
