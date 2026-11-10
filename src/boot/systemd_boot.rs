@@ -91,6 +91,10 @@ fn inventory(esp: &Path, lock: &File, direct: bool) -> Result<Inventory> {
         });
     }
     let (policy, entries) = policy::inventory(esp)?;
+    // systemd-boot gives these EFI variables precedence over loader.conf.
+    if let Some(overrides) = uefi::loader_overrides(esp, lock)? {
+        overrides.check(policy.as_ref())?;
+    }
     Ok(Inventory {
         policy,
         entries,
@@ -944,7 +948,19 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
         }
         // loader.conf is replaced through a temporary copy.
         files.push((esp.join("loader/loader.conf.new"), 64 * 1024));
-        check_esp_space(&esp, &id, &files)?;
+        // A slot replacement removes the retired entry and its artifacts
+        // before the new files are written.
+        let mut freed = Vec::new();
+        if let Some(replace) =
+            replace.filter(|_| deployment.is_some_and(|deployment| deployment.target.is_some()))
+        {
+            if let Some(retired) = &retired {
+                freed.push(esp.join("loader/entries").join(&retired.file));
+            }
+            let artifacts = esp.join("EFI/cps").join(replace);
+            freed.extend(["vmlinuz.efi", "initramfs.img"].map(|name| artifacts.join(name)));
+        }
+        check_esp_space(&esp, &id, &files, &freed, volume.is_some())?;
     }
     if let (Some(deployment), Some(fallback), Some(parent)) =
         (deployment, &fallback, &settings.boot_parent)
@@ -1066,7 +1082,17 @@ pub(super) fn activate<R: Clone + Into<Option<String>>>(
 }
 
 /// Fail before writing boot files that would not fit on the ESP.
-fn check_esp_space(esp: &Path, id: &str, files: &[(PathBuf, u64)]) -> Result<()> {
+///
+/// `freed` lists the files the activation removes before its first write;
+/// their clusters count as available. `prune` is true when `cps boot-env
+/// prune` can reclaim space, which requires a Btrfs volume.
+fn check_esp_space(
+    esp: &Path,
+    id: &str,
+    files: &[(PathBuf, u64)],
+    freed: &[PathBuf],
+    prune: bool,
+) -> Result<()> {
     let stat = rustix::fs::statvfs(esp).context("reading EFI system partition free space")?;
     let cluster = stat.f_frsize.max(1);
     let mut needed = ESP_MARGIN;
@@ -1077,12 +1103,31 @@ fn check_esp_space(esp: &Path, id: &str, files: &[(PathBuf, u64)]) -> Result<()>
         }
     }
     needed = needed.saturating_add(2 * cluster);
-    let available = stat.f_bavail.saturating_mul(stat.f_frsize);
+    let mut reclaimed = 0u64;
+    for path in freed {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                reclaimed = reclaimed
+                    .saturating_add(metadata.len().div_ceil(cluster).saturating_mul(cluster));
+            }
+            Ok(_) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let available = stat
+        .f_bavail
+        .saturating_mul(stat.f_frsize)
+        .saturating_add(reclaimed);
+    let remedy = if prune {
+        "Remove old boot environments with `cps boot-env prune`, or free space on the ESP"
+    } else {
+        "Free space on the ESP"
+    };
     ensure!(
         available >= needed,
         "insufficient free space on the EFI system partition for {id}: {} available, {} \
-         needed for its boot files and a {} margin. Remove old boot environments with \
-         `cps boot-env prune`, or free space on the ESP, then retry",
+         needed for its boot files and a {} margin. {remedy}, then retry",
         super::mib(available),
         super::mib(needed),
         super::mib(ESP_MARGIN),
@@ -1429,18 +1474,56 @@ mod tests {
         let existing = dir.path().join("vmlinuz.efi");
         std::fs::write(&existing, b"kernel")?;
         let id = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
-        check_esp_space(dir.path(), id, &[(dir.path().join("initramfs.img"), 4096)])?;
+        check_esp_space(
+            dir.path(),
+            id,
+            &[(dir.path().join("initramfs.img"), 4096)],
+            &[],
+            true,
+        )?;
         // A retry reuses the file that is already in place.
-        check_esp_space(dir.path(), id, &[(existing, u64::MAX / 2)])?;
+        check_esp_space(dir.path(), id, &[(existing, u64::MAX / 2)], &[], true)?;
         let message = check_esp_space(
             dir.path(),
             id,
             &[(dir.path().join("uki.efi"), u64::MAX / 2)],
+            &[],
+            true,
         )
         .unwrap_err()
         .to_string();
         assert!(message.contains("insufficient free space on the EFI system partition"));
         assert!(message.contains(id) && message.contains("cps boot-env prune"));
+        // Without a Btrfs volume, pruning cannot help.
+        let message = check_esp_space(
+            dir.path(),
+            id,
+            &[(dir.path().join("uki.efi"), u64::MAX / 2)],
+            &[],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!message.contains("prune") && message.contains("Free space on the ESP"));
+        Ok(())
+    }
+
+    #[test]
+    fn esp_space_counts_files_a_replacement_frees() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stat = rustix::fs::statvfs(dir.path())?;
+        let available = stat.f_bavail * stat.f_frsize;
+        let cluster = stat.f_frsize.max(1);
+        let id = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-3";
+        // Ask for slightly more than the filesystem has, then free enough
+        // through a sparse replaced artifact whose length counts.
+        let want = available + 64 * cluster;
+        let new = [(dir.path().join("vmlinuz.efi"), want)];
+        assert!(check_esp_space(dir.path(), id, &new, &[], false).is_err());
+        let old = dir.path().join("old.efi");
+        std::fs::File::create(&old)?.set_len(want + 64 * 1024 * 1024)?;
+        let missing = dir.path().join("missing.img");
+        check_esp_space(dir.path(), id, &new, &[old, missing], false)?;
         Ok(())
     }
 

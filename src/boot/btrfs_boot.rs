@@ -390,24 +390,7 @@ impl BtrfsVolume {
         // SAFETY: the initialized buffer matches btrfs_ioctl_search_args.
         unsafe { ioctl(self.root.as_file(), Updater::<SEARCH, _>::new(&mut args)) }
             .context("reading the Btrfs default subvolume")?;
-        let mut items = &args.buf[..];
-        for _ in 0..args.key.nr_items {
-            let header = items.get(..32).context("truncated Btrfs search result")?;
-            let len = u32::from_ne_bytes(header[28..32].try_into()?) as usize;
-            let item = items
-                .get(32..32 + len)
-                .context("truncated Btrfs search item")?;
-            // btrfs_dir_item: location key (17), transid (8), data_len (2), name_len (2), type (1).
-            if item.len() >= 30 {
-                let name_len = u16::from_le_bytes(item[27..29].try_into()?) as usize;
-                if item.get(30..30 + name_len) == Some(b"default".as_slice()) {
-                    return Ok(u64::from_le_bytes(item[..8].try_into()?));
-                }
-            }
-            items = &items[32 + len..];
-        }
-        // Without the item the top level (ID 5) is the default.
-        Ok(5)
+        default_from_search(&args.buf, args.key.nr_items)
     }
 
     pub fn running_parent(&self) -> Result<Option<String>> {
@@ -534,6 +517,29 @@ fn filesystem_info(root: &Root) -> Result<FsInfo> {
     Ok(info)
 }
 
+/// Find the "default" directory item in a tree search result buffer.
+fn default_from_search(buf: &[u8], nr_items: u32) -> Result<u64> {
+    let mut items = buf;
+    for _ in 0..nr_items {
+        // btrfs_ioctl_search_header: transid, objectid, offset (8 each), type, len (4 each).
+        let header = items.get(..32).context("truncated Btrfs search result")?;
+        let len = u32::from_ne_bytes(header[28..32].try_into()?) as usize;
+        let item = items
+            .get(32..32 + len)
+            .context("truncated Btrfs search item")?;
+        // btrfs_dir_item: location key (17), transid (8), data_len (2), name_len (2), type (1).
+        if item.len() >= 30 {
+            let name_len = u16::from_le_bytes(item[27..29].try_into()?) as usize;
+            if item.get(30..30 + name_len) == Some(b"default".as_slice()) {
+                return Ok(u64::from_le_bytes(item[..8].try_into()?));
+            }
+        }
+        items = &items[32 + len..];
+    }
+    // Without the item the top level (ID 5) is the default.
+    Ok(5)
+}
+
 fn subvolume_info(root: &Root) -> Result<SubvolInfo> {
     ensure!(
         fstatfs(root.as_file())?.f_type == libc::BTRFS_SUPER_MAGIC
@@ -583,7 +589,39 @@ fn uuid_string(bytes: &[u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::BtrfsRecord;
+    use super::{BtrfsRecord, default_from_search};
+
+    /// A tree search result item holding a directory item named `name`.
+    fn dir_item(name: &[u8], target: u64) -> Vec<u8> {
+        let mut item = target.to_le_bytes().to_vec();
+        item.push(132); // ROOT_ITEM key type
+        item.extend_from_slice(&u64::MAX.to_le_bytes());
+        item.extend_from_slice(&7u64.to_le_bytes()); // transid
+        item.extend_from_slice(&0u16.to_le_bytes()); // data_len
+        item.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        item.push(2); // BTRFS_FT_DIR
+        item.extend_from_slice(name);
+        let mut header = vec![0; 28];
+        header.extend_from_slice(&(item.len() as u32).to_ne_bytes());
+        header.extend(item);
+        header
+    }
+
+    #[test]
+    fn default_subvolume_comes_from_the_default_directory_item() -> anyhow::Result<()> {
+        let mut buf = dir_item(b"other", 300);
+        buf.extend(dir_item(b"default", 257));
+        assert_eq!(default_from_search(&buf, 2)?, 257);
+        // Items beyond the reported count are ignored.
+        assert_eq!(default_from_search(&buf, 1)?, 5);
+        // Without a default item the top level is the default.
+        assert_eq!(default_from_search(&[], 0)?, 5);
+        assert_eq!(default_from_search(&dir_item(b"defaults", 300), 1)?, 5);
+        // A truncated result is an error, not a guess.
+        assert!(default_from_search(&buf[..20], 1).is_err());
+        assert!(default_from_search(&buf[..40], 1).is_err());
+        Ok(())
+    }
 
     #[test]
     fn boot_record_binds_exact_subvolume_options() -> anyhow::Result<()> {

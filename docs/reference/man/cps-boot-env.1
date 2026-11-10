@@ -65,16 +65,20 @@
 .B \&cps boot\-env destroy\-btrfs [OPTIONS] \-\-esp <ESP> \-\-btrfs\-volume <BTRFS_VOLUME> <ID>
 .PP
 .B Arguments
-.PP
+.TP
 .B \&<ID>
+\&Environment ID to retire, as shown by boot\-env list
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-esp <ESP>
-.PP
+\&Mount point of the EFI System Partition holding the boot entry
+.TP
 .B \&\-\-btrfs\-volume <BTRFS_VOLUME>
-.PP
+\&Mounted Btrfs top\-level volume holding the root subvolume
+.TP
 .B \&\-\-dry\-run
+\&Run every check without changing anything
 .TP
 .B \&\-h, \-\-help
 \&Print help
@@ -152,12 +156,15 @@
 .B \&cps boot\-env list [OPTIONS]
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-esp <ESP>
-.PP
+\&Mount point of the EFI System Partition
+.TP
 .B \&\-\-disk <DISK>
-.PP
+\&Offline GPT disk image to read instead of a mounted ESP
+.TP
 .B \&\-\-esp\-partuuid <ESP_PARTUUID>
+\&GPT PARTUUID of the EFI System Partition on the disk
 .TP
 .B \&\-h, \-\-help
 \&Print help
@@ -172,12 +179,15 @@
 \&Environment ID. Defaults to the previous known\-good environment
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-esp <ESP>
-.PP
+\&Mount point of the EFI System Partition
+.TP
 .B \&\-\-disk <DISK>
-.PP
+\&Offline GPT disk image to change instead of a mounted ESP
+.TP
 .B \&\-\-esp\-partuuid <ESP_PARTUUID>
+\&GPT PARTUUID of the EFI System Partition on the disk
 .TP
 .B \&\-\-output\-disk <OUTPUT_DISK>
 \&Publish the rollback in a new disk file
@@ -186,12 +196,13 @@
 \&Mounted Btrfs top\-level volume for checking a subvolume root
 .TP
 .B \&\-\-dry\-run
-\&Compare the configured default with the rollback root without changing boot selection
+\&Compare the configured default with the rollback root without changing boot selection. Requires \-\-esp and \-\-btrfs\-volume
 .TP
 .B \&\-\-paths
-\&Include managed file actions and ownership in the preview
-.PP
+\&Include managed file actions and ownership in the preview. Requires \-\-dry\-run
+.TP
 .B \&\-\-json
+\&Print the preview as JSON. Requires \-\-dry\-run
 .TP
 .B \&\-h, \-\-help
 \&Print help

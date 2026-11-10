@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{FlockOperation, flock, fstatfs};
 
-use super::policy::{self, BootEntry, LoaderPolicy, field};
+use super::policy::{self, BootEntry, LoaderOverrides, LoaderPolicy, field};
 use crate::boot::{
     device::{EspDevicePath, esp_device_path},
     uki,
@@ -17,6 +17,8 @@ use crate::boot::{
 pub(super) const DIRECTORY: &str = "EFI/cps-uefi";
 pub(super) const ARMED: &str = "# cps-uefi-armed ";
 const GLOBAL: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
+/// The vendor GUID of the systemd-boot loader interface variables.
+const LOADER: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
 const EFIVARFS: &str = "/sys/firmware/efi/efivars";
 const EFIVARFS_MAGIC: u32 = 0xde5e81e4;
 const ATTRIBUTES: u32 = 7; // Non-volatile, boot service and runtime access.
@@ -430,7 +432,9 @@ fn efivarfs() -> PathBuf {
 #[cfg(test)]
 thread_local! {
     /// A directory of regular files standing in for efivarfs in unit tests.
-    static TEST_EFIVARFS: std::cell::RefCell<PathBuf> = std::cell::RefCell::new(PathBuf::from(EFIVARFS));
+    /// Tests that do not install one see no variables.
+    static TEST_EFIVARFS: std::cell::RefCell<PathBuf> =
+        std::cell::RefCell::new(PathBuf::from("/nonexistent/cps-test-efivarfs"));
 }
 
 #[cfg(test)]
@@ -440,6 +444,63 @@ fn efivarfs() -> PathBuf {
 
 fn variable_path(name: &str) -> PathBuf {
     efivarfs().join(format!("{name}-{GLOBAL}"))
+}
+
+/// The systemd-boot variables that override loader.conf, when systemd-boot
+/// booted this host from `esp`.
+///
+/// Other ESPs, and hosts without efivarfs or systemd-boot, return `None`.
+pub(super) fn loader_overrides(esp: &Path, locked_esp: &File) -> Result<Option<LoaderOverrides>> {
+    let Some(booted) = loader_string("LoaderDevicePartUUID")? else {
+        return Ok(None);
+    };
+    // A directory that is not a mounted GPT ESP is not the booted one.
+    let Ok(device) = esp_device_path(esp, locked_esp) else {
+        return Ok(None);
+    };
+    if !booted.eq_ignore_ascii_case(&device.uuid) {
+        return Ok(None);
+    }
+    Ok(Some(LoaderOverrides {
+        timeout: loader_string("LoaderConfigTimeout")?,
+        timeout_one_shot: loader_string("LoaderConfigTimeoutOneShot")?,
+        default: loader_string("LoaderEntryDefault")?,
+        preferred: loader_string("LoaderEntryPreferred")?,
+    }))
+}
+
+/// Read a systemd-boot string variable. Unreadable efivarfs reads as unset.
+fn loader_string(name: &str) -> Result<Option<String>> {
+    let path = efivarfs().join(format!("{name}-{LOADER}"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading EFI variable {name}")),
+    };
+    parse_loader_string(&bytes)
+        .map(Some)
+        .with_context(|| format!("invalid EFI variable {name}"))
+}
+
+/// Decode efivarfs contents: attributes, then UTF-16LE text that ends at
+/// the first NUL, as systemd-boot reads it.
+fn parse_loader_string(bytes: &[u8]) -> Result<String> {
+    let data = bytes.get(4..).context("missing variable attributes")?;
+    let (units, tail) = data.as_chunks::<2>();
+    ensure!(tail.is_empty(), "incomplete UTF-16 character");
+    let units: Vec<_> = units
+        .iter()
+        .map(|unit| u16::from_le_bytes(*unit))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16(&units).context("invalid UTF-16")
 }
 
 fn option_name(number: u16) -> String {
@@ -711,6 +772,51 @@ mod tests {
             names.sort();
             Ok(names)
         }
+    }
+
+    fn utf16(text: &str, nul: bool) -> Vec<u8> {
+        let mut bytes = ATTRIBUTES.to_le_bytes().to_vec();
+        for unit in text.encode_utf16().chain(nul.then_some(0)) {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn loader_variables_decode_like_systemd_boot() -> Result<()> {
+        assert_eq!(
+            parse_loader_string(&utf16("menu-force", true))?,
+            "menu-force"
+        );
+        assert_eq!(parse_loader_string(&utf16("5", false))?, "5");
+        // Text ends at the first NUL.
+        let mut early = utf16("a.conf", true);
+        early.extend_from_slice(&utf16("tail", false)[4..]);
+        assert_eq!(parse_loader_string(&early)?, "a.conf");
+        assert!(parse_loader_string(&[7, 0, 0]).is_err());
+        assert!(parse_loader_string(&[7, 0, 0, 0, b'a']).is_err());
+        assert!(parse_loader_string(&[7, 0, 0, 0, 0x00, 0xd8]).is_err());
+
+        let _fake = FakeFirmware::new()?;
+        assert_eq!(loader_string("LoaderEntryDefault")?, None);
+        fs::write(
+            efivarfs().join(format!("LoaderEntryDefault-{LOADER}")),
+            utf16("arch.conf", true),
+        )?;
+        assert_eq!(
+            loader_string("LoaderEntryDefault")?.as_deref(),
+            Some("arch.conf")
+        );
+        // The variables apply only to the ESP that systemd-boot booted from.
+        let esp = tempfile::tempdir()?;
+        let lock = File::open(esp.path())?;
+        assert!(loader_overrides(esp.path(), &lock)?.is_none());
+        fs::write(
+            efivarfs().join(format!("LoaderDevicePartUUID-{LOADER}")),
+            utf16("6E2B6B4A-6E9B-4B4B-9C3E-8F2B5D7C9A10", true),
+        )?;
+        assert!(loader_overrides(esp.path(), &lock)?.is_none());
+        Ok(())
     }
 
     #[test]

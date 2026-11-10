@@ -1532,12 +1532,16 @@ enum PlanCommand {
 enum BootCommand {
     /// Retire an inactive Btrfs root and its boot artifacts, or resume its cleanup
     DestroyBtrfs {
+        /// Mount point of the EFI System Partition holding the boot entry
         #[arg(long)]
         esp: PathBuf,
+        /// Mounted Btrfs top-level volume holding the root subvolume
         #[arg(long)]
         btrfs_volume: PathBuf,
+        /// Run every check without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Environment ID to retire, as shown by boot-env list
         id: String,
     },
     /// Remove old environments and failed trials under the boot-btrfs retention policy
@@ -1581,19 +1585,25 @@ enum BootCommand {
     },
     /// List registered boot environments and the configured default
     List {
+        /// Mount point of the EFI System Partition
         #[arg(long, required_unless_present = "disk", conflicts_with = "disk")]
         esp: Option<PathBuf>,
+        /// Offline GPT disk image to read instead of a mounted ESP
         #[arg(long, requires = "esp_partuuid")]
         disk: Option<PathBuf>,
+        /// GPT PARTUUID of the EFI System Partition on the disk
         #[arg(long, requires = "disk")]
         esp_partuuid: Option<String>,
     },
     /// Select a known-good environment for the next boot
     Rollback {
+        /// Mount point of the EFI System Partition
         #[arg(long, required_unless_present = "disk", conflicts_with = "disk")]
         esp: Option<PathBuf>,
+        /// Offline GPT disk image to change instead of a mounted ESP
         #[arg(long, requires_all = ["esp_partuuid", "output_disk"])]
         disk: Option<PathBuf>,
+        /// GPT PARTUUID of the EFI System Partition on the disk
         #[arg(long, requires = "disk")]
         esp_partuuid: Option<String>,
         /// Publish the rollback in a new disk file
@@ -1602,12 +1612,14 @@ enum BootCommand {
         /// Mounted Btrfs top-level volume for checking a subvolume root
         #[arg(long, requires = "esp", conflicts_with = "disk")]
         btrfs_volume: Option<PathBuf>,
-        /// Compare the configured default with the rollback root without changing boot selection
-        #[arg(long, requires = "btrfs_volume")]
+        /// Compare the configured default with the rollback root without changing boot
+        /// selection. Requires --esp and --btrfs-volume.
+        #[arg(long, requires_all = ["esp", "btrfs_volume"])]
         dry_run: bool,
-        /// Include managed file actions and ownership in the preview
+        /// Include managed file actions and ownership in the preview. Requires --dry-run.
         #[arg(long, requires = "dry_run")]
         paths: bool,
+        /// Print the preview as JSON. Requires --dry-run.
         #[arg(long, requires = "dry_run")]
         json: bool,
         /// Environment ID. Defaults to the previous known-good environment.
@@ -3896,11 +3908,10 @@ fn run(command: Command) -> Result<ExitCode> {
                 id,
             } => {
                 if dry_run {
+                    // clap requires --esp and --btrfs-volume with --dry-run.
                     let (target, diff) = cps::preview_btrfs_rollback(
-                        esp.as_deref().context("--dry-run requires --esp")?,
-                        btrfs_volume
-                            .as_deref()
-                            .context("--dry-run requires --btrfs-volume")?,
+                        esp.as_deref().context("missing --esp")?,
+                        btrfs_volume.as_deref().context("missing --btrfs-volume")?,
                         id.as_deref(),
                         paths,
                     )?;
@@ -4178,7 +4189,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, Parser};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     use super::Cli;
 
@@ -4223,10 +4234,7 @@ mod tests {
         let error = build(&[])
             .err()
             .expect("signing without a check was accepted");
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(build(&["--check-reproducible"]).is_ok());
     }
 
@@ -4257,5 +4265,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn boot_env_help_describes_every_option() {
+        with_stack(boot_env_help);
+    }
+
+    fn boot_env_help() {
+        Cli::command().debug_assert();
+        let mut command = Cli::command();
+        let boot = command.find_subcommand_mut("boot-env").unwrap();
+        for (name, args) in [
+            ("list", ["esp", "disk", "esp_partuuid"].as_slice()),
+            ("destroy-btrfs", &["id", "esp", "btrfs_volume", "dry_run"]),
+            (
+                "rollback",
+                &["esp", "disk", "esp_partuuid", "dry_run", "paths", "json"],
+            ),
+        ] {
+            let subcommand = boot.find_subcommand(name).unwrap();
+            for arg in args.iter() {
+                let arg = subcommand
+                    .get_arguments()
+                    .find(|candidate| candidate.get_id() == *arg)
+                    .unwrap();
+                assert!(
+                    arg.get_help().is_some(),
+                    "{name} {} has no help",
+                    arg.get_id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_preview_requires_its_esp_and_volume() {
+        with_stack(rollback_preview);
+    }
+
+    fn rollback_preview() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["cps", "boot-env", "rollback"].iter().chain(args)).map(drop)
+        };
+        for args in [
+            ["--esp", "/efi", "--dry-run"].as_slice(),
+            &["--btrfs-volume", "/v", "--dry-run"],
+            &["--esp", "/efi", "--paths"],
+        ] {
+            let error = parse(args).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
+        }
+        parse(&[
+            "--esp",
+            "/efi",
+            "--btrfs-volume",
+            "/v",
+            "--dry-run",
+            "--paths",
+        ])
+        .unwrap();
     }
 }

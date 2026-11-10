@@ -237,8 +237,7 @@ after `multi-user.target`. Systemd blesses the entry when boot completion
 succeeds, removing the boot counter. If the attempts run out, systemd-boot
 selects the previous environment. CPS owns the boot selection in the ESP's
 [loader configuration](boot-operations.md#the-loader-configuration) and
-assumes no EFI default override, as described in
-[Trials and blessing](boot-operations.md#trials-and-blessing).
+rejects [EFI variables that override it](boot-operations.md#firmware-variable-overrides).
 [systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
 
 ## Reusing a root slot
@@ -272,7 +271,9 @@ On an installed disk, pass `--replace "$old_environment_id"` to
 `activate-device` with `--root-image` and the older root's device and
 PARTUUID. CPS verifies the new export, durably retires the old boot entry and
 artifacts, and writes the root while the selected known-good environment
-stays available.
+stays available. The ESP space check counts the files that the replacement
+retires as free, so a full ESP can still take the new kernel and initramfs
+in place of the old ones.
 
 If writing the slot is interrupted, rerun the replacement command with the
 same `--replace` ID. CPS records that ID on the ESP until it has verified the

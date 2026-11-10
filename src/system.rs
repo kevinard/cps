@@ -605,7 +605,7 @@ impl System {
             return Ok(None);
         }
 
-        self.prune_before_staging();
+        self.prune_before_staging(change)?;
         let root = self.stage_change(change)?;
         let id = if boot.uefi {
             boot.activation
@@ -631,14 +631,20 @@ impl System {
         self.check_running()?;
         fetch_plan(Path::new(ROOT), &change.plan)
             .context("fetching the approved repair payloads")?;
-        self.prune_before_staging();
+        self.prune_before_staging(change)?;
         self.stage_change(change)
+    }
+
+    /// The staging directory for `change`, which a retry reuses.
+    fn staging_directory(&self, change: &Change) -> Result<PathBuf> {
+        let plan_id = change.plan.id()?;
+        Ok(self.boot().environments.join(format!("upgrade-{plan_id}")))
     }
 
     fn stage_change(&self, change: &Change) -> Result<PathBuf> {
         let boot = self.boot();
         let plan_id = change.plan.id()?;
-        let output = boot.environments.join(format!("upgrade-{plan_id}"));
+        let output = self.staging_directory(change)?;
         let root = output.join("root");
         if root.try_exists()? {
             let staged = Image::open_query(&root)?;
@@ -733,7 +739,7 @@ impl System {
         if blessed.is_some() && boot.auto_prune {
             // The promoted trial is the new default, so older roots can retire.
             match self.lock() {
-                Ok(_lock) => self.prune_quietly(Some(boot.keep_environments)),
+                Ok(_lock) => self.prune_quietly(Some(boot.keep_environments), None),
                 Err(error) => eprintln!("Warning: could not prune boot environments: {error:#}"),
             }
         }
@@ -754,6 +760,7 @@ impl System {
             &boot.volume,
             Some(keep.unwrap_or(boot.keep_environments)),
             dry_run,
+            None,
         )?;
         if !dry_run {
             self.remove_empty_staging_directories();
@@ -770,14 +777,22 @@ impl System {
     }
 
     /// Remove failed trials, and old roots when auto-prune is set, before staging.
-    fn prune_before_staging(&self) {
+    ///
+    /// The trial of an interrupted activation of `change` stays, so that
+    /// staging and activation resume it.
+    fn prune_before_staging(&self, change: &Change) -> Result<()> {
         let boot = self.boot();
-        self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments));
+        let staged = self.staging_directory(change)?.join("root");
+        self.prune_quietly(
+            boot.auto_prune.then_some(boot.keep_environments),
+            Some(&staged),
+        );
+        Ok(())
     }
 
-    fn prune_quietly(&self, keep: Option<usize>) {
+    fn prune_quietly(&self, keep: Option<usize>, staged: Option<&Path>) {
         let boot = self.boot();
-        match prune_btrfs_boot_environments(&boot.esp, &boot.volume, keep, false) {
+        match prune_btrfs_boot_environments(&boot.esp, &boot.volume, keep, false, staged) {
             Ok(report) => {
                 for (id, kind) in &report.removed {
                     eprintln!("Removed {} {id}", removal_label(*kind));
