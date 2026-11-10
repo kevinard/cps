@@ -5,12 +5,15 @@ use tough::{Repository, RepositoryLoader};
 use url::Url;
 
 use super::{
-    ENDPOINTS_LIMIT, Mirror, MirrorTransport, PUBLISHER_KEY_TARGET, PUBLISHER_NAME_TARGET,
+    ENDPOINTS_LIMIT, Mirror, MirrorTransport, PUBLISHER_NAME_TARGET, TRUST_ROOT_TARGET,
     checked_target, download_target, mirror_base, read_tuf_root,
 };
 use crate::{
     model::{digest, validate_publisher},
-    repo::{PUBLIC_KEY_DER_LEN, parse_public_key, read_limited},
+    repo::{
+        keys::trust::{self, Pinned, TRUST_ROOT_LIMIT},
+        read_limited,
+    },
     transport::https_client,
 };
 
@@ -20,11 +23,12 @@ pub struct PublisherBootstrap {
     pub name: String,
     pub url: Url,
     pub tuf_root: Vec<u8>,
-    pub trust_key: Vec<u8>,
+    /// The publisher's newest trust root, as served by the mirror.
+    pub trust_root: Vec<u8>,
 }
 
 impl PublisherBootstrap {
-    /// Discover the publisher and public key using a locally trusted TUF root.
+    /// Discover the publisher and its trust root using a locally trusted TUF root.
     pub fn fetch(base: &str, trusted_root: &Path) -> Result<Self> {
         let url = mirror_base(base)?;
         ensure!(
@@ -41,7 +45,7 @@ impl PublisherBootstrap {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let (name, trust_key) = runtime.block_on(async {
+        let (name, trust_root) = runtime.block_on(async {
             let timeout = Duration::from_secs(30);
             let client = https_client().timeout(timeout).build()?;
             let verified = RepositoryLoader::new(&tuf_root, mirror.metadata, mirror.targets)
@@ -56,13 +60,24 @@ impl PublisherBootstrap {
             name,
             url,
             tuf_root,
-            trust_key,
+            trust_root,
         })
     }
 
-    /// SHA-256 fingerprints of the trusted root document and verified DER key, in that order.
-    pub fn fingerprints(&self) -> (String, String) {
-        (digest(&self.tuf_root), digest(&self.trust_key))
+    /// The SHA-256 of the trusted TUF root document.
+    pub fn tuf_root_fingerprint(&self) -> String {
+        digest(&self.tuf_root)
+    }
+
+    /// The publisher, version, expiry, and key fingerprints of the trust root.
+    pub fn describe(&self) -> Result<String> {
+        Ok(Pinned::parse(&self.trust_root)?.root().to_string())
+    }
+
+    /// Require the trust root to name exactly these root key fingerprints, so
+    /// provisioning does not depend on trusting the first mirror response.
+    pub fn check_root_keys(&self, expected: &[String]) -> Result<()> {
+        trust::check_expected_root_keys(Pinned::parse(&self.trust_root)?.root(), expected)
     }
 }
 
@@ -79,16 +94,15 @@ async fn verified_identity(verified: &Repository, scratch: &Path) -> Result<(Str
     .await?;
     let name = String::from_utf8(name).context("reading TUF publisher name")?;
     validate_publisher(&name)?;
-    let key = read_target(
-        verified,
-        scratch,
-        PUBLISHER_KEY_TARGET,
-        PUBLIC_KEY_DER_LEN,
-        Some(PUBLIC_KEY_DER_LEN),
-    )
-    .await?;
-    parse_public_key(&key).context("checking TUF publisher key")?;
-    Ok((name, key))
+    let trust_root =
+        read_target(verified, scratch, TRUST_ROOT_TARGET, TRUST_ROOT_LIMIT, None).await?;
+    let pinned = Pinned::parse(&trust_root).context("checking the TUF publisher trust root")?;
+    ensure!(
+        pinned.root().publisher == name,
+        "TUF publisher trust root belongs to {}, not {name}",
+        pinned.root().publisher
+    );
+    Ok((name, trust_root))
 }
 
 async fn read_target(
@@ -123,10 +137,19 @@ mod tests {
         let export = work.path().join("export");
         let mirror = work.path().join("mirror");
         fs::create_dir(&export)?;
-        let mut key = hex::decode("302a300506032b6570032100")?;
-        key.extend([42; 32]);
+        let publisher = work.path().join("publisher");
+        fs::create_dir(&publisher)?;
+        let key = publisher.join("key.der");
+        fs::write(
+            &key,
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap()
+                .as_ref(),
+        )?;
+        let trust_path = crate::repo::init_trust(&publisher, "extras", &key, None)?;
+        let key = fs::read(trust_path)?;
         fs::write(export.join(PUBLISHER_NAME_TARGET), "extras")?;
-        fs::write(export.join(PUBLISHER_KEY_TARGET), &key)?;
+        fs::write(export.join(TRUST_ROOT_TARGET), &key)?;
         fs::write(export.join("current"), format!("{}\n", digest(b"catalog")))?;
         let expires = jiff::Timestamp::now().checked_add(jiff::Span::new().hours(1))?;
         tuf::sign_export(
@@ -162,12 +185,29 @@ mod tests {
         let identity = runtime.block_on(verified_identity(&verified, scratch.path()))?;
         assert_eq!(identity, ("extras".to_owned(), key.clone()));
 
+        let bootstrap = PublisherBootstrap {
+            name: identity.0.clone(),
+            url: url.clone(),
+            tuf_root: anchor.clone(),
+            trust_root: identity.1.clone(),
+        };
+        let root_key = Pinned::parse(&key)?
+            .root()
+            .root_keys
+            .iter()
+            .map(|key| trust::fingerprint(&key.0))
+            .collect::<Vec<_>>();
+        bootstrap.check_root_keys(&root_key)?;
+        assert!(bootstrap.check_root_keys(&[digest(b"other key")]).is_err());
+        assert!(bootstrap.describe()?.contains("Publisher: extras"));
+
         let key_target =
             mirror
                 .join("targets")
-                .join(format!("{}.{}", digest(&key), PUBLISHER_KEY_TARGET));
+                .join(format!("{}.{}", digest(&key), TRUST_ROOT_TARGET));
         let mut tampered = key;
-        tampered[43] ^= 1;
+        let last = tampered.len() - 3;
+        tampered[last] ^= 1;
         fs::write(&key_target, tampered)?;
         assert!(
             runtime
@@ -175,7 +215,7 @@ mod tests {
                 .is_err()
         );
 
-        fs::remove_file(export.join(PUBLISHER_KEY_TARGET))?;
+        fs::remove_file(export.join(TRUST_ROOT_TARGET))?;
         tuf::sign_export(
             &export,
             &mirror,

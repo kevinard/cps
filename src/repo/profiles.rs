@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     Catalog, CatalogLineage, CatalogPin, Published, ReleaseAdvisory, ReleaseProfile, Snapshot,
-    catalog_snapshot, read_catalog, read_key, read_package, snapshot,
+    catalog_snapshot, read_catalog, read_package, read_trust_root, snapshot,
 };
 
 type Composition = (BTreeMap<String, Installed>, BTreeMap<String, Managed>);
@@ -42,7 +42,7 @@ impl<'a> CompanionCatalogs<'a> {
         primary_keys: &[[u8; 32]],
     ) -> Result<Self> {
         let config = &companion.config;
-        let key = read_key(&config.trust_key)?;
+        let key = read_trust_root(&config.trust_key)?;
         let catalog = read_catalog(&config.repository, &companion.catalog, &config.name, &key)
             .with_context(|| {
                 format!(
@@ -50,11 +50,11 @@ impl<'a> CompanionCatalogs<'a> {
                     companion.catalog, config.name
                 )
             })?;
-        let lineage = CatalogLineage::new(&key, &catalog);
+        let lineage = CatalogLineage::new(&catalog);
         if let Some(previous) = previous {
             if let Some(old) = &previous.lineage {
                 ensure!(
-                    old.anchor_sha256 == lineage.anchor_sha256,
+                    old.trust_root_sha256 == lineage.trust_root_sha256,
                     "release changes companion trust anchor for {}",
                     config.name
                 );
@@ -75,8 +75,7 @@ impl<'a> CompanionCatalogs<'a> {
                     })?;
             }
         }
-        let current =
-            catalog_snapshot(&config.repository, catalog, companion.catalog.clone(), &key)?;
+        let current = catalog_snapshot(&config.repository, catalog, companion.catalog.clone())?;
         let trust = config
             .build_trust
             .as_ref()
@@ -153,7 +152,7 @@ pub(super) fn check(
         return Ok(BTreeMap::new());
     }
     let packages = load_packages(repo, catalog)?;
-    let primary_keys = catalog.publisher_keys(key)?;
+    let primary_keys = catalog.publisher_keys();
     let mut baselines = BTreeMap::new();
     let mut checked = BTreeMap::new();
     for (name, profile) in profiles {

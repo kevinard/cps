@@ -64,7 +64,8 @@ impl KeySpec {
 
 /// Facts about one signing request, passed to the helper in its environment.
 pub(crate) struct SignRequest<'a> {
-    /// `tuf` for mirror metadata or `catalog` for a CPS publisher signature.
+    /// `tuf` for mirror metadata, `catalog` for a catalog root, `trust-root`
+    /// for a publisher trust root, or `attestation` for a build statement.
     pub context: &'static str,
     pub key_id: &'a str,
     pub algorithm: &'static str,

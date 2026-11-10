@@ -241,9 +241,9 @@ publisher "canopa" {{
         format!(
             r#"schema-version 1 kind="image-config"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            f.repo, f.public
+            f.repo, f.trust
         ),
     )?;
     create_configured_image(&f.root, &config)?;

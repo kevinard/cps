@@ -10,10 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use ring::{
-    rand::SystemRandom,
-    signature::{Ed25519KeyPair, KeyPair},
-};
+use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
 use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -29,8 +26,11 @@ use crate::{
     },
     model::{FileDigest, Manifest, digest},
     publish,
-    repo::{read_key, read_signing_key, snapshot},
+    repo::{read_signing_key, read_trust_root, snapshot},
 };
+
+/// Renew the local Git publisher's trust root this long before it expires.
+const RENEW_BEFORE_DAYS: i64 = 90;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -429,7 +429,7 @@ impl GitBuild {
         store: &GitStore,
         toolchain: &Path,
     ) -> Result<String> {
-        let key = read_key(&store.public_key())?;
+        let key = store.ensure_trust(&self.manifest.publisher)?;
         if store.repo().join("current").try_exists()? {
             let catalog = snapshot(&store.repo(), &self.manifest.publisher, &key, None)?;
             let mut newest = None;
@@ -575,13 +575,9 @@ impl GitStore {
             let private = stage.path().join("private.der");
             fs::write(&private, key.as_ref())?;
             fs::set_permissions(&private, fs::Permissions::from_mode(0o600))?;
-            let key = read_signing_key(&private)?;
-            let mut public = hex::decode("302a300506032b6570032100")?;
-            public.extend_from_slice(key.public_key().as_ref());
-            fs::write(stage.path().join("public.der"), public)?;
+            read_signing_key(&private)?;
             fs::create_dir(stage.path().join("repo"))?;
             File::open(private)?.sync_all()?;
-            File::open(stage.path().join("public.der"))?.sync_all()?;
             File::open(stage.path())?.sync_all()?;
             fs::rename(stage.path(), &path)?;
             File::open(parent)?.sync_all()?;
@@ -597,8 +593,19 @@ impl GitStore {
     pub(crate) fn repo(&self) -> PathBuf {
         self.0.join("repo")
     }
-    pub(crate) fn public_key(&self) -> PathBuf {
-        self.0.join("public.der")
+    /// The pinned version 1 trust root of the local Git publisher.
+    pub(crate) fn trust_root(&self) -> PathBuf {
+        crate::repo::trust_root_path(&self.repo(), 1)
+    }
+
+    /// Create the local 1-of-1 trust root on first use, renew it before it
+    /// expires, and return the pinned trust root bytes.
+    fn ensure_trust(&self, publisher: &str) -> Result<Vec<u8>> {
+        if !self.trust_root().try_exists()? {
+            crate::repo::init_trust(&self.repo(), publisher, &self.private_key(), None)?;
+        }
+        crate::repo::renew_trust(&self.repo(), &self.private_key(), RENEW_BEFORE_DAYS)?;
+        read_trust_root(&self.trust_root())
     }
     fn private_key(&self) -> PathBuf {
         self.0.join("private.der")

@@ -32,7 +32,7 @@ use crate::{
     model::{FileDigest, Node, digest, digest_reader},
     plan::{CandidateSet, Candidates, resolve_packages, select_paths},
     repo::{
-        MANIFEST_LIMIT, read_key, read_limited, read_signing_key,
+        MANIFEST_LIMIT, read_limited, read_signing_key, read_trust_root,
         release::{compressed_payload_name, copy_compressed_payload, fetch_repository_payloads},
         snapshot, stage_blob,
     },
@@ -444,7 +444,7 @@ struct ToolchainRepository {
 
 impl ToolchainRepository {
     fn configured(entry: PublisherConfig, pin: &PublisherPin) -> Result<Self> {
-        let key = read_key(&entry.trust_key)?;
+        let key = read_trust_root(&entry.trust_key)?;
         let key_sha256 = digest(&key);
         ensure!(
             pin.key_sha256 == key_sha256,
@@ -483,7 +483,7 @@ fn toolchain_repositories(
                 pin.name == publisher,
                 "toolchain publisher differs from the recipe pin"
             );
-            let key = read_key(trust_key)?;
+            let key = read_trust_root(trust_key)?;
             ensure!(
                 pin.key_sha256 == digest(&key),
                 "toolchain key digest mismatch for {publisher}"

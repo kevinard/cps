@@ -406,7 +406,7 @@ impl System {
                     &mut Image::open_for_live_apply(root, id, revision)?,
                     source,
                     &store.repo(),
-                    &store.public_key(),
+                    &store.trust_root(),
                     true,
                 )
             },
@@ -452,7 +452,7 @@ impl System {
                 let store = GitStore::open(path)?;
                 ensure!(
                     fs::canonicalize(store.repo())? == publisher.repo
-                        && crate::repo::read_key(&store.public_key())? == publisher.key,
+                        && crate::repo::read_trust_root(&store.trust_root())? == publisher.key,
                     "Git publisher cache or signing key changed for {name}"
                 );
                 updates.push(build.publish(source, &store, self.git_toolchain()?)?);

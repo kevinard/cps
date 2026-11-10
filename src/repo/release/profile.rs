@@ -312,7 +312,7 @@ fn check_composition(
             .with_context(|| format!("loading build trust for {}", source.publisher))?;
         let signed = pin.build_trust.as_ref();
         let evidence = (signed.is_some() || local.is_some())
-            .then(|| catalog.take_build_evidence(&pin.sha256, &source.key))
+            .then(|| catalog.take_build_evidence(&pin.sha256))
             .transpose()?;
         candidates.add_obsoletions(&mut origins, source.publisher, &catalog.obsoletions);
         // A publisher claims a name even when its versions miss the locked digest.

@@ -18,7 +18,7 @@ use crate::{
         manifest_text, parse_manifest,
     },
     model::{Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name},
-    repo::{MANIFEST_LIMIT, read_key, read_limited},
+    repo::{MANIFEST_LIMIT, read_key, read_limited, trust_root_keys},
 };
 
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
@@ -70,6 +70,14 @@ impl BuildTrust {
             !self.keys.iter().any(|builder| builder.as_slice() == key),
             "builder and publisher must use distinct keys"
         );
+        Ok(())
+    }
+
+    /// Require every builder key to differ from every key of a pinned trust root.
+    pub fn check_publisher_trust(&self, trust_root: &[u8]) -> Result<()> {
+        for key in trust_root_keys(trust_root)? {
+            self.check_publisher_key(&key)?;
+        }
         Ok(())
     }
 

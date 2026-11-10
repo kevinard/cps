@@ -31,6 +31,10 @@ struct Fixture {
     recipe: PathBuf,
     private: PathBuf,
     public: PathBuf,
+    /// A client's copy of the repository's version 1 trust root, created for
+    /// "canopa" and recreated for another publisher before its first
+    /// publication.
+    trust: PathBuf,
 }
 
 impl Fixture {
@@ -48,8 +52,12 @@ impl Fixture {
         let mut spki = hex::decode("302a300506032b6570032100")?;
         spki.extend_from_slice(key.public_key().as_ref());
         fs::write(&public, spki)?;
+        let repo = path.join("repo");
+        let trust = path.join("trust.json");
+        fs::copy(crate::init_trust(&repo, "canopa", &private, None)?, &trust)?;
         Ok(Self {
-            repo: path.join("repo"),
+            trust,
+            repo,
             root: path.join("image"),
             recipe: path.join("manifest.kdl"),
             proto,
@@ -57,6 +65,21 @@ impl Fixture {
             public,
             _dir: dir,
         })
+    }
+
+    /// Make the repository's trust root name `publisher` while it has no catalog.
+    fn trust_publisher(&self, publisher: &str) -> Result<()> {
+        if self.repo.join("current").exists()
+            || crate::show_trust(&self.trust)?.contains(&format!("Publisher: {publisher}\n"))
+        {
+            return Ok(());
+        }
+        fs::remove_dir_all(self.repo.join("trust"))?;
+        fs::copy(
+            crate::init_trust(&self.repo, publisher, &self.private, None)?,
+            &self.trust,
+        )?;
+        Ok(())
     }
 
     fn package(&self, name: &str, version: &str, actions: String) -> Result<()> {
@@ -74,6 +97,7 @@ impl Fixture {
             "schema-version 1 kind=\"package-manifest\"\npackage {name:?} publisher={publisher:?} version={version:?} {{\n{actions}}}\n"
         );
         fs::write(&self.recipe, manifest)?;
+        self.trust_publisher(publisher)?;
         publish(&self.repo, &self.proto, &self.recipe, &self.private)?;
         Ok(())
     }
@@ -94,7 +118,7 @@ impl Fixture {
             &self.root,
             &self.repo,
             "canopa",
-            &self.public,
+            &self.trust,
             "x86_64",
             BTreeMap::from([("doc.man".to_owned(), false)]),
         )?;
@@ -913,12 +937,12 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
     let config = primary._dir.path().join("image.kdl");
     let definition = |extra_key: &Path| {
         format!(
-            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
-             publisher \"extras\" {{\n    repository {:?}\n    trust-key {:?}\n}}\n",
+            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-root \"trust.json\"\n}}\n\
+             publisher \"extras\" {{\n    repository {:?}\n    trust-root {:?}\n}}\n",
             extra.repo, extra_key,
         )
     };
-    fs::write(&config, definition(&primary.public))?;
+    fs::write(&config, definition(&primary.trust))?;
     let wrong_key_root = primary.root.with_extension("wrong-key");
     crate::create_configured_image(&wrong_key_root, &config)?;
     let install = |name: &str| Request::Install {
@@ -928,9 +952,13 @@ fn plans_pin_ordered_publishers_and_keep_installed_sources() -> Result<()> {
         "{:#}",
         plan(&wrong_key_root, install("desktop/plugin")).unwrap_err()
     );
-    assert!(error.contains("signed catalog for extras") && error.contains("invalid signature"));
+    assert!(
+        error.contains("signed catalog for extras")
+            && error.contains("pinned trust root belongs to publisher canopa"),
+        "{error}"
+    );
 
-    fs::write(&config, definition(&extra.public))?;
+    fs::write(&config, definition(&extra.trust))?;
     crate::create_configured_image(&primary.root, &config)?;
     let plan_for = |request| plan(&primary.root, request);
     let qualified_root = primary.root.with_extension("qualified");
@@ -1247,9 +1275,9 @@ fn publisher_changes_invalidate_plans_without_changing_boot_lineage() -> Result<
     let settings = |root| Image::open(root, false)?.settings();
     let before = settings(&base.root)?;
     let stale = plan_for(Request::Update)?;
-    assert!(add_publisher(&base.root, "extras", &extra.repo, &base.public).is_err());
+    assert!(add_publisher(&base.root, "extras", &extra.repo, &base.trust).is_err());
     assert_eq!(settings(&base.root)?, before);
-    add_publisher(&base.root, "extras", &extra.repo, &extra.public)?;
+    add_publisher(&base.root, "extras", &extra.repo, &extra.trust)?;
     let order = || -> Result<Vec<String>> {
         Ok(list_publishers(&base.root)?
             .into_iter()
@@ -1257,7 +1285,7 @@ fn publisher_changes_invalidate_plans_without_changing_boot_lineage() -> Result<
             .collect())
     };
     assert_eq!(order()?, ["canopa", "extras"]);
-    assert!(add_publisher(&base.root, "extras", &extra.repo, &extra.public).is_err());
+    assert!(add_publisher(&base.root, "extras", &extra.repo, &extra.trust).is_err());
     assert!(
         apply(&base.root, &stale)
             .unwrap_err()
@@ -1898,7 +1926,7 @@ fn requires_one_compatible_backend_and_checks_removal_offline() -> Result<()> {
         &fresh,
         &f.repo,
         "canopa",
-        &f.public,
+        &f.trust,
         "x86_64",
         BTreeMap::new(),
     )?;
@@ -1981,7 +2009,7 @@ fn virtual_packages_resolve_real_providers_and_preserve_dependencies_offline() -
         &fresh,
         &f.repo,
         "canopa",
-        &f.public,
+        &f.trust,
         "x86_64",
         BTreeMap::new(),
     )?;
@@ -2405,7 +2433,7 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
     use crate::{
         add_publisher,
         query::{FileMatch, search_files},
-        repo::{read_key, snapshot},
+        repo::{read_trust_root, snapshot},
     };
 
     let f = Fixture::new()?;
@@ -2438,7 +2466,7 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
         f.file("usr/bin/unrelated", "unrelated", "0755", "")?,
     )?;
     f.create()?;
-    add_publisher(&f.root, "extras", &extras.repo, &extras.public)?;
+    add_publisher(&f.root, "extras", &extras.repo, &extras.trust)?;
     fs::remove_dir_all(f.repo.join("blobs"))?;
     fs::remove_dir_all(extras.repo.join("blobs"))?;
 
@@ -2483,7 +2511,7 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
         fs::write(index_dir.join(&hash), invalid)?;
         assert!(crate::repo::read_file_index(&f.repo, &hash).is_err());
     }
-    let catalog = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
+    let catalog = snapshot(&f.repo, "canopa", &read_trust_root(&f.trust)?, None)?;
     let unrelated = catalog
         .packages
         .iter()
@@ -3840,9 +3868,9 @@ fn configuration_move_identities_are_unique_within_a_publisher() -> Result<()> {
     fs::write(
         &config,
         format!(
-            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-key \"public.der\"\n}}\n\
-             publisher \"extras\" {{\n    repository {:?}\n    trust-key {:?}\n}}\n",
-            extra.repo, extra.public,
+            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n    repository \"repo\"\n    trust-root \"trust.json\"\n}}\n\
+             publisher \"extras\" {{\n    repository {:?}\n    trust-root {:?}\n}}\n",
+            extra.repo, extra.trust,
         ),
     )?;
     crate::create_configured_image(&primary.root, &config)?;
@@ -3885,7 +3913,7 @@ fn rejects_the_old_image_state_layout_and_format() -> Result<()> {
     let config = f._dir.path().join("image.kdl");
     fs::write(
         &config,
-        "schema-version 1 kind=\"image-config\"\nimage-state \"legacy\"\npublisher \"canopa\" {\n repository \"repo\"\n trust-key \"public.der\"\n}\n",
+        "schema-version 1 kind=\"image-config\"\nimage-state \"legacy\"\npublisher \"canopa\" {\n repository \"repo\"\n trust-root \"trust.json\"\n}\n",
     )?;
     f.package("test/pkg", "1.0.0-0", String::new())?;
     assert!(crate::create_configured_image(&f.root, &config).is_err());
@@ -4303,7 +4331,7 @@ fn compares_independent_committed_roots_without_the_repository() -> Result<()> {
         &next,
         &f.repo,
         "canopa",
-        &f.public,
+        &f.trust,
         "x86_64",
         BTreeMap::new(),
     )?;
@@ -4328,5 +4356,40 @@ fn compares_independent_committed_roots_without_the_repository() -> Result<()> {
     assert_eq!(paths.len(), 1);
     assert_eq!(paths[0].name, "usr/bin/tool");
     assert!(crate::image_diff(&next, &next, false)?.packages.is_empty());
+    Ok(())
+}
+
+#[test]
+fn builder_keys_must_differ_from_every_key_of_the_pinned_trust_root() -> Result<()> {
+    let f = Fixture::new()?;
+    let extra = Fixture::new()?;
+    f.package("demo/base", "1.0.0-0", String::new())?;
+    extra.package_as("extras", "demo/extra", "1.0.0-0", String::new())?;
+    f.create()?;
+    let policy = f._dir.path().join("build-trust.kdl");
+    for (builder, rejected) in [(&extra.public, true), (&f.public, false)] {
+        fs::write(
+            &policy,
+            format!(
+                "schema-version 1 kind=\"build-trust\"\nbuild-trust {{\n    builder-key {builder:?}\n}}\n"
+            ),
+        )?;
+        let result = crate::add_publisher_with_build_trust(
+            &f.root,
+            "extras",
+            &extra.repo,
+            &extra.trust,
+            Some(&policy),
+        );
+        if rejected {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("builder and publisher must use distinct keys"),
+                "{error}"
+            );
+        } else {
+            result?;
+        }
+    }
     Ok(())
 }

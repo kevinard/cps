@@ -32,10 +32,10 @@ use cps::{
     prepare_boot_environment, prepare_git_snapshot_ref, publish_witnessed_bundle_with_sources,
     read_attestation, read_worker_config, release, remove_publisher, repair_pending_transaction,
     resume_transaction, rollback_boot_environment, rollback_boot_environment_on_disk,
-    rollback_btrfs_boot_environment, rotate_publisher_key, set_publisher_build_trust,
-    set_publisher_repositories, stage_boot_environment, stage_btrfs_boot_environment,
-    suggest_dependencies, transaction_details, transaction_history, transaction_status, verify,
-    verify_pristine, verify_rebuild, withdraw_package,
+    rollback_btrfs_boot_environment, set_publisher_build_trust, set_publisher_repositories,
+    stage_boot_environment, stage_btrfs_boot_environment, suggest_dependencies,
+    transaction_details, transaction_history, transaction_status, verify, verify_pristine,
+    verify_rebuild, withdraw_package,
 };
 
 #[derive(Parser)]
@@ -206,8 +206,9 @@ enum Command {
         repo: PathBuf,
         #[arg(long)]
         proto: PathBuf,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
         #[arg(required = true)]
         manifests: Vec<PathBuf>,
     },
@@ -215,8 +216,9 @@ enum Command {
     PublishBundle {
         #[arg(long)]
         repo: PathBuf,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
         #[arg(long)]
         builder_key: PathBuf,
         #[arg(long)]
@@ -257,7 +259,7 @@ enum Command {
         root: PathBuf,
         #[arg(
             long,
-            conflicts_with_all = ["repo", "publisher", "trust_key", "arch", "facet", "variant"]
+            conflicts_with_all = ["repo", "publisher", "trust_root", "arch", "facet", "variant"]
         )]
         config: Option<PathBuf>,
         /// Initialize with the publisher layout and bootstrap catalog of this lock
@@ -277,7 +279,7 @@ enum Command {
         #[arg(long, required_unless_present = "config")]
         publisher: Option<String>,
         #[arg(long, required_unless_present = "config")]
-        trust_key: Option<PathBuf>,
+        trust_root: Option<PathBuf>,
         #[arg(long)]
         arch: Option<String>,
         /// Set an image-wide facet rule (FACET, PREFIX.*, or *) or a per-package rule
@@ -484,9 +486,9 @@ struct BuildInputs {
     #[arg(long, required_unless_present = "toolchain_config")]
     publisher: Option<String>,
     #[arg(long, required_unless_present = "toolchain_config")]
-    trust_key: Option<PathBuf>,
+    trust_root: Option<PathBuf>,
     /// Worker-local repository and trust key locations for the pinned publishers
-    #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_key"])]
+    #[arg(long, conflicts_with_all = ["repo", "publisher", "trust_root"])]
     toolchain_config: Option<PathBuf>,
     #[arg(long, required_unless_present = "source_cache")]
     sources: Option<PathBuf>,
@@ -537,9 +539,9 @@ impl BuildInputs {
                     .as_deref()
                     .context("missing toolchain publisher")?,
                 trust_key: self
-                    .trust_key
+                    .trust_root
                     .as_deref()
-                    .context("missing toolchain trust key")?,
+                    .context("missing toolchain trust root")?,
             }
         };
         let mut overrides = BTreeMap::new();
@@ -607,7 +609,7 @@ enum SourceCommand {
         repo: PathBuf,
         /// Ed25519 DER public key for the package publisher
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         /// New directory for the pinned recipe, manifest, and archive
         #[arg(long)]
         output: PathBuf,
@@ -694,10 +696,10 @@ enum PublisherCommand {
         #[arg(long, default_value = "/")]
         root: PathBuf,
         /// Existing local repository
-        #[arg(long, conflicts_with = "url", requires = "trust_key")]
+        #[arg(long, conflicts_with = "url", requires = "trust_root")]
         repo: Option<PathBuf>,
         /// Base URL of a TUF mirror containing metadata/ and targets/
-        #[arg(long, requires_all = ["tuf_root", "trust_key"])]
+        #[arg(long, requires_all = ["tuf_root", "trust_root"])]
         url: Option<String>,
         /// Trusted TUF root metadata for a mirror
         #[arg(long, conflicts_with = "repo")]
@@ -705,12 +707,16 @@ enum PublisherCommand {
         /// Cache directory for a URL mirror
         #[arg(long, conflicts_with = "repo")]
         cache: Option<PathBuf>,
-        /// Trusted CPS publisher public key for --repo or --url
+        /// Pinned CPS publisher trust root for --repo or --url
         #[arg(long)]
-        trust_key: Option<PathBuf>,
+        trust_root: Option<PathBuf>,
         /// Require builder signatures from this KDL policy
         #[arg(long)]
         build_trust: Option<PathBuf>,
+        /// With an HTTPS mirror URL: require exactly these root key SHA-256
+        /// fingerprints instead of asking (repeat for each root key)
+        #[arg(long, value_name = "SHA256", conflicts_with_all = ["repo", "url"])]
+        expect_root_key: Vec<String>,
         /// Publisher name with --repo or --url, or an HTTPS mirror URL
         #[arg(value_name = "NAME_OR_URL")]
         name: String,
@@ -772,6 +778,165 @@ fn parse_repository(value: &str) -> std::result::Result<(String, PathBuf), Strin
     Ok((publisher.to_owned(), path.into()))
 }
 
+/// Membership of the next trust root version. Omitted keys and thresholds
+/// keep the previous version's values.
+#[derive(Args)]
+struct TrustMembership {
+    /// Publisher name; required for the first version
+    #[arg(long)]
+    publisher: Option<String>,
+    /// Root key: a public key file or command:DESCRIPTOR (repeat; replaces the root keys)
+    #[arg(long, value_name = "PUBLIC_KEY")]
+    root_key: Vec<PathBuf>,
+    #[arg(long)]
+    root_threshold: Option<usize>,
+    /// Catalog key: a public key file or command:DESCRIPTOR (repeat; replaces the catalog keys)
+    #[arg(long, value_name = "PUBLIC_KEY")]
+    catalog_key: Vec<PathBuf>,
+    #[arg(long)]
+    catalog_threshold: Option<usize>,
+    /// RFC 3339 UTC expiry, such as 2027-01-01T00:00:00Z (default: one year from now)
+    #[arg(long)]
+    expires: Option<String>,
+}
+
+impl TrustMembership {
+    fn draft(&self) -> cps::TrustDraft<'_> {
+        cps::TrustDraft {
+            publisher: self.publisher.as_deref(),
+            root_keys: &self.root_key,
+            root_threshold: self.root_threshold,
+            catalog_keys: &self.catalog_key,
+            catalog_threshold: self.catalog_threshold,
+            expires: self.expires.as_deref(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum TrustCommand {
+    /// Create a repository's first trust root with one key as root and catalog key
+    Init {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        publisher: String,
+        /// The only root and catalog key: PATH, file:PATH, or command:DESCRIPTOR
+        #[arg(long, value_name = "KEY")]
+        key: PathBuf,
+        /// RFC 3339 UTC expiry, such as 2027-01-01T00:00:00Z (default: one year from now)
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Sign and store the next trust root version with local or external root keys
+    Rotate {
+        #[arg(long)]
+        repo: PathBuf,
+        #[command(flatten)]
+        membership: TrustMembership,
+        /// Root key that signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
+        #[arg(long, value_name = "KEY", required = true)]
+        key: Vec<PathBuf>,
+    },
+    /// Write the unsigned next trust root version for detached signing
+    Draft {
+        #[arg(long)]
+        repo: PathBuf,
+        #[command(flatten)]
+        membership: TrustMembership,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Sign a trust root draft and write detached signatures
+    Sign {
+        #[arg(long)]
+        draft: PathBuf,
+        /// Root key that signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
+        #[arg(long, value_name = "KEY", required = true)]
+        key: Vec<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Combine a draft with its signatures and store it as the next version
+    Commit {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        draft: PathBuf,
+        /// Detached signatures from `cps repo trust sign` (repeat)
+        #[arg(long)]
+        signature: Vec<PathBuf>,
+        /// Root key that also signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
+        #[arg(long, value_name = "KEY")]
+        key: Vec<PathBuf>,
+    },
+    /// Show a trust root file, or the newest version in a repository
+    Show {
+        /// A trust root file or a repository directory
+        path: PathBuf,
+    },
+}
+
+fn run_trust(command: TrustCommand) -> Result<()> {
+    match command {
+        TrustCommand::Init {
+            repo,
+            publisher,
+            key,
+            expires,
+        } => {
+            let path = cps::init_trust(&repo, &publisher, &key, expires.as_deref())?;
+            println!("Created {}", path.display());
+            print!("{}", cps::show_trust(&path)?);
+        }
+        TrustCommand::Rotate {
+            repo,
+            membership,
+            key,
+        } => {
+            let path = cps::rotate_trust(&repo, &membership.draft(), &key)?;
+            println!("Created {}", path.display());
+            print!("{}", cps::show_trust(&path)?);
+        }
+        TrustCommand::Draft {
+            repo,
+            membership,
+            output,
+        } => {
+            let draft = cps::draft_trust(&repo, &membership.draft())?;
+            write_new_file(&output, &draft)?;
+            println!("Wrote {}", output.display());
+        }
+        TrustCommand::Sign { draft, key, output } => {
+            write_new_file(&output, &cps::sign_trust(&draft, &key)?)?;
+            println!("Wrote {}", output.display());
+        }
+        TrustCommand::Commit {
+            repo,
+            draft,
+            signature,
+            key,
+        } => {
+            let path = cps::commit_trust(&repo, &draft, &signature, &key)?;
+            println!("Created {}", path.display());
+            print!("{}", cps::show_trust(&path)?);
+        }
+        TrustCommand::Show { path } => print!("{}", cps::show_trust(&path)?),
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 #[derive(Subcommand)]
 enum RepoCommand {
     /// Widen one profile's rollout on the exact current catalog
@@ -780,8 +945,9 @@ enum RepoCommand {
         repo: PathBuf,
         #[arg(long)]
         publisher: String,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
         #[arg(long)]
         base: String,
         #[arg(long)]
@@ -847,8 +1013,9 @@ enum RepoCommand {
         repo: PathBuf,
         #[arg(long)]
         publisher: String,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
         /// Exact current catalog to build on
         #[arg(long)]
         base: String,
@@ -862,21 +1029,27 @@ enum RepoCommand {
         repo: PathBuf,
         #[arg(long)]
         publisher: String,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
     },
-    /// Authorize a new publisher signing key in a successor catalog
-    RotateKey {
+    /// Publish the exact current catalog again under the newest trust root
+    Resign {
         #[arg(long)]
         repo: PathBuf,
         #[arg(long)]
         publisher: String,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
+        /// Exact current catalog to build on
         #[arg(long)]
         base: String,
-        #[arg(long)]
-        signing_key: PathBuf,
-        #[arg(long)]
-        new_signing_key: PathBuf,
+    },
+    /// Create, rotate, sign, and inspect the publisher trust root
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
     },
     /// List signed package obsoletion cutoffs
     Obsoletions {
@@ -885,14 +1058,15 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
     },
     /// Commit a set of reviewed build bundles and withdrawals as one signed catalog
     PublishRelease {
         #[arg(long)]
         repo: PathBuf,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
         /// Cache of verified source files to include in the publication
         #[arg(long)]
         source_cache: Option<PathBuf>,
@@ -911,7 +1085,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         package_id: String,
     },
     /// Extract the recipe, reviewed manifest, and attestation for an exact package
@@ -921,7 +1095,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         /// Select a historical signed catalog by SHA-256
         #[arg(long)]
         catalog: Option<String>,
@@ -937,7 +1111,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         /// Select a historical signed catalog by SHA-256
         #[arg(long)]
         catalog: Option<String>,
@@ -952,8 +1126,9 @@ enum RepoCommand {
     ArchiveSources {
         #[arg(long)]
         repo: PathBuf,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
         #[arg(long)]
         source_cache: PathBuf,
         package_id: String,
@@ -965,7 +1140,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         #[arg(long)]
         source_cache: PathBuf,
         /// Select a historical signed catalog by SHA-256
@@ -983,8 +1158,9 @@ enum RepoCommand {
     Withdraw {
         #[arg(long)]
         repo: PathBuf,
-        #[arg(long)]
-        signing_key: PathBuf,
+        /// Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+        #[arg(long, value_name = "KEY", required = true)]
+        signing_key: Vec<PathBuf>,
         package_id: String,
     },
     /// List withdrawn package IDs and their original manifest digests
@@ -994,7 +1170,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
     },
     /// Export signed catalogs and their objects for TUF signing
     Export {
@@ -1003,7 +1179,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         #[arg(long)]
         output: PathBuf,
         /// Include a historical catalog and its objects in this mirror release
@@ -1032,7 +1208,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         /// Check the signed catalog against this installed image before promotion
         #[arg(long)]
         image: Option<PathBuf>,
@@ -1068,7 +1244,7 @@ enum RepoCommand {
         #[arg(long)]
         publisher: String,
         #[arg(long)]
-        trust_key: PathBuf,
+        trust_root: PathBuf,
         /// Also retain payloads from this historical catalog
         #[arg(long = "keep-catalog")]
         catalogs: Vec<String>,
@@ -2149,7 +2325,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 tag,
                 commit,
                 repo,
-                trust_key,
+                trust_root,
                 output,
                 recipe,
             } => {
@@ -2160,7 +2336,12 @@ fn run(command: Command) -> Result<ExitCode> {
                     _ => unreachable!("clap requires exactly one Git selector"),
                 };
                 let (package, commit) = prepare_git_snapshot_ref(
-                    &recipe, &git_repo, source, &repo, &trust_key, &output,
+                    &recipe,
+                    &git_repo,
+                    source,
+                    &repo,
+                    &trust_root,
+                    &output,
                 )?;
                 println!("Prepared {package} from {}", source.provenance(&commit));
             }
@@ -2352,24 +2533,24 @@ fn run(command: Command) -> Result<ExitCode> {
                     cps::enable_file_index(&repo, &publisher, &signing_key)?
                 );
             }
-            RepoCommand::RotateKey {
+            RepoCommand::Trust { command } => run_trust(command)?,
+            RepoCommand::Resign {
                 repo,
                 publisher,
-                base,
                 signing_key,
-                new_signing_key,
+                base,
             } => {
                 println!(
                     "Published catalog {}",
-                    rotate_publisher_key(&repo, &publisher, &base, &signing_key, &new_signing_key)?
+                    cps::resign_catalog(&repo, &publisher, &signing_key, &base)?
                 );
             }
             RepoCommand::Obsoletions {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
             } => {
-                for id in list_obsoletions(&repo, &publisher, &trust_key)? {
+                for id in list_obsoletions(&repo, &publisher, &trust_root)? {
                     println!("{id}");
                 }
             }
@@ -2403,10 +2584,10 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::Attestation {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
                 package_id,
             } => {
-                let bytes = read_attestation(&repo, &publisher, &trust_key, &package_id)?;
+                let bytes = read_attestation(&repo, &publisher, &trust_root, &package_id)?;
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(&bytes)?;
                 writeln!(stdout)?;
@@ -2414,7 +2595,7 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::RebuildInputs {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
                 catalog,
                 output,
                 package_id,
@@ -2422,7 +2603,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 let recipe = export_rebuild_inputs(
                     &repo,
                     &publisher,
-                    &trust_key,
+                    &trust_root,
                     &package_id,
                     catalog.as_deref(),
                     &output,
@@ -2432,7 +2613,7 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::VerifyRebuild {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
                 catalog,
                 bundle,
                 witness_key,
@@ -2441,7 +2622,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 let count = verify_rebuild(
                     &repo,
                     &publisher,
-                    &trust_key,
+                    &trust_root,
                     &package_id,
                     catalog.as_deref(),
                     &bundle,
@@ -2465,7 +2646,7 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::FetchSources {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
                 source_cache,
                 catalog,
                 package_id,
@@ -2473,7 +2654,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 let count = fetch_build_sources(
                     &repo,
                     &publisher,
-                    &trust_key,
+                    &trust_root,
                     &package_id,
                     catalog.as_deref(),
                     &source_cache,
@@ -2498,16 +2679,16 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::Withdrawals {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
             } => {
-                for (id, hash) in list_withdrawals(&repo, &publisher, &trust_key)? {
+                for (id, hash) in list_withdrawals(&repo, &publisher, &trust_root)? {
                     println!("{id}\t{hash}");
                 }
             }
             RepoCommand::Export {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
                 output,
                 retained,
                 delta_from,
@@ -2518,7 +2699,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     release::export_archive(
                         &repo,
                         &publisher,
-                        &trust_key,
+                        &trust_root,
                         &output,
                         &catalog,
                         include_sources,
@@ -2527,17 +2708,27 @@ fn run(command: Command) -> Result<ExitCode> {
                     release::export_with_deltas(
                         &repo,
                         &publisher,
-                        &trust_key,
+                        &trust_root,
                         &output,
                         &retained,
                         include_sources,
                         &delta_from,
                     )?
                 } else if include_sources {
-                    release::export_with_sources(&repo, &publisher, &trust_key, &output, &retained)?
+                    release::export_with_sources(
+                        &repo,
+                        &publisher,
+                        &trust_root,
+                        &output,
+                        &retained,
+                    )?
                 } else {
                     release::export_with_retained(
-                        &repo, &publisher, &trust_key, &output, &retained,
+                        &repo,
+                        &publisher,
+                        &trust_root,
+                        &output,
+                        &retained,
                     )?
                 };
                 println!("Exported {hash}");
@@ -2594,7 +2785,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 metadata,
                 targets,
                 publisher,
-                trust_key,
+                trust_root,
                 index_only,
                 image,
                 required_catalogs,
@@ -2607,7 +2798,7 @@ fn run(command: Command) -> Result<ExitCode> {
                         &metadata,
                         &targets,
                         &publisher,
-                        &trust_key,
+                        &trust_root,
                         release::ArchiveSyncOptions {
                             catalog: &catalog,
                             index_only,
@@ -2620,7 +2811,7 @@ fn run(command: Command) -> Result<ExitCode> {
                         &metadata,
                         &targets,
                         &publisher,
-                        &trust_key,
+                        &trust_root,
                         release::SyncOptions {
                             index_only,
                             image: image.as_deref(),
@@ -2650,7 +2841,7 @@ fn run(command: Command) -> Result<ExitCode> {
             RepoCommand::PruneCache {
                 repo,
                 publisher,
-                trust_key,
+                trust_root,
                 catalogs,
                 images,
                 plans,
@@ -2673,11 +2864,21 @@ fn run(command: Command) -> Result<ExitCode> {
                 };
                 let report = if let Some(config) = system_config {
                     System::load(&config)?.prune_cache_with_locks(
-                        &repo, &publisher, &trust_key, keep, &locks, apply,
+                        &repo,
+                        &publisher,
+                        &trust_root,
+                        keep,
+                        &locks,
+                        apply,
                     )?
                 } else {
                     release::prune_payloads_with_locks(
-                        &repo, &publisher, &trust_key, keep, &locks, apply,
+                        &repo,
+                        &publisher,
+                        &trust_root,
+                        keep,
+                        &locks,
+                        apply,
                     )?
                 };
                 for root in &report.registered_roots {
@@ -2730,7 +2931,7 @@ fn run(command: Command) -> Result<ExitCode> {
             primary_repo,
             repo,
             publisher,
-            trust_key,
+            trust_root,
             arch,
             facet,
             with_dependencies,
@@ -2753,7 +2954,7 @@ fn run(command: Command) -> Result<ExitCode> {
                     &root,
                     &repo.context("missing repository")?,
                     &publisher.context("missing publisher")?,
-                    &trust_key.context("missing trust key")?,
+                    &trust_root.context("missing trust root")?,
                     arch.as_deref().unwrap_or(std::env::consts::ARCH),
                     parse_policy(facet, with_dependencies, variant)?,
                 )?,
@@ -2774,43 +2975,51 @@ fn run(command: Command) -> Result<ExitCode> {
                 url,
                 tuf_root,
                 cache,
-                trust_key,
+                trust_root,
                 build_trust,
+                expect_root_key,
                 name,
             } => {
                 let credentials;
-                let (name, url, tuf_root, trust_key) = if repo.is_none() && url.is_none() {
-                    ensure!(trust_key.is_none(), "use --repo or --url with --trust-key");
+                let (name, url, tuf_root, trust_root) = if repo.is_none() && url.is_none() {
+                    ensure!(
+                        trust_root.is_none(),
+                        "use --repo or --url with --trust-root"
+                    );
                     ensure!(
                         name.contains("://"),
                         "provide an HTTPS mirror URL, or a publisher name with --repo or --url"
                     );
                     ensure!(
-                        io::stdin().is_terminal(),
-                        "publisher confirmation requires a terminal; use --url with explicit trust files for non-interactive setup"
+                        !expect_root_key.is_empty() || io::stdin().is_terminal(),
+                        "publisher confirmation requires a terminal; use --expect-root-key, or --url with explicit trust files, for non-interactive setup"
                     );
                     let trusted_root = tuf_root
                         .as_deref()
                         .unwrap_or(Path::new("/etc/cps/tuf-root.json"));
                     let bootstrap = release::PublisherBootstrap::fetch(&name, trusted_root)?;
-                    let (root_hash, key_hash) = bootstrap.fingerprints();
-                    eprintln!("Publisher key verified by TUF.");
-                    eprintln!("Publisher: {}\nMirror: {}", bootstrap.name, bootstrap.url);
-                    eprintln!("TUF root SHA-256: {root_hash}\nPublisher key SHA-256: {key_hash}");
-                    eprint!("Trust this publisher? [y/N] ");
-                    io::stderr().flush()?;
-                    let mut answer = String::new();
-                    io::stdin().read_line(&mut answer)?;
-                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                        println!("Canceled.");
-                        return Ok(ExitCode::SUCCESS);
+                    eprintln!("Publisher trust root verified by TUF.");
+                    eprintln!("Mirror: {}", bootstrap.url);
+                    eprintln!("TUF root SHA-256: {}", bootstrap.tuf_root_fingerprint());
+                    eprint!("{}", bootstrap.describe()?);
+                    if expect_root_key.is_empty() {
+                        eprint!("Trust this publisher? [y/N] ");
+                        io::stderr().flush()?;
+                        let mut answer = String::new();
+                        io::stdin().read_line(&mut answer)?;
+                        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                            println!("Canceled.");
+                            return Ok(ExitCode::SUCCESS);
+                        }
+                    } else {
+                        bootstrap.check_root_keys(&expect_root_key)?;
                     }
 
                     credentials = tempfile::tempdir()?;
                     let root_path = credentials.path().join("root.json");
-                    let key_path = credentials.path().join("publisher.der");
+                    let key_path = credentials.path().join("trust-root.json");
                     fs::write(&root_path, &bootstrap.tuf_root)?;
-                    fs::write(&key_path, &bootstrap.trust_key)?;
+                    fs::write(&key_path, &bootstrap.trust_root)?;
                     (
                         bootstrap.name,
                         Some(bootstrap.url.into()),
@@ -2818,9 +3027,9 @@ fn run(command: Command) -> Result<ExitCode> {
                         Some(key_path),
                     )
                 } else {
-                    (name, url, tuf_root, trust_key)
+                    (name, url, tuf_root, trust_root)
                 };
-                let trust_key = trust_key.context("missing trust key")?;
+                let trust_root = trust_root.context("missing trust root")?;
                 if let Some(url) = url {
                     let (cache, _lock) = if let Some(cache) = cache {
                         (cache, None)
@@ -2838,7 +3047,7 @@ fn run(command: Command) -> Result<ExitCode> {
                         &name,
                         &url,
                         &tuf_root.context("missing trusted TUF root")?,
-                        &trust_key,
+                        &trust_root,
                         &cache,
                         build_trust.as_deref(),
                     )?;
@@ -2848,7 +3057,7 @@ fn run(command: Command) -> Result<ExitCode> {
                         &root,
                         &name,
                         &repo.context("missing local repository")?,
-                        &trust_key,
+                        &trust_root,
                         build_trust.as_deref(),
                     )?;
                 }

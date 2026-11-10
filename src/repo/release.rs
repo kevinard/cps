@@ -28,8 +28,8 @@ use crate::{
 use super::{
     CATALOG_ROOT_LIMIT, Catalog, CatalogEntry, CatalogPin, FILE_INDEX_LIMIT, FILE_INDEX_OBJECTS,
     MANIFEST_LIMIT, Published, Root, SHARD_LIMIT, SHARD_OBJECTS, Snapshot, catalog_shards,
-    catalog_snapshot, lock_repo, parse_current, parse_public_key, path_present, prepare_objects,
-    read_catalog, read_current, read_key, read_key_der, read_limited, read_package, read_pointer,
+    catalog_snapshot, lock_repo, parse_current, path_present, prepare_objects, read_catalog,
+    read_current, read_current_catalog, read_limited, read_package, read_pointer, read_trust_root,
     rebuild, source_archive, write_atomic,
 };
 
@@ -49,7 +49,8 @@ const TIMESTAMP_LIMIT: u64 = TUF_LIMITS.max_timestamp_size;
 const ROLE_LIMIT: u64 = TUF_LIMITS.max_targets_size;
 const _: () = assert!(TUF_LIMITS.max_snapshot_size == ROLE_LIMIT);
 const PUBLISHER_NAME_TARGET: &str = "publisher";
-const PUBLISHER_KEY_TARGET: &str = "publisher.der";
+/// The newest trust root of the current catalog, for publisher discovery.
+const TRUST_ROOT_TARGET: &str = "trust-root.json";
 const ENDPOINTS_LIMIT: u64 = 8192;
 const METADATA_DOWNLOADS: usize = 8;
 const PAYLOAD_DOWNLOADS: usize = 8;
@@ -843,7 +844,7 @@ impl<'a> SyncSource<'a> {
         trust_key: &Path,
     ) -> Result<Self> {
         validate_publisher(publisher)?;
-        let key = read_key(trust_key)?;
+        let key = read_trust_root(trust_key)?;
         let anchor = read_tuf_root(trusted_root)?;
         ensure!(
             mirror.document().len() as u64 <= ENDPOINTS_LIMIT,
@@ -1442,7 +1443,7 @@ async fn materialize(
         }
     }
     for pin in required.iter().filter(|pin| pin.sha256 == hash) {
-        pin.check_lineage(&catalog, key)?;
+        pin.check_lineage(&catalog)?;
     }
     cache_file_index(verified, repo, &catalog).await?;
     let mut entries = BTreeMap::new();
@@ -1467,7 +1468,7 @@ async fn materialize(
                 format!("checking retained catalog {pin} against current {hash}")
             })?;
             for required in required.iter().filter(|required| required.sha256 == pin) {
-                required.check_lineage(&previous, key)?;
+                required.check_lineage(&previous)?;
             }
             cache_file_index(verified, repo, &previous).await?;
             collect_rebuild_objects(&previous, &mut rebuild_objects, &mut attestations);
@@ -1900,10 +1901,9 @@ fn export_targets(
     include_sources: bool,
     delta_from: &[String],
 ) -> Result<String> {
-    let key_der = read_key_der(trust_key)?;
-    let key = parse_public_key(&key_der)?;
-    let current = read_current(repo)?;
-    let catalog = read_catalog(repo, &current, publisher, key)?;
+    let key = &read_trust_root(trust_key)?;
+    let (catalog, current) = read_current_catalog(repo, publisher, key)?;
+    let trust_root = catalog.latest_trust_root()?;
     let (pointer, hash, catalog, retained) = match selection {
         ExportSelection::Current(retained) => {
             let pins = retained_catalogs(retained.iter().map(String::as_str), &current)?;
@@ -1934,11 +1934,11 @@ fn export_targets(
         previous
             .check_successor(&catalog, pin)
             .with_context(|| format!("checking retained catalog {pin} against current {hash}"))?;
-        let release = catalog_snapshot(repo, previous, (*pin).to_owned(), key)?;
+        let release = catalog_snapshot(repo, previous, (*pin).to_owned())?;
         export_catalog(&root, stage.path(), &release, &mut blobs)?;
     }
     let include_sources = include_sources || catalog.source_archives_required;
-    let release = catalog_snapshot(repo, catalog, hash.clone(), key)?;
+    let release = catalog_snapshot(repo, catalog, hash.clone())?;
     export_catalog(&root, stage.path(), &release, &mut blobs)?;
     for (hash, length) in blobs {
         export_payload(&root, stage.path(), &hash, length)?;
@@ -1953,7 +1953,7 @@ fn export_targets(
             previous
                 .check_successor(&current, pin)
                 .with_context(|| format!("checking delta base catalog {pin}"))?;
-            let previous = catalog_snapshot(repo, previous, pin.to_owned(), key)?;
+            let previous = catalog_snapshot(repo, previous, pin.to_owned())?;
             delta::export(&root, stage.path(), &previous, &release, &mut seen)?;
         }
     }
@@ -1989,7 +1989,7 @@ fn export_targets(
             publisher.as_bytes(),
             false,
         )?;
-        write_atomic(&stage.path().join(PUBLISHER_KEY_TARGET), &key_der, false)?;
+        write_atomic(&stage.path().join(TRUST_ROOT_TARGET), &trust_root, false)?;
     }
     write_atomic(
         &stage.path().join(pointer),
