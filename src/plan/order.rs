@@ -5,8 +5,10 @@
 //! files that need it. Writes therefore follow the packages' dependency
 //! graph: a package's dependencies, including generated `cap/elf/...`
 //! capabilities, are written before the package itself, and within a package
-//! shared libraries come before other files, and executables last. Removals
-//! run in the opposite order, after every new file is in place.
+//! shared libraries come before other files, and executables last. A symlink
+//! comes after the write that creates its target, so an upgraded
+//! `libz.so.1` never points at a `libz.so.1.3.1` that does not exist yet.
+//! Removals run in the opposite order, after every new file is in place.
 //!
 //! The order is a pure function of the plan and the two states, so a saved
 //! plan, its journal, and an abort of it always agree on it.
@@ -82,14 +84,79 @@ impl<'a> WriteOrder<'a> {
     }
 
     pub(crate) fn sort(&self, writes: &mut [Write]) {
-        writes.sort_by_cached_key(|write| self.key(write));
+        let by_path: BTreeMap<&str, &Write> = writes
+            .iter()
+            .map(|write| (write.path.as_str(), write))
+            .collect();
+        let trees: Vec<&str> = writes
+            .iter()
+            .filter(|write| write.transition() == Some(true))
+            .map(|write| write.path.as_str())
+            .collect();
+        let mut keys = BTreeMap::new();
+        for write in writes.iter() {
+            self.resolve(write, &by_path, &trees, &mut keys, 0);
+        }
+        writes.sort_by_cached_key(|write| keys[write.path.as_str()].clone());
     }
 
-    fn key(&self, write: &Write) -> (u8, usize, u8, usize, String, String) {
+    /// The key of a write, after the write that creates its symlink target.
+    fn resolve(
+        &self,
+        write: &Write,
+        by_path: &BTreeMap<&str, &Write>,
+        trees: &[&str],
+        keys: &mut BTreeMap<String, Key>,
+        hops: usize,
+    ) -> Key {
+        if let Some(key) = keys.get(&write.path) {
+            return key.clone();
+        }
+        let mut key = self.key(write);
+        if let Some(Node::Symlink { target, .. }) = &write.after
+            && write.transition().is_none()
+            && hops < MAX_HOPS
+            && let Some(resolved) = link_target(&write.path, target)
+        {
+            // A target inside a new directory tree appears with the tree.
+            let creator = trees
+                .iter()
+                .find(|tree| {
+                    resolved
+                        .strip_prefix(**tree)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .map(|tree| by_path[tree])
+                .or_else(|| {
+                    by_path
+                        .get(resolved.as_str())
+                        .copied()
+                        .filter(|creator| creator.after.is_some() && creator.path != write.path)
+                });
+            if let Some(creator) = creator {
+                let created = self.resolve(creator, by_path, trees, keys, hops + 1);
+                if (created.0, created.1, created.2) >= (key.0, key.1, key.2) {
+                    (key.0, key.1, key.2, key.3) = (created.0, created.1, created.2, created.3 + 1);
+                }
+            }
+        }
+        keys.insert(write.path.clone(), key.clone());
+        key
+    }
+
+    fn key(&self, write: &Write) -> Key {
         let path = write.path.as_str();
         let depth = path.bytes().filter(|b| *b == b'/').count();
         let key = |class, rank, kind, depth, target: &str| {
-            (class, rank, kind, depth, target.to_owned(), path.to_owned())
+            (
+                class,
+                rank,
+                kind,
+                0,
+                depth,
+                target.to_owned(),
+                path.to_owned(),
+            )
         };
         match write.transition() {
             // A new directory tree replaces a file or symlink after the
@@ -116,6 +183,35 @@ impl<'a> WriteOrder<'a> {
             key(6, usize::MAX - self.removed.of(path), 0, depth, "")
         }
     }
+}
+
+/// Class, package rank, file kind, symlink hops to an earlier write,
+/// depth, hard link target, and path.
+type Key = (u8, usize, u8, usize, usize, String, String);
+
+/// Symlink chains longer than this are not followed for ordering.
+const MAX_HOPS: usize = 40;
+
+/// The image path that a symlink target names, resolved lexically from the
+/// link's directory.
+fn link_target(path: &str, target: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        let mut parts: Vec<_> = path.split('/').collect();
+        parts.pop();
+        parts
+    };
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// Libraries first, then other files, then executables.
@@ -236,5 +332,97 @@ mod tests {
             Some("etc/app.conf")
         );
         assert_eq!(config_update_target("var/lib/cps/image/stage/x"), None);
+    }
+
+    #[test]
+    fn resolves_symlink_targets_lexically() {
+        assert_eq!(
+            link_target("usr/lib/libz.so.1", "libz.so.1.3.1").as_deref(),
+            Some("usr/lib/libz.so.1.3.1")
+        );
+        assert_eq!(
+            link_target("usr/lib64/libz.so", "../lib/./libz.so.1").as_deref(),
+            Some("usr/lib/libz.so.1")
+        );
+        assert_eq!(
+            link_target("bin/sh", "/usr/bin/busybox").as_deref(),
+            Some("usr/bin/busybox")
+        );
+        assert_eq!(link_target("bin", "usr/bin").as_deref(), Some("usr/bin"));
+        assert_eq!(link_target("a/b", "../../..").as_deref(), None);
+    }
+
+    fn write(path: &str, after: Node) -> Write {
+        Write {
+            path: path.into(),
+            before: None,
+            after: Some(after),
+            detach: false,
+            local_config: false,
+            config_move: None,
+        }
+    }
+
+    #[test]
+    fn symlinks_follow_the_writes_that_create_their_targets() {
+        let file = |mode| Node::File {
+            sha256: String::new(),
+            size: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            capabilities: None,
+        };
+        let link = |target: &str| Node::Symlink {
+            target: target.into(),
+            uid: 0,
+            gid: 0,
+        };
+        let dir = Node::Dir {
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let mut tree = write("opt/tree", dir.clone());
+        tree.before = Some(link("elsewhere"));
+        let mut writes = vec![
+            write("usr/lib/libz.so", link("libz.so.1")),
+            write("usr/lib/libz.so.1", link("libz.so.1.3.1")),
+            write("usr/lib/libz.so.1.3.1", file(0o755)),
+            write("usr/bin/sh", link("busybox")),
+            write("usr/bin/busybox", file(0o755)),
+            // A library link to a data file goes after the data file.
+            write("usr/lib/liba.so", link("../share/a/data")),
+            write("usr/share/a/data", file(0o644)),
+            // A link into a new directory tree goes after the tree.
+            write("usr/lib/libt.so", link("/opt/tree/libt.so")),
+            tree,
+            write("opt/tree/libt.so", file(0o644)),
+            // Links in a cycle still get an order.
+            write("usr/share/loop-a", link("loop-b")),
+            write("usr/share/loop-b", link("loop-a")),
+            write("usr/lib", dir),
+        ];
+        let empty = (BTreeMap::new(), BTreeMap::new());
+        let retired = BTreeSet::new();
+        WriteOrder::new((&empty.0, &empty.1), (&empty.0, &empty.1), &retired).sort(&mut writes);
+        let position = |path: &str| {
+            writes
+                .iter()
+                .position(|write| write.path == path)
+                .unwrap_or_else(|| panic!("{path}"))
+        };
+        for (link, target) in [
+            ("usr/lib/libz.so.1", "usr/lib/libz.so.1.3.1"),
+            ("usr/lib/libz.so", "usr/lib/libz.so.1"),
+            ("usr/bin/sh", "usr/bin/busybox"),
+            ("usr/lib/liba.so", "usr/share/a/data"),
+            ("usr/lib/libt.so", "opt/tree"),
+        ] {
+            assert!(position(link) > position(target), "{link}: {writes:?}");
+        }
+        // Libraries still precede other files and executables.
+        assert!(position("usr/lib/libz.so") < position("usr/bin/busybox"));
+        assert!(position("usr/lib") < position("usr/lib/libz.so.1.3.1"));
     }
 }

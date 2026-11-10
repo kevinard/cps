@@ -730,3 +730,39 @@ fn writes_follow_dependencies_and_removals_run_in_reverse() -> Result<()> {
     assert!(position(&removal, "usr/lib/app") > positions[2]);
     Ok(())
 }
+
+#[test]
+fn library_symlinks_never_dangle_during_an_upgrade() -> Result<()> {
+    let f = Fixture::new()?;
+    let release = |version: &str| -> Result<String> {
+        let file = format!("usr/lib/libz.so.{version}");
+        Ok(f.file(&file, &format!("zlib {version}"), "0755", "")?
+            + &symlink_action("usr/lib/libz.so.1", &format!("libz.so.{version}"))
+            + &symlink_action("usr/lib/libz.so", "libz.so.1"))
+    };
+    f.package("library/zlib", "1.2.0-0", release("1.2")?)?;
+    f.create()?;
+    install_all(&f.root, &["library/zlib"])?;
+    fs::remove_file(f.proto.join("usr/lib/libz.so.1.2"))?;
+    f.package("library/zlib", "1.3.1-0", release("1.3.1")?)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(position(&update, "usr/lib/libz.so.1") > position(&update, "usr/lib/libz.so.1.3.1"));
+    let root = f.root.clone();
+    let mut checked = 0;
+    apply_with(&f.root, &update, |write| {
+        if write.path.starts_with("usr/lib/libz.so") && write.after.is_some() {
+            checked += 1;
+            assert!(
+                fs::read_to_string(root.join("usr/lib/libz.so")).is_ok(),
+                "usr/lib/libz.so dangles after writing {}",
+                write.path
+            );
+        }
+    })?;
+    assert_eq!(checked, 2);
+    assert_eq!(
+        fs::read_to_string(f.root.join("usr/lib/libz.so"))?,
+        "zlib 1.3.1"
+    );
+    Ok(())
+}

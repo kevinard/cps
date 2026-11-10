@@ -115,7 +115,9 @@ live transaction finds each new library before the new executables that
 need it. Each package's files are written after those of the packages it
 requires, including providers of required capabilities such as the
 generated `cap/elf/...` sonames. Within a package, shared libraries go
-first, then other files, and executables last. Directories are created
+first, then other files, and executables last. A symlink goes after the
+write that creates its target, so an upgraded `libz.so.1` link never points
+at a `libz.so.1.3.1` that is not there yet. Directories are created
 first, and removals run after every new file is in place, dependents before
 the packages they depend on. The order is part of the saved plan.
 
