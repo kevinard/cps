@@ -82,7 +82,7 @@ fn hierarchical_rules_defaults_and_package_overrides_recompose_offline() -> Resu
     for (rule, value) in [("devel", false), ("locale.*", false), ("locale.fr", true)] {
         policy.insert_facet(rule, value, false)?;
     }
-    create_image(&f.root, &f.repo, "canopa", &f.public, "x86_64", policy)?;
+    create_image(&f.root, &f.repo, "canopa", &f.trust, "x86_64", policy)?;
     let install = plan(
         &f.root,
         Request::Install {
@@ -466,8 +466,8 @@ fn image_configs_and_bundles_carry_per_package_facets_and_variants() -> Result<(
         fs::write(
             &path,
             format!(
-                "schema-version 1 kind=\"image-config\"\narchitecture \"x86_64\"\npublisher \"canopa\" {{ repository {:?}; trust-key {:?}; }}\n{body}",
-                f.repo, f.public
+                "schema-version 1 kind=\"image-config\"\narchitecture \"x86_64\"\npublisher \"canopa\" {{ repository {:?}; trust-root {:?}; }}\n{body}",
+                f.repo, f.trust
             ),
         )?;
         Ok(path)
@@ -604,8 +604,8 @@ publisher "canopa" {{
     fs::write(
         &config,
         format!(
-            "schema-version 1 kind=\"image-config\"\narchitecture \"x86_64\"\nrelease-profile \"desktop\"\nfacet \"devel\" #false\npublisher \"canopa\" {{ repository {:?}; trust-key {:?}; }}\n",
-            f.repo, f.public
+            "schema-version 1 kind=\"image-config\"\narchitecture \"x86_64\"\nrelease-profile \"desktop\"\nfacet \"devel\" #false\npublisher \"canopa\" {{ repository {:?}; trust-root {:?}; }}\n",
+            f.repo, f.trust
         ),
     )?;
     crate::create_configured_image(&f.root, &config)?;

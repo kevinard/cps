@@ -6,7 +6,7 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
 
 publish() {
     local name=$1 priority=$2
@@ -36,7 +36,7 @@ publish basic 10
 publish advanced 20
 cat > image.kdl <<CONFIG
 schema-version 1 kind="image-config"
-publisher "canopa" { repository "repo"; trust-key "public.der"; }
+publisher "canopa" { repository "repo"; trust-root "repo/trust/1.json"; }
 CONFIG
 "$cps" image-create --root image --config image.kdl
 "$cps" plan --root image --output install.json install editors/basic editors/advanced

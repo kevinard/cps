@@ -42,7 +42,7 @@ run_device_guest() {
     if [[ $mode == installed ]]; then
         # The image database records absolute repository locations.
         mkdir -p "$inputs$PWD" "$inputs/scratch" "$inputs/installed-copy"
-        cp -a -- profile-repo profile-public.der "$inputs$PWD/"
+        cp -a -- profile-repo profile.trust.json "$inputs$PWD/"
         while read -r name repository key; do
             cp -a -- "$repository" "$key" "$inputs$PWD/"
         done < <(profile_companions)
@@ -328,7 +328,8 @@ int main(void)
 }
 C
     openssl genpkey -algorithm ED25519 -outform DER -out cap-private.der
-    openssl pkey -inform DER -in cap-private.der -pubout -outform DER -out "$data/public.der"
+    "$cps" repo trust init --repo "$data/repo" --publisher captest --key cap-private.der >/dev/null
+    cp "$data/repo/trust/1.json" "$data/trust.json"
     for version in 1 2; do
         flags=
         if [[ $version == 1 ]]; then flags='capabilities="cap_net_raw=ep"'; fi

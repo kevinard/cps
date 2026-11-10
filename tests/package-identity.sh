@@ -8,7 +8,7 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher imports --key private.der >/dev/null
 mkdir -p proto/usr/share/imports
 while read -r name upstream; do
     path="usr/share/imports/$name"
@@ -66,7 +66,7 @@ grep -F 'was already published with different content' conflict.log
 
 for architecture in x86_64 aarch64; do
     "$cps" image-create --root "$architecture" --repo repo --publisher imports \
-        --trust-key public.der --arch "$architecture"
+        --trust-root repo/trust/1.json --arch "$architecture"
 done
 "$cps" search --root x86_64 imports/arch | grep -F 'imports/arch@1.0.0-0'
 test "$("$cps" search --root aarch64 imports/arch)" = $'PACKAGE\tSTATE\tSUMMARY'

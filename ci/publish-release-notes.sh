@@ -15,7 +15,7 @@ invalid_url_chars='[[:space:][:cntrl:]`?#@]'
 [[ $mirror_url == */ ]] || mirror_url+=/
 mirror=$(realpath -e -- "${CPS_MIRROR_DIR:?Set CPS_MIRROR_DIR to the deployed mirror directory}")
 root=$(realpath -e -- "${CPS_MIRROR_TUF_ROOT:?Set CPS_MIRROR_TUF_ROOT to the trusted root JSON}")
-key=$(realpath -e -- "${CPS_MIRROR_PUBLISHER_KEY:?Set CPS_MIRROR_PUBLISHER_KEY to the trusted publisher public key}")
+key=$(realpath -e -- "${CPS_MIRROR_TRUST_ROOT:?Set CPS_MIRROR_TRUST_ROOT to the trusted publisher trust root}")
 signer=$(realpath -e -- "${CPS_RELEASE_NOTES_SIGNING_KEY:?Set CPS_RELEASE_NOTES_SIGNING_KEY to the OpenSSH signing key}")
 for file in "$root" "$key" "$signer"; do
     [[ -f $file && $file != "$mirror/"* ]] ||
@@ -26,7 +26,7 @@ done
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 cp -- "$root" "$stage/root.json"
-cp -- "$key" "$stage/publisher.der"
+cp -- "$key" "$stage/trust-root.json"
 cp -- "$mirror/publisher.json" "$stage/publisher.json"
 descriptor=$stage/publisher.json
 [[ $(stat -c %s -- "$descriptor") -le 2097152 ]] || fail 'Deployed publisher.json exceeds the CPS size limit'
@@ -35,17 +35,32 @@ jq -e --arg publisher "$publisher" \
     fail 'The deployed descriptor names a different publisher or schema'
 jq -er '.tuf_root' "$descriptor" | base64 -d | cmp -s -- "$stage/root.json" - ||
     fail 'The deployed descriptor has a different TUF root'
-jq -er '.trust_key' "$descriptor" | base64 -d | cmp -s -- "$stage/publisher.der" - ||
-    fail 'The deployed descriptor has a different publisher key'
+jq -er '.trust_root' "$descriptor" | base64 -d | cmp -s -- "$stage/trust-root.json" - ||
+    fail 'The deployed descriptor has a different publisher trust root'
 
 root_hash=$(sha256sum < "$stage/root.json")
-key_hash=$(sha256sum < "$stage/publisher.der")
+trust_hash=$(sha256sum < "$stage/trust-root.json")
+# Root key fingerprints are the SHA-256 of each raw Ed25519 key, as accepted
+# by `cps publisher add --expect-root-key`.
+root_keys=$(python3 -I -c '
+import hashlib, json, sys, base64
+envelope = json.load(open(sys.argv[1], "rb"))
+root = json.loads(base64.b64decode(envelope["signed"], validate=True))
+if root.get("publisher") != sys.argv[2]:
+    sys.exit("The trusted trust root names a different publisher")
+for key in root["root_keys"]:
+    print(hashlib.sha256(bytes.fromhex(key)).hexdigest())
+' "$stage/trust-root.json" "$publisher") || fail 'Cannot read the trusted publisher trust root'
+[[ -n $root_keys ]] || fail 'The trusted trust root has no root keys'
 notes=$stage/release-notes.md
 {
     printf '## CPS mirror release\n\n'
     printf '%s\n' '```text'
     printf 'Publisher: %s\nMirror: %s\nCatalog SHA-256: %s\n' "$publisher" "$mirror_url" "$catalog"
-    printf 'TUF root SHA-256: %s\nPublisher key SHA-256: %s\n' "${root_hash%% *}" "${key_hash%% *}"
+    printf 'TUF root SHA-256: %s\nTrust root SHA-256: %s\n' "${root_hash%% *}" "${trust_hash%% *}"
+    while IFS= read -r fingerprint; do
+        printf 'Root key SHA-256: %s\n' "$fingerprint"
+    done <<< "$root_keys"
     printf '%s\n\n' '```'
     printf '%s\n' 'Verify the attached release-notes.md and its signature with your trusted CPS release notes signing key before accepting these fingerprints.'
 } > "$notes"

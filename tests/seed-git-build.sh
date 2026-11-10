@@ -7,7 +7,7 @@ umask 022
 project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/build-toolchain.sh"
 source "$project/tests/systemd-boot-guest.sh"
-cps=$1 prototype=$2 signing_key=$3 public_key=$4
+cps=$1 prototype=$2 signing_key=$3
 busybox=${CPS_GIT_BUILD_BUSYBOX:-/usr/lib/initcpio/busybox}
 arch=$(uname -m)
 work=$(mktemp -d)
@@ -27,9 +27,9 @@ done
 
 destination="$prototype/usr/share/cps/git-build"
 mkdir -p "$destination"
-install -m644 -- "$public_key" "$destination/public.der"
 (
     cd -- "$destination"
+    "$cps" repo trust init --repo repo --publisher canopa-git-tools --key "$signing_key" >/dev/null
     "$cps" publish --repo repo --proto "$seed" --signing-key "$signing_key" "$work/base-tools.kdl"
     rm -- repo/publish.lock
     # Keep the sandbox ELF files opaque to the host image's runtime closure check.
@@ -37,7 +37,7 @@ install -m644 -- "$public_key" "$destination/public.der"
         zstd --quiet --zstd=wlog=21 --rm -o "repo/blobs-${blob##*/}.zst" -- "$blob"
     done
     printf 'schema-version 1 kind="toolchain-config"\n' > toolchain.kdl
-    append_toolchain_publisher "$work/pins" toolchain.kdl canopa-git-tools repo public.der
+    append_toolchain_publisher "$work/pins" toolchain.kdl canopa-git-tools repo repo/trust/1.json
     {
         printf 'schema-version 1 kind="git-toolchain"\ntoolchain solver="sat-v2" {\n'
         cat "$work/pins"

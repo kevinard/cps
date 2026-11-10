@@ -12,8 +12,8 @@ use crate::{
 };
 
 use super::{
-    exact_publisher, keys::SigningKey, lock_repo, publication_base, publication_catalog, read_key,
-    read_object, rebuild, release, write_catalog,
+    KeySpecs, Publication, exact_publisher, lock_repo, publication_base, publication_catalog,
+    read_object, read_trust_root, rebuild, release, write_catalog,
 };
 
 pub(super) const OBJECTS: &str = "source-archives";
@@ -21,13 +21,13 @@ pub(super) const OBJECTS: &str = "source-archives";
 /// Attach the complete set of pinned sources to an admitted build.
 pub fn archive_build_sources(
     repo: &Path,
-    signing_key: &Path,
+    signing_key: &(impl KeySpecs + ?Sized),
     source_cache: &Path,
     id: &str,
 ) -> Result<(String, usize)> {
     let publisher = exact_publisher(id)?;
-    let key = SigningKey::open(signing_key)?;
     Root::open(repo)?;
+    let key = Publication::open(repo, signing_key)?;
     let _lock = lock_repo(repo)?;
     let current = publication_base(repo)?.context("repository has no published catalog")?;
     let mut catalog = publication_catalog(repo, publisher, &key, Some(&current))?;
@@ -100,7 +100,7 @@ pub fn fetch_build_sources(
     pin: Option<&str>,
     source_cache: &Path,
 ) -> Result<usize> {
-    let anchor = read_key(trust_key)?;
+    let anchor = read_trust_root(trust_key)?;
     let catalog = rebuild::selected_catalog(repo, publisher, &anchor, id, pin)?;
     ensure!(
         catalog

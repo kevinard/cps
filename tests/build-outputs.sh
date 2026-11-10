@@ -15,7 +15,7 @@ uid=$(id -u)
 gid=$(id -g)
 arch=$(uname -m)
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
-fingerprint() { tail -c 32 -- "$1" | sha256sum | cut -d' ' -f1; }
+fingerprint() { sha256sum -- "$1" | cut -d' ' -f1; }
 keypair() {
     openssl genpkey -algorithm ED25519 -outform DER -out "$1.der"
     openssl pkey -inform DER -in "$1.der" -pubout -outform DER -out "$1-public.der"
@@ -57,6 +57,8 @@ for tool in cat install ln mkdir objcopy; do
 done
 "$cps" manifest generate --proto toolchain-proto --publisher seed --version 1.0.0-0 --uid "$uid" --gid "$gid" \
     --architecture "$arch" build/tools > tools.kdl
+"$cps" repo trust init --repo toolchain --publisher seed --key toolchain.der >/dev/null
+cp toolchain/trust/1.json seed.trust.json
 "$cps" publish --repo toolchain --proto toolchain-proto --signing-key toolchain.der tools.kdl
 
 # The application is prebuilt with symbols and a build ID, then installed by the recipe.
@@ -101,7 +103,7 @@ recipe() {
 schema-version 1 kind="build-recipe"
 build architecture="$arch" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(fingerprint toolchain-public.der)"
+        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(fingerprint seed.trust.json)"
         package "build/tools"
     }
     version "1.2.0-1" upstream="1.2"
@@ -117,7 +119,7 @@ RECIPE
 }
 recipe '    discard "usr/share/doc/**"' "$script" > build.kdl
 build() {
-    "$cps" build --repo toolchain --publisher seed --trust-key toolchain-public.der --sources sources "$@"
+    "$cps" build --repo toolchain --publisher seed --trust-root seed.trust.json --sources sources "$@"
 }
 build --check-reproducible --builder-signing-key builder.der --output first build.kdl > first.log
 grep -Fx "Built cps://canopa/demo/app@1.2.0-1 at first" first.log
@@ -172,7 +174,7 @@ printf 'schema-version 1 kind="build-worker"\nworker jobs=3\n' > worker.kdl
 recipe '    discard "usr/share/doc/**"' "$script
     test \"\$CPS_BUILD_JOBS\" = 3" > jobs.kdl
 build --worker-config worker.kdl --output jobs jobs.kdl
-"$cps" develop --repo toolchain --publisher seed --trust-key toolchain-public.der --sources sources \
+"$cps" develop --repo toolchain --publisher seed --trust-root seed.trust.json --sources sources \
     --worker-config worker.kdl jobs.kdl -- /bin/sh -c 'test "$CPS_BUILD_JOBS" = 3 && test "$MAKEFLAGS" = -j3'
 recipe '    discard "usr/share/doc/**"' "$script
     printf \"%s\\n\" \"\$CPS_BUILD_JOBS\" > \"\$DESTDIR/usr/share/app/jobs\"" > parallel.kdl
@@ -184,6 +186,8 @@ expect_failure 'build option JOBS is reserved' build --output reserved <(
 
 # Both outputs publish in one catalog update under one attestation.
 mkdir repo
+"$cps" repo trust init --repo repo --publisher canopa --key release.der >/dev/null
+cp repo/trust/1.json canopa.trust.json
 cp builder-public.der repo/
 reviewed=$(sha build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
@@ -198,7 +202,7 @@ POLICY
     --recipe-sha256 "$reviewed" first > published.log
 test "$(wc -l < published.log)" = 2
 for package in app app-data; do
-    "$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
+    "$cps" repo attestation --repo repo --publisher canopa --trust-root canopa.trust.json \
         "cps://canopa/demo/$package@1.2.0-1" > "$package-attestation.json"
 done
 cmp app-attestation.json app-data-attestation.json
@@ -222,11 +226,11 @@ cat > image.kdl <<'CONFIG'
 schema-version 1 kind="image-config"
 publisher "canopa" {
     repository "repo"
-    trust-key "release-public.der"
+    trust-root "canopa.trust.json"
 }
 publisher "seed" {
     repository "toolchain"
-    trust-key "toolchain-public.der"
+    trust-root "seed.trust.json"
 }
 CONFIG
 "$cps" image-create --root image --config image.kdl
@@ -240,12 +244,12 @@ test -e image/usr/share/app/data.txt
 test ! -e "image/$debug_path"
 
 # Rebuild verification covers every output of the admitted build.
-rebuild_recipe=$("$cps" repo rebuild-inputs --repo repo --publisher canopa --trust-key release-public.der \
+rebuild_recipe=$("$cps" repo rebuild-inputs --repo repo --publisher canopa --trust-root canopa.trust.json \
     --output rebuild-inputs cps://canopa/demo/app-data@1.2.0-1)
 cmp app.kdl rebuild-inputs/source/app.kdl
 cmp app-data.kdl rebuild-inputs/source/app-data.kdl
 verify_rebuild() {
-    "$cps" repo verify-rebuild --repo repo --publisher canopa --trust-key release-public.der "$@"
+    "$cps" repo verify-rebuild --repo repo --publisher canopa --trust-root canopa.trust.json "$@"
 }
 verify_rebuild --bundle second cps://canopa/demo/app-data@1.2.0-1
 verify_rebuild --bundle second cps://canopa/demo/app@1.2.0-1

@@ -9,7 +9,7 @@ cd "$work"
 
 mkdir -p mirror bin github/assets
 export CPS_MIRROR_DIR=$work/mirror CPS_MIRROR_URL=https://packages.example.test/canopa
-export CPS_MIRROR_TUF_ROOT=$work/root.json CPS_MIRROR_PUBLISHER_KEY=$work/publisher.der
+export CPS_MIRROR_TUF_ROOT=$work/root.json CPS_MIRROR_TRUST_ROOT=$work/trust-root.json
 export CPS_RELEASE_NOTES_SIGNING_KEY=$work/release-signing-key
 export GITHUB_SHA=0123456789abcdef0123456789abcdef01234567
 catalog=$(printf 'a%.0s' {1..64})
@@ -17,10 +17,12 @@ export CPS_TEST_TAG=cps-mirror-$catalog CPS_TEST_GITHUB=$work/github
 
 printf '{"signed":{"_type":"root"}}\n' > root.json
 openssl genpkey -algorithm ED25519 -outform DER -out publisher-private.der
-openssl pkey -inform DER -in publisher-private.der -pubout -outform DER -out publisher.der
+"${CPS_BIN:-$project/target/debug/cps}" repo trust init --repo repo --publisher canopa \
+    --key publisher-private.der >/dev/null
+cp repo/trust/1.json trust-root.json
 ssh-keygen -q -t ed25519 -N '' -f "$CPS_RELEASE_NOTES_SIGNING_KEY"
-jq -n --rawfile root root.json --arg key "$(base64 -w0 publisher.der)" \
-    '{schema_version: 1, kind: "publisher-bootstrap", publisher: "canopa", tuf_root: ($root | @base64), trust_key: $key}' > publisher.json
+jq -n --rawfile root root.json --arg trust "$(base64 -w0 trust-root.json)" \
+    '{schema_version: 1, kind: "publisher-bootstrap", publisher: "canopa", tuf_root: ($root | @base64), trust_root: $trust}' > publisher.json
 cp publisher.json mirror/publisher.json
 
 cat > bin/gh <<'GITHUB'
@@ -69,7 +71,7 @@ if publish_notes; then
 fi
 [[ ! -e github/draft ]]
 
-for field in tuf_root trust_key; do
+for field in tuf_root trust_root; do
     jq --arg field "$field" '.[$field] = "WA=="' publisher.json > mirror/publisher.json
     if publish_notes; then
         echo "Signed a substituted $field" >&2
@@ -92,11 +94,16 @@ notes=github/assets/release-notes.md
 printf 'cps-release namespaces="cps-release-notes" %s\n' "$(cat release-signing-key.pub)" > allowed-signers
 ssh-keygen -Y verify -f allowed-signers -I cps-release -n cps-release-notes -s "$notes.sig" < "$notes"
 root_hash=$(sha256sum < root.json)
-key_hash=$(sha256sum < publisher.der)
+trust_hash=$(sha256sum < trust-root.json)
+root_key=$(jq -er '.signed | @base64d | fromjson | .root_keys[0]' trust-root.json)
+root_key_hash=$(printf '%s' "$root_key" | python3 -I -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read()))' | sha256sum)
 rg -Fx "Catalog SHA-256: $catalog" "$notes"
 rg -Fx "Mirror: $CPS_MIRROR_URL/" "$notes"
 rg -Fx "TUF root SHA-256: ${root_hash%% *}" "$notes"
-rg -Fx "Publisher key SHA-256: ${key_hash%% *}" "$notes"
+rg -Fx "Trust root SHA-256: ${trust_hash%% *}" "$notes"
+rg -Fx "Root key SHA-256: ${root_key_hash%% *}" "$notes"
+# The fingerprint is the one `cps repo trust show` prints for the root key.
+"${CPS_BIN:-$project/target/debug/cps}" repo trust show trust-root.json | rg -F "  ${root_key_hash%% *}"
 publish_notes
 
 printf '%s\n' 'tampered release notes' >> "$notes"

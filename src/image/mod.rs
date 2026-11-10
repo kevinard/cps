@@ -31,7 +31,9 @@ use crate::{
         ImagePolicy, Node, PackageFacets, Selection, validate_digest, validate_name,
         validate_publisher,
     },
-    repo::{BuildReceipt, CatalogCheckpoint, Published, canonical_repo, catalog_index, read_key},
+    repo::{
+        BuildReceipt, CatalogCheckpoint, Published, canonical_repo, catalog_index, read_trust_root,
+    },
 };
 
 pub(crate) const IMAGE_FORMAT: u32 = 1;
@@ -368,7 +370,7 @@ impl Publishers {
             }
             if let Some(trust) = &publisher.build_trust {
                 trust.validate()?;
-                trust.check_publisher_key(&publisher.key)?;
+                trust.check_publisher_trust(&publisher.key)?;
             }
             ensure!(
                 names.insert(&publisher.name),
@@ -386,7 +388,7 @@ impl Publisher {
         Ok(Self {
             name: name.to_owned(),
             repo: canonical_repo(repo)?,
-            key: read_key(key)?,
+            key: read_trust_root(key)?,
             build_trust: None,
             git: None,
         })

@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     RETAINED_LIMIT, Root, StagedRelease, check_cache_origin, lock_repo, open_state, path_present,
-    read_catalog, read_current, read_key, read_limited, release_blobs, retained_catalogs,
+    read_catalog, read_current, read_limited, read_trust_root, release_blobs, retained_catalogs,
     validate_digest, validate_publisher, write_atomic,
 };
 
@@ -248,7 +248,7 @@ pub(crate) fn prune_with_registered_roots(
     prune(
         repo,
         publisher,
-        &read_key(trust_key)?,
+        &read_trust_root(trust_key)?,
         registered,
         PrunePolicy {
             keep,

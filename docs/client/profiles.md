@@ -39,17 +39,30 @@ sudo cps upgrade
 ```
 
 CPS verifies the mirror's TUF metadata with the local root, then fetches the
-publisher name and public key as authenticated targets. It displays the
-verified identity and asks for confirmation. After confirmation, CPS checks
-the catalog signature and saves the trust material for later refreshes.
+publisher name and its newest [trust root](../publisher/publishing.md#publisher-trust-root)
+as authenticated targets. It displays the trust root's version, expiry, and the
+SHA-256 fingerprints of its root and catalog keys, and asks for confirmation.
+After confirmation, CPS checks the catalog signatures and pins that trust root
+for later refreshes.
 
-For non-interactive setup or independently provisioned trust, supply the
-TUF root metadata and CPS publisher key explicitly.
+To provision without trusting the first response, pass the root key
+fingerprints that the publisher announced through another channel. CPS then
+requires the fetched trust root to name exactly those root keys and does not
+ask.
+
+```sh
+sudo cps publisher add https://packages.example.org/extras/ \
+    --expect-root-key 3f2a…e91c
+```
+
+Repeat `--expect-root-key` for each root key. For independently provisioned
+trust, supply the TUF root metadata and the publisher's trust root file
+explicitly.
 
 ```sh
 sudo cps publisher add extras --url https://packages.example.org/extras/ \
     --tuf-root /etc/cps/keys/extras-root.json \
-    --trust-key /etc/cps/keys/extras.der
+    --trust-root /etc/cps/keys/extras.trust.json
 ```
 
 The URL must serve `metadata/` and `targets/` beneath it. CPS verifies
@@ -64,7 +77,7 @@ For a local repository or a manually managed mirror cache, use `--repo`.
 
 ```sh
 sudo cps publisher add extras --repo /var/lib/cps/extras \
-    --trust-key /etc/cps/keys/extras.der
+    --trust-root /etc/cps/keys/extras.trust.json
 ```
 
 The image stores local publishers after the signed ones. `publisher prefer`
@@ -202,7 +215,7 @@ Export verifies every copied object and publishes the new directory only
 after the copy succeeds. The bundle contains the pinned signed catalogs,
 their manifest indexes, and the selected attestations and payloads. Its
 repositories supply the historical pins. The target configuration still
-supplies publisher keys and build trust. Keep the bundle at a stable path
+supplies publisher trust roots and build trust. Keep the bundle at a stable path
 for offline repair, or configure regular repositories to resume updates.
 Before initializing the requested root, `image-create --bundle` replays
 the lock with the local trust policy and reports missing or damaged

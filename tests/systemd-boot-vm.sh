@@ -61,7 +61,7 @@ fi
 kernel=${CPS_VM_KERNEL:-/boot/vmlinuz-linux}
 busybox=${CPS_VM_BUSYBOX:-/usr/lib/initcpio/busybox}
 busybox_repo=${CPS_VM_BUSYBOX_REPO:-}
-busybox_key=${CPS_VM_BUSYBOX_TRUST_KEY:-}
+busybox_key=${CPS_VM_BUSYBOX_TRUST_ROOT:-}
 busybox_revision=0
 if [[ -n $usr_base_fixture ]]; then
     busybox_revision=1
@@ -81,14 +81,14 @@ if [[ $recycle == 1 ]]; then
 fi
 if [[ -n $busybox_repo || -n $busybox_key ]]; then
     busybox_repo=$(realpath -- "${busybox_repo:?Set CPS_VM_BUSYBOX_REPO}")
-    busybox_key=$(realpath -- "${busybox_key:?Set CPS_VM_BUSYBOX_TRUST_KEY}")
+    busybox_key=$(realpath -- "${busybox_key:?Set CPS_VM_BUSYBOX_TRUST_ROOT}")
     case $busybox_version in
         "1.38.0-$busybox_revision") signed_insmod=true ;;
         "1.37.0-$busybox_revision") ;;
         *) echo "Unsupported BusyBox version for this layout: $busybox_version" >&2; exit 2 ;;
     esac
     "$cps" repo attestation --repo "$busybox_repo" --publisher canopa-bootstrap \
-        --trust-key "$busybox_key" "$busybox_package" >/dev/null
+        --trust-root "$busybox_key" "$busybox_package" >/dev/null
 else
     test -r "$busybox" || { echo "Missing input: $busybox" >&2; exit 1; }
 fi
@@ -134,7 +134,7 @@ if [[ -n $cps_fixture ]]; then
     fi
     for package in "${cps_packages[@]}"; do
         "$cps" repo attestation --repo "$cps_fixture/repo" --publisher canopa \
-            --trust-key "$cps_fixture/release-public.der" "cps://canopa/$package" >/dev/null
+            --trust-root "$cps_fixture/release.trust.json" "cps://canopa/$package" >/dev/null
     done
     elf_runtime_paths=(lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1})
     elf_runtime=$cps_fixture
@@ -172,7 +172,7 @@ if [[ -n $kernel_fixture ]]; then
     test "$trial_release" = 6.12.115-cps-vm
     trial_kernel="$kernel_fixture/image/usr/lib/modules/$trial_release/vmlinuz"
     "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
-        --trust-key "$kernel_fixture/release-public.der" "$kernel_package" >/dev/null
+        --trust-root "$kernel_fixture/release.trust.json" "$kernel_package" >/dev/null
 fi
 if [[ -n $util_linux_fixture ]]; then
     [[ -n $usr_base_fixture ]] || { echo 'CPS_VM_UTIL_LINUX_FIXTURE requires the merged /usr fixture' >&2; exit 2; }
@@ -183,13 +183,13 @@ if [[ -n $util_linux_fixture ]]; then
     systemd_version=262.1.0-4
     if [[ $util_linux_version == 2.42.4-1 ]]; then systemd_version=262.1.0-5; fi
     "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
-        --trust-key "$util_linux_fixture/release-public.der" "$util_linux_package" >/dev/null
+        --trust-root "$util_linux_fixture/release.trust.json" "$util_linux_package" >/dev/null
 fi
 if [[ -n $systemd_fixture ]]; then
     $profiled || { echo 'CPS_VM_SYSTEMD_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
     systemd_version=${CPS_VM_SYSTEMD_VERSION:-$systemd_version}
     "$cps" repo attestation --repo "$systemd_fixture/repo" --publisher canopa-systemd \
-        --trust-key "$systemd_fixture/release-public.der" "cps://canopa-systemd/system/systemd-vm@$systemd_version" >/dev/null
+        --trust-root "$systemd_fixture/release.trust.json" "cps://canopa-systemd/system/systemd-vm@$systemd_version" >/dev/null
 fi
 if [[ -n $usr_base_fixture ]]; then
     [[ -n $systemd_fixture ]] || { echo 'CPS_VM_USR_BASE_FIXTURE requires the signed systemd fixture' >&2; exit 2; }
@@ -241,7 +241,8 @@ PARTITIONS
 mkdir -p esp/EFI/BOOT proto/etc
 if [[ -z $systemd_fixture ]]; then cp "$efi" esp/EFI/BOOT/BOOTX64.EFI; fi
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher "$fixture_publisher" --key private.der >/dev/null
+cp repo/trust/1.json public.trust.json
 
 publish_state() {
     local version=$1 state=$2
@@ -306,7 +307,8 @@ MANIFEST
 
 publish_extra_marker() {
     openssl genpkey -algorithm ED25519 -outform DER -out extras-private.der
-    openssl pkey -inform DER -in extras-private.der -pubout -outform DER -out extras-public.der
+    "$cps" repo trust init --repo extras --publisher extras --key extras-private.der >/dev/null
+    cp extras/trust/1.json extras.trust.json
     printf 'extras\n' > proto/etc/cps-vm-extra-marker
     cat > extra-marker.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
@@ -318,29 +320,29 @@ MANIFEST
 }
 
 profile_companions() {
-    printf '%s\n' "$fixture_publisher repo public.der" 'canopa signed-cps cps-public.der'
+    printf '%s\n' "$fixture_publisher repo public.trust.json" 'canopa signed-cps cps.trust.json'
     if [[ -n $usr_base_fixture ]]; then
-        printf '%s\n' 'canopa-usr-base signed-seed seed-public.der'
+        printf '%s\n' 'canopa-usr-base signed-seed seed.trust.json'
     else
-        printf '%s\n' 'canopa-runtime-seed signed-seed seed-public.der'
+        printf '%s\n' 'canopa-runtime-seed signed-seed seed.trust.json'
     fi
-    printf '%s\n' 'canopa-bootstrap signed-busybox busybox-public.der' \
-        'extras extras extras-public.der'
+    printf '%s\n' 'canopa-bootstrap signed-busybox busybox.trust.json' \
+        'extras extras extras.trust.json'
     if [[ -n $kernel_fixture ]]; then
-        printf '%s\n' 'canopa-kernel signed-kernel kernel-public.der'
+        printf '%s\n' 'canopa-kernel signed-kernel kernel.trust.json'
     fi
     if [[ -n $systemd_fixture ]]; then
-        printf '%s\n' 'canopa-systemd signed-systemd systemd-public.der'
+        printf '%s\n' 'canopa-systemd signed-systemd systemd.trust.json'
         if [[ -n $util_linux_fixture ]]; then
-            printf '%s\n' 'canopa-util-linux signed-util-linux util-linux-public.der'
+            printf '%s\n' 'canopa-util-linux signed-util-linux util-linux.trust.json'
         else
-            printf '%s\n' 'canopa-systemd-seed signed-systemd-seed systemd-seed-public.der'
+            printf '%s\n' 'canopa-systemd-seed signed-systemd-seed systemd-seed.trust.json'
         fi
     fi
 }
 
 profile_repositories() {
-    printf '%s\n' 'vm-profile profile-repo profile-public.der'
+    printf '%s\n' 'vm-profile profile-repo profile.trust.json'
     profile_companions
 }
 
@@ -349,7 +351,7 @@ publish_vm_mirror() {
     shift 4
     local mirror="mirrors/$name" export="mirrors/$name/export-$version"
     mkdir -p -- "$mirror"
-    "$cps" repo export --repo "$repository" --publisher "$name" --trust-key "$key" \
+    "$cps" repo export --repo "$repository" --publisher "$name" --trust-root "$key" \
         --output "$export" "$@" >/dev/null
     (umask 077; "$tuf_fixture" "$export" "$mirror" "$version" > "$mirror/url")
     rm -r -- "$export"
@@ -364,7 +366,7 @@ refresh_vm_profile() {
         printf '        facet "devel" #false\n'
         while read -r name repository key; do
             printf '        publisher "%s" catalog="%s" {\n' "$name" "$(cat "$repository/current")"
-            printf '            repository "../%s"\n            trust-key "../%s"\n' "$repository" "$key"
+            printf '            repository "../%s"\n            trust-root "../%s"\n' "$repository" "$key"
             if [[ $name == canopa ]] && $signed_cps_builds; then
                 printf '            build-trust { builder-key "../cps-builder-public.der"; }\n'
             fi
@@ -500,39 +502,40 @@ if $profiled; then
     publish_extra_marker
     cp -a -- "$cps_fixture/repo" signed-cps
     cp -a -- "$busybox_repo" signed-busybox
-    cp -- "$cps_fixture/release-public.der" cps-public.der
+    cp -- "$cps_fixture/release.trust.json" cps.trust.json
     if $signed_cps_builds; then
         cp -- "$cps_fixture/builder-public.der" cps-builder-public.der
     fi
     if [[ -n $usr_base_fixture ]]; then
         cp -a -- "$usr_base_fixture/repo" signed-seed
-        cp -- "$usr_base_fixture/release-public.der" seed-public.der
+        cp -- "$usr_base_fixture/release.trust.json" seed.trust.json
     else
         cp -a -- "$cps_fixture/runtime-seed" signed-seed
-        cp -- "$cps_fixture/runtime-seed-public.der" seed-public.der
+        cp -- "$cps_fixture/runtime-seed.trust.json" seed.trust.json
     fi
-    cp -- "$busybox_key" busybox-public.der
+    cp -- "$busybox_key" busybox.trust.json
     boot_kernel_dependency='    require "system/kernel"'
     if [[ -n $kernel_fixture ]]; then
         cp -a -- "$kernel_fixture/repo" signed-kernel
-        cp -- "$kernel_fixture/release-public.der" kernel-public.der
+        cp -- "$kernel_fixture/release.trust.json" kernel.trust.json
         boot_kernel_dependency=
     fi
     boot_systemd_dependency=
     if [[ -n $systemd_fixture ]]; then
         cp -a -- "$systemd_fixture/repo" signed-systemd
-        cp -- "$systemd_fixture/release-public.der" systemd-public.der
+        cp -- "$systemd_fixture/release.trust.json" systemd.trust.json
         if [[ -n $util_linux_fixture ]]; then
             cp -a -- "$util_linux_fixture/repo" signed-util-linux
-            cp -- "$util_linux_fixture/release-public.der" util-linux-public.der
+            cp -- "$util_linux_fixture/release.trust.json" util-linux.trust.json
         else
             cp -a -- "$systemd_fixture/runtime-seed" signed-systemd-seed
-            cp -- "$systemd_fixture/runtime-seed-public.der" systemd-seed-public.der
+            cp -- "$systemd_fixture/runtime-seed.trust.json" systemd-seed.trust.json
         fi
         boot_systemd_dependency="    require \"system/systemd-vm\" version=\"=$systemd_version\""
     fi
     openssl genpkey -algorithm ED25519 -outform DER -out profile-private.der
-    openssl pkey -inform DER -in profile-private.der -pubout -outform DER -out profile-public.der
+    "$cps" repo trust init --repo profile-repo --publisher vm-profile --key profile-private.der >/dev/null
+    cp profile-repo/trust/1.json profile.trust.json
     cat > boot-stack.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/boot-stack" publisher="vm-profile" version="1.0.0-0" {
@@ -580,7 +583,7 @@ MANIFEST
                 printf 'mirror "%s" root="mirrors/%s/root.json" metadata="%smetadata/" targets="%stargets/"\n' \
                     "$name" "$name" "$mirror_url" "$mirror_url"
             fi
-            printf 'publisher "%s" {\n    repository "%s"\n    trust-key "%s"\n}\n' "$name" "$repository" "$key"
+            printf 'publisher "%s" {\n    repository "%s"\n    trust-root "%s"\n}\n' "$name" "$repository" "$key"
         done < <(profile_repositories)
     } > image.kdl
 else
@@ -589,7 +592,7 @@ schema-version 1 kind="image-config"
 facet "devel" #false
 publisher "$fixture_publisher" {
     repository "repo"
-    trust-key "public.der"
+    trust-root "public.trust.json"
 }
 CONFIG
     if [[ $mode == facet-change ]]; then printf 'facet "doc.man" #false\n' >> image.kdl; fi
@@ -602,12 +605,12 @@ fi
 state_dir=var/lib/cps/image
 if ! $profiled && [[ -n $cps_fixture ]]; then
     "$cps" publisher add --root base --repo "$cps_fixture/repo" \
-        --trust-key "$cps_fixture/release-public.der" canopa
+        --trust-root "$cps_fixture/release.trust.json" canopa
     "$cps" publisher add --root base --repo "$cps_fixture/runtime-seed" \
-        --trust-key "$cps_fixture/runtime-seed-public.der" canopa-runtime-seed
+        --trust-root "$cps_fixture/runtime-seed.trust.json" canopa-runtime-seed
 fi
 if ! $profiled && [[ -n $busybox_repo ]]; then
-    "$cps" publisher add --root base --repo "$busybox_repo" --trust-key "$busybox_key" canopa-bootstrap
+    "$cps" publisher add --root base --repo "$busybox_repo" --trust-root "$busybox_key" canopa-bootstrap
 fi
 if $profiled; then
     "$cps" plan --root base --output install.json install-profile
@@ -728,7 +731,7 @@ if [[ $mode == rollback ]]; then
     base_disk=pinned-base.raw
     if ! $profiled; then
         publish_extra_marker
-        "$cps" publisher add --root base --repo extras --trust-key extras-public.der extras
+        "$cps" publisher add --root base --repo extras --trust-root extras.trust.json extras
     fi
 fi
 mcopy -s -i "$base_disk@@1048576" ::/loader esp/
@@ -755,28 +758,28 @@ RELEASE
 fi
 if $profiled; then
     if [[ $tuf_mirrors == 1 ]]; then
-        publish_vm_mirror "$fixture_publisher" repo public.der 2 --retain-catalog "$base_test_catalog"
+        publish_vm_mirror "$fixture_publisher" repo public.trust.json 2 --retain-catalog "$base_test_catalog"
         "$cps" repo sync-profile --config image.kdl --index-only --image base
         cmp repo/current "mirror-cache/$fixture_publisher/current"
-        publish_vm_mirror "$fixture_publisher" repo public.der 3
+        publish_vm_mirror "$fixture_publisher" repo public.trust.json 3
         mirror_url=$(cat "mirrors/$fixture_publisher/url")
         companion_cache="mirror-cache/$fixture_publisher"
         "$cps" repo sync --repo "$companion_cache" --root "mirrors/$fixture_publisher/root.json" \
             --metadata "${mirror_url}metadata/" --targets "${mirror_url}targets/" \
-            --publisher "$fixture_publisher" --trust-key public.der --index-only
+            --publisher "$fixture_publisher" --trust-root public.trust.json --index-only
         test ! -s "$companion_cache/.tuf/retention/$(cat repo/current)"
         "$cps" repo prune-cache --repo "$companion_cache" --publisher "$fixture_publisher" \
-            --trust-key public.der --apply
+            --trust-root public.trust.json --apply
         old_kernel_hash=$(sha256sum "$kernel" | cut -d' ' -f1)
         cmp "$kernel" "$companion_cache/blobs/$old_kernel_hash"
         echo 'Verified pruning kept the visible profile kernel after the companion mirror dropped its pin'
 
-        "$cps" repo export --repo repo --publisher "$fixture_publisher" --trust-key public.der \
+        "$cps" repo export --repo repo --publisher "$fixture_publisher" --trust-root public.trust.json \
             --archive-catalog "$base_test_catalog" --output fallback-archive-targets
         archive_url=$(umask 077; "$tuf_fixture" fallback-archive-targets fallback-archive-mirror 1)
         "$cps" repo sync --repo fallback-archive --root fallback-archive-mirror/root.json \
             --metadata "${archive_url}metadata/" --targets "${archive_url}targets/" \
-            --publisher "$fixture_publisher" --trust-key public.der --index-only \
+            --publisher "$fixture_publisher" --trust-root public.trust.json --index-only \
             --archive-catalog "$base_test_catalog"
         cp -a --reflink=auto base repair-probe
         repaired_kernel="repair-probe/usr/lib/modules/$base_release/vmlinuz"
@@ -814,7 +817,7 @@ if $profiled; then
         cmp repo/current "$companion_cache/current"
         cmp repo/current "$companion_cache/.tuf/catalog"
         echo 'Verified a saved profile plan replayed after its catalog was restored from a signed archive'
-        publish_vm_mirror "$fixture_publisher" repo public.der 4 --retain-catalog "$base_test_catalog"
+        publish_vm_mirror "$fixture_publisher" repo public.trust.json 4 --retain-catalog "$base_test_catalog"
     fi
     "$cps" plan --root base --output before-profile.json update > before-profile.log
     grep -Fq "\"$base_test_catalog\"" before-profile.json
@@ -825,7 +828,7 @@ if $profiled; then
     echo 'Verified the signed profile kept the previous kernel after the companion advanced'
     refresh_vm_profile
     if [[ $tuf_mirrors == 1 ]]; then
-        publish_vm_mirror vm-profile profile-repo profile-public.der 2 --retain-catalog "$(cat base-catalog)"
+        publish_vm_mirror vm-profile profile-repo profile.trust.json 2 --retain-catalog "$(cat base-catalog)"
         trial_payload=$(sha256sum proto/etc/cps-vm-state | cut -d' ' -f1)
         cached_payload="mirror-cache/$fixture_publisher/blobs/$trial_payload"
         target="mirrors/$fixture_publisher/targets/$trial_payload.blobs-$trial_payload"

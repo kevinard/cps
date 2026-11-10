@@ -8,7 +8,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -22,7 +22,7 @@ use crate::{
         manifest_text, parse_manifest,
     },
     model::{Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name},
-    repo::{MANIFEST_LIMIT, read_key, read_limited},
+    repo::{MANIFEST_LIMIT, Purpose, SigningKey, read_key, read_limited, trust_root_keys},
 };
 
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
@@ -78,6 +78,14 @@ impl BuildTrust {
             !self.keys.iter().any(|builder| builder.as_slice() == key),
             "builder and publisher must use distinct keys"
         );
+        Ok(())
+    }
+
+    /// Require every builder key to differ from every key of a pinned trust root.
+    pub fn check_publisher_trust(&self, trust_root: &[u8]) -> Result<()> {
+        for key in trust_root_keys(trust_root)? {
+            self.check_publisher_key(&key)?;
+        }
         Ok(())
     }
 
@@ -311,8 +319,9 @@ impl VerifiedBuild {
 
 /// Sign one statement that covers every output of a build: each output's exact
 /// published manifest and every payload, with the recipe, sources, and toolchain.
+/// The builder key is held in a file or by an external signer.
 pub(crate) fn sign(
-    key: &Ed25519KeyPair,
+    key: &SigningKey,
     manifests: &[Manifest],
     recipe: &BuildRecipe,
     recipe_bytes: &[u8],
@@ -349,9 +358,8 @@ pub(crate) fn sign(
         },
     };
     let payload = serde_json::to_vec(&statement)?;
-    let signature = key.sign(&pae(&payload));
-    let builder = digest(key.public_key().as_ref());
-    envelope(&payload, [(builder.as_str(), signature.as_ref())])
+    let signature = key.sign(Purpose::Attestation, &pae(&payload))?;
+    envelope(&payload, [(key.key_id().as_str(), signature.as_slice())])
 }
 
 fn envelope<'a>(
@@ -723,6 +731,7 @@ fn subjects(input: Vec<Subject>) -> Result<BTreeMap<String, FileDigest>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
     fn rejects_older_predicates_even_with_a_valid_builder_signature() -> Result<()> {
@@ -746,7 +755,7 @@ build architecture="x86_64" epoch=1700000000 {{
         let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let proto = tempfile::tempdir()?;
         let bytes = sign(
-            &key,
+            &Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap().into(),
             &[manifest],
             &recipe,
             recipe_bytes.as_bytes(),

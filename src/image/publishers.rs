@@ -340,7 +340,7 @@ pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)
                 .iter()
                 .chain(pin.and_then(|pin| pin.build_trust.as_ref()));
             for trust in policies {
-                for key in catalog.publisher_keys(&publisher.key)? {
+                for key in catalog.publisher_keys() {
                     trust.check_publisher_key(&key)?;
                 }
             }
@@ -540,7 +540,7 @@ fn audit_archived<'a>(
                     (catalog, hash)
                 };
                 receipt.check_attestation(expected)?;
-                let publisher_keys = catalog.publisher_keys(&publisher.key)?;
+                let publisher_keys = catalog.publisher_keys();
                 policies.iter().try_for_each(|trust| {
                     for key in &publisher_keys {
                         trust.check_publisher_key(key)?;

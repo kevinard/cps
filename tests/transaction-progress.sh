@@ -8,7 +8,7 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher test --key private.der >/dev/null
 mkdir proto
 for name in one two; do
     echo "$name" > "proto/$name"
@@ -20,8 +20,8 @@ package "test/$name" publisher="test" version="1.0.0-0" {
 MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der package.kdl
 done
-"$cps" image-create --root image --repo repo --publisher test --trust-key public.der
-"$cps" image-create --root other --repo repo --publisher test --trust-key public.der
+"$cps" image-create --root image --repo repo --publisher test --trust-root repo/trust/1.json
+"$cps" image-create --root other --repo repo --publisher test --trust-root repo/trust/1.json
 "$cps" plan --root image --output one.json install test/one
 "$cps" plan --root image --output two.json install test/two
 

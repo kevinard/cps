@@ -63,6 +63,7 @@ KDL documents declare `schema-version 1` and a document `kind`.
 | --- | --- |
 | KDL `package-manifest` | [Actions, dependency declarations, and versions](../maintainer/manifests.md) |
 | Signed publisher catalog in JSON, version 1 | [Signed catalog format](../publisher/publishing.md#signed-catalog-format) |
+| Publisher trust root in JSON, version 1 | [Publisher trust root](../publisher/publishing.md#publisher-trust-root) |
 | KDL `build-recipe`, `toolchain-config`, and `build-worker` | [Pinned toolchains, sources, and limits](../maintainer/builds.md) |
 | KDL `git-package` and `git-toolchain` | [Package definitions and default toolchains for Git installs](../maintainer/git.md) |
 | KDL `image-config` | [Publisher blocks](../client/publishers.md), [mirror definitions](../client/mirrors.md#synchronizing-a-signed-profile), and [Btrfs system settings](../setups/btrfs.md#configure-live-system-commands) |

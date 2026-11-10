@@ -11,8 +11,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine, engine::general_purpose::STANDARD};
-use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -25,9 +23,7 @@ pub(crate) const SHARD_LIMIT: u64 = 16 * 1024 * 1024;
 pub(crate) const CATALOG_ROOT_LIMIT: u64 = 16 * 1024 * 1024;
 pub(super) const ROOT_FORMAT: u32 = 1;
 const SHARD_FORMAT: u32 = 1;
-const SIGNATURE_DOMAIN: &[u8] = b"cps signed catalog root v1\n";
 const ARCHIVE_MAGIC: &[u8] = b"cps catalog archive v1\n";
-const MAX_SIGNATURES: usize = 16;
 
 /// The shard holding records for a package name.
 pub(crate) fn shard_of(name: &str) -> String {
@@ -46,100 +42,31 @@ fn valid_prefix(prefix: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Envelope {
-    signed: String,
-    signatures: Vec<EnvelopeSignature>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EnvelopeSignature {
-    keyid: String,
-    sig: String,
-}
-
-/// Sign a root payload. The signature covers exactly these payload bytes.
-pub(super) fn seal(payload: &[u8], key: &super::keys::SigningKey) -> Result<Vec<u8>> {
-    let mut message = SIGNATURE_DOMAIN.to_vec();
-    message.extend_from_slice(payload);
-    let envelope = Envelope {
-        signed: STANDARD.encode(payload),
-        signatures: vec![EnvelopeSignature {
-            keyid: digest(key.public_key().as_ref()),
-            sig: hex::encode(key.sign(&message)?),
-        }],
-    };
-    Ok(serde_json::to_vec(&envelope)?)
+/// Sign a root payload. The signatures cover exactly these payload bytes.
+pub(super) fn seal(payload: &[u8], signers: &keys::Signers) -> Result<Vec<u8>> {
+    keys::seal(&keys::CATALOG, payload, signers)?.encode()
 }
 
 /// A decoded root envelope whose signatures are yet to be checked.
 pub(super) struct Opened {
     pub(super) payload: Vec<u8>,
-    signatures: Vec<EnvelopeSignature>,
+    envelope: keys::Envelope,
 }
 
 /// Decode a root envelope in its only accepted byte form.
 pub(super) fn open(bytes: &[u8]) -> Result<Opened> {
-    let envelope: Envelope = serde_json::from_slice(bytes).context("invalid catalog envelope")?;
-    // One root has one byte encoding, so its SHA-256 identity cannot be
-    // changed without the signer: no whitespace, escapes, or hex case.
-    ensure!(
-        serde_json::to_vec(&envelope)? == bytes,
-        "catalog envelope is not canonical"
-    );
-    let payload = STANDARD
-        .decode(&envelope.signed)
-        .context("invalid catalog envelope payload")?;
-    ensure!(
-        STANDARD.encode(&payload) == envelope.signed,
-        "catalog envelope payload is not canonical"
-    );
-    ensure!(
-        (1..=MAX_SIGNATURES).contains(&envelope.signatures.len()),
-        "catalog envelope requires 1 to {MAX_SIGNATURES} signatures"
-    );
-    for pair in envelope.signatures.windows(2) {
-        ensure!(
-            pair[0].keyid < pair[1].keyid,
-            "catalog envelope signatures must be sorted by unique key ID"
-        );
-    }
-    for signature in &envelope.signatures {
-        validate_digest(&signature.keyid).context("invalid catalog signature key ID")?;
-        ensure!(
-            signature.sig.len() == 128
-                && signature
-                    .sig
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
-            "invalid catalog signature encoding"
-        );
-    }
+    let envelope = keys::Envelope::decode(&keys::CATALOG, bytes)?;
     Ok(Opened {
-        payload,
-        signatures: envelope.signatures,
+        payload: envelope.validate(&keys::CATALOG)?,
+        envelope,
     })
 }
 
 impl Opened {
-    /// Require every listed signature to verify. Today the only authorized
-    /// key is the publisher's current catalog signer.
-    pub(super) fn verify(&self, signer: &[u8], hash: &str) -> Result<()> {
-        let keyid = digest(signer);
-        ensure!(
-            self.signatures.len() == 1 && self.signatures[0].keyid == keyid,
-            "invalid signature on catalog {hash}: expected exactly the publisher's current key"
-        );
-        let mut message = SIGNATURE_DOMAIN.to_vec();
-        message.extend_from_slice(&self.payload);
-        for signature in &self.signatures {
-            UnparsedPublicKey::new(&ED25519, signer)
-                .verify(&message, &hex::decode(&signature.sig)?)
-                .map_err(|_| anyhow::anyhow!("invalid signature on catalog {hash}"))?;
-        }
-        Ok(())
+    /// Require exactly the catalog threshold of distinct signatures by the
+    /// catalog keys of the trust root version the catalog is signed under.
+    pub(super) fn verify(&self, trust: &keys::trust::VerifiedChain, hash: &str) -> Result<()> {
+        trust.verify_catalog(&self.envelope, hash)
     }
 }
 
@@ -166,8 +93,8 @@ pub(super) struct Root {
     pub(super) pruned_through: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) renames: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) key_rotations: Vec<keys::Rotation>,
+    /// Every trust root version through the one this catalog is signed under.
+    pub(super) trust: keys::trust::TrustChain,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) release_profiles: BTreeMap<String, ReleaseProfile>,
 }
@@ -403,56 +330,75 @@ pub(super) fn unpack_archive(bytes: &[u8], limit: u64) -> Result<(Vec<u8>, Vec<V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::Ed25519KeyPair;
-
-    pub(super) fn key() -> crate::repo::keys::SigningKey {
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
-        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap().into()
-    }
 
     #[test]
-    fn envelopes_have_one_byte_form_and_sign_the_exact_payload() -> Result<()> {
-        let key = key();
-        let signer = key.public_key().as_ref();
+    fn catalog_roots_require_exactly_the_catalog_threshold() -> Result<()> {
+        use crate::repo::keys::{
+            Signers,
+            tests::key,
+            trust::{self, TrustDraft},
+        };
+        let root_key = key();
+        let documents: Vec<_> = (0..3)
+            .map(|_| {
+                ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .unwrap()
+            })
+            .collect();
+        let load = |index: usize| -> crate::repo::keys::SigningKey {
+            ring::signature::Ed25519KeyPair::from_pkcs8(documents[index].as_ref())
+                .unwrap()
+                .into()
+        };
+        let dir = tempfile::tempdir()?;
+        let write = |name: &str, key: &crate::repo::keys::SigningKey| -> Result<_> {
+            let path = dir.path().join(name);
+            std::fs::write(&path, hex::encode(key.public_key()))?;
+            Ok(path)
+        };
+        let root_public = [write("root", &root_key)?];
+        let catalog_public: Vec<_> = (0..3)
+            .map(|index| write(&format!("catalog{index}"), &load(index)))
+            .collect::<Result<_>>()?;
+        let draft = trust::draft(
+            None,
+            &TrustDraft {
+                publisher: Some("canopa"),
+                root_keys: &root_public,
+                catalog_keys: &catalog_public,
+                catalog_threshold: Some(2),
+                ..TrustDraft::default()
+            },
+        )?;
+        let signed = trust::combine(
+            None,
+            &draft.encode()?,
+            Vec::new(),
+            Some(&Signers::from(vec![root_key])),
+        )?;
+        let chain: trust::TrustChain = serde_json::from_value(serde_json::json!([signed]))?;
+        let verified = chain.verify("canopa")?;
         let payload = br#"{"format":1,"publisher":"canopa","sequence":1}"#;
-        let sealed = seal(payload, &key)?;
+        let signers = |indexes: &[usize], extra: bool| {
+            let mut keys: Vec<_> = indexes.iter().map(|index| load(*index)).collect();
+            if extra {
+                keys.push(key());
+            }
+            Signers::from(keys)
+        };
+        let sealed = seal(payload, &signers(&[0, 1], false))?;
         let opened = open(&sealed)?;
         assert_eq!(opened.payload, payload);
-        opened.verify(signer, "test")?;
+        opened.verify(&verified, "test")?;
 
-        let text = String::from_utf8(sealed.clone())?;
-        let mut variants = vec![
-            text.replacen(':', ": ", 1),
-            format!("{text}\n"),
-            text.replacen("\"signed\"", "\"\\u0073igned\"", 1),
-        ];
-        let sig = &opened.signatures[0].sig;
-        variants.push(text.replace(sig.as_str(), &sig.to_uppercase()));
-        let unpadded = STANDARD.encode(payload).trim_end_matches('=').to_owned();
-        variants.push(text.replace(&STANDARD.encode(payload), &unpadded));
-        for variant in variants {
-            assert_ne!(variant.as_bytes(), sealed.as_slice());
-            assert!(open(variant.as_bytes()).is_err(), "accepted {variant}");
-        }
-
-        // The signature covers the payload bytes, not a re-serialization.
-        let spaced = br#"{"format": 1,"publisher":"canopa","sequence":1}"#;
-        let mut forged: Envelope = serde_json::from_slice(&sealed)?;
-        forged.signed = STANDARD.encode(spaced);
-        let forged = open(&serde_json::to_vec(&forged)?)?;
-        let error = forged.verify(signer, "forged").unwrap_err();
-        assert!(format!("{error:#}").contains("invalid signature"));
-
-        // Another key, or an extra signature, is not the publisher's signature.
-        let other = super::tests::key();
-        assert!(opened.verify(other.public_key().as_ref(), "test").is_err());
-        let mut doubled: Envelope = serde_json::from_slice(&sealed)?;
-        let mut extra = doubled.signatures[0].clone();
-        extra.keyid = digest(other.public_key().as_ref());
-        doubled.signatures.push(extra);
-        doubled.signatures.sort_by(|a, b| a.keyid.cmp(&b.keyid));
-        let doubled = open(&serde_json::to_vec(&doubled)?)?;
-        assert!(doubled.verify(signer, "doubled").is_err());
+        let one = open(&seal(payload, &signers(&[2], false))?)?;
+        assert!(one.verify(&verified, "one").is_err());
+        let three = open(&seal(payload, &signers(&[0, 1, 2], false))?)?;
+        assert!(three.verify(&verified, "three").is_err());
+        let error = open(&seal(payload, &signers(&[0], true))?)?
+            .verify(&verified, "unauthorized")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unauthorized key"));
         Ok(())
     }
 

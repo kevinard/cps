@@ -13,6 +13,10 @@ gid=$(id -g)
 for publisher in canopa runtime; do
     openssl genpkey -algorithm ED25519 -outform DER -out "$publisher.der"
     openssl pkey -inform DER -in "$publisher.der" -pubout -outform DER -out "$publisher-public.der"
+    repo=repo
+    [[ $publisher == canopa ]] || repo=companion
+    "$cps" repo trust init --repo "$repo" --publisher "$publisher" --key "$publisher.der" >/dev/null
+    cp "$repo/trust/1.json" "$publisher.trust.json"
 done
 mkdir -p app/usr/bin runtime/usr/lib64
 printf 'int answer(void) { return 42; }\n' > library.c
@@ -60,7 +64,7 @@ publisher "canopa" {
         }
         publisher "runtime" catalog="$(cat companion/current)" {
             repository "../companion"
-            trust-key "../runtime-public.der"
+            trust-root "../runtime.trust.json"
         }
     }
 }
@@ -151,11 +155,11 @@ architecture "$arch"
 release-profile "desktop"
 publisher "canopa" {
     repository "repo"
-    trust-key "canopa-public.der"
+    trust-root "canopa.trust.json"
 }
 publisher "runtime" {
     repository "companion"
-    trust-key "runtime-public.der"
+    trust-root "runtime.trust.json"
 }
 CONFIG
 "$cps" image-create --root image --config image.kdl

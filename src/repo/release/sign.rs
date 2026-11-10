@@ -22,8 +22,8 @@ use tough::{
 };
 
 use super::{
-    ARCHIVE, PUBLISHER_KEY_TARGET, PUBLISHER_NAME_TARGET, RETAINED, ROLE_LIMIT, ROOT_LIMIT,
-    TIMESTAMP_LIMIT,
+    ARCHIVE, PUBLISHER_NAME_TARGET, RETAINED, ROLE_LIMIT, ROOT_LIMIT, TIMESTAMP_LIMIT,
+    TRUST_ROOT_TARGET,
 };
 use crate::{
     model::digest,
@@ -336,7 +336,7 @@ pub fn sign_export(request: SignExport<'_>) -> Result<()> {
                 }
                 if matches!(
                     name.resolved(),
-                    "current" | ARCHIVE | RETAINED | PUBLISHER_NAME_TARGET | PUBLISHER_KEY_TARGET
+                    "current" | ARCHIVE | RETAINED | PUBLISHER_NAME_TARGET | TRUST_ROOT_TARGET
                 ) {
                     editor.add_target(name, target)?;
                 } else {

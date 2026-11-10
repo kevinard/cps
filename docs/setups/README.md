@@ -24,7 +24,7 @@ scenarios.
 
 | Setup | Guide |
 | --- | --- |
-| One or more local repositories with separately trusted publisher keys | [Configure publishers](../client/publishers.md) |
+| One or more local repositories with separately trusted publisher trust roots | [Configure publishers](../client/publishers.md) |
 | One signed mirror with a full or index-only cache | [Sync a mirror](../client/mirrors.md#sync-a-single-publisher) |
 | Signed profile across primary and companion publishers | [Sync a profile](../client/mirrors.md#synchronizing-a-signed-profile) and [install it](../client/profiles.md) |
 | Disconnected provisioning of an exact composition | [Export and install an image bundle](../client/profiles.md#provisioning-the-same-composition-on-another-machine) |

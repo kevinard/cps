@@ -23,7 +23,7 @@ use crate::{
             elf,
             runtime::{PathKind, expand_absolute, library_search, machine, native, walk_path},
         },
-        read_key, read_limited, read_package,
+        read_limited, read_package, read_trust_root,
     },
 };
 
@@ -182,7 +182,7 @@ fn load_providers(
         let hash = hashes
             .remove(name)
             .with_context(|| format!("missing catalog pin for {name}"))?;
-        let key = read_key(&publisher.trust_key)?;
+        let key = read_trust_root(&publisher.trust_key)?;
         let pin = CatalogPin::primary(name.to_owned(), hash.to_owned());
         let catalog = catalog_index(&publisher.repository, name, &key, Some(&pin))
             .with_context(|| format!("reading pinned catalog {hash} for {name}"))?;

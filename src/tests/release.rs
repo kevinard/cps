@@ -20,9 +20,54 @@ use crate::{
     publish_bundle, publish_release,
     query::{Scope, Status, list_packages, package_manifest},
     read_attestation, release as mirror_release,
-    repo::{read_key, read_signing_key, snapshot},
-    rotate_publisher_key, withdraw_package,
+    repo::{read_trust_root, snapshot},
+    withdraw_package,
 };
+
+/// Rotate the catalog key to `next` with the root key, then re-sign `base`
+/// so the current catalog carries the new trust root version.
+fn rotate_catalog_key(
+    repo: &Path,
+    publisher: &str,
+    base: &str,
+    root: &Path,
+    next: &Fixture,
+) -> Result<String> {
+    crate::rotate_trust(
+        repo,
+        &crate::TrustDraft {
+            catalog_keys: std::slice::from_ref(&next.public),
+            ..Default::default()
+        },
+        root,
+    )?;
+    crate::resign_catalog(repo, publisher, &next.private, base)
+}
+
+/// Run `publish` as a holder of a revoked catalog key would: with the
+/// repository's trust history cut back to `through`.
+fn with_revoked_history<T>(
+    repo: &Path,
+    through: u64,
+    publish: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let stash = tempfile::tempdir()?;
+    let mut moved = Vec::new();
+    for version in through + 1.. {
+        let path = crate::repo::trust_root_path(repo, version);
+        if !path.exists() {
+            break;
+        }
+        let target = stash.path().join(format!("{version}.json"));
+        fs::rename(&path, &target)?;
+        moved.push((target, path));
+    }
+    let result = publish();
+    for (from, to) in moved {
+        fs::rename(from, to)?;
+    }
+    result
+}
 
 fn attach_evidence(
     fixture: &Fixture,
@@ -33,7 +78,7 @@ fn attach_evidence(
     fs::create_dir_all(bundle.join("proto/usr/bin"))?;
     let manifest_bytes = fs::read(&fixture.recipe)?;
     let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
-    let key = read_key(&fixture.public)?;
+    let key = read_trust_root(&fixture.trust)?;
     let key_hash = digest(&key);
     let publisher = &manifest.publisher;
     let recipe = format!(
@@ -46,7 +91,7 @@ fn attach_evidence(
     let payload = fs::read(fixture.proto.join(COMPOSITOR))?;
     let recipe_model = build::parse(&recipe)?;
     let envelope = attestation::sign(
-        &read_signing_key(&builder.private)?,
+        &crate::repo::SigningKey::open(&builder.private)?,
         std::slice::from_ref(&manifest),
         &recipe_model,
         recipe.as_bytes(),
@@ -107,7 +152,7 @@ fn publisher_independently_checks_the_signed_toolchain_closure() -> Result<()> {
     let sources = [("seed", &seed), ("tools", &tools)]
         .into_iter()
         .map(|(name, source)| -> Result<_> {
-            let key = read_key(&source.public)?;
+            let key = read_trust_root(&source.trust)?;
             let release = snapshot(&source.repo, name, &key, None)?;
             Ok((
                 PublisherPin {
@@ -136,10 +181,10 @@ fn publisher_independently_checks_the_signed_toolchain_closure() -> Result<()> {
         &config,
         format!(
             r#"schema-version 1 kind="toolchain-config"
-publisher "seed" {{ repository {:?}; trust-key {:?}; }}
-publisher "tools" {{ repository {:?}; trust-key {:?}; }}
+publisher "seed" {{ repository {:?}; trust-root {:?}; }}
+publisher "tools" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            seed.repo, seed.public, tools.repo, tools.public
+            seed.repo, seed.trust, tools.repo, tools.trust
         ),
     )?;
     let bundle = f._dir.path().join("bundle");
@@ -169,7 +214,7 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
             package_manifests.insert(library.to_owned(), package(library, version));
         }
         let envelope = attestation::sign(
-            &read_signing_key(&builder.private)?,
+            &crate::repo::SigningKey::open(&builder.private)?,
             &[parse_manifest(std::str::from_utf8(manifest)?)?],
             &build::parse(&recipe)?,
             recipe.as_bytes(),
@@ -185,7 +230,7 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
     };
     // A higher version on the current pointer cannot change a reviewed pin.
     seed.package_as("seed", library, "3.0.0-0", String::new())?;
-    fs::create_dir(&f.repo)?;
+    fs::create_dir_all(&f.repo)?;
     let policy = f.repo.join("publish-policy.kdl");
     let write_policy = |strict: bool| {
         let setting = if strict { "#true" } else { "#false" };
@@ -261,7 +306,7 @@ fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
     let error = publish_release(&f.repo, &f.private, &release).unwrap_err();
     assert!(error.to_string().contains("no published package"));
     assert_eq!(fs::read_to_string(&pointer)?, base);
-    assert!(list_withdrawals(&f.repo, "canopa", &f.public)?.is_empty());
+    assert!(list_withdrawals(&f.repo, "canopa", &f.trust)?.is_empty());
 
     write("cps://canopa/test/one@1.0.0-0")?;
     let error = publish_release(&f.repo, &f.private, &release).unwrap_err();
@@ -272,7 +317,7 @@ fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
         |mode| crate::publish_release_with_mode(&f.repo, &f.private, &release, None, mode);
     let prepared = publish(crate::ReleaseMode::Prepare)?;
     assert_eq!(fs::read_to_string(&pointer)?, base);
-    let key = read_key(&f.public)?;
+    let key = read_trust_root(&f.trust)?;
     assert!(
         snapshot(&f.repo, "canopa", &key, Some(&prepared))?
             .packages
@@ -284,7 +329,7 @@ fn release_batch_checks_its_base_and_keeps_withdrawals_atomic() -> Result<()> {
     let committed = publish(crate::ReleaseMode::RequireCandidate(&prepared))?;
     assert_eq!(committed, prepared);
     assert_eq!(fs::read_to_string(&pointer)?.trim(), committed);
-    assert_eq!(list_withdrawals(&f.repo, "canopa", &f.public)?.len(), 2);
+    assert_eq!(list_withdrawals(&f.repo, "canopa", &f.trust)?.len(), 2);
     assert!(snapshot(&f.repo, "canopa", &key, None)?.packages.is_empty());
     assert_eq!(
         snapshot(&f.repo, "canopa", &key, Some(base.trim()))?
@@ -317,6 +362,7 @@ fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> 
                 Some(arch),
             )?;
             fs::write(&fixture.recipe, manifest)?;
+            fixture.trust_publisher(publisher)?;
             publish(
                 &fixture.repo,
                 &fixture.proto,
@@ -340,13 +386,13 @@ fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> 
         package "{root}"
         publisher "seed" catalog={:?} {{
             repository {:?}
-            trust-key {:?}
+            trust-root {:?}
         }}
     }}
 "#,
             seed_pin.trim(),
             seed.repo,
-            seed.public
+            seed.trust
         )
     };
     let publish_profiles = |arm_root| -> Result<String> {
@@ -409,12 +455,12 @@ fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> 
                 r#"schema-version 1 kind="image-config"
 architecture "{arch}"
 release-profile "{arch}"
-publisher "canopa" {{ repository "canopa"; trust-key {:?}; }}
-publisher "seed" {{ repository "seed"; trust-key {:?}; }}
+publisher "canopa" {{ repository "canopa"; trust-root {:?}; }}
+publisher "seed" {{ repository "seed"; trust-root {:?}; }}
 mirror "canopa" root={root:?} metadata="{metadata}" targets="{targets}"
 mirror "seed" root={seed_root:?} metadata="{seed_metadata}" targets="{seed_targets}"
 "#,
-                f.public, seed.public,
+                f.trust, seed.trust,
             ),
         )?;
         assert_eq!(mirror_release::sync_profile(&config, true)?, release);
@@ -467,7 +513,7 @@ fn bundle_cannot_claim_a_different_architecture_than_its_build() -> Result<()> {
     let release = snapshot(
         &f.repo,
         "canopa",
-        &read_key(&f.public)?,
+        &read_trust_root(&f.trust)?,
         Some(catalog.trim()),
     )?;
     let package = &release.packages[0];
@@ -526,7 +572,7 @@ fn release_profiles_pin_latest_roots_and_use_image_facets() -> Result<()> {
 
     write_policy("desktop/compositor@1.0.0-0", false)?;
     withdraw_package(&f.repo, &f.private, id)?;
-    assert!(list_withdrawals(&f.repo, "canopa", &f.public)?.contains_key(id));
+    assert!(list_withdrawals(&f.repo, "canopa", &f.trust)?.contains_key(id));
     Ok(())
 }
 
@@ -545,7 +591,7 @@ fn signed_composition_replays_only_its_manifest_digests() -> Result<()> {
         "1.0.0-0",
         "    require-capability \"cap/desktop-runtime\"\n".into(),
     )?;
-    let release = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
+    let release = snapshot(&f.repo, "canopa", &read_trust_root(&f.trust)?, None)?;
     let version = "1.0.0-0".parse()?;
     let composition = release
         .packages
@@ -627,13 +673,13 @@ publisher "canopa" {{
     profile "desktop" architecture="x86_64" rollout-percentage={percentage} {{
         package "desktop/base@{version}"
         {advisory}
-        publisher "seed" catalog={:?} {{ repository {:?}; trust-key {:?}; }}
+        publisher "seed" catalog={:?} {{ repository {:?}; trust-root {:?}; }}
     }}
 }}
 "#,
                 pin.trim(),
                 companion.repo,
-                companion.public,
+                companion.trust,
             ),
         )?;
         let base = fs::read_to_string(f.repo.join("current"))?;
@@ -656,10 +702,10 @@ publisher "canopa" {{
             r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
-publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
+publisher "seed" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            f.repo, f.public, companion.repo, companion.public,
+            f.repo, f.trust, companion.repo, companion.trust,
         ),
     )?;
     create_configured_image(&f.root, &config)?;
@@ -765,7 +811,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     let (_, profile) = crate::repo::release_profile(
         &f.repo,
         "canopa",
-        &read_key(&f.public)?,
+        &read_trust_root(&f.trust)?,
         Some(&widened),
         "desktop",
     )?;
@@ -823,9 +869,9 @@ publisher "canopa" {
             r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            f.repo, f.public
+            f.repo, f.trust
         ),
     )?;
     create_configured_image(&f.root, &config)?;
@@ -883,14 +929,14 @@ publisher "canopa" {{
         package "desktop/tool@{version}"
         publisher "seed" catalog={:?} {{
             repository {:?}
-            trust-key {:?}
+            trust-root {:?}
         }}
     }}
 }}
 "#,
                 pin.trim(),
                 seed.repo,
-                seed.public
+                seed.trust
             ),
         )?;
         let release = f._dir.path().join("refresh.kdl");
@@ -913,10 +959,10 @@ publisher "canopa" {{
             r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
-publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
+publisher "seed" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            f.repo, f.public, seed.repo, seed.public,
+            f.repo, f.trust, seed.repo, seed.trust,
         ),
     )?;
     create_configured_image(&f.root, &config)?;
@@ -1066,9 +1112,9 @@ publisher "canopa" {{
             r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            f.repo, f.public,
+            f.repo, f.trust,
         ),
     )?;
     let exact_root = f._dir.path().join("exact-root");
@@ -1252,13 +1298,13 @@ publisher "canopa" {{
     builder-key "unused.der"
     profile "desktop" architecture="x86_64" {{
         package "desktop/base@{version}"
-        publisher "seed" catalog={:?} {{ repository {:?}; trust-key {:?}; }}
+        publisher "seed" catalog={:?} {{ repository {:?}; trust-root {:?}; }}
     }}
 }}
 "#,
                 pin.trim(),
                 companion.repo,
-                companion.public
+                companion.trust
             ),
         )?;
         let release = main._dir.path().join("refresh.kdl");
@@ -1281,31 +1327,31 @@ publisher "canopa" {{
             r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
-publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
+publisher "seed" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            main.repo, main.public, companion.repo, companion.public
+            main.repo, main.trust, companion.repo, companion.trust
         ),
     )?;
     create_configured_image(&main.root, &config)?;
     let add = |key: &Path, cache: &Path| {
         crate::add_publisher_from_url(&main.root, "extras", url, &anchor, key, cache, None)
     };
-    assert!(add(&extras.public, &cache).is_err());
+    assert!(add(&extras.trust, &cache).is_err());
     assert!(!cache.exists());
     apply(&main.root, &plan(&main.root, Request::InstallProfile)?)?;
     let install = |packages| plan(&main.root, Request::Install { packages });
     let previous = install(vec![editor.into()])?;
     assert!(
-        add(&extras.public, &companion.repo)
+        add(&extras.trust, &companion.repo)
             .unwrap_err()
             .to_string()
             .contains("overlaps")
     );
-    assert!(add(&main.public, &cache).is_err());
+    assert!(add(&main.trust, &cache).is_err());
     assert!(!cache.exists());
     assert_eq!(crate::list_publishers(&main.root)?.len(), 2);
-    assert_eq!(add(&extras.public, &cache)?, cache);
+    assert_eq!(add(&extras.trust, &cache)?, cache);
     assert!(
         apply(&main.root, &previous)
             .unwrap_err()
@@ -1388,9 +1434,9 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     fs::write(
         &locked_config,
         format!(
-            "{}publisher \"extras\" {{ repository {cache:?}; trust-key {:?}; }}\n",
+            "{}publisher \"extras\" {{ repository {cache:?}; trust-root {:?}; }}\n",
             fs::read_to_string(&config)?,
-            extras.public,
+            extras.trust,
         ),
     )?;
     let locked_root = work.join("locked-root");
@@ -1684,7 +1730,7 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
     )?;
     publish_release(&f.repo, &f.private, &release)?;
     assert_eq!(
-        list_obsoletions(&f.repo, "canopa", &f.public)?,
+        list_obsoletions(&f.repo, "canopa", &f.trust)?,
         ["cps://canopa/library/legacy@2.0.0-0"]
     );
     Ok(())
@@ -1711,7 +1757,7 @@ fn signed_renames_upgrade_in_one_transaction_and_preserve_install_intent() -> Re
     )?;
     other.package_as("other", successor, "9.0.0-0", String::new())?;
     f.create()?;
-    add_publisher(&f.root, "other", &other.repo, &other.public)?;
+    add_publisher(&f.root, "other", &other.repo, &other.trust)?;
     prefer_publisher(&f.root, "other")?;
     let install = |packages: &[&str]| Request::Install {
         packages: packages.iter().map(|name| (*name).into()).collect(),
@@ -1881,8 +1927,8 @@ fn signed_profile_renames_require_the_successor_and_keep_local_marks_separate() 
     fs::write(
         &config,
         format!(
-            "schema-version 1 kind=\"image-config\"\nrelease-profile \"desktop\"\npublisher \"canopa\" {{ repository {:?}; trust-key {:?}; }}\n",
-            f.repo, f.public
+            "schema-version 1 kind=\"image-config\"\nrelease-profile \"desktop\"\npublisher \"canopa\" {{ repository {:?}; trust-root {:?}; }}\n",
+            f.repo, f.trust
         ),
     )?;
     crate::create_configured_image(&f.root, &config)?;
@@ -1975,14 +2021,14 @@ publisher "canopa" {{
         package "desktop/compositor@{version}"
         publisher "seed" catalog={:?} {override_pin} {{
             repository {:?}
-            trust-key {:?}
+            trust-root {:?}
         }}
     }}
 }}
 "#,
                 pin.trim(),
                 seed.repo,
-                seed.public,
+                seed.trust,
             ),
         )
     };
@@ -2030,14 +2076,14 @@ architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 publisher "seed" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 "#,
-            f.repo, f.public, seed.repo, seed.public,
+            f.repo, f.trust, seed.repo, seed.trust,
         ),
     )?;
     create_configured_image(&f.root, &config)?;
@@ -2238,7 +2284,7 @@ publisher "canopa" {{
         package "desktop/compositor"
         publisher "seed" catalog={:?} upgrade-from={:?} {{
             repository {:?}
-            trust-key {key:?}
+            trust-root {key:?}
         }}
     }}
 }}
@@ -2251,21 +2297,24 @@ publisher "canopa" {{
         )
     };
 
-    write_policy(&seed_current, &f.public)?;
+    write_policy(&seed_current, &f.trust)?;
     let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
-    assert!(format!("{error:#}").contains("invalid signature on catalog"));
+    assert!(
+        format!("{error:#}").contains("pinned trust root belongs to publisher canopa, not seed"),
+        "{error:#}"
+    );
     assert_eq!(fs::read_to_string(&pointer)?, old);
 
-    write_policy(&seed_baseline, &seed.public)?;
+    write_policy(&seed_baseline, &seed.trust)?;
     let error = withdraw_package(&f.repo, &f.private, id).unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains("update selects cps://canopa/desktop/compositor@1.0.0-0 instead of cps://canopa/desktop/compositor@2.0.0-0"), "{message}");
     assert_eq!(fs::read_to_string(&pointer)?, old);
 
-    write_policy(&seed_current, &seed.public)?;
+    write_policy(&seed_current, &seed.trust)?;
     fs::remove_file(seed.repo.join("current"))?;
     withdraw_package(&f.repo, &f.private, id)?;
-    assert!(list_withdrawals(&f.repo, "canopa", &f.public)?.contains_key(id));
+    assert!(list_withdrawals(&f.repo, "canopa", &f.trust)?.contains_key(id));
     Ok(())
 }
 
@@ -2328,14 +2377,14 @@ architecture {arch:?}
 release-profile "desktop"
 publisher "canopa" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 publisher "seed" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 "#,
-                f.repo, f.public, seed.repo, seed.public
+                f.repo, f.trust, seed.repo, seed.trust
             ),
         )
     };
@@ -2350,14 +2399,14 @@ publisher "canopa" {{
         package "desktop/compositor"
         publisher "seed" catalog={:?} {{
             repository {:?}
-            trust-key {:?}
+            trust-root {:?}
         }}
     }}
 }}
 "#,
                 pin.trim(),
                 seed.repo,
-                seed.public
+                seed.trust
             ),
         )
     };
@@ -2412,13 +2461,8 @@ publisher "canopa" {{
         assert_eq!(fs::read_to_string(&pointer)?.trim(), second);
     }
     let rotated = Fixture::new()?;
-    let rotated_pin = rotate_publisher_key(
-        &seed.repo,
-        "seed",
-        new_pin.trim(),
-        &seed.private,
-        &rotated.private,
-    )?;
+    let rotated_pin =
+        rotate_catalog_key(&seed.repo, "seed", new_pin.trim(), &seed.private, &rotated)?;
     write_policy(&rotated_pin)?;
     let third = refresh(&second)?;
     assert_ne!(second, third);
@@ -2456,7 +2500,7 @@ fn sign_publisher_release(
 ) -> Result<()> {
     fs::create_dir(mirror)?;
     let export = mirror.join("export");
-    mirror_release::export(&fixture.repo, publisher, &fixture.public, &export)?;
+    mirror_release::export(&fixture.repo, publisher, &fixture.trust, &export)?;
     sign_export(&export, mirror, version, expires, root, tuf_key)
 }
 
@@ -2507,7 +2551,7 @@ package "runtime/libcc" publisher="canopa" {
 }
 "#;
     let catalog = digest(b"pinned toolchain");
-    let key_hash = digest(&read_key(&f.public)?);
+    let key_hash = digest(&read_trust_root(&f.trust)?);
     let recipe = format!(
         "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain solver=\"sat-v2\" {{ publisher \"seed\" catalog=\"{catalog}\" key-sha256=\"{key_hash}\"; package \"build/tool\"; }}\n    version \"2.1.0-1\" upstream=\"2.1\"\n    manifest \"compiler.kdl\" sha256=\"{}\"\n    manifest \"runtime.kdl\" sha256=\"{}\"\n    discard \"usr/share/info/**\"\n    script \"true\"\n}}\n",
         digest(compiler_template),
@@ -2560,7 +2604,7 @@ package "runtime/libcc" publisher="canopa" {
         fs::write(path, manifest_text(manifest))?;
     }
     let envelope = attestation::sign(
-        &read_signing_key(&builder.private)?,
+        &crate::repo::SigningKey::open(&builder.private)?,
         &manifests,
         &parsed,
         recipe.as_bytes(),
@@ -2598,7 +2642,7 @@ package "runtime/libcc" publisher="canopa" {
         "{error:#}"
     );
 
-    fs::create_dir(&f.repo)?;
+    fs::create_dir_all(&f.repo)?;
     let policy = |approved: &[&str]| {
         let approvals: String = approved
             .iter()
@@ -2623,12 +2667,12 @@ package "runtime/libcc" publisher="canopa" {
     let ids = publish_bundle(&f.repo, &bundle, &f.private, &builder.public, &reviewed)?;
     assert_eq!(ids, [compiler, runtime]);
     assert_eq!(
-        read_attestation(&f.repo, "canopa", &f.public, compiler)?,
-        read_attestation(&f.repo, "canopa", &f.public, runtime)?
+        read_attestation(&f.repo, "canopa", &f.trust, compiler)?,
+        read_attestation(&f.repo, "canopa", &f.trust, runtime)?
     );
 
     // Clients verify each package against the shared statement.
-    let release = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
+    let release = snapshot(&f.repo, "canopa", &read_trust_root(&f.trust)?, None)?;
     let trust = attestation::BuildTrust::load(1, std::slice::from_ref(&builder.public))?;
     for package in &release.packages {
         release.builds.verify(&f.repo, [&trust], package)?;
@@ -2651,23 +2695,22 @@ package "runtime/libcc" publisher="canopa" {
     // A rebuild of either package proves both came from the admitted build.
     for id in [compiler, runtime] {
         assert_eq!(
-            crate::verify_rebuild(&f.repo, "canopa", &f.public, id, None, &bundle, None)?,
+            crate::verify_rebuild(&f.repo, "canopa", &f.trust, id, None, &bundle, None)?,
             3
         );
     }
-    let error = crate::verify_rebuild(&f.repo, "canopa", &f.public, runtime, None, &tampered, None)
+    let error = crate::verify_rebuild(&f.repo, "canopa", &f.trust, runtime, None, &tampered, None)
         .unwrap_err();
     assert!(format!("{error:#}").contains("differs from its template"));
     let partial = work.join("partial");
     copy_tree(&bundle, &partial)?;
     fs::remove_file(partial.join("proto/usr/lib/libcc.so.1"))?;
     assert!(
-        crate::verify_rebuild(&f.repo, "canopa", &f.public, compiler, None, &partial, None)
-            .is_err()
+        crate::verify_rebuild(&f.repo, "canopa", &f.trust, compiler, None, &partial, None).is_err()
     );
 
     let inputs = work.join("inputs");
-    let path = crate::export_rebuild_inputs(&f.repo, "canopa", &f.public, runtime, None, &inputs)?;
+    let path = crate::export_rebuild_inputs(&f.repo, "canopa", &f.trust, runtime, None, &inputs)?;
     assert_eq!(fs::read(path)?, recipe.as_bytes());
     assert_eq!(
         fs::read(inputs.join("source/compiler.kdl"))?,
@@ -2711,7 +2754,7 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
 }
 "#;
     let catalog = digest(b"pinned toolchain");
-    let key_hash = digest(&read_key(&f.public)?);
+    let key_hash = digest(&read_trust_root(&f.trust)?);
     let recipe = format!(
         "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain solver=\"sat-v2\" {{ publisher \"seed\" catalog=\"{catalog}\" key-sha256=\"{key_hash}\"; package \"build/tool\"; }}\n    manifest \"build.kdl/nested/manifest.kdl\" sha256=\"{}\"\n    source \"input\" sha256=\"{source_hash}\" size={}\n    script \"true\"\n}}\n",
         digest(manifest),
@@ -2724,7 +2767,7 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
     fs::write(bundle.join("build.kdl"), &recipe)?;
     crate::build::write_explicit_outputs(&bundle, &[("build.kdl/nested/manifest.kdl", manifest)])?;
     let envelope = attestation::sign(
-        &read_signing_key(&builder.private)?,
+        &crate::repo::SigningKey::open(&builder.private)?,
         &[parse_manifest(std::str::from_utf8(manifest)?)?],
         &build::parse(&recipe)?,
         recipe.as_bytes(),
@@ -2749,7 +2792,6 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
         &crate::image::root::Root::open(&bundle.join("proto"))?,
     )?;
     fs::write(bundle.join("attestation.json"), &envelope)?;
-    fs::create_dir(&f.repo)?;
     let policy = |archive: &str| {
         fs::write(
             f.repo.join("publish-policy.kdl"),
@@ -2766,10 +2808,10 @@ publisher "canopa" archive-build-inputs={archive} {{
     };
     let publish = || publish_bundle(&f.repo, &bundle, &f.private, &builder.public, &reviewed);
     let extract = |repo: &Path, catalog, output: &Path| {
-        crate::export_rebuild_inputs(repo, "canopa", &f.public, id, catalog, output)
+        crate::export_rebuild_inputs(repo, "canopa", &f.trust, id, catalog, output)
     };
     let compare = |repo: &Path, catalog| {
-        crate::verify_rebuild(repo, "canopa", &f.public, id, catalog, &bundle, None)
+        crate::verify_rebuild(repo, "canopa", &f.trust, id, catalog, &bundle, None)
     };
     policy("#false")?;
     publish()?;
@@ -2828,7 +2870,7 @@ publisher "canopa" archive-build-inputs={archive} {{
     mirror_release::export_with_retained(
         &f.repo,
         "canopa",
-        &f.public,
+        &f.trust,
         &export,
         &[archived.trim().into()],
     )?;
@@ -2844,7 +2886,7 @@ publisher "canopa" archive-build-inputs={archive} {{
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     assert_eq!(sync()?, fs::read_to_string(f.repo.join("current"))?.trim());
@@ -2866,18 +2908,18 @@ publisher "canopa" archive-build-inputs={archive} {{
         metadata.as_str(),
         targets.as_str(),
         "canopa",
-        &f.public,
+        &f.trust,
     )?;
     let rebuild_cache = work.join("rebuild-cache");
     let fetch = |repo: &Path, pin| {
-        crate::fetch_build_sources(repo, "canopa", &f.public, id, pin, &rebuild_cache)
+        crate::fetch_build_sources(repo, "canopa", &f.trust, id, pin, &rebuild_cache)
     };
     let error = fetch(&withdrawn_cache, None).unwrap_err();
     assert!(format!("{error:#}").contains("checking archived source"));
     let sync_sources = |mirror: &Path, version, corrupted: bool| -> Result<()> {
         fs::create_dir(mirror)?;
         let export = mirror.join("export");
-        mirror_release::export_with_sources(&f.repo, "canopa", &f.public, &export, &[])?;
+        mirror_release::export_with_sources(&f.repo, "canopa", &f.trust, &export, &[])?;
         let target = export.join(format!("source-archives-{source_hash}"));
         assert_eq!(fs::read(&target)?, source_bytes);
         if corrupted {
@@ -2892,7 +2934,7 @@ publisher "canopa" archive-build-inputs={archive} {{
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )?;
         Ok(())
     };
@@ -2920,7 +2962,8 @@ publisher "canopa" archive-build-inputs={archive} {{
     assert_eq!(fetch(&withdrawn_cache, None)?, 1);
 
     let protected = work.join("protected-repo");
-    fs::create_dir(&protected)?;
+    fs::create_dir_all(protected.join("trust"))?;
+    fs::copy(f.repo.join("trust/1.json"), protected.join("trust/1.json"))?;
     let policy_path = protected.join("publish-policy.kdl");
     let policy = fs::read_to_string(f.repo.join("publish-policy.kdl"))?;
     fs::write(
@@ -2953,7 +2996,7 @@ publisher "canopa" archive-build-inputs={archive} {{
     withdraw_package(&protected, &f.private, id)?;
 
     let complete_export = work.join("protected-export");
-    let expected = mirror_release::export(&protected, "canopa", &f.public, &complete_export)?;
+    let expected = mirror_release::export(&protected, "canopa", &f.trust, &complete_export)?;
     let source_target = complete_export.join(format!("source-archives-{source_hash}"));
     assert_eq!(fs::read(&source_target)?, source_bytes);
     let protected_cache = work.join("protected-cache");
@@ -2968,7 +3011,7 @@ publisher "canopa" archive-build-inputs={archive} {{
                 .unwrap()
                 .as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     fs::remove_file(&source_target)?;
@@ -2992,7 +3035,7 @@ publisher "canopa" archive-build-inputs={archive} {{
         crate::fetch_build_sources(
             &protected_cache,
             "canopa",
-            &f.public,
+            &f.trust,
             id,
             None,
             &new_source_cache
@@ -3008,7 +3051,7 @@ publisher "canopa" archive-build-inputs={archive} {{
     mirror_release::export_archive(
         &protected,
         "canopa",
-        &f.public,
+        &f.trust,
         &archive_targets,
         &admitted,
         false,
@@ -3027,7 +3070,7 @@ publisher "canopa" archive-build-inputs={archive} {{
                 .unwrap()
                 .as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
             mirror_release::ArchiveSyncOptions {
                 catalog: &admitted,
                 index_only: true
@@ -3045,7 +3088,7 @@ publisher "canopa" archive-build-inputs={archive} {{
         crate::fetch_build_sources(
             &archive_cache,
             "canopa",
-            &f.public,
+            &f.trust,
             id,
             Some(&admitted),
             &archive_sources
@@ -3060,7 +3103,7 @@ publisher "canopa" archive-build-inputs={archive} {{
     let publisher = crate::image::Publisher {
         name: "canopa".into(),
         repo: protected_cache.clone(),
-        key: read_key(&f.public)?,
+        key: read_trust_root(&f.trust)?,
         build_trust: None,
         git: None,
     };
@@ -3119,7 +3162,7 @@ fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -
     let invalid = mirror_release::export_with_retained(
         &seed.repo,
         "seed",
-        &seed.public,
+        &seed.trust,
         &export,
         &[current.trim().to_owned()],
     )
@@ -3133,7 +3176,7 @@ fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -
     mirror_release::export_with_retained(
         &seed.repo,
         "seed",
-        &seed.public,
+        &seed.trust,
         &export,
         &[previous.trim().to_owned()],
     )?;
@@ -3154,14 +3197,14 @@ fn tuf_retained_catalogs_bootstrap_profiled_images_without_rewinding_current() -
         metadata.as_str(),
         targets.as_str(),
         "seed",
-        &seed.public,
+        &seed.trust,
     )?;
     assert_eq!(hash, current.trim());
     assert_eq!(
         fs::read_to_string(seed_cache.join(".tuf/catalog"))?,
         current
     );
-    let key = read_key(&seed.public)?;
+    let key = read_trust_root(&seed.trust)?;
     let now = snapshot(&seed_cache, "seed", &key, None)?;
     assert_eq!(now.packages.len(), 1);
     assert_eq!(
@@ -3188,14 +3231,14 @@ publisher "canopa" {{
         facet "devel" #false
         publisher "seed" catalog={:?} {{
             repository {:?}
-            trust-key {:?}
+            trust-root {:?}
         }}
     }}
 }}
 "#,
             previous.trim(),
             seed.repo,
-            seed.public
+            seed.trust
         ),
     )?;
     withdraw_package(&f.repo, &f.private, "cps://canopa/test/retire@1.0.0-0")?;
@@ -3222,21 +3265,21 @@ release-profile "desktop"
 facet "devel" #false
 publisher "canopa" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 mirror "canopa" root={primary_root:?} metadata={:?} targets={:?}
 publisher "seed" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 mirror "seed" root={anchor:?} metadata={:?} targets={:?}
 "#,
                 primary_cache,
-                f.public,
+                f.trust,
                 endpoint(primary, "metadata"),
                 endpoint(primary, "targets"),
                 seed_cache,
-                seed.public,
+                seed.trust,
                 endpoint(seed_mirror, "metadata"),
                 endpoint(seed_mirror, "targets"),
             ),
@@ -3254,7 +3297,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         mirror_release::prune_payloads(
             cache,
             "seed",
-            &seed.public,
+            &seed.trust,
             mirror_release::CacheRetention {
                 catalogs: &[],
                 images,
@@ -3272,7 +3315,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
         metadata.as_str(),
         targets.as_str(),
         "seed",
-        &seed.public,
+        &seed.trust,
     )?;
     assert_eq!(fs::read_to_string(full.join("current"))?, current);
     assert_eq!(fs::read(full.join(&blob))?, b"old");
@@ -3299,7 +3342,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
             .unwrap()
             .as_str(),
         "seed",
-        &seed.public,
+        &seed.trust,
     )?;
     let orphan = digest(b"unreferenced");
     let orphan_path = seed_cache.join("blobs").join(&orphan);
@@ -3376,7 +3419,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
             .unwrap()
             .as_str(),
         "canopa",
-        &f.public,
+        &f.trust,
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("managed by repo sync-profile"));
@@ -3406,7 +3449,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
             .contains("bound to a different release profile or companion cache set")
     );
     let builder = Fixture::new()?;
-    let seed_key = format!("    trust-key {:?}", seed.public);
+    let seed_key = format!("    trust-root {:?}", seed.trust);
     fs::write(
         &config,
         correct_config.replace(
@@ -3562,7 +3605,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     mirror_release::export_with_retained(
         &f.repo,
         "canopa",
-        &f.public,
+        &f.trust,
         &archive,
         &[first.trim().to_owned()],
     )?;
@@ -3578,7 +3621,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     mirror_release::export_with_retained(
         &seed.repo,
         "seed",
-        &seed.public,
+        &seed.trust,
         &archive,
         &[previous.trim().to_owned()],
     )?;
@@ -3667,7 +3710,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
             .unwrap()
             .as_str(),
         "seed",
-        &seed.public,
+        &seed.trust,
     )?;
     assert!(prune_seed(&cold_seed, &[], true)?.blobs.is_empty());
     fs::rename(&archive_primary, work.join("offline-archive-primary"))?;
@@ -3744,7 +3787,7 @@ fn automatic_payload_pruning_keeps_cached_versions_and_registered_roots() -> Res
                 .unwrap()
                 .as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
             mirror_release::SyncOptions {
                 index_only,
                 image: None,
@@ -3760,7 +3803,7 @@ fn automatic_payload_pruning_keeps_cached_versions_and_registered_roots() -> Res
         )
     };
     let install = |root, version| -> Result<()> {
-        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        create_image(root, &cache, "canopa", &f.trust, "x86_64", BTreeMap::new())?;
         let plan = plan(
             root,
             Request::Install {
@@ -3861,7 +3904,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
                 .unwrap()
                 .as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )?;
         Ok(mirror)
     };
@@ -3869,7 +3912,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
         mirror_release::prune_payloads(
             &cache,
             "canopa",
-            &f.public,
+            &f.trust,
             mirror_release::CacheRetention {
                 catalogs,
                 images,
@@ -3890,7 +3933,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     let old_catalog = fs::read_to_string(cache.join("current"))?.trim().to_owned();
     let installed = work.join("installed");
     for root in [&installed, &f.root] {
-        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        create_image(root, &cache, "canopa", &f.trust, "x86_64", BTreeMap::new())?;
     }
     assert_eq!(crate::query::search_files(&installed, COMPOSITOR)?.len(), 1);
     let request = Request::Install {
@@ -3904,8 +3947,8 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     fs::write(
         &pending_config,
         format!(
-            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n repository {cache:?}\n trust-key {:?}\n build-trust {{ builder-key {:?}; }}\n}}\n",
-            f.public, builder.public,
+            "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" {{\n repository {cache:?}\n trust-root {:?}\n build-trust {{ builder-key {:?}; }}\n}}\n",
+            f.trust, builder.public,
         ),
     )?;
     create_configured_image(&pending, &pending_config)?;
@@ -3949,7 +3992,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     let report = mirror_release::prune_payloads_with_locks(
         &cache,
         "canopa",
-        &f.public,
+        &f.trust,
         mirror_release::CacheRetention {
             catalogs: &[],
             images: &[],
@@ -3963,7 +4006,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     let report = mirror_release::prune_with_registered_roots(
         &cache,
         "canopa",
-        &f.public,
+        &f.trust,
         mirror_release::CacheRetention {
             catalogs: &[],
             images: &[],
@@ -4012,9 +4055,14 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     assert_eq!(fs::read_to_string(cache.join("current"))?, current);
     assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, current);
     assert_eq!(
-        snapshot(&cache, "canopa", &read_key(&f.public)?, Some(&old_catalog))?
-            .packages
-            .len(),
+        snapshot(
+            &cache,
+            "canopa",
+            &read_trust_root(&f.trust)?,
+            Some(&old_catalog)
+        )?
+        .packages
+        .len(),
         1
     );
 
@@ -4033,7 +4081,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
 
     let provision_archive = |repo: &Path, pin: &str, name: &str| -> Result<(PathBuf, PathBuf)> {
         let targets = work.join(format!("{name}-targets"));
-        mirror_release::export_archive(repo, "canopa", &f.public, &targets, pin, false)?;
+        mirror_release::export_archive(repo, "canopa", &f.trust, &targets, pin, false)?;
         let mirror = work.join(format!("{name}-mirror"));
         sign_export(&targets, &mirror, 1, fresh, &anchor, &tuf_key)?;
         let archive = work.join(name);
@@ -4048,7 +4096,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
                     .unwrap()
                     .as_str(),
                 "canopa",
-                &f.public,
+                &f.trust,
                 mirror_release::ArchiveSyncOptions {
                     catalog: pin,
                     index_only: true
@@ -4075,6 +4123,9 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
             "schema-version 1 kind=\"package-manifest\"\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}}}\n"
         ),
     )?;
+    // The same keys sign a different history.
+    fs::create_dir_all(fork.join("trust"))?;
+    fs::copy(f.repo.join("trust/1.json"), fork.join("trust/1.json"))?;
     publish(&fork, &f.proto, &f.recipe, &f.private)?;
     let fork_pin = fs::read_to_string(fork.join("current"))?;
     let (_, fork_cache) = provision_archive(&fork, fork_pin.trim(), "fork-cache")?;
@@ -4126,7 +4177,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
                 .unwrap()
                 .as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )?,
         current.trim()
     );
@@ -4135,7 +4186,7 @@ fn tuf_payload_pruning_preserves_saved_plans_and_offline_repairs() -> Result<()>
     let old_manifest = snapshot(
         &archive,
         "canopa",
-        &read_key(&f.public)?,
+        &read_trust_root(&f.trust)?,
         Some(&old_catalog),
     )?
     .packages
@@ -4207,13 +4258,7 @@ fn image_rejects_catalog_replay_and_retired_signer_forks_without_cache_history()
     f.package("test/fork", "2.0.0-0", String::new())?;
     let higher_fork = fs::read_to_string(&current)?;
     fs::write(&current, &first)?;
-    let rotated = rotate_publisher_key(
-        &f.repo,
-        "canopa",
-        first.trim(),
-        &f.private,
-        &rotated_key.private,
-    )?;
+    let rotated = rotate_catalog_key(&f.repo, "canopa", first.trim(), &f.private, &rotated_key)?;
 
     let install = plan(&f.root, request.clone())?;
     interrupt_apply_at(
@@ -4233,7 +4278,7 @@ fn image_rejects_catalog_replay_and_retired_signer_forks_without_cache_history()
         (&equal_fork, "publisher catalog rollback or fork"),
         (
             &higher_fork,
-            "release drops or changes the publisher key history",
+            "release drops or changes the publisher trust root history",
         ),
     ] {
         fs::write(&current, rejected)?;
@@ -4311,9 +4356,9 @@ publisher "canopa" {{
             r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            f.repo, f.public,
+            f.repo, f.trust,
         ),
     )?;
     create_configured_image(&f.root, &config)?;
@@ -4349,7 +4394,7 @@ publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
             let (checkpoint, _) = crate::repo::release_profile(
                 &f.repo,
                 "canopa",
-                &read_key(&f.public)?,
+                &read_trust_root(&f.trust)?,
                 None,
                 "desktop",
             )?;
@@ -4529,14 +4574,14 @@ publisher "canopa" {{
         package "desktop/base"
         publisher "seed" catalog={:?} {{
             repository {:?}
-            trust-key {:?}
+            trust-root {:?}
         }}
     }}
 }}
 "#,
                 pin.trim(),
                 seed.repo,
-                seed.public,
+                seed.trust,
             ),
         )?;
         let release = f._dir.path().join("refresh.kdl");
@@ -4564,10 +4609,10 @@ publisher "canopa" {{
             r#"schema-version 1 kind="image-config"
 architecture "x86_64"
 release-profile "desktop"
-publisher "canopa" {{ repository {:?}; trust-key {:?}; }}
-publisher "seed" {{ repository {:?}; trust-key {:?}; }}
+publisher "canopa" {{ repository {:?}; trust-root {:?}; }}
+publisher "seed" {{ repository {:?}; trust-root {:?}; }}
 "#,
-            f.repo, f.public, seed.repo, seed.public,
+            f.repo, f.trust, seed.repo, seed.trust,
         ),
     )?;
     let plain = f._dir.path().join("plain");
@@ -4575,7 +4620,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
         &plain,
         &seed.repo,
         "seed",
-        &seed.public,
+        &seed.trust,
         "x86_64",
         BTreeMap::new(),
     )?;
@@ -4628,7 +4673,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
             &cached,
             seed_branch.trim(),
             "seed",
-            &read_key(&seed.public)?,
+            &read_trust_root(&seed.trust)?,
         )?
         .sequence();
         let db = rusqlite::Connection::open(f.root.join("var/lib/cps/image/state.sqlite"))?;
@@ -4690,7 +4735,7 @@ publisher "seed" {{ repository {:?}; trust-key {:?}; }}
     assert!(format!("{error:#}").contains(reason), "{error:#}");
     let extras = Fixture::new()?;
     extras.package_as("extras", "apps/extra", "1.0.0-0", String::new())?;
-    crate::add_publisher(&f.root, "extras", &extras.repo, &extras.public)?;
+    crate::add_publisher(&f.root, "extras", &extras.repo, &extras.trust)?;
     check_guarded_sync(&f, &seed, &plain, [&good_primary, &good_seed], reason)?;
 
     for (source, (_, replacement)) in [&f.repo, &seed.repo].into_iter().zip(&replacements) {
@@ -4766,7 +4811,7 @@ fn check_guarded_sync(
             endpoint(mirror, "metadata").as_str(),
             endpoint(mirror, "targets").as_str(),
             "seed",
-            &seed.public,
+            &seed.trust,
             mirror_release::SyncOptions {
                 index_only: true,
                 image: Some(plain),
@@ -4787,11 +4832,11 @@ fn check_guarded_sync(
         let mut document =
             "schema-version 1 kind=\"image-config\"\narchitecture \"x86_64\"\nrelease-profile \"desktop\"\n".to_owned();
         for (name, repo, key, mirror) in [
-            ("canopa", &primary_cache, &primary.public, primary_mirror),
-            ("seed", &seed_cache, &seed.public, seed_mirror),
+            ("canopa", &primary_cache, &primary.trust, primary_mirror),
+            ("seed", &seed_cache, &seed.trust, seed_mirror),
         ] {
             document.push_str(&format!(
-                "publisher {name:?} {{ repository {repo:?}; trust-key {key:?}; }}\n"
+                "publisher {name:?} {{ repository {repo:?}; trust-root {key:?}; }}\n"
             ));
             document.push_str(&format!(
                 "mirror {name:?} root={anchor:?} metadata={:?} targets={:?}\n",
@@ -4811,7 +4856,7 @@ fn check_guarded_sync(
     mirror_release::export_with_retained(
         &seed.repo,
         "seed",
-        &seed.public,
+        &seed.trust,
         &export,
         &[seed_fork.trim().to_owned()],
     )?;
@@ -4902,7 +4947,7 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
                 .unwrap()
                 .as_str(),
             publisher,
-            &fixture.public,
+            &fixture.trust,
             mirror_release::SyncOptions {
                 index_only: true,
                 image: None,
@@ -4935,7 +4980,7 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
     let latest_catalog = mirror_release::export_with_retained(
         &tools.repo,
         "tools",
-        &tools.public,
+        &tools.trust,
         &export,
         std::slice::from_ref(&tools_pin),
     )?;
@@ -4956,8 +5001,8 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
          publisher \"tools\" catalog={tools_pin:?} key-sha256={:?}\n\
          package \"cps://tools/build/compiler@1.0.0-0\"\n }}\n\
          manifest \"manifest.kdl\" sha256={:?}\n script \"exit 1\"\n}}\n",
-            digest(&read_key(&primary.public)?),
-            digest(&read_key(&tools.public)?),
+            digest(&read_trust_root(&primary.trust)?),
+            digest(&read_trust_root(&tools.trust)?),
             digest(b"reviewed manifest"),
         ),
     )?;
@@ -4967,9 +5012,9 @@ fn fetch_toolchain_uses_retained_catalogs_and_only_fetches_selected_payloads() -
             &config,
             format!(
                 "schema-version 1 kind=\"toolchain-config\"\n\
-             publisher \"canopa\" {{ repository {primary_cache:?}; trust-key {:?}; }}\n\
-             publisher \"tools\" {{ repository {tools_cache:?}; trust-key {:?}; {policy} }}\n",
-                primary.public, tools.public,
+             publisher \"canopa\" {{ repository {primary_cache:?}; trust-root {:?}; }}\n\
+             publisher \"tools\" {{ repository {tools_cache:?}; trust-root {:?}; {policy} }}\n",
+                primary.trust, tools.trust,
             ),
         )
     };
@@ -5047,7 +5092,7 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
     let error = mirror_release::export_archive(
         &fixture.repo,
         "canopa",
-        &fixture.public,
+        &fixture.trust,
         &rejected,
         &fork,
         false,
@@ -5067,7 +5112,7 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
         mirror_release::export_archive(
             &fixture.repo,
             "canopa",
-            &fixture.public,
+            &fixture.trust,
             &targets,
             &pin,
             false
@@ -5099,7 +5144,7 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
             endpoint(mirror, "metadata").as_str(),
             endpoint(mirror, "targets").as_str(),
             "canopa",
-            &fixture.public,
+            &fixture.trust,
         )
     };
     let sync_archive = |cache: &Path, mirror: &Path, catalog: &str| {
@@ -5109,7 +5154,7 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
             endpoint(mirror, "metadata").as_str(),
             endpoint(mirror, "targets").as_str(),
             "canopa",
-            &fixture.public,
+            &fixture.trust,
             mirror_release::ArchiveSyncOptions {
                 catalog,
                 index_only: true,
@@ -5144,7 +5189,7 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
             "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
          toolchain solver=\"sat-v2\" {{ publisher \"canopa\" catalog={pin:?} key-sha256={:?}; package \"build/compiler\"; }}\n\
          manifest \"manifest.kdl\" sha256={:?}\n script \"exit 1\"\n}}\n",
-            digest(&read_key(&fixture.public)?),
+            digest(&read_trust_root(&fixture.trust)?),
             digest(b"reviewed manifest"),
         ),
     )?;
@@ -5152,8 +5197,8 @@ fn archive_mirror_provisions_a_withdrawn_toolchain_without_a_live_pointer() -> R
     fs::write(
         &config,
         format!(
-            "schema-version 1 kind=\"toolchain-config\"\npublisher \"canopa\" {{ repository {archive_cache:?}; trust-key {:?}; }}\n",
-            fixture.public,
+            "schema-version 1 kind=\"toolchain-config\"\npublisher \"canopa\" {{ repository {archive_cache:?}; trust-root {:?}; }}\n",
+            fixture.trust,
         ),
     )?;
     let blob = archive_cache.join("blobs").join(digest(payload.as_bytes()));
@@ -5202,11 +5247,11 @@ fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Resu
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     let create = |root: &Path| -> Result<()> {
-        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        create_image(root, &cache, "canopa", &f.trust, "x86_64", BTreeMap::new())?;
         Ok(())
     };
     let install = |root: &Path| {
@@ -5230,24 +5275,17 @@ fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Resu
     create(&historical)?;
     let saved = install(&historical)?;
 
-    let rotated =
-        rotate_publisher_key(&f.repo, "canopa", &initial, &f.private, &second_key.private)?;
+    let rotated = rotate_catalog_key(&f.repo, "canopa", &initial, &f.private, &second_key)?;
     let current = f.repo.join("current");
     assert_eq!(fs::read_to_string(&current)?.trim(), rotated);
-    let error = rotate_publisher_key(
-        &f.repo,
-        "canopa",
-        &initial,
-        &second_key.private,
-        &third_key.private,
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("rotation base is stale"));
+    let error =
+        crate::resign_catalog(&f.repo, "canopa", &second_key.private, &initial).unwrap_err();
+    assert!(error.to_string().contains("re-signing base is stale"));
     let error = publish(&f.repo, &f.proto, &f.recipe, &f.private).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("signing key is not the current publisher key")
+            .contains("a signing key is not a catalog key of trust root version 2")
     );
 
     let actions = f.file(COMPOSITOR, "new", "0755", "")?;
@@ -5273,29 +5311,36 @@ fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Resu
     // Simulate the retired signer creating a higher-sequence fork and getting
     // it wrapped in fresh TUF metadata. The publisher checkpoint must win.
     fs::write(&current, format!("{initial}\n"))?;
-    for version in ["1.0.0-0", "2.0.0-0", "3.0.0-0"] {
-        f.package("test/fork", version, String::new())?;
-    }
+    with_revoked_history(&f.repo, 1, || {
+        for version in ["1.0.0-0", "2.0.0-0", "3.0.0-0"] {
+            f.package("test/fork", version, String::new())?;
+        }
+        Ok(())
+    })?;
     let fork = sign(3)?;
     fs::write(&current, &second)?;
     let error = refresh(&cache, &fork).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("drops or changes the publisher key history")
+            .contains("drops or changes the publisher trust root history")
     );
     assert_eq!(fs::read_to_string(cache.join(".tuf/catalog"))?, second);
 
-    let latest = rotate_publisher_key(
+    // Only the root key can rotate the trust root; a catalog key cannot.
+    let error = rotate_catalog_key(
         &f.repo,
         "canopa",
         second.trim(),
         &second_key.private,
-        &third_key.private,
-    )?;
-    let error = rotate_publisher_key(&f.repo, "canopa", &latest, &third_key.private, &f.private)
-        .unwrap_err();
-    assert!(error.to_string().contains("publisher key was already used"));
+        &third_key,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("unauthorized key"),
+        "{error:#}"
+    );
+    let latest = rotate_catalog_key(&f.repo, "canopa", second.trim(), &f.private, &third_key)?;
     assert_eq!(fs::read_to_string(&current)?.trim(), latest);
     let newest = sign(4)?;
     assert_eq!(refresh(&cache, &newest)?, latest);
@@ -5339,12 +5384,12 @@ fn tuf_obsoletion_removes_only_when_dependencies_allow_and_preserves_history() -
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     let create = |root: &Path| -> Result<()> {
-        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
-        crate::add_publisher(root, "extras", &extras.repo, &extras.public)
+        create_image(root, &cache, "canopa", &f.trust, "x86_64", BTreeMap::new())?;
+        crate::add_publisher(root, "extras", &extras.repo, &extras.trust)
     };
     let install = |root: &Path, package: &str| {
         plan(
@@ -5395,8 +5440,8 @@ fn tuf_obsoletion_removes_only_when_dependencies_allow_and_preserves_history() -
     );
     let retired = retire(CUTOFF)?;
     assert_eq!(sync(2)?, retired);
-    assert_eq!(list_obsoletions(&cache, "canopa", &f.public)?, [CUTOFF]);
-    assert!(list_withdrawals(&cache, "canopa", &f.public)?.contains_key(OLD));
+    assert_eq!(list_obsoletions(&cache, "canopa", &f.trust)?, [CUTOFF]);
+    assert!(list_withdrawals(&cache, "canopa", &f.trust)?.contains_key(OLD));
     let error = plan(&f.root, Request::Update).unwrap_err();
     assert!(format!("{error:#}").contains(NAME));
     assert_eq!(fs::read_to_string(f.root.join(LIBRARY))?, "legacy");
@@ -5465,7 +5510,7 @@ fn tuf_obsoletion_removes_only_when_dependencies_allow_and_preserves_history() -
     sync(4)?;
     apply(&skipped, &plan(&skipped, Request::Update)?)?;
     assert_eq!(fs::read_to_string(skipped.join(LIBRARY))?, "revived");
-    assert_eq!(list_obsoletions(&cache, "canopa", &f.public)?, [CUTOFF]);
+    assert_eq!(list_obsoletions(&cache, "canopa", &f.trust)?, [CUTOFF]);
     Ok(())
 }
 
@@ -5580,13 +5625,13 @@ publisher "canopa" {{
         package "desktop/session"
         publisher "seed" catalog="{pin}" {{
             repository {:?}
-            trust-key {:?}
+            trust-root {:?}
             {build_trust}
         }}
     }}
 }}
 "#,
-                seed.repo, seed.public,
+                seed.repo, seed.trust,
             ),
         )?;
         let release = f._dir.path().join("refresh.kdl");
@@ -5610,14 +5655,14 @@ architecture "x86_64"
 release-profile "desktop"
 publisher "canopa" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 publisher "seed" {{
     repository {:?}
-    trust-key {:?}
+    trust-root {:?}
 }}
 "#,
-            f.repo, f.public, seed.repo, seed.public,
+            f.repo, f.trust, seed.repo, seed.trust,
         ),
     )?;
     create_configured_image(&f.root, &config)?;
@@ -5773,7 +5818,7 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
 
@@ -5788,7 +5833,7 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
         &f.root,
         &cache,
         "canopa",
-        &f.public,
+        &f.trust,
         "x86_64",
         BTreeMap::new(),
     )?;
@@ -5864,10 +5909,7 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
     assert_eq!(refresh(&second)?, upgraded);
     assert_eq!(fs::read(&cached_blob)?, b"new");
     assert_eq!(digest(&fs::read(&cached_catalog)?), upgraded);
-    assert_eq!(
-        read_attestation(&cache, "canopa", &f.public, &id)?,
-        envelope
-    );
+    assert_eq!(read_attestation(&cache, "canopa", &f.trust, &id)?, envelope);
 
     // The earlier plan still pins a verified catalog after the cache advances.
     apply(&f.root, &install)?;
@@ -5916,7 +5958,7 @@ fn tuf_cache_rejects_corruption_replay_and_expiry() -> Result<()> {
         let error = mirror_release::prune_payloads(
             &cache,
             "canopa",
-            &f.public,
+            &f.trust,
             mirror_release::CacheRetention::default(),
             true,
         )
@@ -5958,11 +6000,11 @@ fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()>
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     let create = |root: &Path, cache: &Path| {
-        create_image(root, cache, "canopa", &f.public, "x86_64", BTreeMap::new())
+        create_image(root, cache, "canopa", &f.trust, "x86_64", BTreeMap::new())
     };
     let install = |root: &Path, package: &str| {
         plan(
@@ -5989,7 +6031,7 @@ fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()>
     sign_release(&f, &original, 1, fresh, &anchor, &tuf_key)?;
     sign_release(&f, &resurrected, 3, fresh, &anchor, &tuf_key)?;
     let original_hash = refresh(&cache, &original)?;
-    let key = read_key(&f.public)?;
+    let key = read_trust_root(&f.trust)?;
     let published = snapshot(&cache, "canopa", &key, Some(&original_hash))?;
     let retired = published
         .packages
@@ -6023,7 +6065,7 @@ fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()>
         withdrawn_pointer
     );
     assert_eq!(
-        read_attestation(&f.repo, "canopa", &f.public, &id)?,
+        read_attestation(&f.repo, "canopa", &f.trust, &id)?,
         envelope
     );
 
@@ -6033,13 +6075,10 @@ fn tuf_withdrawal_keeps_cached_recovery_and_rejects_resurrection() -> Result<()>
     assert_eq!(withdrawn_hash, withdrawn_pointer.trim());
     assert_eq!(refresh(&cache, &withdrawn)?, withdrawn_hash);
     assert_eq!(
-        list_withdrawals(&cache, "canopa", &f.public)?,
+        list_withdrawals(&cache, "canopa", &f.trust)?,
         BTreeMap::from([(id.clone(), retired.sha256.clone())])
     );
-    assert_eq!(
-        read_attestation(&cache, "canopa", &f.public, &id)?,
-        envelope
-    );
+    assert_eq!(read_attestation(&cache, "canopa", &f.trust, &id)?, envelope);
 
     let new_cache = work.join("new-cache");
     assert_eq!(refresh(&new_cache, &withdrawn)?, withdrawn_hash);
@@ -6113,7 +6152,7 @@ fn tuf_cache_remembers_a_newer_publisher_catalog_after_a_failed_download() -> Re
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     let sign =
@@ -6207,12 +6246,12 @@ fn tuf_delta_fetch_reconstructs_from_installed_files_and_falls_back() -> Result<
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     sync(&mirror)?;
     for root in [&f.root, &second_image] {
-        create_image(root, &cache, "canopa", &f.public, "x86_64", BTreeMap::new())?;
+        create_image(root, &cache, "canopa", &f.trust, "x86_64", BTreeMap::new())?;
         let install = plan(
             root,
             Request::Install {
@@ -6232,7 +6271,7 @@ fn tuf_delta_fetch_reconstructs_from_installed_files_and_falls_back() -> Result<
     mirror_release::export_with_deltas(
         &f.repo,
         "canopa",
-        &f.public,
+        &f.trust,
         &export,
         &[],
         false,
@@ -6312,7 +6351,7 @@ fn tuf_delta_fetch_upgrades_files_larger_than_64_mib() -> Result<()> {
     mirror_release::export_with_deltas(
         &f.repo,
         "canopa",
-        &f.public,
+        &f.trust,
         &export,
         &[],
         false,
@@ -6336,7 +6375,7 @@ fn tuf_delta_fetch_upgrades_files_larger_than_64_mib() -> Result<()> {
         metadata.as_str(),
         targets.as_str(),
         "canopa",
-        &f.public,
+        &f.trust,
     )?;
     crate::set_publisher_repositories(&f.root, &[("canopa".to_owned(), cache)])?;
     let upgrade = plan(&f.root, Request::Update)?;
@@ -6367,7 +6406,7 @@ fn tuf_full_sync_checks_compressed_payloads_before_caching() -> Result<()> {
         "1.0.0-0",
         f.file(COMPOSITOR, &program, "0755", "")? + &f.file(MANPAGE, "short", "0644", "")?,
     )?;
-    let catalog = mirror_release::export(&f.repo, "canopa", &f.public, &export)?;
+    let catalog = mirror_release::export(&f.repo, "canopa", &f.trust, &export)?;
     assert!(!export.join(format!("blobs-{hash}")).exists());
     assert!(!export.join(format!("blobs-{small_hash}.zst")).exists());
     assert_eq!(
@@ -6387,7 +6426,7 @@ fn tuf_full_sync_checks_compressed_payloads_before_caching() -> Result<()> {
             metadata.as_str(),
             targets.as_str(),
             "canopa",
-            &f.public,
+            &f.trust,
         )
     };
     let good = work.join("good");
@@ -6505,7 +6544,7 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
         metadata.as_str(),
         targets.as_str(),
         "canopa",
-        &f.public,
+        &f.trust,
     )?;
     let extra_metadata = Url::from_directory_path(extra_mirror.join("metadata")).unwrap();
     let extra_targets = Url::from_directory_path(extra_mirror.join("targets")).unwrap();
@@ -6515,7 +6554,7 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
         extra_metadata.as_str(),
         extra_targets.as_str(),
         "extras",
-        &extras.public,
+        &extras.trust,
     )?;
     assert_eq!(fs::read_dir(cache.join("blobs"))?.count(), 0);
     assert_eq!(fs::read_dir(extra_cache.join("blobs"))?.count(), 0);
@@ -6523,11 +6562,11 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
         &f.root,
         &cache,
         "canopa",
-        &f.public,
+        &f.trust,
         "x86_64",
         BTreeMap::from([("doc.man".into(), false)]),
     )?;
-    crate::add_publisher(&f.root, "extras", &extra_cache, &extras.public)?;
+    crate::add_publisher(&f.root, "extras", &extra_cache, &extras.trust)?;
     let install = plan(
         &f.root,
         Request::Install {
@@ -6573,7 +6612,7 @@ fn tuf_index_and_plan_fetch_support_offline_apply_and_repair() -> Result<()> {
         extra_metadata.as_str(),
         extra_targets.as_str(),
         "extras",
-        &extras.public,
+        &extras.trust,
     )?;
     fs::rename(&extra_cache, work.join("old-extras-cache"))?;
     crate::set_publisher_repositories(&f.root, &[("extras".to_owned(), replacement.clone())])?;
@@ -6642,7 +6681,7 @@ fn batched_publications_sign_once_and_rewrite_only_changed_shards() -> Result<()
         .to_owned();
     assert_eq!(object_count(&f.repo, "catalogs")?, 1);
     let shards = object_count(&f.repo, crate::repo::SHARD_OBJECTS)?;
-    let key = read_key(&f.public)?;
+    let key = read_trust_root(&f.trust)?;
     let catalog = crate::repo::read_catalog(&f.repo, &first, "canopa", &key)?;
     assert_eq!(catalog.sequence(), 1);
     assert!(shards > 1 && shards <= names.len());
@@ -6724,7 +6763,7 @@ fn planning_reads_manifests_only_for_the_selected_packages() -> Result<()> {
     for number in 0..16 {
         f.package(&format!("tools/unused-{number}"), "1.0.0-0", String::new())?;
     }
-    let key = read_key(&f.public)?;
+    let key = read_trust_root(&f.trust)?;
     let unused = snapshot(&f.repo, "canopa", &key, None)?
         .packages
         .into_iter()
@@ -6787,8 +6826,8 @@ fn withdrawal_pruning_keeps_pins_installed_packages_and_identities() -> Result<(
     let withdrawn = fs::read_to_string(f.repo.join("current"))?
         .trim()
         .to_owned();
-    assert_eq!(list_withdrawals(&f.repo, "canopa", &f.public)?.len(), 2);
-    let key = read_key(&f.public)?;
+    assert_eq!(list_withdrawals(&f.repo, "canopa", &f.trust)?.len(), 2);
+    let key = read_trust_root(&f.trust)?;
     let sequence = crate::repo::read_catalog(&f.repo, &withdrawn, "canopa", &key)?.sequence();
 
     let error =
@@ -6802,7 +6841,7 @@ fn withdrawal_pruning_keeps_pins_installed_packages_and_identities() -> Result<(
         crate::prune_withdrawals(&f.repo, "canopa", &f.private, &withdrawn, sequence - 1)?;
     assert_eq!(count, 1);
     assert_eq!(
-        list_withdrawals(&f.repo, "canopa", &f.public)?
+        list_withdrawals(&f.repo, "canopa", &f.trust)?
             .into_keys()
             .collect::<Vec<_>>(),
         ["cps://canopa/apps/other@1.0.0-0"]

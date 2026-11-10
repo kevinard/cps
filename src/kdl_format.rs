@@ -712,7 +712,7 @@ pub(crate) struct BuildTrustConfig {
 impl BuildTrustConfig {
     pub(crate) fn load(&self, publisher_key: &[u8]) -> Result<BuildTrust> {
         let trust = BuildTrust::load(self.minimum_builders, &self.keys)?;
-        trust.check_publisher_key(publisher_key)?;
+        trust.check_publisher_trust(publisher_key)?;
         Ok(trust)
     }
 }
@@ -761,7 +761,7 @@ fn publisher_config(node: &KdlNode, name: String, parent: &Path) -> Result<Publi
         .children()
         .context("publisher requires a configuration block")?;
     let repo = Fields::read(one(children, "repository")?, 1, &[], false)?.string_arg(0)?;
-    let key = Fields::read(one(children, "trust-key")?, 1, &[], false)?.string_arg(0)?;
+    let key = Fields::read(one(children, "trust-root")?, 1, &[], false)?.string_arg(0)?;
     let build_trust = children
         .nodes()
         .iter()
@@ -770,7 +770,7 @@ fn publisher_config(node: &KdlNode, name: String, parent: &Path) -> Result<Publi
         .transpose()?;
     ensure!(
         children.nodes().len() == 2 + usize::from(build_trust.is_some()),
-        "expected repository, trust-key, and optional build-trust under publisher"
+        "expected repository, trust-root, and optional build-trust under publisher"
     );
     Ok(PublisherConfig {
         name,
@@ -1116,7 +1116,7 @@ mod tests {
             schema-version 1 kind="image-config"
             publisher "canopa" {
                 repository "../repo"
-                trust-key "/etc/keys/canopa.der"
+                trust-root "/etc/keys/canopa.trust.json"
             }
             architecture "aarch64"
             cache-keep-versions 2
@@ -1136,7 +1136,7 @@ mod tests {
         );
         assert_eq!(
             parsed.publishers[0].trust_key,
-            Path::new("/etc/keys/canopa.der")
+            Path::new("/etc/keys/canopa.trust.json")
         );
         assert_eq!(parsed.arch, "aarch64");
         assert_eq!(parsed.cache_keep_versions, Some(2));
@@ -1179,7 +1179,7 @@ mod tests {
 
     #[test]
     fn refresh_policies_default_to_failing_and_bound_deferral() -> Result<()> {
-        let header = "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" { repository \"repo\"; trust-key \"key.der\"; }\n";
+        let header = "schema-version 1 kind=\"image-config\"\npublisher \"canopa\" { repository \"repo\"; trust-root \"trust.json\"; }\n";
         let parsed = parse_image_config(
             &format!(
                 "{header}refresh-policy \"extras\" on-unavailable=\"defer\" max-staleness-hours=72\nrefresh-policy \"tools\" on-unavailable=\"fail\"\n"
@@ -1218,7 +1218,7 @@ mod tests {
             schema-version 1 kind="image-config"
             publisher "canopa" {
                 repository "../repo"
-                trust-key "/etc/keys/canopa.der"
+                trust-root "/etc/keys/canopa.trust.json"
             }
         "#;
         let node = r#"boot-btrfs volume="/cps" environments="/cps/@environments" esp="/efi""#;

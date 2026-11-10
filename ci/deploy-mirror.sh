@@ -21,7 +21,7 @@ cps=${CPS_BIN:?Set CPS_BIN to the built CPS executable}
 mirror=$(realpath -e -- "${CPS_MIRROR_DIR:?Set CPS_MIRROR_DIR to the HTTPS document directory}")
 bootstrap_root=$(realpath -e -- "${CPS_MIRROR_TUF_ROOT:?Set CPS_MIRROR_TUF_ROOT to the original signed TUF root JSON}")
 active_root=$(realpath -e -- "${CPS_MIRROR_TUF_ACTIVE_ROOT:-$bootstrap_root}")
-publisher_key=$(realpath -e -- "${CPS_MIRROR_PUBLISHER_KEY:?Set CPS_MIRROR_PUBLISHER_KEY to the publisher public DER key}")
+trust_root=$(realpath -e -- "${CPS_MIRROR_TRUST_ROOT:?Set CPS_MIRROR_TRUST_ROOT to the publisher trust root that clients pin}")
 keys=$(realpath -e -- "${CPS_MIRROR_TUF_KEYS:?Set CPS_MIRROR_TUF_KEYS to the TUF release keys directory}")
 [[ -d $mirror && $mirror != / && $repo != "$mirror" && $repo != "$mirror/"* && $mirror != "$repo/"* ]] ||
     fail 'Use a dedicated mirror directory separate from the publishing repository'
@@ -116,7 +116,7 @@ state_tmp=
 trap 'rm -rf -- "$stage"; if [[ -n $state_tmp ]]; then rm -f -- "$state_tmp"; fi' EXIT
 cp -- "$bootstrap_root" "$stage/bootstrap-root.json"
 cp -- "$active_root" "$stage/root.json"
-cp -- "$publisher_key" "$stage/publisher.der"
+cp -- "$trust_root" "$stage/trust-root.json"
 read_root_version() {
     local file=$1 number
     [[ $(stat -c %s -- "$file") -le 1048576 ]] || fail 'TUF root exceeds the CPS size limit'
@@ -166,7 +166,7 @@ verify_stage() {
     local metadata_dir=$1 targets_dir=$2 metadata_fd targets_fd
     exec {metadata_fd}< "$metadata_dir" {targets_fd}< "$targets_dir"
     "$cps" repo sync --repo "$stage/verified" --root "$stage/bootstrap-root.json" --publisher "$publisher" \
-        --trust-key "$stage/publisher.der" --metadata "file:///proc/self/fd/$metadata_fd/" \
+        --trust-root "$stage/trust-root.json" --metadata "file:///proc/self/fd/$metadata_fd/" \
         --targets "file:///proc/self/fd/$targets_fd/" --index-only --require-catalog "$catalog"
     exec {metadata_fd}<&- {targets_fd}<&-
     [[ $(read_root_version "$stage/verified/.tuf/trusted/root.json") == "$root_version" ]] ||
@@ -286,13 +286,13 @@ done
 role_keys objects
 signing+=("${role_args[@]}" --objects-threshold "$objects_threshold")
 
-"$cps" repo export --repo "$repo" --publisher "$publisher" --trust-key "$stage/publisher.der" \
+"$cps" repo export --repo "$repo" --publisher "$publisher" --trust-root "$stage/trust-root.json" \
     --output "$stage/export"
 [[ $(cat -- "$stage/export/current") == "$catalog" ]] || fail 'Exported a different catalog'
 
 jq -n --arg publisher "$publisher" --rawfile tuf_root "$stage/bootstrap-root.json" \
-    --arg trust_key "$(base64 -w0 -- "$stage/publisher.der")" \
-    '{schema_version: 1, kind: "publisher-bootstrap", publisher: $publisher, tuf_root: ($tuf_root | @base64), trust_key: $trust_key}' \
+    --arg trust_root "$(base64 -w0 -- "$stage/trust-root.json")" \
+    '{schema_version: 1, kind: "publisher-bootstrap", publisher: $publisher, tuf_root: ($tuf_root | @base64), trust_root: $trust_root}' \
     > "$stage/publisher.json"
 if [[ -e $mirror/publisher.json || -L $mirror/publisher.json ]]; then
     [[ -f $mirror/publisher.json && ! -L $mirror/publisher.json ]] &&

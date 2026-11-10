@@ -23,7 +23,7 @@ mkdir -p proto/usr/share/cps-demo
 printf 'Hello from Canopa\n' > proto/usr/share/cps-demo/hello
 
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher canopa --key private.der
 
 cat > hello.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
@@ -36,7 +36,7 @@ cat > image.kdl <<'CONFIG'
 schema-version 1 kind="image-config"
 publisher "canopa" {
     repository "repo"
-    trust-key "public.der"
+    trust-root "repo/trust/1.json"
 }
 CONFIG
 
@@ -51,9 +51,15 @@ cat image/usr/share/cps-demo/hello
 ```
 
 You should see `Hello from Canopa`. The temporary directory contains the
-prototype, throwaway signing keys, signed repository, saved plan, and
-installed image. The package manifest uses your UID and GID so CPS can
-install the file without elevated privileges.
+prototype, a throwaway signing key, the signed repository with its trust root,
+the saved plan, and the installed image. `repo trust init` made `private.der`
+both the only root key and the only catalog key of the trust root in
+`repo/trust/1.json`, which the image pins. A production publisher keeps its root
+keys offline and separate from its catalog keys, as described in
+[Publish and retire packages](publisher/publishing.md#publisher-trust-root).
+
+The package manifest uses your UID and GID so CPS can install the file
+without elevated privileges.
 
 - [Inspect the package and its ownership](client/queries.md)
 - [Update, remove, or repair a package in an image](client/images.md)

@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     Catalog, MANIFEST_LIMIT, exact_publisher, read_catalog, read_current, read_key, read_limited,
-    read_object, store, write_atomic,
+    read_object, read_trust_root, store, write_atomic,
 };
 
 pub(super) const OBJECTS: &str = "build-inputs";
@@ -131,7 +131,7 @@ pub fn export_rebuild_inputs(
     pin: Option<&str>,
     output: &Path,
 ) -> Result<PathBuf> {
-    let catalog = selected_catalog(repo, publisher, &read_key(trust_key)?, id, pin)?;
+    let catalog = selected_catalog(repo, publisher, &read_trust_root(trust_key)?, id, pin)?;
     let inputs = read_archived(repo, &catalog, id)?;
 
     let parent = output
@@ -207,7 +207,7 @@ pub fn verify_rebuild(
     bundle: &Path,
     witness_key: Option<&Path>,
 ) -> Result<usize> {
-    let anchor = read_key(trust_key)?;
+    let anchor = read_trust_root(trust_key)?;
     let catalog = selected_catalog(repo, publisher, &anchor, id, pin)?;
     let admitted = admitted_build(repo, &catalog, id)?;
     let bundle = Root::open(bundle)?;
@@ -236,7 +236,7 @@ pub fn verify_rebuild(
         let key = read_key(witness_key)?;
         ensure!(
             !catalog
-                .publisher_keys(&anchor)?
+                .publisher_keys()
                 .iter()
                 .any(|publisher| publisher.as_slice() == key),
             "publisher keys cannot serve as rebuild witnesses"

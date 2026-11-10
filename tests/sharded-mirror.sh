@@ -11,10 +11,11 @@ cd "$work"
 
 mkdir -p keys public proto
 export CPS_MIRROR_DIR=$work/public CPS_MIRROR_TUF_ROOT=$work/seed/root.json
-export CPS_MIRROR_TUF_KEYS=$work/keys CPS_MIRROR_PUBLISHER_KEY=$work/publisher.der
+export CPS_MIRROR_TUF_KEYS=$work/keys CPS_MIRROR_TRUST_ROOT=$work/trust-root.json
 unset CPS_MIRROR_TUF_ACTIVE_ROOT CPS_MIRROR_INITIAL_VERSION
 openssl genpkey -algorithm ED25519 -outform DER -out publisher-private.der
-openssl pkey -inform DER -in publisher-private.der -pubout -outform DER -out publisher.der
+"$CPS_BIN" repo trust init --repo repo --publisher canopa --key publisher-private.der >/dev/null
+cp repo/trust/1.json trust-root.json
 
 publish() {
     printf '%s\n' "$1" > proto/example
@@ -24,12 +25,12 @@ publish() {
 }
 
 publish 1
-"$CPS_BIN" repo export --repo repo --publisher canopa --trust-key publisher.der --output export
+"$CPS_BIN" repo export --repo repo --publisher canopa --trust-root trust-root.json --output export
 "$tuf_fixture" export seed 1
 for role in targets snapshot timestamp; do cp seed/fixture-key.der "keys/$role.pem"; done
 
 sync_mirror() {
-    "$CPS_BIN" repo sync --repo cache --root seed/root.json --publisher canopa --trust-key publisher.der \
+    "$CPS_BIN" repo sync --repo cache --root seed/root.json --publisher canopa --trust-root trust-root.json \
         --metadata "file://$work/public/metadata/" --targets "file://$work/public/targets/" \
         --require-catalog "$(cat repo/current)"
 }
@@ -37,7 +38,7 @@ for version in 1 2 3; do
     if [[ $version != 1 ]]; then publish "$version"; fi
     "$project/ci/deploy-mirror.sh" repo canopa "$(cat repo/current)"
     sync_mirror
-    jq -e '.signed.targets | keys == ["current", "publisher", "publisher.der"]' \
+    jq -e '.signed.targets | keys == ["current", "publisher", "trust-root.json"]' \
         "public/metadata/$version.targets.json"
     jq -e '.signed.meta | length == 17' "public/metadata/$version.snapshot.json"
 done
@@ -55,7 +56,7 @@ for filter in 'del(.format)' '.format = 2'; do
     cmp public/metadata/timestamp.json timestamp.json
 done
 cat signer-state.json > "$state"
-"$CPS_BIN" image-create --root image --repo cache --publisher canopa --trust-key publisher.der
+"$CPS_BIN" image-create --root image --repo cache --publisher canopa --trust-root trust-root.json
 "$CPS_BIN" plan --root image --output plan.json install example
 "$CPS_BIN" apply --root image plan.json
 grep -Fx 3 image/example

@@ -21,13 +21,13 @@ engine used to run the pinned image.
 
 Keep the signing host outside GitHub Actions. Install the reviewed CPS
 binary and release scripts on that host through a separate administrator
-process. Keep the publisher, online TUF, and release notes keys there,
+process. Keep the publisher catalog keys, online TUF keys, and release notes key there,
 outside the publishing repository and the public mirror. Each key can
 instead stay in a hardware token or KMS behind an
 [external signer](mirrors.md#release-keys-and-external-signers). Only
-releases need the publisher and TUF targets keys. The daily mirror refresh
+releases need the catalog and TUF targets keys. The daily mirror refresh
 needs only the timestamp key, and occasionally the snapshot key. The rehearsal
-runner needs a read-only copy of release objects and publisher public keys.
+runner needs a read-only copy of release objects and publisher trust roots.
 Give it no signing or deployment credentials, access to the signing host,
 or write access to its repository, release requests, scripts, or mirror.
 Retire the old `cps-release` Actions runner and remove the old signing
@@ -42,7 +42,7 @@ configuration. Use absolute paths for files and directories.
 | `CPS_BIN` | Installed and reviewed CPS binary |
 | `CPS_RELEASE_REPO` | Writable publishing repository |
 | `CPS_RELEASE_PUBLISHER` | Publisher name |
-| `CPS_RELEASE_SIGNING_KEY` | Private publisher key outside the publishing repository, or `command:DESCRIPTOR` for an external signer |
+| `CPS_RELEASE_SIGNING_KEY` | Catalog keys outside the publishing repository, one per line, enough to meet the trust root's catalog threshold. Each line is a private key path or `command:DESCRIPTOR` for an external signer |
 | `CPS_RELEASE_INPUTS` | Trusted parent directory of release requests |
 | `CPS_RELEASE_SOURCE_CACHE` | Optional source cache for release build bundles |
 | `CPS_RELEASE_ROLLOUT_GATE` | Administrator-installed cohort health adapter |
@@ -73,7 +73,7 @@ configuration. Use absolute paths for files and directories.
    a current base before it advances the production pointer and deploys.
    The rehearsal job's result informs this operator decision.
 
-Each named case contains an `image.kdl` using trusted publisher keys and the
+Each named case contains an `image.kdl` using pinned publisher trust roots and the
 intended profile and architecture. List any additional historical catalog
 digests in `baselines`, one per line. An optional executable
 `before-upgrade` receives the CPS binary, baseline root, baseline digest,
@@ -97,7 +97,7 @@ cohort's health. Exit 75 to wait for further observations.
 
 The deployment adapter receives the repository, publisher, and exact catalog
 digest. The bundled adapter exports and verifies that catalog, publishes
-`publisher.json` with its TUF root and publisher public key, and publishes
+`publisher.json` with its TUF root and the publisher trust root that clients pin, and publishes
 the new timestamp last. The release script records successful deployment in
 `.ci-deployed-catalog`. If deployment fails after local promotion, retry on
 the signing host with `bash ci/release.sh deploy-current CURRENT_SHA256`.
@@ -106,5 +106,11 @@ the catalog recorded as deployed. The adapter then re-signs only the mirror
 metadata that is about to expire and must not need the targets or publisher
 keys. The release script removes `CPS_RELEASE_SIGNING_KEY` from the
 adapter's environment in both cases.
+Keep the publisher's offline [root keys](publishing.md#publisher-trust-root)
+off the signing host. They are needed only to rotate, revoke, or renew the trust
+root, which you do with `cps repo trust rotate` or the detached `draft`, `sign`,
+and `commit` flow, followed by `cps repo resign` and a deployment. Renew the
+trust root well before its `expires` time: clients reject new current catalogs
+signed under an expired trust root, whatever their refresh policy.
 Run `bash tests/release-ci.sh` to exercise the split using disposable keys
 and test adapters.

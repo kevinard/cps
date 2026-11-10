@@ -4,7 +4,7 @@
 \&cps\-publish \- \&Publish manifests and their payloads to a local repository in one signed catalog update
 .SH SYNOPSIS
 .HP 4
-.B \&cps publish \-\-repo <REPO> \-\-proto <PROTO> \-\-signing\-key <SIGNING_KEY> <MANIFESTS>...
+.B \&cps publish \-\-repo <REPO> \-\-proto <PROTO> \-\-signing\-key <KEY> <MANIFESTS>...
 .SH ARGUMENTS
 .PP
 .B \&<MANIFESTS>...
@@ -13,8 +13,9 @@
 .B \&\-\-repo <REPO>
 .PP
 .B \&\-\-proto <PROTO>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .TP
 .B \&\-h, \-\-help
 \&Print help

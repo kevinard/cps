@@ -16,9 +16,15 @@ mkdir -m 700 -- "$output"
 work=$(mktemp -d "$output/.private.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 
+# KEY [REPOSITORY PUBLISHER] creates a key pair. With a repository, the key
+# also becomes the repository's 1-of-1 trust root, copied to KEY.trust.json.
 keypair() {
     openssl genpkey -algorithm ED25519 -outform DER -out "$work/$1.der"
     openssl pkey -inform DER -in "$work/$1.der" -pubout -outform DER -out "$1-public.der"
+    if [[ $# == 3 ]]; then
+        "$cps" repo trust init --repo "$2" --publisher "$3" --key "$work/$1.der" >/dev/null
+        cp -- "$2/trust/1.json" "$1.trust.json"
+    fi
 }
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 
@@ -83,10 +89,10 @@ python3 "$source_tree/tests/seed-cargo-cache.py" "$source_tree/Cargo.lock" "$reg
 tar --sort=name --format=gnu --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
     -C "$work" -cf - vendor | gzip -n > "$work/sources/vendor.tar.gz"
 
-keypair toolchain
+keypair toolchain toolchain seed
 keypair builder
-keypair release
-keypair runtime-seed
+keypair release repo canopa
+keypair runtime-seed runtime-seed canopa-runtime-seed
 bash "$source_tree/tests/seed-native-c.sh" "$work/native-rust" --rust
 # Preserve the worker's matched loader and C/GCC ABI as a separate signed
 # package that the sandbox and the installed CPS image both consume.
@@ -106,8 +112,8 @@ rm -f -- "$work/native-rust/usr/lib/ld-linux-x86-64.so.2"
 
 printf 'schema-version 1 kind="toolchain-config"\n' > bootstrap-toolchain.kdl
 pins="$work/publisher-pins"
-append_toolchain_publisher "$pins" bootstrap-toolchain.kdl seed toolchain toolchain-public.der
-append_toolchain_publisher "$pins" bootstrap-toolchain.kdl canopa-runtime-seed runtime-seed runtime-seed-public.der
+append_toolchain_publisher "$pins" bootstrap-toolchain.kdl seed toolchain toolchain.trust.json
+append_toolchain_publisher "$pins" bootstrap-toolchain.kdl canopa-runtime-seed runtime-seed runtime-seed.trust.json
 toolchain_recipe="$work/toolchain-recipe"
 write_toolchain_recipe() {
     {
@@ -146,7 +152,7 @@ if [[ -f $git_build_template ]]; then
     keypair git-build
     git_build_proto="$work/git-build-proto"
     bash "$source_tree/tests/seed-git-build.sh" "$cps" "$git_build_proto" \
-        "$work/git-build.der" "$output/git-build-public.der"
+        "$work/git-build.der"
     "$cps" manifest generate --proto "$git_build_proto" --publisher canopa --version "$git_build_version" \
         --architecture "$arch" --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
     git_build_archive="$work/sources/git-build.tar.gz"
@@ -177,7 +183,7 @@ d
     build_bundle bootstrap-toolchain.kdl "$library.build.kdl" "$library.bundle"
 done
 
-mkdir repo
+mkdir -p repo
 cp builder-public.der repo/
 sqlite_recipe=$(sha sqlite.build.kdl)
 seccomp_recipe=$(sha libseccomp.build.kdl)
@@ -196,7 +202,7 @@ write_profile() {
         }
         publisher "canopa-runtime-seed" catalog="$(cat runtime-seed/current)" {
             repository "../runtime-seed"
-            trust-key "../runtime-seed-public.der"
+            trust-root "../runtime-seed.trust.json"
         }
     }
 PROFILE
@@ -242,7 +248,7 @@ RELEASE
     --source-cache sources bootstrap-release.kdl
 bootstrap_catalog=$(cat repo/current)
 cp bootstrap-toolchain.kdl toolchain.kdl
-append_toolchain_publisher "$pins" toolchain.kdl canopa repo release-public.der
+append_toolchain_publisher "$pins" toolchain.kdl canopa repo release.trust.json
 write_toolchain_recipe "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"
 
 fixture_manifest "$cps_manifest" > cps.kdl
@@ -286,11 +292,11 @@ RELEASE
 } > release.kdl
 "$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
     --source-cache sources release.kdl
-"$cps" repo attestation --repo repo --publisher canopa --trust-key release-public.der \
+"$cps" repo attestation --repo repo --publisher canopa --trust-root release.trust.json \
     "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
 if [[ -n $archive_build_inputs ]]; then
-    recovered=$("$cps" repo rebuild-inputs --repo repo --publisher canopa --trust-key release-public.der \
+    recovered=$("$cps" repo rebuild-inputs --repo repo --publisher canopa --trust-root release.trust.json \
         --output reviewed-cps "$cps_package")
     cmp build.kdl "$recovered"
     cmp cps.kdl "$(dirname -- "$recovered")/cps.kdl"
@@ -302,11 +308,11 @@ release-profile "cps-runtime"
 facet "devel" #false
 publisher "canopa" {
     repository "repo"
-    trust-key "release-public.der"
+    trust-root "release.trust.json"
 }
 publisher "canopa-runtime-seed" {
     repository "runtime-seed"
-    trust-key "runtime-seed-public.der"
+    trust-root "runtime-seed.trust.json"
 }
 CONFIG
 "$cps" image-create --root image --config image.kdl
@@ -337,10 +343,10 @@ for library in libsqlite3.so.0 libseccomp.so.2 libc.so.6 libm.so.6 libgcc_s.so.1
 done
 "${loader[@]}" image/usr/bin/cps verify --root image --pristine
 "${loader[@]}" image/usr/bin/cps repo verify-rebuild --repo repo --publisher canopa \
-    --trust-key release-public.der --bundle bundle "$cps_package"
+    --trust-root release.trust.json --bundle bundle "$cps_package"
 for package in "${final_packages[@]}" "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"; do
     "${loader[@]}" image/usr/bin/cps repo fetch-sources --repo repo --publisher canopa \
-        --trust-key release-public.der --source-cache recovered-sources "$package"
+        --trust-root release.trust.json --source-cache recovered-sources "$package"
 done
 diff -r sources/sha256 recovered-sources/sha256
 "${loader[@]}" image/usr/bin/cps repo fetch-toolchain --toolchain-config toolchain.kdl build.kdl

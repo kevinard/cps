@@ -12,7 +12,7 @@ printf '#!/usr/bin/env bash\necho update >> %q\n[[ ! -e %q ]] || exit 42\nexec %
 chmod +x bin/systemd-hwdb
 export PATH="$work/bin:$PATH"
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
 
 for name in first second; do
     path="usr/lib/udev/hwdb.d/$name.hwdb"
@@ -26,7 +26,7 @@ package "test/$name" publisher="canopa" version="1.0.0-0" {
 MANIFEST
     "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
 done
-"$cps" image-create --root image --repo repo --publisher canopa --trust-key public.der
+"$cps" image-create --root image --repo repo --publisher canopa --trust-root repo/trust/1.json
 "$cps" plan --root image --output install.json install test/first test/second
 "$cps" apply --root image install.json
 test "$(wc -l < actions)" -eq 1

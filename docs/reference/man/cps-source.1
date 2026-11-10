@@ -26,7 +26,7 @@
 .SS "\&cps source git\-snapshot"
 \&Pin a Git branch, tag, or commit and prepare a versioned build recipe
 .PP
-.B \&cps source git\-snapshot \-\-git\-repo <GIT_REPO> \-\-repo <REPO> \-\-trust\-key <TRUST_KEY> \-\-output <OUTPUT> <\-\-branch <BRANCH>|\-\-tag <TAG>|\-\-commit <COMMIT>> <RECIPE>
+.B \&cps source git\-snapshot \-\-git\-repo <GIT_REPO> \-\-repo <REPO> \-\-trust\-root <TRUST_ROOT> \-\-output <OUTPUT> <\-\-branch <BRANCH>|\-\-tag <TAG>|\-\-commit <COMMIT>> <RECIPE>
 .PP
 .B Arguments
 .TP
@@ -50,7 +50,7 @@
 .B \&\-\-repo <REPO>
 \&Local CPS repository used to allocate snapshot versions
 .TP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 \&Ed25519 DER public key for the package publisher
 .TP
 .B \&\-\-output <OUTPUT>

@@ -22,8 +22,11 @@
 .B \&index\-files
 \&Enable a catalog\-signed index for available package file lookups
 .TP
-.B \&rotate\-key
-\&Authorize a new publisher signing key in a successor catalog
+.B \&resign
+\&Publish the exact current catalog again under the newest trust root
+.TP
+.B \&trust
+\&Create, rotate, sign, and inspect the publisher trust root
 .TP
 .B \&obsoletions
 \&List signed package obsoletion cutoffs
@@ -77,15 +80,16 @@
 .SS "\&cps repo widen\-rollout"
 \&Widen one profile's rollout on the exact current catalog
 .PP
-.B \&cps repo widen\-rollout \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <SIGNING_KEY> \-\-base <BASE> \-\-profile <PROFILE> \-\-percentage <PERCENTAGE>
+.B \&cps repo widen\-rollout \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <KEY> \-\-base <BASE> \-\-profile <PROFILE> \-\-percentage <PERCENTAGE>
 .PP
 .B Options
 .PP
 .B \&\-\-repo <REPO>
 .PP
 .B \&\-\-publisher <PUBLISHER>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .PP
 .B \&\-\-base <BASE>
 .PP
@@ -165,15 +169,16 @@
 .SS "\&cps repo prune\-withdrawals"
 \&Replace old withdrawal records with signed tombstones up to a catalog sequence
 .PP
-.B \&cps repo prune\-withdrawals \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <SIGNING_KEY> \-\-base <BASE> \-\-through <SEQUENCE>
+.B \&cps repo prune\-withdrawals \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <KEY> \-\-base <BASE> \-\-through <SEQUENCE>
 .PP
 .B Options
 .PP
 .B \&\-\-repo <REPO>
 .PP
 .B \&\-\-publisher <PUBLISHER>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .TP
 .B \&\-\-base <BASE>
 \&Exact current catalog to build on
@@ -186,41 +191,201 @@
 .SS "\&cps repo index\-files"
 \&Enable a catalog\-signed index for available package file lookups
 .PP
-.B \&cps repo index\-files \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <SIGNING_KEY>
+.B \&cps repo index\-files \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <KEY>
 .PP
 .B Options
 .PP
 .B \&\-\-repo <REPO>
 .PP
 .B \&\-\-publisher <PUBLISHER>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .TP
 .B \&\-h, \-\-help
 \&Print help
-.SS "\&cps repo rotate\-key"
-\&Authorize a new publisher signing key in a successor catalog
+.SS "\&cps repo resign"
+\&Publish the exact current catalog again under the newest trust root
 .PP
-.B \&cps repo rotate\-key \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-base <BASE> \-\-signing\-key <SIGNING_KEY> \-\-new\-signing\-key <NEW_SIGNING_KEY>
+.B \&cps repo resign \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <KEY> \-\-base <BASE>
 .PP
 .B Options
 .PP
 .B \&\-\-repo <REPO>
 .PP
 .B \&\-\-publisher <PUBLISHER>
-.PP
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
+.TP
 .B \&\-\-base <BASE>
+\&Exact current catalog to build on
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo trust"
+\&Create, rotate, sign, and inspect the publisher trust root
 .PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.B \&cps repo trust <COMMAND>
 .PP
-.B \&\-\-new\-signing\-key <NEW_SIGNING_KEY>
+.B Commands
+.TP
+.B \&init
+\&Create a repository's first trust root with one key as root and catalog key
+.TP
+.B \&rotate
+\&Sign and store the next trust root version with local or external root keys
+.TP
+.B \&draft
+\&Write the unsigned next trust root version for detached signing
+.TP
+.B \&sign
+\&Sign a trust root draft and write detached signatures
+.TP
+.B \&commit
+\&Combine a draft with its signatures and store it as the next version
+.TP
+.B \&show
+\&Show a trust root file, or the newest version in a repository
+.TP
+.B \&help
+\&Print this message or the help of the given subcommand(s)
+.PP
+.B Options
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo trust init"
+\&Create a repository's first trust root with one key as root and catalog key
+.PP
+.B \&cps repo trust init [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-key <KEY>
+.PP
+.B Options
+.PP
+.B \&\-\-repo <REPO>
+.PP
+.B \&\-\-publisher <PUBLISHER>
+.TP
+.B \&\-\-key <KEY>
+\&The only root and catalog key: PATH, file:PATH, or command:DESCRIPTOR
+.TP
+.B \&\-\-expires <EXPIRES>
+\&RFC 3339 UTC expiry, such as 2027\-01\-01T00:00:00Z (default: one year from now)
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo trust rotate"
+\&Sign and store the next trust root version with local or external root keys
+.PP
+.B \&cps repo trust rotate [OPTIONS] \-\-repo <REPO> \-\-key <KEY>
+.PP
+.B Options
+.PP
+.B \&\-\-repo <REPO>
+.TP
+.B \&\-\-publisher <PUBLISHER>
+\&Publisher name; required for the first version
+.TP
+.B \&\-\-root\-key <PUBLIC_KEY>
+\&Root key: a public key file or command:DESCRIPTOR (repeat; replaces the root keys)
+.PP
+.B \&\-\-root\-threshold <ROOT_THRESHOLD>
+.TP
+.B \&\-\-catalog\-key <PUBLIC_KEY>
+\&Catalog key: a public key file or command:DESCRIPTOR (repeat; replaces the catalog keys)
+.PP
+.B \&\-\-catalog\-threshold <CATALOG_THRESHOLD>
+.TP
+.B \&\-\-expires <EXPIRES>
+\&RFC 3339 UTC expiry, such as 2027\-01\-01T00:00:00Z (default: one year from now)
+.TP
+.B \&\-\-key <KEY>
+\&Root key that signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo trust draft"
+\&Write the unsigned next trust root version for detached signing
+.PP
+.B \&cps repo trust draft [OPTIONS] \-\-repo <REPO> \-\-output <OUTPUT>
+.PP
+.B Options
+.PP
+.B \&\-\-repo <REPO>
+.TP
+.B \&\-\-publisher <PUBLISHER>
+\&Publisher name; required for the first version
+.TP
+.B \&\-\-root\-key <PUBLIC_KEY>
+\&Root key: a public key file or command:DESCRIPTOR (repeat; replaces the root keys)
+.PP
+.B \&\-\-root\-threshold <ROOT_THRESHOLD>
+.TP
+.B \&\-\-catalog\-key <PUBLIC_KEY>
+\&Catalog key: a public key file or command:DESCRIPTOR (repeat; replaces the catalog keys)
+.PP
+.B \&\-\-catalog\-threshold <CATALOG_THRESHOLD>
+.TP
+.B \&\-\-expires <EXPIRES>
+\&RFC 3339 UTC expiry, such as 2027\-01\-01T00:00:00Z (default: one year from now)
+.PP
+.B \&\-\-output <OUTPUT>
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo trust sign"
+\&Sign a trust root draft and write detached signatures
+.PP
+.B \&cps repo trust sign \-\-draft <DRAFT> \-\-key <KEY> \-\-output <OUTPUT>
+.PP
+.B Options
+.PP
+.B \&\-\-draft <DRAFT>
+.TP
+.B \&\-\-key <KEY>
+\&Root key that signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
+.PP
+.B \&\-\-output <OUTPUT>
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo trust commit"
+\&Combine a draft with its signatures and store it as the next version
+.PP
+.B \&cps repo trust commit [OPTIONS] \-\-repo <REPO> \-\-draft <DRAFT>
+.PP
+.B Options
+.PP
+.B \&\-\-repo <REPO>
+.PP
+.B \&\-\-draft <DRAFT>
+.TP
+.B \&\-\-signature <SIGNATURE>
+\&Detached signatures from `cps repo trust sign` (repeat)
+.TP
+.B \&\-\-key <KEY>
+\&Root key that also signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo trust show"
+\&Show a trust root file, or the newest version in a repository
+.PP
+.B \&cps repo trust show <PATH>
+.PP
+.B Arguments
+.TP
+.B \&<PATH>
+\&A trust root file or a repository directory
+.PP
+.B Options
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps repo obsoletions"
 \&List signed package obsoletion cutoffs
 .PP
-.B \&cps repo obsoletions \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY>
+.B \&cps repo obsoletions \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT>
 .PP
 .B Options
 .PP
@@ -228,14 +393,14 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps repo publish\-release"
 \&Commit a set of reviewed build bundles and withdrawals as one signed catalog
 .PP
-.B \&cps repo publish\-release [OPTIONS] \-\-repo <REPO> \-\-signing\-key <SIGNING_KEY> <RELEASE>
+.B \&cps repo publish\-release [OPTIONS] \-\-repo <REPO> \-\-signing\-key <KEY> <RELEASE>
 .PP
 .B Arguments
 .PP
@@ -244,8 +409,9 @@
 .B Options
 .PP
 .B \&\-\-repo <REPO>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .TP
 .B \&\-\-source\-cache <SOURCE_CACHE>
 \&Cache of verified source files to include in the publication
@@ -261,7 +427,7 @@
 .SS "\&cps repo attestation"
 \&Print the signed build evidence for a full package ID
 .PP
-.B \&cps repo attestation \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY> <PACKAGE_ID>
+.B \&cps repo attestation \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT> <PACKAGE_ID>
 .PP
 .B Arguments
 .PP
@@ -273,14 +439,14 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps repo rebuild\-inputs"
 \&Extract the recipe, reviewed manifest, and attestation for an exact package
 .PP
-.B \&cps repo rebuild\-inputs [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY> \-\-output <OUTPUT> <PACKAGE_ID>
+.B \&cps repo rebuild\-inputs [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT> \-\-output <OUTPUT> <PACKAGE_ID>
 .PP
 .B Arguments
 .PP
@@ -292,7 +458,7 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .TP
 .B \&\-\-catalog <CATALOG>
 \&Select a historical signed catalog by SHA\-256
@@ -305,7 +471,7 @@
 .SS "\&cps repo verify\-rebuild"
 \&Compare a local build bundle with the attestation admitted by a signed catalog
 .PP
-.B \&cps repo verify\-rebuild [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY> \-\-bundle <BUNDLE> <PACKAGE_ID>
+.B \&cps repo verify\-rebuild [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT> \-\-bundle <BUNDLE> <PACKAGE_ID>
 .PP
 .B Arguments
 .PP
@@ -317,7 +483,7 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .TP
 .B \&\-\-catalog <CATALOG>
 \&Select a historical signed catalog by SHA\-256
@@ -332,7 +498,7 @@
 .SS "\&cps repo archive\-sources"
 \&Attach verified source files to a published build
 .PP
-.B \&cps repo archive\-sources \-\-repo <REPO> \-\-signing\-key <SIGNING_KEY> \-\-source\-cache <SOURCE_CACHE> <PACKAGE_ID>
+.B \&cps repo archive\-sources \-\-repo <REPO> \-\-signing\-key <KEY> \-\-source\-cache <SOURCE_CACHE> <PACKAGE_ID>
 .PP
 .B Arguments
 .PP
@@ -341,8 +507,9 @@
 .B Options
 .PP
 .B \&\-\-repo <REPO>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .PP
 .B \&\-\-source\-cache <SOURCE_CACHE>
 .TP
@@ -351,7 +518,7 @@
 .SS "\&cps repo fetch\-sources"
 \&Fetch archived sources into a build source cache
 .PP
-.B \&cps repo fetch\-sources [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY> \-\-source\-cache <SOURCE_CACHE> <PACKAGE_ID>
+.B \&cps repo fetch\-sources [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT> \-\-source\-cache <SOURCE_CACHE> <PACKAGE_ID>
 .PP
 .B Arguments
 .PP
@@ -363,7 +530,7 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .PP
 .B \&\-\-source\-cache <SOURCE_CACHE>
 .TP
@@ -390,7 +557,7 @@
 .SS "\&cps repo withdraw"
 \&Withdraw an exact published version from future package selections
 .PP
-.B \&cps repo withdraw \-\-repo <REPO> \-\-signing\-key <SIGNING_KEY> <PACKAGE_ID>
+.B \&cps repo withdraw \-\-repo <REPO> \-\-signing\-key <KEY> <PACKAGE_ID>
 .PP
 .B Arguments
 .PP
@@ -399,15 +566,16 @@
 .B Options
 .PP
 .B \&\-\-repo <REPO>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps repo withdrawals"
 \&List withdrawn package IDs and their original manifest digests
 .PP
-.B \&cps repo withdrawals \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY>
+.B \&cps repo withdrawals \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT>
 .PP
 .B Options
 .PP
@@ -415,14 +583,14 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps repo export"
 \&Export signed catalogs and their objects for TUF signing
 .PP
-.B \&cps repo export [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY> \-\-output <OUTPUT>
+.B \&cps repo export [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT> \-\-output <OUTPUT>
 .PP
 .B Options
 .PP
@@ -430,7 +598,7 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .PP
 .B \&\-\-output <OUTPUT>
 .TP
@@ -451,7 +619,7 @@
 .SS "\&cps repo sync"
 \&Verify and cache a release from a TUF mirror
 .PP
-.B \&cps repo sync [OPTIONS] \-\-repo <REPO> \-\-root <ROOT> \-\-metadata <METADATA> \-\-targets <TARGETS> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY>
+.B \&cps repo sync [OPTIONS] \-\-repo <REPO> \-\-root <ROOT> \-\-metadata <METADATA> \-\-targets <TARGETS> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT>
 .PP
 .B Options
 .PP
@@ -465,7 +633,7 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .TP
 .B \&\-\-image <IMAGE>
 \&Check the signed catalog against this installed image before promotion
@@ -505,7 +673,7 @@
 .SS "\&cps repo prune\-cache"
 \&Preview or remove unused payload files from a TUF mirror cache
 .PP
-.B \&cps repo prune\-cache [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-key <TRUST_KEY>
+.B \&cps repo prune\-cache [OPTIONS] \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-trust\-root <TRUST_ROOT>
 .PP
 .B Options
 .PP
@@ -513,7 +681,7 @@
 .PP
 .B \&\-\-publisher <PUBLISHER>
 .PP
-.B \&\-\-trust\-key <TRUST_KEY>
+.B \&\-\-trust\-root <TRUST_ROOT>
 .TP
 .B \&\-\-keep\-catalog <CATALOGS>
 \&Also retain payloads from this historical catalog

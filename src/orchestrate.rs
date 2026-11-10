@@ -15,7 +15,9 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use crate::{
     kdl_format::{build::RECIPE_LIMIT, read_image_definition},
     model::{Dependency, PackageSpec, Version, digest, validate_digest},
-    repo::{CatalogEntry, CatalogPin, MANIFEST_LIMIT, catalog_index, read_key, read_limited},
+    repo::{
+        CatalogEntry, CatalogPin, MANIFEST_LIMIT, catalog_index, read_limited, read_trust_root,
+    },
 };
 
 const RECIPE_KIND: &str = "build-recipe";
@@ -497,7 +499,7 @@ pub fn rebuild_plan(
         let hash = hashes
             .remove(name)
             .with_context(|| format!("missing catalog pin for {name}"))?;
-        let key = read_key(&publisher.trust_key)?;
+        let key = read_trust_root(&publisher.trust_key)?;
         let pin = CatalogPin::primary(name.to_owned(), hash.to_owned());
         let catalog = catalog_index(&publisher.repository, name, &key, Some(&pin))
             .with_context(|| format!("reading pinned catalog {hash} for {name}"))?;

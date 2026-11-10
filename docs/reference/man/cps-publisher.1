@@ -73,11 +73,14 @@
 .B \&\-\-cache <CACHE>
 \&Cache directory for a URL mirror
 .TP
-.B \&\-\-trust\-key <TRUST_KEY>
-\&Trusted CPS publisher public key for \-\-repo or \-\-url
+.B \&\-\-trust\-root <TRUST_ROOT>
+\&Pinned CPS publisher trust root for \-\-repo or \-\-url
 .TP
 .B \&\-\-build\-trust <BUILD_TRUST>
 \&Require builder signatures from this KDL policy
+.TP
+.B \&\-\-expect\-root\-key <SHA256>
+\&With an HTTPS mirror URL: require exactly these root key SHA\-256 fingerprints instead of asking (repeat for each root key)
 .TP
 .B \&\-h, \-\-help
 \&Print help

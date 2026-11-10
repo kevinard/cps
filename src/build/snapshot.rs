@@ -14,7 +14,7 @@ use crate::{
     image::root::Root,
     kdl_format::build,
     model::{FileDigest, Version, digest, digest_reader},
-    repo::{MANIFEST_LIMIT, assign_git_version, lock_snapshot_series, read_key},
+    repo::{MANIFEST_LIMIT, assign_git_version, lock_snapshot_series, read_trust_root},
 };
 
 use super::{parent, read_templates};
@@ -81,7 +81,7 @@ pub fn prepare_git_snapshot_ref(
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
-    let key = read_key(trust_key)?;
+    let key = read_trust_root(trust_key)?;
     let (template, recipe) = build::read(recipe_path)?;
     ensure!(
         recipe.version.is_none(),

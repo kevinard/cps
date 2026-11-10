@@ -115,7 +115,7 @@ pub(super) fn read_applied<'a>(
             .iter()
             .find(|pin| pin.publisher == publisher.name)
     }) {
-        pin.check_archive(&catalog, &point.catalog, &publisher.key)?;
+        pin.check_archive(&catalog, &point.catalog)?;
     }
     Ok(Some((catalog, &point.catalog)))
 }
@@ -170,7 +170,7 @@ pub(super) fn verify(db: &Connection, state: &State) -> Result<()> {
         };
         let catalog = read_checkpoint(db, publisher, point)?;
         if let Some(pin) = pin {
-            pin.check_archive(&catalog, &point.catalog, &publisher.key)?;
+            pin.check_archive(&catalog, &point.catalog)?;
         }
         check_installed(&catalog, publisher, state)?;
     }

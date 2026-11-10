@@ -36,18 +36,24 @@ work=$(mktemp -d "$output/.private.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$output"
 
+# KEY [REPOSITORY PUBLISHER] creates a key pair. With a repository, the key
+# also becomes the repository's 1-of-1 trust root, copied to KEY.trust.json.
 keypair() {
     openssl genpkey -algorithm ED25519 -outform DER -out "$work/$1.der"
     openssl pkey -inform DER -in "$work/$1.der" -pubout -outform DER -out "$1-public.der"
+    if [[ $# == 3 ]]; then
+        "$cps" repo trust init --repo "$2" --publisher "$3" --key "$work/$1.der" >/dev/null
+        cp -- "$2/trust/1.json" "$1.trust.json"
+    fi
 }
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 
-keypair toolchain
+keypair toolchain toolchain seed
 keypair builder
-keypair release
+keypair release repo canopa-systemd
 add_util_linux() {
     "$cps" publisher add --root "$1" --repo "$util_linux/repo" \
-        --trust-key "$util_linux/release-public.der" canopa-util-linux
+        --trust-root "$util_linux/release.trust.json" canopa-util-linux
 }
 seed_args=()
 packaged_libs=0
@@ -58,12 +64,12 @@ if [[ -n $util_linux || $packaged_seccomp == 1 ]]; then
 fi
 if [[ -n $util_linux ]]; then
     "$cps" repo attestation --repo "$util_linux/repo" --publisher canopa-util-linux \
-        --trust-key "$util_linux/release-public.der" "$util_package" > util-linux-attestation.json
+        --trust-root "$util_linux/release.trust.json" "$util_package" > util-linux-attestation.json
     packaged_libs=1
 else
-    keypair runtime-seed
+    keypair runtime-seed runtime-seed canopa-systemd-seed
 fi
-"$cps" repo attestation --repo "$runtime/repo" --publisher canopa --trust-key "$runtime/release-public.der" \
+"$cps" repo attestation --repo "$runtime/repo" --publisher canopa --trust-root "$runtime/release.trust.json" \
     "$seccomp_package" > libseccomp-attestation.json
 CPS_SYSTEMD_PACKAGED_LIBS=$packaged_libs CPS_SYSTEMD_PACKAGED_SECCOMP=$packaged_seccomp \
     bash "$project/tests/seed-native-c.sh" "$work/native-systemd" --systemd
@@ -94,26 +100,26 @@ fi
     "${seed_args[@]}" build/native-systemd > native-systemd.kdl
 "$cps" publish --repo toolchain --proto "$work/native-systemd" --signing-key "$work/toolchain.der" native-systemd.kdl
 
-toolchain_input=(--repo toolchain --publisher seed --trust-key toolchain-public.der)
+toolchain_input=(--repo toolchain --publisher seed --trust-root toolchain.trust.json)
 if $configured; then
     printf 'schema-version 1 kind="toolchain-config"\n' > toolchain.kdl
     pins="$work/toolchain-recipe"
     printf '    toolchain solver="sat-v2" {\n' > "$pins"
     roots=(cps://seed/build/native-systemd@1.0.0-0 "$seccomp_package")
-    append_toolchain_publisher "$pins" toolchain.kdl seed toolchain toolchain-public.der
+    append_toolchain_publisher "$pins" toolchain.kdl seed toolchain toolchain.trust.json
     if [[ -n $util_linux ]]; then
-        append_toolchain_publisher "$pins" toolchain.kdl canopa-util-linux "$util_linux/repo" "$util_linux/release-public.der"
+        append_toolchain_publisher "$pins" toolchain.kdl canopa-util-linux "$util_linux/repo" "$util_linux/release.trust.json"
         roots+=("$util_package")
     fi
-    append_toolchain_publisher "$pins" toolchain.kdl canopa "$runtime/repo" "$runtime/release-public.der"
-    append_toolchain_publisher "$pins" toolchain.kdl canopa-runtime-seed "$runtime/runtime-seed" "$runtime/runtime-seed-public.der"
+    append_toolchain_publisher "$pins" toolchain.kdl canopa "$runtime/repo" "$runtime/release.trust.json"
+    append_toolchain_publisher "$pins" toolchain.kdl canopa-runtime-seed "$runtime/runtime-seed" "$runtime/runtime-seed.trust.json"
     printf '        package "%s"\n' "${roots[@]}" >> "$pins"
     printf '    }\n' >> "$pins"
     toolchain_input=(--toolchain-config toolchain.kdl)
 else
     cat > "$work/toolchain-recipe" <<TOOLCHAIN
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(tail -c 32 -- toolchain-public.der | sha256sum | cut -d' ' -f1)"
+        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(sha256sum < toolchain.trust.json | cut -d' ' -f1)"
         package "build/native-systemd"
     }
 TOOLCHAIN
@@ -149,7 +155,7 @@ if [[ -z $util_linux ]]; then
     "$cps" publish --repo runtime-seed --proto "$work/runtime-seed" --signing-key "$work/runtime-seed.der" runtime-seed.kdl
 fi
 
-mkdir repo
+mkdir -p repo
 cp builder-public.der repo/
 reviewed=$(sha build.kdl)
 cat > repo/publish-policy.kdl <<POLICY
@@ -162,18 +168,18 @@ POLICY
 "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$reviewed" bundle
 package=cps://canopa-systemd/system/systemd-vm@$systemd_version
-"$cps" repo attestation --repo repo --publisher canopa-systemd --trust-key release-public.der "$package" > attestation.json
+"$cps" repo attestation --repo repo --publisher canopa-systemd --trust-root release.trust.json "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa-systemd --trust-key release-public.der \
+"$cps" image-create --root image --repo repo --publisher canopa-systemd --trust-root release.trust.json \
     --facet devel=false
 if [[ -n $util_linux ]]; then
     add_util_linux image
 else
-    "$cps" publisher add --root image --repo runtime-seed --trust-key runtime-seed-public.der canopa-systemd-seed
+    "$cps" publisher add --root image --repo runtime-seed --trust-root runtime-seed.trust.json canopa-systemd-seed
 fi
-"$cps" publisher add --root image --repo "$runtime/repo" --trust-key "$runtime/release-public.der" canopa
+"$cps" publisher add --root image --repo "$runtime/repo" --trust-root "$runtime/release.trust.json" canopa
 "$cps" publisher add --root image --repo "$runtime/runtime-seed" \
-    --trust-key "$runtime/runtime-seed-public.der" canopa-runtime-seed
+    --trust-root "$runtime/runtime-seed.trust.json" canopa-runtime-seed
 "$cps" plan --root image --output install.json install "$package"
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine

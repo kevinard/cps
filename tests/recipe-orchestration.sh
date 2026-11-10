@@ -87,13 +87,13 @@ test ! -s again.txt
 # A soname bump breaks the consumers of the removed soname, and every
 # direct dependent of the changed package is listed for a rebuild.
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
-openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
+"$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
 cat > image.kdl <<CONFIG
 schema-version 1 kind="image-config"
 architecture "$arch"
 publisher "canopa" {
     repository "repo"
-    trust-key "public.der"
+    trust-root "repo/trust/1.json"
 }
 CONFIG
 printf 'int foo(void) { return 1; }\n' > foo.c
