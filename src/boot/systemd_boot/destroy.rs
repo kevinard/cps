@@ -237,6 +237,8 @@ fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) 
             &marker,
             RenameFlags::NOREPLACE,
         )?;
+        // On VFAT the renamed record's size is durable only with its inode.
+        File::open(Root::fd_path(&loader_entries).join(&marker))?.sync_all()?;
         loader_entries.sync_all()?;
     }
     if let Some(firmware) = firmware {

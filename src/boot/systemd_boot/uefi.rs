@@ -396,6 +396,8 @@ impl Firmware {
 fn rename_record(dir: &Path, from: &Path, to: &Path) -> Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)?;
+    // On VFAT the renamed record's size is durable only with its inode.
+    File::open(to)?.sync_all()?;
     File::open(dir)?.sync_all()?;
     Ok(())
 }

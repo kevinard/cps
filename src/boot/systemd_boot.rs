@@ -1585,7 +1585,9 @@ fn install_checked(
     );
     verify(temp.path())?;
     temp.as_file().sync_all()?;
-    temp.persist_noclobber(path)?;
+    // VFAT writes a renamed file's size and first cluster with its inode,
+    // not with the directory, so sync the file again after the rename.
+    temp.persist_noclobber(path)?.sync_all()?;
     File::open(parent)?.sync_all()?;
     Ok(true)
 }

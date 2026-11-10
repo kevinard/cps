@@ -358,14 +358,11 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid boot entry filename")?;
-    renameat_with(
-        CWD,
-        &entry.path,
-        CWD,
-        entry.path.with_file_name(exhausted_name(id, name)?),
-        RenameFlags::NOREPLACE,
-    )
-    .context("exhausting the abandoned trial's boot counter")?;
+    let exhausted = entry.path.with_file_name(exhausted_name(id, name)?);
+    renameat_with(CWD, &entry.path, CWD, &exhausted, RenameFlags::NOREPLACE)
+        .context("exhausting the abandoned trial's boot counter")?;
+    // On VFAT the renamed entry's size is durable only with its inode.
+    File::open(&exhausted)?.sync_all()?;
     File::open(entry.path.parent().context("missing entries directory")?)?.sync_all()?;
     Ok(())
 }
