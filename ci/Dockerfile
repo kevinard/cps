@@ -8,7 +8,7 @@ RUN printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/11/03/$repo
         '1848ec50754657edf473b42680099511ba244671f9e008d780e7c82e33911198  /var/lib/pacman/sync/extra.db' \
         | sha256sum --check \
     && pacman -Su --noconfirm --needed attr btrfs-progs bubblewrap curl dosfstools git jq libseccomp \
-        mtools openssl python ripgrep sqlite systemd util-linux \
+        mtools openssh openssl python ripgrep sqlite systemd util-linux \
     && rm -f /var/cache/pacman/pkg/*
 
 COPY rust-dist.sha256 /tmp/rust-dist.sha256

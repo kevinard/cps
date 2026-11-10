@@ -48,9 +48,12 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build and test
         run: |
-          mkdir -p "$RUNNER_TEMP/cps-cargo"
+          mkdir -p "$RUNNER_TEMP/cps-cargo" "$RUNNER_TEMP/cps-tmp"
           run_ci() {
+            # Tests keep their images on the runner's disk: overlayfs, the
+            # container's own /tmp, cannot hold a trigger handler's overlay.
             docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
+              --env TMPDIR="$RUNNER_TEMP/cps-tmp" \
               --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
               --security-opt systempaths=unconfined \
               --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
@@ -86,9 +89,12 @@ jobs:
         run: docker build --target boot -t cps-ci ci
       - name: Build the pinned kernel and exercise boot recovery
         run: |
-          mkdir -p "$RUNNER_TEMP/cps-cargo"
+          mkdir -p "$RUNNER_TEMP/cps-cargo" "$RUNNER_TEMP/cps-tmp"
           run_ci() {
+            # Tests keep their images on the runner's disk: overlayfs, the
+            # container's own /tmp, cannot hold a trigger handler's overlay.
             docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
+              --env TMPDIR="$RUNNER_TEMP/cps-tmp" \
               --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
               --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$PWD" "$@"
           }
