@@ -372,6 +372,8 @@ fn check_state(
         // Triggers own what their output patterns cover, and their contents
         // are not part of any manifest.
         let generated = crate::triggers::active_outputs(&state.installed, &expected);
+        // The /etc state that the systemd actions of installed packages write.
+        let actions = crate::systemd::ActionOutputs::of(root, state)?;
         let var = crate::image::VAR_DIRECTORY;
         match root.dir(var) {
             Ok(directory) => {
@@ -414,6 +416,11 @@ fn check_state(
                     }
                     if crate::triggers::generated(&generated, path) {
                         return Ok(false);
+                    }
+                    // Descend into what the actions create, since its other
+                    // entries need an owner of their own.
+                    if actions.covers(path, entry, kind) {
+                        return Ok(true);
                     }
                     findings.push(Finding {
                         is_error: true,

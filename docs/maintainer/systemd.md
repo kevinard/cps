@@ -42,7 +42,7 @@ account created earlier in the same transaction. A declared tmpfiles file
 may contain only the `d`, `f`, `L`, and `C` rules, which create missing
 paths, and publication rejects other rule types. Boot-only rules, such as
 `d!`, and paths under `/dev`, `/proc`, `/run`, and `/sys` are deferred to
-boot.
+boot. A rule's path is absolute and unquoted, without `.` or `..`.
 [systemd-tmpfiles](https://www.freedesktop.org/software/systemd/man/latest/systemd-tmpfiles.html)
 
 Packages never ship `/var`. They declare what they need there with these
@@ -57,6 +57,17 @@ does not contain, so CPS defers rules for `/var` to boot, where
 mounts. A rule such as `d /var/lib/example 0750 example example -` then
 resolves `example` from the accounts that sysusers already wrote into the
 image's `/etc/passwd`.
+
+CPS decides what a rule writes from where its path leads, not from its
+text. `systemd-tmpfiles` follows the image's symlinks, so in an image where
+`/srv` links to `/var/srv`, the rule `d /srv/www` writes into `/var`, and
+`d /lib/sysimage/cps/x` writes into the CPS state through `/lib`. CPS
+resolves each path in the image, including the symlinks that `L` rules of
+the same run create, and leaves out the rules that lead into `/var` of an
+inactive image, into the CPS state, or into the kernel file systems. A
+specifier such as `%m` stops the resolution, because it names a value of the
+booted machine. A rule inside a tree that a `C` rule of the same run copies
+fails the transaction, since the copy decides where it leads.
 
 Presets apply the image's enablement policy to newly installed units. CPS
 preserves enablement during upgrades and honors local unit overrides and

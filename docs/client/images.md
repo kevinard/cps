@@ -409,6 +409,12 @@ hard links to regular files and undeclared extended attributes on managed
 regular files and directories. Use regular `verify` after provisioning or
 booting, when the system can generate files outside package ownership.
 Trigger outputs count as owned paths, and their contents are not checked.
+So does the state that installed packages' [systemd actions](../maintainer/systemd.md)
+write: the account databases of sysusers declarations, the paths of
+tmpfiles declarations and the directories above them, and the enablement
+links of presets, which point to a unit under `/usr/lib/systemd/system`.
+Local configuration, such as a mask or an administrator's tmpfiles file,
+is still reported.
 
 Use `verify --package NAME` or `verify --path /path` to limit on-disk
 checks to the selected managed files while still authenticating image

@@ -75,7 +75,11 @@ C /srv/$scope-copy - - - - /usr/lib/systemd/system-preset/99-fixture.preset
 C /var/lib/$scope-seed - - - - /usr/lib/systemd/system-preset/99-fixture.preset
 d $host_tmpfiles 0750 $user $user -
 d /run/$scope 0755 - - -
+d /srv/$scope-link/$scope-hidden 0755 - - -
 RULES
+# The rule above names /srv, but this link takes it into the shared /var.
+mkdir -p base/srv
+ln -s /var/lib "base/srv/$scope-link"
 
 printf 'g %s %s\nu %s %s:%s\n' "$user" "$account_gid" "$user" "$account_uid" "$account_gid" > "proto/usr/lib/sysusers.d/$scope.conf"
 printf 'd /srv/%s-vendor 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$scope.conf"
@@ -160,6 +164,22 @@ wants=etc/systemd/system/multi-user.target.wants
 test "$(readlink "staged/$wants/$enabled")" = "/usr/lib/systemd/system/$enabled"
 test "$(readlink "staged/etc/systemd/system/$masked")" = /dev/null
 for unit in "$existing" "$masked" "$denied"; do test ! -L "staged/$wants/$unit"; done
+# Pristine verification expects the accounts, tmpfiles paths, and enablement
+# links that the declared actions wrote, and still reports local edits.
+if "$cps" verify --root staged --pristine > pristine.log 2>&1; then
+    echo 'Pristine verification accepted local configuration' >&2
+    exit 1
+fi
+# The fixture ships etc/passwd itself, so the account that sysusers adds
+# changes package content.
+cat > expected-pristine.log <<FINDINGS
+error: etc/passwd: content, type, or metadata differs
+error: unmanaged path "etc/systemd/system/$masked"
+error: unmanaged path "etc/systemd/system-preset"
+error: unmanaged path "etc/tmpfiles.d"
+error: unmanaged path "srv/$scope-link"
+FINDINGS
+grep '^error:' pristine.log | diff -u expected-pristine.log -
 
 # Fail the native tmpfiles step after sysusers has changed the managed
 # passwd file. The same plan must resume offline without replaying file writes.

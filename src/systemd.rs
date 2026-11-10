@@ -126,19 +126,269 @@ fn active_actions<'a>(
 
 /// Accept only rules that create missing paths: directories, files,
 /// symlinks, and copies, such as a copy of `/usr/share/factory/var/...` that
-/// seeds the shared `/var`.
+/// seeds the shared `/var`. Paths are absolute and unquoted, without `.` or
+/// `..`, so that CPS sees the same path that `systemd-tmpfiles` writes.
 pub(crate) fn validate_tmpfiles(bytes: &[u8]) -> Result<()> {
     for (index, line) in std::str::from_utf8(bytes)?.lines().enumerate() {
-        if let Some(kind) = line.split_ascii_whitespace().next() {
+        let Some(rule) = TmpfilesRule::parse(line) else {
+            continue;
+        };
+        let line = index + 1;
+        ensure!(
+            matches!(rule.kind, "d" | "f" | "L" | "C" | "d!" | "f!" | "L!" | "C!"),
+            "tmpfiles line {line} uses unsupported offline rule {:?}; use d, f, L, or C",
+            rule.kind
+        );
+        let path = rule
+            .path
+            .context(format!("tmpfiles line {line} has no path"))?;
+        ensure!(
+            (path.starts_with('/') || path.starts_with('%'))
+                && !path.contains(['"', '\'', '\\'])
+                && path
+                    .split('/')
+                    .skip(1)
+                    .all(|part| !matches!(part, "." | "..")),
+            "tmpfiles line {line} has path {path:?}; use an absolute, unquoted path without . or .."
+        );
+    }
+    Ok(())
+}
+
+/// The fields of a tmpfiles.d line that decide where it writes.
+struct TmpfilesRule<'a> {
+    kind: &'a str,
+    path: Option<&'a str>,
+    /// The symlink target of `L`, or the source of `C`.
+    argument: Option<&'a str>,
+}
+
+impl<'a> TmpfilesRule<'a> {
+    fn parse(line: &'a str) -> Option<Self> {
+        fn field(text: &str) -> (Option<&str>, &str) {
+            let text = text.trim_start_matches([' ', '\t']);
+            match text.find([' ', '\t']) {
+                _ if text.is_empty() => (None, text),
+                Some(end) => (Some(&text[..end]), &text[end..]),
+                None => (Some(text), ""),
+            }
+        }
+        let (kind, mut rest) = field(line);
+        let kind = kind.filter(|kind| !kind.starts_with('#'))?;
+        let (path, after) = field(rest);
+        rest = after;
+        for _ in 0..4 {
+            rest = field(rest).1;
+        }
+        let argument =
+            Some(rest.trim()).filter(|argument| !argument.is_empty() && *argument != "-");
+        Some(Self {
+            kind,
+            path,
+            argument,
+        })
+    }
+}
+
+/// The root-relative trees that tmpfiles does not write beneath, as `run`
+/// excludes them: the CPS image state, the kernel file systems, and for an
+/// inactive root, `-E`'s /run and the shared /var.
+fn tmpfiles_exclusions(live: bool) -> Vec<&'static str> {
+    let mut excluded = vec![crate::image::STATE_DIRECTORY, "dev", "proc", "sys"];
+    if !live {
+        excluded.extend(["run", crate::image::VAR_DIRECTORY]);
+    }
+    excluded
+}
+
+fn beneath(path: &[String], prefix: &str) -> bool {
+    let prefix = prefix.split('/').collect::<Vec<_>>();
+    path.len() >= prefix.len() && path.iter().zip(&prefix).all(|(part, want)| part == want)
+}
+
+/// Where a tmpfiles path lands in the root. `systemd-tmpfiles --root` follows
+/// the root's symlinks, with absolute targets taken from the root, so a rule
+/// for `/lib/sysimage/cps/x` or for `/srv/x`, when `/srv` links to `/var/srv`,
+/// writes beneath a prefix that its text does not name. `links` holds the
+/// symlinks that earlier rules of the same run create. A component with a
+/// specifier such as `%m` names a machine value, so resolution stops there.
+fn resolve_tmpfiles_path(
+    root: &fs::File,
+    path: &str,
+    follow_last: bool,
+    links: &BTreeMap<Vec<String>, String>,
+) -> Result<Vec<String>> {
+    let mut parts = path
+        .split('/')
+        .map(str::to_owned)
+        .collect::<std::collections::VecDeque<_>>();
+    // systemd's directory specifiers, as a system-mode run expands them.
+    if let Some(first) = parts.front()
+        && let Some(directory) = match first.as_str() {
+            "%S" => Some("var/lib"),
+            "%C" => Some("var/cache"),
+            "%L" => Some("var/log"),
+            "%t" => Some("run"),
+            "%T" => Some("tmp"),
+            "%V" => Some("var/tmp"),
+            "%h" => Some("root"),
+            _ => None,
+        }
+    {
+        parts.pop_front();
+        for part in directory.rsplit('/') {
+            parts.push_front(part.to_owned());
+        }
+    }
+    let mut resolved = Vec::<String>::new();
+    let mut hops = 0;
+    while let Some(part) = parts.pop_front() {
+        match part.as_str() {
+            "" | "." => continue,
+            ".." => {
+                resolved.pop();
+                continue;
+            }
+            _ if part.contains('%') => {
+                resolved.push(part);
+                resolved.extend(parts);
+                break;
+            }
+            _ => {}
+        }
+        resolved.push(part);
+        if parts.is_empty() && !follow_last {
+            break;
+        }
+        let target = match links.get(&resolved) {
+            Some(target) => Some(target.clone()),
+            None => {
+                let relative = resolved.join("/");
+                match rustix::fs::statat(root, &relative, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(info) if rustix::fs::FileType::from_raw_mode(info.st_mode).is_symlink() => {
+                        let target = rustix::fs::readlinkat(root, &relative, Vec::new())?;
+                        Some(target.into_string().context("non-UTF-8 symlink target")?)
+                    }
+                    Ok(_) | Err(Errno::NOENT | Errno::NOTDIR) => None,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("inspecting /{relative}"));
+                    }
+                }
+            }
+        };
+        if let Some(target) = target {
+            hops += 1;
             ensure!(
-                kind.starts_with('#')
-                    || matches!(kind, "d" | "f" | "L" | "C" | "d!" | "f!" | "L!" | "C!"),
-                "tmpfiles line {} uses unsupported offline rule {kind:?}; use d, f, L, or C",
-                index + 1
+                hops <= 40,
+                "too many symlinks resolving tmpfiles path {path}"
+            );
+            resolved.pop();
+            if target.starts_with('/') {
+                resolved.clear();
+            }
+            for part in target.rsplit('/') {
+                parts.push_front(part.to_owned());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// A tmpfiles rule type and the root-relative components of where it writes.
+type Resolved<'a> = (&'a str, Vec<String>);
+
+/// Resolve the lines of tmpfiles configurations to where they write, and
+/// drop the lines that write beneath an excluded tree. Their text may name
+/// another path, so each one is resolved in the root first. Like the
+/// exclusions of `systemd-tmpfiles` itself, a dropped line is not an error:
+/// systemd-tmpfiles-setup.service creates the /var paths at boot.
+fn resolve_tmpfiles<'a>(
+    root: &Root,
+    rules: &'a str,
+    live: bool,
+) -> Result<Vec<(&'a str, Option<Resolved<'a>>)>> {
+    let root = root.as_file();
+    let excluded = tmpfiles_exclusions(live);
+    let is_excluded = |path: &[String]| excluded.iter().any(|prefix| beneath(path, prefix));
+    let parsed = rules
+        .lines()
+        .map(|line| (line, TmpfilesRule::parse(line)))
+        .collect::<Vec<_>>();
+
+    // The symlinks that these rules create, as later rules traverse them.
+    let mut links = BTreeMap::new();
+    for (_, rule) in &parsed {
+        if let Some(rule) = rule
+            && rule.kind.starts_with('L')
+            && let Some(path) = rule.path
+        {
+            let location = resolve_tmpfiles_path(root, path, false, &links)?;
+            if !is_excluded(&location) {
+                let target = rule
+                    .argument
+                    .map_or_else(|| format!("/usr/share/factory{path}"), str::to_owned);
+                links.insert(location, target);
+            }
+        }
+    }
+
+    let mut copies = Vec::new();
+    let mut kept = Vec::new();
+    for (line, rule) in parsed {
+        let Some(rule) = rule else {
+            kept.push((line, None));
+            continue;
+        };
+        let path = rule.path.context("tmpfiles rule without a path")?;
+        let location = resolve_tmpfiles_path(root, path, !rule.kind.starts_with('L'), &links)?;
+        if is_excluded(&location) {
+            continue;
+        }
+        if rule.kind.starts_with('C')
+            && rustix::fs::statat(
+                root,
+                location.join("/"),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .is_err()
+        {
+            copies.push((location.clone(), path));
+        }
+        kept.push((line, Some((rule.kind, location))));
+    }
+    for (_, rule) in &kept {
+        if let Some((_, location)) = rule
+            && let Some((_, copy)) = copies
+                .iter()
+                .find(|(copy, _)| location.len() > copy.len() && beneath(location, &copy.join("/")))
+        {
+            bail!(
+                "tmpfiles rule for /{} lies inside the tree that the rule for {copy} copies; \
+                 CPS cannot tell where it writes. Ship the path in the copied tree instead",
+                location.join("/")
             );
         }
     }
-    Ok(())
+    Ok(kept)
+}
+
+/// The lines of tmpfiles configurations that do not write beneath an
+/// excluded tree.
+fn filter_tmpfiles(root: &Root, rules: &str, live: bool) -> Result<String> {
+    let mut output = String::new();
+    for (line, _) in resolve_tmpfiles(root, rules, live)? {
+        output.push_str(line);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// The rule types and resolved locations of the kept tmpfiles rules.
+fn tmpfiles_locations<'a>(root: &Root, rules: &'a str, live: bool) -> Result<Vec<Resolved<'a>>> {
+    Ok(resolve_tmpfiles(root, rules, live)?
+        .into_iter()
+        .filter_map(|(_, rule)| rule)
+        .collect())
 }
 
 pub(crate) fn run(
@@ -152,7 +402,7 @@ pub(crate) fn run(
     let mut sysusers = Vec::new();
     let mut presets = Vec::new();
     let state_path = crate::image::STATE_DIRECTORY;
-    let mut rules = tempfile::tempfile_in(path.join(state_path).join("stage"))?;
+    let mut configs = String::new();
     for action in actions {
         action.validate()?;
         let vendor_path = action.path();
@@ -169,8 +419,8 @@ pub(crate) fn run(
             Action::Tmpfiles(name) => {
                 if let Some(bytes) = tmpfiles_config(root, runtime.as_ref(), name)? {
                     validate_tmpfiles(&bytes).with_context(|| format!("validating {name}"))?;
-                    rules.write_all(&bytes)?;
-                    rules.write_all(b"\n")?;
+                    configs.push_str(std::str::from_utf8(&bytes)?);
+                    configs.push('\n');
                 }
             }
             Action::Preset(unit) => {
@@ -189,7 +439,13 @@ pub(crate) fn run(
             live,
         )?;
     }
-    if rules.stream_position()? != 0 {
+    let configs = filter_tmpfiles(root, &configs, live)?;
+    if configs
+        .lines()
+        .any(|line| TmpfilesRule::parse(line).is_some())
+    {
+        let mut rules = tempfile::tempfile_in(path.join(state_path).join("stage"))?;
+        rules.write_all(configs.as_bytes())?;
         rules.rewind()?;
         let mut tool = command("systemd-tmpfiles", path);
         if live {
@@ -203,6 +459,8 @@ pub(crate) fn run(
             // is the mount point of the /var that every environment shares,
             // and systemd-tmpfiles-setup.service creates these paths there
             // at boot, like the paths under /dev, /proc, /run and /sys.
+            // These prefixes match the text of a rule; filter_tmpfiles has
+            // already dropped the rules that reach them through a symlink.
             tool.args(["-E", "--exclude-prefix=/var"]);
         }
         run_tool(
@@ -225,6 +483,98 @@ pub(crate) fn run(
     }
     root.sync()?;
     Ok(())
+}
+
+/// The local state that the active systemd actions of an inactive root write,
+/// which pristine verification accepts like trigger outputs.
+#[derive(Debug, Default)]
+pub(crate) struct ActionOutputs {
+    /// Exact paths: the account databases, and what tmpfiles rules create
+    /// and the directories above them.
+    paths: BTreeSet<String>,
+    /// Trees that tmpfiles copies.
+    trees: Vec<String>,
+    /// Whether presets are active, so enablement links are expected.
+    presets: bool,
+}
+
+impl ActionOutputs {
+    pub(crate) fn of(root: &Root, state: &State) -> Result<Self> {
+        let mut outputs = Self::default();
+        let mut configs = String::new();
+        for action in active_actions(&state.installed, &state.paths).into_keys() {
+            match action {
+                Action::Sysusers(_) => {
+                    for database in ["passwd", "group", "shadow", "gshadow"] {
+                        outputs.paths.insert(format!("etc/{database}"));
+                        outputs.paths.insert(format!("etc/{database}-"));
+                    }
+                    outputs.paths.insert("etc/.pwd.lock".to_owned());
+                }
+                Action::Tmpfiles(name) => {
+                    if let Some(bytes) = tmpfiles_config(root, None, name)? {
+                        configs.push_str(std::str::from_utf8(&bytes)?);
+                        configs.push('\n');
+                    }
+                }
+                Action::Preset(_) => outputs.presets = true,
+            }
+        }
+        for (kind, location) in tmpfiles_locations(root, &configs, false)? {
+            let path = location.join("/");
+            for (index, _) in path.match_indices('/') {
+                outputs.paths.insert(path[..index].to_owned());
+            }
+            if kind.starts_with('C') {
+                outputs.trees.push(path.clone());
+            }
+            outputs.paths.insert(path);
+        }
+        Ok(outputs)
+    }
+
+    /// Whether an action wrote this unmanaged path. The entries of a
+    /// directory that an action creates still need an owner of their own.
+    pub(crate) fn covers(&self, path: &str, entry: &fs::File, kind: rustix::fs::FileType) -> bool {
+        use rustix::fs::FileType;
+        let in_tree = |tree: &String| {
+            path.strip_prefix(tree.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
+        if self.paths.contains(path) || self.trees.iter().any(in_tree) {
+            return true;
+        }
+        if !self.presets {
+            return false;
+        }
+        let units = "etc/systemd/system";
+        let unit = path
+            .strip_prefix(units)
+            .and_then(|rest| rest.strip_prefix('/'));
+        match (kind, unit) {
+            (FileType::Directory, _) if path == "etc/systemd" || path == units => true,
+            (FileType::Directory, Some(unit))
+                if !unit.contains('/')
+                    && [".wants", ".requires", ".upholds"]
+                        .iter()
+                        .any(|suffix| unit.ends_with(suffix)) =>
+            {
+                true
+            }
+            // `systemctl preset` links each enabled unit and alias to its
+            // vendor unit by absolute path.
+            (FileType::Symlink, Some(_)) => rustix::fs::readlinkat(entry, "", Vec::new())
+                .ok()
+                .and_then(|target| target.into_string().ok())
+                .and_then(|target| {
+                    target
+                        .strip_prefix("/usr/lib/systemd/system/")
+                        .map(|name| !name.is_empty() && !name.contains('/'))
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
 }
 
 fn unit_overridden(root: &Root, runtime: Option<&Root>, unit: &str) -> Result<bool> {
@@ -790,6 +1140,67 @@ mod tests {
         assert!(services(&[], &["app.service"]).check_jobs(&abort).is_err());
         assert!(services(&[], &[]).check_jobs(&forward).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn tmpfiles_rules_cannot_reach_excluded_trees_through_symlinks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let top = dir.path();
+        fs::create_dir_all(top.join("usr/lib/sysimage/cps"))?;
+        fs::create_dir_all(top.join("usr/share/factory"))?;
+        fs::create_dir_all(top.join("var"))?;
+        fs::create_dir_all(top.join("etc"))?;
+        std::os::unix::fs::symlink("usr/lib", top.join("lib"))?;
+        std::os::unix::fs::symlink("var/srv", top.join("srv"))?;
+        std::os::unix::fs::symlink("/var/opt", top.join("opt"))?;
+        std::os::unix::fs::symlink("../var/log/app.log", top.join("etc/app.log"))?;
+        let root = Root::open(top)?;
+        let rules = "# kept\n\
+            d /etc/example 0755 - - -\n\
+            L /etc/app.log - - - - /var/log/app.log\n\
+            L /etc/cache - - - - /var/cache\n\
+            d /var/lib/example 0755 - - -\n\
+            d /lib/sysimage/cps/stage 0755 - - -\n\
+            d /srv/www 0755 - - -\n\
+            d /opt/app 0755 - - -\n\
+            f /etc/app.log 0644 - - -\n\
+            d /etc/cache/app 0755 - - -\n\
+            d %S/app 0755 - - -\n\
+            d /etc/%m 0755 - - -\n";
+        let kept = filter_tmpfiles(&root, rules, false)?;
+        assert_eq!(
+            kept,
+            "# kept\nd /etc/example 0755 - - -\nL /etc/app.log - - - - /var/log/app.log\n\
+             L /etc/cache - - - - /var/cache\nd /etc/%m 0755 - - -\n"
+        );
+
+        // A running root keeps /var, and still never writes the CPS state.
+        let kept = filter_tmpfiles(&root, rules, true)?;
+        assert!(kept.contains("d /srv/www") && kept.contains("d /etc/cache/app"));
+        assert!(!kept.contains("sysimage"));
+
+        // A copy that creates a tree hides where the paths inside it lead.
+        let error =
+            filter_tmpfiles(&root, "C /etc/tree\nd /etc/tree/sub 0755 - - -\n", false).unwrap_err();
+        assert!(error.to_string().contains("inside the tree"), "{error}");
+        fs::create_dir(top.join("etc/tree"))?;
+        filter_tmpfiles(&root, "C /etc/tree\nd /etc/tree/sub 0755 - - -\n", false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tmpfiles_paths_must_be_plain() {
+        for rule in [
+            "d /etc/../var/x 0755",
+            "d /etc/./x 0755",
+            "d etc/x 0755",
+            "d \"/etc/a b\" 0755",
+            "d /etc/a\\x20b 0755",
+            "d",
+        ] {
+            assert!(super::validate_tmpfiles(rule.as_bytes()).is_err(), "{rule}");
+        }
+        super::validate_tmpfiles(b"d %S/app 0755\nd /etc/%m\n").unwrap();
     }
 
     #[test]
