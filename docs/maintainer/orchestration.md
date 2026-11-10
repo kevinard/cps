@@ -150,10 +150,11 @@ Repeat `--toolchain-catalog PUBLISHER=SHA256` for each publisher to move.
 CPS finds recipes the same way as `build-order` and changes only the
 `catalog` property of matching `publisher` entries in toolchain blocks. It
 edits the text in place, so comments, spacing, and other properties stay as
-written, and it confirms the parsed result before writing each file. A pin
-spelled in a form it cannot rewrite exactly is an error. A placeholder such
-as `@CATALOG_SHA256@` is left for the template. Each file is replaced
-atomically and keeps its permissions. `--dry-run` writes nothing and prints
+written, and it confirms the parsed result of every file before writing
+any of them. A pin spelled in a form it cannot rewrite exactly is an error,
+and then no recipe changes. A placeholder such as `@CATALOG_SHA256@` is
+left for the template. Each file is replaced atomically and keeps its
+permissions. `--dry-run` writes nothing and prints
 `would repin` in place of `repinned`.
 
 A repinned recipe has a new digest, which the output prints for concrete

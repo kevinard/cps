@@ -708,6 +708,9 @@ pub fn repin_recipes(paths: &[PathBuf], pins: &[String], dry_run: bool) -> Resul
         "repin needs at least one --toolchain-catalog"
     );
     let mut changes = Vec::new();
+    // Every rewrite is computed and validated before any recipe changes, so
+    // one recipe that repin cannot rewrite leaves the whole tree as it was.
+    let mut writes = Vec::new();
     for path in discover(paths)? {
         let text = read_text(&path, RECIPE_LIMIT)?;
         let pins = toolchain_pins(&parse_document(&path, RECIPE_LIMIT)?);
@@ -762,9 +765,6 @@ pub fn repin_recipes(paths: &[PathBuf], pins: &[String], dry_run: bool) -> Resul
                 .with_context(|| format!("validating repinned {}", path.display()))?;
             Some(digest(output.as_bytes()))
         };
-        if !dry_run {
-            write_replacing(&path, output.as_bytes())?;
-        }
         changes.extend(rewritten.into_iter().map(|(publisher, from, to)| Repin {
             recipe: path.clone(),
             publisher,
@@ -772,6 +772,12 @@ pub fn repin_recipes(paths: &[PathBuf], pins: &[String], dry_run: bool) -> Resul
             to: to.to_owned(),
             recipe_sha256: recipe_sha256.clone(),
         }));
+        writes.push((path, output));
+    }
+    if !dry_run {
+        for (path, output) in writes {
+            write_replacing(&path, output.as_bytes())?;
+        }
     }
     Ok(changes)
 }
@@ -881,6 +887,27 @@ mod tests {
         assert!(
             repin_recipes(&[dir.path().to_owned()], &[format!("seed={new}")], false)?.is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn repin_changes_nothing_when_one_recipe_cannot_be_rewritten() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        recipe(dir.path(), "app", "cc", "")?;
+        recipe(dir.path(), "zzz", "cc", "")?;
+        let good = dir.path().join("app.build.kdl.in");
+        let bad = dir.path().join("zzz.build.kdl.in");
+        let before = fs::read_to_string(&good)?;
+        // A pin split over two lines is a form that repin does not rewrite.
+        let split = fs::read_to_string(&bad)?.replace(" catalog=", " \\\n            catalog=");
+        fs::write(&bad, &split)?;
+        let new = "1".repeat(64);
+        let error = repin_recipes(&[dir.path().to_owned()], &[format!("seed={new}")], false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("edit it by hand"), "{error}");
+        assert_eq!(fs::read_to_string(&good)?, before);
+        assert_eq!(fs::read_to_string(&bad)?, split);
         Ok(())
     }
 
