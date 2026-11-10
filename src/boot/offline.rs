@@ -425,10 +425,10 @@ fn root_registration(text: &str) -> Result<Option<String>> {
             if let Some(value) = line.strip_prefix("name: ") {
                 name = Some(value);
             } else if let Some(value) = line.strip_prefix("data ") {
-                if name == Some(super::btrfs_boot::REGISTRATION) {
-                    if found.replace(value.to_owned()).is_some() {
-                        bail!("duplicate boot registration in the root subvolume");
-                    }
+                if name == Some(super::btrfs_boot::REGISTRATION)
+                    && found.replace(value.to_owned()).is_some()
+                {
+                    bail!("duplicate boot registration in the root subvolume");
                 }
                 break;
             }

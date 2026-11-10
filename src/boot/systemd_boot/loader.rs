@@ -113,8 +113,10 @@ pub(super) fn running_version(efivars: &Path) -> Result<Option<LoaderVersion>> {
     let units: Vec<u16> = bytes
         .get(4..)
         .unwrap_or_default()
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .take_while(|unit| *unit != 0)
         .collect();
     let info = String::from_utf16(&units).context("LoaderInfo is not UTF-16")?;
