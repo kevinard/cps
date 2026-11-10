@@ -113,6 +113,13 @@ fn first_rule<'a>(template: &'a Template, path: &str) -> Option<&'a CollectRule>
         .find(|rule| pattern::matches(&rule.pattern, path))
 }
 
+fn shared_directory(first: &Action, second: &Action) -> Result<bool> {
+    Ok(
+        matches!((first, second), (Action::Dir { .. }, Action::Dir { .. }))
+            && first.node()? == second.node()?,
+    )
+}
+
 /// The first collected path of an inode, which later collected paths of the
 /// same inode may hard-link to.
 struct LinkTarget {
@@ -132,18 +139,24 @@ pub(crate) fn expand(
     tree: &Tree,
 ) -> Result<Vec<Manifest>> {
     let name = |index: usize| &templates[index].manifest.name;
-    let mut explicit = BTreeMap::<&str, usize>::new();
+    let mut explicit = BTreeMap::<&str, (usize, &Action)>::new();
     for (index, template) in templates.iter().enumerate() {
         for action in &template.manifest.action {
             let path = action.path();
-            if let Some(&other) = explicit.get(path).filter(|&&other| other != index) {
+            if let Some(&(other, existing)) =
+                explicit.get(path).filter(|(other, _)| *other != index)
+            {
+                // Packages may share a directory that they declare with the same metadata.
+                if shared_directory(existing, action)? {
+                    continue;
+                }
                 bail!(
                     "{path} belongs to both {} and {}; a path may belong to only one output",
                     name(other),
                     name(index)
                 );
             }
-            explicit.insert(path, index);
+            explicit.insert(path, (index, action));
             if matches!(action, Action::File { .. }) {
                 ensure!(
                     matches!(tree.get(path), Some(Entry::File { .. })),
@@ -652,6 +665,43 @@ package "runtime/libcc" publisher="canopa" {
     }
 
     #[test]
+    fn outputs_may_share_identical_directories() -> Result<()> {
+        let recipe = recipe("");
+        let template = |name: &str, dir: &str| {
+            parse_template(
+                &format!(
+                    "schema-version 1 kind=\"package-manifest\"\npackage \"{name}\" publisher=\"canopa\" {{\n    {dir}\n    collect \"usr/lib/{name}/**\"\n}}\n"
+                ),
+                &recipe,
+            )
+            .unwrap()
+        };
+        let tree = Tree::from([
+            ("usr/lib/a/x".into(), file(false, 1)),
+            ("usr/lib/b/y".into(), file(false, 2)),
+        ]);
+        let shared = "dir \"usr/lib/plugins\" mode=\"0755\" uid=0 gid=0";
+        let templates = [template("a", shared), template("b", shared)];
+        let outputs = expand(&templates, &[], &tree)?;
+        for (template, output) in templates.iter().zip(&outputs) {
+            assert_eq!(output.action[0].path(), "usr/lib/plugins");
+            check_expansion(template, output, false)?;
+        }
+        let templates = [
+            template("a", shared),
+            template("b", &shared.replace("0755", "0750")),
+        ];
+        let message = format!("{:#}", expand(&templates, &[], &tree).unwrap_err());
+        assert!(message.contains("belongs to both a and b"), "{message}");
+        let templates = [
+            template("a", shared),
+            template("b", "symlink \"usr/lib/plugins\" target=\"x\" uid=0 gid=0"),
+        ];
+        assert!(expand(&templates, &[], &tree).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn hard_link_aliases_keep_their_own_collect_rule() -> Result<()> {
         let recipe = recipe("");
         let template = |rules: &str| {
@@ -688,9 +738,8 @@ package "runtime/libcc" publisher="canopa" {
         check_expansion(&state, output, false)?;
 
         // A setuid alias keeps its mode.
-        let helper = template(
-            "    collect \"usr/bin/*\"\n    collect \"usr/sbin/helper\" mode=\"4755\"\n",
-        );
+        let helper =
+            template("    collect \"usr/bin/*\"\n    collect \"usr/sbin/helper\" mode=\"4755\"\n");
         let tree = Tree::from([
             ("usr/bin/x".into(), file(true, 2)),
             ("usr/sbin/helper".into(), file(true, 2)),
