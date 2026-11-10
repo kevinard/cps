@@ -109,6 +109,23 @@ remaining triggers, and a trigger interrupted before CPS journaled its
 success runs again. Rebuild every output from the image's current files, as
 cache tools do, and remove outputs that no longer have inputs.
 
+Aborting a transaction regenerates outputs too. After `transaction abort`
+restores the files, CPS plans the triggers of the change from the pending
+packages back to the committed ones and runs them with the same rules:
+
+- a trigger whose watched paths the abort restores runs again over the
+  restored files,
+- the outputs of a trigger that the transaction added are removed, and
+- a trigger that the transaction removed runs again for its restored
+  package.
+
+A handler can therefore run on files that it already processed, or after
+its own outputs were removed. The abort journals each finished trigger, so
+an abort that a failing or interrupted handler stops runs only the
+remaining triggers when `transaction abort` or `transaction resume`
+finishes it. If one of these triggers regenerates the initramfs of the
+committed kernel, the abort also prepares that kernel again.
+
 ## Common triggers
 
 | Cache | Handler and arguments | Watch | Output |
@@ -175,6 +192,6 @@ A trigger whose outputs can cover a boot-sensitive path, such as
 Live changes report that staging is required.
 
 Run [`tests/triggers.sh`](../../tests/triggers.sh) after `cargo build` to
-exercise ordering, confinement, recovery, removal, and a generated
+exercise ordering, confinement, recovery, aborts, removal, and a generated
 initramfs. [`tests/hwdb-trigger.sh`](../../tests/hwdb-trigger.sh) runs the
 hardware database trigger with the host's `systemd-hwdb`.
