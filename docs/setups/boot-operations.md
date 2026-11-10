@@ -37,7 +37,7 @@ Each line shows one environment, newest first.
 | `STATUS` | `known-good`, `trial (N left)` for a trial with N boot attempts left, `exhausted` for a failed trial, or `retiring` for an environment whose removal was interrupted. |
 | `ID` | `cps-IMAGE-REVISION`, from the root's image identity and revision. |
 | `ROOT` | The root partition's PARTUUID. When any entry selects a Btrfs root by filesystem UUID, the column shows `UUID=` or `PARTUUID=` before each identifier. |
-| `TITLE` | The entry title, which includes the Linux release for manifest-managed kernels. |
+| `TITLE` | The entry title, which includes the Linux release for manifest-managed kernels. A [backup](btrfs.md#backups-before-live-changes) of a running Btrfs root is titled `Canopa backup`. |
 
 CPS entries declare their metadata format with `# cps-boot-entry-version 1`
 and record SHA-256 digests of their boot files. CPS checks those files before
@@ -71,7 +71,10 @@ and extend it with readiness checks as described in
 
 On a running Btrfs system, while a trial is selected for the next boot,
 system package commands such as `cps install` refuse to change the running
-root. Boot the trial, or cancel it with `cps boot-env discard-trial`.
+root. Boot the trial, or cancel it with `cps boot-env discard-trial`. When
+the running system shuts down cleanly, `cps-finalize-trial.service`
+[merges the `/etc` changes](btrfs.md#merging-etc-at-shutdown) made since
+staging into the trial.
 
 ## Roll back
 
@@ -103,8 +106,9 @@ the digests in its entry, then checks the root itself.
   access to the ESP. For a detached ESP directory, the operator supplies the
   partition mapping.
 
-Rollback then writes the target as `default` in `loader.conf` and removes any
-`preferred` trial selection. With direct UEFI boot, it instead cancels a
+A read-only Btrfs [backup](btrfs.md#backups-before-live-changes) becomes
+writable when rollback selects it. Rollback then writes the target as
+`default` in `loader.conf` and removes any `preferred` trial selection. With direct UEFI boot, it instead cancels a
 pending `BootNext`, marks that trial as exhausted, and moves the target to the
 front of `BootOrder`. Rollback keeps every environment and its files.
 
