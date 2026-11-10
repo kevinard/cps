@@ -119,7 +119,7 @@ fn payload_declarations(
             return Ok(None);
         }
         file.rewind()?;
-        elf::inspect(file, digest.size, &digest.sha256)
+        elf::inspect_loadable(file, digest.size, &digest.sha256)
     })?
     .declarations()
 }
@@ -428,6 +428,39 @@ mod tests {
             declarations.requires.keys().collect::<Vec<_>>(),
             ["cap/elf/x86_64/libwide.so.1"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unparseable_elf_payloads_are_data() -> Result<()> {
+        let manifest = manifest("    file \"usr/lib/libbroken.so.1\" mode=\"0644\" uid=0 gid=0\n");
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("payload");
+        let bytes = b"\x7fELF\x02\x01\x01 truncated fixture";
+        std::fs::write(&path, bytes)?;
+        let artifacts = BTreeMap::from([(
+            "usr/lib/libbroken.so.1".to_owned(),
+            FileDigest {
+                sha256: crate::model::digest(bytes),
+                size: bytes.len() as u64,
+            },
+        )]);
+        assert!(
+            elf::inspect(
+                File::open(&path)?,
+                bytes.len() as u64,
+                &artifacts["usr/lib/libbroken.so.1"].sha256
+            )
+            .is_err()
+        );
+        let published =
+            published_manifest(manifest.clone(), &artifacts, |_, _| Ok(File::open(&path)?))?;
+        assert!(published.provides.is_empty() && published.dependency.is_empty());
+
+        // The payload must still match its digest.
+        let mut wrong = artifacts.clone();
+        wrong.get_mut("usr/lib/libbroken.so.1").unwrap().sha256 = "0".repeat(64);
+        assert!(published_manifest(manifest, &wrong, |_, _| Ok(File::open(&path)?)).is_err());
         Ok(())
     }
 

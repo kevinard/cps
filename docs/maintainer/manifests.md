@@ -331,7 +331,10 @@ the same declarations.
 Only actions without a facet or variant take part. The package-level
 architecture counts as unconditional, so `arch="x86_64"` on an action in an
 `x86_64` package does too. Content that a facet or variant selects neither
-provides nor requires a capability.
+provides nor requires a capability. A file that starts with the ELF magic
+but does not parse as an ELF executable or shared object, such as a
+malformed test fixture, is data and takes no part either. `cps manifest
+dependencies` reports such files as diagnostics.
 
 Preview the declarations for a manifest and its prototype tree. Each
 requirement is followed by a comment listing the files that need it.

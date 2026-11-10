@@ -78,7 +78,8 @@ fn prototype_elf(root: &Root, path: &str) -> Result<Option<elf::Elf>> {
     let mut file = root.file(path)?;
     let mut prefix = Vec::new();
     file.by_ref().take(5).read_to_end(&mut prefix)?;
-    elf::inspect_header(&mut file, &prefix)
+    // The same rule as publication, which treats an unparseable ELF file as data.
+    elf::loadable_header(&mut file, &prefix)
 }
 
 fn inspect_dependencies(
