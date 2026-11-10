@@ -2909,6 +2909,15 @@ impl Publication {
     /// catalog keys in the repository's newest trust root version.
     fn open(repo: &Path, keys: &(impl KeySpecs + ?Sized)) -> Result<Self> {
         let signers = Signers::open(keys)?;
+        let trust = Self::read_trust(repo, &signers)?;
+        Ok(Self {
+            anchor: trust.genesis_bytes()?,
+            signers,
+            trust,
+        })
+    }
+
+    fn read_trust(repo: &Path, signers: &Signers) -> Result<trust::Store> {
         let trust = trust::Store::read(repo)?.with_context(|| {
             format!(
                 "repository {} has no publisher trust root; create one with `cps repo trust init`",
@@ -2929,11 +2938,19 @@ impl Publication {
             current.catalog_threshold,
             keys.len()
         );
-        Ok(Self {
-            anchor: trust.genesis_bytes()?,
-            signers,
-            trust,
-        })
+        Ok(trust)
+    }
+
+    /// Re-read the trust root history while the caller holds the repository
+    /// lock. Trust root changes take the same lock, so a key revoked after
+    /// `open` cannot sign under the history it was loaded with.
+    fn locked_trust(&self, repo: &Path) -> Result<trust::Store> {
+        let trust = Self::read_trust(repo, &self.signers)?;
+        ensure!(
+            trust.genesis_bytes()? == self.anchor,
+            "repository trust root changed while publishing"
+        );
+        Ok(trust)
     }
 
     fn anchor(&self) -> &[u8] {
@@ -3369,6 +3386,7 @@ fn save_catalog(
     write_catalog_document(repo, catalog, key, mode)
 }
 
+/// Sign and store a catalog. The caller holds the repository lock.
 fn write_catalog_document(
     repo: &Path,
     mut catalog: Catalog,
@@ -3378,7 +3396,8 @@ fn write_catalog_document(
     catalog.rename_targets()?;
     catalog.check_source_archives()?;
     catalog.sequence = catalog.next_sequence()?.get();
-    let current = key.trust.verified.current();
+    let trust = key.locked_trust(repo)?;
+    let current = trust.verified.current();
     ensure!(
         current.publisher == catalog.publisher,
         "repository trust root belongs to publisher {}, not {}",
@@ -3388,10 +3407,10 @@ fn write_catalog_document(
     current.check_unexpired()?;
     // The new catalog carries the repository's whole trust root history,
     // which must extend the history of the catalog it replaces.
-    catalog.trust.check_successor(&key.trust.chain)?;
-    catalog.trust = key.trust.chain.clone();
-    catalog.trust_keys = key.keys();
-    catalog.trust_genesis = key.trust.verified.genesis().to_owned();
+    catalog.trust.check_successor(&trust.chain)?;
+    catalog.trust_keys = trust.verified.keys();
+    catalog.trust_genesis = trust.verified.genesis().to_owned();
+    catalog.trust = trust.chain;
     catalog.validate_profile_build_trust()?;
     prepare_objects(repo)?;
     let root = catalog.commit(repo)?;
@@ -3659,6 +3678,39 @@ mod tests {
         )?;
         let path = init_trust(repo, publisher, &key, None)?;
         Ok((Publication::open(repo, &key)?, read_trust_root(&path)?))
+    }
+
+    #[test]
+    fn publications_recheck_the_trust_root_under_the_repository_lock() -> Result<()> {
+        let keys = trust::tests::Keys::new(2)?;
+        let work = tempfile::tempdir()?;
+        let repo = work.path().join("repo");
+        init_trust(&repo, "canopa", &keys.private(0), None)?;
+        // A publication loads its keys before it takes the repository lock.
+        let stale = Publication::open(&repo, &keys.private(0))?;
+        rotate_trust(
+            &repo,
+            &TrustDraft {
+                catalog_keys: &[keys.public(1)],
+                ..TrustDraft::default()
+            },
+            &keys.private(0),
+        )?;
+        let error = write_catalog(&repo, Catalog::empty("canopa"), &stale).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a catalog key of trust root version 2"),
+            "{error:#}"
+        );
+        assert!(!repo.join("current").exists());
+        let hash = write_catalog(
+            &repo,
+            Catalog::empty("canopa"),
+            &Publication::open(&repo, &keys.private(1))?,
+        )?;
+        let pinned = fs::read(trust_root_path(&repo, 1))?;
+        let catalog = read_catalog(&repo, &hash, "canopa", &pinned)?;
+        assert_eq!(catalog.trust.versions().len(), 2);
+        Ok(())
     }
 
     #[test]
