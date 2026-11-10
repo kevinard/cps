@@ -957,19 +957,26 @@ fn abort_pending(
         if let Some(kernel) = &inverse.kernel_install {
             kernel.prepare(image, &path, &base.settings)?;
         }
-        // A recovery plan's paths return to the damage it was repairing.
-        let journaled: BTreeSet<&str> = inverse
-            .writes
-            .iter()
-            .map(|write| write.path.as_str())
-            .collect();
+        // Each journaled path is back in its state before the transaction.
+        // That state differs from the committed manifest where the path
+        // had drifted before the transaction replaced it, or where a
+        // recovery plan was repairing it, and the abort keeps that drift
+        // for verify to report rather than rejecting its own result.
+        let mut restored = BTreeSet::new();
+        for write in &inverse.writes {
+            if base.paths.get(&write.path).map(|managed| &managed.node) != write.after.as_ref()
+                && image.root.inspect(&write.path)? == write.after
+            {
+                restored.insert(write.path.as_str());
+            }
+        }
         let records = image.file_records(None)?;
         let checked = check_transaction_state(
             &image.root,
             base,
             Contents::Fingerprints(&records),
             &base.installed,
-            |path| !plan.is_recovery() || !journaled.contains(path),
+            |path| !restored.contains(path),
         )?;
         if let Some(finding) = checked.errors().next() {
             anyhow::bail!(

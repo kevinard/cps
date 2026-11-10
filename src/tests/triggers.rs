@@ -219,6 +219,61 @@ fn package_paths_and_overlapping_outputs_conflict() -> Result<()> {
 }
 
 #[test]
+fn outputs_beneath_symlinks_are_refused_or_skipped() -> Result<()> {
+    let f = Fixture::new()?;
+    let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
+    f.package(
+        "base/merged",
+        "1.0.0-0",
+        format!("    dir \"usr/lib\" mode=\"0755\" uid={uid} gid={gid}\n")
+            + &format!("    symlink \"lib\" target=\"usr/lib\" uid={uid} gid={gid}\n"),
+    )?;
+    f.package(
+        "test/linked",
+        "1.0.0-0",
+        handler(&f, "usr/libexec/linked")?
+            + &trigger(
+                "cache",
+                "        run \"usr/libexec/linked\"\n        watch \"usr/share/linked/*\"\n        output \"lib/foo/cache\"\n",
+            ),
+    )?;
+    f.package(
+        "test/opt",
+        "1.0.0-0",
+        format!("    dir \"opt\" mode=\"0755\" uid={uid} gid={gid}\n")
+            + &handler(&f, "usr/libexec/opt")?
+            + &trigger(
+                "cache",
+                "        run \"usr/libexec/opt\"\n        watch \"usr/share/opt/*\"\n        output \"opt/app/cache\"\n",
+            ),
+    )?;
+    f.create()?;
+    apply(&f.root, &install_plan(&f.root, &["base/merged"])?)?;
+    // A managed symlink in an output's directories refuses the plan.
+    let error = install_plan(&f.root, &["test/linked"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(
+            "trigger test/linked:cache output lib/foo/cache lies beneath the symbolic link lib"
+        ),
+        "{error:#}"
+    );
+
+    // An unmanaged symlink fails the handler, and the abort still finishes.
+    fs::create_dir(f.root.join("opt"))?;
+    std::os::unix::fs::symlink("../usr/lib", f.root.join("opt/app"))?;
+    let install = install_plan(&f.root, &["test/opt"])?;
+    let error = apply(&f.root, &install).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("opt/app is not a directory"),
+        "{error:#}"
+    );
+    assert_eq!(crate::abort_transaction(&f.root, false)?, Some(1));
+    assert!(crate::transaction_status(&f.root)?.pending.is_none());
+    assert!(fs::symlink_metadata(f.root.join("opt/app"))?.is_symlink());
+    Ok(())
+}
+
+#[test]
 fn trigger_cycles_are_rejected() -> Result<()> {
     let f = Fixture::new()?;
     for (name, watch, output) in [

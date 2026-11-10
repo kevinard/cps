@@ -509,6 +509,14 @@ pub(crate) fn check_conflicts(
         })
         .collect();
     for (index, &((package, name), output)) in outputs.iter().enumerate() {
+        // Handlers write, and CPS publishes and removes, outputs without
+        // following symlinks, so an output's directories must be real.
+        if let Some(link) = linked_ancestor(output, paths) {
+            bail!(
+                "trigger {package}:{name} output {output} lies beneath the symbolic link {link}; \
+                 declare the output at the link's target instead"
+            );
+        }
         let prefix = literal_prefix(output);
         let nested = format!("{prefix}/");
         let end = format!("{prefix}0");
@@ -540,6 +548,17 @@ pub(crate) fn check_conflicts(
         }
     }
     Ok(())
+}
+
+/// A managed symlink among the literal directories that hold an output.
+fn linked_ancestor<'a>(output: &str, paths: &'a BTreeMap<String, Managed>) -> Option<&'a str> {
+    let parts: Vec<_> = output.split('/').collect();
+    (1..parts.len())
+        .take_while(|&end| !wildcard(parts[end - 1]))
+        .find_map(|end| {
+            let (path, managed) = paths.get_key_value(parts[..end].join("/").as_str())?;
+            matches!(managed.node, Node::Symlink { .. }).then_some(path.as_str())
+        })
 }
 
 fn check_cycles(edges: &BTreeMap<Key<'_>, BTreeSet<Key<'_>>>) -> Result<()> {

@@ -132,6 +132,55 @@ fn directory_becomes_a_symlink_in_a_transaction_with_triggers() -> Result<()> {
     assert_merged(&f.root)
 }
 
+#[test]
+fn abort_restores_paths_that_drifted_before_the_transaction() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new()?;
+    let release = |version: &str, link: &str| -> Result<String> {
+        Ok(f.file("usr/bin/x", &format!("x {version}"), "0755", "")?
+            + &symlink_action("usr/bin/y", link))
+    };
+    f.package("app/x", "1.0.0-0", release("1", "x")?)?;
+    f.package(
+        "app/watch",
+        "1.0.0-0",
+        "    trigger \"tools\" {\n        watch \"usr/bin/*\"\n        reload \"example.service\"\n    }\n".to_owned(),
+    )?;
+    f.create()?;
+    install_all(&f.root, &["app/x", "app/watch"])?;
+    f.package("app/x", "2.0.0-0", release("2", "x2")?)?;
+    let x = f.root.join("usr/bin/x");
+    let y = f.root.join("usr/bin/y");
+    fs::set_permissions(&x, fs::Permissions::from_mode(0o700))?;
+    fs::remove_file(&y)?;
+    std::os::unix::fs::symlink("local", &y)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(!update.triggers.is_empty());
+    let assert_drifted = || -> Result<()> {
+        assert_eq!(fs::read_to_string(&x)?, "x 1");
+        assert_eq!(fs::metadata(&x)?.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(fs::read_link(&y)?, Path::new("local"));
+        let findings = verify(&f.root)?;
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(crate::transaction_status(&f.root)?.pending.is_none());
+        Ok(())
+    };
+    // The abort returns both paths to their drifted state before the
+    // transaction, whether it finishes at once or is interrupted.
+    interrupt_step(&f, &update, "triggers", false, false)?;
+    assert_eq!(abort_transaction(&f.root, false)?, Some(1));
+    assert_drifted()?;
+    interrupt_step(&f, &update, "triggers", false, false)?;
+    interrupt_step(&f, &update, "abort-retired", false, true)?;
+    assert_eq!(resume_transaction(&f.root)?, Some(1));
+    assert_drifted()?;
+    // Applying the update replaces the drifted paths.
+    assert_eq!(apply(&f.root, &update)?, 2);
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
 fn assert_split(root: &Path) -> Result<()> {
     assert!(fs::symlink_metadata(root.join("bin"))?.is_dir());
     assert_eq!(fs::read_to_string(root.join("bin/tool"))?, "tool 1");

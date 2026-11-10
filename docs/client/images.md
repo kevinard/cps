@@ -242,6 +242,10 @@ links hard link aliases to their restored targets, copies moved or adjusted
 local configuration back from where the transaction put it, and removes
 vendor proposals staged under `config-updates`. Completed transitions between
 directories and files or symlinks are undone the same way they were made.
+A path that already differed from its manifest when the transaction was
+planned, such as a file whose mode was changed locally, returns to that
+local state rather than to its manifest. `verify` then reports it as it did
+before the transaction, and `repair` restores it.
 
 Abort then runs the systemd actions and triggers of the change back to the
 committed packages. A trigger whose watched paths the abort restores runs
@@ -286,8 +290,10 @@ only `transaction abort --fetch` downloads missing payloads.
 Each restored path is checked against both its state after and before the
 transaction, so finishing an abort is idempotent. Each trigger that the
 abort finished is journaled, so a failing or interrupted handler leaves the
-abort pending, and finishing it runs only the remaining triggers. If the
-final check finds a path in neither state, abort reports
+abort pending, and finishing it runs only the remaining triggers. After its
+actions, abort checks every managed path: each journaled path against its
+state before the transaction, and every other path against the committed
+manifests. If a path matches neither, abort reports
 `aborting left an inconsistent image`; correct that path and abort again.
 
 ### What abort cannot undo
