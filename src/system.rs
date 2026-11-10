@@ -1131,7 +1131,10 @@ impl System {
 }
 
 /// Ask systemd to merge /etc into the activated trial at shutdown.
-fn arm_finalize() {
+///
+/// The merge only runs for a trial whose fallback is the running root, so
+/// the request is harmless elsewhere, such as on an installer.
+pub fn arm_finalize() {
     let result = fs::create_dir_all("/run/cps").and_then(|()| fs::write(FINALIZE_FLAG, b""));
     if let Err(error) = result {
         eprintln!(

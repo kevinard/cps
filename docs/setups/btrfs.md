@@ -264,8 +264,8 @@ trial is accepted, or coordinate its backup and restore with the application.
 
 A trial is a snapshot taken when the change is staged. Staging records the
 snapshot's `/etc`, before the plan changes it, as the merge base in the
-trial's image state. After CPS selects the trial on the running system, it
-creates `/run/cps/finalize-trial`, and `cps-finalize-trial.path` starts
+trial's image state. After a system command or `boot-env activate-btrfs`
+selects the trial, CPS creates `/run/cps/finalize-trial`, and `cps-finalize-trial.path` starts
 `cps-finalize-trial.service`. When the system shuts down, stopping that
 service runs `cps boot-env finalize-trial`. The command finds the trial
 selected for the next boot whose fallback is the running root, takes the

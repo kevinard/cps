@@ -4041,6 +4041,9 @@ fn run(command: Command) -> Result<ExitCode> {
                 } else {
                     activation.activate_btrfs(&root, &btrfs_volume, &esp)?
                 };
+                if !known_good {
+                    system::arm_finalize();
+                }
                 println!("Activated {id}");
             }
             BootCommand::BlessUefi { config } => {
