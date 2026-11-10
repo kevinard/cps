@@ -1,7 +1,10 @@
 pub(crate) mod cgroup;
+pub(crate) mod expand;
+pub(crate) mod pattern;
 mod sandbox;
 pub(crate) mod snapshot;
 pub(crate) mod sources;
+mod strip;
 pub use snapshot::{GitSnapshotRef, prepare_git_snapshot, prepare_git_snapshot_ref};
 
 use std::{
@@ -26,10 +29,13 @@ use crate::{
     image::{Installed, Managed, root::Root},
     kdl_format::{
         PublisherConfig,
-        build::{BuildRecipe, PublisherPin, read, read_toolchain_config, read_with_options},
-        parse_manifest,
+        build::{
+            BuildRecipe, PublisherPin, Template, TemplatePin, parse_template, read,
+            read_toolchain_config, read_with_options,
+        },
+        manifest_text,
     },
-    model::{FileDigest, Node, digest, digest_reader},
+    model::{FileDigest, Manifest, Node, digest, digest_reader},
     plan::{CandidateSet, Candidates, resolve_packages, select_paths},
     repo::{
         MANIFEST_LIMIT, read_key, read_limited, read_signing_key,
@@ -75,7 +81,30 @@ pub struct BuildWorker {
     pub(crate) file_bytes: u64,
     pub(crate) output_bytes: u64,
     pub(crate) log_bytes: u64,
+    /// Parallel jobs for the build script; by default the usable CPUs.
+    pub(crate) jobs: Option<u32>,
     pub(crate) cgroup: Option<cgroup::CgroupLimits>,
+}
+
+impl BuildWorker {
+    /// The job count exported as `CPS_BUILD_JOBS` and `MAKEFLAGS`. Without a
+    /// configured count, CPS uses the CPUs available to this process, capped
+    /// by the cgroup CPU quota.
+    pub(crate) fn jobs(&self) -> u32 {
+        self.jobs.unwrap_or_else(|| {
+            let cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
+            let quota = self.cgroup.as_ref().map_or(usize::MAX, |limits| {
+                (limits.cpu_percent as usize).div_ceil(100)
+            });
+            u32::try_from(cpus.min(quota).clamp(1, 1024)).unwrap_or(1)
+        })
+    }
+}
+
+/// A different job count for the repeated build, so that output that depends on
+/// parallelism fails the reproducibility check.
+fn check_jobs(jobs: u32) -> u32 {
+    if jobs > 1 { jobs.div_ceil(2) } else { 2 }
 }
 
 impl Default for BuildWorker {
@@ -86,6 +115,7 @@ impl Default for BuildWorker {
             file_bytes: 8 << 30,
             output_bytes: 16 << 30,
             log_bytes: 16 << 20,
+            jobs: None,
             cgroup: None,
         }
     }
@@ -106,7 +136,7 @@ pub fn build(
     sources: &Path,
     output: &Path,
     check_reproducible: bool,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     build_package(
         recipe_path,
         BuildOptions {
@@ -121,7 +151,7 @@ pub fn build(
     )
 }
 
-pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<String> {
+pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<Vec<String>> {
     build_with_worker(
         recipe_path,
         options,
@@ -131,7 +161,7 @@ pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<St
 }
 
 /// Build offline using pinned objects from a source cache.
-pub fn build_cached_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<String> {
+pub fn build_cached_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<Vec<String>> {
     build_with_worker(
         recipe_path,
         options,
@@ -145,7 +175,7 @@ pub fn build_with_worker(
     options: BuildOptions<'_>,
     layout: SourceLayout,
     worker: &BuildWorker,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     build_with_recipe_options(
         recipe_path,
         BuildToolchain::Single {
@@ -172,7 +202,7 @@ pub fn build_with_toolchain_config(
     settings: BuildSettings<'_>,
     layout: SourceLayout,
     worker: &BuildWorker,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     build_with_recipe_options(
         recipe_path,
         BuildToolchain::Config(config),
@@ -184,6 +214,7 @@ pub fn build_with_toolchain_config(
 }
 
 /// Override named recipe options and record their effective values in the bundle.
+/// Returns the IDs of the packages that the build produced.
 pub fn build_with_recipe_options(
     recipe_path: &Path,
     location: BuildToolchain<'_>,
@@ -191,7 +222,7 @@ pub fn build_with_recipe_options(
     layout: SourceLayout,
     worker: &BuildWorker,
     overrides: &BTreeMap<String, String>,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     let BuildSettings {
         sources,
         output,
@@ -202,8 +233,7 @@ pub fn build_with_recipe_options(
         builder_signing_key.is_none() || check_reproducible,
         "builder signing requires --check-reproducible"
     );
-    let (recipe_bytes, recipe, manifest_bytes, manifest) = checked_recipe(recipe_path, overrides)?;
-    let paths = manifest.payload_paths();
+    let (recipe_bytes, recipe, templates) = checked_recipe(recipe_path, overrides)?;
 
     let destination = fs::canonicalize(parent(output))?;
     let name = output.file_name().context("missing build output name")?;
@@ -214,43 +244,84 @@ pub fn build_with_recipe_options(
     }
     let work = TempDir::new_in(&destination)?;
     let resolved_toolchain = prepare_workspace(work.path(), sources, location, &recipe, layout)?;
+    let parsed: Vec<_> = templates
+        .iter()
+        .map(|input| input.template.clone())
+        .collect();
 
     let stage = TempDir::new_in(&destination)?;
     let proto = stage.path().join("proto");
     fs::create_dir(&proto)?;
-    let artifacts = run(work.path(), &recipe, worker, &paths, Some(&proto))?;
+    let jobs = worker.jobs();
+    let built = run(work.path(), &recipe, &parsed, worker, jobs, Some(&proto))?;
     if check_reproducible {
-        let repeated = run(work.path(), &recipe, worker, &paths, None)?;
-        for (path, hash) in &artifacts {
+        let repeated = run(
+            work.path(),
+            &recipe,
+            &parsed,
+            worker,
+            check_jobs(jobs),
+            None,
+        )?;
+        for (path, hash) in &built.artifacts {
             ensure!(
-                repeated.get(path) == Some(hash),
+                repeated.artifacts.get(path) == Some(hash),
                 "build is not reproducible for {path}"
             );
         }
+        ensure!(
+            repeated.artifacts.len() == built.artifacts.len(),
+            "build is not reproducible: the repeated build shipped different files"
+        );
+        for (first, second) in built.manifests.iter().zip(&repeated.manifests) {
+            ensure!(
+                first == second,
+                "build is not reproducible: the expanded manifest for {} differs",
+                first.name
+            );
+        }
     }
-    for (name, bytes) in [
-        ("manifest.kdl", &manifest_bytes),
-        ("build.kdl", &recipe_bytes),
-    ] {
-        let path = stage.path().join(name);
+    let mut directories = BTreeSet::new();
+    let mut write = |path: &str, bytes: &[u8]| -> Result<()> {
+        let path = stage.path().join(path);
+        fs::create_dir_all(parent(&path))?;
+        directories.extend(
+            path.ancestors()
+                .skip(1)
+                .take_while(|dir| dir.starts_with(stage.path()) && *dir != stage.path())
+                .map(Path::to_owned),
+        );
         fs::write(&path, bytes)?;
         set_mode(&path, 0o644)?;
-        normalize(&path, recipe.epoch)?;
+        normalize(&path, recipe.epoch)
+    };
+    write("build.kdl", &recipe_bytes)?;
+    for input in &templates {
+        write(&format!("{TEMPLATES}/{}", input.path), &input.bytes)?;
+    }
+    for manifest in &built.manifests {
+        let text = manifest_text(manifest);
+        ensure!(
+            text.len() as u64 <= MANIFEST_LIMIT,
+            "expanded manifest for {} exceeds {MANIFEST_LIMIT} bytes",
+            manifest.name
+        );
+        write(&expanded_manifest_path(&manifest.name), text.as_bytes())?;
     }
     if let Some(key) = builder_signing_key {
         let bytes = attestation::sign(
             &read_signing_key(key)?,
-            &manifest,
-            &manifest_bytes,
+            &built.manifests,
             &recipe,
             &recipe_bytes,
             resolved_toolchain,
-            &artifacts,
+            &built.artifacts,
         )?;
-        let path = stage.path().join("attestation.json");
-        fs::write(&path, bytes)?;
-        set_mode(&path, 0o644)?;
-        normalize(&path, recipe.epoch)?;
+        write("attestation.json", &bytes)?;
+    }
+    for directory in directories.iter().rev() {
+        set_mode(directory, 0o755)?;
+        normalize(directory, recipe.epoch)?;
     }
     normalize(stage.path(), recipe.epoch)?;
     // Flush the complete bundle before moving it into place on the same filesystem.
@@ -264,7 +335,32 @@ pub fn build_with_recipe_options(
         RenameFlags::NOREPLACE,
     )?;
     parent.sync_all()?;
-    Ok(manifest.id())
+    Ok(built.manifests.iter().map(Manifest::id).collect())
+}
+
+/// The bundle directory that holds the recipe's pinned templates at their recipe paths.
+pub(crate) const TEMPLATES: &str = "templates";
+
+/// The bundle path of the expanded manifest for one output package.
+pub(crate) fn expanded_manifest_path(name: &str) -> String {
+    format!("manifests/{name}.kdl")
+}
+
+/// Write explicit manifests into a test bundle as both the pinned templates and
+/// their expansions.
+#[cfg(test)]
+pub(crate) fn write_explicit_outputs(bundle: &Path, manifests: &[(&str, &[u8])]) -> Result<()> {
+    for (path, bytes) in manifests {
+        let name = crate::kdl_format::parse_manifest(std::str::from_utf8(bytes)?)?.name;
+        for path in [
+            bundle.join(TEMPLATES).join(path),
+            bundle.join(expanded_manifest_path(&name)),
+        ] {
+            fs::create_dir_all(parent(&path))?;
+            fs::write(path, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// Run a shell or command with a recipe's verified build inputs.
@@ -277,7 +373,7 @@ pub fn develop(
     worker: &BuildWorker,
     overrides: &BTreeMap<String, String>,
 ) -> Result<ExitStatus> {
-    let (_, recipe, _, _) = checked_recipe(recipe_path, overrides)?;
+    let (_, recipe, _) = checked_recipe(recipe_path, overrides)?;
     let workspace = workspace.map(fs::canonicalize).transpose()?;
     let work = TempDir::new()?;
     if let Some(workspace) = &workspace {
@@ -298,6 +394,7 @@ pub fn develop(
         recipe.epoch,
         &recipe.options,
         worker,
+        worker.jobs(),
         sandbox::Mode::Develop {
             workspace: workspace.as_deref(),
             command,
@@ -308,7 +405,7 @@ pub fn develop(
 fn checked_recipe(
     recipe_path: &Path,
     overrides: &BTreeMap<String, String>,
-) -> Result<(Vec<u8>, BuildRecipe, Vec<u8>, crate::model::Manifest)> {
+) -> Result<(Vec<u8>, BuildRecipe, Vec<TemplateInput>)> {
     ensure!(
         !geteuid().is_root(),
         "package builds require an unprivileged user"
@@ -323,27 +420,61 @@ fn checked_recipe(
         "toolchain architecture {} does not match this build worker",
         recipe.arch
     );
-    let (manifest_bytes, manifest) = read_recipe_manifest(recipe_path, &recipe)?;
-    Ok((recipe_bytes, recipe, manifest_bytes, manifest))
+    let templates = read_templates(&Root::open(parent(recipe_path))?, &recipe)?;
+    Ok((recipe_bytes, recipe, templates))
 }
 
-fn read_recipe_manifest(
-    recipe_path: &Path,
+/// A pinned template with its exact bytes.
+pub(crate) struct TemplateInput {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub template: Template,
+}
+
+/// Read and check every template that a recipe pins, relative to `directory`.
+pub(crate) fn read_templates(directory: &Root, recipe: &BuildRecipe) -> Result<Vec<TemplateInput>> {
+    load_templates(recipe, |pin| {
+        read_limited(directory.file(&pin.path)?, MANIFEST_LIMIT)
+            .with_context(|| format!("reading manifest {}", pin.path))
+    })
+}
+
+/// Check the bytes of every template that a recipe pins.
+pub(crate) fn load_templates(
     recipe: &BuildRecipe,
-) -> Result<(Vec<u8>, crate::model::Manifest)> {
-    let manifest_bytes = read_limited(
-        Root::open(parent(recipe_path))?.file(&recipe.manifest)?,
-        MANIFEST_LIMIT,
-    )?;
-    ensure!(
-        digest(&manifest_bytes) == recipe.manifest_digest,
-        "manifest digest mismatch for {}",
-        recipe.manifest
-    );
-    let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
-    manifest.validate(false)?;
-    manifest.check_architecture(&recipe.arch)?;
-    Ok((manifest_bytes, manifest))
+    mut read: impl FnMut(&TemplatePin) -> Result<Vec<u8>>,
+) -> Result<Vec<TemplateInput>> {
+    let mut names = BTreeSet::new();
+    let mut publisher = None;
+    recipe
+        .manifests
+        .iter()
+        .map(|pin| {
+            let bytes = read(pin)?;
+            ensure!(
+                digest(&bytes) == pin.sha256,
+                "manifest digest mismatch for {}",
+                pin.path
+            );
+            let template = parse_template(std::str::from_utf8(&bytes)?, recipe)
+                .with_context(|| format!("reading manifest {}", pin.path))?;
+            let manifest = &template.manifest;
+            ensure!(
+                names.insert(manifest.name.clone()),
+                "the recipe builds {} twice",
+                manifest.name
+            );
+            ensure!(
+                publisher.get_or_insert_with(|| manifest.publisher.clone()) == &manifest.publisher,
+                "every package of one build must belong to one publisher"
+            );
+            Ok(TemplateInput {
+                path: pin.path.clone(),
+                bytes,
+                template,
+            })
+        })
+        .collect()
 }
 
 fn prepare_workspace(
@@ -768,13 +899,20 @@ impl ResolvedToolchain {
     }
 }
 
+/// The expanded manifests and payload digests of one build run.
+struct Built {
+    manifests: Vec<Manifest>,
+    artifacts: BTreeMap<String, FileDigest>,
+}
+
 fn run(
     work: &Path,
     recipe: &BuildRecipe,
+    templates: &[Template],
     worker: &BuildWorker,
-    paths: &BTreeSet<&str>,
+    jobs: u32,
     proto: Option<&Path>,
-) -> Result<BTreeMap<String, FileDigest>> {
+) -> Result<Built> {
     let output = TempDir::new_in(work)?;
     let status = sandbox::run(
         work,
@@ -782,11 +920,49 @@ fn run(
         recipe.epoch,
         &recipe.options,
         worker,
-        sandbox::Mode::Build,
+        jobs,
+        sandbox::Mode::Build {
+            script: &work.join("build.sh"),
+        },
     )?;
     ensure!(status.success(), "isolated build failed with {status}");
     let epoch = recipe.epoch;
     let root = Root::open(output.path())?;
+    let tree = expand::scan(&root)?;
+    let mut manifests = expand::expand(templates, &recipe.discard, &tree)?;
+    if recipe.strip {
+        let (splits, debug) = strip::plan(&root, &manifests, &recipe.arch)?;
+        if !splits.is_empty() {
+            let script = work.join("strip.sh");
+            if script.symlink_metadata().is_ok() {
+                fs::remove_file(&script)?;
+            }
+            fs::write(&script, strip::script(&splits))?;
+            set_mode(&script, 0o444)?;
+            normalize(&script, epoch)?;
+            let status = sandbox::run(
+                work,
+                output.path(),
+                epoch,
+                &recipe.options,
+                worker,
+                jobs,
+                sandbox::Mode::Build { script: &script },
+            )?;
+            ensure!(
+                status.success(),
+                "stripping ELF outputs failed with {status}"
+            );
+            strip::finish(output.path(), &splits)?;
+            for (manifest, actions) in manifests.iter_mut().zip(debug) {
+                manifest.action.extend(actions);
+                manifest
+                    .validate(false)
+                    .with_context(|| format!("adding debug information to {}", manifest.name))?;
+            }
+        }
+    }
+    let paths: BTreeSet<&str> = manifests.iter().flat_map(Manifest::payload_paths).collect();
     let mut artifacts = BTreeMap::new();
     let mut directories: BTreeSet<_> = proto.into_iter().map(Path::to_owned).collect();
     let mut remaining = worker.output_bytes;
@@ -832,11 +1008,14 @@ fn run(
                 size,
             }
         };
-        artifacts.insert((*path).to_owned(), artifact);
+        artifacts.insert(path.to_owned(), artifact);
     }
     for directory in directories.iter().rev() {
         set_mode(directory, 0o755)?;
         normalize(directory, epoch)?;
     }
-    Ok(artifacts)
+    Ok(Built {
+        manifests,
+        artifacts,
+    })
 }

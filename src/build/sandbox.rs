@@ -75,7 +75,8 @@ fn filter(terminal: bool) -> Result<File> {
 }
 
 pub(super) enum Mode<'a> {
-    Build,
+    /// Run a script noninteractively, such as the recipe script or the strip step.
+    Build { script: &'a Path },
     Develop {
         workspace: Option<&'a Path>,
         command: &'a [OsString],
@@ -88,6 +89,7 @@ pub(super) fn run(
     epoch: u32,
     options: &BTreeMap<String, String>,
     worker: &BuildWorker,
+    jobs: u32,
     mode: Mode<'_>,
 ) -> Result<ExitStatus> {
     let terminal = matches!(mode, Mode::Develop { .. }) && io::stdin().is_terminal();
@@ -122,7 +124,10 @@ pub(super) fn run(
         .arg(work.join("sources"))
         .arg("/sources")
         .arg("--ro-bind")
-        .arg(work.join("build.sh"))
+        .arg(match &mode {
+            Mode::Build { script } => script.to_path_buf(),
+            Mode::Develop { .. } => work.join("build.sh"),
+        })
         .arg("/recipe/build.sh")
         .arg("--bind")
         .arg(output)
@@ -156,6 +161,10 @@ pub(super) fn run(
         command.args(["--chdir", "/build"]);
     }
     let epoch = epoch.to_string();
+    // The job count is a worker property. It must never change the outputs,
+    // and --check-reproducible repeats the build with a different count.
+    let jobs = jobs.to_string();
+    let makeflags = format!("-j{jobs}");
     for (key, value) in [
         ("PATH", "/usr/bin:/bin"),
         ("HOME", "/build/home"),
@@ -169,6 +178,8 @@ pub(super) fn run(
         ("SOURCE_DATE_EPOCH", &epoch),
         ("CPS_SOURCES", "/sources"),
         ("DESTDIR", "/out"),
+        ("CPS_BUILD_JOBS", &jobs),
+        ("MAKEFLAGS", &makeflags),
     ] {
         command.args(["--setenv", key, value]);
     }
@@ -179,7 +190,7 @@ pub(super) fn run(
             .arg(value);
     }
     let logs = match mode {
-        Mode::Build => {
+        Mode::Build { .. } => {
             let (logs, writer) = io::pipe()?;
             command
                 .args([

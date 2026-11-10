@@ -187,6 +187,7 @@ build architecture="$arch" epoch=1700000000 {
         package "build/probe"
     }
     manifest "manifest.kdl" sha256="$(sha manifest.kdl)"
+    discard "unlisted"
     source "input" sha256="$(sha sources/input)" size=$(wc -c < sources/input)
     script """
 $1
@@ -266,6 +267,18 @@ cp build.kdl other-recipe.kdl
 printf '\n// A different reviewed input\n' >> other-recipe.kdl
 build_package --sources sources --builder-signing-key other.der --check-reproducible --output mismatch other-recipe.kdl
 test ! -e first/proto/unlisted
+cmp manifest.kdl first/templates/manifest.kdl
+grep -E 'file "?hello"? mode="0644"' first/manifests/demo/hello.kdl
+
+# Everything the build installs must belong to an output or match a discard pattern.
+sed '/^    discard "unlisted"$/d' build.kdl > unpackaged.kdl
+if build_package --sources sources --output unpackaged unpackaged.kdl 2> unpackaged.log; then
+    echo 'A build with an unclaimed installed file unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F "the build installed 1 file(s) that no output claims" unpackaged.log
+grep -Fx '  unlisted' unpackaged.log
+test ! -e unpackaged
 test "$(stat -c '%Y %a' first/proto/hello)" = "1700000000 644"
 test "$(stat -c '%Y %a' second/proto/hello)" = "1700000000 644"
 
@@ -374,7 +387,7 @@ worker timeout-seconds=2 scratch-bytes=1048576 file-bytes=4096 output-bytes=4 lo
 KDL
 recipe '    probe limits
     printf "%2048s\n" "log output"
-    printf "hello" > "$DESTDIR/hello"' > limits.build.kdl
+    printf "hello" > "$DESTDIR/hello"' | sed '/^    discard "unlisted"$/a\    discard "too-large"' > limits.build.kdl
 if build_package --sources sources --worker-config limits.kdl --output limited limits.build.kdl 2> limits.log; then
     echo 'oversized bundle unexpectedly succeeded' >&2
     exit 1
@@ -468,7 +481,7 @@ if build_package --sources sources --output symlink symlink.kdl 2> symlink.log; 
     echo "symlink build output unexpectedly succeeded" >&2
     exit 1
 fi
-grep -F 'opening declared build output hello' symlink.log
+grep -F 'the build did not install declared file hello' symlink.log
 test ! -e symlink
 
 # A same-length modification must fail digest verification before the sandbox starts.
@@ -522,7 +535,7 @@ expect_failure() {
 }
 write_policy "$reviewed"
 expect_failure 'publish policy requires an attested build bundle' "$cps" publish \
-    --repo release --proto first/proto --signing-key signing.der first/manifest.kdl
+    --repo release --proto first/proto --signing-key signing.der first/manifests/demo/hello.kdl
 expect_failure 'invalid builder attestation signature' publish_bundle \
     --builder-key other-public.der --recipe-sha256 "$reviewed" first
 expect_failure 'build signer is not authorized by publish policy' publish_bundle \
@@ -556,7 +569,7 @@ first_catalog=$(cat release/current)
 publish_bundle --builder-key builder-public.der --recipe-sha256 "$reviewed" second
 mv release/publish-policy.kdl policy.saved
 expect_failure 'protected repository is missing publish-policy.kdl' "$cps" publish \
-    --repo release --proto first/proto --signing-key signing.der first/manifest.kdl
+    --repo release --proto first/proto --signing-key signing.der first/manifests/demo/hello.kdl
 expect_failure 'protected repository is missing publish-policy.kdl' publish_bundle \
     --builder-key builder-public.der --recipe-sha256 "$reviewed" first
 mv policy.saved release/publish-policy.kdl
@@ -564,7 +577,7 @@ test "$(cat release/current)" = "$first_catalog"
 rebuild_recipe=$("$cps" repo rebuild-inputs --repo release --publisher canopa --trust-key public.der \
     --catalog "$first_catalog" --output rebuild-inputs cps://canopa/demo/hello@1.0.0-0)
 cmp first/build.kdl "$rebuild_recipe"
-cmp first/manifest.kdl "$(dirname -- "$rebuild_recipe")/manifest.kdl"
+cmp first/templates/manifest.kdl "$(dirname -- "$rebuild_recipe")/manifest.kdl"
 cmp first/attestation.json rebuild-inputs/attestation.json
 "$cps" repo fetch-sources --repo release --publisher canopa --trust-key public.der \
     --catalog "$first_catalog" --source-cache rebuild-sources cps://canopa/demo/hello@1.0.0-0
@@ -609,7 +622,8 @@ assert statement['_type'] == 'https://in-toto.io/Statement/v1'
 assert statement['predicate']['identical_runs'] == 2
 assert set(statement['predicate']['toolchain']['package_manifests']) == {'build/shell', 'build/probe'}
 subjects = {subject['name']: subject for subject in statement['subject']}
-assert set(subjects) == {'manifest.kdl', 'published-manifest.kdl', 'proto/hello'}
+assert set(subjects) == {'manifest/demo/hello', 'proto/hello'}
+assert statement['predicate']['packages'] == ['cps://canopa/demo/hello@1.0.0-0']
 envelope_root = json.loads((Path('release/catalogs') / Path('release/current').read_text().strip()).read_bytes())
 root = json.loads(base64.b64decode(envelope_root['signed'], validate=True))
 assert root['toolchains_verified'] is True
@@ -619,7 +633,7 @@ shard = json.loads((Path('release/catalog-shards') / shard_hash).read_bytes())
 assert shard['build_inputs']['cps://canopa/demo/hello@1.0.0-0']['sources_archived'] is True
 manifest_hash = shard['entries']['cps://canopa/demo/hello@1.0.0-0']['manifest']
 manifest = (Path('release/manifests') / manifest_hash).read_bytes()
-published = subjects['published-manifest.kdl']
+published = subjects['manifest/demo/hello']
 assert published['digest']['sha256'] == manifest_hash == hashlib.sha256(manifest).hexdigest()
 assert published['annotations']['cps:size'] == len(manifest)
 Path('pae').write_bytes(b'DSSEv1 %d %s %d %s' % (len(kind), kind, len(payload), payload))
@@ -676,7 +690,7 @@ PYTHON
 test -f "targets/source-archives-$(printf 'hello from pinned input\n' | sha256sum | cut -d' ' -f1)"
 test -f "targets/attestations-$(sha first/attestation.json)"
 cmp first/build.kdl "targets/build-inputs-$(sha first/build.kdl)"
-cmp first/manifest.kdl "targets/build-inputs-$(sha first/manifest.kdl)"
+cmp first/templates/manifest.kdl "targets/build-inputs-$(sha first/templates/manifest.kdl)"
 test ! -e targets/publish-policy.kdl
 test ! -e targets/builder-public.der
 protected_image() {
@@ -953,7 +967,7 @@ schema-version 1 kind="package-manifest"
 package "demo/unchecked" publisher="canopa" version="1.0.0-0" {}
 MANIFEST
 "$cps" publish --repo desktop-repo --proto first/proto --signing-key desktop.der desktop.kdl
-"$cps" publish --repo profile-companion --proto first/proto --signing-key signing.der first/manifest.kdl
+"$cps" publish --repo profile-companion --proto first/proto --signing-key signing.der first/manifests/demo/hello.kdl
 "$cps" publish --repo profile-companion --proto first/proto --signing-key signing.der unchecked.kdl
 desktop_base=$(cat desktop-repo/current)
 desktop_baseline=$desktop_base
@@ -992,7 +1006,7 @@ test "$(cat desktop-repo/current)" = "$desktop_base"
 # The fresh composition now finds the primary package, but the upgrade keeps
 # the companion's copy because it was already installed from that publisher.
 rm -- desktop-repo/publish-policy.kdl
-sed 's/publisher="canopa"/publisher="desktop"/' first/manifest.kdl > desktop-hello.kdl
+sed -E 's/publisher="?canopa"?/publisher="desktop"/' first/manifests/demo/hello.kdl > desktop-hello.kdl
 "$cps" publish --repo desktop-repo --proto first/proto --signing-key desktop.der desktop-hello.kdl
 desktop_base=$(cat desktop-repo/current)
 profile_policy profile-companion "upgrade-from=\"$desktop_baseline\"" "upgrade-from=\"$unattested\""

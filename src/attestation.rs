@@ -12,9 +12,13 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    build::{
+        TEMPLATES, TemplateInput, expand::check_expansion, expanded_manifest_path, load_templates,
+        read_templates,
+    },
     image::root::Root,
     kdl_format::{
-        build::{BuildRecipe, PublisherPin, RECIPE_LIMIT, parse},
+        build::{BuildRecipe, PublisherPin, RECIPE_LIMIT, TemplatePin, parse},
         manifest_text, parse_manifest,
     },
     model::{Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name},
@@ -25,7 +29,11 @@ pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_BUILDERS: usize = 16;
 const STATEMENT: &str = "https://in-toto.io/Statement/v1";
 const PUBLISHED_PREDICATE: &str = "urn:canopa:cps:published-build-provenance:v1";
-const PUBLISHED_MANIFEST: &str = "published-manifest.kdl";
+
+/// The subject that names an output's exact published manifest.
+fn manifest_subject(name: &str) -> String {
+    format!("manifest/{name}")
+}
 const MEDIA_TYPE: &str = "application/vnd.in-toto+json";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -95,21 +103,19 @@ impl BuildTrust {
             self.minimum_builders
         );
         let statement = parse_statement(&payload)?;
+        let id = manifest.id();
         ensure!(
-            statement.predicate.package == manifest.id() && statement.predicate.identical_runs == 2,
+            statement.predicate.packages.contains(&id) && statement.predicate.identical_runs == 2,
             "build attestation does not match the package or the reproducibility requirement"
         );
         manifest.check_architecture(&statement.predicate.architecture)?;
         validate_digest(&statement.predicate.recipe_sha256)?;
-        let mut subjects = subjects(statement.subject)?;
+        // One statement covers every output of the build. Check this package's
+        // manifest and payloads; the other outputs have their own catalog entries.
+        let subjects = subjects(statement.subject)?;
         ensure!(
-            subjects.remove(PUBLISHED_MANIFEST) == Some(published),
+            subjects.get(&manifest_subject(&manifest.name)) == Some(&published),
             "build attestation does not cover the exact published manifest"
-        );
-        ensure!(
-            subjects.remove("manifest.kdl").is_some()
-                && subjects.len() == manifest.payload_paths().len(),
-            "build attestation does not cover the declared package outputs"
         );
         for action in &manifest.action {
             if let Action::File {
@@ -179,6 +185,13 @@ struct Size {
 }
 
 impl Subject {
+    fn file(&self) -> FileDigest {
+        FileDigest {
+            sha256: self.digest.sha256.clone(),
+            size: self.annotations.bytes,
+        }
+    }
+
     fn new(name: String, file: &FileDigest) -> Self {
         Self {
             name,
@@ -193,7 +206,8 @@ impl Subject {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Predicate {
-    package: String,
+    /// The IDs of every package that the build produced, in recipe order.
+    packages: Vec<String>,
     recipe_sha256: String,
     architecture: String,
     source_date_epoch: u32,
@@ -253,13 +267,16 @@ impl Toolchain {
 pub(crate) struct VerifiedBuild {
     payload: Vec<u8>,
     signatures: BTreeMap<String, Vec<u8>>,
+    /// The payloads of every output.
     pub artifacts: BTreeMap<String, FileDigest>,
     pub recipe_sha256: String,
     pub recipe: BuildRecipe,
     pub recipe_document: Vec<u8>,
-    pub manifest_document: Vec<u8>,
+    /// The recipe's pinned templates and their exact bytes.
+    pub templates: Vec<TemplateInput>,
     pub toolchain: Toolchain,
-    pub published_manifest: FileDigest,
+    /// The exact published manifest of each output, by package ID.
+    pub published: BTreeMap<String, FileDigest>,
 }
 
 impl VerifiedBuild {
@@ -292,22 +309,25 @@ impl VerifiedBuild {
     }
 }
 
+/// Sign one statement that covers every output of a build: each output's exact
+/// published manifest and every payload, with the recipe, sources, and toolchain.
 pub(crate) fn sign(
     key: &Ed25519KeyPair,
-    manifest: &Manifest,
-    manifest_bytes: &[u8],
+    manifests: &[Manifest],
     recipe: &BuildRecipe,
     recipe_bytes: &[u8],
     toolchain: Toolchain,
     artifacts: &BTreeMap<String, FileDigest>,
 ) -> Result<Vec<u8>> {
-    let mut subject = vec![
-        Subject::new("manifest.kdl".to_owned(), &file_digest(manifest_bytes)),
-        Subject::new(
-            PUBLISHED_MANIFEST.to_owned(),
-            &published_manifest_digest(manifest, artifacts)?,
-        ),
-    ];
+    let mut subject = manifests
+        .iter()
+        .map(|manifest| {
+            Ok(Subject::new(
+                manifest_subject(&manifest.name),
+                &published_manifest_digest(manifest, artifacts)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     subject.extend(
         artifacts
             .iter()
@@ -318,7 +338,7 @@ pub(crate) fn sign(
         subject,
         predicate_type: PUBLISHED_PREDICATE.to_owned(),
         predicate: Predicate {
-            package: manifest.id(),
+            packages: manifests.iter().map(Manifest::id).collect(),
             recipe_sha256: digest(recipe_bytes),
             architecture: recipe.arch.clone(),
             source_date_epoch: recipe.epoch,
@@ -427,11 +447,13 @@ fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>
     Ok((payload, signature))
 }
 
+/// Verify a build bundle against the builder key and the reviewed recipe digest.
+/// Returns the expanded manifest of each output, in recipe order.
 pub(crate) fn verify_bundle(
     bundle: &Root,
     builder_key: &[u8],
     reviewed_recipe: &str,
-) -> Result<(Manifest, VerifiedBuild)> {
+) -> Result<(Vec<Manifest>, VerifiedBuild)> {
     validate_digest(reviewed_recipe).context("invalid reviewed recipe digest")?;
     let bytes = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
     let (payload, signature) = verify_envelope(&bytes, builder_key)?;
@@ -444,25 +466,12 @@ pub(crate) fn verify_bundle(
     );
     let recipe = parse(std::str::from_utf8(&recipe_bytes)?)?;
     check_recipe(&predicate, &recipe)?;
-
-    let manifest_bytes = read_limited(bundle.file("manifest.kdl")?, MANIFEST_LIMIT)?;
-    let manifest_digest = file_digest(&manifest_bytes);
-    ensure!(
-        manifest_digest.sha256 == recipe.manifest_digest,
-        "bundle manifest differs from the reviewed recipe"
-    );
-    let manifest = parse_manifest(std::str::from_utf8(&manifest_bytes)?)?;
-    manifest.validate(false)?;
-    manifest.check_architecture(&recipe.arch)?;
-    ensure!(
-        manifest.id() == predicate.package,
-        "build attestation names a different package"
-    );
-
-    let (artifacts, published_manifest) =
-        claimed_artifacts(&manifest, manifest_digest, statement.subject)?;
+    let templates = read_templates(&bundle.subdir(TEMPLATES)?, &recipe)
+        .context("bundle templates differ from the reviewed recipe")?;
+    let manifests = expanded_outputs(bundle, &recipe, &templates, &predicate.packages)?;
+    let (artifacts, published) = claimed_artifacts(&manifests, statement.subject)?;
     Ok((
-        manifest,
+        manifests,
         VerifiedBuild {
             payload,
             signatures: BTreeMap::from([(digest(builder_key), signature)]),
@@ -470,11 +479,42 @@ pub(crate) fn verify_bundle(
             recipe_sha256: reviewed_recipe.to_owned(),
             recipe,
             recipe_document: recipe_bytes,
-            manifest_document: manifest_bytes,
+            templates,
             toolchain: predicate.toolchain,
-            published_manifest,
+            published,
         },
     ))
+}
+
+/// Read each output's expanded manifest from a bundle and check that its template
+/// produces it and that the statement names exactly these packages.
+fn expanded_outputs(
+    bundle: &Root,
+    recipe: &BuildRecipe,
+    templates: &[TemplateInput],
+    packages: &[String],
+) -> Result<Vec<Manifest>> {
+    let manifests = templates
+        .iter()
+        .map(|input| {
+            let name = &input.template.manifest.name;
+            let bytes = read_limited(bundle.file(&expanded_manifest_path(name))?, MANIFEST_LIMIT)
+                .with_context(|| format!("reading the expanded manifest for {name}"))?;
+            let manifest = parse_manifest(std::str::from_utf8(&bytes)?)?;
+            manifest.validate(false)?;
+            manifest.check_architecture(&recipe.arch)?;
+            check_expansion(&input.template, &manifest, recipe.strip)?;
+            Ok(manifest)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        manifests
+            .iter()
+            .map(Manifest::id)
+            .eq(packages.iter().cloned()),
+        "build attestation names different packages than the recipe"
+    );
+    Ok(manifests)
 }
 
 fn check_recipe(predicate: &Predicate, recipe: &BuildRecipe) -> Result<()> {
@@ -488,43 +528,77 @@ fn check_recipe(predicate: &Predicate, recipe: &BuildRecipe) -> Result<()> {
     predicate.toolchain.verify(recipe)
 }
 
+/// Match the statement's subjects to exactly the payloads and published
+/// manifests of every output.
 fn claimed_artifacts(
-    manifest: &Manifest,
-    manifest_digest: FileDigest,
+    manifests: &[Manifest],
     claimed: Vec<Subject>,
-) -> Result<(BTreeMap<String, FileDigest>, FileDigest)> {
+) -> Result<(BTreeMap<String, FileDigest>, BTreeMap<String, FileDigest>)> {
     let mut subjects = subjects(claimed)?;
-    ensure!(
-        subjects.remove("manifest.kdl") == Some(manifest_digest),
-        "build attestation does not cover the bundle manifest"
-    );
     let mut artifacts = BTreeMap::new();
-    for path in manifest.payload_paths() {
-        let file = subjects
-            .remove(&format!("proto/{path}"))
-            .with_context(|| format!("build attestation omits output {path}"))?;
-        artifacts.insert(path.to_owned(), file);
+    for path in manifests.iter().flat_map(Manifest::payload_paths) {
+        if !artifacts.contains_key(path) {
+            let file = subjects
+                .remove(&format!("proto/{path}"))
+                .with_context(|| format!("build attestation omits output {path}"))?;
+            artifacts.insert(path.to_owned(), file);
+        }
     }
-    let published_manifest = published_manifest_digest(manifest, &artifacts)?;
-    ensure!(
-        subjects.remove(PUBLISHED_MANIFEST).as_ref() == Some(&published_manifest),
-        "build attestation does not cover the exact published manifest"
-    );
+    let mut published = BTreeMap::new();
+    for manifest in manifests {
+        let digest = published_manifest_digest(manifest, &artifacts)?;
+        ensure!(
+            subjects.remove(&manifest_subject(&manifest.name)).as_ref() == Some(&digest),
+            "build attestation does not cover the exact published manifest of {}",
+            manifest.id()
+        );
+        published.insert(manifest.id(), digest);
+    }
     ensure!(
         subjects.is_empty(),
         "build attestation contains undeclared outputs"
     );
-    Ok((artifacts, published_manifest))
+    Ok((artifacts, published))
 }
 
+/// An admitted build statement, checked against archived or rebuilt inputs.
 pub(crate) struct RebuildEvidence {
     pub recipe: BuildRecipe,
-    pub artifacts: BTreeMap<String, FileDigest>,
+    pub templates: Vec<TemplateInput>,
     payload: Vec<u8>,
     signatures: Vec<Vec<u8>>,
+    packages: Vec<String>,
+    subjects: Vec<Subject>,
 }
 
 impl RebuildEvidence {
+    /// The IDs of every package that the admitted build produced.
+    pub fn packages(&self) -> &[String] {
+        &self.packages
+    }
+
+    /// The digest of the published manifest that the admitted build names for a package.
+    pub fn published_manifest(&self, id: &str) -> Result<&str> {
+        let name = &crate::model::PackageSpec::parse(id)?.name;
+        self.subjects
+            .iter()
+            .find(|subject| subject.name == manifest_subject(name))
+            .map(|subject| subject.digest.sha256.as_str())
+            .with_context(|| format!("admitted build does not cover {id}"))
+    }
+
+    /// Check a rebuilt bundle's expanded manifests against the admitted build,
+    /// and return the admitted payload digests of every output.
+    pub fn check_outputs(&self, bundle: &Root) -> Result<BTreeMap<String, FileDigest>> {
+        let manifests = expanded_outputs(bundle, &self.recipe, &self.templates, &self.packages)?;
+        let claimed = self
+            .subjects
+            .iter()
+            .map(|subject| Subject::new(subject.name.clone(), &subject.file()))
+            .collect();
+        Ok(claimed_artifacts(&manifests, claimed)?.0)
+    }
+
     pub fn check_witness(&self, envelope: &[u8], key: &[u8]) -> Result<()> {
         let message = pae(&self.payload);
         let public = UnparsedPublicKey::new(&ED25519, key);
@@ -544,47 +618,42 @@ impl RebuildEvidence {
     }
 }
 
+/// Check that a recipe and its templates are the inputs of an admitted build
+/// that produced `id`.
 pub(crate) fn verify_rebuild_inputs(
     envelope: &[u8],
     id: &str,
     recipe_bytes: &[u8],
-    manifest_bytes: &[u8],
-    published_hash: &str,
+    templates: impl FnMut(&TemplatePin) -> Result<Vec<u8>>,
 ) -> Result<RebuildEvidence> {
     let (payload, signatures) = decode_envelope(envelope)?;
     let statement = parse_statement(&payload)?;
+    let predicate = statement.predicate;
     ensure!(
-        statement.predicate.package == id,
-        "admitted build names a different package"
+        predicate.packages.iter().any(|package| package == id),
+        "admitted build does not produce {id}"
     );
     ensure!(
-        statement.predicate.recipe_sha256 == digest(recipe_bytes),
+        predicate.recipe_sha256 == digest(recipe_bytes),
         "rebuild recipe differs from the admitted build"
     );
     let recipe = parse(std::str::from_utf8(recipe_bytes)?)?;
-    check_recipe(&statement.predicate, &recipe)?;
-    let manifest_digest = file_digest(manifest_bytes);
+    check_recipe(&predicate, &recipe)?;
+    let templates = load_templates(&recipe, templates)?;
     ensure!(
-        manifest_digest.sha256 == recipe.manifest_digest,
-        "rebuild manifest differs from the reviewed recipe"
-    );
-    let manifest = parse_manifest(std::str::from_utf8(manifest_bytes)?)?;
-    manifest.validate(false)?;
-    manifest.check_architecture(&recipe.arch)?;
-    ensure!(
-        manifest.id() == id,
-        "rebuild manifest names a different package"
-    );
-    let (artifacts, published) = claimed_artifacts(&manifest, manifest_digest, statement.subject)?;
-    ensure!(
-        published.sha256 == published_hash,
-        "admitted build does not match the catalog manifest for {id}"
+        templates
+            .iter()
+            .map(|input| input.template.manifest.id())
+            .eq(predicate.packages.iter().cloned()),
+        "rebuild templates name different packages than the admitted build"
     );
     Ok(RebuildEvidence {
         recipe,
-        artifacts,
+        templates,
         payload,
         signatures,
+        packages: predicate.packages,
+        subjects: statement.subject,
     })
 }
 
@@ -648,8 +717,7 @@ build architecture="x86_64" epoch=1700000000 {{
         let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let bytes = sign(
             &key,
-            &manifest,
-            manifest_bytes,
+            &[manifest],
             &recipe,
             recipe_bytes.as_bytes(),
             Toolchain {

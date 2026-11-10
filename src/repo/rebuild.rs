@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::{
-    attestation::{ATTESTATION_LIMIT, VerifiedBuild, verify_rebuild_inputs},
+    attestation::{ATTESTATION_LIMIT, RebuildEvidence, VerifiedBuild, verify_rebuild_inputs},
     image::root::Root,
     kdl_format::build,
     model::{FileDigest, digest_reader},
@@ -28,26 +28,40 @@ pub(super) const OBJECTS: &str = "build-inputs";
 #[serde(deny_unknown_fields)]
 pub(super) struct Digests {
     pub(super) recipe: String,
-    manifest: String,
+    /// The recipe's pinned templates, in recipe order.
+    templates: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) sources_archived: bool,
 }
 
 impl Digests {
-    pub(super) fn objects(&self) -> [(&str, u64); 2] {
-        [
-            (&self.recipe, build::RECIPE_LIMIT),
-            (&self.manifest, MANIFEST_LIMIT),
-        ]
+    pub(super) fn objects(&self) -> Vec<(&str, u64)> {
+        std::iter::once((self.recipe.as_str(), build::RECIPE_LIMIT))
+            .chain(
+                self.templates
+                    .iter()
+                    .map(|template| (template.as_str(), MANIFEST_LIMIT)),
+            )
+            .collect()
     }
 
     pub(super) fn preserved_by(&self, next: &Self) -> bool {
         self.recipe == next.recipe
-            && self.manifest == next.manifest
+            && self.templates == next.templates
             && (!self.sources_archived || next.sources_archived)
+    }
+
+    fn matches(&self, recipe: &[u8], evidence: &RebuildEvidence) -> bool {
+        self.recipe == crate::model::digest(recipe)
+            && self
+                .templates
+                .iter()
+                .eq(evidence.recipe.manifests.iter().map(|pin| &pin.sha256))
     }
 }
 
+/// Record the rebuild inputs of one output. Every output of a build records
+/// the same recipe and templates.
 pub(super) fn archive(
     repo: &Path,
     catalog: &mut Catalog,
@@ -56,7 +70,11 @@ pub(super) fn archive(
 ) -> Result<bool> {
     let inputs = Digests {
         recipe: store(repo, OBJECTS, &evidence.recipe_document)?,
-        manifest: store(repo, OBJECTS, &evidence.manifest_document)?,
+        templates: evidence
+            .templates
+            .iter()
+            .map(|input| store(repo, OBJECTS, &input.bytes))
+            .collect::<Result<_>>()?,
         sources_archived: false,
     };
     if let Some(previous) = catalog.build_inputs.get(id) {
@@ -72,9 +90,8 @@ pub(super) fn archive(
 
 pub(super) struct ArchivedInputs {
     recipe_document: Vec<u8>,
-    manifest_document: Vec<u8>,
     envelope: Vec<u8>,
-    pub(super) recipe: build::BuildRecipe,
+    pub(super) evidence: RebuildEvidence,
 }
 
 pub(super) fn read_archived(repo: &Path, catalog: &Catalog, id: &str) -> Result<ArchivedInputs> {
@@ -82,26 +99,29 @@ pub(super) fn read_archived(repo: &Path, catalog: &Catalog, id: &str) -> Result<
         .build_inputs
         .get(id)
         .with_context(|| format!("no archived rebuild inputs for {id}"))?;
-    let (published_hash, envelope) = admitted_build(repo, catalog, id)?;
+    let admitted = admitted_build(repo, catalog, id)?;
     let recipe_document = read_object(repo, OBJECTS, &inputs.recipe, build::RECIPE_LIMIT)?;
-    let manifest_document = read_object(repo, OBJECTS, &inputs.manifest, MANIFEST_LIMIT)?;
-    let recipe = verify_rebuild_inputs(
-        &envelope,
-        id,
-        &recipe_document,
-        &manifest_document,
-        published_hash,
-    )?
-    .recipe;
+    let evidence = verify_rebuild_inputs(&admitted.envelope, id, &recipe_document, |pin| {
+        ensure!(
+            inputs.templates.contains(&pin.sha256),
+            "archived rebuild inputs omit {}",
+            pin.path
+        );
+        read_object(repo, OBJECTS, &pin.sha256, MANIFEST_LIMIT)
+    })?;
+    ensure!(
+        inputs.matches(&recipe_document, &evidence),
+        "archived rebuild inputs differ from the recipe for {id}"
+    );
+    admitted.check(&evidence, id)?;
     Ok(ArchivedInputs {
         recipe_document,
-        manifest_document,
-        envelope,
-        recipe,
+        envelope: admitted.envelope,
+        evidence,
     })
 }
 
-/// Extract an authenticated build recipe, its manifest, and the admitted attestation.
+/// Extract an authenticated build recipe, its templates, and the admitted attestation.
 /// Returns the path to the recipe in the new directory.
 pub fn export_rebuild_inputs(
     repo: &Path,
@@ -124,29 +144,41 @@ pub fn export_rebuild_inputs(
     let directory = File::open(parent)?;
     let stage = TempDir::new_in(parent)?;
     let source = stage.path().join("source");
-    let manifest_path = source.join(&inputs.recipe.manifest);
-    let manifest_parent = manifest_path
-        .parent()
-        .context("missing reviewed manifest directory")?;
-    fs::create_dir_all(manifest_parent)?;
-    let recipe_name = if Path::new(&inputs.recipe.manifest).starts_with("build.kdl") {
+    fs::create_dir(&source)?;
+    let templates = &inputs.evidence.templates;
+    let recipe_name = if templates
+        .iter()
+        .any(|input| Path::new(&input.path).starts_with("build.kdl"))
+    {
         "rebuild.kdl"
     } else {
         "build.kdl"
     };
     write_atomic(&source.join(recipe_name), &inputs.recipe_document, true)?;
-    write_atomic(&manifest_path, &inputs.manifest_document, true)?;
+    let mut directories = BTreeSet::from([source.clone()]);
+    for input in templates {
+        let path = source.join(&input.path);
+        let parent = path
+            .parent()
+            .context("missing reviewed manifest directory")?;
+        fs::create_dir_all(parent)?;
+        directories.extend(
+            parent
+                .ancestors()
+                .take_while(|path| path.starts_with(&source))
+                .map(Path::to_owned),
+        );
+        write_atomic(&path, &input.bytes, true)?;
+    }
     write_atomic(
         &stage.path().join("attestation.json"),
         &inputs.envelope,
         true,
     )?;
-    for path in manifest_parent
-        .ancestors()
-        .take_while(|path| path.starts_with(stage.path()))
-    {
+    for path in directories.iter().rev() {
         File::open(path)?.sync_all()?;
     }
+    File::open(stage.path())?.sync_all()?;
     renameat_with(
         &directory,
         stage
@@ -163,7 +195,9 @@ pub fn export_rebuild_inputs(
 }
 
 /// Check a local rebuild against the build attestation admitted by the signed catalog.
-/// Returns the number of verified payloads.
+/// The admitted statement covers every output of the build, so the rebuild must
+/// reproduce every output's manifest and payloads, and each output's catalog entry
+/// must name this same attestation. Returns the number of verified payloads.
 pub fn verify_rebuild(
     repo: &Path,
     publisher: &str,
@@ -175,17 +209,28 @@ pub fn verify_rebuild(
 ) -> Result<usize> {
     let anchor = read_key(trust_key)?;
     let catalog = selected_catalog(repo, publisher, &anchor, id, pin)?;
-    let (published_hash, envelope) = admitted_build(repo, &catalog, id)?;
+    let admitted = admitted_build(repo, &catalog, id)?;
     let bundle = Root::open(bundle)?;
     let recipe = read_limited(bundle.file("build.kdl")?, build::RECIPE_LIMIT)?;
-    let manifest = read_limited(bundle.file("manifest.kdl")?, MANIFEST_LIMIT)?;
-    let build = verify_rebuild_inputs(&envelope, id, &recipe, &manifest, published_hash)?;
+    let templates = bundle.subdir(crate::build::TEMPLATES)?;
+    let build = verify_rebuild_inputs(&admitted.envelope, id, &recipe, |pin| {
+        read_limited(templates.file(&pin.path)?, MANIFEST_LIMIT)
+            .with_context(|| format!("reading rebuilt template {}", pin.path))
+    })?;
     if let Some(inputs) = catalog.build_inputs.get(id) {
         ensure!(
-            inputs.recipe == crate::model::digest(&recipe)
-                && inputs.manifest == build.recipe.manifest_digest,
+            inputs.matches(&recipe, &build),
             "rebuild inputs differ from the signed archive for {id}"
         );
+    }
+    for package in build.packages() {
+        let sibling = admitted_build(repo, &catalog, package)
+            .with_context(|| format!("checking {package} from the same build"))?;
+        ensure!(
+            sibling.attestation == admitted.attestation,
+            "{package} names a different build attestation than {id}"
+        );
+        sibling.check(&build, package)?;
     }
     if let Some(witness_key) = witness_key {
         let key = read_key(witness_key)?;
@@ -199,8 +244,9 @@ pub fn verify_rebuild(
         let envelope = read_limited(bundle.file("attestation.json")?, ATTESTATION_LIMIT)?;
         build.check_witness(&envelope, &key)?;
     }
-    verify_artifacts(&bundle.subdir("proto")?, &build.artifacts)?;
-    Ok(build.artifacts.len())
+    let artifacts = build.check_outputs(&bundle)?;
+    verify_artifacts(&bundle.subdir("proto")?, &artifacts)?;
+    Ok(artifacts.len())
 }
 
 pub(super) fn selected_catalog(
@@ -221,13 +267,34 @@ pub(super) fn selected_catalog(
     read_catalog(repo, &hash, publisher, anchor)
 }
 
-fn admitted_build<'a>(repo: &Path, catalog: &'a Catalog, id: &str) -> Result<(&'a str, Vec<u8>)> {
+/// The catalog record and admitted attestation of a published or withdrawn package.
+struct Admitted<'a> {
+    published: &'a str,
+    attestation: &'a str,
+    envelope: Vec<u8>,
+}
+
+impl Admitted<'_> {
+    fn check(&self, evidence: &RebuildEvidence, id: &str) -> Result<()> {
+        ensure!(
+            evidence.published_manifest(id)? == self.published,
+            "admitted build does not match the catalog manifest for {id}"
+        );
+        Ok(())
+    }
+}
+
+fn admitted_build<'a>(repo: &Path, catalog: &'a Catalog, id: &str) -> Result<Admitted<'a>> {
     let (published, attestation) = catalog
         .package_record(id)
         .with_context(|| format!("no published package {id}"))?;
     let attestation = attestation.with_context(|| format!("no build attestation for {id}"))?;
     let envelope = read_object(repo, "attestations", attestation, ATTESTATION_LIMIT)?;
-    Ok((published.manifest_digest(), envelope))
+    Ok(Admitted {
+        published: published.manifest_digest(),
+        attestation,
+        envelope,
+    })
 }
 
 fn verify_artifacts(proto: &Root, artifacts: &BTreeMap<String, FileDigest>) -> Result<()> {

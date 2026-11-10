@@ -33,7 +33,22 @@ pub fn archive_build_sources(
     let mut catalog = publication_catalog(repo, publisher, &key, Some(&current))?;
     let inputs = rebuild::read_archived(repo, &catalog, id)?;
     let source_cache = Root::open(source_cache)?;
-    let (changed, count) = stage(repo, &mut catalog, id, &inputs.recipe, Some(&source_cache))?;
+    let mut changed = false;
+    let mut count = 0;
+    // Every output of the build shares the sources.
+    for package in inputs.evidence.packages() {
+        if catalog.build_inputs.contains_key(package) {
+            let (staged, pins) = stage(
+                repo,
+                &mut catalog,
+                package,
+                &inputs.evidence.recipe,
+                Some(&source_cache),
+            )?;
+            changed |= staged;
+            count = pins;
+        }
+    }
     let hash = if changed {
         write_catalog(repo, catalog, &key)?
     } else {
@@ -95,7 +110,7 @@ pub fn fetch_build_sources(
         "no source archive for {id} in the selected catalog"
     );
     let inputs = rebuild::read_archived(repo, &catalog, id)?;
-    let pins = source_pins(&inputs.recipe);
+    let pins = source_pins(&inputs.evidence.recipe);
     fs::create_dir_all(source_cache)?;
     let destination = Root::open(source_cache)?.ensure_dir(sources::OBJECTS)?;
     let repo_root = Root::open(repo)?;

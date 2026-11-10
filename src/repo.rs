@@ -573,17 +573,8 @@ impl Catalog {
     /// Checks that span shards, run once every shard is loaded.
     fn validate_complete(&self) -> Result<()> {
         ensure!(self.is_complete(), "catalog shards are incomplete");
-        let mut evidence = BTreeSet::new();
-        let withdrawn = self
-            .withdrawals
-            .values()
-            .filter_map(|withdrawal| withdrawal.attestation.as_ref());
-        for digest in self.attestations.values().chain(withdrawn) {
-            ensure!(
-                evidence.insert(digest),
-                "duplicate package attestation {digest}"
-            );
-        }
+        // The packages of one build share its attestation. Each package's
+        // verification checks that the statement names it and its exact manifest.
         self.rename_targets()?;
         for (name, profile) in &self.release_profiles {
             profile.validate_composition(name, self)?;
@@ -2479,7 +2470,7 @@ pub fn publish_bundle(
     key: &Path,
     builder_key: &Path,
     reviewed_recipe: &str,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     publish_witnessed_bundle(repo, bundle, key, builder_key, reviewed_recipe, &[])
 }
 
@@ -2496,7 +2487,7 @@ pub fn publish_witnessed_bundle(
     builder_key: &Path,
     reviewed_recipe: &str,
     witnesses: &[BuildWitness],
-) -> Result<String> {
+) -> Result<Vec<String>> {
     publish_witnessed_bundle_with_sources(
         repo,
         bundle,
@@ -2516,9 +2507,9 @@ pub fn publish_witnessed_bundle_with_sources(
     reviewed_recipe: &str,
     witnesses: &[BuildWitness],
     source_cache: Option<&Path>,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     let key = SigningKey::open(key)?;
-    let (proto, manifest, verified) = verify_publication(
+    let (proto, manifests, verified) = verify_publication(
         bundle,
         builder_key,
         reviewed_recipe,
@@ -2526,14 +2517,17 @@ pub fn publish_witnessed_bundle_with_sources(
         key.public_key().as_ref(),
     )?;
     let source_cache = source_cache.map(Root::open).transpose()?;
-    let mut ids = publish_manifests(
+    // Every output of the build is published in one signed catalog update.
+    publish_manifests(
         repo,
         &proto,
-        vec![(manifest, Some(verified))],
+        manifests
+            .into_iter()
+            .map(|manifest| (manifest, Some(&verified)))
+            .collect(),
         &key,
         source_cache.as_ref(),
-    )?;
-    Ok(ids.remove(0))
+    )
 }
 
 fn verify_publication(
@@ -2542,7 +2536,7 @@ fn verify_publication(
     reviewed_recipe: &str,
     witnesses: &[BuildWitness],
     publisher_key: &[u8],
-) -> Result<(Root, Manifest, VerifiedBuild)> {
+) -> Result<(Root, Vec<Manifest>, VerifiedBuild)> {
     ensure!(
         witnesses.len() < MAX_BUILDERS,
         "at most {MAX_BUILDERS} build signers are supported"
@@ -2553,7 +2547,7 @@ fn verify_publication(
         builder.as_slice() != publisher_key,
         "builder and publisher must use distinct keys"
     );
-    let (manifest, mut verified) = verify_bundle(&bundle, &builder, reviewed_recipe)?;
+    let (manifests, mut verified) = verify_bundle(&bundle, &builder, reviewed_recipe)?;
     for witness in witnesses {
         let builder = read_key(&witness.key)?;
         ensure!(
@@ -2574,7 +2568,7 @@ fn verify_publication(
             .add_witness(&envelope, &builder)
             .with_context(|| format!("verifying witness {}", witness.attestation.display()))?;
     }
-    Ok((bundle.subdir("proto")?, manifest, verified))
+    Ok((bundle.subdir("proto")?, manifests, verified))
 }
 
 pub fn publish_release(repo: &Path, key: &Path, document: &Path) -> Result<String> {
@@ -2665,7 +2659,7 @@ pub fn publish_release_with_mode(
                     witness.key = parent.join(&witness.key);
                     witness.attestation = parent.join(&witness.attestation);
                 }
-                let (proto, manifest, verified) = verify_publication(
+                let (proto, manifests, verified) = verify_publication(
                     &parent.join(path),
                     &parent.join(builder_key),
                     &recipe,
@@ -2674,20 +2668,28 @@ pub fn publish_release_with_mode(
                 )
                 .with_context(|| format!("verifying bundle for {id}"))?;
                 ensure!(
-                    manifest.id() == id,
-                    "bundle contains {} instead of {id}",
-                    manifest.id()
+                    manifests.iter().any(|manifest| manifest.id() == id),
+                    "bundle for {id} contains only {}",
+                    manifests
+                        .iter()
+                        .map(Manifest::id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
-                changed |= stage_manifest(
-                    repo,
-                    &mut catalog,
-                    &proto,
-                    manifest,
-                    Some(verified),
-                    policy.as_ref(),
-                    source_cache.as_ref(),
-                )
-                .with_context(|| format!("staging {id}"))?;
+                // A build's outputs share one attestation and are published together.
+                for manifest in manifests {
+                    let output = manifest.id();
+                    changed |= stage_manifest(
+                        repo,
+                        &mut catalog,
+                        &proto,
+                        manifest,
+                        Some(&verified),
+                        policy.as_ref(),
+                        source_cache.as_ref(),
+                    )
+                    .with_context(|| format!("staging {output}"))?;
+                }
             }
             publish_release::Change::Withdraw(id) => changed |= catalog.withdraw(&id)?,
             publish_release::Change::Obsolete(id) => changed |= catalog.obsolete(&id)?,
@@ -2761,7 +2763,7 @@ fn publication_root(
 fn publish_manifests(
     repo: &Path,
     proto: &Root,
-    manifests: Vec<(Manifest, Option<VerifiedBuild>)>,
+    manifests: Vec<(Manifest, Option<&VerifiedBuild>)>,
     key: &SigningKey,
     source_cache: Option<&Root>,
 ) -> Result<Vec<String>> {
@@ -2824,7 +2826,7 @@ fn stage_manifest(
     catalog: &mut Catalog,
     proto: &Root,
     manifest: Manifest,
-    evidence: Option<VerifiedBuild>,
+    evidence: Option<&VerifiedBuild>,
     policy: Option<&PublicationPolicy>,
     source_cache: Option<&Root>,
 ) -> Result<bool> {
@@ -2848,11 +2850,11 @@ fn stage_manifest(
         );
     }
     if let Some(policy) = policy {
-        policy.verify(&id, evidence.as_ref())?;
+        policy.verify(&id, evidence)?;
         catalog.attestations_required = true;
         catalog.toolchains_verified |= policy.verify_toolchains;
     }
-    if let Some(evidence) = &evidence {
+    if let Some(evidence) = evidence {
         for rotation in &catalog.key_rotations {
             let retired = digest(rotation.previous_key());
             ensure!(
@@ -2875,7 +2877,6 @@ fn stage_manifest(
                 .file(path)
                 .with_context(|| format!("reading build output {path}"))?;
             let expected = evidence
-                .as_ref()
                 .map(|build| {
                     build
                         .artifacts
@@ -2910,7 +2911,10 @@ fn stage_manifest(
     };
     if let Some(evidence) = evidence {
         ensure!(
-            catalog.entries[&id].manifest_digest() == evidence.published_manifest.sha256,
+            evidence
+                .published
+                .get(&id)
+                .is_some_and(|published| catalog.entries[&id].manifest_digest() == published.sha256),
             "build attestation names a different published manifest for {id}"
         );
         let envelope = evidence.envelope()?;
@@ -2928,7 +2932,7 @@ fn stage_manifest(
             true
         };
         let added_inputs = if policy.is_some_and(|policy| policy.archive_build_inputs) {
-            rebuild::archive(repo, catalog, &id, &evidence)?
+            rebuild::archive(repo, catalog, &id, evidence)?
         } else {
             false
         };
@@ -3764,7 +3768,7 @@ mod tests {
                 active.clone(),
                 serde_json::from_value(serde_json::json!({
                     "recipe": digest(b"reviewed recipe"),
-                    "manifest": digest(b"reviewed manifest"),
+                    "templates": [digest(b"reviewed manifest")],
                 }))?,
             )]),
             source_archives_required: false,

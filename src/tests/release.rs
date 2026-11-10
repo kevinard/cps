@@ -47,8 +47,7 @@ fn attach_evidence(
     let recipe_model = build::parse(&recipe)?;
     let envelope = attestation::sign(
         &read_signing_key(&builder.private)?,
-        &manifest,
-        &manifest_bytes,
+        std::slice::from_ref(&manifest),
         &recipe_model,
         recipe.as_bytes(),
         Toolchain {
@@ -71,17 +70,19 @@ fn attach_evidence(
         )]),
     )?;
     fs::write(bundle.join("build.kdl"), &recipe)?;
-    fs::write(bundle.join("manifest.kdl"), manifest_bytes)?;
+    crate::build::write_explicit_outputs(&bundle, &[("manifest.kdl", &manifest_bytes)])?;
     fs::write(bundle.join("attestation.json"), &envelope)?;
     fs::write(bundle.join("proto").join(COMPOSITOR), payload)?;
-    let id = publish_bundle(
+    let [id] = &publish_bundle(
         &fixture.repo,
         &bundle,
         &fixture.private,
         &builder.public,
         &digest(recipe.as_bytes()),
-    )?;
-    Ok((id, envelope))
+    )?[..] else {
+        panic!("expected one output");
+    };
+    Ok((id.clone(), envelope))
 }
 
 #[test]
@@ -144,7 +145,7 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
     fs::create_dir_all(bundle.join("proto"))?;
     let manifest =
         b"schema-version 1 kind=\"package-manifest\"\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
-    fs::write(bundle.join("manifest.kdl"), manifest)?;
+    crate::build::write_explicit_outputs(&bundle, &[("manifest.kdl", manifest)])?;
     let mut recipe =
         "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {\n    toolchain solver=\"sat-v2\" {\n"
             .to_owned();
@@ -168,8 +169,7 @@ publisher "tools" {{ repository {:?}; trust-key {:?}; }}
         }
         let envelope = attestation::sign(
             &read_signing_key(&builder.private)?,
-            &parse_manifest(std::str::from_utf8(manifest)?)?,
-            manifest,
+            &[parse_manifest(std::str::from_utf8(manifest)?)?],
             &build::parse(&recipe)?,
             recipe.as_bytes(),
             Toolchain {
@@ -2486,6 +2486,212 @@ fn signed_compressed_payload(export: &Path, mirror: &Path, hash: &str) -> Result
 }
 
 #[test]
+fn one_build_publishes_several_packages_under_one_attestation() -> Result<()> {
+    use crate::{build::expand, kdl_format::manifest_text};
+
+    let f = Fixture::new()?;
+    let builder = Fixture::new()?;
+    let work = f._dir.path();
+    let compiler_template = br#"schema-version 1 kind="package-manifest"
+package "devel/compiler" publisher="canopa" license="GPL-3.0-or-later WITH GCC-exception-3.1" homepage="https://gcc.gnu.org/" {
+    require "runtime/libcc" version="={version}"
+    collect "usr/bin/*"
+    collect "usr/include/**"
+}
+"#;
+    let runtime_template = br#"schema-version 1 kind="package-manifest"
+package "runtime/libcc" publisher="canopa" {
+    file "usr/lib/libcc.so.1" mode="0755" uid=0 gid=0
+}
+"#;
+    let catalog = digest(b"pinned toolchain");
+    let key_hash = digest(&read_key(&f.public)?);
+    let recipe = format!(
+        "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain solver=\"sat-v2\" {{ publisher \"seed\" catalog=\"{catalog}\" key-sha256=\"{key_hash}\"; package \"build/tool\"; }}\n    version \"2.1.0-1\" upstream=\"2.1\"\n    manifest \"compiler.kdl\" sha256=\"{}\"\n    manifest \"runtime.kdl\" sha256=\"{}\"\n    discard \"usr/share/info/**\"\n    script \"true\"\n}}\n",
+        digest(compiler_template),
+        digest(runtime_template),
+    );
+    let reviewed = digest(recipe.as_bytes());
+    let parsed = build::parse(&recipe)?;
+    let templates = [compiler_template.as_slice(), runtime_template]
+        .into_iter()
+        .map(|text| build::parse_template(std::str::from_utf8(text).unwrap(), &parsed))
+        .collect::<Result<Vec<_>>>()?;
+    let file = |inode, executable| expand::Entry::File {
+        executable,
+        inode: (1, inode),
+    };
+    let tree = expand::Tree::from([
+        ("usr/bin/cc".into(), file(1, true)),
+        ("usr/bin/c++".into(), file(1, true)),
+        ("usr/include/cc.h".into(), file(2, false)),
+        ("usr/lib/libcc.so.1".into(), file(3, true)),
+        ("usr/share/info/cc.info".into(), file(4, false)),
+    ]);
+    let manifests = expand::expand(&templates, &parsed.discard, &tree)?;
+    let payloads: [(&str, &[u8]); 3] = [
+        ("usr/bin/c++", b"compiler"),
+        ("usr/include/cc.h", b"header"),
+        ("usr/lib/libcc.so.1", b"runtime"),
+    ];
+    let bundle = work.join("bundle");
+    let mut artifacts = BTreeMap::new();
+    for (path, bytes) in payloads {
+        let target = bundle.join("proto").join(path);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::write(target, bytes)?;
+        artifacts.insert(
+            path.to_owned(),
+            FileDigest {
+                sha256: digest(bytes),
+                size: bytes.len() as u64,
+            },
+        );
+    }
+    fs::write(bundle.join("build.kdl"), &recipe)?;
+    fs::create_dir_all(bundle.join("templates"))?;
+    fs::write(bundle.join("templates/compiler.kdl"), compiler_template)?;
+    fs::write(bundle.join("templates/runtime.kdl"), runtime_template)?;
+    for manifest in &manifests {
+        let path = bundle.join(crate::build::expanded_manifest_path(&manifest.name));
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path, manifest_text(manifest))?;
+    }
+    let envelope = attestation::sign(
+        &read_signing_key(&builder.private)?,
+        &manifests,
+        &parsed,
+        recipe.as_bytes(),
+        Toolchain {
+            publishers: parsed.toolchain.clone(),
+            package_manifests: BTreeMap::from([(
+                "build/tool".into(),
+                PinnedPackage {
+                    publisher: "seed".into(),
+                    version: "1.0.0-0".parse()?,
+                    sha256: digest(b"tool"),
+                },
+            )]),
+        },
+        &artifacts,
+    )?;
+    fs::write(bundle.join("attestation.json"), &envelope)?;
+    let compiler = "cps://canopa/devel/compiler@2.1.0-1";
+    let runtime = "cps://canopa/runtime/libcc@2.1.0-1";
+
+    // An expanded manifest must be what its pinned template can produce.
+    let tampered = work.join("tampered");
+    copy_tree(&bundle, &tampered)?;
+    let mut changed = manifests[0].clone();
+    changed.dependency.clear();
+    fs::write(
+        tampered.join("manifests/devel/compiler.kdl"),
+        manifest_text(&changed),
+    )?;
+    let error =
+        publish_bundle(&f.repo, &tampered, &f.private, &builder.public, &reviewed).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("differs from its template"),
+        "{error:#}"
+    );
+
+    fs::create_dir(&f.repo)?;
+    let policy = |approved: &[&str]| {
+        let approvals: String = approved
+            .iter()
+            .map(|name| {
+                format!("    approve \"{name}\" version=\"2.1.0-1\" sha256=\"{reviewed}\"\n")
+            })
+            .collect();
+        fs::write(
+            f.repo.join("publish-policy.kdl"),
+            format!(
+                "schema-version 1 kind=\"publish-policy\"\npublisher \"canopa\" archive-build-inputs=#true {{\n    builder-key {:?}\n{approvals}}}\n",
+                builder.public
+            ),
+        )
+    };
+    policy(&["devel/compiler"])?;
+    let error =
+        publish_bundle(&f.repo, &bundle, &f.private, &builder.public, &reviewed).unwrap_err();
+    assert!(format!("{error:#}").contains("not approved for cps://canopa/runtime/libcc"));
+    assert!(!f.repo.join("current").exists());
+    policy(&["devel/compiler", "runtime/libcc"])?;
+    let ids = publish_bundle(&f.repo, &bundle, &f.private, &builder.public, &reviewed)?;
+    assert_eq!(ids, [compiler, runtime]);
+    assert_eq!(
+        read_attestation(&f.repo, "canopa", &f.public, compiler)?,
+        read_attestation(&f.repo, "canopa", &f.public, runtime)?
+    );
+
+    // Clients verify each package against the shared statement.
+    let release = snapshot(&f.repo, "canopa", &read_key(&f.public)?, None)?;
+    let trust = attestation::BuildTrust::load(1, std::slice::from_ref(&builder.public))?;
+    for package in &release.packages {
+        release.builds.verify(&f.repo, [&trust], package)?;
+    }
+    let installed = release
+        .packages
+        .iter()
+        .find(|package| package.manifest.name == "devel/compiler")
+        .unwrap();
+    assert_eq!(
+        installed.manifest.license.as_deref(),
+        Some("GPL-3.0-or-later WITH GCC-exception-3.1")
+    );
+    assert_eq!(installed.manifest.upstream_version.as_deref(), Some("2.1"));
+    assert!(installed.manifest.action.iter().any(|action| matches!(
+        action,
+        crate::model::Action::Hardlink { path, target, .. } if path == "usr/bin/cc" && target == "usr/bin/c++"
+    )));
+
+    // A rebuild of either package proves both came from the admitted build.
+    for id in [compiler, runtime] {
+        assert_eq!(
+            crate::verify_rebuild(&f.repo, "canopa", &f.public, id, None, &bundle, None)?,
+            3
+        );
+    }
+    let error = crate::verify_rebuild(&f.repo, "canopa", &f.public, runtime, None, &tampered, None)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("differs from its template"));
+    let partial = work.join("partial");
+    copy_tree(&bundle, &partial)?;
+    fs::remove_file(partial.join("proto/usr/lib/libcc.so.1"))?;
+    assert!(
+        crate::verify_rebuild(&f.repo, "canopa", &f.public, compiler, None, &partial, None)
+            .is_err()
+    );
+
+    let inputs = work.join("inputs");
+    let path = crate::export_rebuild_inputs(&f.repo, "canopa", &f.public, runtime, None, &inputs)?;
+    assert_eq!(fs::read(path)?, recipe.as_bytes());
+    assert_eq!(
+        fs::read(inputs.join("source/compiler.kdl"))?,
+        compiler_template
+    );
+    assert_eq!(
+        fs::read(inputs.join("source/runtime.kdl"))?,
+        runtime_template
+    );
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -> Result<()> {
     let f = Fixture::new()?;
     let builder = Fixture::new()?;
@@ -2513,11 +2719,10 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
     fs::create_dir_all(bundle.join("proto/usr/share/cps"))?;
     fs::write(bundle.join("proto").join(output), bytes)?;
     fs::write(bundle.join("build.kdl"), &recipe)?;
-    fs::write(bundle.join("manifest.kdl"), manifest)?;
+    crate::build::write_explicit_outputs(&bundle, &[("build.kdl/nested/manifest.kdl", manifest)])?;
     let envelope = attestation::sign(
         &read_signing_key(&builder.private)?,
-        &parse_manifest(std::str::from_utf8(manifest)?)?,
-        manifest,
+        &[parse_manifest(std::str::from_utf8(manifest)?)?],
         &build::parse(&recipe)?,
         recipe.as_bytes(),
         Toolchain {

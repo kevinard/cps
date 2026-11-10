@@ -9,9 +9,10 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::build::pattern;
 use crate::model::{
-    FileDigest, MANIFEST_FORMAT, Manifest, PackageSpec, validate_digest, validate_path,
-    validate_publisher,
+    Dependency, FileDigest, MANIFEST_FORMAT, Manifest, PackageSpec, Version, parse_mode,
+    validate_digest, validate_facet, validate_path, validate_publisher, validate_variant,
 };
 use crate::repo::read_limited;
 
@@ -21,6 +22,8 @@ use super::{
 };
 
 pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
+/// The most packages that one build can produce.
+pub(crate) const MAX_OUTPUTS: usize = 64;
 const RECIPE_KIND: &str = "build-recipe";
 
 pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, String)> {
@@ -94,16 +97,186 @@ pub(crate) struct PublisherPin {
     pub key_sha256: String,
 }
 
+/// A package template pinned by the recipe. Each template becomes one output package.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TemplatePin {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// The package version that the recipe supplies to templates that omit it.
+pub(crate) struct RecipeVersion {
+    pub version: Version,
+    pub upstream: Option<String>,
+}
+
 pub(crate) struct BuildRecipe {
     pub arch: String,
     pub epoch: u32,
     pub toolchain: Vec<PublisherPin>,
     pub packages: BTreeSet<String>,
-    pub manifest: String,
-    pub manifest_digest: String,
+    pub version: Option<RecipeVersion>,
+    pub manifests: Vec<TemplatePin>,
+    pub discard: Vec<String>,
+    pub strip: bool,
     pub sources: BTreeMap<String, Source>,
     pub options: BTreeMap<String, String>,
     pub script: String,
+}
+
+/// How a `collect` rule assigns a facet to the paths it claims.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FacetChoice {
+    /// Apply the built-in rules, such as `devel` for `usr/include/**`.
+    Default,
+    /// Ship the paths without a facet.
+    None,
+    Facet(String),
+}
+
+/// A build-time rule that claims installed paths for one output package.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CollectRule {
+    pub pattern: String,
+    pub mode: Option<String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub preserve: bool,
+    pub facet: FacetChoice,
+    pub variants: BTreeMap<String, String>,
+}
+
+/// A source manifest: explicit package metadata and actions plus `collect` rules
+/// that `cps build` expands against the build's destination tree.
+#[derive(Clone, Debug)]
+pub(crate) struct Template {
+    pub manifest: Manifest,
+    pub collect: Vec<CollectRule>,
+}
+
+/// The token that a template dependency constraint can use for the recipe version.
+const VERSION_TOKEN: &str = "{version}";
+
+/// Parse a pinned template in the context of its recipe.
+pub(crate) fn parse_template(text: &str, recipe: &BuildRecipe) -> Result<Template> {
+    let mut collect = Vec::new();
+    let (mut manifest, declared) = super::parse_package(
+        text,
+        |node| {
+            if node.name().value() != "collect" {
+                return Ok(false);
+            }
+            collect.push(collect_rule(node).context("collect rule")?);
+            Ok(true)
+        },
+        recipe.version.as_ref().map(|version| &version.version),
+    )?;
+    if let Some(version) = &recipe.version {
+        ensure!(
+            !declared && manifest.upstream_version.is_none(),
+            "{} sets its version in the template, but the recipe already declares version {}",
+            manifest.name,
+            version.version
+        );
+        manifest.upstream_version.clone_from(&version.upstream);
+        let constraints = manifest
+            .dependency
+            .iter_mut()
+            .flat_map(|dependency| match dependency {
+                Dependency::Require(target)
+                | Dependency::RequireCapability(target)
+                | Dependency::Recommend(target)
+                | Dependency::Incorporate(target)
+                | Dependency::Exclude(target) => vec![target],
+                Dependency::RequireAny { alternatives } => alternatives.iter_mut().collect(),
+                Dependency::Conditional { target, predicate } => vec![target, predicate],
+            })
+            .chain(
+                manifest
+                    .optional_dependencies
+                    .iter_mut()
+                    .map(|optional| &mut optional.target),
+            );
+        let replacement = version.version.to_string();
+        for target in constraints {
+            if let Some(constraint) = &mut target.version {
+                *constraint = constraint.replace(VERSION_TOKEN, &replacement);
+            }
+        }
+    }
+    manifest.validate(false)?;
+    manifest.check_architecture(&recipe.arch)?;
+    let mut patterns = BTreeSet::new();
+    for rule in &collect {
+        ensure!(
+            patterns.insert(&rule.pattern),
+            "duplicate collect rule {}",
+            rule.pattern
+        );
+    }
+    Ok(Template { manifest, collect })
+}
+
+fn collect_rule(node: &KdlNode) -> Result<CollectRule> {
+    let fields = Fields::read(
+        node,
+        1,
+        &[
+            "mode",
+            "uid",
+            "gid",
+            "preserve",
+            "facet",
+            "arch",
+            super::VARIANT_PROPERTY,
+        ],
+        false,
+    )?;
+    let pattern = fields.string_arg(0)?;
+    pattern::validate(&pattern)?;
+    ensure!(
+        pattern.split('/').next() != Some(".cps"),
+        "reserved image path {pattern}"
+    );
+    let mode = fields.string("mode")?;
+    if let Some(mode) = &mode {
+        parse_mode(mode)?;
+    }
+    let facet = match fields.properties.get("facet") {
+        None => FacetChoice::Default,
+        Some(value) if value.is_null() => FacetChoice::None,
+        Some(value) => {
+            let facet = value
+                .as_string()
+                .context("facet must be a string or #null")?
+                .to_owned();
+            validate_facet(&facet)?;
+            FacetChoice::Facet(facet)
+        }
+    };
+    let variants = fields.variants()?;
+    for (name, value) in &variants {
+        validate_variant(name, value)?;
+    }
+    let owner = |key| -> Result<u32> {
+        let id = fields.integer(key)?.unwrap_or(0);
+        ensure!(id != u32::MAX, "invalid owner");
+        Ok(id)
+    };
+    Ok(CollectRule {
+        mode,
+        uid: owner("uid")?,
+        gid: owner("gid")?,
+        preserve: fields
+            .properties
+            .get("preserve")
+            .map(|value| value.as_bool().context("preserve must be #true or #false"))
+            .transpose()?
+            .unwrap_or(false),
+        facet,
+        variants,
+        pattern,
+    })
 }
 
 impl BuildRecipe {
@@ -205,10 +378,14 @@ pub(crate) fn snapshot_recipe(
         node.name().value() != "source"
             || node.get(0).and_then(KdlValue::as_string) != Some(archive_name)
     });
-    let manifest = children
+    let mut manifests = children
         .iter_mut()
-        .find(|node| node.name().value() == "manifest")
-        .context("missing manifest node")?;
+        .filter(|node| node.name().value() == "manifest");
+    let manifest = manifests.next().context("missing manifest node")?;
+    ensure!(
+        manifests.next().is_none(),
+        "Git snapshots build exactly one package"
+    );
     manifest.entries_mut().clear();
     manifest.push("manifest.kdl");
     manifest.insert("sha256", manifest_sha256);
@@ -223,6 +400,23 @@ pub(crate) fn snapshot_recipe(
         "snapshot build recipe exceeds the size limit"
     );
     parse(&text).context("validating the snapshot build recipe")?;
+    Ok(text)
+}
+
+/// Set the package version and upstream version of a template, keeping its
+/// other nodes, such as `collect` rules, as written.
+pub(crate) fn set_template_version(
+    template: &[u8],
+    version: &Version,
+    upstream: &str,
+    recipe: &BuildRecipe,
+) -> Result<String> {
+    let mut doc = document(std::str::from_utf8(template)?)?;
+    let package = doc.get_mut("package").context("missing package node")?;
+    package.insert("version", version.to_string());
+    package.insert("upstream-version", upstream);
+    let text = doc.to_string();
+    parse_template(&text, recipe).context("validating the snapshot manifest")?;
     Ok(text)
 }
 
@@ -319,12 +513,6 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         "build requires a pinned toolchain publisher"
     );
 
-    let fields = Fields::read(one(children, "manifest")?, 1, &["sha256"], false)?;
-    let manifest = fields.string_arg(0)?;
-    validate_path(&manifest)?;
-    let manifest_digest = fields.required_string("sha256")?;
-    validate_digest(&manifest_digest).context("invalid manifest digest")?;
-
     let script = Fields::read(one(children, "script")?, 1, &[], false)?.string_arg(0)?;
     ensure!(
         !script.trim().is_empty() && !script.contains('\0'),
@@ -333,9 +521,52 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
 
     let mut sources = BTreeMap::new();
     let mut options = BTreeMap::new();
+    let mut manifests = Vec::<TemplatePin>::new();
+    let mut discard = Vec::new();
+    let mut version = None;
+    let mut strip = None;
     for node in children.nodes() {
         match node.name().value() {
-            "toolchain" | "manifest" | "script" => {}
+            "toolchain" | "script" => {}
+            "manifest" => {
+                let fields = Fields::read(node, 1, &["sha256"], false)?;
+                let path = fields.string_arg(0)?;
+                validate_path(&path)?;
+                let sha256 = fields.required_string("sha256")?;
+                validate_digest(&sha256).context("invalid manifest digest")?;
+                ensure!(
+                    manifests.iter().all(|pin| pin.path != path),
+                    "duplicate manifest {path}"
+                );
+                manifests.push(TemplatePin { path, sha256 });
+            }
+            "version" => {
+                ensure!(version.is_none(), "duplicate version node");
+                let fields = Fields::read(node, 1, &["upstream"], false)?;
+                let upstream = fields.string("upstream")?;
+                version = Some(RecipeVersion {
+                    version: fields.string_arg(0)?.parse()?,
+                    upstream,
+                });
+            }
+            "discard" => {
+                let pattern = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                pattern::validate(&pattern)?;
+                ensure!(
+                    !discard.contains(&pattern),
+                    "duplicate discard pattern {pattern}"
+                );
+                discard.push(pattern);
+            }
+            "strip" => {
+                ensure!(strip.is_none(), "duplicate strip node");
+                let fields = Fields::read(node, 1, &[], false)?;
+                strip = Some(
+                    fields.args[0]
+                        .as_bool()
+                        .context("strip must be #true or #false")?,
+                );
+            }
             "option" => {
                 let fields = Fields::read(node, 2, &[], false)?;
                 let name = fields.string_arg(0)?;
@@ -389,13 +620,23 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
             source.pin.sha256
         );
     }
+    ensure!(
+        !manifests.is_empty(),
+        "build requires at least one manifest node"
+    );
+    ensure!(
+        manifests.len() <= MAX_OUTPUTS,
+        "a build can produce at most {MAX_OUTPUTS} packages"
+    );
     let recipe = BuildRecipe {
         arch,
         epoch,
         toolchain: pins,
         packages,
-        manifest,
-        manifest_digest,
+        version,
+        manifests,
+        discard,
+        strip: strip.unwrap_or(true),
         sources,
         options,
         script,
@@ -405,6 +646,10 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
 }
 
 fn check_option(name: &str, value: &str) -> Result<()> {
+    ensure!(
+        name != "JOBS",
+        "build option JOBS is reserved; recipes read the worker's job count from CPS_BUILD_JOBS"
+    );
     ensure!(
         name.len() <= 64
             && name.starts_with(|c: char| c.is_ascii_uppercase())
@@ -488,7 +733,7 @@ build architecture="x86_64" epoch=1700000000 {{
         let flags = "-O3 -DNAME=\"a b\" -DKEY=x=y\n\\literal";
         let (bytes, effective) = read_with_options(&path, &options("CFLAGS", flags))?;
         assert_eq!(effective.options["CFLAGS"], flags);
-        assert_eq!(effective.manifest, "nested/hello.kdl");
+        assert_eq!(effective.manifests[0].path, "nested/hello.kdl");
         assert!(std::str::from_utf8(&bytes)?.contains("// compiler flags"));
         assert_eq!(std::fs::read(&path)?, recipe.as_bytes());
         assert_eq!(
