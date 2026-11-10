@@ -16,7 +16,7 @@ use crate::{
     boot::kernel::Artifacts,
     image::{
         Image, Managed, Publisher, Settings, State, StateDelta,
-        root::{DirSyncs, Fingerprint, ReplacementSource, Root},
+        root::{self, DirSyncs, Fingerprint, ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
     plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, pending_repairs},
@@ -49,10 +49,25 @@ struct Journal {
     /// How many of the plan's triggers have run and published their outputs.
     #[serde(default, skip_serializing_if = "is_zero")]
     triggers_done: usize,
+    /// Progress of an abort. Once recorded, the transaction only goes back:
+    /// resume and abort both finish returning to the committed revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    abort: Option<AbortProgress>,
 }
 
 fn is_zero(count: &usize) -> bool {
     *count == 0
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AbortProgress {
+    /// Every journaled path is back in its state before the transaction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    files_ready: bool,
+    /// Live service jobs that the abort runs around its writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_jobs: Option<systemd::LiveJobs>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -83,6 +98,16 @@ impl PendingRecord {
         match self {
             Self::Journaled(journal) | Self::Live(journal) => journal,
         }
+    }
+
+    fn journal_mut(&mut self) -> &mut Journal {
+        match self {
+            Self::Journaled(journal) | Self::Live(journal) => journal,
+        }
+    }
+
+    fn aborting(&self) -> bool {
+        self.journal().abort.is_some()
     }
 
     fn work(&self) -> PendingWork<'_> {
@@ -150,6 +175,8 @@ pub struct PendingTransaction {
     pub files_ready: bool,
     pub plan_summary: String,
     pub live: bool,
+    /// An abort has started and must be finished.
+    pub aborting: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -159,6 +186,7 @@ pub enum TransactionPhase {
     PayloadValidated,
     Blocked,
     Applying,
+    Aborting,
     Applied,
     Superseded,
     PreparedForBoot,
@@ -197,6 +225,7 @@ pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
                 files_ready: work.files_ready,
                 plan_summary,
                 live: pending.is_live(),
+                aborting: pending.aborting(),
             })
         })
         .transpose()?;
@@ -228,7 +257,9 @@ pub fn transaction_progress(
                     settings.id == work.next.settings.id,
                     "pending transaction targets a different image"
                 );
-                if work.id == plan_id {
+                if work.id == plan_id && pending.aborting() {
+                    TransactionPhase::Aborting
+                } else if work.id == plan_id {
                     TransactionPhase::Applying
                 } else {
                     TransactionPhase::Blocked
@@ -474,6 +505,10 @@ pub(crate) fn apply_to_image(
             pending.work().id == id,
             "a different plan is pending; use transaction status to identify it"
         );
+        ensure!(
+            !pending.aborting(),
+            "this plan is being aborted; finish with transaction abort, then apply it again"
+        );
         let state = image.state()?;
         return resume_pending(
             &mut image,
@@ -529,6 +564,7 @@ pub(crate) fn apply_to_image(
             _ => None,
         },
         triggers_done: 0,
+        abort: None,
     });
     let pending = if live.is_some() {
         PendingRecord::Live(journal)
@@ -638,6 +674,10 @@ fn resume_image(
         discard_stage(&image);
         return Ok(None);
     };
+    if pending.aborting() {
+        // An abort that started is the only way out of this transaction.
+        return abort_pending(&mut image, &state, pending, live, false, |_| {}).map(Some);
+    }
     resume_pending(&mut image, &state, pending, live, repair, |_| {}).map(Some)
 }
 
@@ -735,6 +775,367 @@ fn resume_pending(
         repair,
         after_write,
     )
+}
+
+/// Abort the pending transaction of an inactive image.
+///
+/// Every journaled write runs backwards, so the image returns to the
+/// committed revision, which the abort leaves unchanged. Returns that
+/// revision, or `None` without a pending transaction. With `fetch`, missing
+/// package payloads are downloaded from each publisher's mirror first.
+pub fn abort_transaction(path: &Path, fetch: bool) -> Result<Option<u64>> {
+    abort_image(Image::open_for_apply(path)?, false, fetch, |_| {})
+}
+
+pub(crate) fn abort_live(image: Image, fetch: bool) -> Result<Option<u64>> {
+    abort_image(image, true, fetch, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn abort_with(path: &Path, after_write: impl FnMut(&Write)) -> Result<Option<u64>> {
+    abort_image(Image::open_for_apply(path)?, false, false, after_write)
+}
+
+fn abort_image(
+    mut image: Image,
+    live: bool,
+    fetch: bool,
+    after_write: impl FnMut(&Write),
+) -> Result<Option<u64>> {
+    let state = image.state()?;
+    let Some(pending) = image.pending::<PendingRecord>()? else {
+        discard_stage(&image);
+        return Ok(None);
+    };
+    abort_pending(&mut image, &state, pending, live, fetch, after_write).map(Some)
+}
+
+/// Return every journaled path to its committed state and drop the pending record.
+///
+/// The abort is recorded in the pending record before it changes anything,
+/// and from then on both resume and abort finish it. Its writes are the
+/// plan's writes reversed, checked like any other: each path must be in its
+/// state after the transaction, before it, or for a transition in one of
+/// the recognized intermediate states, so an interrupted abort resumes.
+fn abort_pending(
+    image: &mut Image,
+    base: &State,
+    mut pending: PendingRecord,
+    live: bool,
+    fetch: bool,
+    mut after_write: impl FnMut(&Write),
+) -> Result<u64> {
+    ensure!(
+        pending.is_live() == live,
+        if pending.is_live() {
+            "the pending transaction changed the running system; abort it with cps transaction abort without --root"
+        } else {
+            "the pending transaction belongs to an inactive image; abort it with cps transaction abort --root"
+        }
+    );
+    let plan = pending.recorded_plan()?.clone();
+    let work = pending.work();
+    validate_digest(work.id)?;
+    let next = work
+        .next
+        .apply(base)
+        .context("rebuilding the pending state from the committed revision")?;
+    let inverse = plan.inverse(base, &next)?;
+    let stage = image.stage()?;
+    let mut payloads = abort_payloads(&image.root, &stage, &inverse, base)?;
+    if fetch && !payloads.missing.is_empty() {
+        fetch_abort_payloads(&image.root, &payloads.missing)?;
+        payloads = abort_payloads(&image.root, &stage, &inverse, base)?;
+    }
+    payloads.check()?;
+    let services = live.then(|| systemd::LiveServices::plan(&inverse, &next, base));
+    match (&services, &pending.journal().abort) {
+        (_, None) => {
+            let live_jobs = services
+                .as_ref()
+                .map(systemd::LiveServices::active_jobs)
+                .transpose()?;
+            pending.journal_mut().abort = Some(AbortProgress {
+                files_ready: false,
+                live_jobs,
+            });
+            image.update_pending(&pending)?;
+        }
+        (Some(services), Some(progress)) => services.check_jobs(
+            progress
+                .live_jobs
+                .as_ref()
+                .context("live abort has no service jobs")?,
+        )?,
+        (None, Some(_)) => {}
+    }
+    payloads.stage(&image.root, &stage)?;
+    let progress = pending
+        .journal_mut()
+        .abort
+        .as_mut()
+        .expect("recorded abort");
+    let mut jobs = progress.live_jobs.clone();
+    // ExecStop can need the very files that the abort will remove.
+    if let Some(jobs) = &mut jobs
+        && jobs.stop_removed_units()?
+    {
+        progress.live_jobs = Some(jobs.clone());
+        image.update_pending(&pending)?;
+    }
+    let files_ready = pending
+        .journal()
+        .abort
+        .as_ref()
+        .is_some_and(|abort| abort.files_ready);
+    if !files_ready {
+        write_files(
+            &image.root,
+            &stage,
+            &inverse.writes,
+            &base.paths,
+            false,
+            None,
+            &mut after_write,
+        )?;
+    }
+    systemd::clean_enablement(&image.root, &inverse.writes, &base.paths)?;
+    let actions = live || !inverse.systemd.is_empty();
+    if actions && !files_ready {
+        pending
+            .journal_mut()
+            .abort
+            .as_mut()
+            .expect("recorded abort")
+            .files_ready = true;
+        image.update_pending(&pending)?;
+    }
+    let mut observed = BTreeMap::new();
+    if actions {
+        let path = if live {
+            PathBuf::from("/")
+        } else {
+            systemd::offline_path(&image.root)?
+        };
+        if !inverse.systemd.is_empty() {
+            systemd::run(&image.root, &path, &inverse.systemd, base, live)?;
+        }
+        // A recovery plan's paths return to the damage it was repairing.
+        let journaled: BTreeSet<&str> = inverse
+            .writes
+            .iter()
+            .map(|write| write.path.as_str())
+            .collect();
+        let records = image.file_records(None)?;
+        let checked = check_transaction_state(
+            &image.root,
+            base,
+            Contents::Fingerprints(&records),
+            &base.installed,
+            |path| !plan.is_recovery() || !journaled.contains(path),
+        )?;
+        if let Some(finding) = checked.errors().next() {
+            anyhow::bail!(
+                "aborting left an inconsistent image: {}; correct it and abort again",
+                finding.message
+            );
+        }
+        observed = checked.observed;
+        if let Some(jobs) = &jobs {
+            jobs.run()?;
+        }
+    }
+    let written = plan
+        .writes
+        .iter()
+        .map(|write| write.path.as_str())
+        .collect();
+    image.abort_pending(&written, &observed, base)?;
+    discard_stage(image);
+    Ok(base.settings.revision)
+}
+
+/// Where the contents that an abort restores come from.
+enum AbortSource<'a> {
+    /// Already staged and verified.
+    Staged,
+    /// A path that the abort already restored, so its contents are verified.
+    Image(&'a str),
+    /// A publisher's payload cache or repository.
+    Cache(&'a Publisher),
+}
+
+struct MissingPayload<'a> {
+    path: &'a str,
+    node: &'a Node,
+    /// The committed package that declares these contents, if any.
+    owner: Option<(&'a Publisher, String)>,
+}
+
+struct AbortPayloads<'a> {
+    found: BTreeMap<&'a str, (&'a Node, AbortSource<'a>)>,
+    missing: Vec<MissingPayload<'a>>,
+}
+
+fn abort_payloads<'a>(
+    root: &Root,
+    stage: &Root,
+    inverse: &'a Plan,
+    base: &'a State,
+) -> Result<AbortPayloads<'a>> {
+    let mut needed = BTreeMap::<&str, (&Node, Vec<&str>)>::new();
+    for write in inverse.writes.iter().filter(|write| write.needs_blob()) {
+        let Some(node @ Node::File { sha256, .. }) = &write.after else {
+            unreachable!("only file replacements require a payload");
+        };
+        needed
+            .entry(sha256.as_str())
+            .or_insert((node, Vec::new()))
+            .1
+            .push(write.path.as_str());
+    }
+    let mut payloads = AbortPayloads {
+        found: BTreeMap::new(),
+        missing: Vec::new(),
+    };
+    'payloads: for (hash, (node, paths)) in needed {
+        let Node::File { size, .. } = node else {
+            unreachable!("payloads contain only files");
+        };
+        if checked_payload(stage, node).is_ok() {
+            payloads.found.insert(hash, (node, AbortSource::Staged));
+            continue;
+        }
+        for &path in &paths {
+            if root.inspect(path)?.as_ref() == Some(node) {
+                payloads
+                    .found
+                    .insert(hash, (node, AbortSource::Image(path)));
+                continue 'payloads;
+            }
+        }
+        let owner = paths.iter().find_map(|path| {
+            let managed = base
+                .paths
+                .get(*path)
+                .filter(|managed| managed.node == *node)?;
+            let package = &base
+                .installed
+                .get(managed.owners.first()?)?
+                .published
+                .manifest;
+            Some((base.publishers.get(&package.publisher)?, package.id()))
+        });
+        let candidates = owner
+            .iter()
+            .map(|(publisher, _)| *publisher)
+            .chain(base.publishers.as_slice());
+        for publisher in candidates {
+            if crate::repo::release::cached_object(
+                &publisher.repo,
+                &format!("blobs/{hash}"),
+                hash,
+                *size,
+            )? {
+                payloads
+                    .found
+                    .insert(hash, (node, AbortSource::Cache(publisher)));
+                continue 'payloads;
+            }
+        }
+        payloads.missing.push(MissingPayload {
+            path: paths[0],
+            node,
+            owner,
+        });
+    }
+    Ok(payloads)
+}
+
+impl AbortPayloads<'_> {
+    /// Refuse to start, or continue, an abort that cannot restore every path.
+    fn check(&self) -> Result<()> {
+        if self.missing.is_empty() {
+            return Ok(());
+        }
+        let mut lines = vec![
+            "cannot abort the pending transaction; the contents that restore these paths are unavailable:"
+                .to_owned(),
+        ];
+        for missing in &self.missing {
+            let Node::File { sha256, size, .. } = missing.node else {
+                unreachable!("payloads contain only files");
+            };
+            lines.push(match &missing.owner {
+                Some((_, package)) => format!(
+                    "  {}: payload sha256 {sha256}, {size} bytes, from {package}",
+                    missing.path
+                ),
+                None => format!(
+                    "  {}: local contents sha256 {sha256} that the transaction replaced",
+                    missing.path
+                ),
+            });
+        }
+        if self.missing.iter().any(|missing| missing.owner.is_some()) {
+            lines.push(
+                "Abort again with --fetch to download the package payloads from each publisher's mirror; \
+                 the committed manifests pin their digests and sizes."
+                    .to_owned(),
+            );
+        }
+        if self.missing.iter().any(|missing| missing.owner.is_none()) {
+            lines.push(
+                "No package payload holds local contents. Restore those paths from a backup and abort \
+                 again, or finish the transaction with resume."
+                    .to_owned(),
+            );
+        }
+        anyhow::bail!(lines.join("\n"))
+    }
+
+    fn stage(&self, root: &Root, stage: &Root) -> Result<()> {
+        let dir = Root::fd_path(stage.as_file());
+        for (hash, (node, source)) in &self.found {
+            let mut file = NamedTempFile::new_in(&dir)?;
+            match source {
+                AbortSource::Staged => continue,
+                AbortSource::Image(path) => {
+                    copy_payload(&root.file(path)?, node, file.as_file_mut())
+                        .with_context(|| format!("staging the restored contents of {path}"))?
+                }
+                AbortSource::Cache(publisher) => {
+                    stage_blob(&publisher.repo, node, file.as_file_mut()).with_context(|| {
+                        format!("staging payload {hash} from {}", publisher.name)
+                    })?
+                }
+            }
+            file.as_file().sync_all()?;
+            file.persist(dir.join(hash))?;
+        }
+        Ok(stage.as_file().sync_all()?)
+    }
+}
+
+fn fetch_abort_payloads(root: &Root, missing: &[MissingPayload<'_>]) -> Result<()> {
+    let mut by_publisher = BTreeMap::<&str, (&Publisher, Vec<_>)>::new();
+    for missing in missing {
+        let (Some((publisher, _)), Node::File { sha256, size, .. }) =
+            (&missing.owner, missing.node)
+        else {
+            continue;
+        };
+        by_publisher
+            .entry(publisher.name.as_str())
+            .or_insert((publisher, Vec::new()))
+            .1
+            .push((sha256.as_str(), *size, None));
+    }
+    for (publisher, blobs) in by_publisher.into_values() {
+        fetch_payloads(publisher, root, blobs)
+            .with_context(|| PublisherFetchError(publisher.name.clone()))?;
+    }
+    Ok(())
 }
 
 /// The committed and next states of a transaction being finished.
@@ -973,64 +1374,151 @@ fn write_files(
         };
         payloads.insert(sha256.as_str(), fingerprint);
     }
-    let staged_payload = |node: &Node| -> Result<File> {
+    let mut writer = Writer {
+        root,
+        stage,
+        paths,
+        repair,
+        payloads,
+        syncs: DirSyncs::default(),
+        copied_from: BTreeSet::new(),
+        checked_target: None,
+        groups: if writes.iter().any(|write| write.detach) {
+            hardlink_groups(paths)
+        } else {
+            BTreeMap::new()
+        },
+        after_write,
+    };
+    let transitions: Vec<&str> = writes
+        .iter()
+        .filter(|write| write.transition().is_some())
+        .map(|write| write.path.as_str())
+        .collect();
+    for write in writes {
+        // A transition carries every write beneath its path.
+        if transitions.iter().any(|directory| write.beneath(directory)) {
+            continue;
+        }
+        if write.transition().is_some() {
+            let children = writes
+                .iter()
+                .filter(|child| child.beneath(&write.path))
+                .collect();
+            writer.transition(write, children)?;
+        } else {
+            writer.write(write)?;
+        }
+    }
+    // Every directory entry must be durable before the journal records the
+    // files as ready or commits the transaction.
+    root.sync_dirs(&mut writer.syncs, Some(stage.as_file()))?;
+    debug_assert!(writer.syncs.is_empty());
+    Ok(())
+}
+
+/// Executes a transaction's writes against the image root.
+struct Writer<'a, F> {
+    root: &'a Root,
+    stage: &'a Root,
+    paths: &'a BTreeMap<String, Managed>,
+    repair: bool,
+    payloads: BTreeMap<&'a str, Fingerprint>,
+    syncs: DirSyncs,
+    // Local configuration copied to a new path must be durable before its
+    // source path changes, or a crash could lose it.
+    copied_from: BTreeSet<&'a str>,
+    checked_target: Option<(&'a str, File)>,
+    groups: BTreeMap<&'a str, Vec<&'a str>>,
+    after_write: &'a mut F,
+}
+
+impl<'a, F: FnMut(&Write)> Writer<'a, F> {
+    fn staged_payload(&self, node: &Node) -> Result<File> {
         let Node::File { sha256, .. } = node else {
             anyhow::bail!("expected a file payload");
         };
-        let fingerprint = payloads
+        let fingerprint = self
+            .payloads
             .get(sha256.as_str())
             .with_context(|| format!("missing staged blob {sha256}"))?;
-        stage.file_matching(sha256, fingerprint)
-    };
-    let mut syncs = DirSyncs::default();
-    // Local configuration copied to a new path must be durable before its
-    // source path changes, or a crash could lose it.
-    let mut copied_from = BTreeSet::new();
-    let mut checked_target: Option<(&str, File)> = None;
-    let groups = if writes.iter().any(|write| write.detach) {
-        hardlink_groups(paths)
-    } else {
-        BTreeMap::new()
-    };
-    for write in writes {
-        if write.hardlink_target().is_some() || copied_from.contains(write.path.as_str()) {
+        self.stage.file_matching(sha256, fingerprint)
+    }
+
+    /// Open a verified hard link target. A target inside a directory tree
+    /// that is still being assembled in staging is opened there.
+    fn hardlink_source(&mut self, target: &'a str, tree: Option<(&Root, &str)>) -> Result<File> {
+        let managed = self
+            .paths
+            .get(target)
+            .with_context(|| format!("missing hard link target {target}"))?;
+        if let Some((tree, directory)) = tree
+            && let Some(relative) = target
+                .strip_prefix(directory)
+                .and_then(|rest| rest.strip_prefix('/'))
+        {
+            return tree.checked_hardlink_target(relative, &managed.node);
+        }
+        if self
+            .checked_target
+            .as_ref()
+            .is_none_or(|(name, _)| *name != target)
+        {
+            self.checked_target = Some((
+                target,
+                self.root.checked_hardlink_target(target, &managed.node)?,
+            ));
+        }
+        let (_, file) = self.checked_target.as_ref().expect("checked target");
+        Ok(file.try_clone()?)
+    }
+
+    fn source(
+        &mut self,
+        write: &'a Write,
+        tree: Option<(&Root, &str)>,
+    ) -> Result<Option<ReplacementSource<'a>>> {
+        Ok(match &write.after {
+            Some(node @ Node::File { .. }) => Some(match write.local_config_source() {
+                Some((path, before)) => ReplacementSource::LocalConfig { path, before },
+                None => ReplacementSource::Staged(self.staged_payload(node)?),
+            }),
+            Some(Node::Hardlink { target }) => Some(ReplacementSource::Staged(
+                self.hardlink_source(target, tree)?,
+            )),
+            _ => None,
+        })
+    }
+
+    fn write(&mut self, write: &'a Write) -> Result<()> {
+        let root = self.root;
+        if write.hardlink_target().is_some() || self.copied_from.contains(write.path.as_str()) {
             // A hard link publishes the target's new inode, so the target's
             // rename must be durable first.
-            root.sync_dirs(&mut syncs, Some(stage.as_file()))?;
+            root.sync_dirs(&mut self.syncs, Some(self.stage.as_file()))?;
         }
         if let Some((source, _)) = write.local_config_source()
             && source != write.path
         {
-            copied_from.insert(source);
+            self.copied_from.insert(source);
         }
-        let link_source = if let Some(target) = write.hardlink_target() {
-            if checked_target
-                .as_ref()
-                .is_none_or(|(name, _)| *name != target)
-            {
-                let managed = paths
-                    .get(target)
-                    .with_context(|| format!("missing hard link target {target}"))?;
-                checked_target =
-                    Some((target, root.checked_hardlink_target(target, &managed.node)?));
-            }
-            checked_target.as_ref().map(|(_, file)| file)
-        } else {
-            None
+        let link_source = match write.hardlink_target() {
+            Some(target) => Some(self.hardlink_source(target, None)?),
+            None => None,
         };
-        if let Some(source) = link_source
+        if let Some(source) = &link_source
             && root.shares_inode(&write.path, source)?
         {
-            syncs.parent_of(&write.path);
-            syncs.mark_staging();
-            continue;
+            self.syncs.parent_of(&write.path);
+            self.syncs.mark_staging();
+            return Ok(());
         }
         let observed = root.inspect(&write.path)?;
         // Only restore immutable paths still owned by the pending composition.
         // Removals and edits to preserved or locally moved config remain strict.
-        let before = if repair
+        let before = if self.repair
             && observed != write.after
-            && let Some(managed) = paths.get(&write.path)
+            && let Some(managed) = self.paths.get(&write.path)
             && !managed.preserve
             && write.after.as_ref() == Some(&managed.node)
             && observed.as_ref().is_none_or(|node| {
@@ -1045,78 +1533,221 @@ fn write_files(
             && before != after
         {
             if root.repair_directory(&write.path, before, after)? {
-                after_write(write);
+                (self.after_write)(write);
             }
-            continue;
+            return Ok(());
         }
         let detach = write.detach
             && observed == write.after
             && root.has_other_links(
                 &write.path,
-                groups.get(write.path.as_str()).map_or(&[], Vec::as_slice),
+                self.groups
+                    .get(write.path.as_str())
+                    .map_or(&[], Vec::as_slice),
             )?;
         if observed == write.after && !detach {
             if write.before != write.after || write.detach {
                 // An interrupted run may have published this path without
                 // syncing its directory.
-                syncs.parent_of(&write.path);
-                syncs.mark_staging();
+                self.syncs.parent_of(&write.path);
+                self.syncs.mark_staging();
             }
-            continue;
+            return Ok(());
         }
+        // A path holding exactly the contents and metadata of its hard link
+        // target can be linked to it without losing anything. An abort finds
+        // aliases still linked to the target's old inode in this state once
+        // it has restored the target.
+        let same_as_target = write
+            .hardlink_target()
+            .and_then(|target| self.paths.get(target))
+            .is_some_and(|target| observed.as_ref() == Some(&target.node));
         ensure!(
-            &observed == before,
+            &observed == before || same_as_target,
             "unexpected state at {}; pending transaction retained",
             write.path
         );
         if write.removes_directory() {
-            if root.remove_empty_dir(&write.path, &mut syncs)? {
-                after_write(write);
+            if root.remove_empty_dir(&write.path, &mut self.syncs)? {
+                (self.after_write)(write);
             }
-            continue;
+            return Ok(());
         }
         match &write.after {
             Some(node) => {
-                let payload = match node {
-                    Node::File { .. } => Some(match write.local_config_source() {
-                        Some((path, before)) => ReplacementSource::LocalConfig { path, before },
-                        None => ReplacementSource::Staged(staged_payload(node)?),
-                    }),
-                    Node::Hardlink { .. } => Some(ReplacementSource::Staged(
-                        link_source
-                            .context("missing hard link target")?
-                            .try_clone()?,
-                    )),
-                    _ => None,
+                let payload = match (node, link_source) {
+                    (Node::Hardlink { .. }, Some(source)) => {
+                        Some(ReplacementSource::Staged(source))
+                    }
+                    (Node::Hardlink { .. }, None) => anyhow::bail!("missing hard link target"),
+                    _ => self.source(write, None)?,
                 };
                 root.replace(
                     &write.path,
                     node,
                     payload,
-                    stage.as_file(),
+                    self.stage.as_file(),
                     write.config_move.is_some(),
-                    &mut syncs,
+                    &mut self.syncs,
                 )?;
             }
-            None => root.remove_file_deferred(&write.path, &mut syncs)?,
+            None => root.remove_file_deferred(&write.path, &mut self.syncs)?,
         }
-        after_write(write);
+        (self.after_write)(write);
+        Ok(())
     }
-    // Every directory entry must be durable before the journal records the
-    // files as ready or commits the transaction.
-    root.sync_dirs(&mut syncs, Some(stage.as_file()))?;
-    debug_assert!(syncs.is_empty());
-    Ok(())
+
+    /// Replace a directory with a file or symlink, or the reverse, together
+    /// with every write beneath the path.
+    ///
+    /// The new object, including a complete new directory tree, is built
+    /// under a private staging name and exchanged with the old object, so
+    /// the path never goes missing on a filesystem that supports
+    /// RENAME_EXCHANGE. Resume and abort recognize every intermediate state:
+    ///
+    /// - The path is in its old state: anything under the staging names is
+    ///   an incomplete replacement, which is rebuilt.
+    /// - The path is in its new state: the staging names hold the old
+    ///   object, which is removed.
+    /// - The path is absent after the fallback for filesystems without
+    ///   RENAME_EXCHANGE moved the old object aside: whichever object the
+    ///   write wants is renamed into place.
+    fn transition(&mut self, write: &'a Write, children: Vec<&'a Write>) -> Result<()> {
+        let (root, stage) = (self.root, self.stage);
+        let path = write.path.as_str();
+        let into_directory = write.transition() == Some(true);
+        let id = &crate::model::digest(path.as_bytes())[..32];
+        let (swap, old) = (format!("swap-{id}"), format!("old-{id}"));
+        let observed = root.inspect(path)?;
+        let mut changed = true;
+        if observed == write.after {
+            changed = false;
+        } else if observed == write.before {
+            if !into_directory {
+                check_replaced_tree(root, write, &children)?;
+            }
+            // Configuration copied out of the old tree and link targets of
+            // the new one must be durable before the old object goes.
+            root.sync_dirs(&mut self.syncs, Some(stage.as_file()))?;
+            self.stage_replacement(write, &children, &swap)?;
+            root::test_point("staged");
+            root.exchange(path, stage.as_file(), &swap, &old)?;
+        } else if observed.is_none() {
+            let displaced = stage.inspect(&old)?;
+            ensure!(
+                displaced.is_some(),
+                "unexpected state at {path}; pending transaction retained"
+            );
+            if displaced == write.before {
+                self.stage_replacement(write, &children, &swap)?;
+                root.publish_staged(path, stage.as_file(), &swap)?;
+            } else if displaced == write.after {
+                root.publish_staged(path, stage.as_file(), &old)?;
+            } else {
+                anyhow::bail!("unexpected state at {path}; pending transaction retained");
+            }
+        } else {
+            anyhow::bail!("unexpected state at {path}; pending transaction retained");
+        }
+        for name in [&swap, &old] {
+            if stage.remove_staged(name)? {
+                self.syncs.mark_staging();
+            }
+        }
+        if changed {
+            (self.after_write)(write);
+        }
+        if into_directory {
+            // The new tree is in place, so each write beneath it now
+            // finds its new state, or an earlier one if the tree was
+            // published before an interruption completed it.
+            for child in children {
+                self.write(child)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the replacement object for a transition as the staging entry `name`.
+    fn stage_replacement(
+        &mut self,
+        write: &'a Write,
+        children: &[&'a Write],
+        name: &str,
+    ) -> Result<()> {
+        let (root, stage) = (self.root, self.stage);
+        let path = write.path.as_str();
+        let node = write
+            .after
+            .as_ref()
+            .context("transition has no new object")?;
+        if write.transition() == Some(false) {
+            let payload = self.source(write, None)?;
+            root.stage_object(stage.as_file(), name, path, node, payload)?;
+            return Ok(stage.as_file().sync_all()?);
+        }
+        root.stage_object(stage.as_file(), name, path, node, None)?;
+        let tree = stage.subdir(name)?;
+        let mut built: Vec<&Write> = Vec::new();
+        for &child in children {
+            ensure!(
+                child.before.is_none(),
+                "unexpected journaled state beneath {path}"
+            );
+            if child.after.is_some() {
+                built.push(child);
+            }
+        }
+        // Parents before their entries, and link targets before links.
+        built.sort_by_cached_key(|child| {
+            (
+                child.hardlink_target().is_some(),
+                child.path.bytes().filter(|b| *b == b'/').count(),
+                child.path.clone(),
+            )
+        });
+        let mut syncs = DirSyncs::default();
+        for child in built {
+            let relative = &child.path[path.len() + 1..];
+            let payload = self.source(child, Some((&tree, path)))?;
+            let node = child.after.as_ref().expect("built children have contents");
+            root.replace_beneath(&tree, relative, node, payload, stage.as_file(), &mut syncs)?;
+        }
+        tree.sync_dirs(&mut syncs, None)?;
+        tree.as_file().sync_all()?;
+        Ok(stage.as_file().sync_all()?)
+    }
+}
+
+/// Check that a directory about to be replaced holds only the journaled
+/// paths beneath it, each still in its state before the transaction.
+fn check_replaced_tree(root: &Root, write: &Write, children: &[&Write]) -> Result<()> {
+    let expected: BTreeMap<&str, &Write> = children
+        .iter()
+        .map(|child| (child.path.as_str(), *child))
+        .collect();
+    root.walk_beneath(&write.path, |path, _| {
+        let child = expected.get(path).with_context(|| {
+            format!(
+                "unexpected path {path} beneath {}; pending transaction retained",
+                write.path
+            )
+        })?;
+        ensure!(
+            child.after.is_none() && root.inspect(path)? == child.before,
+            "unexpected state at {path}; pending transaction retained"
+        );
+        Ok(true)
+    })
 }
 
 fn clear_stage(stage: &Root) -> Result<()> {
     for entry in fs::read_dir(Root::fd_path(stage.as_file()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir(entry.path())?;
-        } else {
-            fs::remove_file(entry.path())?;
-        }
+        let name = entry?.file_name();
+        let name = name
+            .to_str()
+            .with_context(|| format!("non-UTF-8 staging entry {name:?}"))?;
+        stage.remove_staged(name)?;
     }
     Ok(())
 }

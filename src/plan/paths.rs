@@ -50,14 +50,6 @@ pub(crate) fn effective_paths(
     )
 }
 
-pub(crate) fn check_path_type(path: &str, before: &Managed, after: &Managed) -> Result<()> {
-    ensure!(
-        before.node.is_dir() == after.node.is_dir(),
-        "cannot change between directory and leaf actions at {path}"
-    );
-    Ok(())
-}
-
 pub(crate) fn check_directory(path: &str, existing: &Node, target: &Managed) -> Result<()> {
     ensure!(
         existing == &target.node || (target.implicit && existing.is_dir()),

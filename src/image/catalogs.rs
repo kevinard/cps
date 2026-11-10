@@ -29,6 +29,13 @@ pub(super) fn save(tx: &Transaction<'_>, state: &State) -> Result<()> {
         }
         let bytes = catalog_bytes(&publisher.repo, &checkpoint.catalog)
             .with_context(|| format!("archiving the signed catalog for {name}"))?;
+        // Keep the committed archive, or its absence, until the pending
+        // transaction commits, so an abort can put it back.
+        tx.execute(
+            "INSERT OR IGNORE INTO replaced_catalog_archives
+             VALUES (?1, (SELECT catalog FROM catalog_archives WHERE publisher=?1))",
+            [name],
+        )?;
         insert.execute((name, bytes))?;
     }
     Ok(())

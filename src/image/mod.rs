@@ -845,7 +845,8 @@ fn initialize(
          CREATE TABLE pending (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
          CREATE TABLE history (plan TEXT PRIMARY KEY, revision INTEGER NOT NULL);
          CREATE TABLE transaction_details (plan TEXT PRIMARY KEY, data TEXT NOT NULL, sha256 TEXT NOT NULL);
-         CREATE TABLE catalog_archives (publisher TEXT PRIMARY KEY, catalog BLOB NOT NULL);",
+         CREATE TABLE catalog_archives (publisher TEXT PRIMARY KEY, catalog BLOB NOT NULL);
+         CREATE TABLE replaced_catalog_archives (publisher TEXT PRIMARY KEY, catalog BLOB);",
     )?;
     tx.execute(
         "INSERT INTO image VALUES (1, ?1)",
@@ -1309,7 +1310,47 @@ impl Image {
             params![plan, next.settings.revision],
         )?;
         history::record(&tx, plan, next.settings.revision, details)?;
+        tx.execute("DELETE FROM replaced_catalog_archives", [])?;
         tx.execute("DELETE FROM pending WHERE id=1", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop an aborted pending transaction, leaving the committed revision.
+    ///
+    /// The files are back in their committed state. One SQLite transaction
+    /// restores the catalog archives and build receipts that the pending
+    /// record replaced, forgets the fingerprints of every journaled path,
+    /// records fingerprints the abort verified, and deletes the record.
+    pub(crate) fn abort_pending(
+        &mut self,
+        written: &BTreeSet<&str>,
+        observed: &BTreeMap<String, Observation>,
+        base: &State,
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute_batch(
+            "DELETE FROM catalog_archives WHERE publisher IN
+                 (SELECT publisher FROM replaced_catalog_archives WHERE catalog IS NULL);
+             INSERT OR REPLACE INTO catalog_archives
+                 SELECT publisher, catalog FROM replaced_catalog_archives WHERE catalog IS NOT NULL;
+             DELETE FROM replaced_catalog_archives;",
+        )?;
+        catalogs::verify(&tx, base).context("restoring the committed catalog archives")?;
+        builds::prune(&tx, base)?;
+        let forgotten: BTreeSet<String> = written.iter().map(|path| (*path).to_owned()).collect();
+        let observed: BTreeMap<_, _> = observed
+            .iter()
+            .filter(|(path, _)| {
+                !forgotten.contains(path.as_str()) && base.paths.contains_key(path.as_str())
+            })
+            .map(|(path, observation)| (path.clone(), observation.clone()))
+            .collect();
+        save_file_records(&tx, &observed, &forgotten)?;
+        ensure!(
+            tx.execute("DELETE FROM pending WHERE id=1", [])? == 1,
+            "no pending transaction to abort"
+        );
         tx.commit()?;
         Ok(())
     }

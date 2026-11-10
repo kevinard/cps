@@ -2,6 +2,7 @@ mod catalogs;
 mod config;
 pub(crate) mod freeze;
 mod intent;
+mod order;
 mod paths;
 mod rename;
 mod repair;
@@ -36,9 +37,10 @@ pub(crate) use catalogs::{CandidateSet, claim_source};
 pub use config::{ConfigChoice, ConfigUpdate, config_diff_inputs, list_config_updates};
 pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
 pub use intent::{IntentChange, MarkChoice};
+use order::WriteOrder;
 pub(crate) use paths::{
-    check_directory, check_path_type, choose_mediators, effective_paths, hardlink_groups,
-    mediator_offers, resolve_facets, select_paths,
+    check_directory, choose_mediators, effective_paths, hardlink_groups, mediator_offers,
+    resolve_facets, select_paths,
 };
 pub(crate) use rename::Renames;
 pub(crate) use resolve::{
@@ -505,7 +507,26 @@ impl Plan {
                 lines.push(format!("Restore vendor configuration {}", write.path));
             }
         }
-        for write in self.writes.iter().filter(|write| write.removes_directory()) {
+        let transitions: Vec<_> = self
+            .writes
+            .iter()
+            .filter(|write| write.transition().is_some())
+            .collect();
+        for write in &transitions {
+            let kind = match &write.after {
+                Some(Node::Dir { .. }) => "a directory".to_owned(),
+                Some(Node::Symlink { target, .. }) => format!("a symbolic link to {target}"),
+                Some(Node::Hardlink { target }) => format!("a hard link to {target}"),
+                _ => "a file".to_owned(),
+            };
+            lines.push(format!("Replace {} with {kind}", write.path));
+        }
+        for write in self.writes.iter().filter(|write| {
+            write.removes_directory()
+                && !transitions
+                    .iter()
+                    .any(|transition| write.beneath(&transition.path))
+        }) {
             lines.push(format!("Prune if empty {}", write.path));
         }
         for write in &self.writes {
@@ -1548,6 +1569,9 @@ fn build_with_update_diagnostics(
         .filter(|(to, from)| to != from)
         .map(|(_, from)| from.as_str())
         .collect();
+    // Directories that this transaction replaces with a file or symlink.
+    // Paths sort after their ancestors, so each is known before its contents.
+    let mut replaced_directories = BTreeSet::new();
     for path in state
         .paths
         .keys()
@@ -1571,14 +1595,32 @@ fn build_with_update_diagnostics(
         {
             retired_update = state.settings.config_updates.remove(path);
         }
-        if let (Some(old), Some(new)) = (before, after) {
-            check_path_type(path, old, new)?;
-        }
         let observed = root.inspect(path)?;
         let mut local_config = false;
+        let replaced = within(path, &replaced_directories);
         let destination = match after {
             Some(target) if target.node.is_dir() => match &observed {
                 None => Some(target.node.clone()),
+                Some(existing)
+                    if !existing.is_dir() && before.is_some_and(|old| !old.node.is_dir()) =>
+                {
+                    // A managed file or symlink becomes a directory. The new
+                    // tree is assembled in staging and swapped into place.
+                    ensure!(
+                        !matches!(existing, Node::Special),
+                        "path type conflict at {path}"
+                    );
+                    if let Some(old) = before
+                        && old.preserve
+                        && observed.as_ref() != Some(&old.node)
+                    {
+                        anyhow::bail!(
+                            "replacing {path} with a directory would discard local config; \
+                             move it aside or restore the vendor configuration with revert, then plan again"
+                        );
+                    }
+                    Some(target.node.clone())
+                }
                 Some(existing) => {
                     if !target.implicit
                         && before.is_some_and(|old| !old.implicit && existing == &old.node)
@@ -1593,6 +1635,15 @@ fn build_with_update_diagnostics(
                     }
                 }
             },
+            Some(target)
+                if matches!(observed, Some(Node::Dir { .. }))
+                    && before.is_some_and(|old| old.node.is_dir()) =>
+            {
+                // A managed directory becomes a file or symlink. Its contents
+                // must all leave in this transaction; see check_replaced_directory.
+                replaced_directories.insert(path.as_str());
+                Some(target.node.clone())
+            }
             Some(target) => {
                 ensure!(
                     !matches!(observed, Some(Node::Dir { .. } | Node::Special)),
@@ -1644,8 +1695,9 @@ fn build_with_update_diagnostics(
                 }
             }
             None if before.is_some_and(|old| old.node.is_dir()) => {
-                if state.settings.created_directories.contains(path)
-                    && observed.as_ref() == before.map(|old| &old.node)
+                if replaced
+                    || state.settings.created_directories.contains(path)
+                        && observed.as_ref() == before.map(|old| &old.node)
                 {
                     None
                 } else {
@@ -1709,7 +1761,15 @@ fn build_with_update_diagnostics(
             },
         );
     }
-    plan.writes = ordered_writes(root, &paths, writes, &retired)?;
+    for directory in &replaced_directories {
+        check_replaced_directory(root, directory, &state, &writes)?;
+    }
+    let order = WriteOrder::new(
+        (&state.installed, &state.paths),
+        (&installed, &paths),
+        &retired,
+    );
+    plan.writes = ordered_writes(root, &paths, writes, &order)?;
     let planned = triggers::plan(
         &state.installed,
         &state.paths,
@@ -1749,12 +1809,12 @@ fn build_with_update_diagnostics(
     state
         .settings
         .created_directories
-        .retain(|path| paths.contains_key(path));
+        .retain(|path| paths.get(path).is_some_and(|managed| managed.node.is_dir()));
     state.settings.created_directories.extend(
         plan.writes
             .iter()
             .filter(|write| {
-                write.before.is_none()
+                write.before.as_ref().is_none_or(|node| !node.is_dir())
                     && write.after.as_ref().is_some_and(Node::is_dir)
                     && paths.contains_key(&write.path)
             })
@@ -1768,14 +1828,74 @@ fn build_with_update_diagnostics(
 pub(crate) fn pending_repairs(root: &Root, state: &State) -> Result<Vec<Write>> {
     let paths = state.paths.keys().map(String::as_str);
     let writes = repair::write_paths(root, state, paths, &mut Vec::new())?;
-    ordered_writes(root, &state.paths, writes, &BTreeSet::new())
+    let current = (&state.installed, &state.paths);
+    let retired = BTreeSet::new();
+    ordered_writes(
+        root,
+        &state.paths,
+        writes,
+        &WriteOrder::new(current, current, &retired),
+    )
+}
+
+/// Whether `path` lies beneath one of `directories`.
+fn within(path: &str, directories: &BTreeSet<&str>) -> bool {
+    path.match_indices('/')
+        .any(|(index, _)| directories.contains(&path[..index]))
+}
+
+/// Refuse to replace a directory whose contents would not all leave with it.
+///
+/// Every entry beneath the directory must be a managed path that this
+/// transaction removes. CPS never discards unmanaged files or locally
+/// modified configuration, and it does not move them elsewhere either: the
+/// administrator decides where they belong before the directory goes away.
+fn check_replaced_directory(
+    root: &Root,
+    directory: &str,
+    committed: &State,
+    writes: &BTreeMap<String, Write>,
+) -> Result<()> {
+    const LISTED: usize = 20;
+    let mut kept = Vec::new();
+    root.walk_beneath(directory, |path, _| {
+        if writes.get(path).is_some_and(|write| write.after.is_none()) {
+            return Ok(true);
+        }
+        kept.push(match committed.paths.get(path) {
+            Some(managed) if managed.preserve => format!("{path} (locally modified configuration)"),
+            Some(_) => format!("{path} (kept by this transaction)"),
+            None if committed.settings.dormant_configs.contains_key(path) => {
+                format!("{path} (retained local configuration)")
+            }
+            None => format!("{path} (not managed by CPS)"),
+        });
+        Ok(false)
+    })
+    .with_context(|| format!("checking the contents of {directory} before replacing it"))?;
+    if kept.is_empty() {
+        return Ok(());
+    }
+    let more = kept.len().saturating_sub(LISTED);
+    kept.truncate(LISTED);
+    let mut message = format!(
+        "cannot replace directory {directory}: this transaction would not remove these paths beneath it:\n  {}",
+        kept.join("\n  ")
+    );
+    if more > 0 {
+        message.push_str(&format!("\n  and {more} more"));
+    }
+    message.push_str(
+        "\nMove or remove them, or restore vendor configuration with revert, then plan again",
+    );
+    anyhow::bail!(message)
 }
 
 fn ordered_writes(
     root: &Root,
     paths: &BTreeMap<String, Managed>,
     mut writes: BTreeMap<String, Write>,
-    retired: &BTreeSet<&str>,
+    order: &WriteOrder<'_>,
 ) -> Result<Vec<Write>> {
     // Replacing a regular file swaps its inode. Its aliases still refer to
     // the old inode even when their actions have not changed.
@@ -1815,7 +1935,7 @@ fn ordered_writes(
         }
     }
     let mut ordered: Vec<_> = writes.into_values().collect();
-    ordered.sort_by(|a, b| a.order(retired).cmp(&b.order(retired)));
+    order.sort(&mut ordered);
     Ok(ordered)
 }
 
@@ -1846,6 +1966,107 @@ pub(crate) fn boot_sensitive_pattern(pattern: &str) -> bool {
             .any(|prefix| triggers::intersects(pattern, &format!("{prefix}*")))
 }
 
+impl Plan {
+    /// A plan that returns every path this plan journals to its state
+    /// before the plan, for aborting it. Applied to the image in any mix of
+    /// before and after states, it leaves the committed revision `base`.
+    ///
+    /// Each write runs backwards. Local configuration copied by a move or a
+    /// metadata change is copied back from where the plan put it, aliases
+    /// declared as hard links in `base` are linked again to their restored
+    /// targets, and other files come from package payloads. Systemd actions
+    /// are those of the change from `next` back to `base`; kernel
+    /// preparation is not repeated, since `base` already prepared its kernel.
+    pub(crate) fn inverse(&self, base: &State, next: &State) -> Result<Self> {
+        let mut writes = BTreeMap::new();
+        let mut retired = BTreeSet::new();
+        for write in &self.writes {
+            if write.before == write.after && !write.detach {
+                continue;
+            }
+            let before = match &write.after {
+                // A hard link reads as its target's inode.
+                Some(Node::Hardlink { target }) => Some(
+                    next.paths
+                        .get(target)
+                        .with_context(|| format!("missing hard link target {target}"))?
+                        .node
+                        .clone(),
+                ),
+                other => other.clone(),
+            };
+            let after = match base.paths.get(&write.path) {
+                Some(
+                    managed @ Managed {
+                        node: Node::Hardlink { .. },
+                        ..
+                    },
+                ) if write.before.is_some() => Some(managed.node.clone()),
+                _ => write.before.clone(),
+            };
+            if let Some(migration) = &write.config_move
+                && migration.from != write.path
+            {
+                retired.insert(write.path.as_str());
+            }
+            writes.insert(
+                write.path.clone(),
+                Write {
+                    path: write.path.clone(),
+                    before,
+                    after,
+                    detach: false,
+                    local_config: write.local_config,
+                    config_move: None,
+                },
+            );
+        }
+        // A moved configuration's local contents go back to their source.
+        for write in &self.writes {
+            if let Some(migration) = &write.config_move
+                && migration.local.is_some()
+                && migration.from != write.path
+                && let Some(source) = writes.get_mut(&migration.from)
+            {
+                let local = write
+                    .after
+                    .clone()
+                    .context("moved configuration has no destination contents")?;
+                source.config_move = Some(ConfigMove {
+                    from: write.path.clone(),
+                    local: Some(local),
+                });
+            }
+        }
+        for (path, managed) in &base.paths {
+            if let Node::Hardlink { target } = &managed.node {
+                ensure!(
+                    !writes.get(target).is_some_and(Write::replaces_file)
+                        || writes.contains_key(path),
+                    "aborting would leave {path} linked to the replaced {target}"
+                );
+            }
+        }
+        let mut writes: Vec<_> = writes.into_values().collect();
+        WriteOrder::new(
+            (&next.installed, &next.paths),
+            (&base.installed, &base.paths),
+            &retired,
+        )
+        .sort(&mut writes);
+        let mut inverse = self.clone();
+        inverse.writes = writes;
+        inverse.systemd = systemd::plan_actions(next, &base.installed, &base.paths);
+        inverse.kernel_install = None;
+        inverse.transfers.clear();
+        inverse.preserved.clear();
+        for change in &mut inverse.package_changes {
+            std::mem::swap(&mut change.from, &mut change.to);
+        }
+        Ok(inverse)
+    }
+}
+
 impl Write {
     pub(crate) fn boot_sensitive(&self) -> bool {
         let path = Path::new(&self.path);
@@ -1854,6 +2075,12 @@ impl Write {
                 || BOOT_SENSITIVE_LOADERS
                     .iter()
                     .any(|prefix| self.path.starts_with(prefix)))
+    }
+
+    pub(crate) fn beneath(&self, directory: &str) -> bool {
+        self.path
+            .strip_prefix(directory)
+            .is_some_and(|rest| rest.starts_with('/'))
     }
 
     pub(crate) fn removes_directory(&self) -> bool {
@@ -1888,19 +2115,20 @@ impl Write {
         }
     }
 
-    fn order(&self, retired: &BTreeSet<&str>) -> (u8, usize, &str) {
-        let depth = self.path.bytes().filter(|b| *b == b'/').count();
-        if self.removes_directory() {
-            (4, usize::MAX - depth, "")
-        } else if retired.contains(self.path.as_str()) {
-            // Publish both the new path and its vendor proposal before retiring the old path.
-            (3, depth, "")
-        } else if let Some(target) = self.hardlink_target() {
-            (2, 0, target)
-        } else if self.after.as_ref().is_some_and(Node::is_dir) {
-            (0, depth, "")
-        } else {
-            (1, depth, "")
+    /// Whether this write replaces a directory with a file or symlink
+    /// (`Some(false)`) or a file or symlink with a directory (`Some(true)`).
+    ///
+    /// Such a write also carries every write beneath its path: the new
+    /// object, with any new directory tree, is assembled in staging and
+    /// exchanged with the old one in a single rename.
+    pub(crate) fn transition(&self) -> Option<bool> {
+        match (&self.before, &self.after) {
+            (Some(before), Some(after))
+                if before.is_dir() != after.is_dir() && !matches!(before, Node::Special) =>
+            {
+                Some(after.is_dir())
+            }
+            _ => None,
         }
     }
 }

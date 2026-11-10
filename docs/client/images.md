@@ -11,6 +11,8 @@ a package into an image you can use with these commands.
 
 - [Plan, fetch, validate, and apply](#plan-fetch-validate-and-apply)
 - [Resume a transaction and inspect its history](#resume-a-transaction-and-inspect-its-history)
+- [Abort a transaction](#abort-a-transaction)
+- [Replace a directory with a file or symlink](#replace-a-directory-with-a-file-or-symlink)
 - [Verify an image and locate its state](#verify-an-image-and-locate-its-state)
 - [Reconcile or remove packages](#reconcile-or-remove-packages)
 - [Repair files or restore vendor defaults](#repair-files-or-restore-vendor-defaults)
@@ -76,6 +78,14 @@ path the same way, which hashes the files the transaction wrote and any file
 the actions changed. The shared-library check also reuses ELF metadata
 recorded for unchanged files.
 
+Writes follow the packages' dependencies. Each package's files are written
+after those of the packages it requires, including providers of required
+capabilities such as the generated `cap/elf/...` sonames. Within a package,
+shared libraries go first, then other files, and executables last.
+Directories are created first, and removals run after every new file is in
+place, dependents before the packages they depend on. The order is part of
+the saved plan.
+
 Use `cps transaction history --root image` to list completed plans, newest
 first. The default limit is 20 entries. Use
 `cps transaction show --root image PLAN_SHA256` for a JSON record of the
@@ -83,6 +93,85 @@ request, package changes, catalog digests, and planned action counts. The record
 commits with the image state, works offline, and follows the source image's
 history when staging a boot environment. History uses commit order within a revision and omits wall-clock
 timestamps so independently provisioned images can still match byte for byte.
+
+## Abort a transaction
+
+When a transaction cannot finish, for example because a payload is gone or
+an offline action keeps failing, return the image to its committed revision
+instead.
+
+```sh
+cps transaction abort --root image
+```
+
+Abort runs every journaled write backwards in reverse order. It restores
+files, links, and directory metadata to their state before the transaction,
+links hard link aliases to their restored targets, copies moved or adjusted
+local configuration back from where the transaction put it, and removes
+vendor proposals staged under `config-updates`. Completed transitions between
+directories and files or symlinks are undone the same way they were made. It
+then runs the systemd actions of the change back to the committed packages,
+restores the catalog archives and build receipts that the pending record
+replaced, drops the file records of every journaled path, and deletes the
+pending record. The committed revision and history do not change, so the same
+saved plan can be applied again later.
+
+Before it changes anything, abort checks that it can restore every path
+that is not already in its old state. Old file contents come from the staged
+payloads, from paths it already restored, or from the payload cache of each
+publisher, which keeps the payloads of installed packages and saved plans.
+If any are missing, abort lists each path with the payload digest, size, and
+the committed package that declares it. Add `--fetch` to download those
+payloads from each publisher's mirror. The committed manifests pin their
+digests and sizes. Contents that no package declares, such as a locally edited
+configuration file that a `revert` plan already replaced, cannot be fetched.
+Restore those paths from a backup and abort again, or finish the transaction
+with `cps transaction resume`.
+
+Abort is journaled like apply. It records the decision in the pending
+record first, and from then on the transaction only goes back:
+`transaction status` reports the abort in progress, `transaction progress`
+reports the `aborting` phase, `apply` with the same plan refuses, and both
+`transaction abort` and `transaction resume` finish the abort after an
+interruption. Each restored path is checked against both its state after and
+before the transaction, so finishing an abort is idempotent.
+
+Abort cannot undo effects outside the managed paths, such as users that an
+offline `sysusers` action already created or a kernel that the transaction
+already prepared. Prepared kernels are stored by content and remain unused.
+
+## Replace a directory with a file or symlink
+
+A release can turn a directory into a file or symlink, as in a merged `/usr`
+where `bin` becomes a link to `usr/bin`, or turn a file or symlink into a
+directory. CPS refuses the plan when the directory holds anything the
+transaction does not remove, and lists those paths; see the
+[manifest rules](../maintainer/manifests.md#package-metadata-and-version-constraints). Nothing is moved or
+deleted until the plan is changed or the paths are cleared.
+
+CPS builds the replacement in the image's private staging directory: the
+new file or symlink, or the complete new directory tree with its files,
+links, and subdirectories. It syncs it and swaps it with the old object with
+`renameat2(RENAME_EXCHANGE)`, so the path names either the old or the new
+object at every moment. The writes that the new target needs, such as the
+files of `usr/bin`, come first. The old object, now in staging, is then
+removed without following its symlinks. Paths are resolved beneath the
+image root without following symlinks or crossing mounts, so no write can
+pass through a symlink that a transition created, and a mount point inside a
+replaced directory stops the plan.
+
+Some filesystems do not support `RENAME_EXCHANGE`. There CPS first renames
+the old object into staging, syncs, and then renames the replacement into
+place, so the path is briefly absent. Each rename is synced before the next
+step.
+
+Resume and abort recognize every intermediate state:
+
+| On-disk state | Resume | Abort |
+| --- | --- | --- |
+| Old object in place, partial replacement in staging | Rebuilds the replacement and swaps it in | Removes the staged replacement |
+| New object in place, old object in staging | Removes the old object | Rebuilds the old object from payloads and swaps it back |
+| Path absent, old object in staging (fallback only) | Renames the replacement into place | Renames the old object back |
 
 ## Verify an image and locate its state
 

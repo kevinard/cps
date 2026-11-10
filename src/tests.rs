@@ -21,7 +21,7 @@ const COMPOSITOR: &str = "usr/bin/canopa-compositor";
 const PLUGIN: &str = "usr/lib/canopa/plugin.so";
 const LIBRARY: &str = "usr/lib/libdisplay.so";
 const MANPAGE: &str = "usr/share/man/man1/canopa-compositor.1";
-const INTERRUPTED: i32 = 86;
+pub(crate) const INTERRUPTED: i32 = 86;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -3941,6 +3941,15 @@ fn rejects_the_old_image_state_layout_and_format() -> Result<()> {
 
 fn interrupt_apply_at(root: &Path, saved: &Path, plan: &Plan, path: &str) -> Result<()> {
     fs::write(saved, serde_json::to_vec(plan)?)?;
+    interrupt_worker(root, saved, &[("CPS_TEST_AFTER_PATH", path)])
+}
+
+/// Run an apply, or with `CPS_TEST_ABORT` an abort, in a worker process
+/// that exits at the interruption point that `env` selects: after writing
+/// `CPS_TEST_AFTER_PATH`, or at the transition step `CPS_TEST_INTERRUPT_STEP`.
+/// `CPS_TEST_NO_EXCHANGE` makes transitions use the fallback without
+/// RENAME_EXCHANGE.
+fn interrupt_worker(root: &Path, saved: &Path, env: &[(&str, &str)]) -> Result<()> {
     let worker = Command::new(std::env::current_exe()?)
         .args([
             "--exact",
@@ -3949,7 +3958,7 @@ fn interrupt_apply_at(root: &Path, saved: &Path, plan: &Plan, path: &str) -> Res
         ])
         .env("CPS_TEST_IMAGE", root)
         .env("CPS_TEST_PLAN", saved)
-        .env("CPS_TEST_AFTER_PATH", path)
+        .envs(env.iter().copied())
         .output()?;
     assert_eq!(
         worker.status.code(),
@@ -3961,14 +3970,19 @@ fn interrupt_apply_at(root: &Path, saved: &Path, plan: &Plan, path: &str) -> Res
 }
 
 fn interrupt_apply_worker(root: &Path, saved: &Path) -> Result<()> {
-    let plan: Plan = serde_json::from_slice(&fs::read(saved)?)?;
-    let path = std::env::var("CPS_TEST_AFTER_PATH")?;
-    apply_with(root, &plan, |write| {
-        if write.path == path {
+    let path = std::env::var("CPS_TEST_AFTER_PATH").unwrap_or_default();
+    let stop = |write: &crate::plan::Write| {
+        if !path.is_empty() && write.path == path {
             std::process::exit(INTERRUPTED);
         }
-    })?;
-    panic!("fixture did not write {path}");
+    };
+    if std::env::var_os("CPS_TEST_ABORT").is_some() {
+        crate::apply::abort_with(root, stop)?;
+        panic!("abort did not reach the interruption point");
+    }
+    let plan: Plan = serde_json::from_slice(&fs::read(saved)?)?;
+    apply_with(root, &plan, stop)?;
+    panic!("apply did not reach the interruption point");
 }
 
 #[test]
@@ -4116,7 +4130,12 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     fs::write(&blob, "plugin 1")?;
     interrupt_apply(&f.root, &f._dir.path().join("repair.json"), &repair)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 1");
-    assert!(!f.root.join(PLUGIN).exists());
+    // Libraries go before executables, and the link sorts after COMPOSITOR.
+    assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "plugin 1");
+    assert_eq!(
+        fs::read_link(f.root.join(LINK))?,
+        Path::new("unexpected-target")
+    );
     assert!(verify(&f.root).is_err());
     let offline = f.repo.with_extension("offline");
     fs::rename(&f.repo, &offline)?;
@@ -4295,6 +4314,7 @@ fn exact_install_and_remove_offline() -> Result<()> {
 }
 
 mod release;
+mod transitions;
 
 mod facets;
 mod freezes;

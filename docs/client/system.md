@@ -141,12 +141,28 @@ to managed files, use `sudo cps resume --repair`. For an offline image use
 damaged paths in the pending package state from verified staged or cached
 payloads, including during the file-writing phase. They keep local edits to preserved
 configuration. If a systemd helper still fails, correct its reported
-problem and resume again. The explicit
+problem and resume again. To abandon the change instead, run
+`sudo cps transaction abort`, or `cps transaction abort --root IMAGE` for an
+offline image. Abort writes every journaled path back to its state before
+the transaction, stops services whose units it removes, reloads systemd and
+restarts the affected services that were running, and keeps the committed
+package revision. It refuses before changing anything when a needed payload
+is not cached; add `--fetch` to download it. A service that the transaction
+stopped because it removed its unit is not started again by the abort. See
+[aborting a transaction](images.md#abort-a-transaction). The explicit
 `plan`, `fetch`, `apply`, and `boot-env` commands remain available for
 administering images and boot environments.
 
 Live transactions advance the package revision while preserving the boot
-entry's identity. Changes to the running root use the same verified,
+entry's identity. Live writes follow the packages' dependency graph, so a
+program started during the transaction finds each new library before the
+new executables that need it; see
+[write order](images.md#resume-a-transaction-and-inspect-its-history). A
+directory that becomes a symlink, such as `/bin` turning into a link to
+`/usr/bin`, is swapped in one `RENAME_EXCHANGE` rename after its target is
+complete, so the path never disappears. On a filesystem without that rename
+the path is briefly absent; see
+[path transitions](images.md#replace-a-directory-with-a-file-or-symlink). Changes to the running root use the same verified,
 resumable package journal as offline image transactions. A transaction's
 cost follows the packages it changes: CPS trusts recorded fingerprints of
 unchanged files instead of hashing the whole system, as described in
