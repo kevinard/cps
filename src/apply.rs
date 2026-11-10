@@ -15,21 +15,18 @@ use tempfile::NamedTempFile;
 use crate::{
     boot::kernel::Artifacts,
     image::{
-        Image, Managed, Publisher, Settings, State,
-        root::{ReplacementSource, Root},
+        Image, Managed, Publisher, Settings, State, StateDelta,
+        root::{DirSyncs, Fingerprint, ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
-    plan::{
-        Plan, Request, Write, build, config_update_prefix, hardlink_groups, payloads,
-        pending_repairs,
-    },
+    plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, pending_repairs},
     repo::{
         BuildReceipt, Published,
         release::{ArchiveCache, DeltaBase, fetch_payloads},
         stage_blob,
     },
     systemd::{self, Action as SystemdAction},
-    verify::{manifest_paths, verify_state, verify_unchanged},
+    verify::{Checked, Contents, check_transaction_state, manifest_paths_since},
 };
 
 const JOURNAL_FORMAT: u32 = 1;
@@ -40,7 +37,9 @@ struct Journal {
     format: u32,
     id: String,
     plan: Plan,
-    next: State,
+    /// The next state as changes to the committed revision it replaces.
+    next: StateDelta,
+    /// The digest of `next`.
     state_sha256: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     files_ready: bool,
@@ -58,7 +57,7 @@ enum PendingRecord {
 struct PendingWork<'a> {
     id: &'a str,
     writes: &'a [Write],
-    next: &'a State,
+    next: &'a StateDelta,
     systemd: &'a [SystemdAction],
     kernel_install: Option<&'a Artifacts>,
     files_ready: bool,
@@ -112,7 +111,7 @@ impl PendingRecord {
     }
 }
 
-fn state_digest(state: &State) -> Result<String> {
+fn state_digest(state: &StateDelta) -> Result<String> {
     let mut sha = Sha256::new();
     serde_json::to_writer(&mut sha, state)?;
     Ok(hex::encode(sha.finalize()))
@@ -267,14 +266,14 @@ pub fn fetch_plan_with_archives(
 ) -> Result<usize> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
-    let state = image.state()?;
     ensure!(
-        plan.image == state.settings.id,
+        plan.image == image.settings()?.id,
         "plan targets a different image"
     );
     if image.applied(&plan.id()?)?.is_some() {
         return Ok(0);
     }
+    let state = image.state()?;
     check_plan_revision(&state.settings, plan)?;
     let mut archives = BTreeMap::<_, Vec<_>>::new();
     for (name, path) in archive_caches {
@@ -379,15 +378,25 @@ fn validate_in_image(image: &Image, plan: &Plan) -> Result<()> {
         plan.image == state.settings.id,
         "plan targets a different image"
     );
-    let previous = elf::applies(plan, &state).then(|| state.paths.clone());
+    let check_elf = elf::applies(plan, &state);
+    let base = state.clone();
     let (checked, next, _) = check_plan(image, state, plan)?;
-    check_drift(&image.root, &checked, &next)?;
+    let records = image.file_records(None)?;
+    let drift = check_drift(&image.root, &checked, &next, &base, &records)?;
     let parent = image.stage()?;
     let scratch = tempfile::tempdir_in(Root::fd_path(parent.as_file()))?;
     let stage = Root::open(scratch.path())?;
     prepare(&image.root, &stage, &checked, &next)?;
-    if let Some(previous) = &previous {
-        elf::check(&image.root, stage.as_file(), &checked, previous, &next)?;
+    if check_elf {
+        let known = elf::Known::new(&records, &drift, &checked);
+        elf::check(
+            &image.root,
+            stage.as_file(),
+            &checked,
+            &base.paths,
+            &next,
+            &known,
+        )?;
     }
     Ok(())
 }
@@ -436,9 +445,8 @@ pub(crate) fn apply_to_image(
     after_write: impl FnMut(&Write),
 ) -> Result<u64> {
     let id = plan.id()?;
-    let state = image.state()?;
     ensure!(
-        plan.image == state.settings.id,
+        plan.image == image.settings()?.id,
         "plan targets a different image"
     );
     if let Some(pending) = image.pending::<PendingRecord>()? {
@@ -446,6 +454,7 @@ pub(crate) fn apply_to_image(
             pending.work().id == id,
             "a different plan is pending; use transaction status to identify it"
         );
+        let state = image.state()?;
         return resume_pending(
             &mut image,
             &state,
@@ -459,34 +468,41 @@ pub(crate) fn apply_to_image(
         discard_stage(&image);
         return Ok(revision);
     }
+    let state = image.state()?;
     let check_elf = elf::applies(plan, &state);
-    let previous_paths = (check_elf && live.is_none()).then(|| state.paths.clone());
-    let current = live.map(|_| state.clone());
+    let base = state.clone();
     let (checked, mut next, receipts) = check_plan(&image, state, plan)?;
-    check_drift(&image.root, &checked, &next)?;
+    let records = image.file_records(None)?;
+    let drift = check_drift(&image.root, &checked, &next, &base, &records)?;
     let stage = image.stage()?;
-    let after = if let (Some(stage_packages), Some(current)) = (live, &current) {
+    let after = if let Some(stage_packages) = live {
         check_live_plan(&checked, stage_packages)?;
-        next.settings.boot_revision = Some(current.settings.boot_revision());
-        AfterFiles::Live(systemd::LiveServices::plan(&checked, current, &next).active_jobs()?)
+        next.settings.boot_revision = Some(base.settings.boot_revision());
+        AfterFiles::Live(systemd::LiveServices::plan(&checked, &base, &next).active_jobs()?)
     } else {
         AfterFiles::offline(&image.root, &checked)?
     };
-    prepare(&image.root, &stage, &checked, &next)?;
+    let staged = prepare(&image.root, &stage, &checked, &next)?;
+    let mut learned = Vec::new();
     if check_elf {
-        let previous = previous_paths
-            .as_ref()
-            .or_else(|| current.as_ref().map(|state| &state.paths))
-            .expect("ELF checking retained the previous paths");
-        elf::check(&image.root, stage.as_file(), &checked, previous, &next)?;
+        let known = elf::Known::new(&records, &drift, &checked);
+        learned = elf::check(
+            &image.root,
+            stage.as_file(),
+            &checked,
+            &base.paths,
+            &next,
+            &known,
+        )?;
     }
     let repo_backed = !checked.catalogs.is_empty();
+    let delta = StateDelta::between(&base, &next);
     let journal = Box::new(Journal {
         format: JOURNAL_FORMAT,
         id,
         plan: checked,
-        state_sha256: state_digest(&next)?,
-        next,
+        state_sha256: state_digest(&delta)?,
+        next: delta,
         files_ready: false,
         live_jobs: match &after {
             AfterFiles::Live(jobs) => Some(jobs.clone()),
@@ -498,28 +514,77 @@ pub(crate) fn apply_to_image(
     } else {
         PendingRecord::Journaled(journal)
     };
-    image.record_pending(&pending, pending.work().next, &receipts, repo_backed)?;
-    finish(&mut image, &stage, pending, after, None, after_write)
+    // Fingerprints and ELF metadata learned above join the pending record's
+    // SQLite transaction rather than costing syncs of their own.
+    let files = crate::image::FileUpdates {
+        observed: Some(&drift.observed),
+        stale: Some(&drift.stale),
+        elf: learned,
+    };
+    image.record_pending(&pending, &next, &receipts, repo_backed, &files)?;
+    let transaction = Transaction {
+        base: &base,
+        next: &next,
+        staged: Some(&staged),
+    };
+    finish(
+        &mut image,
+        &stage,
+        pending,
+        transaction,
+        after,
+        None,
+        after_write,
+    )
 }
 
-fn check_drift(root: &Root, plan: &Plan, next: &State) -> Result<()> {
-    if plan.is_recovery() || matches!(plan.request, Request::ResolveConfig { .. }) {
-        return Ok(());
+/// Check that paths the plan leaves unchanged still match their manifests.
+///
+/// Files whose recorded fingerprint still matches are trusted; the rest are
+/// hashed. The result carries new fingerprints to record.
+fn check_drift(
+    root: &Root,
+    plan: &Plan,
+    next: &State,
+    base: &State,
+    records: &crate::image::FileRecords,
+) -> Result<Checked> {
+    if !drift_checked(plan) {
+        return Ok(Checked {
+            findings: Vec::new(),
+            observed: BTreeMap::new(),
+            stale: BTreeSet::new(),
+        });
     }
-    let changed = plan
-        .writes
-        .iter()
-        .filter(|write| write.before != write.after || write.detach)
-        .map(|write| write.path.as_str())
-        .collect();
-    for finding in verify_unchanged(root, next, &changed)? {
-        ensure!(
-            !finding.is_error,
+    let changed = changed_paths(plan);
+    let checked = check_transaction_state(
+        root,
+        next,
+        Contents::Fingerprints(records),
+        &base.installed,
+        |path| !changed.contains(path),
+    )?;
+    if let Some(finding) = checked.errors().next() {
+        anyhow::bail!(
             "pre-existing drift at {}; repair the image before applying the transaction",
             finding.message
         );
     }
-    Ok(())
+    Ok(checked)
+}
+
+/// Recovery plans repair drift, and resolving configuration only touches
+/// the selected path, so neither requires a drift-free image.
+fn drift_checked(plan: &Plan) -> bool {
+    !plan.is_recovery() && !matches!(plan.request, Request::ResolveConfig { .. })
+}
+
+fn changed_paths(plan: &Plan) -> BTreeSet<&str> {
+    plan.writes
+        .iter()
+        .filter(|write| write.before != write.after || write.detach)
+        .map(|write| write.path.as_str())
+        .collect()
 }
 
 pub fn resume_transaction(path: &Path) -> Result<Option<u64>> {
@@ -588,29 +653,33 @@ fn resume_pending(
         pending.is_live() == live,
         "resume the transaction in its original mode"
     );
-    let work = pending.work();
     let plan = pending.recorded_plan()?;
+    let work = pending.work();
     validate_digest(work.id)?;
-    plan.check_recovery_state(state, work.next)?;
+    let next = work
+        .next
+        .apply(state)
+        .context("rebuilding the pending state from the committed revision")?;
+    plan.check_recovery_state(state, &next)?;
     let expected_boot_revision = if live {
         Some(state.settings.boot_revision())
     } else {
         state.settings.boot_revision
     };
     ensure!(
-        work.next.settings.boot_revision == expected_boot_revision,
+        next.settings.boot_revision == expected_boot_revision,
         "pending state has a different boot revision"
     );
     ensure!(
-        manifest_paths(work.next)? == work.next.paths,
+        manifest_paths_since(&next, Some(&state.installed))? == next.paths,
         "pending ownership index differs from its installed manifests"
     );
     image
-        .verify_catalog_archives(work.next)
+        .verify_catalog_archives(&next)
         .context("verifying catalog archives for the pending transaction")?;
     let after = if let PendingRecord::Live(journal) = &pending {
         check_live_plan(plan, repair.unwrap_or(&BTreeSet::new()))?;
-        let services = systemd::LiveServices::plan(plan, state, work.next);
+        let services = systemd::LiveServices::plan(plan, state, &next);
         if let Some(jobs) = &journal.live_jobs {
             services.check_jobs(jobs)?;
             AfterFiles::Live(jobs.clone())
@@ -631,7 +700,28 @@ fn resume_pending(
         image.update_pending(&pending)?;
     }
     let stage = image.stage()?;
-    finish(image, &stage, pending, after, repair, after_write)
+    let transaction = Transaction {
+        base: state,
+        next: &next,
+        staged: None,
+    };
+    finish(
+        image,
+        &stage,
+        pending,
+        transaction,
+        after,
+        repair,
+        after_write,
+    )
+}
+
+/// The committed and next states of a transaction being finished.
+struct Transaction<'a> {
+    base: &'a State,
+    next: &'a State,
+    /// Payloads staged and verified by this process, if any.
+    staged: Option<&'a StagedPayloads>,
 }
 
 enum AfterFiles {
@@ -654,10 +744,12 @@ fn finish(
     image: &mut Image,
     stage: &Root,
     mut pending: PendingRecord,
+    transaction: Transaction<'_>,
     mut after: AfterFiles,
     repair: Option<&BTreeSet<String>>,
     mut after_write: impl FnMut(&Write),
 ) -> Result<u64> {
+    let Transaction { base, next, staged } = transaction;
     // ExecStop can need the very files that this transaction will remove.
     if let (AfterFiles::Live(jobs), PendingRecord::Live(journal)) = (&mut after, &mut pending)
         && jobs.stop_removed_units()?
@@ -666,34 +758,41 @@ fn finish(
         image.update_pending(&pending)?;
     }
     let work = pending.work();
+    let mut written: BTreeSet<String> =
+        work.writes.iter().map(|write| write.path.clone()).collect();
     if !work.files_ready {
-        if repair.is_some() {
-            restore_pending_payloads(stage, work.writes, work.next)?;
-        }
+        let staged = if repair.is_some() {
+            restore_pending_payloads(stage, work.writes, next)?;
+            None
+        } else {
+            staged
+        };
         write_files(
             &image.root,
             stage,
             work.writes,
-            &work.next.paths,
+            &next.paths,
             repair.is_some(),
+            staged,
             &mut after_write,
         )?;
     }
-    systemd::clean_enablement(&image.root, work.writes, &work.next.paths)?;
+    systemd::clean_enablement(&image.root, work.writes, &next.paths)?;
     if !work.files_ready && !matches!(after, AfterFiles::None) {
         pending.mark_files_ready();
         image.update_pending(&pending)?;
     }
     let work = pending.work();
     if let Some(stage_packages) = repair {
-        restore_pending_paths(
+        written.extend(restore_pending_paths(
             &image.root,
             stage,
-            work.next,
+            next,
             pending.is_live(),
             stage_packages,
-        )?;
+        )?);
     }
+    let mut observed = BTreeMap::new();
     if !matches!(after, AfterFiles::None) {
         let path = match &after {
             AfterFiles::Offline(path) => path.as_path(),
@@ -701,16 +800,10 @@ fn finish(
             AfterFiles::None => unreachable!(),
         };
         if !work.systemd.is_empty() {
-            systemd::run(
-                &image.root,
-                path,
-                work.systemd,
-                work.next,
-                pending.is_live(),
-            )?;
+            systemd::run(&image.root, path, work.systemd, next, pending.is_live())?;
         }
         if let Some(kernel) = work.kernel_install {
-            kernel.prepare(image, path, &work.next.settings)?;
+            kernel.prepare(image, path, &next.settings)?;
         }
         let phase = if pending.is_live() { "live" } else { "offline" };
         let repaired = matches!(&pending, PendingRecord::Live(live) if live.plan.is_recovery())
@@ -718,22 +811,44 @@ fn finish(
                 work.writes
                     .iter()
                     .map(|write| write.path.as_str())
-                    .collect()
+                    .collect::<BTreeSet<_>>()
             });
-        for finding in verify_state(&image.root, work.next, repaired.as_ref())? {
-            ensure!(
-                !finding.is_error,
+        // Actions can touch any path, for example through tmpfiles rules,
+        // and every change to a file sets a new ctime. Trusting matching
+        // fingerprints still checks every managed path: directories, links,
+        // and ownership exactly, and every file that the transaction wrote
+        // or that changed since CPS last hashed it.
+        let records = image.file_records(None)?;
+        let checked = check_transaction_state(
+            &image.root,
+            next,
+            Contents::Fingerprints(&records),
+            &base.installed,
+            |path| repaired.as_ref().is_none_or(|paths| paths.contains(path)),
+        )?;
+        if let Some(finding) = checked.errors().next() {
+            anyhow::bail!(
                 "{phase} actions left an inconsistent image: {}; try resuming with --repair",
                 finding.message
             );
         }
+        written.extend(checked.stale);
+        observed = checked.observed;
         if let AfterFiles::Live(services) = after {
             services.run()?;
         }
     }
-    let revision = work.next.settings.revision;
-    let plan = &pending.journal().plan;
-    image.commit(work.id, work.next, &plan.transaction_details())?;
+    let revision = next.settings.revision;
+    let journal = pending.journal();
+    let written = written.iter().map(String::as_str).collect();
+    image.commit(
+        work.id,
+        &journal.next,
+        next,
+        &written,
+        &observed,
+        &journal.plan.transaction_details(),
+    )?;
     discard_stage(image);
     Ok(revision)
 }
@@ -755,7 +870,7 @@ fn restore_pending_paths(
     next: &State,
     live: bool,
     stage_packages: &BTreeSet<String>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let writes = pending_repairs(root, next)?;
     if live {
         for write in &writes {
@@ -768,7 +883,8 @@ fn restore_pending_paths(
         }
     }
     restore_pending_payloads(stage, &writes, next)?;
-    write_files(root, stage, &writes, &next.paths, false, &mut |_| {})
+    write_files(root, stage, &writes, &next.paths, false, None, &mut |_| {})?;
+    Ok(writes.into_iter().map(|write| write.path).collect())
 }
 
 fn restore_pending_payloads(stage: &Root, writes: &[Write], next: &State) -> Result<()> {
@@ -789,17 +905,49 @@ fn restore_pending_payloads(stage: &Root, writes: &[Write], next: &State) -> Res
     Ok(stage.as_file().sync_all()?)
 }
 
+/// Fingerprints of payloads that this process staged and hashed.
+type StagedPayloads = BTreeMap<String, Fingerprint>;
+
 fn write_files(
     root: &Root,
     stage: &Root,
     writes: &[Write],
     paths: &BTreeMap<String, Managed>,
     repair: bool,
+    staged: Option<&StagedPayloads>,
     after_write: &mut impl FnMut(&Write),
 ) -> Result<()> {
-    for node in payloads(writes).into_values() {
-        checked_payload(stage, node)?;
+    // Check every payload before touching the image. A payload this process
+    // just staged was hashed while it was copied into the private staging
+    // directory, so only its fingerprint is checked. Payloads left by an
+    // interrupted run are hashed once here.
+    let mut payloads = BTreeMap::new();
+    for node in crate::plan::payloads(writes).into_values() {
+        let Node::File { sha256, .. } = node else {
+            unreachable!("payloads contain only files");
+        };
+        let fingerprint = match staged.and_then(|staged| staged.get(sha256)) {
+            Some(fingerprint) => {
+                stage.file_matching(sha256, fingerprint)?;
+                *fingerprint
+            }
+            None => Fingerprint::of(&rustix::fs::fstat(checked_payload(stage, node)?)?),
+        };
+        payloads.insert(sha256.as_str(), fingerprint);
     }
+    let staged_payload = |node: &Node| -> Result<File> {
+        let Node::File { sha256, .. } = node else {
+            anyhow::bail!("expected a file payload");
+        };
+        let fingerprint = payloads
+            .get(sha256.as_str())
+            .with_context(|| format!("missing staged blob {sha256}"))?;
+        stage.file_matching(sha256, fingerprint)
+    };
+    let mut syncs = DirSyncs::default();
+    // Local configuration copied to a new path must be durable before its
+    // source path changes, or a crash could lose it.
+    let mut copied_from = BTreeSet::new();
     let mut checked_target: Option<(&str, File)> = None;
     let groups = if writes.iter().any(|write| write.detach) {
         hardlink_groups(paths)
@@ -807,6 +955,16 @@ fn write_files(
         BTreeMap::new()
     };
     for write in writes {
+        if write.hardlink_target().is_some() || copied_from.contains(write.path.as_str()) {
+            // A hard link publishes the target's new inode, so the target's
+            // rename must be durable first.
+            root.sync_dirs(&mut syncs, Some(stage.as_file()))?;
+        }
+        if let Some((source, _)) = write.local_config_source()
+            && source != write.path
+        {
+            copied_from.insert(source);
+        }
         let link_source = if let Some(target) = write.hardlink_target() {
             if checked_target
                 .as_ref()
@@ -825,8 +983,8 @@ fn write_files(
         if let Some(source) = link_source
             && root.shares_inode(&write.path, source)?
         {
-            root.sync_parent(&write.path)?;
-            stage.as_file().sync_all()?;
+            syncs.parent_of(&write.path);
+            syncs.mark_staging();
             continue;
         }
         let observed = root.inspect(&write.path)?;
@@ -861,8 +1019,10 @@ fn write_files(
             )?;
         if observed == write.after && !detach {
             if write.before != write.after || write.detach {
-                root.sync_parent(&write.path)?;
-                stage.as_file().sync_all()?;
+                // An interrupted run may have published this path without
+                // syncing its directory.
+                syncs.parent_of(&write.path);
+                syncs.mark_staging();
             }
             continue;
         }
@@ -872,7 +1032,7 @@ fn write_files(
             write.path
         );
         if write.removes_directory() {
-            if root.remove_empty_dir(&write.path)? {
+            if root.remove_empty_dir(&write.path, &mut syncs)? {
                 after_write(write);
             }
             continue;
@@ -882,7 +1042,7 @@ fn write_files(
                 let payload = match node {
                     Node::File { .. } => Some(match write.local_config_source() {
                         Some((path, before)) => ReplacementSource::LocalConfig { path, before },
-                        None => ReplacementSource::Staged(checked_payload(stage, node)?),
+                        None => ReplacementSource::Staged(staged_payload(node)?),
                     }),
                     Node::Hardlink { .. } => Some(ReplacementSource::Staged(
                         link_source
@@ -897,12 +1057,17 @@ fn write_files(
                     payload,
                     stage.as_file(),
                     write.config_move.is_some(),
+                    &mut syncs,
                 )?;
             }
-            None => root.remove_file(&write.path)?,
+            None => root.remove_file_deferred(&write.path, &mut syncs)?,
         }
         after_write(write);
     }
+    // Every directory entry must be durable before the journal records the
+    // files as ready or commits the transaction.
+    root.sync_dirs(&mut syncs, Some(stage.as_file()))?;
+    debug_assert!(syncs.is_empty());
     Ok(())
 }
 
@@ -918,7 +1083,7 @@ fn clear_stage(stage: &Root) -> Result<()> {
     Ok(())
 }
 
-fn prepare(root: &Root, stage: &Root, plan: &Plan, state: &State) -> Result<()> {
+fn prepare(root: &Root, stage: &Root, plan: &Plan, state: &State) -> Result<StagedPayloads> {
     let writes = &plan.writes;
     let dir = Root::fd_path(stage.as_file());
     clear_stage(stage)?;
@@ -942,24 +1107,31 @@ fn prepare(root: &Root, stage: &Root, plan: &Plan, state: &State) -> Result<()> 
             })?;
         }
     }
+    // copy_payload hashes each staged copy after writing it, so the staged
+    // files are verified here and only fingerprinted afterwards.
+    let mut staged = StagedPayloads::new();
+    let mut persist = |file: NamedTempFile, hash: &str| -> Result<()> {
+        file.as_file().sync_all()?;
+        let file = file.persist_noclobber(dir.join(hash))?;
+        staged.insert(hash.to_owned(), Fingerprint::of(&rustix::fs::fstat(&file)?));
+        Ok(())
+    };
     if let Some((path, node @ Node::File { sha256, .. })) = plan.config_payload() {
         let mut file = NamedTempFile::new_in(&dir)?;
         copy_payload(&root.file(&path)?, node, file.as_file_mut())
             .with_context(|| format!("staging vendor configuration {path}"))?;
-        file.as_file().sync_all()?;
-        file.persist_noclobber(dir.join(sha256))?;
+        persist(file, sha256)?;
     } else {
         for (publisher, blobs) in payload_sources(writes, state)? {
             for (hash, payload) in blobs {
                 let mut file = NamedTempFile::new_in(&dir)?;
                 stage_blob(&publisher.repo, payload.node, file.as_file_mut())?;
-                file.as_file().sync_all()?;
-                file.persist_noclobber(dir.join(hash))?;
+                persist(file, hash)?;
             }
         }
     }
     stage.as_file().sync_all()?;
-    Ok(())
+    Ok(staged)
 }
 
 fn payload_sources<'a>(

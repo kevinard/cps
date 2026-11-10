@@ -73,7 +73,9 @@ pub use repo::{
     read_attestation, release, resign_catalog, rotate_trust, show_trust, sign_trust,
     verify_rebuild, widen_rollout, withdraw_package,
 };
-pub use verify::{Finding, verify, verify_elf_runtime, verify_pristine, verify_selected};
+pub use verify::{
+    Finding, verify, verify_elf_runtime, verify_pristine, verify_quick, verify_selected,
+};
 
 #[cfg(test)]
 mod tests;

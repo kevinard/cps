@@ -22,9 +22,10 @@ use rustix::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use self::root::Root;
+use self::root::{Fingerprint, Observation, Root};
 use crate::{
     attestation::BuildTrust,
+    file_caps::FileCapabilities,
     git_install::GitSource,
     kdl_format::{ImageDefinition, PublisherConfig, read_image_definition},
     model::{
@@ -431,6 +432,196 @@ pub struct State {
     pub paths: BTreeMap<String, Managed>,
 }
 
+/// A next state recorded as changes to the committed state it replaces.
+///
+/// A pending transaction always applies to the committed revision it was
+/// planned against: the committed tables cannot change while it is pending.
+/// Publishers cannot change in a transaction, so the delta omits them.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateDelta {
+    pub settings: Settings,
+    /// New or changed packages, or `null` for removed packages.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) installed: BTreeMap<String, Option<Installed>>,
+    /// New or changed managed paths, or `null` for removed paths.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) paths: BTreeMap<String, Option<Managed>>,
+}
+
+fn changes<T: Clone + PartialEq>(
+    before: &BTreeMap<String, T>,
+    after: &BTreeMap<String, T>,
+) -> BTreeMap<String, Option<T>> {
+    let mut changes = BTreeMap::new();
+    for (key, value) in after {
+        if before.get(key) != Some(value) {
+            changes.insert(key.clone(), Some(value.clone()));
+        }
+    }
+    for key in before.keys() {
+        if !after.contains_key(key) {
+            changes.insert(key.clone(), None);
+        }
+    }
+    changes
+}
+
+fn apply_changes<T: Clone + PartialEq>(
+    base: &mut BTreeMap<String, T>,
+    changes: &BTreeMap<String, Option<T>>,
+    kind: &str,
+) -> Result<()> {
+    for (key, change) in changes {
+        match change {
+            Some(value) => ensure!(
+                base.insert(key.clone(), value.clone()).as_ref() != Some(value),
+                "pending {kind} change for {key} does not change the committed state"
+            ),
+            None => ensure!(
+                base.remove(key).is_some(),
+                "pending {kind} removal of {key} is absent from the committed state"
+            ),
+        }
+    }
+    Ok(())
+}
+
+impl StateDelta {
+    pub(crate) fn between(base: &State, next: &State) -> Self {
+        Self {
+            settings: next.settings.clone(),
+            installed: changes(&base.installed, &next.installed),
+            paths: changes(&base.paths, &next.paths),
+        }
+    }
+
+    /// Rebuild the full next state on top of the committed state.
+    pub(crate) fn apply(&self, base: &State) -> Result<State> {
+        let mut next = base.clone();
+        next.settings = self.settings.clone();
+        apply_changes(&mut next.installed, &self.installed, "package")?;
+        apply_changes(&mut next.paths, &self.paths, "path")?;
+        Ok(next)
+    }
+}
+
+/// A recorded fingerprint of a managed regular file and what CPS learned
+/// from its verified contents.
+#[derive(Clone, Debug)]
+pub(crate) struct FileRecord {
+    pub(crate) observation: Observation,
+    /// Cached ELF metadata as JSON, when known.
+    pub(crate) elf: Option<String>,
+}
+
+pub(crate) type FileRecords = BTreeMap<String, FileRecord>;
+
+/// What a transaction learned about unchanged files before writing any.
+///
+/// Fingerprints describe the files on disk rather than the committed state,
+/// so they are saved with the pending record instead of at commit.
+#[derive(Default)]
+pub(crate) struct FileUpdates<'a> {
+    pub(crate) observed: Option<&'a BTreeMap<String, Observation>>,
+    pub(crate) stale: Option<&'a BTreeSet<String>>,
+    /// Cached ELF metadata for files whose fingerprint is unchanged.
+    pub(crate) elf: Vec<(&'a str, &'a Observation, String)>,
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn save_elf(
+    tx: &rusqlite::Transaction<'_>,
+    entries: &[(&str, &Observation, String)],
+) -> Result<()> {
+    let mut update = tx.prepare_cached(
+        "UPDATE files SET elf=?1 WHERE path=?2 AND sha256=?3 AND ino=?4 AND size=?5
+         AND mtime_ns=?6 AND ctime_ns=?7 AND mode=?8 AND uid=?9 AND gid=?10",
+    )?;
+    for (path, observation, elf) in entries {
+        let fingerprint = &observation.fingerprint;
+        update.execute(params![
+            elf,
+            path,
+            observation.sha256,
+            fingerprint.ino as i64,
+            fingerprint.size as i64,
+            fingerprint.mtime_ns,
+            fingerprint.ctime_ns,
+            fingerprint.mode,
+            fingerprint.uid,
+            fingerprint.gid,
+        ])?;
+    }
+    Ok(())
+}
+
+const FILE_COLUMNS: &str =
+    "path, sha256, capabilities, ino, size, mtime_ns, ctime_ns, mode, uid, gid, elf";
+
+// SQLite stores 64-bit signed integers; inode numbers and sizes keep their bits.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn file_record(row: &rusqlite::Row<'_>) -> Result<(String, FileRecord)> {
+    let capabilities: Option<String> = row.get(2)?;
+    let capabilities = capabilities
+        .map(|json| serde_json::from_str::<FileCapabilities>(&json))
+        .transpose()?;
+    let fingerprint = Fingerprint {
+        ino: row.get::<_, i64>(3)? as u64,
+        size: row.get::<_, i64>(4)? as u64,
+        mtime_ns: row.get(5)?,
+        ctime_ns: row.get(6)?,
+        mode: row.get(7)?,
+        uid: row.get(8)?,
+        gid: row.get(9)?,
+    };
+    Ok((
+        row.get(0)?,
+        FileRecord {
+            observation: Observation {
+                fingerprint,
+                sha256: row.get(1)?,
+                capabilities,
+            },
+            elf: row.get(10)?,
+        },
+    ))
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn save_file_records(
+    tx: &rusqlite::Transaction<'_>,
+    observed: &BTreeMap<String, Observation>,
+    stale: &BTreeSet<String>,
+) -> Result<()> {
+    let mut delete = tx.prepare_cached("DELETE FROM files WHERE path=?1")?;
+    for path in stale {
+        delete.execute([path])?;
+    }
+    let mut insert = tx.prepare_cached(&format!(
+        "INSERT OR REPLACE INTO files ({FILE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)"
+    ))?;
+    for (path, observation) in observed {
+        let fingerprint = &observation.fingerprint;
+        insert.execute(params![
+            path,
+            observation.sha256,
+            observation
+                .capabilities
+                .map(|capabilities| serde_json::to_string(&capabilities))
+                .transpose()?,
+            fingerprint.ino as i64,
+            fingerprint.size as i64,
+            fingerprint.mtime_ns,
+            fingerprint.ctime_ns,
+            fingerprint.mode,
+            fingerprint.uid,
+            fingerprint.gid,
+        ])?;
+    }
+    Ok(())
+}
+
 pub struct Image {
     db: Connection,
     pub root: Root,
@@ -647,6 +838,10 @@ fn initialize(
          CREATE TABLE publishers (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
          CREATE TABLE installed (name TEXT PRIMARY KEY, data TEXT NOT NULL);
          CREATE TABLE paths (path TEXT PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, capabilities TEXT,
+             ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+             ctime_ns INTEGER NOT NULL, mode INTEGER NOT NULL, uid INTEGER NOT NULL,
+             gid INTEGER NOT NULL, elf TEXT) WITHOUT ROWID;
          CREATE TABLE pending (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
          CREATE TABLE history (plan TEXT PRIMARY KEY, revision INTEGER NOT NULL);
          CREATE TABLE transaction_details (plan TEXT PRIMARY KEY, data TEXT NOT NULL, sha256 TEXT NOT NULL);
@@ -974,8 +1169,15 @@ impl Image {
         next: &State,
         receipts: &[BuildReceipt],
         repo_backed: bool,
+        files: &FileUpdates<'_>,
     ) -> Result<()> {
         let tx = self.db.transaction()?;
+        save_file_records(
+            &tx,
+            files.observed.unwrap_or(&BTreeMap::new()),
+            files.stale.unwrap_or(&BTreeSet::new()),
+        )?;
+        save_elf(&tx, &files.elf)?;
         if repo_backed {
             catalogs::save(&tx, next)?;
         }
@@ -986,6 +1188,33 @@ impl Image {
             [serde_json::to_string(data)?],
         )?;
         Ok(tx.commit()?)
+    }
+
+    /// Load recorded file fingerprints, for every path or only selected ones.
+    pub(crate) fn file_records(&self, selected: Option<&BTreeSet<&str>>) -> Result<FileRecords> {
+        let mut records = BTreeMap::new();
+        if let Some(selected) = selected {
+            let mut statement = self
+                .db
+                .prepare_cached(&format!("SELECT {FILE_COLUMNS} FROM files WHERE path=?1"))?;
+            for path in selected {
+                let mut rows = statement.query([path])?;
+                if let Some(row) = rows.next()? {
+                    let (path, record) = file_record(row)?;
+                    records.insert(path, record);
+                }
+            }
+        } else {
+            let mut statement = self
+                .db
+                .prepare(&format!("SELECT {FILE_COLUMNS} FROM files"))?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let (path, record) = file_record(row)?;
+                records.insert(path, record);
+            }
+        }
+        Ok(records)
     }
 
     pub fn update_pending(&self, data: &impl Serialize) -> Result<()> {
@@ -1008,37 +1237,78 @@ impl Image {
             .optional()?)
     }
 
-    pub fn commit(
+    /// Commit a pending transaction by applying its recorded delta.
+    ///
+    /// Only changed package and path rows are written, in one SQLite
+    /// transaction that also records history and clears the pending record.
+    /// `written` lists every path the transaction wrote, whose recorded
+    /// fingerprints are dropped; `observed` adds new settled fingerprints of
+    /// files the transaction verified but did not write.
+    pub(crate) fn commit(
         &mut self,
         plan: &str,
-        state: &State,
+        delta: &StateDelta,
+        next: &State,
+        written: &BTreeSet<&str>,
+        observed: &BTreeMap<String, Observation>,
         details: &history::TransactionDetails,
     ) -> Result<()> {
         let tx = self.db.transaction()?;
         tx.execute(
             "UPDATE image SET data=?1 WHERE id=1",
-            [serde_json::to_string(&state.settings)?],
+            [serde_json::to_string(&delta.settings)?],
         )?;
-        tx.execute("DELETE FROM installed", [])?;
-        for (name, package) in &state.installed {
-            tx.execute(
-                "INSERT INTO installed VALUES (?1, ?2)",
-                params![name, serde_json::to_string(package)?],
-            )?;
+        {
+            let mut upsert = tx.prepare("INSERT OR REPLACE INTO installed VALUES (?1, ?2)")?;
+            let mut delete = tx.prepare("DELETE FROM installed WHERE name=?1")?;
+            for (name, package) in &delta.installed {
+                match package {
+                    Some(package) => {
+                        upsert.execute(params![name, serde_json::to_string(package)?])?;
+                    }
+                    None => ensure!(
+                        delete.execute([name])? == 1,
+                        "committed package {name} disappeared"
+                    ),
+                }
+            }
         }
-        builds::prune(&tx, state)?;
-        tx.execute("DELETE FROM paths", [])?;
-        for (path, managed) in &state.paths {
-            tx.execute(
-                "INSERT INTO paths VALUES (?1, ?2)",
-                params![path, serde_json::to_string(managed)?],
-            )?;
+        builds::prune(&tx, next)?;
+        {
+            let mut upsert = tx.prepare("INSERT OR REPLACE INTO paths VALUES (?1, ?2)")?;
+            let mut delete = tx.prepare("DELETE FROM paths WHERE path=?1")?;
+            for (path, managed) in &delta.paths {
+                match managed {
+                    Some(managed) => {
+                        upsert.execute(params![path, serde_json::to_string(managed)?])?;
+                    }
+                    None => ensure!(
+                        delete.execute([path])? == 1,
+                        "committed path {path} disappeared"
+                    ),
+                }
+            }
         }
+        let forgotten: BTreeSet<String> = delta
+            .paths
+            .keys()
+            .map(String::as_str)
+            .chain(written.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let observed: BTreeMap<_, _> = observed
+            .iter()
+            .filter(|(path, _)| {
+                !forgotten.contains(path.as_str()) && next.paths.contains_key(path.as_str())
+            })
+            .map(|(path, observation)| (path.clone(), observation.clone()))
+            .collect();
+        save_file_records(&tx, &observed, &forgotten)?;
         tx.execute(
             "INSERT INTO history VALUES (?1, ?2)",
-            params![plan, state.settings.revision],
+            params![plan, next.settings.revision],
         )?;
-        history::record(&tx, plan, state.settings.revision, details)?;
+        history::record(&tx, plan, next.settings.revision, details)?;
         tx.execute("DELETE FROM pending WHERE id=1", [])?;
         tx.commit()?;
         Ok(())

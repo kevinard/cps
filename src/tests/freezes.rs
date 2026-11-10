@@ -145,7 +145,8 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let mut journal: serde_json::Value = serde_json::from_str(&original)?;
     journal["journaled"]["next"]["settings"]["freezes"][runtime]["reason"] = "tampered".into();
-    let next: crate::image::State = serde_json::from_value(journal["journaled"]["next"].clone())?;
+    let next: crate::image::StateDelta =
+        serde_json::from_value(journal["journaled"]["next"].clone())?;
     journal["journaled"]["state_sha256"] = digest(&serde_json::to_vec(&next)?).into();
     db.execute(
         "UPDATE pending SET data=?1 WHERE id=1",

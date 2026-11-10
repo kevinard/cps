@@ -50,6 +50,32 @@ reached the offline systemd and kernel actions. Resume uses the verified
 plan and staged payloads from the image journal. You can also rerun `apply`
 with the same saved plan.
 
+The journal records the plan and the next state as changes to the committed
+revision, so its size follows the transaction rather than the image. CPS
+writes the journal before changing any file. Each new file is synced before
+it is renamed into place, and every changed directory is synced once before
+the journal records progress or the transaction commits. The commit writes
+only the changed package and path records, in one SQLite transaction. Resume
+rebuilds the next state from the committed revision and checks each path
+against both its old and new contents, so an interruption at any point can
+be resumed or repaired.
+
+Before writing, apply checks that the paths the plan leaves unchanged still
+match their manifests. When CPS hashes a managed file, it records the file's
+inode, size, timestamps, mode, and owner. A later transaction trusts a file
+whose record still matches and hashes the rest, so the check costs one
+`stat` per unchanged file. Linux updates a file's change time on every
+write, metadata change, rename, and extended attribute change, including
+file capabilities, and programs cannot set it back. Files changed within the
+last two seconds are not recorded, because filesystems take that time from
+a coarse clock. The record carries over into a staged Btrfs snapshot, whose
+files keep their inodes and change times. A copied root, such as an ext4
+slot, has new inodes, so CPS hashes its files once and records them again.
+After offline or live systemd and kernel actions, CPS checks every managed
+path the same way, which hashes the files the transaction wrote and any file
+the actions changed. The shared-library check also reuses ELF metadata
+recorded for unchanged files.
+
 Use `cps transaction history --root image` to list completed plans, newest
 first. The default limit is 20 entries. Use
 `cps transaction show --root image PLAN_SHA256` for a JSON record of the
@@ -67,6 +93,19 @@ It also rejects unexpected hard links to regular files
 and undeclared extended attributes on managed regular files and directories.
 Use regular `verify` after provisioning or booting, when the system can
 generate files outside package ownership.
+
+Regular and pristine verification hash every managed file. Add `--quick` to
+trust the file records described in
+[resuming a transaction](#resume-a-transaction-and-inspect-its-history)
+instead. A quick check still compares every directory, link, mode, and owner
+and the path records, and hashes each file that changed or that CPS has not
+recorded. It trusts the stored package manifests, which CPS checked against
+their signed documents before committing them, instead of parsing each one
+again. It reads the records but never writes them. The boot
+health check and the promotion of a direct UEFI trial use quick
+verification. Run full verification to detect changes below the filesystem,
+such as edits to the block device, or changes made while the system clock
+was set back.
 
 Images keep the package database, transaction staging, and prepared kernel
 files under `/var/lib/cps/image/` inside the image. The SQLite database
@@ -103,7 +142,7 @@ type conflicts involving directories or special files before retrying the plan.
 
 Use `verify --package NAME` or `verify --path /path` to limit on-disk
 checks to the selected managed files while still authenticating image
-metadata. Use `plan repair --path /path` for an exact path and any necessary
+metadata. Both also accept `--quick`. Use `plan repair --path /path` for an exact path and any necessary
 parent directories or hard links. To intentionally replace an edited or
 removed preserved file with the defaults from its installed package, use
 `plan revert /path` and apply the saved plan. Revert uses the installed

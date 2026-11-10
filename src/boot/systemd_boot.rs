@@ -353,18 +353,22 @@ pub(super) fn bless_uefi(esp: &Path, volume: &BtrfsVolume) -> Result<Option<Stri
             .as_deref()
             .context("missing UEFI trial fallback")?,
     )?;
-    let verify = |entry: &BootEntry| {
+    let verify = |entry: &BootEntry| -> Result<crate::image::Image> {
         verify_fallback_artifacts(&esp, entry)?;
         volume.check_boot_device(&esp, &lock, &entry.root)?;
         let (id, revision) = policy::entry_identity(&entry.id)?;
-        volume.verify(
+        let image = volume.open_image(
             entry
                 .btrfs
                 .as_ref()
                 .context("missing UEFI Btrfs identity")?,
             id,
             revision,
-        )
+        )?;
+        // Matching fingerprints prove unchanged files without re-hashing
+        // both whole roots on every boot.
+        crate::verify::require_quick(&image)?;
+        Ok(image)
     };
     let _fallback = verify(parent).context("checking the UEFI fallback")?;
     let image = verify(trial).context("checking the UEFI trial's health")?;

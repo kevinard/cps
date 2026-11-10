@@ -147,7 +147,12 @@ administering images and boot environments.
 
 Live transactions advance the package revision while preserving the boot
 entry's identity. Changes to the running root use the same verified,
-resumable package journal as offline image transactions.
+resumable package journal as offline image transactions. A transaction's
+cost follows the packages it changes: CPS trusts recorded fingerprints of
+unchanged files instead of hashing the whole system, as described in
+[Images](images.md#resume-a-transaction-and-inspect-its-history). Run
+`sudo cps verify --root /` to hash every managed file, or add `--quick` for
+the fingerprint check that the boot health unit uses.
 
 Pass `--save-plan PATH` to a system package command to record the exact plan
 it displays. This also works with `--dry-run`. Use
