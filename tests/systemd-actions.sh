@@ -71,6 +71,8 @@ printf 'disable %s\n' "$denied" > base/etc/systemd/system-preset/00-local.preset
 cat > "base/etc/tmpfiles.d/$scope.conf" <<RULES
 d /srv/$scope-local 0750 $user $user -
 d /var/lib/$scope-state 0750 $user $user -
+C /srv/$scope-copy - - - - /usr/lib/systemd/system-preset/99-fixture.preset
+C /var/lib/$scope-seed - - - - /usr/lib/systemd/system-preset/99-fixture.preset
 d $host_tmpfiles 0750 $user $user -
 d /run/$scope 0755 - - -
 RULES
@@ -133,6 +135,7 @@ grep -q "^$user:x:$account_uid:$account_gid:" staged/etc/passwd
 grep -q "^$user:x:$account_gid:" staged/etc/group
 test "$(stat -c '%a %u:%g' "staged/srv/$scope-local")" = "750 $account_uid:$account_gid"
 test -d "staged$host_tmpfiles"
+cmp staged/usr/lib/systemd/system-preset/99-fixture.preset "staged/srv/$scope-copy"
 test ! -e "staged/srv/$scope-vendor"
 test ! -e "staged/srv/$scope-unrelated"
 test ! -e "staged/run/$scope"
@@ -143,6 +146,7 @@ test ! -e "staged/run/$scope"
 test -d staged/var && test -z "$(ls -A staged/var)"
 systemd-tmpfiles --root="$work/staged" --boot --create --prefix=/var 2>/dev/null
 test "$(stat -c '%a %u:%g' "staged/var/lib/$scope-state")" = "750 $account_uid:$account_gid"
+cmp staged/usr/lib/systemd/system-preset/99-fixture.preset "staged/var/lib/$scope-seed"
 "$cps" verify --root staged
 if "$cps" verify --root staged --pristine > pristine.log 2>&1; then
     echo 'Pristine verification accepted a populated /var' >&2

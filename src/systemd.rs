@@ -124,12 +124,19 @@ fn active_actions<'a>(
     actions
 }
 
+/// Accept only rules that create missing paths: directories, files,
+/// symlinks, and copies, such as a copy of `/usr/share/factory/var/...` that
+/// seeds the shared `/var`.
 pub(crate) fn validate_tmpfiles(bytes: &[u8]) -> Result<()> {
     for (index, line) in std::str::from_utf8(bytes)?.lines().enumerate() {
         if let Some(kind) = line.split_ascii_whitespace().next() {
             ensure!(
-                kind.starts_with('#') || matches!(kind, "d" | "f" | "L" | "d!" | "f!" | "L!"),
-                "tmpfiles line {} uses unsupported offline rule {kind:?}; use d, f, or L",
+                kind.starts_with('#')
+                    || matches!(
+                        kind,
+                        "d" | "f" | "L" | "C" | "d!" | "f!" | "L!" | "C!"
+                    ),
+                "tmpfiles line {} uses unsupported offline rule {kind:?}; use d, f, L, or C",
                 index + 1
             );
         }
@@ -786,5 +793,18 @@ mod tests {
         assert!(services(&[], &["app.service"]).check_jobs(&abort).is_err());
         assert!(services(&[], &[]).check_jobs(&forward).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn tmpfiles_accepts_only_creation_rules() {
+        super::validate_tmpfiles(
+            b"# state\nd /var/lib/example 0750 example example -\nf /etc/example.conf 0644\n\
+              L /etc/example - - - - /usr/lib/example\nC /var/lib/example/seed.db\nd! /run/x\n",
+        )
+        .unwrap();
+        for rule in ["z /var/lib/example", "R /var/lib", "C+ /var/lib/example", "x /tmp/*"] {
+            let error = super::validate_tmpfiles(rule.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("use d, f, L, or C"), "{rule}");
+        }
     }
 }
