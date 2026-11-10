@@ -606,9 +606,13 @@ mod tests {
         }
 
         fn load(&self, mirror: &str) -> Result<tough::Repository> {
+            self.load_with(mirror, tempfile::tempdir()?.path())
+        }
+
+        /// Load a mirror as a client whose trusted metadata lives in `datastore`.
+        fn load_with(&self, mirror: &str, datastore: &Path) -> Result<tough::Repository> {
             let mirror = self.path(mirror);
             let root = fs::read(&self.root)?;
-            let datastore = tempfile::tempdir()?;
             runtime()?.block_on(async {
                 Ok(RepositoryLoader::new(
                     &root,
@@ -616,7 +620,7 @@ mod tests {
                     url::Url::from_directory_path(mirror.join("targets")).unwrap(),
                 )
                 .limits(super::super::TUF_LIMITS)
-                .datastore(datastore.path())
+                .datastore(datastore)
                 .load()
                 .await?)
             })
@@ -810,6 +814,60 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("not signed by the root's snapshot keys"));
+        Ok(())
+    }
+
+    /// A refresh knows only the snapshot it extends, not the timestamps
+    /// published since. The deployment's reserved metadata version keeps
+    /// refreshes increasing, and clients reject a timestamp below the one
+    /// they trust as a rollback.
+    #[test]
+    fn refreshed_timestamps_below_the_trusted_version_are_rollbacks() -> Result<()> {
+        let fixture = fixture()?;
+        fixture.sign("signed", &fixture.keys["targets"], &[], 1)?;
+        let snapshot = fixture.path("signed/metadata/1.snapshot.json");
+        let refresh = |output: &str, version| {
+            refresh_metadata(RefreshMetadata {
+                root: &fixture.root,
+                snapshot: &snapshot,
+                output: &fixture.path(output),
+                timestamp_keys: &fixture.keys["timestamp"],
+                snapshot_keys: &[],
+                version: NonZeroU64::new(version).unwrap(),
+                snapshot_expires: None,
+                timestamp_expires: &in_hours(12),
+            })
+        };
+        let client = tempfile::tempdir()?;
+        fixture.load_with("signed", client.path())?;
+        refresh("third", 3)?;
+        fixture.overlay("signed", "third", "mirror-3")?;
+        let trusted = fixture.load_with("mirror-3", client.path())?;
+        assert_eq!(trusted.timestamp().signed.version.get(), 3);
+
+        // Version 2 exceeds the snapshot version, so the refresh signs it ...
+        refresh("second", 2)?;
+        fixture.overlay("signed", "second", "mirror-2")?;
+        assert_eq!(
+            fixture.load("mirror-2")?.timestamp().signed.version.get(),
+            2
+        );
+        // ... but a client that trusts version 3 rejects it and keeps version 3.
+        let error = fixture.load_with("mirror-2", client.path()).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<tough::error::Error>(),
+                Some(tough::error::Error::OlderMetadata {
+                    role: tough::schema::RoleType::Timestamp,
+                    current_version: 3,
+                    new_version: 2,
+                    ..
+                })
+            ),
+            "{error:#}"
+        );
+        let trusted = fixture.load_with("mirror-3", client.path())?;
+        assert_eq!(trusted.timestamp().signed.version.get(), 3);
         Ok(())
     }
 
