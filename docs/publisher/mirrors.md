@@ -19,10 +19,10 @@
 `publish` assembles the local CPS repository using a publisher signing key. Export a snapshot to a new directory before signing it with [The Update Framework](https://theupdateframework.github.io/specification/latest/).
 
 ```sh
-cps repo export --repo repo --publisher canopa --trust-key public.der --output release-targets
+cps repo export --repo repo --publisher canopa --trust-root repo/trust/1.json --output release-targets
 ```
 
-The live export includes the catalog pointer, the signed catalog root with its shards and any per-shard file indexes, and the manifests and payloads for active packages. It also includes the `publisher` and `publisher.der` targets for publisher discovery. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
+The live export includes the catalog pointer, the signed catalog root with its shards and any per-shard file indexes, and the manifests and payloads for active packages. It also includes the `publisher` target and a `trust-root.json` target holding the newest trust root version the current catalog carries, for publisher discovery. Sign the exported files with a TUF repository tool such as [`tuftool`](https://github.com/awslabs/tough/tree/develop/tuftool), using the export directory as `--add-targets`. Keep root signing keys offline, assign separate keys to the release roles, enable consistent snapshots, and advance the relevant metadata versions whenever their contents change. Publish the versioned root files, targets, and versioned metadata before publishing the new `timestamp.json`.
 
 Export compresses each distinct payload with Zstandard when the result is
 smaller. The mirror carries either `blobs-SHA256.zst` or `blobs-SHA256`,
@@ -59,7 +59,7 @@ that your users are likely to have installed. Repeat the option for other
 baselines.
 
 ```sh
-cps repo export --repo repo --publisher canopa --trust-key public.der \
+cps repo export --repo repo --publisher canopa --trust-root repo/trust/1.json \
     --delta-from "$previous_catalog" --output release-targets
 ```
 
@@ -89,7 +89,7 @@ variables when invoking the adapter directly.
 | Variable | Value |
 | --- | --- |
 | `CPS_MIRROR_DIR` | The directory served over HTTPS |
-| `CPS_MIRROR_PUBLISHER_KEY` | CPS publisher's public DER key |
+| `CPS_MIRROR_TRUST_ROOT` | The publisher [trust root](publishing.md#publisher-trust-root) file that clients pin, used to verify the catalog and published in `publisher.json` |
 | `CPS_MIRROR_TUF_ROOT` | Original signed TUF root JSON used to bootstrap and verify the rotation chain |
 | `CPS_MIRROR_TUF_ACTIVE_ROOT` | Optional current or next signed TUF root JSON, with consistent snapshots enabled |
 | `CPS_MIRROR_TUF_KEYS` | Private TUF release key sources, described in [Release keys and external signers](#release-keys-and-external-signers) |
@@ -273,9 +273,10 @@ cloud KMS without CPS linking those libraries. Protocol version 1 works as
 follows:
 
 - CPS executes the program with the descriptor's arguments and its own
-  environment, plus `CPS_SIGNER_PROTOCOL=1`, `CPS_SIGNER_CONTEXT` (`tuf` or
-  `catalog`), `CPS_SIGNER_KEY_ID` (the TUF key ID, or the SHA-256 of the
-  Ed25519 public key for a catalog), and `CPS_SIGNER_ALGORITHM` (`ed25519`,
+  environment, plus `CPS_SIGNER_PROTOCOL=1`, `CPS_SIGNER_CONTEXT` (`tuf`,
+  `catalog`, `trust-root`, or `attestation`), `CPS_SIGNER_KEY_ID` (the TUF key
+  ID, or the SHA-256 of the Ed25519 public key otherwise), and
+  `CPS_SIGNER_ALGORITHM` (`ed25519`,
   `rsassa-pss-sha256`, or `ecdsa-sha2-nistp256`).
 - Stdin carries the exact message bytes followed by end of file. For TUF this
   is the canonical JSON of the role. The helper signs the message itself. For
@@ -319,7 +320,7 @@ To publish notes for the bundled mirror, install GitHub CLI and OpenSSH on
 the signing host. Configure `CPS_MIRROR_URL`, the mirror paths, and
 `CPS_RELEASE_NOTES_SIGNING_KEY` in its private configuration. Use an
 Ed25519 OpenSSH key kept outside the HTTPS directory with the trusted
-root and publisher public key. Provide the signing host with GitHub
+root and publisher trust root. Provide the signing host with GitHub
 credentials scoped to publishing releases, `GH_REPO` for the repository,
 and `GITHUB_SHA` for the reviewed release commit.
 
@@ -327,10 +328,12 @@ After deployment, run
 `bash ci/publish-release-notes.sh PUBLISHER DEPLOYED_CATALOG_SHA256` on the
 signing host. The `publisher.json` descriptor declares `"schema_version": 1`
 and `"kind": "publisher-bootstrap"`. The script checks it against the trusted
-TUF root and CPS public key and publishes an optional GitHub Release with
+TUF root and CPS trust root and publishes an optional GitHub Release with
 `release-notes.md` and `release-notes.md.sig`. The signed notes identify the
-publisher, mirror URL, catalog digest, and SHA-256 fingerprints of the root
-JSON and DER key bytes. Rerun the command with the same catalog to retry.
+publisher, mirror URL, catalog digest, the SHA-256 fingerprints of the TUF root
+and trust root files, and the fingerprint of each root key, which clients can
+pass to `cps publisher add --expect-root-key`. The script needs `python3` to
+read the trust root. Rerun the command with the same catalog to retry.
 
 For independent verification of the release notes, obtain the notes signer's
 public key through a trusted channel. With that key in

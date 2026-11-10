@@ -2,13 +2,13 @@
 
 [Documentation](../README.md) · [Package maintainers](README.md)
 
-Run `cps build` as an unprivileged user on an x86-64 or AArch64 Linux worker. It needs Linux 5.11 or newer, unprivileged user namespaces, seccomp, and a current Bubblewrap at `/usr/bin/bwrap`. Supply a local CPS repository or synchronized cache containing a signed toolchain catalog. The recipe pins the catalog and its publisher key, the package manifest, and each source file.
+Run `cps build` as an unprivileged user on an x86-64 or AArch64 Linux worker. It needs Linux 5.11 or newer, unprivileged user namespaces, seccomp, and a current Bubblewrap at `/usr/bin/bwrap`. Supply a local CPS repository or synchronized cache containing a signed toolchain catalog. The recipe pins the catalog and its publisher trust root, the package manifest, and each source file.
 
 ```kdl
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<key SHA-256>"
+        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
         package "devel/base"
     }
     manifest "hello.kdl" sha256="<manifest SHA-256>"
@@ -20,7 +20,7 @@ build architecture="x86_64" epoch=1700000000 {
 }
 ```
 
-Use the digest of the selected repository catalog, such as the digest recorded in its `current` file at recipe preparation. Compute the publisher key digest with `tail -c 32 public.der | sha256sum`. Replace the manifest and source hashes with their SHA-256 digests and set `size` to the source byte count. The manifest path is relative to the recipe. Source paths are relative to `--sources`. The example toolchain package must provide the shell, compiler, and utilities through its dependencies.
+Use the digest of the selected repository catalog, such as the digest recorded in its `current` file at recipe preparation. `key-sha256` is the SHA-256 of the publisher trust root file that the toolchain configuration pins, such as `sha256sum canopa.trust.json`. Replace the manifest and source hashes with their SHA-256 digests and set `size` to the source byte count. The manifest path is relative to the recipe. Source paths are relative to `--sources`. The example toolchain package must provide the shell, compiler, and utilities through its dependencies.
 
 Every toolchain block declares `solver="sat-v2"` and at least one publisher pin.
 
@@ -85,13 +85,13 @@ streams and return their exit status.
 
 Use a toolchain block with publisher pins when a compiler and its dependencies
 come from separate signed catalogs. Each pin gives the catalog digest and
-the SHA-256 of the raw 32-byte Ed25519 public key. With a CPS DER public
-key, calculate the fingerprint with `tail -c 32 public.der | sha256sum`.
+the SHA-256 of the publisher trust root file the configuration pins for that
+publisher, such as `sha256sum tools.trust.json`.
 
 ```kdl
 toolchain solver="sat-v2" {
-    publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<key SHA-256>"
-    publisher "tools" catalog="<catalog SHA-256>" key-sha256="<key SHA-256>"
+    publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+    publisher "tools" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
     package "devel/base"
     package "cps://tools/devel/compiler@1.0.0-0"
 }
@@ -106,11 +106,11 @@ resolve against the worker's configuration file.
 schema-version 1 kind="toolchain-config"
 publisher "canopa" {
     repository "cache/canopa"
-    trust-key "keys/canopa.der"
+    trust-root "keys/canopa.trust.json"
 }
 publisher "tools" {
     repository "cache/tools"
-    trust-key "keys/tools.der"
+    trust-root "keys/tools.trust.json"
 }
 ```
 
@@ -129,7 +129,7 @@ Add a `url="https://upstream.example.org/releases/hello.c"` property to a pinned
 
 ```sh
 cps source fetch --cache source-cache hello.build.kdl
-cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
+cps build --repo toolchain-cache --publisher canopa --trust-root canopa.trust.json \
     --source-cache source-cache --output hello-build --check-reproducible hello.build.kdl
 ```
 
@@ -152,7 +152,7 @@ template manifest can use `version="0.0.0-0"` as a placeholder. Write the script
 
 ```sh
 cps source git-snapshot --git-repo https://git.example.org/hello.git --branch main \
-    --repo packages --trust-key publisher.der --output snapshot hello.build.kdl
+    --repo packages --trust-root canopa.trust.json --output snapshot hello.build.kdl
 cps source fetch --from snapshot/sources --cache source-cache snapshot/build.kdl
 ```
 
@@ -183,7 +183,7 @@ preparation with the same inputs reuses its version while it remains eligible.
 ## Building and publishing with signed evidence
 
 ```sh
-cps build --repo toolchain-cache --publisher canopa --trust-key public.der \
+cps build --repo toolchain-cache --publisher canopa --trust-root canopa.trust.json \
     --sources sources --output hello-build --check-reproducible \
     --builder-signing-key builder-private.der hello.build.kdl
 cps publish-bundle --repo repo --signing-key private.der --builder-key builder-public.der \
@@ -191,6 +191,8 @@ cps publish-bundle --repo repo --signing-key private.der --builder-key builder-p
 ```
 
 CPS resolves build dependencies against the pinned catalog and verifies their payloads. The toolchain and source mounts are read-only. The recipe gets a fixed user, hostname, locale, timezone, umask, paths, and `SOURCE_DATE_EPOCH` with fresh writable scratch space. Bubblewrap isolates namespaces and seccomp limits sockets to local Unix sockets. Package signing is a separate step with its own inputs. [Bubblewrap sandboxing](https://github.com/containers/bubblewrap/blob/main/README.md) · [SOURCE_DATE_EPOCH](https://reproducible-builds.org/docs/source-date-epoch/)
+
+`--builder-signing-key` accepts `PATH`, `file:PATH`, or `command:DESCRIPTOR`, so the builder key can stay in a hardware token or KMS behind an [external signer](../publisher/mirrors.md#external-signer-protocol). The helper receives `CPS_SIGNER_CONTEXT=attestation`.
 
 The bundle contains the recipe, package manifest, and the declared regular file outputs. The manifest supplies the packaged modes, owners, directory entries, and symlinks. `--check-reproducible` repeats the build in a fresh sandbox and requires identical file hashes before making the bundle available. Both runs use the same worker kernel and CPU.
 

@@ -5,7 +5,7 @@
 A mirror distributes a publisher's signed catalogs and package files.
 CPS writes the verified objects to a local repository cache, which the
 image uses for planning and fetching. Obtain the mirror's initial TUF
-root and the CPS publisher key through a trusted channel.
+root and the CPS publisher trust root through a trusted channel.
 
 ## On this page
 
@@ -24,7 +24,7 @@ Pass `--index-only` to fetch metadata now and payloads on demand.
 cps repo sync --repo /var/lib/cps/canopa --root canopa-root.json \
     --metadata https://packages.example.org/metadata/ \
     --targets https://packages.example.org/targets/ \
-    --publisher canopa --trust-key public.der
+    --publisher canopa --trust-root canopa.trust.json
 ```
 
 Point `image-create` or the KDL image configuration at this cache. Give write access to the account that runs sync and keep the cache outside all boot roots on persistent storage. CPS uses the original provisioned root to identify the repository on each sync and stores authenticated root rotations and replay state under `.tuf`. Sync accepts HTTPS or a local `file:///` mirror, with trailing slashes on both URLs.
@@ -68,10 +68,11 @@ its existing repository paths until an explicit relocation.
 ## Catalog checkpoints and archived signatures
 
 Each committed repository-backed transaction records the selected catalog
-digest, sequence, and publisher key history in the image. Subsequent plans,
+digest, sequence, and trust root history in the image. Subsequent plans,
 saved-plan checks, and available-package queries reject a lower sequence, a
-different catalog at the same sequence, or a signing history that drops a
-known rotation. The check works with a replacement cache that lacks the
+different catalog at the same sequence, or a trust root history that drops or
+changes a known version, such as a catalog signed under an older version with
+a key that a later version revoked. The check works with a replacement cache that lacks the
 previous catalog.
 
 CPS also archives one signed catalog per applied publisher: a compressed copy
@@ -97,11 +98,11 @@ schema-version 1 kind="image-config"
 release-profile "desktop"
 publisher "canopa" {
     repository "/var/lib/cps/desktop"
-    trust-key "canopa.der"
+    trust-root "canopa.trust.json"
 }
 publisher "runtime" {
     repository "/var/lib/cps/runtime"
-    trust-key "runtime.der"
+    trust-root "runtime.trust.json"
 }
 mirror "canopa" root="canopa-root.json" metadata="https://packages.example.org/canopa/metadata/" targets="https://packages.example.org/canopa/targets/"
 mirror "runtime" root="runtime-root.json" metadata="https://packages.example.org/runtime/metadata/" targets="https://packages.example.org/runtime/targets/"
@@ -141,7 +142,7 @@ objects. Replay checkpoints still remember newer verified metadata.
 Use `repo sync-profile --config image.kdl --image /path/to/image` to guard
 the whole profile with an existing image. The supplied configuration must
 match the installed profile, architecture, facets, variants, publisher order, and
-publisher keys. CPS checks the current catalog from each mirror and the
+publisher trust roots. CPS checks the current catalog from each mirror and the
 exact companion catalogs pinned by the new primary profile. It advances
 the CPS checkpoints only after the guarded profile passes validation.
 
@@ -179,7 +180,7 @@ cps apply --root image repair.json
 ```
 
 Repeat `--archive-cache PUBLISHER=PATH` for multiple archives. CPS checks
-the archive with the image's publisher key and uses the first supplied
+the archive with the image's pinned trust root and uses the first supplied
 archive that lists the exact package manifest. It verifies the required
 payloads and copies them into the configured repository's blob cache
 without changing catalog pointers or the image. Other payloads use the
@@ -221,7 +222,7 @@ Run it on a synchronized TUF mirror cache.
 
 ```sh
 cps repo prune-cache --repo /var/lib/cps/canopa --publisher canopa \
-    --trust-key public.der --keep-image current-root --keep-image fallback-root \
+    --trust-root canopa.trust.json --keep-image current-root --keep-image fallback-root \
     --keep-plan upgrade.json
 ```
 
@@ -249,7 +250,7 @@ available.
 
 Use `--keep-lock image.lock.json` to retain the locked packages' payloads
 for that cache's publisher without retaining every payload in the pinned
-catalog. CPS checks the lock's publisher key, catalog, and manifest digests
+catalog. CPS checks the lock's publisher trust root, catalog, and manifest digests
 before pruning.
 
 Each new publication or withdrawal advances a sequence signed by the CPS
@@ -261,4 +262,4 @@ successor must preserve known package identities, build evidence, and
 withdrawals. Once a repository requires build evidence, sync also enforces that
 requirement on successors. A new repository starts its sequence at one.
 
-The publisher signs the association between each package and its build evidence. Export and sync carry the evidence with the release. To retrieve it, use `cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-key public.der cps://canopa/demo/hello@1.0.0-0`.
+The publisher signs the association between each package and its build evidence. Export and sync carry the evidence with the release. To retrieve it, use `cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-root canopa.trust.json cps://canopa/demo/hello@1.0.0-0`.

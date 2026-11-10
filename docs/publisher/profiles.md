@@ -118,7 +118,7 @@ profile "cps-runtime" architecture="x86_64" {
     package "system/git-build"
     publisher "canopa-runtime-seed" catalog="<signed seed catalog SHA-256>" {
         repository "../runtime-seed"
-        trust-key "../runtime-seed-public.der"
+        trust-root "../runtime-seed.trust.json"
     }
 }
 ```

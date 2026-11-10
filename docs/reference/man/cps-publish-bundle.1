@@ -4,15 +4,16 @@
 \&cps\-publish\-bundle \- \&Publish a reproducible build bundle after verifying its worker signature and reviewed recipe
 .SH SYNOPSIS
 .HP 4
-.B \&cps publish\-bundle [OPTIONS] \-\-repo <REPO> \-\-signing\-key <SIGNING_KEY> \-\-builder\-key <BUILDER_KEY> \-\-recipe\-sha256 <RECIPE_SHA256> <BUNDLE>
+.B \&cps publish\-bundle [OPTIONS] \-\-repo <REPO> \-\-signing\-key <KEY> \-\-builder\-key <BUILDER_KEY> \-\-recipe\-sha256 <RECIPE_SHA256> <BUNDLE>
 .SH ARGUMENTS
 .PP
 .B \&<BUNDLE>
 .SH OPTIONS
 .PP
 .B \&\-\-repo <REPO>
-.PP
-.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-signing\-key <KEY>
+\&Catalog key: PATH, file:PATH, or command:DESCRIPTOR (repeat to meet the catalog threshold)
 .PP
 .B \&\-\-builder\-key <BUILDER_KEY>
 .PP

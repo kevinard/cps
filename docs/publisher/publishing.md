@@ -2,7 +2,7 @@
 
 [Documentation](../README.md) · [Publishers](README.md)
 
-A publisher controls the catalog and its signing key. Use
+A publisher controls the catalog, its trust root, and its signing keys. Use
 `cps publish` for a reviewed manifest and prototype in a simple local
 repository. Use `cps publish-bundle` or `cps repo publish-release`
 for repositories that require signed build evidence.
@@ -15,7 +15,8 @@ for repositories that require signed build evidence.
 - [Publishing policy](#publishing-policy)
 - [Publish a coordinated release](#publish-a-coordinated-release)
 - [External catalog signing keys](#external-catalog-signing-keys)
-- [Publisher signing key rotation](#publisher-signing-key-rotation)
+- [Publisher trust root](#publisher-trust-root)
+- [Rotate, revoke, and recover keys](#rotate-revoke-and-recover-keys)
 - [Withdrawing and obsoleting packages](#withdrawing-and-obsoleting-packages)
 - [Pruning withdrawal history](#pruning-withdrawal-history)
 - [Renaming packages within a publisher](#renaming-packages-within-a-publisher)
@@ -31,9 +32,18 @@ openssl genpkey -algorithm ED25519 -outform DER -out private.der
 openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der
 ```
 
-Keep `private.der` with the signing account. Distribute `public.der`
-through the channel your clients use to provision trust. For a simple
-repository, publish the first reviewed manifest with its prototype tree.
+Create the repository's [trust root](#publisher-trust-root). For a simple
+repository, one key can be both the only root key and the only catalog key.
+
+```sh
+cps repo trust init --repo repo --publisher canopa --key private.der
+```
+
+This writes `repo/trust/1.json`, valid for one year, and prints the SHA-256
+fingerprint of its root key. Keep `private.der` with the signing account.
+Distribute `repo/trust/1.json` through the channel your clients use to provision
+trust, and publish the root key fingerprint separately so clients can check it.
+Then publish the first reviewed manifest with its prototype tree.
 
 ```sh
 cps publish --repo repo --proto proto --signing-key private.der hello.kdl
@@ -77,10 +87,11 @@ JSON:
 Each signature covers the bytes `cps signed catalog root v1`, a newline, and
 the exact decoded payload. CPS accepts an envelope only in this byte form:
 padded standard base64, lowercase hex, compact JSON without escapes, and
-signatures sorted by unique key ID. Every listed signature must verify with an
-authorized key. Today the only authorized key is the publisher's current
-catalog key, so an envelope carries exactly one signature. The list leaves
-room for threshold signing.
+signatures sorted by unique key ID. The authorized keys are the catalog keys of
+the newest trust root version in the root's `trust` field. The envelope must
+carry exactly the catalog threshold of signatures, each by a distinct
+authorized key, and every signature must verify. Requiring exactly the
+threshold keeps one signed root from having several valid byte forms.
 
 The root payload is a JSON object with these fields:
 
@@ -93,7 +104,8 @@ The root payload is a JSON object with these fields:
 | `file_index` | `true` when every shard carries a signed file index. |
 | `attestations_required`, `toolchains_verified`, `source_archives_required`, `profiles_required` | Protection flags. Once set, successors keep them. |
 | `pruned_through` | Withdrawal retention cutoff, see [Pruning withdrawal history](#pruning-withdrawal-history). |
-| `renames`, `key_rotations`, `release_profiles` | Signed renames, key handoffs, and composition profiles. |
+| `renames`, `release_profiles` | Signed renames and composition profiles. |
+| `trust` | Every [trust root](#publisher-trust-root) envelope from version 1 through the version the catalog is signed under. |
 
 A shard holds the records of every package name whose SHA-256 begins with its
 prefix, so a catalog has at most 256 shards. It is stored at
@@ -199,11 +211,12 @@ rebuilding its own packages.
 
 ## External catalog signing keys
 
-Every `--signing-key`, `--new-signing-key`, and `CPS_RELEASE_SIGNING_KEY`
-accepts `PATH`, `file:PATH`, or `command:DESCRIPTOR`. A descriptor names an
-external signer that holds the Ed25519 catalog key, such as a PKCS#11 token
-or a cloud KMS. Its `public-key` is the publisher's `public.der`. CPS checks
-each returned signature against that key before it writes a catalog. The
+Every `--signing-key`, every trust root `--key`, and `CPS_RELEASE_SIGNING_KEY`
+accept `PATH`, `file:PATH`, or `command:DESCRIPTOR`. A descriptor names an
+external signer that holds the Ed25519 key, such as a PKCS#11 token or a cloud
+KMS. Its `public-key` is the key the trust root lists. CPS checks each returned
+signature against that key before it uses it. The helper receives
+`CPS_SIGNER_CONTEXT` set to `catalog`, `trust-root`, or `attestation`. The
 descriptor format and helper protocol are described in
 [Release keys and external signers](mirrors.md#external-signer-protocol).
 
@@ -212,38 +225,156 @@ cps repo publish-release --repo repo \
     --signing-key command:/etc/cps/signers/catalog.signer.kdl release.kdl
 ```
 
-## Publisher signing key rotation
-
-Rotate a publisher's catalog signing key on the publishing repository with both
-private keys and the reviewed current catalog digest.
+When the catalog threshold is more than one, repeat `--signing-key` once for
+each required catalog key. Every publishing command takes the same set.
 
 ```sh
-cps repo rotate-key --repo repo --publisher canopa --base "$reviewed_catalog_sha256" \
-    --signing-key old-private.der --new-signing-key new-private.der
+cps publish --repo repo --proto proto \
+    --signing-key command:/etc/cps/signers/catalog-a.signer.kdl \
+    --signing-key command:/etc/cps/signers/catalog-b.signer.kdl hello.kdl
 ```
 
-Both keys sign the handoff, including the base catalog digest and the sequence
-where the new key takes effect. The new key signs the successor catalog and all
-subsequent publications and withdrawals. The catalog carries the handoff
-history, so clients can skip releases and still verify the current signing key.
-TUF sync remembers authenticated handoffs even if a payload download fails. It
-rejects releases that drop or rewrite known handoffs or backdate a new handoff
-into an already authenticated catalog sequence.
+## Publisher trust root
 
-Keep the original publisher public key as the trust anchor for export, sync,
-images, and pinned build toolchains. It verifies historical catalogs and anchors
-newer ones. Export and sign the rotated catalog with the repository's TUF roles
-as usual. The publisher and TUF roles have separate keys and rotation procedures.
-If the current private key is lost, recovery requires a new trust bootstrap.
+The trust root states which keys may sign the publisher's catalogs. It follows
+the TUF root and targets split inside CPS, so it works the same for a local
+`--repo` repository and for a TUF mirror.
+
+- **Root keys** are offline keys. A threshold of them signs every trust root
+  version. They never sign catalogs.
+- **Catalog keys** are online keys. Exactly the catalog threshold of them signs
+  every catalog root.
+
+Each version is stored at `trust/<version>.json` in the publishing repository,
+in the same canonical envelope as a catalog root. Its signatures cover the bytes
+`cps publisher trust root v1`, a newline, and the decoded payload:
+
+```json
+{"publisher":"canopa","version":2,"expires":"2027-11-10T00:00:00Z","root_keys":["<64 hex digits>"],"root_threshold":1,"catalog_keys":["<64 hex digits>","<64 hex digits>"],"catalog_threshold":2}
+```
+
+Keys are raw Ed25519 public keys in lowercase hex, sorted. A role lists 1 to 16
+keys and a threshold no larger than its key count. A key ID or fingerprint is the
+SHA-256 of the raw key, as printed by `cps repo trust show`.
+
+- Version 1 is valid when a threshold of its own root keys signs it.
+- Each later version is valid only when it is signed by the root threshold of
+  the previous version **and** the root threshold of the new version.
+- Every catalog root carries the whole chain from version 1 in its `trust`
+  field, at most 64 versions, and is signed under the newest one. A successor
+  catalog must extend its predecessor's chain unchanged.
+
+Builder keys are not part of the trust root. Build attestations are evidence
+that is independent of the publisher. Clients choose builder keys in their own
+[build trust](rebuilds.md#verifying-builds-on-images-and-workers) policy and the
+publisher in its publish policy, so a compromised root key cannot also
+authorize its own builders. CPS rejects any builder key that appears anywhere
+in the trust root history.
+
+### Expiry
+
+Every version has an `expires` time, one year after creation unless you pass
+`--expires`. A client accepts a new current catalog only while the trust root
+version it is signed under is unexpired, and CPS refuses to publish under an
+expired version. Renew before then by signing a new version with the root keys
+and [re-signing the current catalog](#re-sign-the-current-catalog). A pinned
+historical catalog stays valid after its trust root expires.
+
+## Rotate, revoke, and recover keys
+
+Every change is a new trust root version that the root keys sign. Clients learn
+of it from the next catalog, so follow each rotation with a publication or a
+re-signed catalog.
+
+### Rotate or revoke keys
+
+`cps repo trust rotate` writes the next version. Omitted options keep the
+previous version's values. `--root-key` and `--catalog-key` take public keys in
+DER, PEM, or hexadecimal form, or `command:` descriptors, and replace that role's
+whole key list. Each `--key` is a root key that signs: list enough keys to meet
+both the old and the new root thresholds.
+
+```sh
+# Renew the expiry with the same keys.
+cps repo trust rotate --repo repo --key root-a.der
+
+# Move to two of three catalog keys, which revokes every catalog key not listed.
+cps repo trust rotate --repo repo --key root-a.der \
+    --catalog-key catalog-a.pub --catalog-key catalog-b.pub --catalog-key catalog-c.pub \
+    --catalog-threshold 2
+
+# Replace a root key: both the old and the new root keys sign.
+cps repo trust rotate --repo repo --key root-a.der --key root-b.der --root-key root-b.pub
+```
+
+Revoking a key means publishing a version that omits it. A catalog signed by the
+revoked key under an older version is no longer accepted as a client's new
+current catalog once the client has seen the newer version.
+
+### Sign with offline root keys
+
+When root keys are held by different people or on air-gapped machines, use the
+detached flow. Draft the next version, sign it on each signing machine, then
+combine the signatures on the publishing host.
+
+```sh
+cps repo trust draft --repo repo --catalog-key catalog-new.pub --output trust-2.draft
+cps repo trust sign --draft trust-2.draft --key root-a.der --output root-a.sig
+cps repo trust sign --draft trust-2.draft --key command:/etc/cps/signers/root-b.signer.kdl --output root-b.sig
+cps repo trust commit --repo repo --draft trust-2.draft --signature root-a.sig --signature root-b.sig
+cps repo trust show repo
+```
+
+`commit` checks both thresholds and that the version follows the repository's
+newest version before it writes `trust/<version>.json`. A draft for
+version 1 needs `--publisher`, `--root-key`, and `--catalog-key`. Use it instead
+of `cps repo trust init` to start with several keys.
+
+### Re-sign the current catalog
+
+Publish the exact current catalog again under the newest trust root version
+with its catalog keys:
+
+```sh
+cps repo resign --repo repo --publisher canopa --signing-key catalog-new.der \
+    --base "$(cat repo/current)"
+```
+
+The successor has the next sequence and reuses every shard. Then export and sign
+a new mirror release as usual.
+
+### Recover from a compromised catalog key
+
+1. Use the offline root keys to rotate to a version without the compromised key.
+   Add a new catalog key in the same version.
+2. Re-sign the current catalog with the new catalog key and release it.
+
+Clients that accept the recovery catalog record the new version in their catalog
+checkpoint and reject every later catalog signed under the old version. A client
+that has not refreshed since the compromise can still accept a catalog the
+attacker signed, as with any revocation. TUF mirror freshness, which the attacker
+would also need to defeat, and the trust root expiry bound that window.
+Provision new clients with the newest trust root, or its root key fingerprints,
+so they never trust the compromised version.
+
+### Recover from a compromised or lost root key
+
+While a threshold of the current root keys remains available, rotate to a new
+root key set. If a threshold of root keys is lost, the publisher can no longer
+sign a new version. If an attacker holds a threshold of root keys, they can sign
+a different history from that version. Clients that already hold a newer
+version reject it, because a catalog's chain must contain their checkpoint
+unchanged. In both cases, create a new trust root and provision it to clients
+again.
 
 ## Withdrawing and obsoleting packages
 
-To withdraw an exact version, use the publisher signing key on the publishing
+To withdraw an exact version, use the publisher's catalog keys on the publishing
 repository, then export and sign a new TUF release.
 
 ```sh
 cps repo withdraw --repo repo --signing-key private.der cps://canopa/demo/hello@1.0.0-0
-cps repo withdrawals --repo repo --publisher canopa --trust-key public.der
+cps repo withdrawals --repo repo --publisher canopa --trust-root repo/trust/1.json
 ```
 
 The signed withdrawal records the original manifest digest and prevents reuse of
@@ -280,7 +411,7 @@ An obsoletion reserves the name at its publisher's position in the search order.
 A higher version can reintroduce the package, while the cutoff and earlier
 withdrawals remain in the signed history. Saved plans still use their pinned
 catalogs. Inspect the cutoffs with `cps repo obsoletions --repo repo --publisher
-canopa --trust-key public.der`.
+canopa --trust-root repo/trust/1.json`.
 
 ## Pruning withdrawal history
 

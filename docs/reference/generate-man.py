@@ -83,14 +83,24 @@ def command_page(binary, command):
     lines += format_help(description, synopsis, sections)
     if "Commands" in sections:
         lines.append(".SH SUBCOMMAND REFERENCE")
-        for child, _ in sections["Commands"]:
-            if child == "help":
-                continue
-            child_command = (*command, child)
-            lines.append(f'.SS "{roff("cps " + " ".join(child_command))}"')
-            lines += format_help(*read_help(binary, child_command), nested=True)
+        lines += subcommand_reference(binary, command, sections)
     lines += [".SH SEE ALSO", ".BR cps (1)"]
     return "\n".join(lines) + "\n"
+
+
+def subcommand_reference(binary, command, sections):
+    """Document every subcommand, including nested groups such as cps repo trust."""
+    lines = []
+    for child, _ in sections["Commands"]:
+        if child == "help":
+            continue
+        child_command = (*command, child)
+        help_text = read_help(binary, child_command)
+        lines.append(f'.SS "{roff("cps " + " ".join(child_command))}"')
+        lines += format_help(*help_text, nested=True)
+        if "Commands" in help_text[2]:
+            lines += subcommand_reference(binary, child_command, help_text[2])
+    return lines
 
 
 def manual(binary):

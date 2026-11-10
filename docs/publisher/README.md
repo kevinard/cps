@@ -8,8 +8,9 @@ A small local repository can publish reviewed prototypes directly. A
 distribution repository can require reproducible builds, independently
 verified workers, and checked image compositions.
 
-1. Provision the publisher signing key, review build inputs, and configure
-   admission requirements before the first publication.
+1. Create the publisher trust root and its root and catalog keys, review
+   build inputs, and configure admission requirements before the first
+   publication.
    [Publish and retire packages](publishing.md)
 2. Specify and check release profiles when you ship a coordinated base image.
    [Define signed release profiles](profiles.md)

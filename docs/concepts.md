@@ -33,14 +33,24 @@ objects for a publisher. The **catalog** is a signed snapshot of package
 identities, their manifest digests, and the dependency summaries the planner
 resolves with. A small signed **catalog root** commits by digest to
 content-addressed **shards** that partition the records by package name, so a
-publication rewrites only the shards it changes. Its sequence and signing
+publication rewrites only the shards it changes. Its sequence and trust root
 history let clients detect replay and inconsistent successors. A **catalog
 pin** is the SHA-256 of the exact signed root. Plans and profiles can keep
 using a historical pin when its objects are available.
 
+The publisher's **trust root** names its offline **root keys** and online
+**catalog keys**, each with a signature threshold, and an expiry. A threshold of
+root keys signs each trust root version, and each new version must also be
+signed by the previous version's root keys. Exactly the catalog threshold of
+catalog keys signs each catalog root, which carries the trust root history it
+is signed under. Rotating or revoking a key, or recovering from a compromised
+catalog key, is a new trust root version. A client pins one trust root version
+for each publisher and records the highest version it has verified, so it
+rejects catalogs signed under an older version.
+
 A **mirror** distributes an exported repository. CPS verifies the transport
 metadata using a provisioned **TUF root** (The Update Framework), then
-verifies the catalog using the **CPS publisher key**. TUF roles govern
+verifies the catalog against the publisher's pinned **trust root**. TUF roles govern
 freshness and authorization for mirror targets. Publisher signatures
 authenticate the catalog and bind its package manifests. A **mirror cache**
 is the local repository populated by sync. An **index-only cache** stores

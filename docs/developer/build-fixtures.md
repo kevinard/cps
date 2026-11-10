@@ -211,8 +211,8 @@ The seed catalog identifies the prebuilt compiler used by this test.
 [Function recursion patch](https://lists.busybox.net/pipermail/busybox/2026-June/092354.html)
 
 To use that package in the VM, set `CPS_VM_BUSYBOX_REPO` to
-`target/busybox-fixture/repo` and `CPS_VM_BUSYBOX_TRUST_KEY` to
-`target/busybox-fixture/release-public.der`. The fixture installs the exact
+`target/busybox-fixture/repo` and `CPS_VM_BUSYBOX_TRUST_ROOT` to
+`target/busybox-fixture/release.trust.json`. The fixture installs the exact
 package from that publisher. The systemd guest loads its prepared modules
 with the packaged `insmod` applet, checks the loaded modules in sysfs, and
 reports the version and loaded module names on each boot. The host still prepares

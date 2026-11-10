@@ -14,13 +14,13 @@ attestation to add its inputs.
 
 ```sh
 recipe=$(cps repo rebuild-inputs --repo /var/lib/cps/canopa --publisher canopa \
-    --trust-key canopa.der --output reviewed cps://canopa/demo/hello@1.0.0-0)
+    --trust-root canopa.trust.json --output reviewed cps://canopa/demo/hello@1.0.0-0)
 cps source fetch --cache source-cache "$recipe"
 cps repo fetch-toolchain --toolchain-config toolchain.kdl "$recipe"
 cps build --toolchain-config toolchain.kdl --source-cache source-cache \
     --check-reproducible --output rebuilt "$recipe"
 cps repo verify-rebuild --repo /var/lib/cps/canopa --publisher canopa \
-    --trust-key canopa.der --bundle rebuilt cps://canopa/demo/hello@1.0.0-0
+    --trust-root canopa.trust.json --bundle rebuilt cps://canopa/demo/hello@1.0.0-0
 ```
 
 When the source files are available for redistribution, the publisher can
@@ -50,7 +50,7 @@ attach the sources.
 ```sh
 cps repo archive-sources --repo repo --signing-key release-private.der \
     --source-cache publisher-source-cache cps://canopa/demo/hello@1.0.0-0
-cps repo export --repo repo --publisher canopa --trust-key canopa.der \
+cps repo export --repo repo --publisher canopa --trust-root canopa.trust.json \
     --include-sources --output source-mirror-targets
 ```
 
@@ -67,7 +67,7 @@ the cache without contacting the recipe's upstream URLs.
 
 ```sh
 cps repo fetch-sources --repo /var/lib/cps/canopa --publisher canopa \
-    --trust-key canopa.der --source-cache source-cache cps://canopa/demo/hello@1.0.0-0
+    --trust-root canopa.trust.json --source-cache source-cache cps://canopa/demo/hello@1.0.0-0
 ```
 
 Use this command in place of `cps source fetch` in the rebuild workflow.
@@ -93,7 +93,7 @@ digest from the recipe.
 ```sh
 cps repo sync --repo /var/lib/cps/build/canopa --root tuf-root.json \
     --metadata "$metadata_url" --targets "$targets_url" --publisher canopa \
-    --trust-key canopa.der --index-only --require-catalog "$catalog_sha256"
+    --trust-root canopa.trust.json --index-only --require-catalog "$catalog_sha256"
 ```
 
 Repeat `--require-catalog` when provisioning one cache for several recipes.
@@ -110,7 +110,7 @@ catalog and its objects. CPS checks an older catalog against the publisher's
 current catalog before exporting it.
 
 ```sh
-cps repo export --repo toolchain-repo --publisher tools --trust-key tools.der \
+cps repo export --repo toolchain-repo --publisher tools --trust-root tools.trust.json \
     --archive-catalog "$catalog_sha256" --output archive-targets
 ```
 
@@ -120,7 +120,7 @@ root to rebuilders. Use one archive cache per catalog pin.
 ```sh
 cps repo sync --repo "cache/tools/$catalog_sha256" --root archive-root.json \
     --metadata "$archive_metadata_url" --targets "$archive_targets_url" \
-    --publisher tools --trust-key tools.der --index-only \
+    --publisher tools --trust-root tools.trust.json --index-only \
     --archive-catalog "$catalog_sha256"
 ```
 
@@ -155,7 +155,7 @@ policy. Provision the worker keys separately from the repository.
 schema-version 1 kind="image-config"
 publisher "canopa" {
     repository "/var/lib/cps/canopa"
-    trust-key "/etc/cps/keys/canopa.der"
+    trust-root "/etc/cps/keys/canopa.trust.json"
     build-trust minimum-builders=2 {
         builder-key "/etc/cps/keys/worker-a.der"
         builder-key "/etc/cps/keys/worker-b.der"
@@ -191,16 +191,16 @@ cps publisher audit-builds --root image canopa
 ```
 
 Applying a guarded plan archives each admitted package's signed attestation,
-catalog digest, and publisher key history in the image database. The archive
+catalog digest, and trust root history in the image database. The archive
 follows the installed versions in each boot environment. `audit-builds`
 rechecks those signatures against the installed manifest, the recorded
-publisher key history, and the image's current builder policy, even without
+trust root history, and the image's current builder policy, even without
 the repository. Where the image has a signed catalog archive, the envelope
 must match the attestation digest admitted by the publisher for that exact
 manifest. The same check applies when reusing archived evidence during a
 signed profile upgrade.
 
-By default, CPS checks the current or profile-pinned catalog's publisher key
+By default, CPS checks the current or profile-pinned catalog's trust root
 history and audits every installed package before saving the policy. For a
 package without an archived receipt, it checks the installed manifest
 against the signed catalog and reads the referenced evidence from the
