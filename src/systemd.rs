@@ -339,7 +339,17 @@ pub(crate) struct LiveServices {
 pub(crate) struct LiveJobs {
     reload: bool,
     restart: Vec<String>,
+    /// Active services whose unit files the transaction removes, to stop
+    /// before writing files.
     stop: Vec<String>,
+    /// Services from `stop` that have been stopped. The journal records
+    /// them before and after stopping, so an abort can start them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stopped: Vec<String>,
+    /// Services to start after writing files: those that the aborted
+    /// transaction stopped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    start: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     trigger_reload: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -441,6 +451,8 @@ impl LiveServices {
         let mut jobs = LiveJobs {
             reload: self.reload,
             stop: Vec::new(),
+            stopped: Vec::new(),
+            start: Vec::new(),
             restart: Vec::new(),
             trigger_reload: self.trigger_reload.iter().cloned().collect(),
             trigger_restart: self.trigger_restart.iter().cloned().collect(),
@@ -486,10 +498,12 @@ impl LiveServices {
                 && jobs
                     .stop
                     .iter()
+                    .chain(&jobs.stopped)
                     .all(|unit| service_name(unit) && matches_service(&self.stop, unit))
                 && jobs
                     .restart
                     .iter()
+                    .chain(&jobs.start)
                     .all(|unit| service_name(unit) && matches_service(&self.restart, unit)),
             "pending systemd jobs differ from the transaction"
         );
@@ -498,6 +512,8 @@ impl LiveServices {
 }
 
 impl LiveJobs {
+    /// Stop the services in `stop`. Returns whether the caller must
+    /// journal the jobs again, now that `stopped` holds those services.
     pub(crate) fn stop_removed_units(&mut self) -> Result<bool> {
         if self.stop.is_empty() {
             return Ok(false);
@@ -506,39 +522,64 @@ impl LiveJobs {
             live_systemctl().args(["stop", "--"]).args(&self.stop),
             "stop",
         )?;
-        self.stop.clear();
+        self.mark_stopped();
         Ok(true)
     }
 
-    pub(crate) fn run(&self) -> Result<()> {
-        if self.reload {
-            run_live_job(live_systemctl().arg("daemon-reload"), "daemon-reload")?;
+    fn mark_stopped(&mut self) {
+        for unit in std::mem::take(&mut self.stop) {
+            if !self.stopped.contains(&unit) {
+                self.stopped.push(unit);
+            }
         }
-        if !self.restart.is_empty() {
-            // These units were active before writing files. A failed restart
-            // may leave them inactive, so a retry must still attempt to start them.
-            run_live_job(
-                live_systemctl().args(["restart", "--"]).args(&self.restart),
-                "restart",
-            )?;
+    }
+
+    /// Start, after an abort restores their unit files, the services that
+    /// the aborted transaction stopped or was about to stop. Starting an
+    /// active service changes nothing, so a service whose stop the
+    /// transaction never journaled as done is covered too.
+    pub(crate) fn start_stopped_by(&mut self, aborted: &Self) {
+        for unit in aborted.stop.iter().chain(&aborted.stopped) {
+            if !self.restart.contains(unit) && !self.start.contains(unit) {
+                self.start.push(unit.clone());
+            }
+        }
+    }
+
+    /// The systemctl invocations that follow the file writes, in order.
+    fn jobs(&self) -> Vec<(&'static str, Vec<&str>)> {
+        let mut jobs = Vec::new();
+        if self.reload {
+            jobs.push(("daemon-reload", Vec::new()));
+        }
+        // These units were active before writing files. A failed restart
+        // may leave them inactive, so a retry must still attempt to start them.
+        for (action, units) in [("restart", &self.restart), ("start", &self.start)] {
+            if !units.is_empty() {
+                jobs.push((action, units.iter().map(String::as_str).collect()));
+            }
         }
         // Triggers ran after the files were written. Like IPS actuators,
         // they refresh or restart only services that are running.
-        if !self.trigger_reload.is_empty() {
-            run_live_job(
-                live_systemctl()
-                    .args(["try-reload-or-restart", "--"])
-                    .args(&self.trigger_reload),
-                "reload after triggers",
-            )?;
+        for (action, units) in [
+            ("try-reload-or-restart", &self.trigger_reload),
+            ("try-restart", &self.trigger_restart),
+        ] {
+            if !units.is_empty() {
+                jobs.push((action, units.iter().map(String::as_str).collect()));
+            }
         }
-        if !self.trigger_restart.is_empty() {
-            run_live_job(
-                live_systemctl()
-                    .args(["try-restart", "--"])
-                    .args(&self.trigger_restart),
-                "restart after triggers",
-            )?;
+        jobs
+    }
+
+    pub(crate) fn run(&self) -> Result<()> {
+        for (action, units) in self.jobs() {
+            let mut command = live_systemctl();
+            command.arg(action);
+            if !units.is_empty() {
+                command.arg("--").args(units);
+            }
+            run_live_job(&mut command, action)?;
         }
         Ok(())
     }
@@ -675,4 +716,71 @@ pub(crate) fn decode_mount_path(encoded: &[u8]) -> Result<PathBuf> {
         }
     }
     Ok(std::ffi::OsString::from_vec(decoded).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn services(stop: &[&str], restart: &[&str]) -> LiveServices {
+        LiveServices {
+            reload: true,
+            restart: restart.iter().map(|unit| (*unit).to_owned()).collect(),
+            stop: stop.iter().map(|unit| (*unit).to_owned()).collect(),
+            trigger_reload: BTreeSet::new(),
+            trigger_restart: BTreeSet::new(),
+        }
+    }
+
+    fn jobs(stop: &[&str], restart: &[&str]) -> LiveJobs {
+        LiveJobs {
+            reload: true,
+            restart: restart.iter().map(|unit| (*unit).to_owned()).collect(),
+            stop: stop.iter().map(|unit| (*unit).to_owned()).collect(),
+            stopped: Vec::new(),
+            start: Vec::new(),
+            trigger_reload: Vec::new(),
+            trigger_restart: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_abort_starts_the_services_that_the_transaction_stopped() -> Result<()> {
+        // The transaction removes the units of two running services.
+        let forward_services = services(&["app.service", "worker@.service"], &[]);
+        let mut forward = jobs(&["app.service", "worker@1.service"], &[]);
+        forward_services.check_jobs(&forward)?;
+        // Interrupted before the stop was journaled, the abort still
+        // starts both: they were running before the transaction.
+        let restored = services(&[], &["app.service", "worker@.service", "other.service"]);
+        let mut abort = jobs(&[], &["other.service"]);
+        abort.start_stopped_by(&forward);
+        assert_eq!(abort.start, ["app.service", "worker@1.service"]);
+        restored.check_jobs(&abort)?;
+
+        forward.mark_stopped();
+        assert!(forward.stop.is_empty());
+        assert_eq!(forward.stopped, ["app.service", "worker@1.service"]);
+        forward_services.check_jobs(&forward)?;
+        let journaled: LiveJobs = serde_json::from_str(&serde_json::to_string(&forward)?)?;
+        let mut abort = jobs(&[], &["app.service"]);
+        abort.start_stopped_by(&journaled);
+        // A service that is active again is restarted rather than started.
+        assert_eq!(abort.start, ["worker@1.service"]);
+        abort.start_stopped_by(&journaled);
+        assert_eq!(abort.start, ["worker@1.service"]);
+        restored.check_jobs(&abort)?;
+        assert_eq!(
+            abort.jobs(),
+            [
+                ("daemon-reload", vec![]),
+                ("restart", vec!["app.service"]),
+                ("start", vec!["worker@1.service"]),
+            ]
+        );
+        // The journal accepts only services whose unit files the abort restores.
+        assert!(services(&[], &["app.service"]).check_jobs(&abort).is_err());
+        assert!(services(&[], &[]).check_jobs(&forward).is_err());
+        Ok(())
+    }
 }

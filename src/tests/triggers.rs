@@ -219,6 +219,61 @@ fn package_paths_and_overlapping_outputs_conflict() -> Result<()> {
 }
 
 #[test]
+fn outputs_beneath_symlinks_are_refused_or_skipped() -> Result<()> {
+    let f = Fixture::new()?;
+    let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
+    f.package(
+        "base/merged",
+        "1.0.0-0",
+        format!("    dir \"usr/lib\" mode=\"0755\" uid={uid} gid={gid}\n")
+            + &format!("    symlink \"lib\" target=\"usr/lib\" uid={uid} gid={gid}\n"),
+    )?;
+    f.package(
+        "test/linked",
+        "1.0.0-0",
+        handler(&f, "usr/libexec/linked")?
+            + &trigger(
+                "cache",
+                "        run \"usr/libexec/linked\"\n        watch \"usr/share/linked/*\"\n        output \"lib/foo/cache\"\n",
+            ),
+    )?;
+    f.package(
+        "test/opt",
+        "1.0.0-0",
+        format!("    dir \"opt\" mode=\"0755\" uid={uid} gid={gid}\n")
+            + &handler(&f, "usr/libexec/opt")?
+            + &trigger(
+                "cache",
+                "        run \"usr/libexec/opt\"\n        watch \"usr/share/opt/*\"\n        output \"opt/app/cache\"\n",
+            ),
+    )?;
+    f.create()?;
+    apply(&f.root, &install_plan(&f.root, &["base/merged"])?)?;
+    // A managed symlink in an output's directories refuses the plan.
+    let error = install_plan(&f.root, &["test/linked"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(
+            "trigger test/linked:cache output lib/foo/cache lies beneath the symbolic link lib"
+        ),
+        "{error:#}"
+    );
+
+    // An unmanaged symlink fails the handler, and the abort still finishes.
+    fs::create_dir(f.root.join("opt"))?;
+    std::os::unix::fs::symlink("../usr/lib", f.root.join("opt/app"))?;
+    let install = install_plan(&f.root, &["test/opt"])?;
+    let error = apply(&f.root, &install).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("opt/app is not a directory"),
+        "{error:#}"
+    );
+    assert_eq!(crate::abort_transaction(&f.root, false)?, Some(1));
+    assert!(crate::transaction_status(&f.root)?.pending.is_none());
+    assert!(fs::symlink_metadata(f.root.join("opt/app"))?.is_symlink());
+    Ok(())
+}
+
+#[test]
 fn trigger_cycles_are_rejected() -> Result<()> {
     let f = Fixture::new()?;
     for (name, watch, output) in [
@@ -654,5 +709,85 @@ fn interrupted_abort_runs_each_remaining_trigger_once() -> Result<()> {
         assert_eq!(finish(resume)?, Some(base));
         assert_aborted(runs, "failed handler")?;
     }
+    Ok(())
+}
+
+/// A package whose handler writes `cache` into `directory`, and the
+/// actions that ship it.
+fn cache_generator(f: &Fixture, name: &str, directory: &str) -> Result<String> {
+    Ok(dependency("require", "test/runtime", "1.0.0-0")
+        + &f.file(
+            &format!("usr/libexec/{name}"),
+            &format!("#!/usr/bin/bash\nset -eu\necho generated > /{directory}/cache\n"),
+            "0755",
+            "",
+        )?
+        + &trigger(
+            "cache",
+            &format!(
+                "        run \"usr/libexec/{name}\"\n        watch \"{directory}/*.item\"\n        output \"{directory}/cache\"\n"
+            ),
+        ))
+}
+
+#[test]
+fn transitions_carry_generated_outputs_away_with_the_old_tree() -> Result<()> {
+    if !sandbox_available() {
+        return Ok(());
+    }
+    let f = Fixture::new()?;
+    let owner = format!("uid={} gid={}", geteuid().as_raw(), getegid().as_raw());
+    f.package("test/runtime", "1.0.0-0", runtime(&f, &["/usr/bin/bash"])?)?;
+    f.package(
+        "test/gen",
+        "1.0.0-0",
+        format!("    dir \"usr/share/gen\" mode=\"0755\" {owner}\n")
+            + &f.file("usr/share/gen/a.item", "a", "0644", "")?
+            + &cache_generator(&f, "gen", "usr/share/gen")?,
+    )?;
+    f.package(
+        "test/conf",
+        "1.0.0-0",
+        f.file("usr/share/conf", "plain", "0644", "")?,
+    )?;
+    f.create()?;
+    apply(&f.root, &install_plan(&f.root, &["test/gen", "test/conf"])?)?;
+    assert_eq!(read(&f, "usr/share/gen/cache")?, "generated\n");
+
+    // The directory holding generated outputs becomes a symlink, and the
+    // release drops the trigger. The outputs leave with the old tree.
+    fs::remove_dir_all(f.proto.join("usr/share/gen"))?;
+    f.package(
+        "test/gen",
+        "2.0.0-0",
+        f.file("usr/lib/gen/a.item", "a", "0644", "")?
+            + &format!("    symlink \"usr/share/gen\" target=\"../lib/gen\" {owner}\n"),
+    )?;
+    let update = install_plan(&f.root, &["test/gen@2.0.0-0"])?;
+    assert_eq!(update.retired_triggers.len(), 1);
+    // Aborting it after its triggers brings the tree and its outputs back.
+    abort_after_triggers(&f, &update)?;
+    assert_eq!(read(&f, "usr/share/gen/cache")?, "generated\n");
+    apply(&f.root, &update)?;
+    assert!(fs::symlink_metadata(f.root.join("usr/share/gen"))?.is_symlink());
+    assert!(!f.root.join("usr/lib/gen/cache").exists());
+    assert!(verify::verify_pristine(&f.root)?.is_empty());
+
+    // A file becomes a directory that a new trigger writes into. Aborting
+    // turns the directory, with its outputs, back into the file.
+    fs::remove_file(f.proto.join("usr/share/conf"))?;
+    f.package(
+        "test/conf",
+        "2.0.0-0",
+        f.file("usr/share/conf/a.item", "a", "0644", "")?
+            + &cache_generator(&f, "conf", "usr/share/conf")?,
+    )?;
+    let update = install_plan(&f.root, &["test/conf@2.0.0-0"])?;
+    assert_eq!(runs(&update), ["test/conf:cache"]);
+    abort_after_triggers(&f, &update)?;
+    assert_eq!(read(&f, "usr/share/conf")?, "plain");
+    apply(&f.root, &update)?;
+    assert_eq!(read(&f, "usr/share/conf/cache")?, "generated\n");
+    assert!(verify::verify_pristine(&f.root)?.is_empty());
     Ok(())
 }

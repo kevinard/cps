@@ -370,6 +370,15 @@ pub(crate) fn active_outputs<'a>(
         .collect()
 }
 
+/// The output patterns of the triggers active in either of two states.
+pub(crate) fn outputs_of<'a>(from: &'a State, to: &'a State) -> Vec<&'a str> {
+    let mut outputs = active_outputs(&from.installed, &from.paths);
+    outputs.extend(active_outputs(&to.installed, &to.paths));
+    outputs.sort_unstable();
+    outputs.dedup();
+    outputs
+}
+
 /// Whether an active trigger generates a path.
 pub(crate) fn generated(outputs: &[&str], path: &str) -> bool {
     outputs.iter().any(|output| covers(output, path))
@@ -509,6 +518,14 @@ pub(crate) fn check_conflicts(
         })
         .collect();
     for (index, &((package, name), output)) in outputs.iter().enumerate() {
+        // Handlers write, and CPS publishes and removes, outputs without
+        // following symlinks, so an output's directories must be real.
+        if let Some(link) = linked_ancestor(output, paths) {
+            bail!(
+                "trigger {package}:{name} output {output} lies beneath the symbolic link {link}; \
+                 declare the output at the link's target instead"
+            );
+        }
         let prefix = literal_prefix(output);
         let nested = format!("{prefix}/");
         let end = format!("{prefix}0");
@@ -540,6 +557,17 @@ pub(crate) fn check_conflicts(
         }
     }
     Ok(())
+}
+
+/// A managed symlink among the literal directories that hold an output.
+fn linked_ancestor<'a>(output: &str, paths: &'a BTreeMap<String, Managed>) -> Option<&'a str> {
+    let parts: Vec<_> = output.split('/').collect();
+    (1..parts.len())
+        .take_while(|&end| !wildcard(parts[end - 1]))
+        .find_map(|end| {
+            let (path, managed) = paths.get_key_value(parts[..end].join("/").as_str())?;
+            matches!(managed.node, Node::Symlink { .. }).then_some(path.as_str())
+        })
 }
 
 fn check_cycles(edges: &BTreeMap<Key<'_>, BTreeSet<Key<'_>>>) -> Result<()> {
@@ -618,6 +646,9 @@ pub(crate) fn actuators(
     Ok((reload, restart))
 }
 
+/// The type of the object at a path, without following symlinks. A path
+/// beneath a file or a symlink is absent: CPS never generates or removes
+/// anything through a link.
 fn kind(root: &Root, path: &str) -> Result<Option<FileType>> {
     validate_path(path)?;
     let (parent, leaf) = match path.rsplit_once('/') {
@@ -626,7 +657,7 @@ fn kind(root: &Root, path: &str) -> Result<Option<FileType>> {
             Err(error)
                 if matches!(
                     error.downcast_ref::<Errno>(),
-                    Some(&(Errno::NOENT | Errno::NOTDIR))
+                    Some(&(Errno::NOENT | Errno::NOTDIR | Errno::LOOP))
                 ) =>
             {
                 return Ok(None);
@@ -777,11 +808,24 @@ fn remove_unclaimed(
 
 /// Finish directory removals that generated outputs prevented. A generated
 /// path inside a directory that no package ships any more is orphaned.
+///
+/// A directory beneath a transition left with the old tree when the
+/// transition replaced it, so only removals outside transitions remain.
 pub(crate) fn prune(root: &Root, writes: &[Write], next: &State) -> Result<()> {
     let outputs = active_outputs(&next.installed, &next.paths);
+    let transitions: Vec<&str> = writes
+        .iter()
+        .filter(|write| write.transition().is_some())
+        .map(|write| write.path.as_str())
+        .collect();
     let mut removed: Vec<_> = writes
         .iter()
-        .filter(|write| write.removes_directory())
+        .filter(|write| {
+            write.removes_directory()
+                && !transitions
+                    .iter()
+                    .any(|transition| write.beneath(transition))
+        })
         .map(|write| write.path.as_str())
         .collect();
     removed.sort_unstable_by(|a, b| b.cmp(a));
@@ -944,7 +988,8 @@ fn execute(
         "running trigger {label} requires Bubblewrap at {BWRAP}"
     );
     let privileged = rustix::process::geteuid().is_root();
-    let filter = crate::build::sandbox::filter(false).context("creating seccomp trigger policy")?;
+    let filter =
+        crate::build::sandbox::trigger_filter().context("creating seccomp trigger policy")?;
     let mut command = Command::new(BWRAP);
     command.env_clear().args([
         "--unshare-ipc",
@@ -1129,6 +1174,25 @@ fn opaque(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// The overlay attribute that marks an upper entry whose data or contents
+/// stay in the lower layer: a metadata-only copy-up or a renamed directory.
+/// Publishing the upper entry alone would lose them.
+fn indirect(path: &Path) -> Result<Option<&'static str>> {
+    for name in [
+        "trusted.overlay.metacopy",
+        "user.overlay.metacopy",
+        "trusted.overlay.redirect",
+        "user.overlay.redirect",
+    ] {
+        match rustix::fs::lgetxattr(path, name, &mut [0_u8; 0][..]) {
+            Ok(_) => return Ok(Some(name)),
+            Err(Errno::NODATA | Errno::NOTSUP) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
+
 /// Turn an overlay's upper directory into changes, refusing every change
 /// that is not a declared output of the trigger.
 fn collect(
@@ -1157,6 +1221,12 @@ fn collect(
         );
         let metadata = fs::symlink_metadata(&source)?;
         let file_type = metadata.file_type();
+        if let Some(attribute) = indirect(&source)? {
+            bail!(
+                "{path} carries {attribute}, so its contents are not in the overlay; \
+                 rewrite outputs instead of only changing their metadata or renaming them"
+            );
+        }
         let mode = metadata.mode() & 0o777;
         let (uid, gid) = (metadata.uid(), metadata.gid());
         if file_type.is_char_device() && metadata.rdev() == 0 {
@@ -1305,6 +1375,107 @@ mod tests {
             "var/cache/fontconfig",
             "var/cache/fontconfig/*.cache-9"
         ));
+    }
+
+    #[test]
+    fn metadata_only_and_redirected_copies_are_refused() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let image = dir.path().join("image");
+        let upper = dir.path().join("upper");
+        fs::create_dir_all(image.join("usr/share/x"))?;
+        fs::create_dir_all(upper.join("moved"))?;
+        fs::write(upper.join("cache"), "")?;
+        let root = Root::open(&image)?;
+        let trigger = Trigger {
+            name: "x".into(),
+            handler: Some("usr/libexec/x".into()),
+            args: Vec::new(),
+            watch: vec!["usr/share/x/*.item".into()],
+            outputs: vec!["usr/share/x/cache".into(), "usr/share/x/moved".into()],
+            reload: Vec::new(),
+            restart: Vec::new(),
+            timeout: None,
+        };
+        let mut changes = Vec::new();
+        collect(&root, &upper, "usr/share/x", &trigger, &[], &mut changes)?;
+        assert_eq!(changes.len(), 2);
+        for (name, attribute) in [
+            ("cache", "user.overlay.metacopy"),
+            ("moved", "user.overlay.redirect"),
+        ] {
+            let source = upper.join(name);
+            match rustix::fs::lsetxattr(&source, attribute, b"", rustix::fs::XattrFlags::empty()) {
+                Ok(()) => {}
+                Err(Errno::NOTSUP | Errno::PERM) => {
+                    eprintln!("Skipping: this filesystem has no user extended attributes");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let error =
+                collect(&root, &upper, "usr/share/x", &trigger, &[], &mut Vec::new()).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!("usr/share/x/{name} carries {attribute}")),
+                "{error:#}"
+            );
+            rustix::fs::lremovexattr(&source, attribute)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn handlers_cannot_create_sockets_that_reach_other_services() -> Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        let usable = python.is_file()
+            && Command::new(BWRAP)
+                .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+                .output()
+                .is_ok_and(|output| output.status.success());
+        if !usable {
+            eprintln!(
+                "Skipping: this test needs a working {BWRAP} and {}",
+                python.display()
+            );
+            return Ok(());
+        }
+        let script = "\
+import socket
+def denied(create):
+    try:
+        create().close()
+    except PermissionError:
+        return True
+    return False
+assert denied(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+assert denied(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM))
+assert denied(lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+assert denied(lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)[0])
+for kind in (socket.SOCK_STREAM, socket.SOCK_SEQPACKET):
+    left, right = socket.socketpair(socket.AF_UNIX, kind)
+    left.send(b'x')
+    assert right.recv(1) == b'x'
+";
+        let filter = crate::build::sandbox::trigger_filter()?;
+        let mut command = Command::new(BWRAP);
+        command
+            .args(["--unshare-user", "--ro-bind", "/", "/", "--seccomp"])
+            .arg(filter.as_raw_fd().to_string())
+            .arg("--")
+            .arg(python)
+            .args(["-I", "-c", script]);
+        unsafe {
+            command.pre_exec(move || {
+                fcntl_setfd(&filter, FdFlags::empty())?;
+                Ok(())
+            });
+        }
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
     }
 
     #[test]

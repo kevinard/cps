@@ -6,8 +6,9 @@
 .HP 4
 .B \&cps repair [OPTIONS] [PACKAGES]...
 .SH ARGUMENTS
-.PP
+.TP
 .B \&[PACKAGES]...
+\&Repair the paths of these installed packages (default: every package)
 .SH OPTIONS
 .TP
 .B \&\-\-config <CONFIG>
@@ -30,8 +31,9 @@
 .TP
 .B \&\-\-prepare\-only
 \&Prepare a verified recovery root for separate activation
-.PP
+.TP
 .B \&\-\-path <PATH>
+\&Repair only this managed path, absolute or relative to the image root (repeat for each path)
 .TP
 .B \&\-h, \-\-help
 \&Print help

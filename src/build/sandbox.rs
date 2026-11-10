@@ -24,15 +24,40 @@ use super::{
 };
 
 pub(crate) fn filter(terminal: bool) -> Result<File> {
+    policy(terminal, true)
+}
+
+/// The seccomp policy of trigger handlers. A live handler runs as root
+/// over the image's read-only files, and a read-only mount does not stop
+/// connect() to a UNIX socket, so handlers cannot create a socket that
+/// could address one. Connected stream and sequenced-packet pairs remain.
+pub(crate) fn trigger_filter() -> Result<File> {
+    policy(false, false)
+}
+
+fn policy(terminal: bool, unix_sockets: bool) -> Result<File> {
     let mut rules = ScmpFilterContext::new(ScmpAction::Allow)?;
     let denied = ScmpAction::Errno(libc::EPERM);
-    for syscall in ["socket", "socketpair"] {
+    if unix_sockets {
         rules.add_rule_conditional(
             denied,
-            ScmpSyscall::from_name(syscall)?,
+            ScmpSyscall::from_name("socket")?,
             &[scmp_cmp!($arg0 != libc::AF_UNIX as u64)],
         )?;
+    } else {
+        rules.add_rule(denied, ScmpSyscall::from_name("socket")?)?;
+        // A datagram socket from a pair can still send to any address.
+        rules.add_rule_conditional(
+            denied,
+            ScmpSyscall::from_name("socketpair")?,
+            &[scmp_cmp!($arg1 & 0xf == libc::SOCK_DGRAM as u64)],
+        )?;
     }
+    rules.add_rule_conditional(
+        denied,
+        ScmpSyscall::from_name("socketpair")?,
+        &[scmp_cmp!($arg0 != libc::AF_UNIX as u64)],
+    )?;
     for syscall in [
         "bpf",
         "perf_event_open",

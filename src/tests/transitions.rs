@@ -73,6 +73,114 @@ fn usrmerge() -> Result<(Fixture, Plan)> {
     Ok((f, update))
 }
 
+/// The usrmerge fixture with a trigger that watches the merged directory,
+/// so each transaction prunes after its triggers.
+fn usrmerge_with_trigger() -> Result<(Fixture, Plan)> {
+    let f = Fixture::new()?;
+    let split = f.file("bin/tool", "tool 1", "0755", "")?
+        + &f.file("bin/sub/data", "data 1", "0644", "")?
+        + &f.file("usr/bin/other", "other 1", "0755", "")?;
+    f.package("base/filesystem", "1.0.0-0", split)?;
+    f.package(
+        "base/watch",
+        "1.0.0-0",
+        "    trigger \"tools\" {\n        watch \"usr/bin/**\"\n        watch \"bin/**\"\n        reload \"example.service\"\n    }\n".to_owned(),
+    )?;
+    f.create()?;
+    assert_eq!(install_all(&f.root, &["base/filesystem", "base/watch"])?, 1);
+    fs::remove_dir_all(f.proto.join("bin"))?;
+    let merged = f.file("usr/bin/tool", "tool 2", "0755", "")?
+        + &f.file("usr/bin/sub/data", "data 2", "0644", "")?
+        + &f.file("usr/bin/other", "other 1", "0755", "")?
+        + &symlink_action("bin", "usr/bin");
+    f.package("base/filesystem", "2.0.0-0", merged)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(!update.triggers.is_empty());
+    Ok((f, update))
+}
+
+#[test]
+fn directory_becomes_a_symlink_in_a_transaction_with_triggers() -> Result<()> {
+    let (f, update) = usrmerge_with_trigger()?;
+    // Interrupted after the exchange, the forward transaction aborts.
+    interrupt_step(&f, &update, "exchanged", false, false)?;
+    assert_eq!(abort_transaction(&f.root, false)?, Some(1));
+    assert_split(&f.root)?;
+    // Interrupted after its triggers, it resumes forward.
+    interrupt_step(&f, &update, "triggers", false, false)?;
+    assert!(is_symlink(&f.root.join("bin")));
+    assert_eq!(resume_transaction(&f.root)?, Some(2));
+    assert_merged(&f.root)?;
+    // The downgrade turns the symlink back into a tree, and aborting it
+    // after its triggers restores the symlink.
+    let downgrade = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["base/filesystem@1.0.0-0".into()],
+        },
+    )?;
+    assert!(!downgrade.triggers.is_empty());
+    interrupt_step(&f, &downgrade, "triggers", false, false)?;
+    assert!(fs::symlink_metadata(f.root.join("bin"))?.is_dir());
+    assert_eq!(abort_transaction(&f.root, false)?, Some(2));
+    assert_merged(&f.root)?;
+    assert_eq!(apply(&f.root, &downgrade)?, 3);
+    assert_split(&f.root)?;
+    // Applying the merge in one go also succeeds.
+    let update = plan(&f.root, Request::Update)?;
+    assert_eq!(apply(&f.root, &update)?, 4);
+    assert_merged(&f.root)
+}
+
+#[test]
+fn abort_restores_paths_that_drifted_before_the_transaction() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new()?;
+    let release = |version: &str, link: &str| -> Result<String> {
+        Ok(f.file("usr/bin/x", &format!("x {version}"), "0755", "")?
+            + &symlink_action("usr/bin/y", link))
+    };
+    f.package("app/x", "1.0.0-0", release("1", "x")?)?;
+    f.package(
+        "app/watch",
+        "1.0.0-0",
+        "    trigger \"tools\" {\n        watch \"usr/bin/*\"\n        reload \"example.service\"\n    }\n".to_owned(),
+    )?;
+    f.create()?;
+    install_all(&f.root, &["app/x", "app/watch"])?;
+    f.package("app/x", "2.0.0-0", release("2", "x2")?)?;
+    let x = f.root.join("usr/bin/x");
+    let y = f.root.join("usr/bin/y");
+    fs::set_permissions(&x, fs::Permissions::from_mode(0o700))?;
+    fs::remove_file(&y)?;
+    std::os::unix::fs::symlink("local", &y)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(!update.triggers.is_empty());
+    let assert_drifted = || -> Result<()> {
+        assert_eq!(fs::read_to_string(&x)?, "x 1");
+        assert_eq!(fs::metadata(&x)?.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(fs::read_link(&y)?, Path::new("local"));
+        let findings = verify(&f.root)?;
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(crate::transaction_status(&f.root)?.pending.is_none());
+        Ok(())
+    };
+    // The abort returns both paths to their drifted state before the
+    // transaction, whether it finishes at once or is interrupted.
+    interrupt_step(&f, &update, "triggers", false, false)?;
+    assert_eq!(abort_transaction(&f.root, false)?, Some(1));
+    assert_drifted()?;
+    interrupt_step(&f, &update, "triggers", false, false)?;
+    interrupt_step(&f, &update, "abort-retired", false, true)?;
+    assert_eq!(resume_transaction(&f.root)?, Some(1));
+    assert_drifted()?;
+    // Applying the update replaces the drifted paths.
+    assert_eq!(apply(&f.root, &update)?, 2);
+    assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
 fn assert_split(root: &Path) -> Result<()> {
     assert!(fs::symlink_metadata(root.join("bin"))?.is_dir());
     assert_eq!(fs::read_to_string(root.join("bin/tool"))?, "tool 1");
@@ -620,5 +728,86 @@ fn writes_follow_dependencies_and_removals_run_in_reverse() -> Result<()> {
         .collect();
     assert!(positions.is_sorted(), "{:?}", removal.writes);
     assert!(position(&removal, "usr/lib/app") > positions[2]);
+    Ok(())
+}
+
+#[test]
+fn library_symlinks_never_dangle_during_an_upgrade() -> Result<()> {
+    let f = Fixture::new()?;
+    let release = |version: &str| -> Result<String> {
+        let file = format!("usr/lib/libz.so.{version}");
+        Ok(f.file(&file, &format!("zlib {version}"), "0755", "")?
+            + &symlink_action("usr/lib/libz.so.1", &format!("libz.so.{version}"))
+            + &symlink_action("usr/lib/libz.so", "libz.so.1"))
+    };
+    f.package("library/zlib", "1.2.0-0", release("1.2")?)?;
+    f.create()?;
+    install_all(&f.root, &["library/zlib"])?;
+    fs::remove_file(f.proto.join("usr/lib/libz.so.1.2"))?;
+    f.package("library/zlib", "1.3.1-0", release("1.3.1")?)?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(position(&update, "usr/lib/libz.so.1") > position(&update, "usr/lib/libz.so.1.3.1"));
+    let root = f.root.clone();
+    let mut checked = 0;
+    apply_with(&f.root, &update, |write| {
+        if write.path.starts_with("usr/lib/libz.so") && write.after.is_some() {
+            checked += 1;
+            assert!(
+                fs::read_to_string(root.join("usr/lib/libz.so")).is_ok(),
+                "usr/lib/libz.so dangles after writing {}",
+                write.path
+            );
+        }
+    })?;
+    assert_eq!(checked, 2);
+    assert_eq!(
+        fs::read_to_string(f.root.join("usr/lib/libz.so"))?,
+        "zlib 1.3.1"
+    );
+    Ok(())
+}
+
+#[test]
+fn aborting_a_unit_removal_plans_to_start_the_stopped_services() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "app/daemon",
+        "1.0.0-0",
+        f.file(
+            "usr/lib/systemd/system/app.service",
+            "[Service]\n",
+            "0644",
+            "",
+        )? + &f.file(
+            "usr/lib/systemd/system/worker@.service",
+            "[Service]\n",
+            "0644",
+            "",
+        )?,
+    )?;
+    f.create()?;
+    install_all(&f.root, &["app/daemon"])?;
+    let (forward, next, _) = crate::plan::plan_image(
+        &f.root,
+        Request::Remove {
+            packages: vec!["app/daemon".into()],
+        },
+        crate::PlanOptions::default(),
+        None,
+    )?;
+    let base = crate::image::Image::open_query(&f.root)?.state()?;
+    let inverse = forward.inverse(&base, &next)?;
+    let stop = "Stop active services matching app.service, worker@.service";
+    assert!(
+        crate::systemd::LiveServices::plan(&forward, &base, &next)
+            .preview()
+            .iter()
+            .any(|line| line == stop)
+    );
+    // The abort restores both units, so the services that the forward
+    // transaction stopped are among those it may start.
+    let restart = "Restart active services matching app.service, worker@.service";
+    let preview = crate::systemd::LiveServices::plan(&inverse, &next, &base).preview();
+    assert!(preview.iter().any(|line| line == restart), "{preview:?}");
     Ok(())
 }

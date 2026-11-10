@@ -38,11 +38,12 @@
 .SS "\&cps publisher list"
 \&Show configured publishers in search order
 .PP
-.B \&cps publisher list \-\-root <ROOT>
+.B \&cps publisher list [OPTIONS]
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&[default: /]
 .TP
 .B \&\-h, \-\-help
 \&Print help
@@ -87,11 +88,12 @@
 .SS "\&cps publisher set\-repository"
 \&Replace one or more local repository paths as a single change
 .PP
-.B \&cps publisher set\-repository \-\-root <ROOT> \-\-repo <PUBLISHER=PATH>
+.B \&cps publisher set\-repository [OPTIONS] \-\-repo <PUBLISHER=PATH>
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&[default: /]
 .PP
 .B \&\-\-repo <PUBLISHER=PATH>
 .TP
@@ -100,15 +102,16 @@
 .SS "\&cps publisher set\-build\-trust"
 \&Replace a publisher's locally configured builder keys and threshold
 .PP
-.B \&cps publisher set\-build\-trust [OPTIONS] \-\-root <ROOT> \-\-policy <POLICY> <NAME>
+.B \&cps publisher set\-build\-trust [OPTIONS] \-\-policy <POLICY> <NAME>
 .PP
 .B Arguments
 .PP
 .B \&<NAME>
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&[default: /]
 .PP
 .B \&\-\-policy <POLICY>
 .TP
@@ -120,45 +123,48 @@
 .SS "\&cps publisher audit\-builds"
 \&Check installed packages against the configured builder policy
 .PP
-.B \&cps publisher audit\-builds \-\-root <ROOT> <NAME>
+.B \&cps publisher audit\-builds [OPTIONS] <NAME>
 .PP
 .B Arguments
 .PP
 .B \&<NAME>
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&[default: /]
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps publisher prefer"
 \&Search this publisher first when selecting new packages
 .PP
-.B \&cps publisher prefer \-\-root <ROOT> <NAME>
+.B \&cps publisher prefer [OPTIONS] <NAME>
 .PP
 .B Arguments
 .PP
 .B \&<NAME>
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&[default: /]
 .TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps publisher remove"
 \&Remove a publisher that has no installed packages
 .PP
-.B \&cps publisher remove \-\-root <ROOT> <NAME>
+.B \&cps publisher remove [OPTIONS] <NAME>
 .PP
 .B Arguments
 .PP
 .B \&<NAME>
 .PP
 .B Options
-.PP
+.TP
 .B \&\-\-root <ROOT>
+\&[default: /]
 .TP
 .B \&\-h, \-\-help
 \&Print help

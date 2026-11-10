@@ -1155,7 +1155,8 @@ impl Image {
                 .query_row("SELECT EXISTS(SELECT 1 FROM pending)", [], |row| row.get(0))?;
         ensure!(
             !pending,
-            "image has an incomplete transaction; use transaction status or rerun apply with the same plan"
+            "image has an incomplete transaction; finish it with cps transaction resume, \
+             or undo it with cps transaction abort (cps transaction status shows it)"
         );
         Ok(())
     }

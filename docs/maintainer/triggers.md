@@ -93,6 +93,12 @@ The declaring package owns every path its outputs cover.
   trigger's package, as
   `dir "etc/udev"` does for the hardware database. A handler cannot create
   directories outside its outputs.
+- CPS never follows a symlink to an output. A plan fails if a directory
+  named literally in an output, such as `lib` in `lib/foo/cache`, is a
+  managed symlink, as after a merged `/usr` turns `lib` into a link to
+  `usr/lib`. Declare the output at the link's target instead. A handler
+  fails when an unmanaged symlink stands in for the directory that holds
+  its output, and removing generated paths skips anything beneath a link.
 - `cps verify` does not check generated contents, and `--quick` records no
   fingerprints for them. `--pristine` accepts them as owned paths.
 - CPS removes the generated paths when the trigger goes away: its package
@@ -118,9 +124,14 @@ transaction, so a package that ships CPS should depend on Bubblewrap.
 - Each directory that holds an output is an overlay. After the handler
   exits, CPS publishes only the changes to declared outputs. If the handler
   wrote, removed, or changed anything else, the trigger fails and none of
-  its changes reach the image. A generated file may be at most 4 GiB.
+  its changes reach the image. A generated file may be at most 4 GiB. Write
+  each output in full: an overlay that records only a mode change or a
+  rename, as metadata-only copies and redirected directories do, fails the
+  trigger, because the contents stay outside the overlay.
 - The handler has no network, a private PID namespace, and a seccomp
-  filter. Its environment holds only `PATH=/usr/sbin:/usr/bin`, `LC_ALL=C`,
+  filter. It cannot create sockets, so it cannot reach a service through a
+  UNIX socket in the image even when it runs as root. `socketpair` works for
+  stream and sequenced-packet sockets. Its environment holds only `PATH=/usr/sbin:/usr/bin`, `LC_ALL=C`,
   `LANG=C`, `TZ=UTC`, `HOME=/tmp`, `TMPDIR=/tmp`, and
   `CPS_TRIGGER=PACKAGE:NAME`. Its output goes to the standard error of CPS.
 - Offline and in staged boot environments, an unprivileged CPS runs the

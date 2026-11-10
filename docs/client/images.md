@@ -115,7 +115,9 @@ live transaction finds each new library before the new executables that
 need it. Each package's files are written after those of the packages it
 requires, including providers of required capabilities such as the
 generated `cap/elf/...` sonames. Within a package, shared libraries go
-first, then other files, and executables last. Directories are created
+first, then other files, and executables last. A symlink goes after the
+write that creates its target, so an upgraded `libz.so.1` link never points
+at a `libz.so.1.3.1` that is not there yet. Directories are created
 first, and removals run after every new file is in place, dependents before
 the packages they depend on. The order is part of the saved plan.
 
@@ -242,6 +244,10 @@ links hard link aliases to their restored targets, copies moved or adjusted
 local configuration back from where the transaction put it, and removes
 vendor proposals staged under `config-updates`. Completed transitions between
 directories and files or symlinks are undone the same way they were made.
+A path that already differed from its manifest when the transaction was
+planned, such as a file whose mode was changed locally, returns to that
+local state rather than to its manifest. `verify` then reports it as it did
+before the transaction, and `repair` restores it.
 
 Abort then runs the systemd actions and triggers of the change back to the
 committed packages. A trigger whose watched paths the abort restores runs
@@ -286,8 +292,10 @@ only `transaction abort --fetch` downloads missing payloads.
 Each restored path is checked against both its state after and before the
 transaction, so finishing an abort is idempotent. Each trigger that the
 abort finished is journaled, so a failing or interrupted handler leaves the
-abort pending, and finishing it runs only the remaining triggers. If the
-final check finds a path in neither state, abort reports
+abort pending, and finishing it runs only the remaining triggers. After its
+actions, abort checks every managed path: each journaled path against its
+state before the transaction, and every other path against the committed
+manifests. If a path matches neither, abort reports
 `aborting left an inconsistent image`; correct that path and abort again.
 
 ### What abort cannot undo
@@ -320,7 +328,11 @@ The reasons are `not managed by CPS`, `locally modified configuration`,
 this transaction`. Move or remove those paths, or
 [revert](#repair-files-or-restore-vendor-defaults) the configuration to its
 vendor default, and plan again. Locally edited configuration that the
-release moves to a path outside the directory moves with its edits.
+release moves to a path outside the directory moves with its edits. Paths
+that a [trigger](../maintainer/triggers.md) generated are no obstacle: they
+leave with the old directory, and the trigger regenerates whatever it still
+declares. The same holds when an abort turns a directory back into a file
+or symlink after a trigger wrote into it.
 [Change the file layout between versions](../maintainer/manifests.md#change-the-file-layout-between-versions)
 describes what a package declares.
 
