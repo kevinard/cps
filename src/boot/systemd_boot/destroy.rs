@@ -63,6 +63,20 @@ pub fn destroy_btrfs_boot_environment(
     id: &str,
     dry_run: bool,
 ) -> Result<String> {
+    destroy(esp, volume, id, dry_run, false)
+}
+
+/// Run every destroy-btrfs check for a trial as if its remaining boot
+/// attempts were already spent, without changing anything.
+pub(super) fn check_exhausted_destruction(esp: &Path, volume: &Path, id: &str) -> Result<()> {
+    destroy(esp, volume, id, true, true).map(drop)
+}
+
+fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) -> Result<String> {
+    ensure!(
+        dry_run || !exhausted,
+        "only a dry run can assume exhaustion"
+    );
     policy::entry_identity(id)?;
     let volume = BtrfsVolume::open(volume)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
@@ -88,6 +102,10 @@ pub fn destroy_btrfs_boot_environment(
             .with_context(|| format!("unknown boot environment {id}"))?;
         entries.remove(index)
     };
+    let mut target = target;
+    if exhausted && target.tries.is_some() {
+        target.tries = Some(0);
+    }
     let record = target
         .btrfs
         .as_ref()

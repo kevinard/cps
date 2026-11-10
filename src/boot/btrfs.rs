@@ -19,13 +19,15 @@ use rustix::{
 use crate::{
     image::{Image, STATE_DIRECTORY, root::Root},
     model::{Node, validate_path},
-    plan::{Plan, payloads},
+    plan::{Plan, Write, payloads},
 };
 
-use super::{check_image_integrity, check_staging_plan, entry_id, finish_staged_root};
+use super::{
+    check_image_integrity, check_staging_plan, entry_id, finish_staged_root, kernel::Artifacts,
+};
 
 const READ_ONLY: u64 = 1 << 1;
-/// Space kept free beyond the plan's payload for metadata and kernel preparation.
+/// Space kept free beyond the plan's payloads and kernel artifacts for metadata.
 const STAGING_RESERVE: u64 = 32 * 1024 * 1024;
 /// Nested subvolumes that systemd creates on Btrfs. Staged roots get an empty directory.
 pub const DEFAULT_EXCLUDED_SUBVOLUMES: [&str; 2] = ["var/lib/machines", "var/lib/portables"];
@@ -98,7 +100,7 @@ pub(crate) fn excluded_subvolumes(extra: &[String]) -> Result<Vec<String>> {
     Ok(paths.into_iter().collect())
 }
 
-fn check_staging_space(parent: &Root, plan: &Plan) -> Result<()> {
+fn check_staging_space(parent: &Root, source: &Path, plan: &Plan) -> Result<()> {
     let payload = payloads(&plan.writes)
         .values()
         .map(|node| match node {
@@ -106,22 +108,101 @@ fn check_staging_space(parent: &Root, plan: &Plan) -> Result<()> {
             _ => 0,
         })
         .fold(0u64, u64::saturating_add);
+    let kernel = kernel_preparation(
+        plan.kernel_install.as_ref(),
+        &plan.writes,
+        |path| file_size(&source.join(path)),
+        || largest_initrd(source),
+    )?;
     // Btrfs statfs reports the space new data can use under the data profile,
     // including unallocated device space.
     let stat = fstatvfs(parent.as_file()).context("reading Btrfs free space")?;
     let available = stat.f_bavail.saturating_mul(stat.f_frsize);
-    let needed = payload.saturating_add(STAGING_RESERVE);
+    let needed = payload
+        .saturating_add(kernel)
+        .saturating_add(STAGING_RESERVE);
     ensure!(
         available >= needed,
         "insufficient free space on the Btrfs filesystem to stage this transaction: {} available, \
-         {} needed ({} of payloads plus a {} reserve). Remove old boot environments with \
-         `cps boot-env prune`, or free space on the filesystem, then retry",
+         {} needed ({} of payloads, {} of kernel artifacts and a {} reserve). Remove old boot \
+         environments with `cps boot-env prune`, or free space on the filesystem, then retry",
         super::mib(available),
         super::mib(needed),
         super::mib(payload),
+        super::mib(kernel),
         super::mib(STAGING_RESERVE),
     );
     Ok(())
+}
+
+/// Bytes that kernel preparation writes beyond the plan's payloads.
+///
+/// Preparation copies the kernel and its initramfs into a private
+/// `kernel-<digest>` directory of the image state, so each costs its size
+/// once more, whether the plan writes it or the base already holds it. A
+/// generated initramfs is not a payload: its trigger writes it into the root
+/// and preparation copies it, so it counts twice. Its size is known only
+/// after the trigger runs, so `generated` estimates it from the base.
+fn kernel_preparation(
+    artifacts: Option<&Artifacts>,
+    writes: &[Write],
+    base_size: impl Fn(&str) -> Result<Option<u64>>,
+    generated: impl FnOnce() -> Result<Option<u64>>,
+) -> Result<u64> {
+    let Some(artifacts) = artifacts else {
+        return Ok(0);
+    };
+    let size = |path: &str| -> Result<u64> {
+        let written = writes.iter().find_map(|write| match &write.after {
+            Some(Node::File { size, .. }) if write.path == path => Some(*size),
+            _ => None,
+        });
+        Ok(match written {
+            Some(size) => size,
+            None => base_size(path)?.unwrap_or(0),
+        })
+    };
+    let kernel = &artifacts.kernel;
+    let mut bytes = size(&kernel.image())?;
+    if let Some(initrd) = kernel.initrd() {
+        bytes = bytes.saturating_add(size(&initrd)?);
+    } else if artifacts.generated_initrd {
+        let estimate = match base_size(&kernel.initrd_path())? {
+            Some(size) => size,
+            None => generated()?.unwrap_or(0),
+        };
+        bytes = bytes.saturating_add(estimate.saturating_mul(2));
+    }
+    Ok(bytes)
+}
+
+fn file_size(path: &Path) -> Result<Option<u64>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The largest initramfs of any kernel release in the base root.
+fn largest_initrd(root: &Path) -> Result<Option<u64>> {
+    let modules = root.join("usr/lib/modules");
+    let children = match fs::read_dir(&modules) {
+        Ok(children) => children,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut largest = None;
+    for child in children {
+        let child = child?;
+        if child.file_type()?.is_dir()
+            && let Some(size) = file_size(&child.path().join("initrd"))?
+        {
+            largest = largest.max(Some(size));
+        }
+    }
+    Ok(largest)
 }
 
 fn snapshot_environment(
@@ -170,7 +251,7 @@ fn snapshot_environment(
         Err(error) => return Err(error).context("checking the capture destination"),
     }
     if let Some(plan) = plan {
-        check_staging_space(&parent, plan)?;
+        check_staging_space(&parent, &source, plan)?;
     }
 
     let scratch = tempfile::Builder::new()
@@ -422,7 +503,82 @@ fn check_snapshot_tree(root: &Root) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::excluded_subvolumes;
+    use super::{excluded_subvolumes, kernel_preparation};
+    use crate::{
+        boot::kernel::{Artifacts, Kernel},
+        model::Node,
+        plan::Write,
+    };
+
+    fn artifacts(initrd: bool, generated_initrd: bool) -> Artifacts {
+        Artifacts {
+            kernel: Kernel {
+                release: "6.12.0".into(),
+                initrd,
+            },
+            linux_sha256: "a".repeat(64),
+            initrd_sha256: initrd.then(|| "b".repeat(64)),
+            generated_initrd,
+        }
+    }
+
+    fn write(path: &str, size: u64) -> Write {
+        Write {
+            path: path.into(),
+            before: None,
+            after: Some(Node::File {
+                sha256: "c".repeat(64),
+                size,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                capabilities: None,
+            }),
+            detach: false,
+            local_config: false,
+            config_move: None,
+        }
+    }
+
+    #[test]
+    fn staging_space_counts_kernel_preparation() -> anyhow::Result<()> {
+        let base = |path: &str| {
+            Ok(match path {
+                "usr/lib/modules/6.12.0/vmlinuz" => Some(10),
+                "usr/lib/modules/6.12.0/initrd" => Some(30),
+                _ => None,
+            })
+        };
+        let none = |_: &str| Ok(None);
+        let unused = || -> anyhow::Result<Option<u64>> { panic!("no estimate needed") };
+        assert_eq!(kernel_preparation(None, &[], base, unused)?, 0);
+        // Written payloads give the sizes of the prepared copies.
+        let writes = [
+            write("usr/lib/modules/6.12.0/vmlinuz", 100),
+            write("usr/lib/modules/6.12.0/initrd", 200),
+        ];
+        assert_eq!(
+            kernel_preparation(Some(&artifacts(true, false)), &writes, base, unused)?,
+            300
+        );
+        // A kernel the plan does not rewrite is still copied from the base.
+        assert_eq!(
+            kernel_preparation(Some(&artifacts(true, false)), &[], base, unused)?,
+            40
+        );
+        // A generated initramfs counts twice: the trigger output and its copy.
+        assert_eq!(
+            kernel_preparation(Some(&artifacts(false, true)), &writes[..1], base, unused)?,
+            100 + 2 * 30
+        );
+        assert_eq!(
+            kernel_preparation(Some(&artifacts(false, true)), &writes[..1], none, || Ok(
+                Some(50)
+            ))?,
+            100 + 2 * 50
+        );
+        Ok(())
+    }
 
     #[test]
     fn subvolume_exclusions_extend_the_systemd_defaults() -> anyhow::Result<()> {

@@ -82,17 +82,25 @@ impl LoaderPolicy {
     fn parse(text: &str) -> Result<Option<Self>> {
         let mut default = None;
         let mut preferred = None;
-        for (key, value) in text.lines().filter_map(loader_line) {
+        for (key, value, quote) in text.lines().filter_map(loader_line) {
+            if matches!(key, "default" | "preferred") {
+                ensure!(
+                    quote != Some('\''),
+                    "{LOADER} sets `{key}` to a single-quoted value. systemd-boot before version \
+                     260 reads single quotes literally, so the selection would differ between \
+                     versions; remove the quotes"
+                );
+            }
             let slot = match key {
                 "default" => &mut default,
                 "preferred" => &mut preferred,
                 "timeout" => {
                     ensure!(
-                        value != "menu-force",
-                        "{LOADER} sets `timeout menu-force`, which waits at the boot menu \
-                         indefinitely and stops unattended trial and fallback boots. CPS expects \
-                         `timeout` to be a number of seconds, `menu-hidden` or `menu-disabled`; \
-                         change or remove that line"
+                        !timeout_stalls(value, false),
+                        "{LOADER} sets `timeout {value}`, which waits at the boot menu \
+                         indefinitely like `menu-force` and stops unattended trial and fallback \
+                         boots. CPS expects `timeout` to be a number of seconds, `menu-hidden` or \
+                         `menu-disabled`; change or remove that line"
                     );
                     continue;
                 }
@@ -168,7 +176,7 @@ impl LoaderPolicy {
         let mut content = String::with_capacity(text.len() + 128);
         let mut placed = false;
         for line in text.split_inclusive('\n') {
-            match loader_line(line).map(|(key, _)| key) {
+            match loader_line(line).map(|(key, ..)| key) {
                 Some("default") if !placed => {
                     content.push_str(&self.selection());
                     placed = true;
@@ -210,8 +218,95 @@ impl LoaderPolicy {
     }
 }
 
-/// Split a loader.conf line the way systemd-boot does.
-fn loader_line(line: &str) -> Option<(&str, &str)> {
+/// Whether systemd-boot waits at its menu indefinitely for this timeout.
+///
+/// systemd-boot reads `4294967295` as `menu-force`, and `4294967294` as an
+/// unset timeout that shows the menu with a countdown of 136 years. A
+/// one-shot timeout always shows the menu, and without a countdown for
+/// `menu-hidden` or `0`. Values that systemd-boot cannot parse are ignored.
+fn timeout_stalls(value: &str, one_shot: bool) -> bool {
+    const UNSET: u64 = u32::MAX as u64 - 1;
+    match value {
+        "menu-force" => true,
+        "menu-hidden" | "menu-disabled" => one_shot,
+        value => value
+            .parse::<u64>()
+            .is_ok_and(|seconds| seconds >= UNSET || (one_shot && seconds == 0)),
+    }
+}
+
+/// The systemd-boot EFI variables that override loader.conf, as strings.
+#[derive(Debug, Default)]
+pub(super) struct LoaderOverrides {
+    pub timeout: Option<String>,
+    pub timeout_one_shot: Option<String>,
+    pub default: Option<String>,
+    pub preferred: Option<String>,
+}
+
+impl LoaderOverrides {
+    /// Reject firmware variables that would stall the boot menu or select a
+    /// different entry than the CPS selection in loader.conf.
+    pub fn check(&self, policy: Option<&LoaderPolicy>) -> Result<()> {
+        for (name, value, one_shot, clear) in [
+            (
+                "LoaderConfigTimeout",
+                &self.timeout,
+                false,
+                "bootctl set-timeout ''",
+            ),
+            (
+                "LoaderConfigTimeoutOneShot",
+                &self.timeout_one_shot,
+                true,
+                "bootctl set-timeout-oneshot ''",
+            ),
+        ] {
+            if let Some(value) = value {
+                ensure!(
+                    !timeout_stalls(value, one_shot),
+                    "the EFI variable {name} sets the boot menu timeout to {value:?}, which \
+                     overrides {LOADER}, waits at the boot menu indefinitely and stops \
+                     unattended trial and fallback boots. Clear it with `{clear}`"
+                );
+            }
+        }
+        let (default, preferred) = match policy {
+            None => (None, None),
+            Some(LoaderPolicy::Automatic) => (Some(AUTO.to_owned()), None),
+            Some(LoaderPolicy::Pinned { default, preferred }) => (
+                Some(format!("{default}.conf")),
+                preferred.as_ref().map(|id| format!("{id}.conf")),
+            ),
+        };
+        for (name, value, expected, command) in [
+            (
+                "LoaderEntryPreferred",
+                &self.preferred,
+                preferred,
+                "set-preferred",
+            ),
+            ("LoaderEntryDefault", &self.default, default, "set-default"),
+        ] {
+            if let Some(value) = value.as_deref().filter(|value| !value.is_empty()) {
+                // systemd-boot compares entry IDs and patterns case-insensitively.
+                ensure!(
+                    expected.is_some_and(|expected| expected.eq_ignore_ascii_case(value)),
+                    "the EFI variable {name} selects {value:?}, which takes precedence over the \
+                     CPS selection in {LOADER}. Clear it with `bootctl {command} ''`"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Split a loader.conf line the way systemd-boot does, and report the quote
+/// that surrounded the value.
+///
+/// systemd-boot removes one pair of matching double quotes, and since
+/// version 260 one pair of matching single quotes as well.
+fn loader_line(line: &str) -> Option<(&str, &str, Option<char>)> {
     let line = line.trim_ascii();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -220,15 +315,16 @@ fn loader_line(line: &str) -> Option<(&str, &str)> {
         .split_once(|c: char| c.is_ascii_whitespace())
         .unwrap_or((line, ""));
     let value = value.trim_ascii();
-    let value = [('"', '"'), ('\'', '\'')]
-        .iter()
-        .find_map(|(open, close)| {
-            value
-                .strip_prefix(*open)
-                .and_then(|value| value.strip_suffix(*close))
-        })
-        .unwrap_or(value);
-    Some((key, value))
+    for quote in ['"', '\''] {
+        if let Some(inner) = value.strip_prefix(quote)
+            && value.ends_with(quote)
+        {
+            // A lone quote character unquotes to an empty value.
+            let inner = inner.strip_suffix(quote).unwrap_or(inner);
+            return Some((key, inner, Some(quote)));
+        }
+    }
+    Some((key, value, None))
 }
 
 fn selector(value: &str) -> Result<String> {
@@ -540,8 +636,8 @@ pub(super) fn directory_exists(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BootRoot, BtrfsRecord, INITRD_HASH, LINUX_HASH, LoaderPolicy, OPTIONS, boot_field,
-        check_parent, read_entry,
+        AUTO, BootRoot, BtrfsRecord, INITRD_HASH, LINUX_HASH, LoaderOverrides, LoaderPolicy,
+        OPTIONS, boot_field, check_parent, loader_line, read_entry,
     };
 
     const BASE: &str = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
@@ -590,6 +686,118 @@ mod tests {
     }
 
     #[test]
+    fn firmware_variables_cannot_override_the_cps_selection() -> anyhow::Result<()> {
+        let pinned = LoaderPolicy::pinned(BASE);
+        let trial = LoaderPolicy::trial(BASE, TRIAL);
+        let set = |timeout: Option<&str>, one_shot: Option<&str>| LoaderOverrides {
+            timeout: timeout.map(str::to_owned),
+            timeout_one_shot: one_shot.map(str::to_owned),
+            ..LoaderOverrides::default()
+        };
+        LoaderOverrides::default().check(Some(&trial))?;
+        for value in [
+            "0",
+            "5",
+            "menu-hidden",
+            "menu-disabled",
+            "4294967293",
+            "garbage",
+        ] {
+            set(Some(value), None).check(Some(&pinned))?;
+        }
+        for value in [
+            "menu-force",
+            "4294967294",
+            "4294967295",
+            "18446744073709551615",
+        ] {
+            let message = set(Some(value), None)
+                .check(Some(&pinned))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("LoaderConfigTimeout "), "{message}");
+            assert!(message.contains("bootctl set-timeout ''"), "{message}");
+        }
+        // A one-shot timeout forces the menu, so only a countdown boots on.
+        set(None, Some("3")).check(Some(&pinned))?;
+        for value in [
+            "0",
+            "menu-hidden",
+            "menu-disabled",
+            "menu-force",
+            "4294967295",
+        ] {
+            let message = set(None, Some(value))
+                .check(Some(&pinned))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("LoaderConfigTimeoutOneShot"), "{message}");
+        }
+
+        let entry = |default: Option<&str>, preferred: Option<&str>| LoaderOverrides {
+            default: default.map(str::to_owned),
+            preferred: preferred.map(str::to_owned),
+            ..LoaderOverrides::default()
+        };
+        // Variables that repeat the CPS selection, or are empty, change nothing.
+        entry(Some(&format!("{BASE}.conf")), None).check(Some(&pinned))?;
+        entry(Some(&format!("{}.conf", BASE.to_uppercase())), None).check(Some(&trial))?;
+        entry(None, Some(&format!("{TRIAL}.conf"))).check(Some(&trial))?;
+        entry(Some(""), Some("")).check(Some(&pinned))?;
+        entry(Some(AUTO), None).check(Some(&LoaderPolicy::Automatic))?;
+        let message = entry(Some("arch.conf"), None)
+            .check(Some(&trial))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("LoaderEntryDefault"), "{message}");
+        assert!(message.contains("bootctl set-default ''"), "{message}");
+        let message = entry(None, Some(&format!("{BASE}.conf")))
+            .check(Some(&pinned))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("bootctl set-preferred ''"), "{message}");
+        assert!(entry(Some("@saved"), None).check(Some(&pinned)).is_err());
+        assert!(
+            entry(Some(&format!("{BASE}.conf")), None)
+                .check(None)
+                .is_err()
+        );
+        // loader.conf numbers that systemd-boot reads as menu-force stall as well.
+        assert!(
+            LoaderPolicy::parse(&format!("timeout 4294967295\ndefault {BASE}.conf\n")).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loader_lines_unquote_like_systemd_boot() {
+        assert_eq!(
+            loader_line("  default \"a.conf\" "),
+            Some(("default", "a.conf", Some('"')))
+        );
+        assert_eq!(
+            loader_line("timeout 'menu-force'"),
+            Some(("timeout", "menu-force", Some('\'')))
+        );
+        // Only one matching pair is removed.
+        assert_eq!(
+            loader_line("default \"'a.conf'\""),
+            Some(("default", "'a.conf'", Some('"')))
+        );
+        assert_eq!(
+            loader_line("default \"a.conf'"),
+            Some(("default", "\"a.conf'", None))
+        );
+        assert_eq!(loader_line("default \""), Some(("default", "", Some('"'))));
+        assert_eq!(loader_line("editor"), Some(("editor", "", None)));
+        assert_eq!(loader_line("  # default a.conf"), None);
+        // A quoted menu-force is rejected as well.
+        assert!(
+            LoaderPolicy::parse(&format!("timeout 'menu-force'\ndefault {BASE}.conf\n")).is_err()
+        );
+    }
+
+    #[test]
     fn loader_policy_names_the_conflicting_key_and_its_fix() {
         let error = |text: &str| format!("{:#}", LoaderPolicy::parse(text).unwrap_err());
         let message = error("default arch.conf\n");
@@ -610,6 +818,11 @@ mod tests {
         assert!(
             LoaderPolicy::parse(&format!("default {BASE}.conf\npreferred {BASE}.conf\n")).is_err()
         );
+        // Older systemd-boot reads single quotes literally.
+        let message = error(&format!("default '{BASE}.conf'\n"));
+        assert!(message.contains("single-quoted"), "{message}");
+        let message = error(&format!("default {BASE}.conf\npreferred '{TRIAL}.conf'\n"));
+        assert!(message.contains("`preferred`"), "{message}");
         // Rendering never overwrites a conflicting selection.
         assert!(
             LoaderPolicy::pinned(BASE)

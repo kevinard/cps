@@ -10,7 +10,10 @@ use super::{
     policy::{BootEntry, LoaderPolicy},
     rollback,
 };
-use crate::boot::btrfs_boot::BtrfsVolume;
+use crate::{
+    boot::btrfs_boot::{BtrfsRecord, BtrfsVolume},
+    image::root::Root,
+};
 
 /// Why prune removes an environment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,14 +51,19 @@ pub struct TrialDiscard {
 /// environments beyond the `keep` most recent are removed as well. The
 /// running, selected and default environments and their recorded fallbacks
 /// are never candidates, and each removal repeats every destroy-btrfs check.
+///
+/// `staged` names the root that the caller's transaction stages into. A
+/// trial booting that root is an interrupted activation that the caller
+/// resumes, so it stays while its activation can still complete.
 pub fn prune_btrfs_boot_environments(
     esp: &Path,
     volume_path: &Path,
     keep: Option<usize>,
     dry_run: bool,
+    staged: Option<&Path>,
 ) -> Result<BootPruneReport> {
     let volume = BtrfsVolume::open(volume_path)?;
-    let planned = plan(esp, &volume, keep)?;
+    let planned = plan(esp, &volume, keep, staged)?;
     // The kernel refuses to delete the default subvolume, but only after
     // destroy-btrfs has retired its boot entry. Skip it up front. If the
     // lookup fails, destroy-btrfs still reports the refusal.
@@ -73,21 +81,39 @@ pub fn prune_btrfs_boot_environments(
             ));
             continue;
         }
-        let result = (|| {
-            if kind == BootRemoval::AbandonedTrial {
-                exhaust_trial(esp, &volume, &id, dry_run)?;
-                if dry_run {
-                    return Ok(());
+        let result = remove(
+            kind,
+            dry_run,
+            |dry_run| exhaust_trial(esp, &volume, &id, dry_run),
+            |dry_run, exhausted| {
+                if exhausted {
+                    destroy::check_exhausted_destruction(esp, volume_path, &id)
+                } else {
+                    destroy_btrfs_boot_environment(esp, volume_path, &id, dry_run).map(drop)
                 }
-            }
-            destroy_btrfs_boot_environment(esp, volume_path, &id, dry_run).map(drop)
-        })();
+            },
+        );
         match result {
             Ok(()) => report.removed.push((id, kind)),
             Err(error) => report.failed.push((id, format!("{error:#}"))),
         }
     }
     Ok(report)
+}
+
+/// Remove one planned environment. An abandoned trial first spends its
+/// remaining attempts; a dry run checks its destruction as if it had.
+fn remove(
+    kind: BootRemoval,
+    dry_run: bool,
+    exhaust: impl FnOnce(bool) -> Result<()>,
+    destroy: impl FnOnce(bool, bool) -> Result<()>,
+) -> Result<()> {
+    let abandoned = kind == BootRemoval::AbandonedTrial;
+    if abandoned {
+        exhaust(dry_run)?;
+    }
+    destroy(dry_run, abandoned && dry_run)
 }
 
 /// Cancel the pending or running trial, then remove every failed trial that is not running.
@@ -102,20 +128,14 @@ pub fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscar
             entries,
             firmware,
         } = inventory(&esp, &lock, false)?;
-        let selected = policy
-            .as_ref()
-            .and_then(|policy| policy.selected(&entries))
-            .filter(|entry| entry.tries.is_some());
         // A verified firmware trial is already known-good and only awaits promotion.
         let booted = match &firmware {
             Some(firmware) => firmware.running_trial(&entries)?,
             None => entries
                 .iter()
                 .find(|entry| Some(&entry.id) == running.as_ref()),
-        }
-        .filter(|entry| entry.tries.is_some());
-        selected
-            .or(booted)
+        };
+        cancellable(policy.as_ref(), &entries, booted)
             .map(|trial| (trial.id.clone(), trial.parent.clone()))
     };
     let cancelled = match pending {
@@ -128,7 +148,7 @@ pub fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscar
         None => None,
     };
     let still_running = cancelled.is_some() && cancelled == running;
-    let prune = prune_btrfs_boot_environments(esp, volume_path, None, false)?;
+    let prune = prune_btrfs_boot_environments(esp, volume_path, None, false, None)?;
     Ok(TrialDiscard {
         cancelled,
         running: still_running,
@@ -136,9 +156,27 @@ pub fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscar
     })
 }
 
+/// The trial that discard-trial cancels: the one selected for the next boot,
+/// or else the running one.
+fn cancellable<'a>(
+    policy: Option<&LoaderPolicy>,
+    entries: &'a [BootEntry],
+    booted: Option<&'a BootEntry>,
+) -> Option<&'a BootEntry> {
+    policy
+        .and_then(|policy| policy.selected(entries))
+        .filter(|entry| entry.tries.is_some())
+        .or(booted.filter(|entry| entry.tries.is_some()))
+}
+
 type Planned = (String, BootRemoval, u64);
 
-fn plan(esp: &Path, volume: &BtrfsVolume, keep: Option<usize>) -> Result<Vec<Planned>> {
+fn plan(
+    esp: &Path,
+    volume: &BtrfsVolume,
+    keep: Option<usize>,
+    staged: Option<&Path>,
+) -> Result<Vec<Planned>> {
     let esp = std::fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockShared)?;
     let Inventory {
@@ -162,23 +200,72 @@ fn plan(esp: &Path, volume: &BtrfsVolume, keep: Option<usize>) -> Result<Vec<Pla
         })
         .collect();
     let policy = policy.context(NO_SELECTION)?;
-    let mut protected = Vec::new();
-    if let Some((id, parent)) = volume.running()? {
-        protected.push(id);
-        protected.extend(parent);
-    }
-    if let Some(firmware) = &firmware
-        && let Some(trial) = firmware.running_trial(&entries)?
-    {
-        protected.push(trial.id.clone());
-        protected.extend(trial.parent.clone());
-    }
+    let firmware_trial = match &firmware {
+        Some(firmware) => firmware.running_trial(&entries)?,
+        None => None,
+    };
+    let staged_trial = match staged.and_then(|path| staged_record(volume, path)) {
+        Some(record) => resumable_trial(&entries, &record, |entry| match &firmware {
+            // An unarmed direct UEFI trial reads as exhausted until BootNext
+            // selects it; activation arms it again within the same boot.
+            Some(firmware) => firmware.can_arm(entry),
+            None => Ok(entry.tries.is_some_and(|tries| tries > 0)),
+        })?,
+        None => None,
+    };
+    let protected = protected(volume.running()?, firmware_trial, staged_trial);
     let entries: Vec<_> = entries.into_iter().filter(on_volume).collect();
     for (id, kind) in candidates(&entries, &policy, &protected, keep)? {
         let entry = entries.iter().find(|entry| entry.id == id);
         planned.push((id, kind, entry.map_or(0, subvolume)));
     }
     Ok(planned)
+}
+
+/// The Btrfs identity of a staged root, if it exists on this volume.
+fn staged_record(volume: &BtrfsVolume, path: &Path) -> Option<BtrfsRecord> {
+    let path = std::fs::canonicalize(path).ok()?;
+    let root = Root::open(&path).ok()?;
+    volume.record(&root, &path).ok()
+}
+
+/// The trial whose root is `staged` and whose activation can still resume.
+fn resumable_trial<'a>(
+    entries: &'a [BootEntry],
+    staged: &BtrfsRecord,
+    can_resume: impl Fn(&BootEntry) -> Result<bool>,
+) -> Result<Option<&'a BootEntry>> {
+    for entry in entries {
+        if entry.tries.is_some()
+            && entry
+                .btrfs
+                .as_ref()
+                .is_some_and(|record| record.same_subvolume(staged))
+            && can_resume(entry)?
+        {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
+/// Environments that prune never removes, with the fallbacks they record:
+/// the running root, the running firmware trial and a resumable staged trial.
+fn protected(
+    running: Option<(String, Option<String>)>,
+    firmware_trial: Option<&BootEntry>,
+    staged_trial: Option<&BootEntry>,
+) -> Vec<String> {
+    let mut protected = Vec::new();
+    if let Some((id, parent)) = running {
+        protected.push(id);
+        protected.extend(parent);
+    }
+    for trial in [firmware_trial, staged_trial].into_iter().flatten() {
+        protected.push(trial.id.clone());
+        protected.extend(trial.parent.clone());
+    }
+    protected
 }
 
 /// Choose removable environments, oldest first within each kind.
@@ -271,25 +358,30 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid boot entry filename")?;
-    let counter = name
-        .strip_prefix(id)
-        .and_then(|name| name.strip_prefix('+'))
-        .and_then(|name| name.strip_suffix(".conf"))
-        .context("expected a counted boot entry")?;
-    let exhausted = match counter.split_once('-') {
-        Some((_, done)) => format!("{id}+0-{done}.conf"),
-        None => format!("{id}+0.conf"),
-    };
     renameat_with(
         CWD,
         &entry.path,
         CWD,
-        entry.path.with_file_name(exhausted),
+        entry.path.with_file_name(exhausted_name(id, name)?),
         RenameFlags::NOREPLACE,
     )
     .context("exhausting the abandoned trial's boot counter")?;
     File::open(entry.path.parent().context("missing entries directory")?)?.sync_all()?;
     Ok(())
+}
+
+/// The boot-counted filename with no attempts left, keeping the count of
+/// attempts already made: `ID+N-M.conf` becomes `ID+0-M.conf`.
+fn exhausted_name(id: &str, name: &str) -> Result<String> {
+    let counter = name
+        .strip_prefix(id)
+        .and_then(|name| name.strip_prefix('+'))
+        .and_then(|name| name.strip_suffix(".conf"))
+        .context("expected a counted boot entry")?;
+    Ok(match counter.split_once('-') {
+        Some((_, done)) => format!("{id}+0-{done}.conf"),
+        None => format!("{id}+0.conf"),
+    })
 }
 
 #[cfg(test)]
@@ -332,6 +424,174 @@ mod tests {
             .iter()
             .map(|(id, kind)| (id.rsplit_once('-').unwrap().1.parse().unwrap(), *kind))
             .collect()
+    }
+
+    fn btrfs(subvolid: u64, path: &str) -> BtrfsRecord {
+        BtrfsRecord {
+            fsid: "11111111-1111-4111-8111-111111111111".into(),
+            uuid: format!("22222222-2222-4222-8222-{subvolid:012}"),
+            subvolid,
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn exhausting_a_trial_keeps_its_attempt_count() -> Result<()> {
+        let id = id(4);
+        assert_eq!(
+            exhausted_name(&id, &format!("{id}+2-1.conf"))?,
+            format!("{id}+0-1.conf")
+        );
+        assert_eq!(
+            exhausted_name(&id, &format!("{id}+3.conf"))?,
+            format!("{id}+0.conf")
+        );
+        assert_eq!(
+            exhausted_name(&id, &format!("{id}+1-12.conf"))?,
+            format!("{id}+0-12.conf")
+        );
+        assert!(exhausted_name(&id, &format!("{id}.conf")).is_err());
+        assert!(exhausted_name(&id, &format!("{}+1.conf", self::id(5))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_protects_running_firmware_and_resumable_trials_with_their_fallbacks() -> Result<()> {
+        let firmware_trial = entry(5, Some(4), Some(1));
+        let staged_trial = entry(7, Some(6), Some(3));
+        assert!(protected(None, None, None).is_empty());
+        assert_eq!(
+            protected(Some((id(3), Some(id(2)))), None, None),
+            [id(3), id(2)]
+        );
+        // A bootstrap root has no fallback.
+        assert_eq!(protected(Some((id(1), None)), None, None), [id(1)]);
+        assert_eq!(
+            protected(
+                Some((id(3), Some(id(2)))),
+                Some(&firmware_trial),
+                Some(&staged_trial)
+            ),
+            [id(3), id(2), id(5), id(4), id(7), id(6)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_interrupted_activation_of_the_staged_root_survives_pruning() -> Result<()> {
+        let staged = btrfs(300, "@environments/upgrade-plan/root");
+        let entries = |trial_tries| {
+            let mut base = entry(2, Some(1), None);
+            base.btrfs = Some(btrfs(280, "@environments/upgrade-old/root"));
+            let mut trial = entry(3, Some(2), Some(trial_tries));
+            trial.btrfs = Some(btrfs(300, "@environments/upgrade-plan/root"));
+            let mut other = entry(4, Some(2), Some(3));
+            other.btrfs = Some(btrfs(310, "@environments/upgrade-other/root"));
+            [base, trial, other]
+        };
+        let failed = entries(0);
+        let entries = entries(3);
+        let systemd_boot = |entry: &BootEntry| Ok(entry.tries.is_some_and(|tries| tries > 0));
+        let found = resumable_trial(&entries, &staged, systemd_boot)?;
+        assert_eq!(found.map(|entry| entry.revision), Some(3));
+        // Without that protection, the unselected counted entry is abandoned.
+        let pinned = LoaderPolicy::pinned(&id(2));
+        assert_eq!(
+            removed(&candidates(&entries, &pinned, &[], None)?),
+            [
+                (3, BootRemoval::AbandonedTrial),
+                (4, BootRemoval::AbandonedTrial)
+            ]
+        );
+        let kept = protected(None, None, found);
+        assert_eq!(
+            removed(&candidates(&entries, &pinned, &kept, None)?),
+            [(4, BootRemoval::AbandonedTrial)]
+        );
+        // An exhausted systemd-boot trial has failed and is not resumed.
+        assert!(resumable_trial(&failed, &staged, systemd_boot)?.is_none());
+        // A direct UEFI trial reads as exhausted until BootNext arms it; it is
+        // resumable while the firmware can still arm it in this boot.
+        assert!(resumable_trial(&failed, &staged, |_| Ok(true))?.is_some());
+        assert!(resumable_trial(&failed, &staged, |_| Ok(false))?.is_none());
+        // Known-good roots are never treated as trials.
+        assert!(resumable_trial(&entries[..1], &btrfs(280, "x"), |_| Ok(true))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_checks_abandoned_trial_destruction_as_exhausted() -> Result<()> {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let run = |kind, dry_run| {
+            calls.borrow_mut().clear();
+            remove(
+                kind,
+                dry_run,
+                |dry_run| {
+                    calls.borrow_mut().push(format!("exhaust dry={dry_run}"));
+                    Ok(())
+                },
+                |dry_run, exhausted| {
+                    calls
+                        .borrow_mut()
+                        .push(format!("destroy dry={dry_run} exhausted={exhausted}"));
+                    Ok(())
+                },
+            )
+        };
+        run(BootRemoval::AbandonedTrial, true)?;
+        assert_eq!(
+            *calls.borrow(),
+            ["exhaust dry=true", "destroy dry=true exhausted=true"]
+        );
+        run(BootRemoval::AbandonedTrial, false)?;
+        assert_eq!(
+            *calls.borrow(),
+            ["exhaust dry=false", "destroy dry=false exhausted=false"]
+        );
+        run(BootRemoval::FailedTrial, true)?;
+        assert_eq!(*calls.borrow(), ["destroy dry=true exhausted=false"]);
+        // A failed destroy check fails the dry run.
+        let error = remove(
+            BootRemoval::AbandonedTrial,
+            true,
+            |_| Ok(()),
+            |_, _| anyhow::bail!("another boot entry references this root"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("references"));
+        Ok(())
+    }
+
+    #[test]
+    fn discard_cancels_the_selected_trial_or_else_the_running_one() {
+        let base = entry(2, Some(1), None);
+        let running = entry(4, Some(2), Some(0));
+        let entries = [entry(2, Some(1), None), entry(3, Some(2), Some(2))];
+        let trial = LoaderPolicy::trial(&id(2), &id(3));
+        let pinned = LoaderPolicy::pinned(&id(2));
+        let revision = |found: Option<&BootEntry>| found.map(|entry| entry.revision);
+        // The pending trial wins over the running one.
+        assert_eq!(
+            revision(cancellable(Some(&trial), &entries, Some(&running))),
+            Some(3)
+        );
+        // A running trial is cancelled when nothing is pending.
+        assert_eq!(
+            revision(cancellable(Some(&pinned), &entries, Some(&running))),
+            Some(4)
+        );
+        assert_eq!(
+            revision(cancellable(None, &entries, Some(&running))),
+            Some(4)
+        );
+        // Known-good selections and a known-good running root are not trials.
+        assert_eq!(
+            revision(cancellable(Some(&pinned), &entries, Some(&base))),
+            None
+        );
+        assert_eq!(revision(cancellable(Some(&pinned), &entries, None)), None);
     }
 
     #[test]

@@ -112,8 +112,9 @@ front of `BootOrder`. Rollback keeps every environment and its files.
 
 Each environment keeps its root and its boot files on the ESP until it is
 removed. Before activation copies boot files, CPS checks that they fit on the
-ESP with a 1 MiB margin, and fails before any change with a message that
-suggests pruning.
+ESP with a 1 MiB margin, and fails before any change. A slot replacement
+counts the clusters of the entry and boot files it retires as free. With a
+Btrfs volume, the message suggests pruning.
 
 - On Btrfs, `cps boot-env prune` applies the retention policy, system package
   commands prune automatically before they stage a change, and
@@ -169,8 +170,12 @@ you set one of these:
   `default cps-*.conf`, or a `preferred` without a `default`. Delete the line
   to cancel the trial selection.
 - More than one `default` or `preferred` line. Keep the one CPS wrote.
-- `timeout menu-force`. Use a number of seconds, `menu-hidden`, or
-  `menu-disabled`.
+- A single-quoted `default` or `preferred` value. systemd-boot 260 and later
+  remove matching single or double quotes, but earlier versions read single
+  quotes literally. Remove the quotes.
+- `timeout menu-force`, or the numbers `4294967295` and `4294967294`, which
+  systemd-boot treats as `menu-force` and as a menu with a 136-year
+  countdown. Use a number of seconds, `menu-hidden`, or `menu-disabled`.
 
 These rules keep trial selection safe. Right after bootstrap,
 `default cps-*.conf` selects the newest CPS entry whose attempts are not
@@ -193,8 +198,33 @@ selector or `cps-*.conf`. CPS rejects non-CPS Type #1 entries in
 console change the kernel command line of a Type #1 entry. Enabling it does
 not change automatic selection.
 
-The EFI variables `LoaderEntryDefault` and `LoaderEntryOneShot`, set with
-`bootctl set-default` and `bootctl set-oneshot`, override `default` from
-outside the file. Likewise, `LoaderConfigTimeout`, set with
-`bootctl set-timeout`, overrides `timeout`. CPS assumes that none of them is
-set on a managed system.
+### Firmware variable overrides
+
+systemd-boot also reads selection and timeout settings from EFI variables,
+and these take precedence over `loader.conf`.
+[systemd-boot variables](https://www.freedesktop.org/software/systemd/man/latest/systemd-boot.html#EFI%20Variables)
+When systemd-boot booted the host from the ESP that CPS manages, as
+`LoaderDevicePartUUID` reports, CPS reads these variables from efivarfs each
+time it reads the boot selection. It rejects the ESP, names the variable,
+and gives the `bootctl` command that clears it in these cases:
+
+- `LoaderEntryPreferred`, set with `bootctl set-preferred`, names anything
+  other than the CPS `preferred` entry. systemd-boot tries it before both
+  `loader.conf` keys.
+- `LoaderEntryDefault`, set with `bootctl set-default` or with the `d` key
+  in the menu, names anything other than the CPS `default`. It replaces the
+  known-good fallback once a trial's attempts are exhausted.
+- `LoaderConfigTimeout`, set with `bootctl set-timeout`, holds a timeout
+  that `loader.conf` cannot have, such as `menu-force`.
+- `LoaderConfigTimeoutOneShot`, set with `bootctl set-timeout-oneshot` or
+  `systemctl reboot --boot-loader-menu`, holds anything but a positive number
+  of seconds. A one-shot timeout always shows the menu, so `0`,
+  `menu-hidden`, and `menu-disabled` wait at it as `menu-force` does.
+
+Empty variables, and variables that repeat the CPS selection, are accepted.
+Without efivarfs, without systemd-boot, or for an ESP that did not boot the
+host, such as an offline disk, CPS skips the check. `LoaderEntryOneShot`,
+set with `bootctl set-oneshot` or `systemctl reboot --boot-loader-entry`,
+selects an entry for the next boot only and is left to the administrator.
+The SMBIOS OEM string `io.systemd.boot.timeout=`, which a virtual machine
+manager can set, also overrides `timeout` and is not checked.

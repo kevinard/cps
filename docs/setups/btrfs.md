@@ -410,6 +410,15 @@ reports problems as warnings and never blocks the transaction. With
 keeps every known-good environment. Pruning also removes empty `upgrade-*`
 directories left in `environments`.
 
+The prune before staging keeps the trial of an interrupted activation of the
+same change, whose root is that change's `upgrade-*/root`, so that the retry
+resumes it. An interrupted systemd-boot activation can leave the counted
+entry without its `preferred` selection, and an interrupted direct UEFI
+activation can leave the entry without `BootNext`. The trial is kept while
+it has attempts left, or, with direct UEFI boot, while the firmware can
+still schedule it in the current boot. `cps boot-env prune` run by hand
+removes such a trial like any other abandoned or failed trial.
+
 ### Discarding a trial
 
 To give up on a trial, run `cps boot-env discard-trial`. It reads the same
@@ -432,9 +441,15 @@ running root and point to this command.
 Before staging, CPS checks the Btrfs filesystem's free space with
 `statvfs(3)`. Btrfs reports the space that new data can use under the data
 profile, including unallocated device space. CPS requires the sizes of the
-plan's payloads plus a 32 MiB reserve for metadata and kernel preparation.
-The check is an early estimate. Btrfs can still run out of metadata space,
-which `btrfs filesystem usage` shows.
+plan's payloads, the kernel artifacts it prepares, and a 32 MiB reserve for
+metadata. When the plan installs a kernel or regenerates its initramfs, CPS
+copies the kernel and initramfs into the image state, so each counts once
+more. A generated initramfs is not a payload: its trigger writes it into the
+root before CPS copies it, so it counts twice. Its size is known only after
+the trigger runs, so CPS estimates it from the current initramfs at that
+path, or else from the largest `usr/lib/modules/*/initrd` in the base. The
+check is an early estimate. Btrfs can still run out of metadata space, which
+`btrfs filesystem usage` shows.
 
 Before activation copies boot files, CPS checks the ESP's free space against
 the files it adds: the kernel and initramfs or the UKI, the entry, and a
