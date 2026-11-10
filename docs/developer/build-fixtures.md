@@ -12,6 +12,17 @@
 - [Building GNU tools for boot preparation](#building-gnu-tools-for-boot-preparation)
 - [Testing a source-built BusyBox](#testing-a-source-built-busybox)
 
+Each builder in `tests/build-*.sh` takes a new output directory and runs
+CPS from `CPS_TEST_BINARY` (default `target/debug/cps`). The source builds
+run twice in fresh offline sandboxes and publish the matching outputs with
+signed build evidence. The merged `/usr` base publishes signed prebuilt
+files instead. The outputs feed the
+[VM tests](boot-tests.md#signed-fixtures-and-release-profiles). Package
+manifests and recipe templates live under [`packaging/`](../../packaging),
+and recipes pin each manifest by digest, so rebuild a fixture after
+changing its packaging. See
+[Rebuild the VM fixtures after packaging changes](boot-tests.md#rebuild-the-vm-fixtures-after-packaging-changes).
+
 The fixture recipes take their parallelism from the worker: plain `make` reads
 `MAKEFLAGS`, and Ninja and Cargo receive `CPS_BUILD_JOBS`. CPS strips the ELF
 outputs with the seeded toolchain's `objcopy` and ships their debug
@@ -114,7 +125,10 @@ The fixture pins the archive and the signed worker toolchain. It builds the
 VM's systemd components twice offline and publishes the matching outputs with
 signed build evidence. The standalone build publishes systemd revision
 `262.1.0-3` and a separate seed for the worker's prebuilt libmount and
-libblkid. Set `CPS_SYSTEMD_TOOLS_ROOT` to a trusted
+libblkid. With `CPS_SYSTEMD_UTIL_LINUX_FIXTURE`, the revision is
+`262.1.0-4`, or `262.1.0-5` with util-linux `2.42.4-1`.
+`CPS_SYSTEMD_LIBSECCOMP_VERSION` selects the libseccomp package from the
+CPS fixture, `2.6.1-1` by default. Set `CPS_SYSTEMD_TOOLS_ROOT` to a trusted
 extracted Arch package tree if gperf, patchelf, Jinja2, and pyelftools are
 available there instead of on the worker.
 

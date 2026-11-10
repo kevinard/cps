@@ -2,9 +2,9 @@
 
 [Documentation](../README.md) · [Package maintainers](README.md)
 
-Put one `cps.kdl` at the Git repository root. It combines the usual package
-actions and build recipe. CPS assigns the local publisher and supplies the
-manifest and `git.tar` pins when it prepares a build.
+Users can build and install a package straight from a Git repository. Put
+one `cps.kdl` at the repository root. It combines a package manifest and a
+build recipe in one document.
 
 ```kdl
 schema-version 1 kind="git-package"
@@ -20,22 +20,40 @@ build architecture="x86_64" epoch=1700000000 {
 }
 ```
 
-The signed base profile ships `system/git-build`. CPS reads its
-`/usr/share/cps/git-build/toolchain.kdl` automatically. The default supplies a
-shell, tar, install, and other basic utilities from a local signed catalog.
-Use an explicit toolchain pin and a matching
-[toolchain configuration](builds.md#building-with-several-publishers) for builds that
-need a compiler or other tools. Administrators can still set
-`git-toolchain-config "toolchains.kdl"` in `/etc/cps/image.kdl` to use a
-different config. To support `toolchain "default"`, place a pinned toolchain
-block in `toolchains.default.kdl` with the header
+The document holds exactly the `schema-version` header, one `package`
+node, and one `build` node.
+
+- The `package` node is an ordinary [package manifest](manifests.md)
+  without `publisher`: CPS assigns its local publisher. It names its own
+  `version` and lists its files explicitly, since `collect` rules belong to
+  [recipe templates](builds.md#collecting-installed-files). Every file the
+  script installs must still be declared, and CPS still
+  [strips ELF objects](builds.md#stripping-and-debug-information) into the
+  `debug.symbols` facet.
+- The `build` node is a [build recipe](builds.md#recipe-structure) without
+  `manifest` nodes or a `version` node. CPS supplies the manifest pin and a
+  pinned `git.tar` source holding the files committed at the selected
+  commit. Other sources use their normal pinned HTTPS downloads.
+
+## Choose a toolchain
+
+`toolchain "default"` uses the default Git toolchain. The signed base
+profile ships `system/git-build`, and CPS reads its
+`/usr/share/cps/git-build/toolchain.kdl` automatically. The default supplies
+a shell, tar, install, and other basic utilities from a local signed
+catalog. For builds that need a compiler or other tools, write an explicit
+`toolchain solver="sat-v2"` block with publisher pins and a matching
+[toolchain configuration](builds.md#building-with-several-publishers).
+
+Administrators can set `git-toolchain-config "toolchains.kdl"` in
+`/etc/cps/image.kdl` to use a different configuration. To support
+`toolchain "default"` with it, place a pinned toolchain block beside it in
+`toolchains.default.kdl`, with the header
 `schema-version 1 kind="git-toolchain"`.
 
-The running Btrfs system needs Git and Bubblewrap. Invoke CPS through `sudo`
-from an unprivileged account with read access to the toolchain configuration,
-its keys, and the pinned toolchain payloads. Other recipe sources can use their
-normal pinned HTTPS downloads. Files committed in Git are available inside
-`git.tar`.
+The running Btrfs system needs Git and Bubblewrap. Invoke CPS through
+`sudo` from an unprivileged account with read access to the toolchain
+configuration, its keys, and the pinned toolchain payloads.
 
 ## Install and track a branch
 
@@ -56,21 +74,27 @@ sudo cps upgrade
 Use `--commit FULL_COMMIT_ID` in place of `--track-branch` to pin a package.
 Use an HTTPS URL or a local Git repository path. CPS shows the exact commit
 before building, then offers the normal package transaction for approval.
-The Git package can depend on packages from configured publishers. Its signed
-local catalog is shared across boot environments for offline repair.
+The Git package can depend on packages from configured publishers. Its
+signed local catalog is shared across boot environments for offline repair.
 
 An ordinary `cps upgrade` checks opted-in branches for descendants of the
 installed commit. It reports a branch rewrite and leaves that package at its
-installed commit. `--dry-run` shows available Git commits without building, and
-`--no-refresh` uses the installed Git selections. CPS stages tracked updates
-in a new boot environment for rollback. When a tracked commit's version
-would not advance the package, CPS allocates a higher revision. The check uses
-[version ordering](manifests.md#package-metadata-and-version-constraints), so
-`1.0.0` does not advance `1.0.0-0` and the next build becomes `1.0.0-1`. Give an
-upstream release that contains a dash an explicit revision, such as
-`7.1.1-15-0`, so allocated revisions continue as `7.1.1-15-1`. `cps info NAME` shows the
+installed commit. `--dry-run` shows available Git commits without building,
+and `--no-refresh` uses the installed Git selections. CPS stages tracked
+updates in a new boot environment for rollback. `cps info NAME` shows the
 installed commit as `upstream-version`. That manifest is part of the boot
-environment, so rollback restores the commit and the installed files together.
+environment, so rollback restores the commit and the installed files
+together.
+
+### Versions of tracked commits
+
+When a new commit's `version` would not advance the installed package, CPS
+allocates a higher revision. The check uses
+[version ordering](manifests.md#versions), so `1.0.0` does not advance
+`1.0.0-0`, and the next build becomes `1.0.0-1`. Bump `version` in `cps.kdl`
+when you release. Give an upstream release that ends in a dash and a number
+an explicit revision, such as `7.1.1-15-0`, so allocated revisions continue
+as `7.1.1-15-1`.
 
 ## Require signed commits or tags
 
@@ -93,10 +117,10 @@ for this check. Lightweight tags do not count.
 CPS checks the policy with `git verify-commit` or `git verify-tag` before
 building, on the initial install and on every tracked-branch upgrade. A
 missing or untrusted signature stops the build and leaves the installed
-commit in place. OpenPGP checks use a private keyring that contains only
-the allowed keys. CPS records the policy with the installed source and
-reads the file each time, so editing the file rotates or revokes signers
-for later upgrades. The file must be owned by the CPS account, normally
-root, and not writable by group or others. The signature covers the commit
-being installed. CPS still requires each upgrade to descend from the
-installed commit, so a signed commit on a rewritten branch is rejected.
+commit in place. OpenPGP checks use a private keyring that contains only the
+allowed keys. CPS records the policy with the installed source and reads the
+file each time, so editing the file rotates or revokes signers for later
+upgrades. The file must be owned by the CPS account, normally root, and not
+writable by group or others. The signature covers the commit being
+installed. CPS still requires each upgrade to descend from the installed
+commit, so a signed commit on a rewritten branch is rejected.

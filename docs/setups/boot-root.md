@@ -38,17 +38,20 @@ cps verify --root "$root" --pristine
 If you assemble the base directly from a local repository, use
 `plan install PACKAGE...` with the set of packages that supplies your
 bootable system. For a managed kernel, include the package that provides
-the kernel actions. CPS runs the host's kernel preparation tools while
-applying the plan.
+the kernel actions, and a package with an
+[initramfs trigger](../maintainer/triggers.md#generate-an-initramfs) if the
+kernel package ships no initrd. CPS runs the host's `kernel-install` while
+applying the plan and verifies the result.
 [Kernel package declarations](../maintainer/systemd.md#kernel-packages)
 
 ## Configure and register the root
 
 Before registering the root, configure its machine-specific mounts and
 kernel command line. For live Btrfs system commands, provision
-`/etc/cps/image.kdl` in the installed root with publisher, mirror, and boot
-settings that resolve on that system. Keep repository caches accessible
-at stable paths across environments. The [Btrfs guide](btrfs.md#configure-live-system-commands)
+`/etc/cps/image.kdl` in the installed root with publisher, mirror, and
+[`boot-btrfs`](btrfs.md#configure-live-system-commands) settings that resolve
+on that system. Keep repository caches accessible
+at stable paths across environments. The [Btrfs guide](btrfs.md#activating-btrfs-roots)
 covers the root and ESP mounts and the health service.
 
 Register the first known-good root using the guide for your layout.

@@ -2,40 +2,151 @@
 
 [Documentation](../README.md) · [Setup guides](README.md)
 
-Use the command form for your boot mode. For prerequisites and
-installation, see the [Btrfs](btrfs.md) and [ext4](ext4.md) setup guides.
+These commands work the same way for every boot mode once an ESP holds CPS
+boot entries. For prerequisites and installation, see the [Btrfs](btrfs.md)
+and [ext4](ext4.md) setup guides. The terms are defined in
+[Boot environments](../concepts.md#boot-environments).
 
-## Listing and rolling back
+## On this page
+
+- [List environments](#list-environments)
+- [Trials and blessing](#trials-and-blessing)
+- [Roll back](#roll-back)
+- [Clean up environments](#clean-up-environments)
+- [Compare environments](#compare-environments)
+- [The loader configuration](#the-loader-configuration)
+
+## List environments
 
 ```sh
-cps boot-env list --esp esp
-cps boot-env rollback --esp esp
-# Or select a specific known-good ID from the list.
-cps boot-env rollback --esp esp "$environment_id"
+cps boot-env list --esp /efi
 ```
 
-For an offline disk, list the entries that systemd-boot actually sees and
-publish rollback to a new disk file.
+For an offline disk file, list the entries that systemd-boot sees in the
+disk's ESP.
 
 ```sh
 cps boot-env list --disk bootable-next.raw --esp-partuuid "$esp_partuuid"
+```
+
+Each line shows one environment, newest first.
+
+| Column | Meaning |
+| --- | --- |
+| `DEFAULT` | `*` marks the environment selected for the next boot. |
+| `STATUS` | `known-good`, `trial (N left)` for a trial with N boot attempts left, `exhausted` for a failed trial, or `retiring` for an environment whose removal was interrupted. |
+| `ID` | `cps-IMAGE-REVISION`, from the root's image identity and revision. |
+| `ROOT` | The root partition's PARTUUID. When any entry selects a Btrfs root by filesystem UUID, the column shows `UUID=` or `PARTUUID=` before each identifier. |
+| `TITLE` | The entry title, which includes the Linux release for manifest-managed kernels. |
+
+CPS entries declare their metadata format with `# cps-boot-entry-version 1`
+and record SHA-256 digests of their boot files. CPS checks those files before
+it uses an entry as a fallback or rollback target.
+
+## Trials and blessing
+
+A staged environment boots first as a **trial**. Its fallback is the
+known-good environment it was staged from.
+
+- With systemd-boot, the trial is a counted entry such as
+  `cps-IMAGE-REVISION+2.conf`. It gets two attempts unless `--tries` or the
+  `tries` key in `boot-btrfs` sets another number, from 1 to 99. systemd-boot
+  decrements the counter on each attempt, and boots the fallback once the
+  attempts are used up.
+- With [direct UEFI boot](btrfs.md#direct-uefi-boot-for-btrfs-roots) on
+  Btrfs, CPS sets the firmware's `BootNext` to the trial for exactly one
+  attempt. The firmware consumes `BootNext`, so any reset after that boots
+  the fallback.
+
+The trial is blessed only when the boot reaches `boot-complete.target`, which
+requires `cps-boot-health.service`. That unit runs
+`cps verify --quick --root /` after `multi-user.target`. With systemd-boot,
+systemd then removes the boot counter from the entry's file name. With direct
+UEFI boot, `cps-uefi-bless.service` runs `cps boot-env bless-uefi`, which
+verifies the trial and its fallback and makes the trial the firmware default.
+Install the health unit with [the `system/cps` package](../../packaging/cps.kdl),
+and extend it with readiness checks as described in
+[Health checks and shared state](btrfs.md#health-checks-and-shared-state).
+[systemd boot assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/)
+
+On a running Btrfs system, while a trial is selected for the next boot,
+system package commands such as `cps install` refuse to change the running
+root. Boot the trial, or cancel it with `cps boot-env discard-trial`.
+
+## Roll back
+
+`rollback` selects the fallback of the environment currently selected for the
+next boot, or of the running direct UEFI trial. Pass a known-good environment
+ID to select a specific root, or when the selection has no recorded fallback.
+
+```sh
+# A root partition on the same disk as a mounted ESP.
+cps boot-env rollback --esp /efi
+# A Btrfs root, checked through the mounted top-level volume.
+cps boot-env rollback --esp /efi --btrfs-volume /cps
+# A specific known-good environment.
+cps boot-env rollback --esp /efi --btrfs-volume /cps "$environment_id"
+# An offline disk, published as a new disk file.
 cps boot-env rollback --disk bootable-next.raw --esp-partuuid "$esp_partuuid" \
     --output-disk rolled-back.raw
 ```
 
-Rollback on a disk image or a mounted VFAT ESP checks that the selected
-root's ext4 UUID and revision match its registered entry before changing
-the default. For a mounted ESP, CPS reads the parent GPT disk and locates the
-root by PARTUUID on that disk. The command requires read access to the disk
-and write access to the ESP. For a detached ESP directory, the operator
-supplies the partition mapping.
+Before changing the selection, CPS checks the target's boot files against
+the digests in its entry, then checks the root itself.
 
-The list marks the default configured on the ESP and shows each registered root's partition or Btrfs filesystem UUID, title, and boot status. The title includes the Linux release for manifest-managed kernels. CPS entries declare their metadata format with `# cps-boot-entry-version 1`. Rollback selects the default environment's recorded parent. Supply a known-good environment ID to select a specific root or when the default has no recorded parent. Rollback checks the selected entry's boot files and updates `loader.conf` for the next boot. It keeps both environments available. Trials started from a pinned environment use the `preferred` setting in systemd-boot 262, with the pinned base as the fallback. [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
+- For a Btrfs root, it checks the registered filesystem and subvolume
+  identity on the mounted volume and the root's CPS image identity and
+  revision. `--btrfs-volume` is required for these roots.
+- For a root partition, it checks that the partition's ext4 UUID and revision
+  label match the entry. On a mounted ESP, CPS reads the parent GPT disk and
+  locates the root by PARTUUID, so it needs read access to the disk and write
+  access to the ESP. For a detached ESP directory, the operator supplies the
+  partition mapping.
+
+Rollback then writes the target as `default` in `loader.conf` and removes any
+`preferred` trial selection. With direct UEFI boot, it instead cancels a
+pending `BootNext`, marks that trial as exhausted, and moves the target to the
+front of `BootOrder`. Rollback keeps every environment and its files.
+
+## Clean up environments
+
+Each environment keeps its root and its boot files on the ESP until it is
+removed. Before activation copies boot files, CPS checks that they fit on the
+ESP with a 1 MiB margin, and fails before any change with a message that
+suggests pruning.
+
+- On Btrfs, `cps boot-env prune` applies the retention policy, system package
+  commands prune automatically before they stage a change, and
+  `cps boot-env discard-trial` cancels a trial and removes failed ones. See
+  [Retention and pruning](btrfs.md#retention-and-pruning).
+- With ext4 root slots, activate the next release into the slot of an
+  inactive environment with `--replace`, which retires the old entry and its
+  boot files. See [Reusing a root slot](ext4.md#reusing-a-root-slot).
+
+## Compare environments
+
+Compare the committed package state of two roots offline, including roots
+created independently.
+
+```sh
+cps image-diff base staged
+cps image-diff base staged --paths --json
+cps boot-env rollback --esp /efi --btrfs-volume /cps --dry-run
+```
+
+The diff reports changes to package identity, manifest digest, local
+requests, and signed profile roles. `--paths` adds changes to managed file
+actions and owners. It reads committed metadata, so use `cps verify` to check
+the files on disk. The Btrfs rollback preview compares the environment
+selected for the next boot with the rollback target and leaves the selection
+unchanged. It accepts an environment ID, `--paths`, and `--json` as well.
 
 ## The loader configuration
 
-CPS creates `loader/loader.conf` when it registers the first environment on
-an ESP. A new file starts with the following lines.
+CPS creates `loader/loader.conf` when it registers the first systemd-boot
+environment on an ESP. Direct UEFI boot selects environments with firmware
+variables instead and uses no loader configuration. A new file starts with the
+following lines.
 
 ```
 default cps-*.conf
@@ -48,12 +159,12 @@ auto-firmware no
 CPS owns only the `default` and `preferred` keys. It changes them in place
 and keeps every other line, including comments, in its original order. You
 can change the menu timeout, enable the editor or the automatic entries, or
-add keys such as `console-mode`. CPS rejects the file and names the key
-when you set one of these:
+add keys such as `console-mode`. CPS rejects the file and names the key when
+you set one of these:
 
 - A `default` that is neither `cps-*.conf` nor a CPS entry ID followed by
   `.conf`. Restore the CPS value, or delete the line and select a known-good
-  environment with `cps boot-env rollback --esp esp ID`.
+  environment with `cps boot-env rollback --esp /efi ID`.
 - A `preferred` that is not a CPS entry, a `preferred` with
   `default cps-*.conf`, or a `preferred` without a `default`. Delete the line
   to cancel the trial selection.
@@ -61,53 +172,29 @@ when you set one of these:
 - `timeout menu-force`. Use a number of seconds, `menu-hidden`, or
   `menu-disabled`.
 
-These rules keep trial selection safe. systemd-boot 262 boots the
-`preferred` entry while its boot counter has attempts left, and otherwise
-boots `default`. CPS writes a known-good environment as `default` and
-publishes a trial and its files before it names the trial as `preferred`.
-Right after bootstrap, `default cps-*.conf` selects the newest CPS entry
-whose attempts are not exhausted, so a first trial falls back the same way.
-The boot counter is part of the entry's file name. systemd-boot decrements it
-on each attempt, and systemd removes it when the health checks pass. So the
-automatic choice depends only on the two owned keys and the CPS entry files.
-A second `default` line would take precedence over the first, so CPS
-rejects duplicates. `timeout menu-force` disables the timeout. The firmware
-would then wait at the menu, so an unattended trial or fallback never
-boots. Any other timeout only delays the automatic choice. The other keys
+These rules keep trial selection safe. Right after bootstrap,
+`default cps-*.conf` selects the newest CPS entry whose attempts are not
+exhausted, so the first trial boots and falls back to the bootstrapped root.
+After a rollback pins a known-good environment as `default`, CPS publishes
+each later trial and its files before it names the trial as `preferred`.
+systemd-boot 262 boots the `preferred` entry while its boot counter has
+attempts left, and otherwise boots `default`.
+[systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
+
+The automatic choice therefore depends only on the two owned keys and the CPS
+entry files. A second `default` line would take precedence over the first, so
+CPS rejects duplicates. `timeout menu-force` disables the timeout, so the
+firmware would wait at the menu and an unattended trial or fallback would
+never boot. Any other timeout only delays the automatic choice. The other keys
 change the menu, its extra entries, or the console. Automatically detected
-entries have their own IDs, such as `auto-windows`. These never match a CPS
-selector or `cps-*.conf`, and CPS rejects non-CPS Type #1 entries in
-`loader/entries`. CPS writes `editor no` because the editor lets anyone at
-the console change the kernel command line of a Type #1 entry. Enabling it
-does not change automatic selection.
+entries have their own IDs, such as `auto-windows`, which never match a CPS
+selector or `cps-*.conf`. CPS rejects non-CPS Type #1 entries in
+`loader/entries`. CPS writes `editor no` because the editor lets anyone at the
+console change the kernel command line of a Type #1 entry. Enabling it does
+not change automatic selection.
 
 The EFI variables `LoaderEntryDefault` and `LoaderEntryOneShot`, set with
 `bootctl set-default` and `bootctl set-oneshot`, override `default` from
 outside the file. Likewise, `LoaderConfigTimeout`, set with
 `bootctl set-timeout`, overrides `timeout`. CPS assumes that none of them is
 set on a managed system.
-
-## Cleaning up environments
-
-Old environments, their roots, and their boot files stay until they are
-removed. On Btrfs systems, `cps boot-env prune` and the automatic
-retention policy remove them, and `cps boot-env discard-trial` cancels a
-pending trial. See [Retention and pruning](btrfs.md#retention-and-pruning).
-Activation checks the ESP's free space before it copies boot files, and
-fails with a message that suggests pruning.
-
-## Comparing environments
-
-Compare two committed image states offline, including independently created roots.
-
-```sh
-cps image-diff base staged
-cps image-diff base staged --paths --json
-cps boot-env rollback --esp /efi --btrfs-volume /cps --dry-run
-```
-
-The diff reports changes to package identity, manifest digest, local requests,
-and signed profile roles. `--paths` adds changes to managed file actions and
-owners. It reads committed metadata. Use `cps verify` to check the files on
-disk. The Btrfs rollback preview compares the configured default with the
-selected known-good root and leaves the boot selection in place.

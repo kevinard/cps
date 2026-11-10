@@ -2,13 +2,28 @@
 
 [Documentation](../README.md) · [Clients](README.md)
 
+A [release profile](../concepts.md#release-profiles-and-locks) is a signed,
+tested composition that an image can follow. An image lock captures one
+image's exact composition so that you can reproduce it.
+
+## On this page
+
+- [Images that follow a signed release profile](#images-that-follow-a-signed-release-profile)
+- [Install a particular release](#install-a-particular-release)
+- [Update a profile image](#update-a-profile-image)
+- [Add local publishers to a profile image](#add-local-publishers-to-a-profile-image)
+- [Facet rules on profile images](#facet-rules-on-profile-images)
+- [Provisioning the same composition on another machine](#provisioning-the-same-composition-on-another-machine)
+
 ## Images that follow a signed release profile
 
 Add `release-profile "desktop"` to the image KDL to follow that profile in the
 first publisher's signed catalog. Configure the same architecture, image-wide
-facet rules, variants, and publisher order as the profile. Each companion repository must have the signed
-catalog referenced by the profile. The signed publishers keep their signed
-membership and order. Repository paths can be relocated in place.
+facet rules, variants, and publisher order as the profile. Each companion
+repository must have the signed catalog referenced by the profile. The signed
+publishers keep their signed membership and order. Repository paths can be
+relocated in place. To fetch the profile from mirrors, see
+[Synchronizing a signed profile](mirrors.md#synchronizing-a-signed-profile).
 
 On an image with no installed packages, use the profile's checked roots and
 dependencies directly.
@@ -27,73 +42,7 @@ installs, exact installs, removals, and dependency cleanup preserve that
 composition. Exact installs reconcile local additions around the protected
 packages. Only a signed profile update can replace the protected set.
 
-After installing the signed composition, you can add a publisher from an HTTPS
-mirror using its preinstalled TUF root at `/etc/cps/tuf-root.json`. Provision the
-root through a trusted channel, such as the signed installer. Use
-`--tuf-root PATH` to select another locally trusted root.
-
-```sh
-sudo cps publisher add https://packages.example.org/extras/
-sudo cps install cps://extras/apps/editor
-sudo cps upgrade
-```
-
-CPS verifies the mirror's TUF metadata with the local root, then fetches the
-publisher name and its newest [trust root](../publisher/publishing.md#publisher-trust-root)
-as authenticated targets. It displays the trust root's version, expiry, and the
-SHA-256 fingerprints of its root and catalog keys, and asks for confirmation.
-After confirmation, CPS checks the catalog signatures and pins that trust root
-for later refreshes.
-
-To provision without trusting the first response, pass the root key
-fingerprints that the publisher announced through another channel. CPS then
-requires the fetched trust root to name exactly those root keys and does not
-ask.
-
-```sh
-sudo cps publisher add https://packages.example.org/extras/ \
-    --expect-root-key 3f2a…e91c
-```
-
-Repeat `--expect-root-key` for each root key. For independently provisioned
-trust, supply the TUF root metadata and the publisher's trust root file
-explicitly.
-
-```sh
-sudo cps publisher add extras --url https://packages.example.org/extras/ \
-    --tuf-root /etc/cps/keys/extras-root.json \
-    --trust-root /etc/cps/keys/extras.trust.json
-```
-
-The URL must serve `metadata/` and `targets/` beneath it. CPS verifies
-and registers the mirror in one command, and `upgrade` refreshes it
-automatically using the saved trust root. The default cache lives in
-`repositories/NAME` under the configured Btrfs environments directory so
-it is available across boots. Use `--cache PATH` for a different location
-or when adding to an offline image. Use `--no-refresh` on `upgrade` to
-use already cached catalogs.
-
-For a local repository or a manually managed mirror cache, use `--repo`.
-
-```sh
-sudo cps publisher add extras --repo /var/lib/cps/extras \
-    --trust-root /etc/cps/keys/extras.trust.json
-```
-
-The image stores local publishers after the signed ones. `publisher prefer`
-reorders local publishers within that group. `publisher remove` removes a
-local publisher once its packages have been removed. A local package can
-depend on the protected base, and CPS rejects package selections that would
-replace a protected manifest or conflict with its files. On an installed
-Btrfs system, publisher membership edits use the boot configuration in
-`/etc/cps/image.kdl` and apply to the running known-good environment.
-
-Keep the signed publishers and their mirror definitions in the profile's
-image configuration. CPS refreshes URL-added publishers independently of
-the signed profile sync. A profile update uses the signed companion pins
-and each local publisher's current verified catalog. For manually managed
-mirrors, run `repo sync --image /` with the mirror options to check the
-new catalog against the installed system.
+## Install a particular release
 
 To install a particular published release, set `bootstrap-catalog` to the
 primary publisher's signed catalog digest.
@@ -125,15 +74,23 @@ configuration, canonical repository paths, builder UID and GID, and
 `SOURCE_DATE_EPOCH`. Use the same GPT template for byte-identical disk
 images. A staged upgrade receives a fresh image identity.
 
-On a profiled image with installed packages, `plan update` reconciles the
-image to the current signed composition plus the packages the operator
-explicitly requested and their dependencies. A previous profile default
-leaves the image if the new profile and local packages no longer require it.
-The package can remain published for manual installation. Use
-`plan mark explicit` to keep an installed default as a local choice.
-`plan exact-install` replaces the local choices while preserving the signed
-composition. Signed obsoletion rules still apply. A profile update fails if
-the signed set requires a downgrade or a publisher switch.
+## Update a profile image
+
+On a profiled image with installed packages, `plan update`, or `cps upgrade`
+on a running system, reconciles the image to the current signed composition
+plus the packages the operator explicitly requested and their dependencies.
+A previous profile default leaves the image if the new profile and local
+packages no longer require it. The package can remain published for manual
+installation. Use `plan mark explicit` to keep an installed default as a
+local choice. `plan exact-install` replaces the local choices while
+preserving the signed composition. Signed obsoletion rules still apply. A
+profile update fails if the signed set requires a downgrade or a publisher
+switch, or if it conflicts with a [freeze](configuration.md#freezing-package-versions).
+
+When the publisher rolls an update out in phases, an image outside the
+current rollout keeps its composition, and `check-updates` reports the
+rollout in `phased_update`. Pass `--force-phased-update` to `plan update` or
+`upgrade` to take the update anyway.
 
 Save and apply the plan normally, or stage it in a boot environment.
 The image tracks local requests separately from the signed profile roots.
@@ -143,6 +100,32 @@ catalog and the companion digests it signs. Saved plans use their original
 primary catalog and must match the companion digests signed in that catalog.
 Local history keeps those plans usable after a release advances. Offline
 installed-package queries, removal, and repair use committed image state.
+
+## Add local publishers to a profile image
+
+After installing the signed composition, you can add publishers of your
+own, from a [mirror URL](publishers.md#add-a-publisher-from-an-https-mirror)
+or a local repository.
+
+```sh
+sudo cps publisher add https://packages.example.org/extras/
+sudo cps install cps://extras/apps/editor
+```
+
+The image stores local publishers after the signed ones. `publisher prefer`
+reorders local publishers within that group. `publisher remove` removes a
+local publisher once its packages have been removed. A local package can
+depend on the protected base, and CPS rejects package selections that would
+replace a protected manifest or conflict with its files. On an installed
+Btrfs system, publisher membership edits use the boot configuration in
+`/etc/cps/image.kdl` and apply to the running known-good environment.
+
+Keep the signed publishers and their mirror definitions in the profile's
+image configuration. CPS refreshes URL-added publishers independently of
+the signed profile sync. A profile update uses the signed companion pins
+and each local publisher's current verified catalog. For manually managed
+mirrors, run `repo sync --image /` with the mirror options to check the
+new catalog against the installed system.
 
 ## Facet rules on profile images
 
@@ -166,7 +149,7 @@ accepted by allowing it, and never changes the protected package set.
 
 ```sh
 cps plan --root image --output app.json change-facet tools/app:devel=true
-cps plan --root image --output sqlite.json change-facet library/sqlite:devel=true  # needs allow-facet-override
+cps plan --root image --output sqlite.json change-facet 'library/sqlite:debug.symbols=true'  # needs allow-facet-override
 ```
 
 ## Provisioning the same composition on another machine
@@ -181,17 +164,19 @@ cps image-diff installed replica
 ```
 
 An image lock is a JSON document with `"format": 1` and
-`"kind": "image-lock"`. It records the exact package composition, publisher order and key
-fingerprints, catalog pins, architecture, image-wide facet rules,
-per-package facet rules, variants, and local package requests. The replica
-gets a fresh image identity. The target's KDL configuration supplies its
-repository locations, trust keys, and build trust policies. Give it the
+`"kind": "image-lock"`. It records the exact package composition, publisher
+order and key fingerprints, catalog pins, architecture, image-wide facet
+rules, per-package facet rules, variants, and local package requests. The
+replica gets a fresh image identity. The target's KDL configuration supplies
+its repository locations, trust roots, and build trust policies. Give it the
 locked architecture, image-wide facet rules, variants, profile name, and
 publisher order, including any locally added publishers. The configuration
 may omit per-package facet rules, and the replica then adopts the lock's
-rules. If it lists any, they must equal the lock's. Retain the
-pinned signed catalogs and their selected payloads in the configured
-repositories or caches.
+rules. If it lists any, they must equal the lock's. Retain the pinned signed
+catalogs and their selected payloads in the configured repositories or
+caches. The target's pinned trust roots must verify the locked catalogs, so
+pin a version no later than the one those catalogs are signed under; see
+[pinned trust roots](publishers.md#rotation-and-revocation).
 
 Capture a profiled image after its applied base matches its archived
 primary catalog. If a local install advanced that catalog to a different

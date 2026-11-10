@@ -2,9 +2,14 @@
 
 [Documentation](../README.md) · [Package maintainers](README.md)
 
+CPS runs no package scripts. A manifest declares what systemd should do
+with the files it ships, and CPS applies those declarations with systemd's
+own tools. Derived files that many packages contribute to are rebuilt by
+[triggers](triggers.md).
+
 ## Offline systemd actions
 
-A manifest can request an operation for a vendor file it delivers. The operation is selected with that file's architecture and facet settings.
+A manifest can request an operation for a vendor file it delivers.
 
 ```kdl
 schema-version 1 kind="package-manifest"
@@ -18,27 +23,55 @@ package "service/example" publisher="canopa" version="1.0.0-0" {
 }
 ```
 
-CPS shows the actions in the plan and invokes the host's systemd tools with the inactive image as their alternate root. It installs the package files first, then provisions accounts, creates state, and applies presets. New or changed sysusers and tmpfiles declarations are processed by name, with target-local replacements and masks taking precedence. For example, a tmpfiles rule of `d /var/lib/example 0750 example example -` can use the account created earlier in the same transaction. Offline tmpfiles supports `d`, `f`, and `L` creation rules. Boot-only rules and paths under `/dev`, `/proc`, `/run`, and `/sys` are deferred to boot. [systemd-tmpfiles](https://www.freedesktop.org/software/systemd/man/latest/systemd-tmpfiles.html)
+| Node | Names a file in | File name |
+| --- | --- | --- |
+| `sysusers NAME` | `usr/lib/sysusers.d` | ends in `.conf` |
+| `tmpfiles NAME` | `usr/lib/tmpfiles.d` | ends in `.conf` |
+| `preset UNIT` | `usr/lib/systemd/system` | a `.service`, `.socket`, `.timer`, `.path`, `.target`, `.mount`, `.automount`, `.swap`, or `.slice` unit |
 
-Presets apply the image's enablement policy to newly installed units.
-CPS preserves enablement during upgrades and honors local unit overrides
-and masks. When a vendor unit is removed, CPS cleans persistent enablement
-links that point directly to it. It also clears stale links to newly installed
-vendor units before applying their presets. [systemd presets](https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html)
+The package must ship the named file as an immutable `file` action, and the
+operation follows that file's architecture, facet, and variant selection.
 
-These actions are declarations that systemd applies to the files they name.
-To rebuild a file derived from what many packages install, such as the
-hardware database `etc/udev/hwdb.bin`, the package that ships the tool
-declares a trigger. The systemd package declares the `hwdb` trigger, which
-runs `systemd-hwdb --strict update` once per transaction when
-`usr/lib/udev/hwdb.d` changes. [Regenerate shared caches with triggers](triggers.md)
+CPS shows the actions in the plan and invokes the host's systemd tools with
+the inactive image as their alternate root. It installs the package files
+first, then provisions accounts, creates state, and applies presets. New or
+changed sysusers and tmpfiles declarations are processed by name, with
+target-local replacements and masks taking precedence. For example, a
+tmpfiles rule of `d /var/lib/example 0750 example example -` can use the
+account created earlier in the same transaction. A declared tmpfiles file
+may contain only `d`, `f`, and `L` creation rules, and publication rejects
+other rule types. Boot-only rules, such as `d!`, and paths under `/dev`,
+`/proc`, `/run`, and `/sys` are deferred to boot.
+[systemd-tmpfiles](https://www.freedesktop.org/software/systemd/man/latest/systemd-tmpfiles.html)
 
-Run `cargo build` followed by [`tests/systemd-actions.sh`](../../tests/systemd-actions.sh) to exercise the real helpers against a staged root. The test also checks recovery from a failed tmpfiles step after sysusers has run.
+Presets apply the image's enablement policy to newly installed units. CPS
+preserves enablement during upgrades and honors local unit overrides and
+masks. When a vendor unit is removed, CPS cleans persistent enablement links
+that point directly to it. It also clears stale links to newly installed
+vendor units before applying their presets.
+[systemd presets](https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html)
+
+These actions apply to the files they name. To rebuild a file derived from
+what many packages install, such as the hardware database
+`etc/udev/hwdb.bin`, the package that ships the tool declares a trigger.
+The systemd package declares the
+[`hwdb` trigger](triggers.md#regenerate-the-hardware-database), which runs
+`systemd-hwdb --strict update` once per transaction when
+`usr/lib/udev/hwdb.d` changes.
+
+Run `cargo build` followed by
+[`tests/systemd-actions.sh`](../../tests/systemd-actions.sh) to exercise the
+real helpers against a staged root. The test also checks recovery from a
+failed tmpfiles step after sysusers has run.
 
 ## Kernel packages
 
-An image can select one kernel from its package manifests. The kernel release identifies the `usr/lib/modules` directory and the packaged kernel image. An optional prebuilt initrd goes in the same directory. Without one, an
-installed [initramfs trigger](triggers.md#generate-an-initramfs) can generate
+An image can select one kernel from its package manifests. The
+`kernel-install` node names the kernel release, which identifies the
+`usr/lib/modules/RELEASE` directory. The package ships the kernel image as
+`usr/lib/modules/RELEASE/vmlinuz`, and with `initrd=#true` a prebuilt
+initramfs as `usr/lib/modules/RELEASE/initrd`. Without a prebuilt one, an
+installed [initramfs trigger](triggers.md#generate-an-initramfs) generates
 `usr/lib/modules/RELEASE/initrd` instead.
 
 ```kdl
@@ -50,4 +83,17 @@ package "system/kernel" publisher="canopa" version="7.2.11-1" {
 }
 ```
 
-Installing or changing the selected kernel runs the host's `kernel-install add` with systemd's Type #1 BLS plugin and a private boot tree inside the image. CPS verifies the resulting kernel and initrd against the signed manifest. A staged upgrade prepares its files before publishing the new root. Later, `boot-env activate` takes the prepared files from that root and publishes them alongside its boot entry. Omit `--kernel` and `--initrd` for manifest-managed kernels. Images with manually supplied boot files can supply explicit boot paths during [activation](../setups/README.md). [systemd kernel-install](https://www.freedesktop.org/software/systemd/man/260/kernel-install.html)
+The release starts with a letter or digit and contains letters, digits,
+`.`, `_`, `+`, and `-`, up to 128 bytes. A manifest has at most one
+`kernel-install` node.
+
+Installing or changing the selected kernel runs the host's
+`kernel-install add` with systemd's Type #1 BLS plugin and a private boot
+tree inside the image. CPS verifies the resulting kernel and initrd against
+the signed manifest, or against the digest it recorded for a generated
+initramfs. A staged upgrade prepares its files before publishing the new
+root. Later, `boot-env activate` takes the prepared files from that root and
+publishes them alongside its boot entry. Omit `--kernel` and `--initrd` for
+manifest-managed kernels. Images with manually supplied boot files can
+supply explicit boot paths during [activation](../setups/README.md).
+[systemd kernel-install](https://www.freedesktop.org/software/systemd/man/260/kernel-install.html)

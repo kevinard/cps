@@ -50,13 +50,24 @@ CONFIG
 cat image/usr/share/cps-demo/hello
 ```
 
-You should see `Hello from Canopa`. The temporary directory contains the
-prototype, a throwaway signing key, the signed repository with its trust root,
-the saved plan, and the installed image. `repo trust init` made `private.der`
-both the only root key and the only catalog key of the trust root in
-`repo/trust/1.json`, which the image pins. A production publisher keeps its root
-keys offline and separate from its catalog keys, as described in
-[Publish and retire packages](publisher/publishing.md#publisher-trust-root).
+You should see `Hello from Canopa`. The temporary directory holds the
+prototype tree, a throwaway signing key, the signed repository with its trust
+root, the saved plan, and the installed image.
+
+- `repo trust init` creates version 1 of the publisher's
+  [trust root](concepts.md#publishers-catalogs-and-trust) in
+  `repo/trust/1.json`, with `private.der` as both its only root key and its
+  only catalog key. The image configuration pins that file. A production
+  publisher keeps its root keys offline and separate from its catalog keys, as
+  described in [Publisher trust root](publisher/publishing.md#publisher-trust-root).
+- `publish` reads the file contents from `proto`, stores the payload, and
+  signs a new catalog that lists `demo/hello`.
+- `plan`, `fetch`, `validate`, and `apply` are the steps of every
+  [transaction](concepts.md#images-and-transactions): resolve and save the
+  change, download and verify its payloads, check the plan against them, and
+  write the files and commit the new image revision.
+- `verify --pristine` checks every installed file against its manifest and
+  confirms that the image holds nothing unmanaged.
 
 The package manifest uses your UID and GID so CPS can install the file
 without elevated privileges.
