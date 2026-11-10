@@ -4116,7 +4116,12 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     fs::write(&blob, "plugin 1")?;
     interrupt_apply(&f.root, &f._dir.path().join("repair.json"), &repair)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "compositor 1");
-    assert!(!f.root.join(PLUGIN).exists());
+    // Libraries go before executables, and the link sorts after COMPOSITOR.
+    assert_eq!(fs::read_to_string(f.root.join(PLUGIN))?, "plugin 1");
+    assert_eq!(
+        fs::read_link(f.root.join(LINK))?,
+        Path::new("unexpected-target")
+    );
     assert!(verify(&f.root).is_err());
     let offline = f.repo.with_extension("offline");
     fs::rename(&f.repo, &offline)?;
@@ -4295,6 +4300,7 @@ fn exact_install_and_remove_offline() -> Result<()> {
 }
 
 mod release;
+mod transitions;
 
 mod facets;
 mod freezes;

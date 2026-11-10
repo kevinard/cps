@@ -146,7 +146,10 @@ problem and resume again. The explicit
 administering images and boot environments.
 
 Live transactions advance the package revision while preserving the boot
-entry's identity. Changes to the running root use the same verified,
+entry's identity. Live writes follow the packages' dependency graph, so a
+program started during the transaction finds each new library before the
+new executables that need it; see
+[write order](images.md#resume-a-transaction-and-inspect-its-history). Changes to the running root use the same verified,
 resumable package journal as offline image transactions. A transaction's
 cost follows the packages it changes: CPS trusts recorded fingerprints of
 unchanged files instead of hashing the whole system, as described in

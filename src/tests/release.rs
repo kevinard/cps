@@ -4443,7 +4443,8 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
     f.package(
         "desktop/compositor",
         "1.0.0-0",
-        f.file(COMPOSITOR, "first", "0755", "")? + &f.file(SECOND, "second", "0644", "")?,
+        // Executables go last within a package, so SECOND follows COMPOSITOR.
+        f.file(COMPOSITOR, "first", "0755", "")? + &f.file(SECOND, "second", "0755", "")?,
     )?;
     let plan = install("desktop/compositor")?;
     let saved = f._dir.path().join("pending.json");

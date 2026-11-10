@@ -2,6 +2,7 @@ mod catalogs;
 mod config;
 pub(crate) mod freeze;
 mod intent;
+mod order;
 mod paths;
 mod rename;
 mod repair;
@@ -35,6 +36,7 @@ pub(crate) use catalogs::{CandidateSet, claim_source};
 pub use config::{ConfigChoice, ConfigUpdate, config_diff_inputs, list_config_updates};
 pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
 pub use intent::{IntentChange, MarkChoice};
+use order::WriteOrder;
 pub(crate) use paths::{
     check_directory, check_path_type, choose_mediators, effective_paths, hardlink_groups,
     mediator_offers, resolve_facets, select_paths,
@@ -1677,7 +1679,12 @@ fn build_with_update_diagnostics(
             },
         );
     }
-    plan.writes = ordered_writes(root, &paths, writes, &retired)?;
+    let order = WriteOrder::new(
+        (&state.installed, &state.paths),
+        (&installed, &paths),
+        &retired,
+    );
+    plan.writes = ordered_writes(root, &paths, writes, &order)?;
     plan.payload_bytes = payloads(&plan.writes)
         .values()
         .try_fold(0_u64, |total, node| {
@@ -1719,14 +1726,21 @@ fn build_with_update_diagnostics(
 pub(crate) fn pending_repairs(root: &Root, state: &State) -> Result<Vec<Write>> {
     let paths = state.paths.keys().map(String::as_str);
     let writes = repair::write_paths(root, state, paths, &mut Vec::new())?;
-    ordered_writes(root, &state.paths, writes, &BTreeSet::new())
+    let current = (&state.installed, &state.paths);
+    let retired = BTreeSet::new();
+    ordered_writes(
+        root,
+        &state.paths,
+        writes,
+        &WriteOrder::new(current, current, &retired),
+    )
 }
 
 fn ordered_writes(
     root: &Root,
     paths: &BTreeMap<String, Managed>,
     mut writes: BTreeMap<String, Write>,
-    retired: &BTreeSet<&str>,
+    order: &WriteOrder<'_>,
 ) -> Result<Vec<Write>> {
     // Replacing a regular file swaps its inode. Its aliases still refer to
     // the old inode even when their actions have not changed.
@@ -1766,7 +1780,7 @@ fn ordered_writes(
         }
     }
     let mut ordered: Vec<_> = writes.into_values().collect();
-    ordered.sort_by(|a, b| a.order(retired).cmp(&b.order(retired)));
+    order.sort(&mut ordered);
     Ok(ordered)
 }
 
@@ -1822,22 +1836,6 @@ impl Write {
         match &self.after {
             Some(Node::Hardlink { target }) => Some(target),
             _ => None,
-        }
-    }
-
-    fn order(&self, retired: &BTreeSet<&str>) -> (u8, usize, &str) {
-        let depth = self.path.bytes().filter(|b| *b == b'/').count();
-        if self.removes_directory() {
-            (4, usize::MAX - depth, "")
-        } else if retired.contains(self.path.as_str()) {
-            // Publish both the new path and its vendor proposal before retiring the old path.
-            (3, depth, "")
-        } else if let Some(target) = self.hardlink_target() {
-            (2, 0, target)
-        } else if self.after.as_ref().is_some_and(Node::is_dir) {
-            (0, depth, "")
-        } else {
-            (1, depth, "")
         }
     }
 }

@@ -76,6 +76,14 @@ path the same way, which hashes the files the transaction wrote and any file
 the actions changed. The shared-library check also reuses ELF metadata
 recorded for unchanged files.
 
+Writes follow the packages' dependencies. Each package's files are written
+after those of the packages it requires, including providers of required
+capabilities such as the generated `cap/elf/...` sonames. Within a package,
+shared libraries go first, then other files, and executables last.
+Directories are created first, and removals run after every new file is in
+place, dependents before the packages they depend on. The order is part of
+the saved plan.
+
 Use `cps transaction history --root image` to list completed plans, newest
 first. The default limit is 20 entries. Use
 `cps transaction show --root image PLAN_SHA256` for a JSON record of the
