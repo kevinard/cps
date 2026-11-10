@@ -98,8 +98,10 @@ Regular and pristine verification hash every managed file. Add `--quick` to
 trust the file records described in
 [resuming a transaction](#resume-a-transaction-and-inspect-its-history)
 instead. A quick check still compares every directory, link, mode, and owner
-and the package and path records, and hashes each file that changed or that
-CPS has not recorded. It reads the records but never writes them. The boot
+and the path records, and hashes each file that changed or that CPS has not
+recorded. It trusts the stored package manifests, which CPS checked against
+their signed documents before committing them, instead of parsing each one
+again. It reads the records but never writes them. The boot
 health check and the promotion of a direct UEFI trial use quick
 verification. Run full verification to detect changes below the filesystem,
 such as edits to the block device, or changes made while the system clock
