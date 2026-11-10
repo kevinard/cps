@@ -187,7 +187,7 @@ These settings extend it:
 | `CPS_VM_BTRFS_DESTROY_FAILED=1` | With a failed trial, removes the exhausted trial with `boot-env destroy-btrfs` |
 | `CPS_VM_BTRFS_DESTROY=1` | With a successful trial, stages another trial from the blessed root, rejects destroying protected and mounted roots, and retires the old root after an interrupted destruction |
 | `CPS_VM_STAGED_TRANSACTIONS=1` | With a successful trial, freezes, unfreezes, and upgrades the private staged root, and rejects a stale plan |
-| `CPS_VM_SYSTEM_COMMANDS=1` | With a successful trial, the everyday commands: a live install, a live upgrade of a running service, a staged upgrade, rollback with the live package still installed, a live removal, and a staged removal of its unused dependency with the repository unavailable |
+| `CPS_VM_SYSTEM_COMMANDS=1` | With a successful trial, the everyday commands: a live install that saves an unselected backup environment, a live upgrade of a running service, a staged upgrade whose trial receives `/etc` edits made before `systemctl reboot` through `cps-finalize-trial.service`, rollback with the live package still installed, a live removal followed by a boot of the backup taken before it, and a staged removal of its unused dependency with the repository unavailable |
 | `CPS_VM_GIT_INSTALLS=1` | With `CPS_VM_SYSTEM_COMMANDS=1`, a tracked Git install that advances, a pinned one that stays at its commit, and rollback of the tracked commit |
 | `CPS_VM_KERNEL_FIXTURE` | With native boot, stages the signed Btrfs-capable kernel from `tests/build-kernel.sh` as part of the upgrade, requires its builder signature, audits the installed evidence after boot, and checks the running kernel in the trial and the previous root |
 

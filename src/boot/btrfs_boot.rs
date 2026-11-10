@@ -458,6 +458,36 @@ impl Activation {
     }
 }
 
+impl Activation {
+    /// Register a backup root as a known-good environment without selecting it.
+    pub(crate) fn register_btrfs_backup(
+        &self,
+        root: &Path,
+        volume: &Path,
+        esp: &Path,
+        uki: bool,
+        uefi: bool,
+    ) -> Result<String> {
+        let volume = BtrfsVolume::open(volume)?;
+        let mode = if uefi {
+            BootMode::Uefi
+        } else if uki {
+            BootMode::Uki
+        } else {
+            BootMode::Split
+        };
+        let activation = Activation {
+            root_partuuid: self.root_partuuid.clone(),
+            kernel: self.kernel.clone(),
+            initrd: self.initrd.clone(),
+            options: self.options.clone(),
+            tries: 1,
+            known_good: true,
+        };
+        systemd_boot::register_backup(root, esp, &activation, &volume, mode)
+    }
+}
+
 pub(crate) fn bless_uefi(esp: &Path, volume: &Path) -> Result<Option<String>> {
     systemd_boot::bless_uefi(esp, &BtrfsVolume::open(volume)?)
 }
@@ -498,6 +528,14 @@ pub(crate) fn with_running_environment<T>(
 ) -> Result<T> {
     let volume = BtrfsVolume::open(volume)?;
     systemd_boot::with_running_environment(&volume, esp, partuuid, action)
+}
+
+pub(crate) fn pending_trial(
+    volume: &Path,
+    esp: &Path,
+    partuuid: Option<&str>,
+) -> Result<Option<systemd_boot::PendingTrial>> {
+    systemd_boot::pending_trial(&BtrfsVolume::open(volume)?, esp, partuuid)
 }
 
 fn filesystem_info(root: &Root) -> Result<FsInfo> {

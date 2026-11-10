@@ -229,6 +229,12 @@ impl Firmware {
         Ok(())
     }
 
+    /// Create the firmware option of a known-good environment without
+    /// changing the boot selection.
+    pub fn register(&self, id: &str) -> Result<()> {
+        self.ensure_option(id).map(drop)
+    }
+
     pub fn rollback(&self, esp: &Path, id: &str, entries: &[BootEntry]) -> Result<()> {
         self.check_next(entries, true)?;
         let target = self
@@ -390,6 +396,8 @@ impl Firmware {
 fn rename_record(dir: &Path, from: &Path, to: &Path) -> Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)?;
+    // On VFAT the renamed record's size is durable only with its inode.
+    File::open(to)?.sync_all()?;
     File::open(dir)?.sync_all()?;
     Ok(())
 }

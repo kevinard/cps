@@ -163,6 +163,8 @@ pub(super) fn rollback(esp: &Path, id: Option<&str>, volume: &BtrfsVolume) -> Re
     let _root_lock = volume
         .verify(&target.btrfs, image, revision)
         .context("checking the Btrfs rollback root")?;
+    // A backup stays read-only until it is selected to boot.
+    super::btrfs::make_writable(&_root_lock.root)?;
     if let Some(firmware) = firmware {
         firmware.rollback(&esp, &target.id, &entries)?;
     } else {
@@ -388,6 +390,54 @@ pub(super) fn with_running_environment<T>(
     action(running, id, revision)
 }
 
+/// A trial selected for the next boot whose fallback is the running root.
+pub(crate) struct PendingTrial {
+    pub id: String,
+    pub parent: String,
+    pub root: Root,
+}
+
+/// The trial that the next boot starts in place of the running root, if any.
+pub(super) fn pending_trial(
+    volume: &BtrfsVolume,
+    esp: &Path,
+    partuuid: Option<&str>,
+) -> Result<Option<PendingTrial>> {
+    let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
+    let lock = lock_esp(&esp, FlockOperation::LockShared)?;
+    let root = volume.boot_root(partuuid)?;
+    volume.check_boot_device(&esp, &lock, &root)?;
+    let Some((running, _)) = volume.running()? else {
+        return Ok(None);
+    };
+    let Inventory {
+        policy, entries, ..
+    } = inventory(&esp, &lock, false)?;
+    let Some(trial) = policy
+        .as_ref()
+        .and_then(|policy| policy.selected(&entries))
+        .filter(|entry| entry.tries.is_some_and(|tries| tries > 0))
+    else {
+        return Ok(None);
+    };
+    if trial.parent.as_deref() != Some(running.as_str()) {
+        return Ok(None);
+    }
+    if trial.root != root {
+        volume.check_boot_device(&esp, &lock, &trial.root)?;
+    }
+    let trial_root = volume.open_registered(&trial.btrfs, &trial.id)?;
+    ensure!(
+        !same_root(&trial_root, &Root::open(Path::new("/"))?)?,
+        "the pending trial is the running root"
+    );
+    Ok(Some(PendingTrial {
+        id: trial.id.clone(),
+        parent: running,
+        root: trial_root,
+    }))
+}
+
 pub struct Activation {
     /// Boot the root by this GPT partition instead of the Btrfs filesystem UUID.
     pub root_partuuid: Option<String>,
@@ -485,6 +535,33 @@ pub(super) fn activate(
     volume: &BtrfsVolume,
     mode: BootMode,
 ) -> Result<String> {
+    activate_as(root, esp, activation, volume, mode, false)
+}
+
+/// Register a read-only backup of the running Btrfs root as a known-good
+/// environment without selecting it.
+pub(super) fn register_backup(
+    root: &Path,
+    esp: &Path,
+    activation: &Activation,
+    volume: &BtrfsVolume,
+    mode: BootMode,
+) -> Result<String> {
+    activate_as(root, esp, activation, volume, mode, true)
+}
+
+fn activate_as(
+    root: &Path,
+    esp: &Path,
+    activation: &Activation,
+    volume: &BtrfsVolume,
+    mode: BootMode,
+    backup: bool,
+) -> Result<String> {
+    ensure!(
+        !backup || activation.known_good,
+        "a backup is a known-good Btrfs environment"
+    );
     let sign_uki = mode != BootMode::Split;
     let direct = mode == BootMode::Uefi;
     let boot_root = volume.boot_root(activation.root_partuuid.as_deref())?;
@@ -509,7 +586,12 @@ pub(super) fn activate(
         image.root.offline_path()?;
     }
     let btrfs = volume.record(&image.root, &root)?;
-    check_image_integrity(&image)?;
+    if backup {
+        // A backup is a snapshot of the running root, which was just checked.
+        crate::verify::require_quick(&image)?;
+    } else {
+        check_image_integrity(&image)?;
+    }
     let state = image.state()?;
     let settings = &state.settings;
     let image_id = canonical_partuuid(&settings.id).context("invalid image identity")?;
@@ -558,7 +640,7 @@ pub(super) fn activate(
     } = inventory(&esp, &_lock, direct)?;
     if let Some(firmware) = &firmware {
         firmware.check_next(&existing, false)?;
-        if activation.known_good {
+        if activation.known_good && !backup {
             let running = Root::open(Path::new("/"))?;
             ensure!(
                 same_root(&running, &image.root)?,
@@ -613,6 +695,7 @@ pub(super) fn activate(
         initrd_sha256: initrd_sha256.as_deref(),
         uki_sha256: signed_uki.as_ref().map(|(_, hash)| hash.as_str()),
         kernel_release: kernel_release.as_deref(),
+        backup,
     }
     .render();
     if let Some(firmware) = &firmware
@@ -661,6 +744,7 @@ pub(super) fn activate(
         loader::require_preferred(&esp)?;
     }
     let mut _fallback_lock = None;
+    let mut pin_before_backup = None;
     if let Some(fallback) = fallback.as_deref().filter(|_| select_trial) {
         let base = find_known_good(&existing, fallback)
             .context("the base must have a known-good boot entry")?;
@@ -700,6 +784,8 @@ pub(super) fn activate(
                 }),
             "each environment requires a distinct Btrfs subvolume"
         );
+    } else if backup && existing_entry.is_none() {
+        pin_before_backup = backup_selection(policy.as_ref(), &existing, &btrfs, direct)?;
     } else if existing_entry.is_none() {
         ensure!(
             existing.is_empty(),
@@ -735,6 +821,9 @@ pub(super) fn activate(
         files.push((esp.join("loader/loader.conf.new"), 64 * 1024));
         check_esp_space(&esp, &id, &files)?;
     }
+    if let Some(selected) = &pin_before_backup {
+        LoaderPolicy::pinned(selected).write(&esp.join("loader/loader.conf"))?;
+    }
     if !sign_uki {
         mark_registered(&image.root, &id)?;
     }
@@ -768,7 +857,7 @@ pub(super) fn activate(
         File::open(&entry.path)?.sync_all()?;
         File::open(&entries)?.sync_all()?;
     } else {
-        if fallback.is_none() && !direct {
+        if fallback.is_none() && !direct && !backup {
             LoaderPolicy::Automatic.write(&config_path)?;
         }
         let file = match fallback {
@@ -778,7 +867,10 @@ pub(super) fn activate(
         install_text(&entries.join(&file), &description)?;
     }
     if let Some(firmware) = firmware {
-        if fallback.is_none() || select_trial {
+        if backup {
+            // Rollback promotes the option; until then BootOrder is unchanged.
+            firmware.register(&id)?;
+        } else if fallback.is_none() || select_trial {
             firmware.activate(&id, fallback.is_some())?;
         }
     } else if let Some(fallback) = fallback.as_deref().filter(|_| prefer_trial) {
@@ -787,6 +879,33 @@ pub(super) fn activate(
     }
 
     Ok(id)
+}
+
+/// Check that a new backup can join `existing` without changing the next
+/// boot, and return the selection to pin first, if any.
+///
+/// An automatic selection boots the newest revision, which a backup of the
+/// running root would become, so the current selection is pinned before the
+/// backup's entry appears.
+fn backup_selection(
+    policy: Option<&LoaderPolicy>,
+    existing: &[BootEntry],
+    record: &BtrfsRecord,
+    direct: bool,
+) -> Result<Option<String>> {
+    let policy = policy.context(NO_SELECTION)?;
+    let selected = policy.selected(existing).context(NO_SELECTION)?;
+    ensure!(
+        selected.tries.is_none(),
+        "a trial is selected for the next boot; boot it or cancel it before backing up"
+    );
+    ensure!(
+        !existing
+            .iter()
+            .any(|entry| entry.btrfs.fsid == record.fsid && entry.btrfs.same_subvolume(record)),
+        "each environment requires a distinct Btrfs subvolume"
+    );
+    Ok((*policy == LoaderPolicy::Automatic && !direct).then(|| selected.id.clone()))
 }
 
 /// Register the first, known-good environment of an offline disk on a
@@ -820,6 +939,7 @@ pub(super) fn bootstrap_offline(
         initrd_sha256: files.initrd_sha256.as_deref(),
         uki_sha256: None,
         kernel_release: files.kernel_release.as_deref(),
+        backup: false,
     }
     .render();
     let efi = ensure_dir(esp, "EFI")?;
@@ -896,6 +1016,7 @@ struct Entry<'a> {
     initrd_sha256: Option<&'a str>,
     uki_sha256: Option<&'a str>,
     kernel_release: Option<&'a str>,
+    backup: bool,
 }
 
 impl Entry<'_> {
@@ -910,10 +1031,12 @@ impl Entry<'_> {
             initrd_sha256,
             uki_sha256,
             kernel_release,
+            backup,
         } = self;
+        let name = if *backup { "Canopa backup" } else { "Canopa" };
         let title = match kernel_release {
-            Some(release) => format!("Canopa ({id}, Linux {release})"),
-            None => format!("Canopa ({id})"),
+            Some(release) => format!("{name} ({id}, Linux {release})"),
+            None => format!("{name} ({id})"),
         };
         let mut entry = format!(
             "title {title}\nsort-key cps\nversion {revision}\n{}{}\n",
@@ -1119,14 +1242,120 @@ fn install_checked(
     );
     verify(temp.path())?;
     temp.as_file().sync_all()?;
-    temp.persist_noclobber(path)?;
+    // VFAT writes a renamed file's size and first cluster with its inode,
+    // not with the directory, so sync the file again after the rename.
+    temp.persist_noclobber(path)?.sync_all()?;
     File::open(parent)?.sync_all()?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{check_esp_space, digest, install_checked};
+    use super::{
+        BootEntry, BtrfsRecord, Entry, LoaderPolicy, backup_selection, check_esp_space, digest,
+        install_checked, policy::BootRoot,
+    };
+
+    fn record(subvolid: u64) -> BtrfsRecord {
+        BtrfsRecord {
+            fsid: "11111111-1111-4111-8111-111111111111".into(),
+            uuid: format!("22222222-2222-4222-8222-{subvolid:012}"),
+            subvolid,
+            path: format!("@environments/{subvolid}/root"),
+        }
+    }
+
+    fn entry(id: &str, revision: u64, tries: Option<u32>, subvolid: u64) -> BootEntry {
+        BootEntry {
+            path: format!("{id}.conf").into(),
+            id: id.into(),
+            revision,
+            tries,
+            description: String::new(),
+            title: String::new(),
+            root: BootRoot::Btrfs("11111111-1111-4111-8111-111111111111".into()),
+            parent: None,
+            btrfs: record(subvolid),
+            uki: None,
+        }
+    }
+
+    #[test]
+    fn backups_never_change_the_next_boot() -> anyhow::Result<()> {
+        let running = entry("cps-a47593c2-e985-42d2-92b6-44c7057e1e96-4", 4, None, 256);
+        let existing = [running];
+        // An automatic selection would boot the backup's newer revision.
+        assert_eq!(
+            backup_selection(
+                Some(&LoaderPolicy::Automatic),
+                &existing,
+                &record(300),
+                false
+            )?,
+            Some(existing[0].id.clone())
+        );
+        // Direct UEFI boot and a pinned default already select by ID.
+        assert_eq!(
+            backup_selection(
+                Some(&LoaderPolicy::Automatic),
+                &existing,
+                &record(300),
+                true
+            )?,
+            None
+        );
+        let pinned = LoaderPolicy::pinned(&existing[0].id);
+        assert_eq!(
+            backup_selection(Some(&pinned), &existing, &record(300), false)?,
+            None
+        );
+        // The backup needs its own subvolume.
+        assert!(backup_selection(Some(&pinned), &existing, &record(256), false).is_err());
+        // No backup while a trial waits for the next boot.
+        let trial = entry(
+            "cps-0f6a2c1e-3b1d-4c9e-8a55-2d0e4c3b9f10-5",
+            5,
+            Some(2),
+            257,
+        );
+        let with_trial = [
+            entry("cps-a47593c2-e985-42d2-92b6-44c7057e1e96-4", 4, None, 256),
+            trial,
+        ];
+        let policy = LoaderPolicy::trial(&existing[0].id, &with_trial[1].id);
+        let error = backup_selection(Some(&policy), &with_trial, &record(300), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("a trial is selected"), "{error}");
+        assert!(backup_selection(None, &existing, &record(300), false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn backup_entries_are_titled_as_backups() {
+        let record = record(256);
+        let render = |backup| {
+            Entry {
+                id: "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-4",
+                revision: 4,
+                cmdline: "root=UUID=x rw",
+                btrfs: &record,
+                parent: None,
+                linux_sha256: "a",
+                initrd_sha256: None,
+                uki_sha256: None,
+                kernel_release: Some("6.12.0"),
+                backup,
+            }
+            .render()
+        };
+        assert!(render(true).starts_with(
+            "title Canopa backup (cps-a47593c2-e985-42d2-92b6-44c7057e1e96-4, Linux 6.12.0)\n"
+        ));
+        assert!(render(false).starts_with("title Canopa (cps-"));
+        // A backup is known-good: no fallback and no boot counter.
+        assert!(!render(true).contains("# cps-parent"));
+    }
 
     #[test]
     fn esp_space_counts_only_missing_files_and_suggests_pruning() -> anyhow::Result<()> {

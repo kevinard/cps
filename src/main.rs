@@ -1555,6 +1555,16 @@ enum BootCommand {
         #[arg(long, default_value = system::CONFIG)]
         config: PathBuf,
     },
+    /// Merge the running /etc into the trial selected for the next boot.
+    /// cps-finalize-trial.service runs this at shutdown.
+    FinalizeTrial {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+        /// Only request the merge at this boot's shutdown, for a trial staged
+        /// during an earlier boot
+        #[arg(long)]
+        arm: bool,
+    },
     /// Stage a saved plan in a writable Btrfs snapshot of a read-only baseline
     StageBtrfs {
         #[arg(long)]
@@ -1668,6 +1678,36 @@ enum BootCommand {
         #[arg(long, default_value = "")]
         options: String,
     },
+}
+
+fn print_etc_merge(trial: &str, report: &cps::EtcMergeReport) {
+    if report.is_empty() {
+        println!("No local /etc changes to merge into {trial}");
+        return;
+    }
+    println!(
+        "Merged /etc into {trial}: {} applied, {} merged, {} configuration updates, {} kept from \
+         the update",
+        report.applied.len(),
+        report.merged.len(),
+        report.config_updates.len(),
+        report.conflicts.len()
+    );
+    for path in &report.config_updates {
+        println!("  /{path}: kept the local edit; review the update with `cps config diff`");
+    }
+    for conflict in &report.conflicts {
+        match &conflict.saved {
+            Some(saved) => println!(
+                "  /{}: kept the update's version, {}. The running version is saved at /{saved}",
+                conflict.path, conflict.reason
+            ),
+            None => println!(
+                "  /{}: kept the update's version, {}",
+                conflict.path, conflict.reason
+            ),
+        }
+    }
 }
 
 fn print_boot_prune(
@@ -3398,6 +3438,28 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Config {
             command: ConfigCommand::Diff { root, path },
         } => {
+            let relative = path.strip_prefix('/').unwrap_or(&path);
+            let saved = cps::saved_etc_versions(&root)?
+                .into_iter()
+                .filter(|(_, saved, _)| saved == relative)
+                .next_back();
+            if let Some((_, _, copy)) = saved
+                && !cps::list_config_updates(&root)?
+                    .iter()
+                    .any(|update| update.path == relative)
+            {
+                let status = std::process::Command::new("/usr/bin/diff")
+                    .args(["-u", "--label", "current", "--label", "saved", "--"])
+                    .arg(root.join(relative))
+                    .arg(root.join(copy))
+                    .status()
+                    .context("running /usr/bin/diff")?;
+                return match status.code() {
+                    Some(0) => Ok(ExitCode::SUCCESS),
+                    Some(1) => Ok(ExitCode::FAILURE),
+                    _ => anyhow::bail!("configuration diff failed with {status}"),
+                };
+            }
             let dir = tempfile::tempdir()?;
             let local = dir.path().join("local");
             let vendor = dir.path().join("vendor");
@@ -3423,10 +3485,14 @@ fn run(command: Command) -> Result<ExitCode> {
             command: ConfigCommand::List { root },
         } => {
             let updates = list_config_updates(&root)?;
-            if updates.is_empty() {
+            let saved = cps::saved_etc_versions(&root)?;
+            if updates.is_empty() && saved.is_empty() {
                 println!("No pending configuration updates");
             } else {
                 println!("STATUS\tREVISION\tPATH\tVENDOR COPY");
+                for (revision, path, copy) in &saved {
+                    println!("saved local\t{revision}\t{path:?}\t{copy:?}");
+                }
                 for update in updates {
                     let status = if update.vendor_available {
                         "pending"
@@ -3832,6 +3898,9 @@ fn run(command: Command) -> Result<ExitCode> {
                 } else {
                     activation.activate_btrfs(&root, &btrfs_volume, &esp)?
                 };
+                if !known_good {
+                    system::arm_finalize();
+                }
                 println!("Activated {id}");
             }
             BootCommand::BlessUefi { config } => {
@@ -3866,6 +3935,26 @@ fn run(command: Command) -> Result<ExitCode> {
                     None => {}
                 }
                 return Ok(print_boot_prune(&discard.prune, false, false));
+            }
+            BootCommand::FinalizeTrial { config, arm } => {
+                let system = System::load(&config)?;
+                let _lock = system.lock()?;
+                if arm {
+                    match system.arm_finalize()? {
+                        Some(id) => println!("The /etc merge into {id} runs at shutdown"),
+                        None => println!("No trial is selected for the next boot"),
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                match system.finalize_trial()? {
+                    system::Finalized::NoTrial => {
+                        println!("No trial is selected for the next boot")
+                    }
+                    system::Finalized::NoBase { trial } => {
+                        println!("Trial {trial} has no /etc merge base; its /etc stays as staged")
+                    }
+                    system::Finalized::Merged { trial, report } => print_etc_merge(&trial, &report),
+                }
             }
             BootCommand::Capture {
                 source,

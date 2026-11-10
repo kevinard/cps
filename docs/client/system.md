@@ -15,6 +15,7 @@ This page covers what differs on the running root.
 - [Remove packages and select publishers](#remove-packages-and-select-publishers)
 - [How live changes apply](#how-live-changes-apply)
 - [Stage changes for the next boot](#stage-changes-for-the-next-boot)
+  - [Local changes before the reboot](#local-changes-before-the-reboot)
 - [Recover an interrupted change](#recover-an-interrupted-change)
 - [Follow a saved plan](#follow-a-saved-plan)
 - [Repair, restore defaults, and verify](#repair-restore-defaults-and-verify)
@@ -153,6 +154,22 @@ A transaction's cost follows the packages it changes. CPS trusts recorded
 unchanged files instead of hashing the whole system. Live transactions
 advance the package revision while preserving the boot entry's identity.
 
+Before each live change, CPS saves the running root as a read-only
+**backup** environment: a Btrfs snapshot registered as a known-good boot
+entry titled `Canopa backup`, which the next boot does not select. If a
+change breaks the system, select the backup and reboot:
+
+```sh
+sudo cps boot-env list --esp /efi
+sudo cps boot-env rollback --esp /efi --btrfs-volume /cps "$backup_id"
+```
+
+Backups count toward the
+[retention policy](../setups/btrfs.md#retention-and-pruning) like other
+known-good environments, and each one needs ESP space for its boot files.
+Set `live-backup=#false` in `boot-btrfs` to change the running root without
+them. See [Backups before live changes](../setups/btrfs.md#backups-before-live-changes).
+
 ## Stage changes for the next boot
 
 A transaction that changes the kernel, initramfs, other boot paths, or
@@ -182,12 +199,56 @@ Package authors can use the
 to stage changes involving a package.
 
 While a trial is pending, system package commands refuse to change the
-running root, so the next boot includes all of your work. Boot into the
+running root, so the trial holds every package change. Boot into the
 trial, or cancel it with `sudo cps boot-env discard-trial`, which selects
 the known-good fallback again. Before staging, CPS checks that the Btrfs
 filesystem has room for the new payloads, and by default it prunes old
 boot environments under the `boot-btrfs` retention policy. See
 [Retention and pruning](../setups/btrfs.md#retention-and-pruning).
+
+### Local changes before the reboot
+
+The trial starts as a snapshot of the running root, so it does not see
+changes to `/etc` made after staging, such as a new password or user.
+When the system shuts down cleanly, for example with `systemctl reboot`,
+`cps-finalize-trial.service` runs `cps boot-env finalize-trial`. It compares
+the running `/etc` and the trial's `/etc` with `/etc` as it was at staging,
+and carries each local change into the trial:
+
+- A path that the trial left as it was takes the running version: contents,
+  mode, owner, extended attributes, symlink target, creation, or removal.
+- `passwd`, `group`, `shadow`, `gshadow`, `subuid`, and `subgid` merge record
+  by record when both sides changed different entries, so a user added
+  locally and a system user added by the upgrade both stay.
+- A preserved file that both sides changed keeps the local edit, and the
+  upgrade's version waits as a
+  [pending configuration update](configuration.md#reviewing-configuration-updates),
+  as if you had edited it before staging.
+- Otherwise a path that both sides changed keeps the trial's version, and the
+  running version is saved below `usr/lib/sysimage/cps/config-updates/etc-merge/`
+  in the trial. A local change to a package file that is not preserved is
+  [drift](images.md#repair-files-or-restore-vendor-defaults), so it is saved
+  the same way, and a removed package file stays.
+
+After booting the trial, review what the merge kept aside:
+
+```sh
+sudo cps config list --root /
+sudo cps config diff --root / /etc/hostname
+```
+
+`config list` shows saved running versions as `saved local`, and
+`config diff` compares the current file with the saved one. Copy what you
+need, then delete the saved copy. `journalctl -b -1 -u cps-finalize-trial`
+shows the merge report of the previous shutdown.
+
+A crash, power loss, or `reboot --force` skips the merge, and the trial boots
+with `/etc` as it was at staging. The merge builds the new `/etc` beside the
+trial's and swaps them in one rename, so an interruption leaves the trial
+with either `/etc`. If the merge fails, CPS leaves the trial's `/etc` as it
+was and cancels the trial, so the next boot starts the fallback with all of
+your changes. Stage the change again once the cause is fixed. See
+[Merging /etc at shutdown](../setups/btrfs.md#merging-etc-at-shutdown).
 
 ## Recover an interrupted change
 

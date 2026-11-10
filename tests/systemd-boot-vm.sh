@@ -18,7 +18,7 @@ project=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$project/tests/systemd-boot-guest.sh"
 cps=${CPS_BIN:-$project/target/debug/cps}
 cps_fixture=${CPS_VM_CPS_FIXTURE:-}
-cps_version=${CPS_VM_CPS_VERSION:-0.1.0-39}
+cps_version=${CPS_VM_CPS_VERSION:-0.1.0-40}
 kernel_fixture=${CPS_VM_KERNEL_FIXTURE:-}
 if [[ $reprovision == 1 && ( ${CPS_VM_RELEASE_PROFILE:-0} != 1 || -z ${SOURCE_DATE_EPOCH:-} ) ]]; then
     echo 'CPS_VM_REPROVISION requires a signed release profile and SOURCE_DATE_EPOCH' >&2
@@ -376,7 +376,7 @@ elif $systemd_guest; then
     else
         cp -- "$cps" proto/usr/bin/cps
     fi
-    cp "$project/packaging/systemd/"{cps-boot-health,cps-uefi-bless}.service proto/usr/lib/systemd/system/
+    cp "$project/packaging/systemd/"{cps-boot-health.service,cps-uefi-bless.service,cps-finalize-trial.path,cps-finalize-trial.service} proto/usr/lib/systemd/system/
     install -Dm644 "$project/LICENSE" proto/usr/share/licenses/cps/LICENSE
     sed -e '/^    require /d' -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
         "$project/packaging/cps.kdl" > cps.kdl

@@ -16,6 +16,9 @@
 .B \&discard\-trial
 \&Cancel a pending or running trial and remove failed trials
 .TP
+.B \&finalize\-trial
+\&Merge the running /etc into the trial selected for the next boot. cps\-finalize\-trial.service runs this at shutdown
+.TP
 .B \&stage\-btrfs
 \&Stage a saved plan in a writable Btrfs snapshot of a read\-only baseline
 .TP
@@ -94,6 +97,21 @@
 .TP
 .B \&\-\-config <CONFIG>
 \&[default: /etc/cps/image.kdl]
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps boot\-env finalize\-trial"
+\&Merge the running /etc into the trial selected for the next boot. cps\-finalize\-trial.service runs this at shutdown
+.PP
+.B \&cps boot\-env finalize\-trial [OPTIONS]
+.PP
+.B Options
+.TP
+.B \&\-\-config <CONFIG>
+\&[default: /etc/cps/image.kdl]
+.TP
+.B \&\-\-arm
+\&Only request the merge at this boot's shutdown, for a trial staged during an earlier boot
 .TP
 .B \&\-h, \-\-help
 \&Print help

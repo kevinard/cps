@@ -21,6 +21,8 @@ configuration work as described in [boot operations](boot-operations.md).
   - [Direct UEFI boot for Btrfs roots](#direct-uefi-boot-for-btrfs-roots)
 - [Share /var between boot environments](#share-var-between-boot-environments)
 - [Health checks and shared state](#health-checks-and-shared-state)
+- [Merging /etc at shutdown](#merging-etc-at-shutdown)
+- [Backups before live changes](#backups-before-live-changes)
 - [Nested subvolumes](#nested-subvolumes)
 - [Capturing a running Btrfs root](#capturing-a-running-btrfs-root)
 - [Reclaiming old Btrfs environments](#reclaiming-old-btrfs-environments)
@@ -58,6 +60,7 @@ stage-package "system/systemd"
 | `tries` | 2, or 1 with `uefi` | Boot attempts for a trial, from 1 to 99. Direct UEFI trials allow exactly one. |
 | `keep-environments` | 3 | Known-good environments to keep, from 1 to 99. See [Retention and pruning](#retention-and-pruning). |
 | `auto-prune` | `#true` | Prune old known-good environments automatically. |
+| `live-backup` | `#true` | Save the running root as a [backup environment](#backups-before-live-changes) before each live change. |
 | `exclude-subvolume` | | A child node naming a [nested subvolume](#nested-subvolumes), relative to the root, that new roots start empty. Repeat it for more paths. |
 
 Each `stage-package` node names a package whose installation, replacement,
@@ -75,7 +78,9 @@ repository caches at stable paths outside the boot roots, such as
 `/var/lib/cps/NAME` on that subvolume. Register the initial root with
 `boot-env activate-btrfs --known-good` and install the
 [CPS health service](../../packaging/systemd/cps-boot-health.service) for
-trial boot assessment.
+trial boot assessment. The same package enables
+`cps-finalize-trial.path`, which [merges /etc](#merging-etc-at-shutdown)
+into a staged trial at shutdown.
 
 ## Activating Btrfs roots
 
@@ -325,6 +330,95 @@ another sibling subvolume, another device, or a network service, has its own
 lifecycle. Keep shared state compatible with the previous system until the
 trial is accepted, or coordinate its backup and restore with the application.
 
+## Merging /etc at shutdown
+
+A trial is a snapshot taken when the change is staged. Staging records the
+snapshot's `/etc`, before the plan changes it, as the merge base in the
+trial's image state. After a system command or `boot-env activate-btrfs`
+selects the trial, CPS creates `/run/cps/finalize-trial`, and `cps-finalize-trial.path` starts
+`cps-finalize-trial.service`. When the system shuts down, stopping that
+service runs `cps boot-env finalize-trial`. The command finds the trial
+selected for the next boot whose fallback is the running root, takes the
+trial's image lock, and merges the running `/etc` into it as described in
+[Local changes before the reboot](../client/system.md#local-changes-before-the-reboot).
+
+- CPS builds the merged tree in the trial's image state, cloning unchanged
+  files from the trial's `/etc` and copying local changes from the running
+  one with their owner, mode, extended attributes, timestamps, and hard
+  links. It then swaps the tree with the trial's `/etc` in one
+  `RENAME_EXCHANGE` rename. Pending configuration updates and saved running
+  versions are recorded before the swap, because they hold with either
+  `/etc`. A crash at any point leaves the trial bootable with the staged or
+  the merged `/etc`.
+- After the swap, the base becomes the running `/etc` that was merged. A
+  repeated run carries only later edits, so `finalize-trial` is safe to run
+  by hand before a reboot, and the shutdown run then adds what changed since.
+  The trial keeps the report of the last merge as `etc-merge.json` in its
+  image state.
+- If the merge fails, CPS leaves the trial's `/etc` as it was and cancels
+  the trial, as `boot-env rollback` would. Booting a trial without a new
+  password or user can lock you out, while the fallback keeps every change
+  and the change can be staged again. The service log names the cause.
+- Mount points and nested subvolumes inside `/etc` are left alone. `/var`
+  is not merged.
+
+The unit stops after the ordinary services, before the local file systems
+are unmounted. The ESP and the Btrfs top-level volume must stay mounted until
+then, as they do when they belong to `local-fs.target`. Otherwise add a
+drop-in, for example
+`/etc/systemd/system/cps-finalize-trial.service.d/mounts.conf`.
+
+```ini
+[Unit]
+RequiresMountsFor=/efi /cps
+```
+
+The flag lasts for one boot. If you boot the fallback by hand while a trial
+is still selected, run `sudo cps boot-env finalize-trial --arm` to request the
+merge at the next shutdown. A trial that is cancelled, rolled back, or
+discarded before the shutdown is not merged.
+
+## Backups before live changes
+
+A change that does not need a reboot applies to the running root. Before
+it starts, CPS takes a read-only snapshot of the root in
+`environments/backup-IMAGE-REVISION/root`, gives it a new image identity, and
+registers it as a known-good environment titled `Canopa backup`. The backup
+has no fallback and is never selected automatically. If `loader.conf` still
+selects the newest entry with `default cps-*.conf`, CPS first pins the running
+environment, because the backup would be the newest. With direct UEFI boot,
+CPS creates the backup's firmware boot option without changing `BootOrder`.
+
+To return to the system as it was before a live change, select the backup
+and reboot. Rollback makes the backup's subvolume writable before it selects
+it, because a running root must be writable.
+
+```sh
+sudo cps boot-env list --esp /efi
+sudo cps boot-env rollback --esp /efi --btrfs-volume /cps "$backup_id"
+```
+
+The snapshot shares all data with the running root. CPS verifies it with
+`verify --quick` semantics, since it has the same inodes as the root it was
+taken from. A retry of the same change, for example after
+`cps transaction abort`, reuses the backup of that revision. Interrupted
+changes resumed with `cps resume` take no new backup, and neither do
+`cps repair` and `cps revert`: they restore package files on a root that
+fails verification, so its snapshot could not boot as known-good.
+
+Each backup counts toward `keep-environments` like any other known-good
+environment, and [pruning](#retention-and-pruning) removes the oldest first.
+With `auto-prune`, CPS prunes before the backup to make room on the ESP and
+again after it. Each backup also costs one copy of the kernel and initramfs,
+or a signed UKI, on the ESP, checked like any
+[activation](#free-space-checks). CPS does not share these files between
+entries: a UKI embeds the subvolume it boots, and shared Type #1 files would
+need reference counting in every removal path. Keep `keep-environments`
+within the ESP's capacity. If a backup cannot be created or registered, the
+live change stops before it changes anything. Free space with
+`cps boot-env prune`, or set `live-backup=#false` to apply live changes
+without a backup.
+
 ## Nested subvolumes
 
 A Btrfs snapshot does not descend into nested subvolumes. In the snapshot,
@@ -475,11 +569,12 @@ trial is selected for the next boot, because the destroy checks require a
 known-good selection.
 
 With `auto-prune` enabled, which is the default, `cps install`, `upgrade`,
-and the other system commands prune before they stage a change, and
-`cps boot-env bless-uefi` prunes after it promotes a trial. Automatic pruning
-reports problems as warnings and never blocks the transaction. With
-`auto-prune=#false`, staging still removes failed and abandoned trials but
-keeps every known-good environment. Pruning also removes empty `upgrade-*`
+and the other system commands prune before they stage a change and around
+each [backup](#backups-before-live-changes), and `cps boot-env bless-uefi`
+prunes after it promotes a trial. Automatic pruning reports problems as
+warnings and never blocks the transaction. With `auto-prune=#false`, staging
+still removes failed and abandoned trials but keeps every known-good
+environment. Pruning also removes empty `upgrade-*` and `backup-*`
 directories left in `environments`.
 
 The prune before staging keeps the trial of an interrupted activation of the
@@ -528,7 +623,8 @@ the files it adds: the kernel and initramfs or the UKI, the entry, and a
 temporary `loader.conf` copy, each rounded up to whole clusters, plus a 1 MiB
 margin. Files already in place from an interrupted attempt do not count.
 
-Both checks fail before any change and suggest `cps boot-env prune`.
+Both checks fail before any change and suggest `cps boot-env prune`. The
+ESP check also applies to each [backup](#backups-before-live-changes).
 
 ## Testing in a VM
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Merge /etc into the staged CPS trial at shutdown
+DefaultDependencies=no
+ConditionPathExists=/run/cps/finalize-trial
+# Stopping runs after the ordinary services have stopped, before local
+# file systems unmount and while the journal still records to disk.
+After=local-fs.target systemd-journal-flush.service
+Before=basic.target final.target
+Conflicts=final.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStop=/usr/bin/cps boot-env finalize-trial
+TimeoutStopSec=5min

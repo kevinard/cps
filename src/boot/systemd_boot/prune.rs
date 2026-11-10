@@ -347,14 +347,11 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid boot entry filename")?;
-    renameat_with(
-        CWD,
-        &entry.path,
-        CWD,
-        entry.path.with_file_name(exhausted_name(id, name)?),
-        RenameFlags::NOREPLACE,
-    )
-    .context("exhausting the abandoned trial's boot counter")?;
+    let exhausted = entry.path.with_file_name(exhausted_name(id, name)?);
+    renameat_with(CWD, &entry.path, CWD, &exhausted, RenameFlags::NOREPLACE)
+        .context("exhausting the abandoned trial's boot counter")?;
+    // On VFAT the renamed entry's size is durable only with its inode.
+    File::open(&exhausted)?.sync_all()?;
     File::open(entry.path.parent().context("missing entries directory")?)?.sync_all()?;
     Ok(())
 }
@@ -441,6 +438,34 @@ mod tests {
         );
         assert!(exhausted_name(&id, &format!("{id}.conf")).is_err());
         assert!(exhausted_name(&id, &format!("{}+1.conf", self::id(5))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn backups_count_as_known_good_environments() -> Result<()> {
+        // The running root 5 boots with fallback 3. Live changes left the
+        // backups 6 to 9, which record no parent.
+        let entries: Vec<_> = [3, 6, 7, 8, 9]
+            .into_iter()
+            .map(|revision| entry(revision, None, None))
+            .chain([entry(5, Some(3), None)])
+            .collect();
+        let policy = LoaderPolicy::pinned(&id(5));
+        let protected = protected(Some((id(5), Some(id(3)))), None, None);
+        // The oldest backups retire first, and the running root and its
+        // fallback stay even when they are among the oldest.
+        assert_eq!(
+            removed(&candidates(&entries, &policy, &protected, Some(3))?),
+            [(6, BootRemoval::KnownGood)]
+        );
+        assert_eq!(
+            removed(&candidates(&entries, &policy, &protected, Some(1))?),
+            [
+                (6, BootRemoval::KnownGood),
+                (7, BootRemoval::KnownGood),
+                (8, BootRemoval::KnownGood)
+            ]
+        );
         Ok(())
     }
 

@@ -211,7 +211,8 @@ impl LoaderPolicy {
             let mut temp = NamedTempFile::new_in(parent)?;
             temp.write_all(content.as_bytes())?;
             temp.as_file().sync_all()?;
-            temp.persist(path)?;
+            // On VFAT the renamed file's size is durable only with its inode.
+            temp.persist(path)?.sync_all()?;
         }
         File::open(parent)?.sync_all()?;
         Ok(())

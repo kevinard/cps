@@ -4481,6 +4481,7 @@ fn exact_install_and_remove_offline() -> Result<()> {
 mod release;
 mod transitions;
 
+mod etc_merge;
 mod facets;
 mod freezes;
 mod modes;
