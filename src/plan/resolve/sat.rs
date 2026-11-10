@@ -1,8 +1,8 @@
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Display},
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -14,11 +14,11 @@ use resolvo::{
     utils::{Pool, VersionSet},
 };
 
+use super::Package;
 use crate::{
     image::Installed,
     model::{Dependency, DependencyTarget, Manifest, Version, VersionConstraint},
     plan::paths::PathConflict,
-    repo::Published,
 };
 
 #[derive(Clone, Default, Eq, Hash, PartialEq)]
@@ -37,6 +37,14 @@ impl Filter {
         };
         matches != self.exclude
     }
+
+    fn accepts(&self, package: Package<'_>) -> bool {
+        let matches = match &self.capability {
+            Some(name) => package.provides_capability(name, &self.constraint),
+            None => self.constraint.matches(package.version()),
+        };
+        matches != self.exclude
+    }
 }
 
 impl VersionSet for Filter {
@@ -52,17 +60,49 @@ impl Display for Filter {
     }
 }
 
-const TIME_LIMIT: Duration = Duration::from_secs(60);
+/// Resolution work is bounded by solver steps, not wall-clock time, so the
+/// outcome of a plan never depends on the speed of the machine. One step is
+/// one cancellation check: a unit propagation round or a provider request.
+/// A solve takes about two steps per selected package, and admitting 2048
+/// recommendations about a million, so the limits only stop runaway searches.
+const REQUIRED_WORK: u64 = 50_000_000;
+/// Recommendations share a separate budget. When it runs out, the remaining
+/// recommendations are skipped, at the same point on every machine.
+const RECOMMENDED_WORK: u64 = 50_000_000;
+
+struct Budget {
+    used: Cell<u64>,
+    limit: u64,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Self {
+            used: Cell::new(0),
+            limit,
+        }
+    }
+
+    fn spend(&self) -> bool {
+        let used = self.used.get().saturating_add(1);
+        self.used.set(used);
+        used <= self.limit
+    }
+
+    fn exhausted(&self) -> bool {
+        self.used.get() >= self.limit
+    }
+}
 
 struct Universe<'a> {
     pool: Pool<Filter>,
     candidates: BTreeMap<NameId, Candidates>,
-    packages: Vec<(&'a Published, KnownDependencies)>,
+    packages: Vec<(Package<'a>, KnownDependencies)>,
 }
 
 impl<'a> Universe<'a> {
     fn new(
-        candidates: &BTreeMap<&str, Vec<&'a Published>>,
+        candidates: &BTreeMap<&str, Vec<Package<'a>>>,
         wanted: &BTreeSet<&str>,
         installed: &BTreeMap<String, Installed>,
     ) -> Result<Self> {
@@ -74,7 +114,7 @@ impl<'a> Universe<'a> {
         let mut providers = BTreeMap::<_, BTreeSet<_>>::new();
         for (&name, versions) in candidates {
             for package in versions {
-                for capability in package.manifest.provides.keys() {
+                for capability in package.provides().keys() {
                     providers
                         .entry(capability.as_str())
                         .or_default()
@@ -92,7 +132,7 @@ impl<'a> Universe<'a> {
             let mut solvables = Vec::with_capacity(versions.len());
             for &package in versions {
                 let mut dependencies = KnownDependencies::default();
-                for dependency in &package.manifest.dependency {
+                for dependency in package.dependencies() {
                     match dependency {
                         Dependency::Require(target) => dependencies
                             .requirements
@@ -144,12 +184,12 @@ impl<'a> Universe<'a> {
         Ok(universe)
     }
 
-    fn package(&self, id: SolvableId) -> &'a Published {
+    fn package(&self, id: SolvableId) -> Package<'a> {
         self.packages[self.pool.resolve_solvable(id).record].0
     }
 
     fn exact(&self, id: SolvableId) -> ConditionalRequirement {
-        let version = &self.package(id).manifest.version;
+        let version = self.package(id).version();
         let name = self.pool.resolve_solvable(id).name;
         self.pool
             .intern_version_set(
@@ -245,7 +285,11 @@ impl<'a> Universe<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{kdl_format::parse_manifest, model::digest};
+    use crate::{
+        kdl_format::parse_manifest,
+        model::digest,
+        repo::{PackageInfo, Published},
+    };
 
     fn published(name: &str, version: &str, body: &str) -> Result<Published> {
         let document = format!(
@@ -263,7 +307,7 @@ mod tests {
         wanted: &[&str],
         installed: &BTreeMap<String, Installed>,
     ) -> Result<BTreeSet<String>> {
-        let mut candidates = BTreeMap::<_, Vec<_>>::new();
+        let mut candidates = BTreeMap::<_, Vec<&dyn PackageInfo>>::new();
         for package in packages {
             candidates
                 .entry(package.manifest.name.as_str())
@@ -338,7 +382,7 @@ mod tests {
     #[test]
     fn resolves_a_large_cycle() -> Result<()> {
         const COUNT: usize = 4096;
-        let mut packages = Vec::<Published>::with_capacity(COUNT);
+        let mut packages = Vec::<crate::repo::Published>::with_capacity(COUNT);
         for index in 0..COUNT {
             let next = (index + 1) % COUNT;
             let document = format!(
@@ -353,7 +397,7 @@ mod tests {
         }
         let candidates = packages
             .iter()
-            .map(|package| (package.manifest.name.as_str(), vec![package]))
+            .map(|package| (package.manifest.name.as_str(), vec![package as Package<'_>]))
             .collect();
         let selected = solve(
             &candidates,
@@ -363,6 +407,62 @@ mod tests {
             Ok,
         )?;
         assert_eq!(selected.len(), COUNT);
+        Ok(())
+    }
+
+    #[test]
+    fn admits_thousands_of_recommendations_with_a_few_solves() -> Result<()> {
+        const COUNT: usize = 2048;
+        let package = |name: &str, body: &str| -> Result<crate::repo::Published> {
+            let document = format!(
+                "schema-version 1 kind=\"package-manifest\"\npackage \"{name}\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{body}}}\n"
+            );
+            Ok(serde_json::from_value(serde_json::json!({
+                "sha256": digest(document.as_bytes()),
+                "manifest": parse_manifest(&document)?,
+                "document": document,
+            }))?)
+        };
+        let mut body = String::new();
+        let mut packages = Vec::new();
+        for index in 0..COUNT {
+            let name = format!("extras/plugin-{index:04}");
+            body.push_str(&format!("    recommends \"{name}\"\n"));
+            // Every other recommendation conflicts with the required runtime.
+            let extra = if index % 64 == 0 {
+                "    exclude \"library/runtime\"\n"
+            } else {
+                ""
+            };
+            packages.push(package(&name, extra)?);
+        }
+        packages.push(package("library/runtime", "")?);
+        body.push_str("    require \"library/runtime\"\n");
+        packages.push(package("apps/desktop", &body)?);
+        let candidates = packages
+            .iter()
+            .map(|package| (package.manifest.name.as_str(), vec![package as Package<'_>]))
+            .collect();
+        let solves = Cell::new(0);
+        let selected = solve(
+            &candidates,
+            &BTreeSet::from(["apps/desktop"]),
+            &BTreeMap::new(),
+            Some(&BTreeMap::new()),
+            |selected| {
+                solves.set(solves.get() + 1);
+                Ok(selected
+                    .keys()
+                    .map(|name| name.to_string())
+                    .collect::<BTreeSet<_>>())
+            },
+        )?;
+        assert_eq!(selected.len(), 2 + COUNT - COUNT / 64);
+        assert!(!selected.contains("extras/plugin-0000"));
+        assert!(selected.contains("extras/plugin-0001"));
+        // Binary splitting isolates each conflict in a logarithmic number of
+        // solves, rather than one solve per recommendation.
+        assert!(solves.get() < COUNT / 2, "{} solves", solves.get());
         Ok(())
     }
 }
@@ -399,7 +499,7 @@ impl Rejections {
                 self.pairs.insert((a.min(b), a.max(b))),
                 "solver selected a rejected candidate pair"
             );
-            let version = &universe.package(b).manifest.version;
+            let version = universe.package(b).version();
             let filter = Filter {
                 expression: Some(format!("={version} ({conflict})")),
                 constraint: VersionConstraint::exact(version.clone()),
@@ -417,7 +517,7 @@ impl Rejections {
 struct Provider<'u, 'a> {
     universe: &'u Universe<'a>,
     rejections: &'u Rejections,
-    deadline: Instant,
+    budget: &'u Budget,
 }
 
 impl Interner for Provider<'_, '_> {
@@ -425,7 +525,7 @@ impl Interner for Provider<'_, '_> {
     type SolvableId = SolvableId;
 
     fn display_solvable(&self, id: SolvableId) -> impl Display + '_ {
-        &self.universe.package(id).manifest.version
+        self.universe.package(id).version()
     }
 
     fn display_name(&self, id: NameId) -> impl Display + '_ {
@@ -468,7 +568,7 @@ impl DependencyProvider for Provider<'_, '_> {
         candidates
             .iter()
             .copied()
-            .filter(|&id| filter.matches(&self.universe.package(id).manifest) != inverse)
+            .filter(|&id| filter.accepts(self.universe.package(id)) != inverse)
             .collect()
     }
 
@@ -502,18 +602,17 @@ impl DependencyProvider for Provider<'_, '_> {
     }
 
     fn should_cancel_with_value(&self) -> Option<Box<dyn Any>> {
-        (Instant::now() >= self.deadline).then(|| Box::new(()) as Box<dyn Any>)
+        (!self.budget.spend()).then(|| Box::new(()) as Box<dyn Any>)
     }
 }
 
 pub(super) fn solve<'a, T>(
-    candidates: &BTreeMap<&str, Vec<&'a Published>>,
+    candidates: &BTreeMap<&str, Vec<Package<'a>>>,
     wanted: &BTreeSet<&str>,
     installed: &BTreeMap<String, Installed>,
     recommendation_exclusions: Option<&BTreeMap<String, String>>,
-    compose: impl Fn(BTreeMap<&'a str, &'a Published>) -> Result<T>,
+    compose: impl Fn(BTreeMap<&'a str, Package<'a>>) -> Result<T>,
 ) -> Result<T> {
-    let deadline = Instant::now() + TIME_LIMIT;
     let universe = Universe::new(candidates, wanted, installed)?;
     let mut requirements: Vec<_> = wanted
         .iter()
@@ -526,11 +625,12 @@ pub(super) fn solve<'a, T>(
         })
         .collect();
     let mut rejections = Rejections::default();
+    let required = Budget::new(REQUIRED_WORK);
     let (mut selected, mut composed) = select(
         &universe,
         &requirements,
         &mut rejections,
-        deadline,
+        &required,
         false,
         &compose,
     )?
@@ -538,24 +638,20 @@ pub(super) fn solve<'a, T>(
     let Some(excluded) = recommendation_exclusions else {
         return Ok(composed);
     };
-    if !selected.values().any(|&id| {
-        universe
-            .package(id)
-            .manifest
-            .dependency
-            .iter()
-            .any(|dependency| matches!(dependency, Dependency::Recommend(_)))
-    }) {
-        return Ok(composed);
-    }
 
-    // Lock the required solution and each accepted addition before trying the
-    // next recommendation. Recommendations can add a closure, never replace one.
+    // Lock the required solution, then admit recommendations in rounds.
+    // Recommendations can add a closure, never replace a locked selection.
+    let mut search = Recommendations {
+        universe: &universe,
+        rejections,
+        budget: Budget::new(RECOMMENDED_WORK),
+        compose: &compose,
+    };
     requirements.clear();
     let mut locked = BTreeSet::new();
-    let mut pending = VecDeque::new();
     let mut attempted = BTreeSet::new();
-    'extend: loop {
+    loop {
+        let mut pending = Vec::new();
         for (&name, &id) in &selected {
             if !locked.insert(name) {
                 continue;
@@ -565,7 +661,7 @@ pub(super) fn solve<'a, T>(
                 continue;
             }
             let old = installed.get(name).map(|entry| &entry.published.manifest);
-            for dependency in &universe.package(id).manifest.dependency {
+            for dependency in universe.package(id).dependencies() {
                 let Dependency::Recommend(target) = dependency else {
                     continue;
                 };
@@ -579,61 +675,93 @@ pub(super) fn solve<'a, T>(
                         continue;
                     }
                 }
-                pending.push_back(target);
+                pending.push(target);
             }
         }
-        while let Some(target) = pending.pop_front() {
+        pending.retain(|target| {
             let name = target.package.as_str();
-            if selected.contains_key(name)
-                || !candidates.contains_key(name)
-                || !attempted.insert((name, target.version.as_deref()))
-            {
-                continue;
-            }
-            requirements.push(universe.target(target, false)?.into());
-            let attempt = select(
-                &universe,
-                &requirements,
-                &mut rejections,
-                deadline,
-                true,
-                &compose,
-            )?;
-            requirements.pop();
-            if let Some(next) = attempt {
-                (selected, composed) = next;
-                continue 'extend;
-            }
-        }
-        return Ok(composed);
+            !selected.contains_key(name)
+                && candidates.contains_key(name)
+                && attempted.insert((name, target.version.as_deref()))
+        });
+        let mut accepted = None;
+        search.admit(&mut requirements, &pending, &mut accepted)?;
+        let Some(next) = accepted else {
+            return Ok(composed);
+        };
+        (selected, composed) = next;
     }
 }
 
 type Selection<'a> = BTreeMap<&'a str, SolvableId>;
 
+struct Recommendations<'u, 'a, C> {
+    universe: &'u Universe<'a>,
+    rejections: Rejections,
+    budget: Budget,
+    compose: &'u C,
+}
+
+impl<'a, T, C: Fn(BTreeMap<&'a str, Package<'a>>) -> Result<T>> Recommendations<'_, 'a, C> {
+    /// Admit a batch of recommendations with one solve when the whole batch
+    /// fits, and split a failing batch in order, so earlier recommendations
+    /// win conflicts. Accepted targets stay in `requirements`.
+    fn admit(
+        &mut self,
+        requirements: &mut Vec<ConditionalRequirement>,
+        batch: &[&DependencyTarget],
+        accepted: &mut Option<(Selection<'a>, T)>,
+    ) -> Result<()> {
+        if batch.is_empty() || self.budget.exhausted() {
+            return Ok(());
+        }
+        let base = requirements.len();
+        for target in batch {
+            requirements.push(self.universe.target(target, false)?.into());
+        }
+        if let Some(next) = select(
+            self.universe,
+            requirements,
+            &mut self.rejections,
+            &self.budget,
+            true,
+            self.compose,
+        )? {
+            *accepted = Some(next);
+            return Ok(());
+        }
+        requirements.truncate(base);
+        if let [_] = batch {
+            return Ok(());
+        }
+        let (first, second) = batch.split_at(batch.len() / 2);
+        self.admit(requirements, first, accepted)?;
+        self.admit(requirements, second, accepted)
+    }
+}
+
 fn select<'a, T>(
     universe: &Universe<'a>,
     requirements: &[ConditionalRequirement],
     rejections: &mut Rejections,
-    deadline: Instant,
+    budget: &Budget,
     optional: bool,
-    compose: &impl Fn(BTreeMap<&'a str, &'a Published>) -> Result<T>,
+    compose: &impl Fn(BTreeMap<&'a str, Package<'a>>) -> Result<T>,
 ) -> Result<Option<(Selection<'a>, T)>> {
     loop {
-        ensure!(
-            Instant::now() < deadline,
-            "package resolution exceeded {} seconds",
-            TIME_LIMIT.as_secs()
-        );
         let ids = {
             let mut solver = Solver::new(Provider {
                 universe,
                 rejections,
-                deadline,
+                budget,
             });
             match solver.solve(Problem::new().requirements(requirements.to_vec())) {
                 Ok(ids) => ids,
-                Err(UnsolvableOrCancelled::Unsolvable(_)) if optional => return Ok(None),
+                Err(UnsolvableOrCancelled::Unsolvable(_) | UnsolvableOrCancelled::Cancelled(_))
+                    if optional =>
+                {
+                    return Ok(None);
+                }
                 Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
                     bail!(
                         "cannot satisfy package constraints\n{}",
@@ -642,15 +770,15 @@ fn select<'a, T>(
                 }
                 Err(UnsolvableOrCancelled::Cancelled(_)) => {
                     bail!(
-                        "package resolution exceeded {} seconds",
-                        TIME_LIMIT.as_secs()
+                        "package resolution exceeded its limit of {} solver steps",
+                        budget.limit
                     );
                 }
             }
         };
         let selected = ids
             .into_iter()
-            .map(|id| (universe.package(id).manifest.name.as_str(), id))
+            .map(|id| (universe.package(id).name(), id))
             .collect::<BTreeMap<_, _>>();
         let manifests = selected
             .iter()

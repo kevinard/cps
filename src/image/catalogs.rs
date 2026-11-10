@@ -5,8 +5,8 @@ use rusqlite::{Connection, Transaction};
 
 use super::{Image, ProfileIntent, Publisher, Publishers, Settings, State};
 use crate::repo::{
-    CATALOG_LIMIT, Catalog, CatalogCheckpoint, ReleaseProfile, catalog_bytes, read_catalog,
-    take_profile,
+    CATALOG_LIMIT, Catalog, CatalogCheckpoint, ReleaseProfile, archived_catalog_hash,
+    catalog_bytes, read_catalog, take_profile,
 };
 
 pub(super) fn save(tx: &Transaction<'_>, state: &State) -> Result<()> {
@@ -20,19 +20,15 @@ pub(super) fn save(tx: &Transaction<'_>, state: &State) -> Result<()> {
             .publishers
             .get(name)
             .context("missing checkpoint publisher")?;
-        let bytes = match catalog_bytes(&publisher.repo, &checkpoint.catalog) {
-            Ok(bytes) => bytes,
-            Err(_)
-                if read(tx, name)
-                    .is_ok_and(|bytes| crate::model::digest(&bytes) == checkpoint.catalog) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("archiving the signed catalog for {name}"));
-            }
-        };
+        // An archive names its catalog in its first record, so an unchanged
+        // checkpoint costs neither the shards nor a rewrite.
+        if read(tx, name).is_ok_and(|bytes| {
+            archived_catalog_hash(&bytes).is_ok_and(|hash| hash == checkpoint.catalog)
+        }) {
+            continue;
+        }
+        let bytes = catalog_bytes(&publisher.repo, &checkpoint.catalog)
+            .with_context(|| format!("archiving the signed catalog for {name}"))?;
         insert.execute((name, bytes))?;
     }
     Ok(())

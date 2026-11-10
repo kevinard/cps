@@ -27,7 +27,7 @@ use crate::{
         Node, PackageSpec, Selection, digest, facet_pattern_covers, validate_name,
         validate_publisher,
     },
-    repo::{BuildReceipt, Published, ReleaseAdvisory, ReleaseProfile},
+    repo::{BuildReceipt, PackageInfo, Published, ReleaseAdvisory, ReleaseProfile},
     systemd::{self, Action as SystemdAction},
 };
 
@@ -787,9 +787,9 @@ fn plan_with_state(
     )
 }
 
-fn resolve_local<'a>(
+fn resolve_local<'a, P: PackageInfo + 'a>(
     state: &'a State,
-    available: Candidates<'_, impl IntoIterator<Item = &'a Published>>,
+    available: Candidates<'_, impl IntoIterator<Item = &'a P>>,
     requested: &BTreeMap<&'a str, PackageSpec<'a>>,
     update: bool,
     exact: bool,
@@ -1156,7 +1156,7 @@ fn build_with_update_diagnostics(
             resolve_local(
                 &state,
                 Candidates {
-                    packages: std::iter::empty(),
+                    packages: std::iter::empty::<&Published>(),
                     obsoletions: &BTreeMap::new(),
                     freezes: &state.settings.freezes,
                     profile_packages: &state.settings.profile_packages,

@@ -17,7 +17,7 @@ use crate::{
         validate_name, validate_policy, validate_publisher,
     },
     query::verified_intent,
-    repo::{CATALOG_LIMIT, Published, catalog_index, export_locked_repository, read_limited},
+    repo::{CATALOG_LIMIT, PackageInfo, catalog_index, export_locked_repository, read_limited},
 };
 
 const LOCK_FORMAT: u32 = 1;
@@ -391,22 +391,24 @@ impl ImageLock {
             .collect()
     }
 
-    pub(crate) fn replay(&self, candidates: &[Published]) -> Result<BTreeMap<String, Installed>> {
+    pub(crate) fn replay(
+        &self,
+        candidates: &[impl PackageInfo],
+    ) -> Result<BTreeMap<String, Installed>> {
         let mut selected = BTreeMap::new();
         for candidate in candidates {
-            let manifest = &candidate.manifest;
-            let name = &manifest.name;
+            let name = candidate.name();
             if self.packages.get(name).is_some_and(|locked| {
-                locked.version == manifest.version
-                    && locked.publisher == manifest.publisher
-                    && locked.manifest_sha256 == candidate.sha256
+                &locked.version == candidate.version()
+                    && locked.publisher == candidate.publisher()
+                    && locked.manifest_sha256 == candidate.sha256()
             }) {
                 ensure!(
                     selected
                         .insert(
-                            name.clone(),
+                            name.to_owned(),
                             Installed {
-                                published: candidate.clone(),
+                                published: candidate.load()?,
                                 explicit: self.local_roots.contains(name),
                             }
                         )

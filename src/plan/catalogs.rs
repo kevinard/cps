@@ -1,7 +1,4 @@
-use std::{
-    borrow::Borrow,
-    collections::{BTreeMap, BTreeSet},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 
@@ -10,13 +7,16 @@ use crate::{
     attestation::BuildTrust,
     image::{Image, Installed, Publisher, State, lock::ImageLock},
     model::{PackageSpec, Version},
-    repo::{BuildEvidence, BuildReceipt, CatalogCheckpoint, Published, ReleaseProfile, snapshot},
+    repo::{
+        BuildEvidence, BuildReceipt, Candidate, CatalogCheckpoint, PackageInfo, Published,
+        ReleaseProfile, candidates,
+    },
 };
 
 #[derive(Default)]
 pub(super) struct Catalogs {
     pub pins: BTreeMap<String, String>,
-    pub candidates: CandidateSet<Published>,
+    pub candidates: CandidateSet<Candidate>,
     pub renames: Renames,
     pub profile: Option<ReleaseProfile>,
     pub checkpoints: BTreeMap<String, CatalogCheckpoint>,
@@ -117,28 +117,28 @@ impl<P> Default for CandidateSet<P> {
     }
 }
 
-impl<P: Borrow<Published>> CandidateSet<P> {
+impl<P: PackageInfo> CandidateSet<P> {
     pub(crate) fn replay(&self, profile: &ReleaseProfile) -> Result<BTreeMap<String, Installed>> {
         let mut installed = BTreeMap::new();
-        for package in self.packages.iter().map(Borrow::borrow) {
-            let name = &package.manifest.name;
-            if profile.composition.get(name) != Some(&package.sha256) {
+        for package in &self.packages {
+            let name = package.name();
+            if profile.composition.get(name).map(String::as_str) != Some(package.sha256()) {
                 continue;
             }
-            package.manifest.check_architecture(&profile.architecture)?;
+            package.check_architecture(&profile.architecture)?;
             ensure!(
                 self.obsoletions
                     .get(name)
-                    .is_none_or(|cutoff| package.manifest.version.semantic() > cutoff.semantic()),
+                    .is_none_or(|cutoff| package.version().semantic() > cutoff.semantic()),
                 "signed profile package {} is obsolete",
-                package.manifest.id()
+                package.id()
             );
             let entry = Installed {
-                published: package.clone(),
+                published: package.load()?,
                 explicit: profile.roots.contains_key(name),
             };
             ensure!(
-                installed.insert(name.clone(), entry).is_none(),
+                installed.insert(name.to_owned(), entry).is_none(),
                 "duplicate manifest for signed profile package {name}"
             );
         }
@@ -190,11 +190,11 @@ impl<P: Borrow<Published>> CandidateSet<P> {
                 },
             );
         }
-        let packages = self.packages.iter().map(Borrow::borrow).filter(|pkg| {
+        let packages = self.packages.iter().filter(|pkg| {
             profile
                 .composition
-                .get(&pkg.manifest.name)
-                .is_none_or(|hash| hash == &pkg.sha256)
+                .get(pkg.name())
+                .is_none_or(|hash| hash == pkg.sha256())
         });
         let (mut installed, paths) = resolve::resolve(
             before,
@@ -241,9 +241,7 @@ impl<P: Borrow<Published>> CandidateSet<P> {
         packages: impl IntoIterator<Item = P>,
     ) {
         self.packages.extend(packages.into_iter().filter(|pkg| {
-            let manifest = &pkg.borrow().manifest;
-            manifest.supports_architecture(architecture)
-                && claim_source(sources, publisher, &manifest.name)
+            pkg.supports_architecture(architecture) && claim_source(sources, publisher, pkg.name())
         }));
     }
 }
@@ -379,9 +377,9 @@ pub(super) fn load(
                 },
                 publisher.name
             );
-            required.snapshot(&publisher.repo, &publisher.name, &publisher.key)
+            required.candidates(&publisher.repo, &publisher.name, &publisher.key)
         } else {
-            snapshot(&publisher.repo, &publisher.name, &publisher.key, pin)
+            candidates(&publisher.repo, &publisher.name, &publisher.key, pin)
         }
         .with_context(|| format!("reading signed catalog for {}", publisher.name))?;
         image.check_catalog(

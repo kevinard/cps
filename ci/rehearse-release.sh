@@ -25,7 +25,7 @@ private=$work/repo
 mkdir "$private"
 
 # Copy only repository objects. The test repository has its own current pointer.
-for dir in catalogs manifests blobs attestations file-indexes; do
+for dir in catalogs catalog-shards manifests blobs attestations file-indexes; do
     if [[ -d $repo/$dir ]]; then
         cp -a --reflink=auto -- "$repo/$dir" "$private/"
     fi
@@ -34,8 +34,8 @@ printf '%s\n' "$candidate" > "$private/current"
 catalog="$private/catalogs/$candidate"
 printf '%s  %s\n' "$candidate" "$catalog" | sha256sum --check --status
 jq -e --arg publisher "$publisher" \
-    '.catalog.publisher == $publisher and (.catalog.release_profiles | length > 0)' "$catalog" >/dev/null
-jq -r '.catalog.release_profiles | keys[]' "$catalog" > "$work/profiles"
+    '(.signed | @base64d | fromjson) | .publisher == $publisher and (.release_profiles | length > 0)' "$catalog" >/dev/null
+jq -r '(.signed | @base64d | fromjson).release_profiles | keys[]' "$catalog" > "$work/profiles"
 touch "$work/tested"
 
 install_profile() {
@@ -66,7 +66,7 @@ for config in "$cases"/*/image.kdl; do
     baselines=()
     if [[ -n $base ]]; then
         recorded=$(jq -r --arg profile "$profile" \
-            '(.catalog.release_profiles[$profile].composition | length) > 0' \
+            '((.signed | @base64d | fromjson).release_profiles[$profile].composition | length) > 0' \
             "$private/catalogs/$base")
         if [[ $recorded == true ]]; then
             baselines+=("$base")

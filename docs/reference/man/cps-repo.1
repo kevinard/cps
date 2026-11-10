@@ -16,6 +16,9 @@
 .B \&refresh\-metadata
 \&Re\-sign the timestamp, and optionally the snapshot, of a published mirror
 .TP
+.B \&prune\-withdrawals
+\&Replace old withdrawal records with signed tombstones up to a catalog sequence
+.TP
 .B \&index\-files
 \&Enable a catalog\-signed index for available package file lookups
 .TP
@@ -156,6 +159,27 @@
 .TP
 .B \&\-\-output <OUTPUT>
 \&New directory for timestamp.json and any re\-signed snapshot
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo prune\-withdrawals"
+\&Replace old withdrawal records with signed tombstones up to a catalog sequence
+.PP
+.B \&cps repo prune\-withdrawals \-\-repo <REPO> \-\-publisher <PUBLISHER> \-\-signing\-key <SIGNING_KEY> \-\-base <BASE> \-\-through <SEQUENCE>
+.PP
+.B Options
+.PP
+.B \&\-\-repo <REPO>
+.PP
+.B \&\-\-publisher <PUBLISHER>
+.PP
+.B \&\-\-signing\-key <SIGNING_KEY>
+.TP
+.B \&\-\-base <BASE>
+\&Exact current catalog to build on
+.TP
+.B \&\-\-through <SEQUENCE>
+\&Prune records withdrawn at or before this catalog sequence
 .TP
 .B \&\-h, \-\-help
 \&Print help

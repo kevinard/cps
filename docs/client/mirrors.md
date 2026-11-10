@@ -31,7 +31,9 @@ Point `image-create` or the KDL image configuration at this cache. Give write ac
 
 Full sync checks TUF signatures, versions, and expiration, then verifies the CPS publisher signature and downloads the complete release. A failed download leaves the previous cache available. Sync can repair a damaged cache object when the mirror release includes that exact digest. The cache retains previous content-addressed objects for saved plans. Planning and applying can work offline once the required metadata and payloads are cached.
 
-CPS limits repository reads to 64 MiB per catalog and 32 MiB per manifest.
+CPS limits repository reads to 16 MiB per signed catalog root, 16 MiB per
+catalog shard, and 32 MiB per manifest. A refresh downloads the new root and
+only the shards whose digests changed.
 It bounds payload staging by the signed file length and checks the digest
 before recording the transaction. TUF metadata is limited to 1 MiB for the
 root and timestamp and 16 MiB for the snapshot and each targets role, the
@@ -72,7 +74,8 @@ different catalog at the same sequence, or a signing history that drops a
 known rotation. The check works with a replacement cache that lacks the
 previous catalog.
 
-CPS also archives one signed catalog per applied publisher. A different
+CPS also archives one signed catalog per applied publisher: a compressed copy
+of the signed root and all of its shards, so the checks below work offline. A different
 catalog must preserve published manifests, withdrawals, obsoletions, and
 profile safeguards, even when the cache lacks the earlier catalog. This
 applies to both profile companions and independently configured publishers.

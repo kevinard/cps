@@ -8,7 +8,7 @@ use super::freeze::{self, FrozenPackage};
 use crate::{
     image::Installed,
     model::{Dependency, DependencyTarget, PackageSpec, Version, VersionConstraint},
-    repo::Published,
+    repo::{PackageInfo, Published},
 };
 
 pub(crate) struct Candidates<'a, P> {
@@ -34,9 +34,11 @@ impl Retention<'_> {
     }
 }
 
-pub fn resolve<'a, T>(
+pub(crate) type Package<'a> = &'a dyn PackageInfo;
+
+pub fn resolve<'a, T, P: PackageInfo + 'a>(
     installed: &'a BTreeMap<String, Installed>,
-    available: Candidates<'_, impl IntoIterator<Item = &'a Published>>,
+    available: Candidates<'_, impl IntoIterator<Item = &'a P>>,
     requested: &BTreeMap<&str, PackageSpec<'_>>,
     update: bool,
     retention: Retention<'_>,
@@ -55,75 +57,71 @@ pub fn resolve<'a, T>(
             );
         }
     }
-    let mut candidates = BTreeMap::<_, Vec<_>>::new();
-    let obsolete = |package: &Published| {
-        let manifest = &package.manifest;
+    let mut candidates = BTreeMap::<_, Vec<Package<'a>>>::new();
+    let obsolete = |package: Package<'_>| {
         available
             .obsoletions
-            .get(&manifest.name)
-            .is_some_and(|cutoff| manifest.version.semantic() <= cutoff.semantic())
+            .get(package.name())
+            .is_some_and(|cutoff| package.version().semantic() <= cutoff.semantic())
     };
-    for package in available
+    let offered = available
         .packages
         .into_iter()
-        .chain(installed.values().map(|pkg| &pkg.published))
-    {
+        .map(|package| package as Package<'a>);
+    for package in offered.chain(installed.values().map(|pkg| &pkg.published as Package<'a>)) {
         if obsolete(package) {
             continue;
         }
-        let manifest = &package.manifest;
+        let (name, version) = (package.name(), package.version());
         if available
             .freezes
-            .get(&manifest.name)
-            .is_some_and(|freeze| freeze.version != manifest.version)
+            .get(name)
+            .is_some_and(|freeze| &freeze.version != version)
         {
             continue;
         }
-        let spec = requested.get(manifest.name.as_str());
+        let spec = requested.get(name);
         let pinned = spec.and_then(|spec| spec.version.as_ref());
-        let previous = installed.get(&manifest.name);
+        let previous = installed.get(name);
         if let Some(previous) = previous {
             let old = &previous.published.manifest;
-            if old.publisher != manifest.publisher
-                || (old.version.semantic() > manifest.version.semantic()
-                    && pinned != Some(&manifest.version))
+            if old.publisher != package.publisher()
+                || (old.version.semantic() > version.semantic() && pinned != Some(version))
             {
                 continue;
             }
             ensure!(
-                old.version != manifest.version || package.sha256 == previous.published.sha256,
+                &old.version != version || package.sha256() == previous.published.sha256,
                 "conflicting digests for {}",
-                manifest.id()
+                package.id()
             );
         }
         if spec.is_some_and(|spec| {
             spec.publisher
-                .is_some_and(|publisher| publisher != manifest.publisher)
-                || pinned.is_some_and(|version| version != &manifest.version)
+                .is_some_and(|publisher| publisher != package.publisher())
+                || pinned.is_some_and(|pinned| pinned != version)
         }) {
             continue;
         }
-        candidates
-            .entry(manifest.name.as_str())
-            .or_default()
-            .push(package);
+        candidates.entry(name).or_default().push(package);
     }
     for (name, versions) in &mut candidates {
         let prefer_current = !update && !requested.contains_key(*name);
-        let current = installed.get(*name).map(|pkg| &pkg.published.sha256);
+        let current = installed
+            .get(*name)
+            .map(|pkg| pkg.published.sha256.as_str());
         // Prefer the newest release. A respelling of the installed release is
         // not an upgrade, so the installed package wins a semantic tie.
-        versions.sort_by_key(|pkg| {
-            let is_current = current == Some(&pkg.sha256);
-            (
-                prefer_current && is_current,
-                pkg.manifest.version.semantic(),
-                is_current,
-                &pkg.manifest.version,
-            )
+        versions.sort_by(|a, b| {
+            let (a_current, b_current) = (current == Some(a.sha256()), current == Some(b.sha256()));
+            (prefer_current && a_current)
+                .cmp(&(prefer_current && b_current))
+                .then_with(|| a.version().semantic().cmp(&b.version().semantic()))
+                .then_with(|| a_current.cmp(&b_current))
+                .then_with(|| a.version().cmp(b.version()))
         });
         versions.reverse();
-        versions.dedup_by(|a, b| a.sha256 == b.sha256);
+        versions.dedup_by(|a, b| a.sha256() == b.sha256());
     }
     for spec in requested.values() {
         if let Some(cutoff) = available.obsoletions.get(spec.name) {
@@ -154,28 +152,32 @@ pub fn resolve<'a, T>(
         .map(|(name, _)| name.as_str())
         .chain(requested.keys().copied())
         .collect();
-    let materialize = |selected: BTreeMap<&str, &Published>| {
+    // Only names reachable from the request can be selected, so the solver
+    // never sees the rest of a large catalog.
+    let candidates = reachable(candidates, &wanted);
+    let materialize = |selected: BTreeMap<&str, Package<'a>>| {
         for name in &wanted {
             ensure!(
                 selected.contains_key(name),
                 "resolver omitted required package {name}"
             );
         }
+        // Full manifests load only for the selection, once per candidate.
         let installed = selected
             .into_iter()
             .map(|(name, pkg)| {
                 let explicit = requested.contains_key(name)
                     || (retention.contains(name)
                         && installed.get(name).is_some_and(|old| old.explicit));
-                (
+                Ok((
                     name.to_owned(),
                     Installed {
-                        published: pkg.clone(),
+                        published: pkg.load()?,
                         explicit,
                     },
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         check(&installed).context("validating the resolved package set")?;
         freeze::check(available.freezes, &installed)?;
         let composed = compose(&installed)?;
@@ -195,6 +197,57 @@ pub fn resolve<'a, T>(
             format!("resolving package selection with freezes: {}; use plan unfreeze to lift a constraint", available.freezes.iter().map(|(name, frozen)| format!("{name}@{}{}", frozen.version, freeze::reason_suffix(frozen))).collect::<Vec<_>>().join(", "))
         })
     }
+}
+
+/// Keep the candidates of names that a requirement chain from `wanted` can
+/// reach: requirements, alternatives, conditional targets, capability
+/// providers, and recommendations. Constraints never add a package.
+fn reachable<'n, 'a>(
+    mut candidates: BTreeMap<&'n str, Vec<Package<'a>>>,
+    wanted: &BTreeSet<&str>,
+) -> BTreeMap<&'n str, Vec<Package<'a>>> {
+    let mut providers = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for (&name, versions) in &candidates {
+        for package in versions {
+            for capability in package.provides().keys() {
+                providers.entry(capability).or_default().insert(name);
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut pending: Vec<&str> = wanted.iter().copied().collect();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name) {
+            continue;
+        }
+        let Some(versions) = candidates.get(name) else {
+            continue;
+        };
+        for package in versions {
+            for dependency in package.dependencies() {
+                match dependency {
+                    Dependency::Require(target) | Dependency::Recommend(target) => {
+                        pending.push(&target.package);
+                    }
+                    Dependency::Conditional { target, .. } => pending.push(&target.package),
+                    Dependency::RequireAny { alternatives } => {
+                        pending.extend(alternatives.iter().map(|target| target.package.as_str()));
+                    }
+                    Dependency::RequireCapability(target) => pending.extend(
+                        providers
+                            .get(target.package.as_str())
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    ),
+                    Dependency::Incorporate(_) | Dependency::Exclude(_) => {}
+                }
+            }
+        }
+    }
+    let seen: BTreeSet<String> = seen.into_iter().map(str::to_owned).collect();
+    candidates.retain(|name, _| seen.contains(*name));
+    candidates
 }
 
 fn check_selected(selected: &BTreeMap<&str, &Published>) -> Result<()> {

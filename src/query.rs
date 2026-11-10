@@ -501,7 +501,7 @@ struct AvailablePackage {
 struct AvailableCatalog {
     packages: Vec<AvailablePackage>,
     obsoletions: BTreeMap<String, Version>,
-    file_index: Option<String>,
+    file_index: Option<Vec<String>>,
     catalog: String,
 }
 
@@ -777,12 +777,9 @@ pub fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
             pins.get(&publisher.name),
         )?;
         entries.dedup_by(|a, b| a.name == b.name);
-        if let Some(index) = file_index {
-            let index = crate::repo::read_file_index(&publisher.repo, &index)?;
+        if let Some(indexes) = file_index {
             let basename = term.rsplit('/').next().unwrap_or(term);
-            let Some(candidates) = index.get(basename) else {
-                continue;
-            };
+            let candidates = crate::repo::search_file_index(&publisher.repo, &indexes, basename)?;
             entries.retain(|entry| candidates.contains(&entry.id));
         }
         for entry in entries {
