@@ -21,13 +21,15 @@ publish() {
 }
 
 # The fixture handler records each run in a declared output and fails while
-# the image contains a marker.
-cat > proto/usr/libexec/hwdb-update <<'HANDLER'
+# the image contains a marker. It runs the tool where ship_runtime copies it,
+# the host path that PATH found, such as /usr/sbin/systemd-hwdb in a
+# container whose PATH lists /usr/sbin first.
+cat > proto/usr/libexec/hwdb-update <<HANDLER
 #!/usr/bin/bash
 set -eu
 [[ ! -e /etc/udev/hwdb-fail ]] || exit 42
 echo update >> /etc/udev/hwdb.runs
-exec /usr/bin/systemd-hwdb --strict update
+exec $tool --strict update
 HANDLER
 chmod 0755 proto/usr/libexec/hwdb-update
 publish test/systemd "$(ship_runtime proto /usr/bin/bash "$tool")
