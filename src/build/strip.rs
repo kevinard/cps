@@ -100,8 +100,14 @@ pub(crate) fn plan(
             if path.starts_with("usr/lib/debug/") {
                 continue;
             }
+            // Read only the magic number of files that cannot be ELF objects.
+            let mut file = root.file(path)?;
             let mut bytes = Vec::new();
-            root.file(path)?.read_to_end(&mut bytes)?;
+            file.by_ref().take(4).read_to_end(&mut bytes)?;
+            if bytes != b"\x7fELF" {
+                continue;
+            }
+            file.read_to_end(&mut bytes)?;
             let Some(id) = inspect(&bytes, arch, path)? else {
                 continue;
             };
