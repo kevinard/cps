@@ -18,15 +18,21 @@ use url::Url;
 
 use crate::{
     BuildSettings, BuildWorker, GitSnapshotRef, SourceLayout,
-    build::snapshot::{ARCHIVE, archive_commit, checkout, git, object_format},
+    build::{
+        read_expanded_output,
+        snapshot::{ARCHIVE, archive_commit, checkout, git, object_format},
+    },
     build_with_toolchain_config, fetch_sources_with_local,
+    image::root::Root,
     kdl_format::{
-        build::{RECIPE_LIMIT, git_document, git_toolchain_template, snapshot_recipe},
+        build::{
+            RECIPE_LIMIT, git_document, git_toolchain_template, parse as parse_recipe,
+            parse_template, snapshot_recipe,
+        },
         manifest_text,
     },
     model::{FileDigest, Manifest, digest},
-    publish,
-    repo::{read_signing_key, read_trust_root, snapshot},
+    repo::{publish_from_root, read_signing_key, read_trust_root, snapshot},
 };
 
 /// Renew the local Git publisher's trust root this long before it expires.
@@ -462,19 +468,31 @@ impl GitBuild {
             &self.archive,
         )?;
         let path = self.work.path();
-        fs::write(path.join("manifest.kdl"), manifest)?;
-        fs::write(path.join("build.kdl"), recipe)?;
+        fs::write(path.join("manifest.kdl"), &manifest)?;
+        fs::write(path.join("build.kdl"), &recipe)?;
         build_package(path, toolchain)?;
-        // The expanded manifest also lists the split debug information.
-        publish(
-            &store.repo(),
-            &path.join("worker/bundle/proto"),
-            &path
-                .join("worker/bundle")
-                .join(crate::build::expanded_manifest_path(&self.manifest.name)),
-            &store.private_key(),
-        )
+        let (proto, expanded) = checked_output(path, &manifest, &recipe)?;
+        let mut ids =
+            publish_from_root(&store.repo(), &proto, vec![expanded], &store.private_key())?;
+        Ok(ids.remove(0))
     }
+}
+
+/// Open the build output without following symlinks and check its expanded
+/// manifest against the template that CPS wrote.
+///
+/// On the sudo path the unprivileged build account owns `worker/`, so the
+/// output is untrusted until the expanded manifest is shown to be what the
+/// template produces. The expanded manifest also lists the split debug
+/// information.
+fn checked_output(work: &Path, template: &str, recipe: &str) -> Result<(Root, Manifest)> {
+    let recipe = parse_recipe(recipe)?;
+    let template = parse_template(template, &recipe)?;
+    let bundle = Root::open(work)?
+        .subdir("worker/bundle")
+        .context("opening the Git build output")?;
+    let manifest = read_expanded_output(&bundle, &recipe, &template)?;
+    Ok((bundle.subdir("proto")?, manifest))
 }
 
 fn build_package(path: &Path, toolchain: &Path) -> Result<()> {
@@ -630,6 +648,69 @@ mod tests {
             .output()?;
         ensure!(output.status.success(), "git {args:?} failed");
         Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
+    }
+
+    #[test]
+    fn git_build_output_is_checked_against_the_template() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let hash = digest(b"recipe input");
+        let recipe = format!(
+            r#"schema-version 1 kind="build-recipe"
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain solver="sat-v2" {{
+        publisher "seed" catalog="{hash}" key-sha256="{hash}"
+        package "build/compiler"
+    }}
+    manifest "manifest.kdl" sha256="{hash}"
+    script "true"
+}}
+"#
+        );
+        let template = r#"schema-version 1 kind="package-manifest"
+package "test/git" publisher="git" version="1.0.0-0" {
+    file "usr/share/git" mode="0644" uid=0 gid=0
+}
+"#;
+        let work = tempfile::tempdir()?;
+        let path = work.path();
+        let bundle = path.join("worker/bundle");
+        let manifests = bundle.join("manifests");
+        fs::create_dir_all(&manifests)?;
+        fs::create_dir(bundle.join("proto"))?;
+        let expanded = manifests.join("test/git.kdl");
+        fs::create_dir(manifests.join("test"))?;
+        fs::write(&expanded, template)?;
+        let (_, manifest) = checked_output(path, template, &recipe)?;
+        assert_eq!(manifest.name, "test/git");
+
+        // The build account cannot add actions that the template lacks.
+        fs::write(
+            &expanded,
+            template.replace(
+                "}\n",
+                "    file \"usr/bin/su\" mode=\"4755\" uid=0 gid=0\n}\n",
+            ),
+        )?;
+        let Err(error) = checked_output(path, template, &recipe) else {
+            panic!("an added setuid file was accepted");
+        };
+        assert!(
+            format!("{error:#}").contains("no collect rule"),
+            "{error:#}"
+        );
+
+        // Nor point root at another file or another tree through a symlink.
+        let elsewhere = path.join("elsewhere.kdl");
+        fs::write(&elsewhere, template)?;
+        fs::remove_file(&expanded)?;
+        symlink(&elsewhere, &expanded)?;
+        assert!(checked_output(path, template, &recipe).is_err());
+        fs::remove_file(&expanded)?;
+        fs::write(&expanded, template)?;
+        fs::rename(&bundle, path.join("real"))?;
+        symlink(path.join("real"), &bundle)?;
+        assert!(checked_output(path, template, &recipe).is_err());
+        Ok(())
     }
 
     #[test]
