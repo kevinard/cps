@@ -5,10 +5,12 @@
 
 Choose the workflow based on the root you want to change.
 
-- **Running system.** Use the system commands on an installed, registered
-  CPS-managed Btrfs root. [Manage a running system](system.md)
-- **Inactive image.** Save a plan, optionally fetch and validate it, then
-  apply it to a directory or prepare a new boot root. [Manage an inactive image](images.md)
+- **Running system.** Run `cps install`, `cps upgrade`, and the other
+  change commands on an installed, registered CPS-managed Btrfs root.
+  [Manage a running system](system.md)
+- **Inactive image.** Run the same commands with `--root` to change a
+  directory or prepare a new boot root, or save a plan to review, fetch,
+  and apply later. [Manage an inactive image](images.md)
 - **Signed distribution.** Sync trusted mirrors, install the named profile, and
   follow it on upgrades. [Sync mirrors](mirrors.md) · [Install a profile](profiles.md)
 

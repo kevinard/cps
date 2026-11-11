@@ -67,7 +67,7 @@ package "apps/editor" publisher="canopa" version="2.1.0-1" upstream-version="2.1
 | `requires-reboot` | `#true` to [require a trial boot](#require-a-trial-boot). |
 
 Set `architecture` for a package that targets one architecture, or pass
-`--architecture` to `manifest generate`. Only matching packages take part in
+`--arch` to `manifest generate`. Only matching packages take part in
 dependency resolution and publisher ordering, and a source build must
 declare the same target. Omit it for portable packages and for manifests
 that select actions per architecture with `arch`. Package IDs are unique
@@ -271,8 +271,8 @@ until its declaration changes or another package pulls it in.
 Recommended packages are automatic unless the user requests them, and they
 can be removed without removing the recommending package. Offline
 `autoremove` keeps a compatible recommendation while its recommending
-package is kept. `cps install`, `cps upgrade`, and `cps plan` accept
-`--no-install-recommends`, and a saved plan records the choice. A signed
+package is kept. `cps install`, `cps upgrade`, and the other change commands accept
+`--no-recommends`, and a saved plan records the choice. A signed
 profile follows its published composition, which may include
 recommendations selected at publication. The build toolchain solver also
 considers recommendations.
@@ -286,7 +286,7 @@ the file list from what the build installed.
 
 ```sh
 cps manifest generate --proto proto --publisher canopa --version 1.0.0-0 demo/tool > tool.kdl
-cps publish --repo repo --proto proto --signing-key private.der tool.kdl
+cps publish manifests --repo repo --proto proto --key private.der tool.kdl
 ```
 
 The generator emits file, directory, symlink, and hard-link actions in
@@ -377,7 +377,7 @@ and an update keeps a provider until a replacement provides the same
 capabilities. The [transaction check](../client/images.md#shared-library-regressions)
 covers what the capabilities cannot: interpreters, facet changes, shadowing
 through `DT_RUNPATH`, and content selected by facets or variants. When a
-soname changes, [`cps rebuild-plan`](orchestration.md#plan-rebuilds-after-a-change)
+soname changes, [`cps recipe rebuilds`](orchestration.md#plan-rebuilds-after-a-change)
 lists the packages to rebuild.
 
 ### Reviewing runtime dependencies
@@ -572,7 +572,7 @@ the caller lacks the required group membership or `CAP_FSETID`.
 Upgrades can change an explicitly managed directory's ownership and modes
 while its metadata still matches the installed declaration. CPS changes
 that inode in place and keeps its contents. Local metadata changes stop the
-upgrade for review; `plan repair` restores the installed declaration.
+upgrade for review; `cps repair` restores the installed declaration.
 Directory changes and privileged file replacements can resume offline from
 the journal. Managed hard links follow their target's permissions.
 
@@ -684,8 +684,8 @@ a recipe author writes neither the debug path nor the facet. Images leave
 or for all packages, without changing what is installed:
 
 ```sh
-cps plan --root image --output debug.json change-facet apps/editor:debug.symbols=true
-cps plan --root image --output debug-all.json change-facet 'debug.*=true'
+cps facet set --root image apps/editor:debug.symbols=true
+cps facet set --root image 'debug.*=true'
 ```
 
 A debug build of the whole system, in contrast, would replace content
@@ -705,8 +705,8 @@ mediate "usr/bin/editor" group="editor" priority=20
 Only the selected package contributes links for the group. A package can
 declare several links for the same group with one priority. CPS selects
 the highest priority by default, with the package name breaking ties.
-Users inspect the choice with `cps mediator` and change it with
-[`plan set-mediator`](../client/configuration.md#choose-the-provider-of-a-mediated-link).
+Users inspect the choice with `cps mediator list` and change it with
+[`cps mediator set`](../client/configuration.md#choose-the-provider-of-a-mediated-link).
 
 ## Change the file layout between versions
 

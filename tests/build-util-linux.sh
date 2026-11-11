@@ -32,8 +32,8 @@ keypair release repo canopa-util-linux
 bash "$project/tests/seed-native-c.sh" "$work/native-util-linux" --util-linux
 "$cps" manifest generate --proto "$work/native-util-linux" --publisher seed --version 1.0.0-0 \
     build/native-util-linux > native-util-linux.kdl
-"$cps" publish --repo toolchain --proto "$work/native-util-linux" \
-    --signing-key "$work/toolchain.der" native-util-linux.kdl
+"$cps" publish manifests --repo toolchain --proto "$work/native-util-linux" \
+    --key "$work/toolchain.der" native-util-linux.kdl
 
 recipe="$project/packaging/util-linux"
 sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/util-linux.kdl" > util-linux.kdl
@@ -41,9 +41,9 @@ sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
     -e "s/@KEY_SHA256@/$(sha256sum < toolchain.trust.json | cut -d' ' -f1)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha util-linux.kdl)/g" "$recipe/build.kdl.in" > build.kdl
 "$cps" source import --from "$sources" --cache sources build.kdl
-"$cps" build --repo toolchain --publisher seed --trust-root toolchain.trust.json \
+"$cps" build --repo toolchain --trust-root toolchain.trust.json \
     --source-cache sources --output bundle --check-reproducible \
-    --builder-signing-key "$work/builder.der" build.kdl
+    --key "$work/builder.der" build.kdl
 
 mkdir -p repo
 cp builder-public.der repo/
@@ -55,16 +55,15 @@ publisher "canopa-util-linux" {
     approve "system/util-linux" version="2.42.4-1" sha256="$reviewed"
 }
 POLICY
-"$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
+"$cps" publish bundle --repo repo --key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$reviewed" bundle
 package=cps://canopa-util-linux/system/util-linux@2.42.4-1
-"$cps" repo attestation --repo repo --publisher canopa-util-linux --trust-root release.trust.json \
+"$cps" repo attestation --repo repo --trust-root release.trust.json \
     "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa-util-linux --trust-root release.trust.json
+"$cps" image create --root image --repo repo --trust-root release.trust.json
 "$cps" publisher add --root image --repo "$base/repo" --trust-root "$base/release.trust.json" canopa-usr-base
-"$cps" plan --root image --output install.json install "$package"
-"$cps" apply --root image install.json
+"$cps" install --root image -y "$package"
 "$cps" verify --root image --pristine
 loader=(env -i "$PWD/image/usr/lib/ld-linux-x86-64.so.2" --inhibit-cache --library-path "$PWD/image/usr/lib")
 for program in blkid mount umount sfdisk; do

@@ -27,7 +27,7 @@ cat > template.kdl <<'KDL'
 schema-version 1 kind="package-manifest"
 package "demo/snapshot" publisher="demo" version="0.0.0-42"
 KDL
-"$cps" publish --repo repo --proto proto --signing-key private.der template.kdl
+"$cps" publish manifests --repo repo --proto proto --key private.der template.kdl
 manifest_sha256=$(sha256sum template.kdl | cut -d' ' -f1)
 cat > template.build.kdl <<KDL
 schema-version 1 kind="build-recipe"
@@ -46,7 +46,7 @@ KDL
 snapshot_from() {
     local output=$1
     shift
-    "$cps" source git-snapshot --git-repo "${git_repo:-$work/upstream}" --repo repo \
+    "$cps" source git-snapshot --git "${git_repo:-$work/upstream}" --repo repo \
         --trust-root repo/trust/1.json --output "$output" "$@" template.build.kdl
 }
 
@@ -65,9 +65,9 @@ manifest_sha256=$(sha256sum first/manifest.kdl | cut -d' ' -f1)
 grep -E "sha256=\"?$manifest_sha256\"?( |$)" first/build.kdl
 grep -F 'option "MODE" "test"' first/build.kdl
 "$cps" source import --from first/sources --cache cache first/build.kdl
-"$cps" publish --repo repo --proto proto --signing-key private.der first/manifest.kdl
+"$cps" publish manifests --repo repo --proto proto --key private.der first/manifest.kdl
 snapshot main published | grep -F 'snapshot@0.0.0-43'
-"$cps" repo withdraw --repo repo --signing-key private.der cps://demo/demo/snapshot@0.0.0-43
+"$cps" repo withdraw --repo repo --key private.der cps://demo/demo/snapshot@0.0.0-43
 snapshot main withdrawn | grep -F 'snapshot@0.0.0-44'
 
 printf 'middle\n' > upstream/hello
@@ -138,7 +138,7 @@ git -C upstream tag -a v1.2.0 -m "Versioned release" "$second"
 snapshot_from numbered --tag v1.2.0 | grep -Fx "Prepared cps://demo/demo/snapshot@1.2.0 from tag:v1.2.0@$second"
 grep -F 'version="1.2.0"' numbered/manifest.kdl
 test "$(git get-tar-commit-id < numbered/sources/git.tar)" = "$second"
-"$cps" publish --repo repo --proto proto --signing-key private.der numbered/manifest.kdl
+"$cps" publish manifests --repo repo --proto proto --key private.der numbered/manifest.kdl
 snapshot_from numbered-repeat --tag v1.2.0 | grep -F 'snapshot@1.2.0 '
 cmp numbered/build.kdl numbered-repeat/build.kdl
 

@@ -21,16 +21,16 @@ publish() {
     printf '%s\n' "$1" > proto/example
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$1.0.0-0" \
         --uid "$(id -u)" --gid "$(id -g)" example > manifest.kdl
-    "$CPS_BIN" publish --repo repo --proto proto --signing-key publisher-private.der manifest.kdl
+    "$CPS_BIN" publish manifests --repo repo --proto proto --key publisher-private.der manifest.kdl
 }
 
 publish 1
-"$CPS_BIN" repo export --repo repo --publisher canopa --trust-root trust-root.json --output export
+"$CPS_BIN" repo export --repo repo --trust-root trust-root.json --output export
 "$tuf_fixture" export seed 1
 for role in targets snapshot timestamp; do cp seed/fixture-key.der "keys/$role.pem"; done
 
 sync_mirror() {
-    "$CPS_BIN" repo sync --repo cache --root seed/root.json --publisher canopa --trust-root trust-root.json \
+    "$CPS_BIN" repo sync --repo cache --tuf-root seed/root.json --trust-root trust-root.json \
         --metadata "file://$work/public/metadata/" --targets "file://$work/public/targets/" \
         --require-catalog "$(cat repo/current)"
 }
@@ -56,8 +56,8 @@ for filter in 'del(.format)' '.format = 2'; do
     cmp public/metadata/timestamp.json timestamp.json
 done
 cat signer-state.json > "$state"
-"$CPS_BIN" image-create --root image --repo cache --publisher canopa --trust-root trust-root.json
-"$CPS_BIN" plan --root image --output plan.json install example
+"$CPS_BIN" image create --root image --repo cache --trust-root trust-root.json
+"$CPS_BIN" install --root image -n --save-plan plan.json example
 "$CPS_BIN" apply --root image plan.json
 grep -Fx 3 image/example
 "$CPS_BIN" verify --root image

@@ -41,7 +41,7 @@ pub(crate) fn check(
         if let Some(package) = installed.get(name) {
             ensure!(
                 package.published.manifest.version == freeze.version,
-                "{name} is frozen at {}{}; use plan unfreeze before changing its version",
+                "{name} is frozen at {}{}; use cps unfreeze before changing its version",
                 freeze.version,
                 reason_suffix(freeze),
             );

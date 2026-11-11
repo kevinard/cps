@@ -63,13 +63,13 @@ if [[ -n $util_linux || $packaged_seccomp == 1 ]]; then
     seed_args=(--uid "$(id -u)" --gid "$(id -g)")
 fi
 if [[ -n $util_linux ]]; then
-    "$cps" repo attestation --repo "$util_linux/repo" --publisher canopa-util-linux \
+    "$cps" repo attestation --repo "$util_linux/repo" \
         --trust-root "$util_linux/release.trust.json" "$util_package" > util-linux-attestation.json
     packaged_libs=1
 else
     keypair runtime-seed runtime-seed canopa-systemd-seed
 fi
-"$cps" repo attestation --repo "$runtime/repo" --publisher canopa --trust-root "$runtime/release.trust.json" \
+"$cps" repo attestation --repo "$runtime/repo" --trust-root "$runtime/release.trust.json" \
     "$seccomp_package" > libseccomp-attestation.json
 CPS_SYSTEMD_PACKAGED_LIBS=$packaged_libs CPS_SYSTEMD_PACKAGED_SECCOMP=$packaged_seccomp \
     bash "$project/tests/seed-native-c.sh" "$work/native-systemd" --systemd
@@ -98,9 +98,9 @@ if [[ $packaged_seccomp == 0 ]]; then
 fi
 "$cps" manifest generate --proto "$work/native-systemd" --publisher seed --version 1.0.0-0 \
     "${seed_args[@]}" build/native-systemd > native-systemd.kdl
-"$cps" publish --repo toolchain --proto "$work/native-systemd" --signing-key "$work/toolchain.der" native-systemd.kdl
+"$cps" publish manifests --repo toolchain --proto "$work/native-systemd" --key "$work/toolchain.der" native-systemd.kdl
 
-toolchain_input=(--repo toolchain --publisher seed --trust-root toolchain.trust.json)
+toolchain_input=(--repo toolchain --trust-root toolchain.trust.json)
 if $configured; then
     printf 'schema-version 1 kind="toolchain-config"\n' > toolchain.kdl
     pins="$work/toolchain-recipe"
@@ -144,7 +144,7 @@ d
 "$cps" source import --from "$sources" --cache sources build.kdl
 "$cps" build "${toolchain_input[@]}" \
     --source-cache sources --output bundle --check-reproducible \
-    --builder-signing-key "$work/builder.der" build.kdl
+    --key "$work/builder.der" build.kdl
 
 if [[ -z $util_linux ]]; then
     for library in libblkid.so.1 libmount.so.1; do
@@ -152,7 +152,7 @@ if [[ -z $util_linux ]]; then
     done
     "$cps" manifest generate --proto "$work/runtime-seed" --publisher canopa-systemd-seed --version 1.0.0-0 \
         --uid "$(id -u)" --gid "$(id -g)" system/systemd-vm-libs > runtime-seed.kdl
-    "$cps" publish --repo runtime-seed --proto "$work/runtime-seed" --signing-key "$work/runtime-seed.der" runtime-seed.kdl
+    "$cps" publish manifests --repo runtime-seed --proto "$work/runtime-seed" --key "$work/runtime-seed.der" runtime-seed.kdl
 fi
 
 mkdir -p repo
@@ -165,12 +165,12 @@ publisher "canopa-systemd" {
     approve "system/systemd-vm" version="$systemd_version" sha256="$reviewed"
 }
 POLICY
-"$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
+"$cps" publish bundle --repo repo --key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$reviewed" bundle
 package=cps://canopa-systemd/system/systemd-vm@$systemd_version
-"$cps" repo attestation --repo repo --publisher canopa-systemd --trust-root release.trust.json "$package" > attestation.json
+"$cps" repo attestation --repo repo --trust-root release.trust.json "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa-systemd --trust-root release.trust.json \
+"$cps" image create --root image --repo repo --trust-root release.trust.json \
     --facet devel=false
 if [[ -n $util_linux ]]; then
     add_util_linux image
@@ -180,8 +180,7 @@ fi
 "$cps" publisher add --root image --repo "$runtime/repo" --trust-root "$runtime/release.trust.json" canopa
 "$cps" publisher add --root image --repo "$runtime/runtime-seed" \
     --trust-root "$runtime/runtime-seed.trust.json" canopa-runtime-seed
-"$cps" plan --root image --output install.json install "$package"
-"$cps" apply --root image install.json
+"$cps" install --root image -y "$package"
 "$cps" verify --root image --pristine
 cmp bundle/proto/usr/lib/systemd/systemd image/usr/lib/systemd/systemd
 cmp bundle/proto/usr/lib/systemd/boot/efi/systemd-bootx64.efi image/usr/lib/systemd/boot/efi/systemd-bootx64.efi

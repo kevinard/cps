@@ -67,6 +67,7 @@ the roles in the applied signed profile.
 
 `search` matches name and summary fragments case-insensitively and shows the
 signed summary when present. Use `--installed` to search installed packages.
+Add `--json` to `list` or `search` for machine-readable output.
 
 `info` prints the verified manifest in KDL, including the summary, license,
 and homepage, optional dependency descriptions, requirements, triggers, and
@@ -77,7 +78,7 @@ Available queries use the configured local repository or cache.
 catalog pins, the preferred source, active freeze, signed profile manifests,
 and whether each source requires build trust. Use `--json` for scripting.
 `--probe` runs the normal install planner for the exact selector and
-reports its result. Use `check-updates --explain` for a probe in the
+reports its result. Use `upgrade --check --explain` for a probe in the
 system upgrade context.
 
 ## Find which package ships a file
@@ -96,7 +97,7 @@ image's facets and signed profile catalog pins. The search uses cached or
 local manifests and works with an index-only mirror cache.
 
 Publishers can enable indexed lookups with `cps repo index-files --repo REPO
---publisher NAME --signing-key KEY`. This publishes a successor catalog
+--key KEY`. This publishes a successor catalog
 whose signature binds a basename index. Subsequent releases regenerate it.
 Searches open only candidate manifests and still check their file actions
 and digests. Mirror export and sync carry the index alongside the signed
@@ -116,6 +117,7 @@ cps why --root image demo/hello
 `/usr/…` or `usr/…` to address a path within the selected image. Shared
 directories can have multiple owners. The command exits with an error
 for paths with no owner, including implicit parent directories.
+`owner`, `contents`, `deps`, and `rdeps` accept `--json`.
 
 `contents` accepts the same installed package selectors as `info` and
 lists owned paths in sorted order, relative to the image root. Both
@@ -146,8 +148,7 @@ matching installed providers.
 ## Mark local requests
 
 ```sh
-cps plan --root image --output mark.json mark explicit demo/hello
-cps apply --root image mark.json
+cps mark --root image explicit demo/hello
 ```
 
 Use `mark automatic` to clear a local request. Both operations accept
@@ -156,5 +157,5 @@ They change the marks in the image database and record them in transaction
 history. Package files and versions stay in place. Automatic packages can
 be removed later by `autoremove` or signed profile reconciliation if the
 resulting image has no use for them. A signed profile root stays protected
-even after its local request is cleared. Apply marks to an inactive image
-or stage the saved plan in a boot environment.
+even after its local request is cleared. Mark packages in an inactive image,
+or save the plan with `-n --save-plan` and stage it in a boot environment.

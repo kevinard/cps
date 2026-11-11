@@ -11,8 +11,8 @@ repo=/usr/lib/cps-cap-test/repo
 trust=/usr/lib/cps-cap-test/trust.json
 
 /bin/busybox mkdir -p "$work"
-"$cps" image-create --root "$root" --repo "$repo" --publisher captest --trust-root "$trust"
-"$cps" plan --root "$root" --output "$work/install.json" install cps://captest/test/raw-probe@1.0.0-0
+"$cps" image create --root "$root" --repo "$repo" --trust-root "$trust"
+"$cps" install --root "$root" -n --save-plan "$work/install.json" cps://captest/test/raw-probe@1.0.0-0
 if error=$(/usr/bin/setpriv --bounding-set=-setfcap "$cps" apply --root "$root" "$work/install.json" 2>&1); then
     printf '%s\n' 'A capability-bearing install succeeded without CAP_SETFCAP' >&2
     exit 1
@@ -45,8 +45,7 @@ expect_drift() {
 }
 
 repair() {
-    "$cps" plan --root "$root" --output "$work/repair.json" repair test/raw-probe
-    "$cps" apply --root "$root" "$work/repair.json"
+    "$cps" repair --root "$root" -y test/raw-probe
     "$cps" verify --root "$root" --pristine
     [ "$probe" -ef "$alias" ]
 }
@@ -69,14 +68,13 @@ expect_drift
 repair
 run_probe "$alias"
 
-"$cps" plan --root "$root" --output "$work/clone.json" install cps://captest/test/raw-probe@1.0.0-0
+"$cps" install --root "$root" -n --save-plan "$work/clone.json" cps://captest/test/raw-probe@1.0.0-0
 cp -a --reflink=auto -- "$root" "$work/clone"
 "$cps" apply --root "$work/clone" "$work/clone.json"
 "$cps" verify --root "$work/clone" --pristine
 run_probe "$work/clone/bin/raw-probe-alias"
 
-"$cps" plan --root "$root" --output "$work/update.json" update
-"$cps" apply --root "$root" "$work/update.json"
+"$cps" upgrade --root "$root" -y
 "$cps" verify --root "$root" --pristine
 [ "$probe" -ef "$alias" ]
 [ -z "$(/usr/bin/getcap "$probe")" ]

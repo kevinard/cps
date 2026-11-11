@@ -22,19 +22,19 @@ cp extra/trust/1.json extra.trust.json
 cp repo/trust/1.json canopa.trust.json
 "$CPS_BIN" repo trust rotate --repo repo --key key.der \
     --catalog-key public.der --catalog-key key2-public.der --catalog-threshold 2 >/dev/null
-signing=(--signing-key key.der --signing-key key2.der)
+signing=(--key key.der --key key2.der)
 mkdir -p proto/usr/share requests/next/cases/desktop
 echo 'local addition' > proto/usr/share/extra
 "$CPS_BIN" manifest generate --proto proto --publisher extra --version 1.0.0-0 \
     --uid "$(id -u)" --gid "$(id -g)" desktop/extra > extra.kdl
-"$CPS_BIN" publish --repo extra --proto proto --signing-key extra.der extra.kdl
+"$CPS_BIN" publish manifests --repo extra --proto proto --key extra.der extra.kdl
 extra_pin=$(cat extra/current)
 rm proto/usr/share/extra
 for version in 1 2 3; do
     echo "$version" > proto/usr/share/cps-test
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$version.0.0-0" \
         --uid "$(id -u)" --gid "$(id -g)" desktop/base > manifest.kdl
-    "$CPS_BIN" publish --repo repo --proto proto "${signing[@]}" manifest.kdl
+    "$CPS_BIN" publish manifests --repo repo --proto proto "${signing[@]}" manifest.kdl
 done
 policy() {
     cat > repo/publish-policy.kdl <<POLICY
@@ -54,7 +54,7 @@ POLICY
 for version in 1 2; do
     policy "$version" 100
     printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
-    "$CPS_BIN" repo publish-release --repo repo "${signing[@]}" baseline.kdl
+    "$CPS_BIN" publish release --repo repo "${signing[@]}" baseline.kdl
     if [[ $version == 1 ]]; then
         cat repo/current > requests/next/cases/desktop/baselines
     fi
@@ -75,7 +75,7 @@ set -euo pipefail
 [[ -z ${CPS_RELEASE_SIGNING_KEY:-} ]]
 plan=$(mktemp)
 trap 'rm -f -- "$plan"' EXIT
-"$1" plan --root "$2" --output "$plan" install cps://extra/desktop/extra
+"$1" install --root "$2" -n --save-plan "$plan" cps://extra/desktop/extra
 "$1" apply --root "$2" "$plan"
 HOOK
 chmod +x requests/next/cases/desktop/before-upgrade

@@ -5,9 +5,17 @@
 
 Use `cps --help` to list commands and `cps COMMAND --help` for arguments
 and options. For a nested command, use the full path, for example
-`cps repo sync --help` or `cps repo trust rotate --help`. Options such as
-`plan --root` and `plan --output` belong to the parent command and appear
-before its subcommand. Follow the synopsis for the command you are using.
+`cps repo sync --help` or `cps repo trust rotate --help`. Follow the
+synopsis for the command you are using.
+
+The commands that change an image share their options. Without `--root`,
+they change the running system described by `--config`, which defaults to
+`/etc/cps/image.kdl`. With `--root IMAGE`, they change that inactive image:
+they plan the change, ask for confirmation, fetch its payloads, and apply
+it. `-y` confirms without a prompt, `-n` previews the change, and
+`--save-plan PLAN` writes the plan for `cps fetch` and `cps apply`. Query
+commands read the running system unless you pass `--root`, and many accept
+`--json`. Signing commands take the private key as `--key`.
 
 ## Man pages
 
@@ -44,18 +52,18 @@ formatted output.
 
 | Task | Commands | Guide |
 | --- | --- | --- |
-| Install and upgrade a running system | [install](man/cps-install.1), [upgrade](man/cps-upgrade.1), [check-updates](man/cps-check-updates.1), [remove](man/cps-remove.1), [autoremove](man/cps-autoremove.1) | [Running system](../client/system.md) |
-| Recover a live change | [repair](man/cps-repair.1), [revert](man/cps-revert.1), [status](man/cps-status.1), [resume](man/cps-resume.1) | [Recover an interrupted change](../client/system.md#recover-an-interrupted-change) |
+| Install and upgrade a running system | [install](man/cps-install.1), [upgrade](man/cps-upgrade.1) (`upgrade --check`), [remove](man/cps-remove.1), [autoremove](man/cps-autoremove.1) | [Running system](../client/system.md) |
+| Recover a change | [repair](man/cps-repair.1), [revert](man/cps-revert.1), [status](man/cps-status.1), [resume](man/cps-resume.1), [abort](man/cps-abort.1), [history](man/cps-history.1) | [Recover an interrupted change](../client/system.md#recover-an-interrupted-change) · [Abort a transaction](../client/images.md#abort-a-transaction) |
 | Find packages and inspect their dependencies | [list](man/cps-list.1), [search](man/cps-search.1), [info](man/cps-info.1), [policy](man/cps-policy.1), [owner](man/cps-owner.1), [contents](man/cps-contents.1), [deps](man/cps-deps.1), [rdeps](man/cps-rdeps.1), [why](man/cps-why.1) | [Package queries](../client/queries.md) |
-| Inspect package preferences and configuration proposals | [facet](man/cps-facet.1), [variant](man/cps-variant.1), [mediator](man/cps-mediator.1), [freeze](man/cps-freeze.1), [config](man/cps-config.1) | [Image configuration](../client/configuration.md) |
-| Initialize, compare, or replicate images | [image-create](man/cps-image-create.1), [image-diff](man/cps-image-diff.1), [image-lock](man/cps-image-lock.1) | [Profiles and image locks](../client/profiles.md) |
-| Apply, verify, or abort an image change | [plan](man/cps-plan.1), [fetch](man/cps-fetch.1), [validate](man/cps-validate.1), [apply](man/cps-apply.1), [transaction](man/cps-transaction.1), [verify](man/cps-verify.1) | [Inactive images](../client/images.md) · [Abort a transaction](../client/images.md#abort-a-transaction) |
+| Change package preferences and review configuration proposals | [freeze](man/cps-freeze.1), [unfreeze](man/cps-unfreeze.1), [mark](man/cps-mark.1), [facet](man/cps-facet.1), [variant](man/cps-variant.1), [mediator](man/cps-mediator.1), [config](man/cps-config.1) | [Image configuration](../client/configuration.md) |
+| Initialize, compare, lock, or write images | [image](man/cps-image.1) (`image create`, `image diff`, `image lock`, `image disk`) | [Profiles and image locks](../client/profiles.md) · [Offline disk images](../setups/disk-image.md) |
+| Save, review, and apply a plan, or verify an image | [fetch](man/cps-fetch.1), [apply](man/cps-apply.1), [verify](man/cps-verify.1) | [Inactive images](../client/images.md) |
 | Configure trust | [publisher](man/cps-publisher.1) | [Trusted publishers](../client/publishers.md) |
 | Prepare and build packages | [manifest](man/cps-manifest.1), [source](man/cps-source.1), [build](man/cps-build.1), [develop](man/cps-develop.1) | [Package maintainers](../maintainer/README.md) |
-| Order recipe builds, plan rebuilds, and refresh recipe pins | [build-order](man/cps-build-order.1), [rebuild-plan](man/cps-rebuild-plan.1), [recipe](man/cps-recipe.1) | [Plan builds across recipes](../maintainer/orchestration.md) |
-| Publish packages and manage the publisher trust root | [publish](man/cps-publish.1), [publish-bundle](man/cps-publish-bundle.1), [repo](man/cps-repo.1) (`repo trust`, `repo publish-release`, `repo resign`, `repo withdraw`) | [Publish and retire packages](../publisher/publishing.md) |
+| Order recipe builds, plan rebuilds, and refresh recipe pins | [recipe](man/cps-recipe.1) (`recipe order`, `recipe rebuilds`, `recipe repin`, `recipe fetch-toolchain`) | [Plan builds across recipes](../maintainer/orchestration.md) |
+| Publish packages and manage the publisher trust root | [publish](man/cps-publish.1) (`publish manifests`, `publish bundle`, `publish release`), [repo](man/cps-repo.1) (`repo trust`, `repo resign`, `repo withdraw`) | [Publish and retire packages](../publisher/publishing.md) |
 | Export, sign, sync, or refresh a mirror | [repo](man/cps-repo.1) (`repo export`, `repo sign-export`, `repo refresh-metadata`, `repo sync`) | [Serve a mirror](../publisher/mirrors.md) · [Mirror clients](../client/mirrors.md) |
-| Stage, activate, prune, or roll back a root, or write an offline disk image | [boot-env](man/cps-boot-env.1) | [Boot setup guides](../setups/README.md) |
+| Stage, activate, prune, or roll back a boot environment | [boot](man/cps-boot.1) | [Boot setup guides](../setups/README.md) |
 
 ## Configuration and data formats
 
@@ -73,7 +81,7 @@ KDL documents declare `schema-version 1` and a document `kind`.
 | KDL `publish-policy` and `publish-release` | [Publishing policy](../publisher/publishing.md#publishing-policy) and [coordinated releases](../publisher/publishing.md#publish-a-coordinated-release) |
 | KDL `signer` | [External signer protocol](../publisher/mirrors.md#external-signer-protocol) |
 | Image state in SQLite, version 1 | [Verify an image and locate its state](../client/images.md#verify-an-image-and-locate-its-state) |
-| Saved plan in JSON, version 1 | [Plan, fetch, validate, and apply](../client/images.md#plan-fetch-validate-and-apply) |
+| Saved plan in JSON, version 1 | [Save, review, and apply a plan](../client/images.md#save-review-and-apply-a-plan) |
 | Transaction history in JSON | [Inspect transaction history](../client/images.md#inspect-transaction-history) |
 | Build provenance predicate, version 1 | [Building and publishing with signed evidence](../maintainer/builds.md#building-and-publishing-with-signed-evidence) |
 | Payload delta, version 1 | [Sharded targets and delta payloads](../publisher/mirrors.md#sharded-targets-and-delta-payloads) |

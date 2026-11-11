@@ -8,7 +8,7 @@ Before=shutdown.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/cps boot-env bless-uefi
+ExecStart=/usr/bin/cps boot bless
 
 [Install]
 WantedBy=multi-user.target

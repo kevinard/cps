@@ -1579,6 +1579,19 @@ pub(crate) fn trust_root_publisher(pinned: &[u8]) -> Result<String> {
     Ok(trust::Pinned::parse(pinned)?.root().publisher.clone())
 }
 
+/// The publisher that a pinned trust root file names.
+pub fn pinned_publisher(path: &Path) -> Result<String> {
+    trust_root_publisher(&read_trust_root(path)?)
+        .with_context(|| format!("reading the publisher of {}", path.display()))
+}
+
+/// The publisher whose trust root a publication repository holds.
+pub fn repository_publisher(repo: &Path) -> Result<String> {
+    let store = trust::Store::read(repo)?
+        .with_context(|| format!("repository {} has no trust root", repo.display()))?;
+    Ok(store.verified.current().publisher.clone())
+}
+
 fn parse_public_key(bytes: &[u8]) -> Result<&[u8]> {
     // SubjectPublicKeyInfo for Ed25519, as emitted by openssl pkey -pubout -outform DER.
     const PREFIX: &[u8] = b"\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00";

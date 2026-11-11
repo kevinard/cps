@@ -11,5 +11,5 @@ Conflicts=final.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStop=/usr/bin/cps boot-env finalize-trial
+ExecStop=/usr/bin/cps boot finalize-trial
 TimeoutStopSec=5min

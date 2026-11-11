@@ -40,15 +40,15 @@ touch "$work/tested"
 
 install_profile() {
     local config=$1 hash=$2 root=$3
-    "$cps" image-create --config "$config" --bootstrap-catalog "$hash" --primary-repo "$private" --root "$root"
-    "$cps" plan --root "$root" --output "$work/transaction.json" install-profile
-    "$cps" validate --root "$root" "$work/transaction.json"
+    "$cps" image create --config "$config" --bootstrap-catalog "$hash" --primary-repo "$private" --root "$root"
+    "$cps" install --root "$root" --profile -n --save-plan "$work/transaction.json"
+    "$cps" apply --root "$root" -n "$work/transaction.json"
     "$cps" apply --root "$root" "$work/transaction.json"
     "$cps" verify --root "$root"
 }
 
 check_pin() {
-    "$cps" image-lock --root "$1" |
+    "$cps" image lock --root "$1" |
         jq -er --arg publisher "$publisher" --arg digest "$2" \
             'select(.publishers[0] | .name == $publisher and .catalog == $digest) | .profile'
 }
@@ -88,8 +88,8 @@ for config in "$cases"/*/image.kdl; do
         if [[ -x $case_dir/before-upgrade ]]; then
             "$case_dir/before-upgrade" "$cps" "$before" "$hash" "$candidate"
         fi
-        "$cps" plan --root "$before" --output "$work/transaction.json" update --force-phased-update
-        "$cps" validate --root "$before" "$work/transaction.json"
+        "$cps" upgrade --root "$before" --force-rollout -n --save-plan "$work/transaction.json"
+        "$cps" apply --root "$before" -n "$work/transaction.json"
         cp -a --reflink=auto -- "$before" "$after"
         "$cps" apply --root "$after" "$work/transaction.json"
         [[ $(check_pin "$after" "$candidate") == "$profile" ]]

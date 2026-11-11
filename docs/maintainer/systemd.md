@@ -117,7 +117,7 @@ Installing or changing the selected kernel runs the host's
 tree inside the image. CPS verifies the resulting kernel and initrd against
 the signed manifest, or against the digest it recorded for a generated
 initramfs. A staged upgrade prepares its files before publishing the new
-root. Later, `boot-env activate-btrfs` takes the prepared files from that root and
+root. Later, `boot activate` takes the prepared files from that root and
 publishes them alongside its boot entry. Omit `--kernel` and `--initrd` for
 manifest-managed kernels. Images with manually supplied boot files can
 supply explicit boot paths during [activation](../setups/README.md).

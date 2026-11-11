@@ -165,7 +165,7 @@ sha256() {
 verify_stage() {
     local metadata_dir=$1 targets_dir=$2 metadata_fd targets_fd
     exec {metadata_fd}< "$metadata_dir" {targets_fd}< "$targets_dir"
-    "$cps" repo sync --repo "$stage/verified" --root "$stage/bootstrap-root.json" --publisher "$publisher" \
+    "$cps" repo sync --repo "$stage/verified" --tuf-root "$stage/bootstrap-root.json" \
         --trust-root "$stage/trust-root.json" --metadata "file:///proc/self/fd/$metadata_fd/" \
         --targets "file:///proc/self/fd/$targets_fd/" --index-only --require-catalog "$catalog"
     exec {metadata_fd}<&- {targets_fd}<&-
@@ -226,7 +226,7 @@ if [[ $mode == refresh ]]; then
     fi
 
     timestamp_expiry=$(date -u -d "+$timestamp_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
-    refresh=("$cps" repo refresh-metadata --root "$stage/root.json" --snapshot "$snapshot"
+    refresh=("$cps" repo refresh-metadata --tuf-root "$stage/root.json" --snapshot "$snapshot"
         --version "$version" --timestamp-expires "$timestamp_expiry" --output "$stage/refreshed")
     role_keys timestamp
     (( ${#role_args[@]} )) || fail 'Missing timestamp key source'
@@ -286,7 +286,7 @@ done
 role_keys objects
 signing+=("${role_args[@]}" --objects-threshold "$objects_threshold")
 
-"$cps" repo export --repo "$repo" --publisher "$publisher" --trust-root "$stage/trust-root.json" \
+"$cps" repo export --repo "$repo" --trust-root "$stage/trust-root.json" \
     --output "$stage/export"
 [[ $(cat -- "$stage/export/current") == "$catalog" ]] || fail 'Exported a different catalog'
 
@@ -313,7 +313,7 @@ if [[ -e $mirror/publisher.json || -L $mirror/publisher.json ]]; then
             fail 'The mirror already advertises different publisher bootstrap material'
         # The deployed catalog's history holds both versions unchanged, so they
         # share version 1 and every version between them.
-        "$cps" repo withdrawals --repo "$repo" --publisher "$publisher" \
+        "$cps" repo withdrawals --repo "$repo" \
             --trust-root "$stage/advertised-trust-root.json" >/dev/null ||
             fail 'The mirror advertises a trust root outside the history of the catalog'
         advertised_version=$(trust_version "$stage/advertised-trust-root.json")
@@ -326,7 +326,7 @@ fi
 
 release_expiry=$(date -u -d "+$targets_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
 timestamp_expiry=$(date -u -d "+$timestamp_lifetime" '+%Y-%m-%dT%H:%M:%SZ')
-"$cps" repo sign-export --root "$stage/root.json" "${signing[@]}" \
+"$cps" repo sign-export --tuf-root "$stage/root.json" "${signing[@]}" \
     --version "$version" --release-expires "$release_expiry" --timestamp-expires "$timestamp_expiry" \
     --output "$stage/signed" "$stage/export"
 cp -- "$stage/roots/"*.root.json "$stage/signed/metadata/"

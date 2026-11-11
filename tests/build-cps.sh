@@ -78,7 +78,7 @@ seed_arch=()
 if grep -q '^package .* architecture=' "$cps_manifest"; then
     seed_version=1.0.0-1
     runtime_version=1.0.0-2
-    seed_arch=(--architecture "$arch")
+    seed_arch=(--arch "$arch")
 fi
 python3 "$source_tree/tests/seed-cargo-cache.py" "$source_tree/Cargo.lock" "$registry" "$work/cargo-home"
 (
@@ -105,10 +105,10 @@ ln "$work/elf-runtime/lib64/ld-linux-x86-64.so.2" "$work/elf-runtime/usr/lib/ld-
 rm -f -- "$work/native-rust/usr/lib/ld-linux-x86-64.so.2"
 "$cps" manifest generate --proto "$work/native-rust" --publisher seed --version "$seed_version" "${seed_arch[@]}" \
     --uid "$(id -u)" --gid "$(id -g)" build/native-rust > native-rust.kdl
-"$cps" publish --repo toolchain --proto "$work/native-rust" --signing-key "$work/toolchain.der" native-rust.kdl
+"$cps" publish manifests --repo toolchain --proto "$work/native-rust" --key "$work/toolchain.der" native-rust.kdl
 "$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version "$runtime_version" "${seed_arch[@]}" \
     --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
-"$cps" publish --repo runtime-seed --proto "$work/elf-runtime" --signing-key "$work/runtime-seed.der" elf-runtime.kdl
+"$cps" publish manifests --repo runtime-seed --proto "$work/elf-runtime" --key "$work/runtime-seed.der" elf-runtime.kdl
 
 printf 'schema-version 1 kind="toolchain-config"\n' > bootstrap-toolchain.kdl
 pins="$work/publisher-pins"
@@ -132,7 +132,7 @@ fixture_manifest() {
 }
 build_bundle() {
     "$cps" build --toolchain-config "$1" --source-cache sources --output "$3" \
-        --check-reproducible --builder-signing-key "$work/builder.der" "$2"
+        --check-reproducible --key "$work/builder.der" "$2"
 }
 if [[ -n $trust_version ]]; then
     fixture_manifest "$trust_manifest" | sed "s/@ROOT_VERSION@/$root_version/" > canopa-trust.kdl
@@ -154,7 +154,7 @@ if [[ -f $git_build_template ]]; then
     bash "$source_tree/tests/seed-git-build.sh" "$cps" "$git_build_proto" \
         "$work/git-build.der"
     "$cps" manifest generate --proto "$git_build_proto" --publisher canopa --version "$git_build_version" \
-        --architecture "$arch" --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
+        --arch "$arch" --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
     git_build_archive="$work/sources/git-build.tar.gz"
     tar --sort=name --format=gnu --mtime=@0 --owner=0 --group=0 --numeric-owner \
         -C "$git_build_proto" -cf - . | gzip -n > "$git_build_archive"
@@ -244,7 +244,7 @@ release "canopa" base="empty" {
     bundle "cps://canopa/system/libseccomp@$seccomp_version" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
 }
 RELEASE
-"$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
+"$cps" publish release --repo repo --key "$work/release.der" \
     --source-cache sources bootstrap-release.kdl
 bootstrap_catalog=$(cat repo/current)
 cp bootstrap-toolchain.kdl toolchain.kdl
@@ -290,13 +290,13 @@ RELEASE
     fi
     printf '}\n'
 } > release.kdl
-"$cps" repo publish-release --repo repo --signing-key "$work/release.der" \
+"$cps" publish release --repo repo --key "$work/release.der" \
     --source-cache sources release.kdl
-"$cps" repo attestation --repo repo --publisher canopa --trust-root release.trust.json \
+"$cps" repo attestation --repo repo --trust-root release.trust.json \
     "$cps_package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
 if [[ -n $archive_build_inputs ]]; then
-    recovered=$("$cps" repo rebuild-inputs --repo repo --publisher canopa --trust-root release.trust.json \
+    recovered=$("$cps" repo rebuild-inputs --repo repo --trust-root release.trust.json \
         --output reviewed-cps "$cps_package")
     cmp build.kdl "$recovered"
     cmp cps.kdl "$(dirname -- "$recovered")/cps.kdl"
@@ -315,11 +315,11 @@ publisher "canopa-runtime-seed" {
     trust-root "runtime-seed.trust.json"
 }
 CONFIG
-"$cps" image-create --root image --config image.kdl
+"$cps" image create --root image --config image.kdl
 if [[ -n $trust_version || -n $git_build_version ]]; then
-    "$cps" plan --root image --output install.json install-profile
+    "$cps" install --root image --profile -n --save-plan install.json
 else
-    "$cps" plan --root image --output install.json install "$cps_package"
+    "$cps" install --root image -n --save-plan install.json "$cps_package"
 fi
 "$cps" apply --root image install.json
 cmp bundle/proto/usr/bin/cps image/usr/bin/cps
@@ -342,12 +342,12 @@ for library in libsqlite3.so.0 libseccomp.so.2 libc.so.6 libm.so.6 libgcc_s.so.1
     grep -F "$library => $PWD/image/usr/lib/$library (" <<< "$libraries"
 done
 "${loader[@]}" image/usr/bin/cps verify --root image --pristine
-"${loader[@]}" image/usr/bin/cps repo verify-rebuild --repo repo --publisher canopa \
+"${loader[@]}" image/usr/bin/cps repo verify-rebuild --repo repo \
     --trust-root release.trust.json --bundle bundle "$cps_package"
 for package in "${final_packages[@]}" "cps://canopa/system/sqlite@$sqlite_version" "cps://canopa/system/libseccomp@$seccomp_version"; do
-    "${loader[@]}" image/usr/bin/cps repo fetch-sources --repo repo --publisher canopa \
-        --trust-root release.trust.json --source-cache recovered-sources "$package"
+    "${loader[@]}" image/usr/bin/cps source fetch-archived --repo repo \
+        --trust-root release.trust.json --cache recovered-sources "$package"
 done
 diff -r sources/sha256 recovered-sources/sha256
-"${loader[@]}" image/usr/bin/cps repo fetch-toolchain --toolchain-config toolchain.kdl build.kdl
+"${loader[@]}" image/usr/bin/cps recipe fetch-toolchain --toolchain-config toolchain.kdl build.kdl
 printf 'Verified reproducible CPS build, signed provenance, and installation from Git %s\n' "$revision"

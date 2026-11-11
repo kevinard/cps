@@ -43,7 +43,7 @@ keypair release repo canopa-kernel
 bash "$project/tests/seed-native-c.sh" "$work/native-kernel" --kernel
 "$cps" manifest generate --proto "$work/native-kernel" --publisher seed --version 1.0.0-0 \
     build/native-kernel > native-kernel.kdl
-"$cps" publish --repo toolchain --proto "$work/native-kernel" --signing-key "$work/toolchain.der" native-kernel.kdl
+"$cps" publish manifests --repo toolchain --proto "$work/native-kernel" --key "$work/toolchain.der" native-kernel.kdl
 
 recipe="$project/packaging/kernel-qemu"
 mkdir "$work/inputs"
@@ -62,9 +62,9 @@ sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
     -e "s/@LOCALVERSION@/$localversion/g" -e "s/@KERNEL_RELEASE@/$release/g" \
     "$recipe/build.kdl.in" > build.kdl
 "$cps" source import --from "$work/inputs" --cache sources build.kdl
-"$cps" build --repo toolchain --publisher seed --trust-root toolchain.trust.json \
+"$cps" build --repo toolchain --trust-root toolchain.trust.json \
     --source-cache sources --output bundle --check-reproducible \
-    --builder-signing-key "$work/builder.der" build.kdl
+    --key "$work/builder.der" build.kdl
 
 mkdir -p repo
 cp builder-public.der repo/
@@ -76,15 +76,14 @@ publisher "canopa-kernel" {
     approve "system/kernel-qemu" version="$kernel_version" sha256="$reviewed"
 }
 POLICY
-"$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
+"$cps" publish bundle --repo repo --key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$reviewed" bundle
 package=cps://canopa-kernel/system/kernel-qemu@$kernel_version
-"$cps" repo attestation --repo repo --publisher canopa-kernel --trust-root release.trust.json \
+"$cps" repo attestation --repo repo --trust-root release.trust.json \
     "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa-kernel --trust-root release.trust.json
-"$cps" plan --root image --output install.json install "$package"
-"$cps" apply --root image install.json
+"$cps" image create --root image --repo repo --trust-root release.trust.json
+"$cps" install --root image -y "$package"
 "$cps" verify --root image --pristine
 cmp "bundle/proto/usr/lib/modules/$release/vmlinuz" "image/usr/lib/modules/$release/vmlinuz"
 printf '%s\n' "$release" > kernel-release

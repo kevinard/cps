@@ -19,8 +19,13 @@ terms are defined in [Boot environments](../concepts.md#boot-environments).
 ## List environments
 
 ```sh
-cps boot-env list --esp /efi
+cps boot list
 ```
+
+`boot list`, `boot rollback`, and `boot destroy` read the ESP and the Btrfs
+volume from the `boot-btrfs` node in `/etc/cps/image.kdl`. Pass `--config`
+for another configuration, or `--esp` and `--btrfs-volume` to name them
+directly.
 
 Each line shows one environment, newest first.
 
@@ -55,7 +60,7 @@ The trial is blessed only when the boot reaches `boot-complete.target`, which
 requires `cps-boot-health.service`. That unit runs
 `cps verify --quick --root /` after `multi-user.target`. With systemd-boot,
 systemd then removes the boot counter from the entry's file name. With direct
-UEFI boot, `cps-uefi-bless.service` runs `cps boot-env bless-uefi`, which
+UEFI boot, `cps-uefi-bless.service` runs `cps boot bless`, which
 verifies the trial and its fallback and makes the trial the firmware default.
 Install the health unit with [the `system/cps` package](../../packaging/cps.kdl),
 and extend it with readiness checks as described in
@@ -64,7 +69,7 @@ and extend it with readiness checks as described in
 
 On a running system, while a trial is selected for the next boot,
 system package commands such as `cps install` refuse to change the running
-root. Boot the trial, or cancel it with `cps boot-env discard-trial`. When
+root. Boot the trial, or cancel it with `cps boot discard-trial`. When
 the running system shuts down cleanly, `cps-finalize-trial.service`
 [merges the `/etc` changes](btrfs.md#merging-etc-at-shutdown) made since
 staging into the trial.
@@ -76,9 +81,9 @@ next boot, or of the running direct UEFI trial. Pass a known-good environment
 ID to select a specific root, or when the selection has no recorded fallback.
 
 ```sh
-cps boot-env rollback --esp /efi --btrfs-volume /cps
+cps boot rollback
 # A specific known-good environment.
-cps boot-env rollback --esp /efi --btrfs-volume /cps "$environment_id"
+cps boot rollback "$environment_id"
 ```
 
 Before changing the selection, CPS checks the target's boot files against
@@ -99,9 +104,9 @@ front of `BootOrder`. Rollback keeps every environment and its files.
 Each environment keeps its root and its boot files on the ESP until it is
 removed. Before activation copies boot files, CPS checks that they fit on the
 ESP with a 1 MiB margin, and fails before any change with a pointer to
-pruning. `cps boot-env prune` applies the retention policy, system package
+pruning. `cps boot prune` applies the retention policy, system package
 commands prune automatically before they stage a change, and
-`cps boot-env discard-trial` cancels a trial and removes failed ones. See
+`cps boot discard-trial` cancels a trial and removes failed ones. See
 [Retention and pruning](btrfs.md#retention-and-pruning).
 
 ## Compare environments
@@ -110,9 +115,9 @@ Compare the committed package state of two roots offline, including roots
 created independently.
 
 ```sh
-cps image-diff base staged
-cps image-diff base staged --paths --json
-cps boot-env rollback --esp /efi --btrfs-volume /cps --dry-run
+cps image diff base staged
+cps image diff base staged --paths --json
+cps boot rollback --dry-run
 ```
 
 The diff reports changes to package identity, manifest digest, local
@@ -145,7 +150,7 @@ you set one of these:
 
 - A `default` that is neither `cps-*.conf` nor a CPS entry ID followed by
   `.conf`. Restore the CPS value, or delete the line and select a known-good
-  environment with `cps boot-env rollback --esp /efi ID`.
+  environment with `cps boot rollback ID`.
 - A `preferred` that is not a CPS entry, a `preferred` with
   `default cps-*.conf`, or a `preferred` without a `default`. Delete the line
   to cancel the trial selection.
@@ -173,7 +178,7 @@ systemd-boot binary under `EFI/systemd` and `EFI/BOOT` on the ESP, and
 refuses the activation if any of them is older than 262. When the ESP holds
 no systemd-boot binary, CPS uses the running loader's `LoaderInfo` EFI
 variable instead. Update the loader with `bootctl update` and retry.
-[`boot-env image`](disk-image.md) applies the same check to the template
+[`image disk`](disk-image.md) applies the same check to the template
 ESP, so a new disk can take trials after its first rollback.
 
 The automatic choice therefore depends only on the two owned keys and the CPS

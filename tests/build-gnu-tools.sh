@@ -30,7 +30,7 @@ keypair release repo canopa-utilities
 bash "$project/tests/seed-native-c.sh" "$work/native-gnu" --util-linux
 "$cps" manifest generate --proto "$work/native-gnu" --publisher seed --version 1.0.0-0 \
     build/native-gnu > native-gnu.kdl
-"$cps" publish --repo toolchain --proto "$work/native-gnu" --signing-key "$work/toolchain.der" native-gnu.kdl
+"$cps" publish manifests --repo toolchain --proto "$work/native-gnu" --key "$work/toolchain.der" native-gnu.kdl
 mkdir -p repo
 cp builder-public.der repo/
 printf 'schema-version 1 kind="publish-policy"\npublisher "canopa-utilities" {\n    builder-key "builder-public.der"\n}\n' > repo/publish-policy.kdl
@@ -41,23 +41,22 @@ for utility in coreutils grep; do
         -e "s/@KEY_SHA256@/$(sha256sum < toolchain.trust.json | cut -d' ' -f1)/g" \
         -e "s/@MANIFEST_SHA256@/$(sha "$utility.kdl")/g" "$recipe/$utility.build.kdl.in" > "$utility.build.kdl"
     "$cps" source import --from "$sources" --cache sources "$utility.build.kdl"
-    "$cps" build --repo toolchain --publisher seed --trust-root toolchain.trust.json \
+    "$cps" build --repo toolchain --trust-root toolchain.trust.json \
         --source-cache sources --output "$utility.bundle" --check-reproducible \
-        --builder-signing-key "$work/builder.der" "$utility.build.kdl"
+        --key "$work/builder.der" "$utility.build.kdl"
     version=$(sed -n -e 's/^package .* version="\([^"]*\)".*/\1/p' \
         -e 's/^    version "\([^"]*\)".*/\1/p' "$utility.kdl" "$utility.build.kdl")
     reviewed=$(sha "$utility.build.kdl")
     sed -i "/^}$/i\\    approve \"system/$utility\" version=\"$version\" sha256=\"$reviewed\"" repo/publish-policy.kdl
-    "$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
+    "$cps" publish bundle --repo repo --key "$work/release.der" --builder-key builder-public.der \
         --recipe-sha256 "$reviewed" "$utility.bundle"
-    "$cps" repo attestation --repo repo --publisher canopa-utilities --trust-root release.trust.json \
+    "$cps" repo attestation --repo repo --trust-root release.trust.json \
         "cps://canopa-utilities/system/$utility@$version" > "$utility-attestation.json"
     (cat "$utility.bundle/attestation.json"; printf '\n') | cmp - "$utility-attestation.json"
 done
-"$cps" image-create --root image --repo repo --publisher canopa-utilities --trust-root release.trust.json
+"$cps" image create --root image --repo repo --trust-root release.trust.json
 "$cps" publisher add --root image --repo "$base/repo" --trust-root "$base/release.trust.json" canopa-usr-base
-"$cps" plan --root image --output install.json install system/coreutils system/grep
-"$cps" apply --root image install.json
+"$cps" install --root image -y system/coreutils system/grep
 "$cps" verify --root image --pristine
 loader=(env -i "$PWD/image/usr/lib/ld-linux-x86-64.so.2" --inhibit-cache --library-path "$PWD/image/usr/lib")
 for program in coreutils grep; do

@@ -825,7 +825,7 @@ fn initialize(
             entry.file_name() == VAR_DIRECTORY
                 && entry.file_type()?.is_dir()
                 && fs::read_dir(entry.path())?.next().is_none(),
-            "image-create requires an empty directory"
+            "image create requires an empty directory"
         );
         existing_var = true;
     }
@@ -1243,8 +1243,8 @@ impl Image {
                 .query_row("SELECT EXISTS(SELECT 1 FROM pending)", [], |row| row.get(0))?;
         ensure!(
             !pending,
-            "image has an incomplete transaction; finish it with cps transaction resume, \
-             or undo it with cps transaction abort (cps transaction status shows it)"
+            "image has an incomplete transaction; finish it with cps resume, or undo it \
+             with cps abort (cps status shows it; pass --root for an inactive image)"
         );
         Ok(())
     }

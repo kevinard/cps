@@ -3,11 +3,11 @@
 [Documentation](../README.md) · [Package maintainers](README.md)
 
 A distribution keeps many [build recipes](builds.md) that depend on each
-other's packages. Three commands plan work across them: `cps build-order`
-sorts recipes, `cps rebuild-plan` lists what a change forces you to
+other's packages. Three commands plan work across them: `cps recipe order`
+sorts recipes, `cps recipe rebuilds` lists what a change forces you to
 rebuild, and `cps recipe repin` refreshes the digests that recipes pin.
 None of them builds, schedules, or publishes. Run `cps build` and
-`cps publish-bundle` yourself, or from your CI, in the order they print.
+`cps publish bundle` yourself, or from your CI, in the order they print.
 
 ## On this page
 
@@ -17,13 +17,13 @@ None of them builds, schedules, or publishes. Run `cps build` and
 
 ## Order recipe builds
 
-`cps build-order` reads every build recipe in the given files and
+`cps recipe order` reads every build recipe in the given files and
 directories and prints the recipe paths in an order where each recipe comes
 after the recipes it needs. `--explain` adds the reasons under each recipe.
 
 ```sh
-cps build-order packaging
-cps build-order --explain packaging/runtime packaging/cps-build.kdl.in
+cps recipe order packaging
+cps recipe order --explain packaging/runtime packaging/cps-build.kdl.in
 ```
 
 ```text
@@ -85,12 +85,12 @@ the way the seed toolchain does.
 
 ## Plan rebuilds after a change
 
-`cps rebuild-plan` lists the packages that depend on a changed package,
+`cps recipe rebuilds` lists the packages that depend on a changed package,
 using the signed dependency summaries of pinned catalogs. It reads no
 manifests, so it stays fast for a whole distribution.
 
 ```sh
-cps rebuild-plan --config image.kdl --catalog "canopa=$canopa_catalog_sha256" \
+cps recipe rebuilds --config image.kdl --catalog "canopa=$canopa_catalog_sha256" \
     --changed system/sqlite@3.55.0-1 --recipes packaging
 ```
 
@@ -171,7 +171,7 @@ and `cps build` verify cached objects against their pins. A selected
 manifest or source that CPS cannot find is left as written with a warning
 that its pin is unchecked.
 
-CPS finds recipes the same way as `build-order` and changes only the
+CPS finds recipes the same way as `recipe order` and changes only the
 selected properties of matching `publisher`, `manifest`, and `source`
 nodes. It edits the text in place, so comments, spacing, and other
 properties stay as written, and it confirms the parsed result of every file

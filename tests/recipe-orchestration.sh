@@ -45,29 +45,29 @@ recipe app apps/app build/cc '    require "devel/tool"
 '
 recipe other apps/other build/cc '    require "lib/foo"
 '
-"$cps" build-order recipes > order.txt
+"$cps" recipe order recipes > order.txt
 diff -u - order.txt <<ORDER
 recipes/libfoo/libfoo.build.kdl
 recipes/other/other.build.kdl
 recipes/tool/tool.build.kdl
 recipes/app/app.build.kdl
 ORDER
-"$cps" build-order --explain recipes > explained.txt
+"$cps" recipe order --explain recipes > explained.txt
 grep -Fx '    after recipes/tool/tool.build.kdl: apps/app requires devel/tool' explained.txt
 grep -Fx '    after recipes/libfoo/libfoo.build.kdl: apps/app requires cap/foo-headers from lib/foo' explained.txt
 grep -Fx '    after recipes/libfoo/libfoo.build.kdl: toolchain needs lib/foo' explained.txt
 
 cp -r recipes cyclic
 sed -i 's/^package "lib\/foo" \(.*\) {$/package "lib\/foo" \1 {\n    require "apps\/app"/' cyclic/libfoo/libfoo.kdl
-if "$cps" build-order cyclic > /dev/null 2> cycle.log; then
-    echo 'build-order accepted a dependency cycle' >&2
+if "$cps" recipe order cyclic > /dev/null 2> cycle.log; then
+    echo 'recipe order accepted a dependency cycle' >&2
     exit 1
 fi
 grep -F 'build dependency cycle' cycle.log
 grep -F 'lib/foo requires apps/app' cycle.log
 cp recipes/app/app.build.kdl recipes/app/duplicate.build.kdl
-if "$cps" build-order recipes 2> duplicate.log; then
-    echo 'build-order accepted two producers of one package' >&2
+if "$cps" recipe order recipes 2> duplicate.log; then
+    echo 'recipe order accepted two producers of one package' >&2
     exit 1
 fi
 grep -F 'both produce apps/app' duplicate.log
@@ -131,14 +131,14 @@ publish() {
     "$cps" manifest generate --proto "$1" --publisher canopa --version "$2" \
         --uid "$uid" --gid "$gid" "$3" > "$4.kdl"
     if [[ -n ${5:-} ]]; then sed -i "/^package .* {\$/a\\    require \"$5\"" "$4.kdl"; fi
-    "$cps" publish --repo repo --proto "$1" --signing-key private.der "$4.kdl" > /dev/null
+    "$cps" publish manifests --repo repo --proto "$1" --key private.der "$4.kdl" > /dev/null
 }
 publish foo1 1.0.0-0 lib/foo foo1
 publish app 1.0.0-0 apps/app app
 publish empty 1.0.0-0 apps/other other lib/foo
 publish empty 1.0.0-0 apps/unrelated unrelated
 publish foo2 2.0.0-0 lib/foo foo2
-"$cps" rebuild-plan --config image.kdl --catalog "canopa=$(cat repo/current)" \
+"$cps" recipe rebuilds --config image.kdl --catalog "canopa=$(cat repo/current)" \
     --changed lib/foo --recipes recipes > plan.txt 2> plan.log
 diff -u - plan.txt <<PLAN
 changed cps://canopa/lib/foo@2.0.0-0 from cps://canopa/lib/foo@1.0.0-0
@@ -156,7 +156,7 @@ PLAN
 test ! -s plan.log
 # Plans read the signed summaries, not the manifests.
 mv repo/manifests manifests
-"$cps" rebuild-plan --config image.kdl --catalog "canopa=$(cat repo/current)" \
+"$cps" recipe rebuilds --config image.kdl --catalog "canopa=$(cat repo/current)" \
     --changed lib/foo@2.0.0-0 > summary-plan.txt
 grep -Fx 'breaks cps://canopa/apps/app@1.0.0-0' summary-plan.txt
 echo 'Verified recipe build order, cycle reports, pin refreshes and checks, and soname rebuild plans'

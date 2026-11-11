@@ -42,7 +42,7 @@ signing_keys() {
         [[ -f $source && $source != "$(realpath -e -- "$repo")/"* ]] ||
             fail 'Keep the publisher signing keys outside the publishing repository'
         if [[ $line == command:* ]]; then line=command:$source; else line=$source; fi
-        signing+=(--signing-key "$line")
+        signing+=(--key "$line")
     done <<< "${CPS_RELEASE_SIGNING_KEY:?Set CPS_RELEASE_SIGNING_KEY}"
     (( ${#signing[@]} > 0 )) || fail 'Set CPS_RELEASE_SIGNING_KEY'
 }
@@ -77,7 +77,7 @@ widen_catalog() {
     else
         fail 'Rollout health gate failed'
     fi
-    message=$("$cps" repo widen-rollout --repo "$repo" --publisher "$publisher" \
+    message=$("$cps" repo widen-rollout --repo "$repo" \
         "${signing[@]}" --base "$base" --profile "$profile" --percentage "$percentage") || return
     hash=$(catalog_from_output "$message" Published) || return
     deploy_catalog "$hash"
@@ -93,7 +93,7 @@ case ${1:-} in
         signing_keys
         request="$inputs/$2/release.kdl"
         [[ -f $request ]] || fail 'Release request needs release.kdl'
-        publish=("$cps" repo publish-release --repo "$repo" "${signing[@]}")
+        publish=("$cps" publish release --repo "$repo" "${signing[@]}")
         if [[ -n ${CPS_RELEASE_SOURCE_CACHE:-} ]]; then
             publish+=(--source-cache "$CPS_RELEASE_SOURCE_CACHE")
         fi

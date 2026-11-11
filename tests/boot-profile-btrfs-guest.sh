@@ -40,18 +40,17 @@ if [ "${1:-}" != observe ]; then
         done < /etc/cps-btrfs-publishers
         cps publisher set-repository --root / "$@"
         cps verify --root /
-        before=$(cps transaction history --root /)
-        if cps plan --root / --output /run/blocked.json update > /run/blocked.log 2>&1; then exit 1; fi
+        before=$(cps history --root /)
+        if cps upgrade --root / -n --save-plan /run/blocked.json > /run/blocked.log 2>&1; then exit 1; fi
         rejection=$("$bb" cat /run/blocked.log)
         case "$rejection" in *'frozen'*) ;; *) printf '%s\n' "$rejection"; exit 1 ;; esac
-        cps boot-env capture --source / --output /environments/base
-        cps plan --root /environments/base/root --output /run/unfreeze.json unfreeze test/desktop
-        cps boot-env stage-btrfs --source /environments/base/root --output /environments/trial /run/unfreeze.json
+        cps boot capture --source / --output /environments/base
+        cps unfreeze --root /environments/base/root -n --save-plan /run/unfreeze.json test/desktop
+        cps boot stage --source /environments/base/root --output /environments/trial /run/unfreeze.json
         trial=/environments/trial/root
         base_release=$("$bb" cat /etc/cps-btrfs-release)
         base_kernel=$(sha256sum "/usr/lib/modules/$base_release/vmlinuz"); base_kernel=${base_kernel%% *}
-        cps plan --root "$trial" --output /run/update.json update
-        cps apply --root "$trial" /run/update.json
+        cps upgrade --root "$trial" -y
         next_release=$("$bb" cat "$trial/etc/cps-btrfs-release")
         test "$base_release" != "$next_release"
         test ! -e "$trial/usr/lib/modules/$base_release/vmlinuz"
@@ -66,16 +65,16 @@ if [ "${1:-}" != observe ]; then
         test "$(sha256sum "/usr/lib/modules/$base_release/vmlinuz")" = "$base_kernel  /usr/lib/modules/$base_release/vmlinuz"
         test "$("$bb" cat "$trial/etc/cps-btrfs-state")" = trial
         test "$("$bb" cat /etc/cps-btrfs-state)" = previous
-        test "$(cps transaction history --root /)" = "$before"
+        test "$(cps history --root /)" = "$before"
         cps verify --root /
         cps verify --root "$trial"
         options='rw console=ttyS0 loglevel=3 init=/usr/local/libexec/cps-profile-btrfs systemd.log_target=console'
-        base=$(cps boot-env activate-btrfs --known-good --root /volume/@ --btrfs-volume /volume \
+        base=$(cps boot activate --known-good --root /volume/@ --btrfs-volume /volume \
             --esp /efi --root-partuuid 7adff456-af50-498f-b39a-dcf87cb4a7c1 --options "$options")
         printf '%s\n' "${base#Activated }" > /environments/base-id
-        cps boot-env activate-btrfs --root /volume/@environments/trial/root --btrfs-volume /volume \
+        cps boot activate --root /volume/@environments/trial/root --btrfs-volume /volume \
             --esp /efi --root-partuuid 7adff456-af50-498f-b39a-dcf87cb4a7c1 --options "$options"
-        cps boot-env list --esp /efi
+        cps boot list --esp /efi
         printf 'CPS_VM_SIGNED_BTRFS: staged unfreeze and profile upgrade\n'
         exit 0
     fi
@@ -116,7 +115,7 @@ done < /etc/cps-btrfs-build-publishers
 printf 'CPS_VM_SIGNED_BTRFS: %s signed stack and kernel verified\n' "$state"
 printf 'CPS_VM_SIGNED_BTRFS_KERNEL: %s %s\n' "$state" "$("$bb" uname -r)"
 base=$("$bb" cat /environments/base-id)
-freezes=$(cps freeze --root /)
+freezes=$(cps list --root / --frozen)
 if [ "$state" = trial ]; then
     case "$freezes" in *test/desktop*) exit 1 ;; esac
     if [ -f /run/cps-counted ]; then
@@ -124,12 +123,12 @@ if [ "$state" = trial ]; then
         systemctl is-active --quiet systemd-bless-boot.service
         printf 'CPS_VM_SIGNED_BTRFS: trial blessed\n'
     else
-        listing=$(cps boot-env list --esp /efi)
+        listing=$(cps boot list --esp /efi)
         printf '%s\n' "$listing"
         # Both roots must now be known-good, with the trial selected by default.
         case "$listing" in *'trial ('*) exit 1 ;; esac
         printf 'CPS_VM_SIGNED_BTRFS: trial default after reboot\n'
-        cps boot-env rollback --esp /efi --btrfs-volume /volume "$base"
+        cps boot rollback --esp /efi --btrfs-volume /volume "$base"
     fi
     "$bb" sync
     exec "$bb" reboot -f
@@ -137,6 +136,6 @@ fi
 test "$state" = previous
 expected=$(printf 'test/desktop\t1.0.0-0\t"Review before upgrade"')
 case "$freezes" in *"$expected"*) ;; *) printf '%s\n' "$freezes"; exit 1 ;; esac
-listing=$(cps boot-env list --esp /efi)
+listing=$(cps boot list --esp /efi)
 case "$listing" in *"$base"*) ;; *) exit 1 ;; esac
 printf 'CPS_VM_SIGNED_BTRFS: previous root restored with its freeze and kernel\n'

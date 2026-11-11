@@ -71,6 +71,9 @@ def main():
             subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", "private.der",
                             "-pubout", "-outform", "DER", "-out", "public.der"],
                            check=True, cwd=work)
+            subprocess.run([binaries[0], "repo", "trust", "init", "--repo", "repo",
+                            "--publisher", "bench", "--key", "private.der"],
+                           check=True, cwd=work, stdout=subprocess.DEVNULL)
 
         def publish(cps, repo, name, version, files, salt):
             proto = work / f"proto-{name.replace('/', '-')}-{version}"
@@ -93,8 +96,8 @@ def main():
                 f'package "{name}" publisher="bench" version="{version}.0.0-0" {{\n'
                 + "".join(lines) + "}\n"
             )
-            run(cps, "publish", "--repo", repo, "--proto", proto,
-                "--signing-key", "private.der", manifest, cwd=work)
+            run(cps, "publish", "manifests", "--repo", repo, "--proto", proto,
+                "--key", "private.der", manifest, cwd=work)
 
         started = time.perf_counter()
         if not published:
@@ -113,10 +116,10 @@ def main():
             provision.mkdir()
             timings = {}
             bases = [f"bench/base-{number:04}" for number in range(options.packages)]
-            run(binaries[-1], "image-create", "--root", provision / "image", "--repo", "repo",
-                "--publisher", "bench", "--trust-key", "public.der", cwd=work)
-            run(binaries[-1], "plan", "--root", provision / "image", "--output",
-                provision / "base.json", "install", *bases, cwd=work,
+            run(binaries[-1], "image", "create", "--root", provision / "image", "--repo", "repo",
+                "--trust-root", "repo/trust/1.json", cwd=work)
+            run(binaries[-1], "install", "--root", provision / "image", "-n", "--save-plan",
+                provision / "base.json", *bases, cwd=work,
                 timings=timings, label="plan_base")
             run(binaries[-1], "apply", "--root", provision / "image", provision / "base.json",
                 cwd=work, timings=timings, label="apply_base")
@@ -135,17 +138,17 @@ def main():
             def step(*args, label=None):
                 run(cps, *args, cwd=run_dir, timings=timings, label=label)
 
-            step("plan", "--root", "image", "--output", "extra.json", "install",
+            step("install", "--root", "image", "-n", "--save-plan", "extra.json",
                  "bench/extra", label="plan_install_one")
             # The first transaction after provisioning hashes every file once.
             step("apply", "--root", "image", "extra.json", label="apply_install_one")
-            step("plan", "--root", "image", "--output", "remove.json", "remove",
+            step("remove", "--root", "image", "-n", "--save-plan", "remove.json",
                  "bench/extra", label="plan_remove_one")
             step("apply", "--root", "image", "remove.json", label="apply_remove_one")
-            step("plan", "--root", "image", "--output", "again.json", "install",
+            step("install", "--root", "image", "-n", "--save-plan", "again.json",
                  "bench/extra", label="plan_reinstall_one")
             step("apply", "--root", "image", "again.json", label="apply_reinstall_one")
-            step("plan", "--root", "image", "--output", "upgrade.json", "update",
+            step("upgrade", "--root", "image", "-n", "--save-plan", "upgrade.json",
                  label="plan_upgrade_one")
             step("apply", "--root", "image", "upgrade.json", label="apply_upgrade_one")
             help_text = subprocess.run([cps, "verify", "--help"], check=True,

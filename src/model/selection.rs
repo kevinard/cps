@@ -203,7 +203,7 @@ impl<'a> Selection<'a> {
         for name in action.selectors().variants.keys() {
             ensure!(
                 self.variant(name).is_some(),
-                "{package} selects {} by variant {name}, which this image does not set; choose a value with plan change-variant {name}=VALUE",
+                "{package} selects {} by variant {name}, which this image does not set; choose a value with cps variant set {name}=VALUE",
                 action.path()
             );
         }

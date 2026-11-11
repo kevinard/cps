@@ -23,7 +23,7 @@ if [ -f "$work/git-phase" ]; then
         check_package tracked 'tracked updated' "$new"
         systemctl is-active --quiet systemd-bless-boot.service
         echo 'CPS_VM_GIT: tracked package advanced and pinned package stayed at its commit'
-        cps boot-env rollback --esp /efi --btrfs-volume /volume
+        cps boot rollback --esp /efi --btrfs-volume /volume
         echo base > "$work/git-phase"
         $bb sync
         exec $bb reboot -f

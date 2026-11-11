@@ -39,7 +39,7 @@ use self::policy::{BootEntry, BootRoot, LoaderPolicy, field};
 const LINUX_HASH: &str = "# cps-linux-sha256 ";
 const INITRD_HASH: &str = "# cps-initrd-sha256 ";
 const NO_SELECTION: &str = "loader/loader.conf selects no CPS boot environment; select a \
-    known-good environment with `cps boot-env rollback --esp ESP ID`";
+    known-good environment with `cps boot rollback --esp ESP ID`";
 /// Free space kept on the ESP beyond the boot files of an activation.
 const ESP_MARGIN: u64 = 1024 * 1024;
 
@@ -356,7 +356,7 @@ pub(super) fn with_running_environment<T>(
     } = inventory(&esp, &lock, false)?;
     if let Some(firmware) = &firmware {
         firmware.require_no_next().context(
-            "boot the scheduled trial, or cancel it with `cps boot-env discard-trial`, before \
+            "boot the scheduled trial, or cancel it with `cps boot discard-trial`, before \
              making more package changes",
         )?;
     }
@@ -366,7 +366,7 @@ pub(super) fn with_running_environment<T>(
         .context("no known-good CPS boot environment is selected")?;
     ensure!(
         selected.tries.is_none(),
-        "a trial is pending ({}); boot it, or cancel it with `cps boot-env discard-trial`, \
+        "a trial is pending ({}); boot it, or cancel it with `cps boot discard-trial`, \
          before making more package changes",
         selected.id
     );
@@ -650,7 +650,7 @@ fn activate_as(
     }
     ensure!(
         !destroy::pending(&esp)?.iter().any(|entry| entry.id == id),
-        "this boot environment is retiring; finish destroy-btrfs first"
+        "this boot environment is retiring; finish it with `cps boot destroy`"
     );
     let existing_entry = existing.iter().find(|entry| entry.id == id);
     if let Some(entry) = existing_entry {
@@ -724,7 +724,7 @@ fn activate_as(
                     .transpose()?
                     .unwrap_or(false),
             "boot attempts are exhausted; remove the failed trial with \
-             `cps boot-env discard-trial`, then stage again"
+             `cps boot discard-trial`, then stage again"
         );
         ensure!(
             entry.description == description,
@@ -1005,7 +1005,7 @@ fn check_esp_space(esp: &Path, id: &str, files: &[(PathBuf, u64)]) -> Result<()>
         available >= needed,
         "insufficient free space on the EFI system partition for {id}: {} available, {} \
          needed for its boot files and a {} margin. Remove old boot environments with \
-         `cps boot-env prune`, or free space on the ESP, then retry",
+         `cps boot prune`, or free space on the ESP, then retry",
         super::mib(available),
         super::mib(needed),
         super::mib(ESP_MARGIN),
@@ -1381,7 +1381,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(message.contains("insufficient free space on the EFI system partition"));
-        assert!(message.contains(id) && message.contains("cps boot-env prune"));
+        assert!(message.contains(id) && message.contains("cps boot prune"));
         Ok(())
     }
 

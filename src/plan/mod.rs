@@ -117,26 +117,27 @@ pub enum Request {
 }
 
 impl Request {
+    /// The cps command that makes this request, as `cps history` shows it.
     pub fn operation(&self) -> &'static str {
         match self {
             Self::Install { .. } => "install",
-            Self::ExactInstall { .. } => "exact-install",
-            Self::InstallProfile => "install-profile",
-            Self::InstallLock { .. } => "install-lock",
+            Self::ExactInstall { .. } => "install --exact",
+            Self::InstallProfile => "install --profile",
+            Self::InstallLock { .. } => "install --lock",
             Self::Mark { .. } => "mark",
             Self::Freeze { .. } => "freeze",
             Self::Unfreeze { .. } => "unfreeze",
             Self::Remove { .. } => "remove",
             Self::Autoremove => "autoremove",
-            Self::ChangeFacet { .. } => "change-facet",
-            Self::ChangeVariant { .. } => "change-variant",
-            Self::SetMediator { .. } => "set-mediator",
+            Self::ChangeFacet { .. } => "facet set",
+            Self::ChangeVariant { .. } => "variant set",
+            Self::SetMediator { .. } => "mediator set",
             Self::Repair { .. } => "repair",
-            Self::RepairPaths { .. } => "repair-paths",
+            Self::RepairPaths { .. } => "repair --path",
             Self::Revert { .. } => "revert",
-            Self::ResolveConfig { .. } => "resolve-config",
-            Self::Update => "update",
-            Self::UpdateProfile => "update-profile",
+            Self::ResolveConfig { .. } => "config resolve",
+            Self::Update => "upgrade",
+            Self::UpdateProfile => "upgrade (profile)",
         }
     }
 }
@@ -1043,7 +1044,7 @@ fn build_with_update_diagnostics(
     };
     ensure!(
         !force_phased_update || updating,
-        "--force-phased-update requires an update request"
+        "--force-rollout requires an update request"
     );
     ensure!(
         state.settings.bootstrap_catalog.is_none()
@@ -1051,7 +1052,7 @@ fn build_with_update_diagnostics(
                 request,
                 Request::InstallProfile | Request::InstallLock { .. }
             ),
-        "install the pinned bootstrap release with plan install-profile first, or provision it with plan install-lock"
+        "install the pinned bootstrap release with cps install --profile first, or provision it with cps install --lock"
     );
     if let Request::Mark { choice, packages } = &request {
         let (installed, intent_changes) = intent::mark(image, &mut state, *choice, packages)?;

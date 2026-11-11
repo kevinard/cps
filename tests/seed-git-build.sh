@@ -23,14 +23,14 @@ for applet in sh awk basename cat chmod cp cut dirname echo env grep gzip head i
     ln -s busybox "$seed/bin/$applet"
 done
 "$cps" manifest generate --proto "$seed" --publisher canopa-git-tools \
-    --version 1.0.0-0 --architecture "$arch" build/base-tools > "$work/base-tools.kdl"
+    --version 1.0.0-0 --arch "$arch" build/base-tools > "$work/base-tools.kdl"
 
 destination="$prototype/usr/share/cps/git-build"
 mkdir -p "$destination"
 (
     cd -- "$destination"
     "$cps" repo trust init --repo repo --publisher canopa-git-tools --key "$signing_key" >/dev/null
-    "$cps" publish --repo repo --proto "$seed" --signing-key "$signing_key" "$work/base-tools.kdl"
+    "$cps" publish manifests --repo repo --proto "$seed" --key "$signing_key" "$work/base-tools.kdl"
     rm -- repo/publish.lock
     # Keep the sandbox ELF files opaque to the host image's runtime closure check.
     for blob in repo/blobs/*; do

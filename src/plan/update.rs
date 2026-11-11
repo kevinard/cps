@@ -48,7 +48,7 @@ impl fmt::Display for PhasedUpdateDeferred {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Profile {}/{} upgrade deferred at {}% rollout (cohort {}). Use --force-phased-update to proceed.",
+            "Profile {}/{} upgrade deferred at {}% rollout (cohort {}). Use --force-rollout to proceed.",
             self.publisher, self.profile, self.percentage, self.cohort
         )
     }

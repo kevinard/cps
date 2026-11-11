@@ -24,7 +24,7 @@ publish() {
     local name=$1 body=$2
     printf 'schema-version 1 kind="package-manifest"\npackage "%s" publisher="canopa" version="%s" {\n%s}\n' \
         "$name" "${3:-1.0.0-0}" "$body" > manifest.kdl
-    "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl
 }
 script() {
     mkdir -p "proto/$(dirname -- "$1")"
@@ -40,7 +40,7 @@ item() {
 plan_apply() {
     local root=$1
     shift
-    "$cps" plan --root "$root" --output plan.json "$@" > plan.log
+    "$cps" "$@" --root "$root" -n --save-plan plan.json > plan.log
     "$cps" apply --root "$root" plan.json
 }
 
@@ -93,8 +93,8 @@ publish test/a "$(item a alpha)"
 publish test/b "$(item b bravo)"
 publish test/c "$(item c charlie 'facet="doc.extra"')"
 
-"$cps" image-create --root image --repo repo --publisher canopa --trust-root repo/trust/1.json
-plan_apply image change-facet doc.extra=false
+"$cps" image create --root image --repo repo --trust-root repo/trust/1.json
+plan_apply image facet set doc.extra=false
 plan_apply image install test/summary test/a test/b test/c
 rg -Fx 'Run trigger test/index:index' plan.log
 rg -Fx 'Run trigger test/summary:summary' plan.log
@@ -109,7 +109,7 @@ test "$(wc -l < image/usr/share/test-summary/runs)" -eq 1
 "$cps" verify --root image --pristine
 
 # Facet recomposition changes a watched path, and both triggers run once.
-plan_apply image change-facet doc.extra=default
+plan_apply image facet set doc.extra=default
 printf 'alpha\nbravo\ncharlie\n' | cmp - image/usr/share/test-items/index
 test "$(wc -l < image/usr/share/test-items/runs)" -eq 2
 test "$(cat image/usr/share/test-summary/count)" -eq 3
@@ -143,7 +143,7 @@ rg -F 'covers the packaged path usr/share/test-items/index' clash.log
 echo stale > proto/usr/share/test-summary/count
 publish test/clash "    file \"usr/share/test-summary/count\" mode=\"0644\" $owner
 "
-if "$cps" plan --root image --output clash.json install test/clash 2> clash.log; then
+if "$cps" install --root image -n --save-plan clash.json test/clash 2> clash.log; then
     echo 'planned a package path inside a trigger output' >&2
     exit 1
 fi
@@ -154,19 +154,19 @@ rg -F 'path conflict for usr/share/test-summary/count' clash.log
 publish test/d "$(item d delta)"
 mkdir image/etc
 touch image/etc/test-summary-fail
-"$cps" plan --root image --output fail.json install test/d > plan.log
+"$cps" install --root image -n --save-plan fail.json test/d > plan.log
 if "$cps" apply --root image fail.json 2> fail.log; then
     echo 'expected the trigger handler to fail' >&2
     exit 1
 fi
 rg -F 'trigger test/summary:summary failed' fail.log
-"$cps" transaction status --root image | rg -Fx 'Offline actions pending'
+"$cps" status --root image | rg -Fx 'Offline actions pending'
 test "$(wc -l < image/usr/share/test-items/runs)" -eq 3
 test "$(wc -l < image/usr/share/test-summary/runs)" -eq 2
 rm image/etc/test-summary-fail
 rmdir image/etc
 mv repo repo.offline
-"$cps" transaction resume --root image
+"$cps" resume --root image
 mv repo.offline repo
 test "$(wc -l < image/usr/share/test-items/runs)" -eq 3
 test "$(wc -l < image/usr/share/test-summary/runs)" -eq 3
@@ -179,29 +179,29 @@ test "$(cat image/usr/share/test-summary/count)" -eq 4
 publish test/e "$(item e echo)"
 mkdir image/etc
 touch image/etc/test-summary-fail
-"$cps" plan --root image --output fail.json install test/e > plan.log
+"$cps" install --root image -n --save-plan fail.json test/e > plan.log
 if "$cps" apply --root image fail.json 2> fail.log; then
     echo 'expected the trigger handler to fail' >&2
     exit 1
 fi
 rg -Fx echo image/usr/share/test-items/index
 test "$(wc -l < image/usr/share/test-items/runs)" -eq 4
-if "$cps" transaction abort --root image 2> fail.log; then
+if "$cps" abort --root image 2> fail.log; then
     echo 'expected the trigger handler to fail during the abort' >&2
     exit 1
 fi
 rg -F 'trigger test/summary:summary failed' fail.log
-"$cps" transaction status --root image | rg -Fx 'Abort in progress'
+"$cps" status --root image | rg -Fx 'Abort in progress'
 test ! -e image/usr/share/test-items/e.item
 printf 'alpha\nbravo\ncharlie\ndelta\n' | cmp - image/usr/share/test-items/index
 test "$(wc -l < image/usr/share/test-items/runs)" -eq 5
 rm image/etc/test-summary-fail
 rmdir image/etc
-"$cps" transaction resume --root image | rg -Fx 'Aborted the pending transaction'
+"$cps" resume --root image | rg -Fx 'Aborted the pending transaction'
 test "$(wc -l < image/usr/share/test-items/runs)" -eq 5
 test "$(wc -l < image/usr/share/test-summary/runs)" -eq 4
 test "$(cat image/usr/share/test-summary/count)" -eq 4
-"$cps" transaction status --root image | rg -Fx 'No pending transaction'
+"$cps" status --root image | rg -Fx 'No pending transaction'
 "$cps" verify --root image --pristine
 
 # Removing the declaring packages removes what they generated.
@@ -240,8 +240,8 @@ HANDLER
         output \"usr/share/test-escape/declared\"
     }
 "
-"$cps" image-create --root escape --repo repo --publisher canopa --trust-root repo/trust/1.json
-"$cps" plan --root escape --output escape.json install test/escape > /dev/null
+"$cps" image create --root escape --repo repo --trust-root repo/trust/1.json
+"$cps" install --root escape -n --save-plan escape.json test/escape > /dev/null
 if CPS_TEST_SECRET=1 "$cps" apply --root escape escape.json 2> escape.log; then
     echo 'a trigger published a path outside its outputs' >&2
     exit 1
@@ -291,7 +291,7 @@ HANDLER
         output \"usr/lib/modules/*/initrd\"
     }
 "
-    "$cps" image-create --root boot --repo repo --publisher canopa --trust-root repo/trust/1.json
+    "$cps" image create --root boot --repo repo --trust-root repo/trust/1.json
     plan_apply boot install test/kernel test/mkinitrd
     rg -Fx "Prepare Linux $release with kernel-install" plan.log
     printf 'initramfs for %s\nkernel/base.ko\n' "$release" | cmp - "boot/usr/lib/modules/$release/initrd"
@@ -325,7 +325,7 @@ $(command -v kernel-install) "\$@" || exit
 [[ ! -e $work/damage ]] || echo damaged > $work/boot/usr/lib/modules/$release/kernel/base.ko
 SHIM
     chmod 0755 shim/kernel-install
-    "$cps" plan --root boot --output module.json install test/module > plan.log
+    "$cps" install --root boot -n --save-plan module.json test/module > plan.log
     touch damage
     if PATH=$work/shim:$PATH "$cps" apply --root boot module.json 2> fail.log; then
         echo 'expected the damaged module to fail the transaction' >&2
@@ -336,7 +336,7 @@ SHIM
     rg -Fx extra.ko "boot/usr/lib/modules/$release/initrd"
     prepared
     echo base > "boot/usr/lib/modules/$release/kernel/base.ko"
-    "$cps" transaction abort --root boot
+    "$cps" abort --root boot
     test "$(find boot/usr/lib/sysimage/cps -maxdepth 1 -name 'kernel-*' | wc -l)" -eq 1
     printf 'initramfs for %s\nkernel/base.ko\n' "$release" | cmp - "boot/usr/lib/modules/$release/initrd"
     prepared

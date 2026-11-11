@@ -29,19 +29,23 @@ Use a Linux filesystem that supports atomic directory exchange for the cache.
 Pass `--index-only` to fetch metadata now and payloads on demand.
 
 ```sh
-cps repo sync --repo /var/lib/cps/canopa --root canopa-root.json \
-    --metadata https://packages.example.org/metadata/ \
-    --targets https://packages.example.org/targets/ \
-    --publisher canopa --trust-root canopa.trust.json
+cps repo sync --repo /var/lib/cps/canopa --tuf-root canopa-root.json \
+    --url https://packages.example.org/ --trust-root canopa.trust.json
 ```
 
-Point `image-create` or the KDL image configuration at this cache. Give
+`--tuf-root` is the mirror's provisioned TUF root metadata, and
+`--trust-root` is the publisher's pinned trust root, which also names the
+publisher. `--url` is the base URL that holds `metadata/` and `targets/`.
+When the two directories live elsewhere, pass `--metadata URL` and
+`--targets URL` instead.
+
+Point `cps image create` or the KDL image configuration at this cache. Give
 write access to the account that runs sync and keep the cache outside all
 boot roots on persistent storage, such as the
 [`/var` that Btrfs environments share](../setups/btrfs.md#share-var-between-boot-environments). CPS uses the original provisioned root to
 identify the repository on each sync and stores authenticated root rotations
 and replay state under `.tuf`. Sync accepts HTTPS or a local `file:///`
-mirror, with trailing slashes on both URLs.
+mirror. URLs passed to `--metadata` and `--targets` end with a slash.
 
 Full sync checks TUF signatures, versions, and expiration, then verifies the
 catalog against the publisher's [pinned trust root](publishers.md#pinned-trust-roots)
@@ -132,12 +136,12 @@ and an abort restores the archives that the pending transaction replaced.
 The publisher signs the association between each package and its build
 evidence. Export and sync carry the evidence with the release. To retrieve
 it, use
-`cps repo attestation --repo /var/lib/cps/canopa --publisher canopa --trust-root canopa.trust.json cps://canopa/demo/hello@1.0.0-0`.
+`cps repo attestation --repo /var/lib/cps/canopa --trust-root canopa.trust.json cps://canopa/demo/hello@1.0.0-0`.
 
 ## Synchronizing a signed profile
 
 For a profile that spans mirrors, add one `mirror` entry per publisher to
-the same KDL file used by `image-create`. The `root` path names that mirror's
+the same KDL file used by `image create`. The `root` path names that mirror's
 provisioned TUF root. Relative paths resolve from the KDL file.
 
 ```kdl
@@ -157,7 +161,7 @@ mirror "runtime" root="runtime-root.json" metadata="https://packages.example.org
 
 ```sh
 cps repo sync-profile --config image.kdl --index-only
-cps image-create --root image --config image.kdl
+cps image create --root image --config image.kdl
 ```
 
 CPS verifies the primary release and requires each companion mirror to
@@ -204,12 +208,13 @@ catalog.
 
 For an image that uses a small part of a mirror, add `--index-only` to `repo sync`.
 This caches the catalog, manifests, and build evidence and verifies the signed
-TUF target entries for payloads. Fetch the files for the resulting plan before
-applying or staging it.
+TUF target entries for payloads. A change such as `cps upgrade --root image`
+fetches the files its plan needs before it applies the plan. For a saved
+plan, fetch the files before applying or staging it.
 
 ```sh
-cps plan --root image --output upgrade.json update
-cps fetch --root image --plan upgrade.json
+cps upgrade --root image -n --save-plan upgrade.json
+cps fetch --root image upgrade.json
 cps apply --root image upgrade.json
 ```
 
@@ -217,7 +222,7 @@ Fetch revalidates the plan against the image and its pinned catalogs. If a
 required payload is missing or damaged, fetch refreshes TUF metadata using the
 mirror endpoints saved by `repo sync` and verifies the exact target. Use the
 sync account to fetch into its cache. Fetch leaves the image and the cache's
-current catalog unchanged. `cps transaction abort --fetch` uses the same
+current catalog unchanged. `cps abort --fetch` uses the same
 endpoints to download the payloads that an
 [abort](images.md#abort-a-transaction) needs.
 
@@ -226,11 +231,11 @@ endpoints to download the payloads that an
 A cached copy or a historical archive can supply payloads the live mirror has
 dropped. To recover a missing payload for a saved plan or an installed
 package, provision a historical cache with `repo sync --archive-catalog` and
-pass it to fetch.
+pass it to fetch with a saved plan.
 
 ```sh
-cps plan --root image --output repair.json repair system/kernel
-cps fetch --root image --plan repair.json --archive-cache canopa=/var/lib/cps/archive/kernel
+cps repair --root image -n --save-plan repair.json system/kernel
+cps fetch --root image --archive-cache canopa=/var/lib/cps/archive/kernel repair.json
 cps apply --root image repair.json
 ```
 
@@ -267,12 +272,12 @@ roots. Offline images and saved plans outside that set can use a separate
 cache and the manual retention options below. Omitting the setting leaves
 pruning manual.
 
-`repo prune-cache` lists unneeded payload files and their lengths. Run it
-once to review the list, then repeat with `--apply` to remove those files.
-Run it on a synchronized TUF mirror cache.
+`repo prune-cache` removes unneeded payload files and lists them with
+their lengths. Add `-n` to review the list without removing anything. Run it
+on a synchronized TUF mirror cache.
 
 ```sh
-cps repo prune-cache --repo /var/lib/cps/canopa --publisher canopa \
+cps repo prune-cache -n --repo /var/lib/cps/canopa \
     --trust-root canopa.trust.json --keep-image current-root --keep-image fallback-root \
     --keep-plan upgrade.json
 ```

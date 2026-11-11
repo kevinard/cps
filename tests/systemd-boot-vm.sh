@@ -70,7 +70,7 @@ if [[ -n $busybox_repo || -n $busybox_key ]]; then
         "1.37.0-$busybox_revision") ;;
         *) echo "Unsupported BusyBox version for this layout: $busybox_version" >&2; exit 2 ;;
     esac
-    "$cps" repo attestation --repo "$busybox_repo" --publisher canopa-bootstrap \
+    "$cps" repo attestation --repo "$busybox_repo" \
         --trust-root "$busybox_key" "$busybox_package" >/dev/null
 else
     test -r "$busybox" || { echo "Missing input: $busybox" >&2; exit 1; }
@@ -115,7 +115,7 @@ if [[ -n $cps_fixture ]]; then
         boot_git_build_dependency="    require \"system/git-build\" version=\"=$git_build_version\""
     fi
     for package in "${cps_packages[@]}"; do
-        "$cps" repo attestation --repo "$cps_fixture/repo" --publisher canopa \
+        "$cps" repo attestation --repo "$cps_fixture/repo" \
             --trust-root "$cps_fixture/release.trust.json" "cps://canopa/$package" >/dev/null
     done
     elf_runtime_paths=(lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1})
@@ -153,7 +153,7 @@ if [[ -n $kernel_fixture ]]; then
     trial_release=$(cat "$kernel_fixture/kernel-release")
     test "$trial_release" = 6.12.115-cps-vm
     trial_kernel="$kernel_fixture/image/usr/lib/modules/$trial_release/vmlinuz"
-    "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
+    "$cps" repo attestation --repo "$kernel_fixture/repo" \
         --trust-root "$kernel_fixture/release.trust.json" "$kernel_package" >/dev/null
 fi
 if [[ -n $util_linux_fixture ]]; then
@@ -164,13 +164,13 @@ if [[ -n $util_linux_fixture ]]; then
     util_linux_package=cps://canopa-util-linux/system/util-linux@$util_linux_version
     systemd_version=262.1.0-4
     if [[ $util_linux_version == 2.42.4-1 ]]; then systemd_version=262.1.0-5; fi
-    "$cps" repo attestation --repo "$util_linux_fixture/repo" --publisher canopa-util-linux \
+    "$cps" repo attestation --repo "$util_linux_fixture/repo" \
         --trust-root "$util_linux_fixture/release.trust.json" "$util_linux_package" >/dev/null
 fi
 if [[ -n $systemd_fixture ]]; then
     $profiled || { echo 'CPS_VM_SYSTEMD_FIXTURE requires CPS_VM_RELEASE_PROFILE=1' >&2; exit 2; }
     systemd_version=${CPS_VM_SYSTEMD_VERSION:-$systemd_version}
-    "$cps" repo attestation --repo "$systemd_fixture/repo" --publisher canopa-systemd \
+    "$cps" repo attestation --repo "$systemd_fixture/repo" \
         --trust-root "$systemd_fixture/release.trust.json" "cps://canopa-systemd/system/systemd-vm@$systemd_version" >/dev/null
 fi
 if [[ -n $usr_base_fixture ]]; then
@@ -255,7 +255,7 @@ $facet_action
 $dependency
 }
 MANIFEST
-    "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl
 }
 
 publish_kernel() {
@@ -273,7 +273,7 @@ package "system/kernel" publisher="$fixture_publisher" version="$version" {
     kernel-install "$release" initrd=#true
 }
 MANIFEST
-    "$cps" publish --repo repo --proto proto --signing-key private.der kernel.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der kernel.kdl
 }
 
 publish_extra_marker() {
@@ -287,7 +287,7 @@ package "test/extra-marker" publisher="extras" version="1.0.0-0" {
     file "etc/cps-vm-extra-marker" mode="0644" uid=$(id -u) gid=$(id -g)
 }
 MANIFEST
-    "$cps" publish --repo extras --proto proto --signing-key extras-private.der extra-marker.kdl
+    "$cps" publish manifests --repo extras --proto proto --key extras-private.der extra-marker.kdl
 }
 
 profile_companions() {
@@ -322,7 +322,7 @@ publish_vm_mirror() {
     shift 4
     local mirror="mirrors/$name" export="mirrors/$name/export-$version"
     mkdir -p -- "$mirror"
-    "$cps" repo export --repo "$repository" --publisher "$name" --trust-root "$key" \
+    "$cps" repo export --repo "$repository" --trust-root "$key" \
         --output "$export" "$@" >/dev/null
     (umask 077; "$tuf_fixture" "$export" "$mirror" "$version" > "$mirror/url")
     rm -r -- "$export"
@@ -347,7 +347,7 @@ refresh_vm_profile() {
     } > profile-repo/publish-policy.kdl
     printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
         "$(cat profile-repo/current)" > profile-release.kdl
-    "$cps" repo publish-release --repo profile-repo --signing-key profile-private.der profile-release.kdl
+    "$cps" publish release --repo profile-repo --key profile-private.der profile-release.kdl
 }
 
 if [[ $mode == rollback ]]; then
@@ -358,7 +358,7 @@ package "test/legacy-marker" publisher="$fixture_publisher" version="1.0.0-0" {
     file "etc/cps-vm-legacy-marker" mode="0644" uid=$(id -u) gid=$(id -g)
 }
 MANIFEST
-    "$cps" publish --repo repo --proto proto --signing-key private.der legacy-marker.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der legacy-marker.kdl
 fi
 publish_state 1.0.0-0 previous
 packages=(test/boot-state)
@@ -380,7 +380,7 @@ elif $systemd_guest; then
     install -Dm644 "$project/LICENSE" proto/usr/share/licenses/cps/LICENSE
     sed -e '/^    require /d' -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
         "$project/packaging/cps.kdl" > cps.kdl
-    "$cps" publish --repo repo --proto proto --signing-key private.der cps.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der cps.kdl
     packages+=(system/cps)
 fi
 mkdir -p runtime/etc
@@ -489,7 +489,7 @@ GUEST
 fi
 "$cps" manifest generate --proto runtime --publisher "$fixture_publisher" --version 1.0.0-0 \
     --uid "$(id -u)" --gid "$(id -g)" test/boot-runtime > runtime.kdl
-"$cps" publish --repo repo --proto runtime --signing-key private.der runtime.kdl
+"$cps" publish manifests --repo repo --proto runtime --key private.der runtime.kdl
 packages+=(test/boot-runtime)
 if $profiled; then
     publish_extra_marker
@@ -544,7 +544,7 @@ $boot_git_build_dependency
     require "system/busybox" version="=$busybox_version"
 }
 MANIFEST
-    "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der boot-stack.kdl
+    "$cps" publish manifests --repo profile-repo --proto proto --key profile-private.der boot-stack.kdl
     printf 'previous default\n' > proto/etc/cps-vm-previous-default
     cat > previous-default.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
@@ -552,7 +552,7 @@ package "test/previous-default" publisher="vm-profile" version="1.0.0-0" {
     file "etc/cps-vm-previous-default" mode="0644" uid=$(id -u) gid=$(id -g)
 }
 MANIFEST
-    "$cps" publish --repo profile-repo --proto proto --signing-key profile-private.der previous-default.kdl
+    "$cps" publish manifests --repo profile-repo --proto proto --key profile-private.der previous-default.kdl
     base_test_catalog=$(cat repo/current)
     refresh_vm_profile base
     if [[ $tuf_mirrors == 1 ]]; then
@@ -594,7 +594,7 @@ if [[ $tuf_mirrors == 1 ]]; then
     "$cps" repo sync-profile --config image.kdl --index-only
     test -z "$(find mirror-cache -path '*/blobs/*' -type f -print -quit)"
 fi
-"$cps" image-create --root base --config image.kdl
+"$cps" image create --root base --config image.kdl
 state_dir=usr/lib/sysimage/cps
 if ! $profiled && [[ -n $cps_fixture ]]; then
     "$cps" publisher add --root base --repo "$cps_fixture/repo" \
@@ -606,28 +606,28 @@ if ! $profiled && [[ -n $busybox_repo ]]; then
     "$cps" publisher add --root base --repo "$busybox_repo" --trust-root "$busybox_key" canopa-bootstrap
 fi
 if $profiled; then
-    "$cps" plan --root base --output install.json install-profile
+    "$cps" install --root base --profile -n --save-plan install.json
 else
-    "$cps" plan --root base --output install.json install "${packages[@]}"
+    "$cps" install --root base -n --save-plan install.json "${packages[@]}"
 fi
 if [[ $tuf_mirrors == 1 ]]; then
-    "$cps" fetch --root base --plan install.json
+    "$cps" fetch --root base install.json
     echo 'Verified initial profile payloads were fetched into an index-only TUF cache'
 fi
 "$cps" apply --root base install.json
 freeze_runtime() {
     local root=$1
-    "$cps" plan --root "$root" --output "$root-freeze.json" freeze \
+    "$cps" freeze --root "$root" -n --save-plan "$root-freeze.json" \
         --reason 'VM runtime compatibility' system/sqlite
     "$cps" apply --root "$root" "$root-freeze.json"
-    "$cps" freeze --root "$root" | grep -F $'system/sqlite\t'"$sqlite_version"$'\t"VM runtime compatibility"'
+    "$cps" list --root "$root" --frozen | grep -F $'system/sqlite\t'"$sqlite_version"$'\t"VM runtime compatibility"'
 }
 if $package_freezes; then freeze_runtime base; fi
 "$cps" verify --root base --pristine
 if [[ $mode == facet-change ]]; then printf 'local settings\n' > base/etc/cps-vm-optional.conf; fi
 if [[ $reprovision == 1 ]]; then
-    "$cps" image-create --root repro-base --config image.kdl
-    "$cps" plan --root repro-base --output repro-install.json install-profile
+    "$cps" image create --root repro-base --config image.kdl
+    "$cps" install --root repro-base --profile -n --save-plan repro-install.json
     cmp install.json repro-install.json
     "$cps" apply --root repro-base repro-install.json
     if $package_freezes; then freeze_runtime repro-base; cmp base-freeze.json repro-base-freeze.json; fi
@@ -694,7 +694,7 @@ image_disk() {
         var=(--var "$root.volume/@var")
     fi
     mv -- "$root" "$root.volume/@"
-    "$cps" boot-env image --btrfs-volume "$root.volume" --root "$root.volume/@" \
+    "$cps" image disk --btrfs-volume "$root.volume" --root "$root.volume/@" \
         --environments "$root.volume/@environments" "${var[@]}" --disk template.raw \
         --root-partuuid "$root_uuid" --output "$output" --options "$options" || status=$?
     mv -- "$root.volume/@" "$root"
@@ -751,7 +751,7 @@ release "$fixture_publisher" base="$(cat repo/current)" {
 $retire_kernel
 }
 RELEASE
-    "$cps" repo publish-release --repo repo --signing-key private.der retirement.kdl
+    "$cps" publish release --repo repo --key private.der retirement.kdl
 fi
 if $profiled; then
     if [[ $tuf_mirrors == 1 ]]; then
@@ -761,34 +761,33 @@ if $profiled; then
         publish_vm_mirror "$fixture_publisher" repo public.trust.json 3
         mirror_url=$(cat "mirrors/$fixture_publisher/url")
         companion_cache="mirror-cache/$fixture_publisher"
-        "$cps" repo sync --repo "$companion_cache" --root "mirrors/$fixture_publisher/root.json" \
+        "$cps" repo sync --repo "$companion_cache" --tuf-root "mirrors/$fixture_publisher/root.json" \
             --metadata "${mirror_url}metadata/" --targets "${mirror_url}targets/" \
-            --publisher "$fixture_publisher" --trust-root public.trust.json --index-only
+            --trust-root public.trust.json --index-only
         test ! -s "$companion_cache/.tuf/retention/$(cat repo/current)"
-        "$cps" repo prune-cache --repo "$companion_cache" --publisher "$fixture_publisher" \
-            --trust-root public.trust.json --apply
+        "$cps" repo prune-cache --repo "$companion_cache" --trust-root public.trust.json
         old_kernel_hash=$(sha256sum "$kernel" | cut -d' ' -f1)
         cmp "$kernel" "$companion_cache/blobs/$old_kernel_hash"
         echo 'Verified pruning kept the visible profile kernel after the companion mirror dropped its pin'
 
-        "$cps" repo export --repo repo --publisher "$fixture_publisher" --trust-root public.trust.json \
+        "$cps" repo export --repo repo --trust-root public.trust.json \
             --archive-catalog "$base_test_catalog" --output fallback-archive-targets
         archive_url=$(umask 077; "$tuf_fixture" fallback-archive-targets fallback-archive-mirror 1)
-        "$cps" repo sync --repo fallback-archive --root fallback-archive-mirror/root.json \
+        "$cps" repo sync --repo fallback-archive --tuf-root fallback-archive-mirror/root.json \
             --metadata "${archive_url}metadata/" --targets "${archive_url}targets/" \
-            --publisher "$fixture_publisher" --trust-root public.trust.json --index-only \
+            --trust-root public.trust.json --index-only \
             --archive-catalog "$base_test_catalog"
         cp -a --reflink=auto base repair-probe
         repaired_kernel="repair-probe/usr/lib/modules/$base_release/vmlinuz"
         rm -- "$repaired_kernel" "$companion_cache/blobs/$old_kernel_hash"
-        "$cps" plan --root repair-probe --output fallback-repair.json repair system/kernel
-        if "$cps" fetch --root repair-probe --plan fallback-repair.json > archive-repair.log 2>&1; then
+        "$cps" repair --root repair-probe -n --save-plan fallback-repair.json system/kernel
+        if "$cps" fetch --root repair-probe fallback-repair.json > archive-repair.log 2>&1; then
             echo 'The live mirror still served the withdrawn fallback kernel' >&2
             exit 1
         fi
         grep -F "checking TUF target blobs/$old_kernel_hash" archive-repair.log || { cat archive-repair.log >&2; exit 1; }
-        "$cps" fetch --root repair-probe --plan fallback-repair.json \
-            --archive-cache "$fixture_publisher=fallback-archive"
+        "$cps" fetch --root repair-probe --archive-cache "$fixture_publisher=fallback-archive" \
+            fallback-repair.json
         "$cps" apply --root repair-probe fallback-repair.json
         "$cps" verify --root repair-probe --pristine
         cmp "$kernel" "$repaired_kernel"
@@ -796,17 +795,17 @@ if $profiled; then
         cmp repo/current "$companion_cache/current"
         echo 'Verified repair restored the withdrawn fallback kernel from a signed archive'
 
-        "$cps" image-create --root replay-base --config image.kdl
-        "$cps" plan --root replay-base --output replay-install.json install-profile
+        "$cps" image create --root replay-base --config image.kdl
+        "$cps" install --root replay-base --profile -n --save-plan replay-install.json
         rm -- "$companion_cache/catalogs/$base_test_catalog"
-        if "$cps" fetch --root replay-base --plan replay-install.json > archive-replay.log 2>&1; then
+        if "$cps" fetch --root replay-base replay-install.json > archive-replay.log 2>&1; then
             echo 'Fetch replayed a saved plan with missing catalog metadata' >&2
             exit 1
         fi
         grep -F "reading signed catalog for $fixture_publisher" archive-replay.log \
             || { cat archive-replay.log >&2; exit 1; }
-        "$cps" fetch --root replay-base --plan replay-install.json \
-            --archive-cache "$fixture_publisher=fallback-archive"
+        "$cps" fetch --root replay-base --archive-cache "$fixture_publisher=fallback-archive" \
+            replay-install.json
         "$cps" apply --root replay-base replay-install.json
         "$cps" verify --root replay-base --pristine
         cmp "$kernel" "replay-base/usr/lib/modules/$base_release/vmlinuz"
@@ -816,7 +815,7 @@ if $profiled; then
         echo 'Verified a saved profile plan replayed after its catalog was restored from a signed archive'
         publish_vm_mirror "$fixture_publisher" repo public.trust.json 4 --retain-catalog "$base_test_catalog"
     fi
-    "$cps" plan --root base --output before-profile.json update > before-profile.log
+    "$cps" upgrade --root base -n --save-plan before-profile.json > before-profile.log
     grep -Fq "\"$base_test_catalog\"" before-profile.json
     if grep -Eq '(Update|Install|Remove) .*system/kernel' before-profile.log; then
         echo 'The companion update escaped its signed profile pin' >&2
@@ -882,25 +881,26 @@ if $profiled; then
         echo 'Verified atomic relocation of the signed profile repositories'
     fi
 fi
-request=(update)
+request=(upgrade)
+request_args=()
 if $package_freezes; then
     cp -a --reflink=auto base freeze-probe
-    "$cps" plan --root freeze-probe --output freeze-state.json freeze \
+    "$cps" freeze --root freeze-probe -n --save-plan freeze-state.json \
         --reason 'VM boot-state compatibility' test/boot-state
     "$cps" apply --root freeze-probe freeze-state.json
-    if "$cps" plan --root freeze-probe --output blocked.json update > freeze-rejected.log 2>&1; then
+    if "$cps" upgrade --root freeze-probe -n --save-plan blocked.json > freeze-rejected.log 2>&1; then
         echo 'The signed profile update ignored a package freeze' >&2
         exit 1
     fi
     grep -F 'VM boot-state compatibility' freeze-rejected.log
     test ! -e blocked.json
-    "$cps" plan --root freeze-probe --output unfreeze-state.json unfreeze test/boot-state
+    "$cps" unfreeze --root freeze-probe -n --save-plan unfreeze-state.json test/boot-state
     "$cps" apply --root freeze-probe unfreeze-state.json
-    "$cps" plan --root freeze-probe --output unfrozen.json update >/dev/null
+    "$cps" upgrade --root freeze-probe -n --save-plan unfrozen.json >/dev/null
     echo 'Verified the signed profile update required explicit unfreezing'
 fi
-if [[ $mode == facet-change ]]; then request=(change-facet doc.man=default optional=false); fi
-"$cps" plan --root base --output update.json "${request[@]}" | tee update.log
+if [[ $mode == facet-change ]]; then request=(facet set); request_args=(doc.man=default optional=false); fi
+"$cps" "${request[@]}" --root base -n --save-plan update.json "${request_args[@]}" | tee update.log
 # The rescue system stages the trial as a Btrfs snapshot on the disk. A plain
 # copy of the base with the same plan applied previews it for host checks.
 if [[ $tuf_mirrors == 1 ]]; then
@@ -941,19 +941,19 @@ if $profiled; then
     test "$(cat base/etc/cps-vm-previous-default)" = 'previous default'
     test ! -e "$staged_root/etc/cps-vm-previous-default"
     "$cps" info --root "$staged_root" --available test/previous-default > /dev/null
-    trial_plan=$("$cps" transaction history --root "$staged_root" --limit 2 | awk -F '\t' -v revision="$((base_revision + 1))" '$1 == revision && $3 == "update-profile" {print $2}')
-    "$cps" transaction show --root "$staged_root" "$trial_plan" > trial-history.json
+    trial_plan=$("$cps" history --root "$staged_root" --limit 2 | awk -F '\t' -v revision="$((base_revision + 1))" '$1 == revision && $3 == "upgrade (profile)" {print $2}')
+    "$cps" history --root "$staged_root" "$trial_plan" > trial-history.json
     grep -Fq "\"kernel_release\": \"$trial_release\"" trial-history.json
     grep -Fq "\"base_revision\": $base_revision" trial-history.json
-    "$cps" transaction history --root base --limit 2 | grep -Fq $'\tinstall-profile'
+    "$cps" history --root base --limit 2 | grep -Fq $'\tinstall --profile'
     echo 'Verified committed history in both boot environments'
 fi
 
 if [[ $mode == rollback ]]; then
     cp "$primary_pointer" trial-catalog
     cp base-catalog "$primary_pointer"
-    "$cps" plan --root base --output base-catalog-plan.json update >/dev/null
-    if "$cps" plan --root "$staged_root" --output replay.json update > replay.log 2>&1; then
+    "$cps" upgrade --root base -n --save-plan base-catalog-plan.json >/dev/null
+    if "$cps" upgrade --root "$staged_root" -n --save-plan replay.json > replay.log 2>&1; then
         echo 'The staged environment accepted a replayed primary catalog' >&2
         exit 1
     fi
@@ -998,7 +998,7 @@ cp --sparse=always bootable-base.raw disk.raw
     cat <<'GUEST'
 trial=/volume/@environments/trial/root
 activate() {
-    cps boot-env activate-btrfs --root "$trial" --btrfs-volume /volume --esp /efi \
+    cps boot activate --root "$trial" --btrfs-volume /volume --esp /efi \
         --root-partuuid "$root_uuid" --options "$options" "$@"
 }
 reject() {
@@ -1010,16 +1010,16 @@ reject() {
 }
 $bb chown 0:0 /volume/@environments
 $bb chmod 0755 /volume/@environments
-cps boot-env list --esp /efi
+cps boot list --esp /efi
 if [ "$mode" = rollback ]; then
     # Pin the base, so the trial is selected with `preferred`.
-    cps boot-env rollback --esp /efi --btrfs-volume /volume "$base_id"
+    cps boot rollback --esp /efi --btrfs-volume /volume "$base_id"
 fi
-cps boot-env capture --source /volume/@ --output /volume/@environments/base
-cps boot-env stage-btrfs --source /volume/@environments/base/root \
+cps boot capture --source /volume/@ --output /volume/@environments/base
+cps boot stage --source /volume/@environments/base/root \
     --output /volume/@environments/trial "$plan"
 if [ "$staged_transactions" = 1 ]; then
-    cps plan --root "$trial" --output /run/review.json freeze --reason 'VM staged review' test/boot-state
+    cps freeze --root "$trial" -n --save-plan /run/review.json --reason 'VM staged review' test/boot-state
     cps apply --root "$trial" /run/review.json
     echo 'CPS_VM_STAGED_TRANSACTIONS: applied a reviewed freeze to the private root'
 fi
@@ -1042,7 +1042,7 @@ id=${result#Activated }
 [ ! -e "/efi/loader/entries/$id+9.conf" ]
 if [ "$mode" = rollback ]; then
     $bb grep -Fx "preferred $id+2.conf" /efi/loader/loader.conf || $bb grep -Fx "preferred $id.conf" /efi/loader/loader.conf
-    reject 'is not known-good' cps boot-env rollback --esp /efi --btrfs-volume /volume "$id"
+    reject 'is not known-good' cps boot rollback --esp /efi --btrfs-volume /volume "$id"
 fi
 # Simulate an offline change after checked activation.
 case "$mode" in
@@ -1053,7 +1053,7 @@ case "$mode" in
         [ "$changed" -gt 0 ]
         ;;
 esac
-cps boot-env list --esp /efi
+cps boot list --esp /efi
 echo "CPS_VM_TRIAL: $id"
 GUEST
 } | run_rescue stage disk.raw
@@ -1176,7 +1176,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
         test "$facets" = $'CPS_VM_FACET: trial docs present\nCPS_VM_FACET: trial docs present'
         printf '%s\n' "$facets"
         cp --sparse=always disk.raw rollback.raw
-        run_rescue facet-rollback rollback.raw <<< 'cps boot-env rollback --esp /efi --btrfs-volume /volume'
+        run_rescue facet-rollback rollback.raw <<< 'cps boot rollback --esp /efi --btrfs-volume /volume'
         run_vm rollback.log rollback.raw
         tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_FACET: previous docs absent'
         tr -d '\r' < rollback.log | grep -Fx 'CPS_VM_BOOT: previous'
@@ -1262,7 +1262,7 @@ if [[ $mode == bless || $mode == rollback || $mode == capabilities || $mode == f
         mcopy -o -i corrupted-fallback.raw@@1048576 corrupted-kernel "::/EFI/cps/$base_id/vmlinuz.efi"
         run_rescue rejected-rollback corrupted-fallback.raw <<'GUEST'
 before=$($bb sha256sum /efi/loader/loader.conf)
-if cps boot-env rollback --esp /efi --btrfs-volume /volume > /run/rejected 2>&1; then exit 1; fi
+if cps boot rollback --esp /efi --btrfs-volume /volume > /run/rejected 2>&1; then exit 1; fi
 $bb cat /run/rejected
 $bb grep -Fq 'boot artifact digest mismatch' /run/rejected
 [ "$($bb sha256sum /efi/loader/loader.conf)" = "$before" ]
@@ -1270,9 +1270,9 @@ GUEST
         rm -- corrupted-fallback.raw corrupted-kernel
         cp --sparse=always disk.raw rollback.raw
         run_rescue rollback rollback.raw <<'GUEST'
-cps boot-env list --esp /efi | $bb sed 's/^/BEFORE /'
-cps boot-env rollback --esp /efi --btrfs-volume /volume
-cps boot-env list --esp /efi | $bb sed 's/^/AFTER /'
+cps boot list --esp /efi | $bb sed 's/^/BEFORE /'
+cps boot rollback --esp /efi --btrfs-volume /volume
+cps boot list --esp /efi | $bb sed 's/^/AFTER /'
 GUEST
         sed -n 's/^BEFORE //p' rescue-rollback.log | tee before-rollback.log
         sed -n 's/^AFTER //p' rescue-rollback.log | tee after-rollback.log
@@ -1352,7 +1352,7 @@ cp --sparse=always disk.raw exhausted.raw
 {
     printf 'root_uuid=%q\noptions=%q\n' "$root_uuid" "$options"
     cat <<'GUEST'
-if cps boot-env activate-btrfs --root /volume/@environments/trial/root --btrfs-volume /volume \
+if cps boot activate --root /volume/@environments/trial/root --btrfs-volume /volume \
     --esp /efi --root-partuuid "$root_uuid" --options "$options" > /run/rejected 2>&1; then
     exit 1
 fi

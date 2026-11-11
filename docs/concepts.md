@@ -29,7 +29,7 @@ in the [quickstart](quickstart.md).
 | **Capability** | A virtual interface under `cap/` that packages provide and require instead of naming each other. File actions can separately grant Linux file capabilities such as `cap_net_raw`. |
 | **Generated library dependency** | A `cap/elf/ABI/SONAME` capability that publication derives from ELF payloads. A package that ships a shared library provides it, and a package whose objects need that library requires it. Maintainers do not write these. |
 | **Trigger** | A declaration that runs a handler the package ships when watched paths change, to rebuild derived files such as a cache or an initramfs. CPS has no package scripts. The paths a trigger generates belong to its package. |
-| **Prototype tree** | A staging directory laid out like the destination filesystem. `publish --proto` reads package file contents from this tree. |
+| **Prototype tree** | A staging directory laid out like the destination filesystem. `publish manifests --proto` reads package file contents from this tree. |
 | **Payload** | File contents identified by their SHA-256 digest. The manifest records the digest and length. |
 
 [Write a manifest](maintainer/manifests.md) ·
@@ -59,8 +59,8 @@ pinned inputs, the outputs, and each manifest as it will be published,
 including its generated library dependencies. Publishers and clients decide
 separately which build workers they trust.
 
-Across many recipes, `cps build-order` prints the order in which to build
-them, `cps rebuild-plan` lists what to rebuild after packages change, and
+Across many recipes, `cps recipe order` prints the order in which to build
+them, `cps recipe rebuilds` lists what to rebuild after packages change, and
 `cps recipe repin` refreshes the toolchain, template, and source digests
 that recipes pin.
 
@@ -130,10 +130,14 @@ populate `/var` at boot. Every change goes through the same steps:
 | **Plan** | A request resolved against the committed revision. It records the catalog pins, package changes, and the ordered writes. |
 | **Fetch** | Downloads and verifies the payloads a plan needs into the cache. |
 | **Apply** | Checks the plan and payloads, records a **transaction journal**, writes the changes, runs triggers and systemd and kernel actions, and commits the next revision. |
-| **Pending transaction** | A journaled transaction that has not committed. `cps transaction status` shows it. |
+| **Pending transaction** | A journaled transaction that has not committed. `cps status` shows it. |
 | **Resume** | Finishes a pending transaction from its journal. |
 | **Abort** | Undoes a pending transaction by applying its inverse, reruns the triggers and kernel preparation for the committed packages, and leaves the committed revision unchanged. |
 | **Verify** | Checks an image against its installed manifests offline. `--quick` trusts recorded file fingerprints that still match instead of hashing every file. |
+
+A change command such as `cps install` plans, fetches, and applies in one
+step. With `-n --save-plan`, it only writes the plan, which `cps fetch` and
+`cps apply` complete later.
 
 Writes follow the dependency graph. A package's files are written after those
 of the packages it requires, so libraries land before the executables that
@@ -239,7 +243,7 @@ subvolume, so logs and application data survive rollback and pruning.
 | **/etc merge** | When the running Btrfs system shuts down with a trial selected, CPS carries the `/etc` changes made since staging into the trial. Changes that conflict with the trial's own stay aside for review. |
 | **Rollback** | Selects a known-good environment, by default the fallback of the current selection, for the next boot. |
 | **Failed trial** | A trial whose attempts are exhausted. An **abandoned trial** still has attempts left but is no longer selected, for example after a rollback. |
-| **Discard** | `cps boot-env discard-trial` cancels a pending or running trial, selects its fallback, and removes failed and abandoned trials. |
+| **Discard** | `cps boot discard-trial` cancels a pending or running trial, selects its fallback, and removes failed and abandoned trials. |
 | **Prune** | Removes failed and abandoned trials and the known-good environments that the retention policy no longer keeps. System package commands prune automatically before staging. |
 
 **systemd-boot** loads either separate kernel and initramfs files or a signed

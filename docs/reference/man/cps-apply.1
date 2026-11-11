@@ -4,13 +4,17 @@
 \&cps\-apply \- \&Apply or resume a saved plan
 .SH SYNOPSIS
 .HP 4
-.B \&cps apply \-\-root <ROOT> <PLAN>
+.B \&cps apply [OPTIONS] \-\-root <IMAGE> <PLAN>
 .SH ARGUMENTS
 .PP
 .B \&<PLAN>
 .SH OPTIONS
-.PP
-.B \&\-\-root <ROOT>
+.TP
+.B \&\-\-root <IMAGE>
+\&Image the plan targets
+.TP
+.B \&\-n, \-\-dry\-run
+\&Validate the plan against cached payloads without applying it
 .TP
 .B \&\-h, \-\-help
 \&Print help

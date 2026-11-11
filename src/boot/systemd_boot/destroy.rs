@@ -61,7 +61,7 @@ pub fn destroy_btrfs_boot_environment(
     destroy(esp, volume, id, dry_run, false)
 }
 
-/// Run every destroy-btrfs check for a trial as if its remaining boot
+/// Run every `cps boot destroy` check for a trial as if its remaining boot
 /// attempts were already spent, without changing anything.
 pub(super) fn check_exhausted_destruction(esp: &Path, volume: &Path, id: &str) -> Result<()> {
     destroy(esp, volume, id, true, true).map(drop)

@@ -492,7 +492,7 @@ pub fn rebuild_plan(
 ) -> Result<RebuildPlan> {
     ensure!(
         !changed.is_empty(),
-        "rebuild-plan needs at least one --changed package"
+        "recipe rebuilds needs at least one --changed package"
     );
     let config = read_image_definition(config)?;
     let mut hashes = BTreeMap::new();

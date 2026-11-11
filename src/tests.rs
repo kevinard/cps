@@ -1442,7 +1442,7 @@ fn builder_policy_changes_are_atomic_and_wait_for_transaction_recovery() -> Resu
     let message = error.to_string();
     assert!(message.contains("incomplete transaction"), "{message}");
     assert!(
-        message.contains("cps transaction resume") && message.contains("cps transaction abort"),
+        message.contains("cps resume") && message.contains("cps abort"),
         "{message}"
     );
     apply(&f.root, &install)?;

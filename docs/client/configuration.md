@@ -2,9 +2,12 @@
 
 [Documentation](../README.md) · [Clients](README.md)
 
-Each change on this page is a saved plan that you apply to an inactive
-image or [stage in a boot environment](../setups/btrfs.md#capturing-a-running-btrfs-root).
-The examples use an image in the `image` directory.
+Each change on this page applies to an inactive image with `--root`, or as
+a saved plan that you can [stage in a boot environment](../setups/btrfs.md#capturing-a-running-btrfs-root).
+The examples use an image in the `image` directory. Each change command
+prints its plan and asks before it applies it; `-y` skips the prompt and
+`-n --save-plan PLAN` only saves the plan, as described in
+[Save, review, and apply a plan](images.md#save-review-and-apply-a-plan).
 
 ## On this page
 
@@ -19,14 +22,12 @@ The examples use an image in the `image` directory.
 ## Freezing package versions
 
 Keep a package at its installed version until explicitly unfreezing it.
-Freeze and unfreeze changes use saved plans and work offline.
+Freeze and unfreeze changes work offline.
 
 ```sh
-cps plan --root image --output freeze.json freeze --reason "Validate graphics compatibility" library/libdisplay
-cps apply --root image freeze.json
-cps freeze --root image
-cps plan --root image --output unfreeze.json unfreeze library/libdisplay
-cps apply --root image unfreeze.json
+cps freeze --root image --reason "Validate graphics compatibility" library/libdisplay
+cps list --root image --frozen
+cps unfreeze --root image library/libdisplay
 ```
 
 A freeze constrains the exact package version during installs, dependency
@@ -63,15 +64,13 @@ package. See
 [facets, packages, and variants](../concepts.md#facets-separate-packages-and-variants).
 
 ```sh
-cps facet --root image
-cps facet --root image locale.fr debug.symbols
-cps facet --root image --package library/sqlite
-cps plan --root image --output facets.json change-facet doc.man=true 'locale.*=false' locale.fr=true
-cps fetch --root image --plan facets.json
-cps apply --root image facets.json
+cps facet list --root image
+cps facet list --root image locale.fr debug.symbols
+cps facet list --root image --package library/sqlite
+cps facet set --root image doc.man=true 'locale.*=false' locale.fr=true
 ```
 
-Without arguments, `facet` lists every rule with its source: `local` for a
+Without arguments, `facet list` lists every rule with its source: `local` for a
 rule set on the image and `default` for a built-in default that no local
 rule replaces. With facet names it prints each effective value and the rule
 that decided it, such as `debug.* (default)` or `unset` for a facet no rule
@@ -84,13 +83,14 @@ versions and catalog checkpoints in place, so it plans offline. The plan
 lists `Recompose PACKAGE` for each installed package whose selected actions
 change, and writes only the paths of those packages. Triggers that watch
 the added or removed files run as part of the change. Enabling an action
-may require its payload from the repository or cache, so fetch before
-applying. The change can be staged in a boot environment and resumed like
-an ordinary plan. Rules also apply to packages that you install later.
+may require its payload from the repository or cache, which `facet set`
+fetches before it applies the change. The change can be staged in a boot
+environment and resumed like an ordinary plan. Rules also apply to packages
+that you install later.
 
-System package commands such as `cps install` do not change facets or
-variants. To change them on a running Btrfs system, capture the root, plan
-the change against the capture, and stage it, as described in
+The running system does not support `facet set` or `variant set`. To
+change facets or variants on a running Btrfs system, capture the root, save
+a plan against the capture, and stage it, as described in
 [Capturing a running Btrfs root](../setups/btrfs.md#capturing-a-running-btrfs-root).
 
 Disabling a facet records the identity and fingerprint of any edited or
@@ -120,12 +120,12 @@ following IPS:
 Within one set of rules, the most specific match wins: an exact name beats
 any wildcard, and a longer wildcard prefix beats a shorter one. Debug
 symbols and multilib objects are therefore off on a new image. Enable them
-like any other facet, for example `change-facet 'debug.*=true'` or
-`change-facet isa.i686=true`. The defaults are built in, like IPS's implicit
-`facet.debug.*` rule, and `cps facet` shows them. `change-facet
+like any other facet, for example `facet set 'debug.*=true'` or
+`facet set isa.i686=true`. The defaults are built in, like IPS's implicit
+`facet.debug.*` rule, and `cps facet list` shows them. `facet set
 'debug.*=default'` returns to the built-in default.
 
-Set initial rules with `image-create --facet` and `--variant`, or in the
+Set initial rules with `image create --facet` and `--variant`, or in the
 image configuration:
 
 ```kdl
@@ -144,10 +144,10 @@ contain `/` and facet names contain `.`, and neither contains `:`. In the
 image configuration, write the package as a `package` property, as above.
 
 ```sh
-cps plan --root image --output headers.json change-facet devel=false library/sqlite:devel=true
-cps plan --root image --output closure.json change-facet --with-dependencies library/sqlite:devel=true
-cps plan --root image --output debug.json change-facet 'apps/editor:debug.symbols=true'
-cps plan --root image --output reset.json change-facet library/sqlite:devel=default
+cps facet set --root image devel=false library/sqlite:devel=true
+cps facet set --root image --with-dependencies library/sqlite:devel=true
+cps facet set --root image 'apps/editor:debug.symbols=true'
+cps facet set --root image library/sqlite:devel=default
 ```
 
 A per-package rule suits content you want for a few packages only, such as
@@ -161,7 +161,7 @@ configuration, to apply the rule to the package's installed dependency
 closure as well. The closure follows `require`, `require-capability`,
 `require-any`, and `conditional` dependencies to installed packages. It
 skips recommendations, incorporations, and exclusions. A dependency's own
-rule beats an inherited one, and `cps facet --package` shows an inherited
+rule beats an inherited one, and `cps facet list --package` shows an inherited
 rule as `RULE (dependency of PACKAGE)`. The closure follows later installs
 and removals, so the packages a plan selects decide which rules reach which
 dependencies. When the files of two packages collide only under the rules
@@ -180,19 +180,18 @@ refused unless the profile allows overriding that facet. See
 ### Changing variants
 
 ```sh
-cps variant --root image
-cps plan --root image --output container.json change-variant container=true
-cps plan --root image --output unset.json change-variant --unset container
+cps variant list --root image
+cps variant set --root image container=true
+cps variant set --root image --unset container
 ```
 
-`variant` lists the image's values, including the built-in `arch`. Set
-other variants with `image-create --variant NAME=VALUE`, a `variant` node in
-the image configuration, or `change-variant`. A variant change works like a
+`variant list` lists the image's values, including the built-in `arch`. Set
+other variants with `image create --variant NAME=VALUE`, a `variant` node in
+the image configuration, or `variant set`. A variant change works like a
 facet change: it reuses the installed manifests and plans offline. The
-architecture is fixed when the image is created, and `change-variant`
+architecture is fixed when the image is created, and `variant set`
 refuses it. Installing a package that selects content by a variant the image
-does not set fails until you set it; the error names the variant and the
-`change-variant` command to run.
+does not set fails until you set it; the error names the variant to set.
 
 ## Reviewing configuration updates
 
@@ -205,14 +204,12 @@ original inode. [Linux access control lists](https://man7.org/linux/man-pages/ma
 When an upgrade keeps an edited or locally removed file and stages new
 vendor defaults, `cps config list` shows the pending file and its vendor
 copy. Compare the two copies or merge changes by editing the local file.
-Then save and apply a review plan on the inactive root.
+Then resolve the update on the inactive root.
 
 ```sh
 cps config list --root staged
 cps config diff --root staged /etc/canopa/session/preferences.conf
-cps plan --root staged --output config-review.json \
-    resolve-config etc/canopa/session/preferences.conf --take vendor
-cps apply --root staged config-review.json
+cps config resolve --root staged --take vendor etc/canopa/session/preferences.conf
 ```
 
 `config diff` compares local contents with the authenticated pending vendor
@@ -241,12 +238,11 @@ A mediator selects which installed package supplies shared symlinks such as
 `usr/bin/editor`. See [how maintainers declare a mediator](../maintainer/manifests.md#mediated-links).
 
 ```sh
-cps mediator --root image
-cps plan --root image --output editor.json set-mediator editor --provider editors/basic
-cps apply --root image editor.json
+cps mediator list --root image
+cps mediator set --root image editor editors/basic
 ```
 
-Omit `--provider` to restore automatic selection. Removing the preferred
+Omit the provider to restore automatic selection. Removing the preferred
 package makes the next provider active. The preference survives removal
 and becomes active again if the package returns. Image locks capture the
 preferences, and staged roots carry them through boot and rollback.

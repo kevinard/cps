@@ -29,7 +29,7 @@ for how the two layers fit together.
 Export a snapshot of the publishing repository to a new directory.
 
 ```sh
-cps repo export --repo repo --publisher canopa --trust-root repo/trust/1.json --output release-targets
+cps repo export --repo repo --trust-root repo/trust/1.json --output release-targets
 ```
 
 `--trust-root` is any version of the publisher's trust root that the
@@ -72,7 +72,7 @@ belongs to its role and that the keys meet the root's thresholds before it
 signs.
 
 ```sh
-cps repo sign-export --root root.json \
+cps repo sign-export --tuf-root root.json \
     --targets-key keys/targets.pem --snapshot-key keys/snapshot.pem \
     --timestamp-key command:/etc/cps/signers/timestamp.signer.kdl \
     --version 8 --release-expires 2026-12-10T00:00:00Z \
@@ -118,7 +118,7 @@ that your users are likely to have installed. Repeat the option for other
 baselines.
 
 ```sh
-cps repo export --repo repo --publisher canopa --trust-root repo/trust/1.json \
+cps repo export --repo repo --trust-root repo/trust/1.json \
     --delta-from "$previous_catalog" --output release-targets
 ```
 
@@ -324,7 +324,7 @@ root and the published versioned snapshot, so it needs neither the export
 nor the targets key.
 
 ```sh
-cps repo refresh-metadata --root root.json --snapshot mirror/metadata/7.snapshot.json \
+cps repo refresh-metadata --tuf-root root.json --snapshot mirror/metadata/7.snapshot.json \
     --timestamp-key command:/etc/cps/signers/timestamp.signer.kdl \
     --version 8 --timestamp-expires 2026-11-17T00:00:00Z --output refreshed
 ```

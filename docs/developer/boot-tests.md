@@ -39,7 +39,7 @@ and share these overrides:
 
 The defaults match Arch Linux paths. The kernel needs built-in virtio
 block, GPT, Btrfs, and serial console support. `CPS_DISK_TOOLS_DIR` names
-the trusted btrfs-progs, dosfstools, and mtools that `cps boot-env image`
+the trusted btrfs-progs, dosfstools, and mtools that `cps image disk`
 runs, as described in [offline disk images](../setups/disk-image.md#checks-and-failure-cleanup).
 Fixture roots that install a
 package with a [trigger](../maintainer/triggers.md), such as the signed
@@ -49,7 +49,7 @@ host, which needs a working `/usr/bin/bwrap`.
 ## Offline disk images
 
 [`tests/boot-image.sh`](../../tests/boot-image.sh) runs without a VM. It
-writes a root with `cps boot-env image` and checks the Btrfs layout, the
+writes a root with `cps image disk` and checks the Btrfs layout, the
 registration that exists only in the image, owners, modes, links, and
 extended attributes, and the known-good entry on the ESP. It repeats an image
 under `SOURCE_DATE_EPOCH`, and checks the rejections, the systemd-boot
@@ -60,10 +60,10 @@ dosfstools, mtools, `sfdisk`, OpenSSL, and `setfattr`.
 
 [`tests/systemd-boot-vm.sh SCENARIO`](../../tests/systemd-boot-vm.sh)
 assembles a base root from signed packages, runs `verify --pristine`, and
-writes it to a Btrfs disk with `cps boot-env image`. A rescue system then
+writes it to a Btrfs disk with `cps image disk`. A rescue system then
 boots with the host kernel from a read-only disk holding CPS and the test
 repositories, captures the base, stages the saved upgrade with
-`boot-env stage-btrfs`, and activates it with `boot-env activate-btrfs`,
+`boot stage`, and activates it with `boot activate`,
 as a maintenance boot of an installed system would. The test then boots the
 disk through OVMF and systemd-boot. Its runtime package imports prebuilt host
 binaries, libraries, and VFAT and ISO-8859-1 modules into a prototype, then
@@ -79,7 +79,7 @@ with the same plan applied lets the host check the staged files.
 | `kernel-upgrade` | Activation rejects a corrupted prepared kernel, then the kernel and initrd on the ESP and `uname -r` from both roots |
 | `facet-change` | Staging documentation from the installed manifest and preserving edited configuration while disabling its facet, then the blessed trial and a rollback to the original facet selection |
 | `capabilities` | A signed capability-bearing package in the guest: failed preflight without `CAP_SETFCAP`, raw socket access as an unprivileged user, repair, cloning, and capability removal during an upgrade |
-| `rollback` | A second signed publisher, an upgrade that adds a dependency from it and removes an obsolete one, replay rejection, a trial selected with `preferred` after the base was pinned, blessing, `boot-env list` and `boot-env rollback` in the rescue system, a rejected rollback to a corrupt fallback kernel, and a boot of the previous kernel and dependencies |
+| `rollback` | A second signed publisher, an upgrade that adds a dependency from it and removes an obsolete one, replay rejection, a trial selected with `preferred` after the base was pinned, blessing, `boot list` and `boot rollback` in the rescue system, a rejected rollback to a corrupt fallback kernel, and a boot of the previous kernel and dependencies |
 
 ```sh
 CPS_VM_OVMF_CODE=/path/to/OVMF_CODE.fd \
@@ -181,10 +181,10 @@ These settings extend it:
 
 | Setting | Adds |
 | --- | --- |
-| `CPS_VM_BTRFS_BOOT=1` | Native boot through systemd-boot with the package's health service and blessing. Needs `CPS_VM_OVMF_CODE`, `CPS_VM_OVMF_VARS`, a trusted `CPS_VM_SYSTEMD_BOOT`, and the installed systemd runtime. Tests activation, a transaction waiting while registration completes, blessing, the trial's default on reboot, rejection of altered subvolume metadata, and rollback. It also fills the EFI partition, checks that activation fails its free-space check with a pointer to `boot-env prune` and keeps the known-good boot selection, and retries after freeing space. |
+| `CPS_VM_BTRFS_BOOT=1` | Native boot through systemd-boot with the package's health service and blessing. Needs `CPS_VM_OVMF_CODE`, `CPS_VM_OVMF_VARS`, a trusted `CPS_VM_SYSTEMD_BOOT`, and the installed systemd runtime. Tests activation, a transaction waiting while registration completes, blessing, the trial's default on reboot, rejection of altered subvolume metadata, and rollback. It also fills the EFI partition, checks that activation fails its free-space check with a pointer to `boot prune` and keeps the known-good boot selection, and retries after freeing space. |
 | `CPS_VM_BTRFS_HEALTH_FAIL=1` | Changes a managed file's metadata at trial boot and checks that two unblessed attempts fall back to the original subvolume. `readiness` instead fails a readiness check after the image verifies. |
-| `CPS_VM_BTRFS_DISCARD_FAILED=1` | With a failed trial, checks from the fallback that `boot-env prune --dry-run` lists the exhausted trial without changing the ESP, that `boot-env discard-trial` removes its root and boot files, and that nothing is then left to prune or discard |
-| `CPS_VM_BTRFS_DESTROY_FAILED=1` | With a failed trial, removes the exhausted trial with `boot-env destroy-btrfs` |
+| `CPS_VM_BTRFS_DISCARD_FAILED=1` | With a failed trial, checks from the fallback that `boot prune --dry-run` lists the exhausted trial without changing the ESP, that `boot discard-trial` removes its root and boot files, and that nothing is then left to prune or discard |
+| `CPS_VM_BTRFS_DESTROY_FAILED=1` | With a failed trial, removes the exhausted trial with `boot destroy` |
 | `CPS_VM_BTRFS_DESTROY=1` | With a successful trial, stages another trial from the blessed root, rejects destroying protected and mounted roots, and retires the old root after an interrupted destruction |
 | `CPS_VM_STAGED_TRANSACTIONS=1` | With a successful trial, freezes, unfreezes, and upgrades the private staged root, and rejects a stale plan |
 | `CPS_VM_SYSTEM_COMMANDS=1` | With a successful trial, the everyday commands: a live install that saves an unselected backup environment, a live upgrade of a running service, a staged upgrade whose trial receives `/etc` edits made before `systemctl reboot` through `cps-finalize-trial.service`, rollback with the live package still installed, a live removal followed by a boot of the backup taken before it, and a staged removal of its unused dependency with the repository unavailable |

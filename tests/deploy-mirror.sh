@@ -29,14 +29,14 @@ publish() {
     printf '%s\n' "$1" > proto/usr/share/example
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$1.0.0-0" \
         --uid "$(id -u)" --gid "$(id -g)" demo/example > manifest.kdl
-    "$CPS_BIN" publish --repo repo --proto proto --signing-key "$signing_key" manifest.kdl
+    "$CPS_BIN" publish manifests --repo repo --proto proto --key "$signing_key" manifest.kdl
 }
 
 deploy() { "$project/ci/deploy-mirror.sh" repo canopa "$1"; }
 exec {mirror_fd}< public
 mirror_url=file:///proc/self/fd/$mirror_fd
 sync_mirror() {
-    "$CPS_BIN" repo sync --repo cache --root root.json --publisher canopa --trust-root trust-root.json \
+    "$CPS_BIN" repo sync --repo cache --tuf-root root.json --trust-root trust-root.json \
         --metadata "$mirror_url/metadata/" --targets "$mirror_url/targets/" --require-catalog "$1"
 }
 
@@ -186,7 +186,7 @@ jq -e --arg revoked "$revoked" --arg replacement "$replacement" '
     (.signed.roles.root.keyids | index($revoked)) == null and
     (.signed.roles.root.keyids | index($replacement)) != null
 ' cache/.tuf/trusted/root.json
-"$CPS_BIN" repo sync --repo new-cache --root root.json --publisher canopa --trust-root trust-root.json \
+"$CPS_BIN" repo sync --repo new-cache --tuf-root root.json --trust-root trust-root.json \
     --metadata "$mirror_url/metadata/" --targets "$mirror_url/targets/" --require-catalog "$second"
 jq -e '.signed.version == 4' new-cache/.tuf/trusted/root.json
 
@@ -249,7 +249,7 @@ jq -e --argjson version "$((before + 3))" \
 jq -e --argjson version "$((before + 3))" '.signed.version == $version' \
     "public/metadata/$((before + 3)).snapshot.json"
 sync_mirror "$second"
-"$CPS_BIN" repo sync --repo refreshed-cache --root root.json --publisher canopa --trust-root trust-root.json \
+"$CPS_BIN" repo sync --repo refreshed-cache --tuf-root root.json --trust-root trust-root.json \
     --metadata "$mirror_url/metadata/" --targets "$mirror_url/targets/" --require-catalog "$second"
 
 # The next content change uses the targets key again and supersedes the refreshes.
@@ -261,7 +261,7 @@ mv -- offline-keys/targets.pem next-keys/
 openssl genpkey -algorithm ED25519 -outform DER -out catalog-private.der
 openssl pkey -inform DER -in catalog-private.der -pubout -outform DER -out catalog.der
 "$CPS_BIN" repo trust rotate --repo repo --key publisher-private.der --catalog-key catalog.der >/dev/null
-if "$CPS_BIN" publish --repo repo --proto proto --signing-key publisher-private.der manifest.kdl 2>/dev/null; then
+if "$CPS_BIN" publish manifests --repo repo --proto proto --key publisher-private.der manifest.kdl 2>/dev/null; then
     echo 'A revoked catalog key published a catalog' >&2
     exit 1
 fi
@@ -281,7 +281,7 @@ CPS_MIRROR_TRUST_ROOT=$work/newest-trust-root.json deploy "$third"
 cmp newest-trust-root.json <(jq -er '.trust_root' public/publisher.json | base64 -d)
 cmp <(jq -S 'del(.trust_root)' original-descriptor.json) <(jq -S 'del(.trust_root)' public/publisher.json)
 cp public/publisher.json newest-descriptor.json
-"$CPS_BIN" repo sync --repo bootstrapped-cache --root root.json --publisher canopa \
+"$CPS_BIN" repo sync --repo bootstrapped-cache --tuf-root root.json \
     --trust-root newest-trust-root.json --metadata "$mirror_url/metadata/" --targets "$mirror_url/targets/" \
     --require-catalog "$third"
 # It never moves back to an older version ...

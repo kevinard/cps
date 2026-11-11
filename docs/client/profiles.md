@@ -29,9 +29,7 @@ On an image with no installed packages, use the profile's checked roots and
 dependencies directly.
 
 ```sh
-cps plan --root image --output install.json install-profile
-cps fetch --root image --plan install.json  # for an index-only mirror cache
-cps apply --root image install.json
+cps install --root image --profile
 ```
 
 CPS checks every manifest digest against the signed composition, then
@@ -56,9 +54,9 @@ repositories. With mirrors, `repo sync-profile --config image.kdl` requires
 both the current and bootstrap catalog sets to be advertised as current or
 retained TUF targets. It verifies both compositions before promoting the
 current release. CPS uses the bootstrap pin when creating the image,
-looking up available packages, and planning `install-profile`. Cache
+looking up available packages, and planning `install --profile`. Cache
 pruning with `--keep-image` retains the pinned catalogs' payloads. The first
-committed `install-profile` consumes the pin, and subsequent plans follow the
+committed `install --profile` consumes the pin, and subsequent plans follow the
 current signed release.
 
 For reproducible release images, also set `image-id` to the release image's
@@ -76,23 +74,23 @@ images. A staged upgrade receives a fresh image identity.
 
 ## Update a profile image
 
-On a profiled image with installed packages, `plan update`, or `cps upgrade`
-on a running system, reconciles the image to the current signed composition
+On a profiled image with installed packages, `cps upgrade` reconciles the image to the current signed composition
 plus the packages the operator explicitly requested and their dependencies.
 A previous profile default leaves the image if the new profile and local
 packages no longer require it. The package can remain published for manual
-installation. Use `plan mark explicit` to keep an installed default as a
-local choice. `plan exact-install` replaces the local choices while
+installation. Use `cps mark explicit` to keep an installed default as a
+local choice. `cps install --exact` replaces the local choices while
 preserving the signed composition. Signed obsoletion rules still apply. A
 profile update fails if the signed set requires a downgrade or a publisher
 switch, or if it conflicts with a [freeze](configuration.md#freezing-package-versions).
 
 When the publisher rolls an update out in phases, an image outside the
-current rollout keeps its composition, and `check-updates` reports the
-rollout in `phased_update`. Pass `--force-phased-update` to `plan update` or
-`upgrade` to take the update anyway.
+current rollout keeps its composition, and `upgrade --check` reports the
+rollout in `phased_update`. Pass `--force-rollout` to `upgrade` to take the
+update anyway.
 
-Save and apply the plan normally, or stage it in a boot environment.
+Apply the upgrade to an image with `--root`, or save its plan with
+`-n --save-plan` and stage it in a boot environment.
 The image tracks local requests separately from the signed profile roots.
 
 Available-package queries and new plans use the primary publisher's current
@@ -130,7 +128,7 @@ new catalog against the installed system.
 ## Facet rules on profile images
 
 The signed profile fixes the image-wide facet rules and variants that its
-publisher checked, so `change-facet FACET=...` and `change-variant` are
+publisher checked, so `facet set FACET=...` and `variant set` are
 refused on a profile image. Per-package rules (`PACKAGE:FACET=...`) follow
 one rule:
 
@@ -148,19 +146,17 @@ override changes files inside protected packages, which the publisher
 accepted by allowing it, and never changes the protected package set.
 
 ```sh
-cps plan --root image --output app.json change-facet tools/app:devel=true
-cps plan --root image --output sqlite.json change-facet 'library/sqlite:debug.symbols=true'  # needs allow-facet-override
+cps facet set --root image tools/app:devel=true
+cps facet set --root image 'library/sqlite:debug.symbols=true'  # needs allow-facet-override
 ```
 
 ## Provisioning the same composition on another machine
 
 ```sh
-cps image-lock --root installed > desktop.lock.json
-cps image-create --root replica --config image.kdl --lock desktop.lock.json
-cps plan --root replica --output install.json install-lock desktop.lock.json
-cps fetch --root replica --plan install.json
-cps apply --root replica install.json
-cps image-diff installed replica
+cps image lock --root installed > desktop.lock.json
+cps image create --root replica --config image.kdl --lock desktop.lock.json
+cps install --root replica -y --lock desktop.lock.json
+cps image diff installed replica
 ```
 
 An image lock is a JSON document with `"format": 1` and
@@ -190,10 +186,9 @@ objects it needs. Populate the source caches with the selected package
 payloads before exporting.
 
 ```sh
-cps image-lock --root installed --export desktop.bundle
-cps image-create --root replica --config image.kdl --bundle desktop.bundle
-cps plan --root replica --output install.json install-lock desktop.bundle/image.lock.json
-cps apply --root replica install.json
+cps image lock --root installed --export desktop.bundle
+cps image create --root replica --config image.kdl --bundle desktop.bundle
+cps install --root replica -y --lock desktop.bundle/image.lock.json
 ```
 
 Export verifies every copied object and publishes the new directory only
@@ -202,6 +197,6 @@ their manifest indexes, and the selected attestations and payloads. Its
 repositories supply the historical pins. The target configuration still
 supplies publisher trust roots and build trust. Keep the bundle at a stable path
 for offline repair, or configure regular repositories to resume updates.
-Before initializing the requested root, `image-create --bundle` replays
+Before initializing the requested root, `image create --bundle` replays
 the lock with the local trust policy and reports missing or damaged
 payloads from the bundle.

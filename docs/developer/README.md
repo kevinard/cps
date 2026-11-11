@@ -142,7 +142,7 @@ do not set them by hand.
 | `CPS_TEST_AFTER_PATH` | Exit after writing this path |
 | `CPS_TEST_INTERRUPT_STEP` | Exit at a named step: `staged`, `exchanged`, `displaced`, or `published` in a path transition, `triggers` after the trigger runs, or `abort-retired`, `abort-trigger-N`, and `abort-pruned` during an abort |
 | `CPS_TEST_NO_EXCHANGE` | Use the fallback without `RENAME_EXCHANGE`, which moves the old object aside first |
-| `CPS_TEST_ABORT` | Run `cps transaction abort` instead of apply |
+| `CPS_TEST_ABORT` | Run `cps abort` instead of apply |
 
 ## Run the shell scenarios
 
@@ -224,7 +224,7 @@ and do not flush the operating system's file cache.
 [`tests/benchmark-catalog.py`](../../tests/benchmark-catalog.py) builds a
 reproducible distribution with dependency fan-out, `require-any`,
 capabilities, and recommendations, and publishes its version history with
-batched `cps publish` calls. It times publishing, installing and upgrading
+batched `cps publish manifests` calls. It times publishing, installing and upgrading
 a dependency closure, publishing one more package into the large catalog,
 offline verification, file search before and after a signed file index,
 and TUF export and sync into empty and existing caches. It also reports

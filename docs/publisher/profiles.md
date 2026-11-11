@@ -88,7 +88,7 @@ planner's directory and kernel transition checks. This models the managed
 package state of a clean image. Live changes and boot health are checked
 during staging and boot.
 
-Use `repo publish-release --prepare` to stage the signed candidate and its
+Use `publish release --prepare` to stage the signed candidate and its
 objects while keeping the current catalog pointer on the previous release.
 Test the candidate digest in a private repository used by your upgrade and
 boot checks. Then rerun publication with `--expect-catalog SHA256` to
@@ -248,12 +248,12 @@ can also check the transition from that catalog. The
 [release process](release-process.md#widen-a-phased-rollout) can widen in
 approved steps after a health check.
 
-A deferred `plan update` reports the reason without saving a plan.
+A deferred `cps upgrade` reports the reason without saving a plan.
 Operators can override the gate explicitly.
 
 ```sh
-sudo cps upgrade --force-phased-update
-cps plan --root image --output upgrade.json update --force-phased-update
+sudo cps upgrade --force-rollout
+cps upgrade --root image --force-rollout -n --save-plan upgrade.json
 ```
 
 The override is recorded in the saved plan and transaction history. The
@@ -269,7 +269,7 @@ selected version falls outside the affected range.
 advisory "CPS-2026-01" package="library/runtime" affected="<2.0.0-0" summary="Runtime security fix" action="Restart dependent applications"
 ```
 
-`check-updates` reports matching advisories for installed packages,
+`upgrade --check` reports matching advisories for installed packages,
 including when the target profile is deferred. The signed advisory reports
 the fixed version and any operator action. Later releases carry the
 advisory forward while the profile still contains the affected package from

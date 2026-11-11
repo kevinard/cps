@@ -3,7 +3,7 @@
 //! The volume directory becomes the Btrfs top level. Its root and
 //! environments directories become subvolumes, laid out like an installed
 //! system, and so does an optional shared /var directory. The ESP gets a known-good systemd-boot entry for the root, as
-//! `activate-btrfs --known-good` would write on a mounted system.
+//! `cps boot activate --known-good` would write on a mounted system.
 
 use std::{
     collections::BTreeMap,
@@ -36,7 +36,7 @@ use crate::{
 
 const FILESYSTEM: &str = "root.btrfs";
 
-/// What `cps boot-env image` turns into a bootable disk.
+/// What `cps image disk` turns into a bootable disk.
 pub struct BootImage<'a> {
     /// Directory that becomes the Btrfs top-level volume.
     pub volume: &'a Path,

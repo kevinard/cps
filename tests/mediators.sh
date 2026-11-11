@@ -25,7 +25,7 @@ package "editors/$name" publisher="canopa" version="1.0.0-0" {
 }
 MANIFEST
     chmod 0755 "$name/usr/bin/editor-$name"
-    "$cps" publish --repo repo --proto "$name" --signing-key private.der package.kdl
+    "$cps" publish manifests --repo repo --proto "$name" --key private.der package.kdl
 }
 assert_links() {
     test "$(readlink "$1/usr/bin/editor")" = "$2"
@@ -38,33 +38,33 @@ cat > image.kdl <<CONFIG
 schema-version 1 kind="image-config"
 publisher "canopa" { repository "repo"; trust-root "repo/trust/1.json"; }
 CONFIG
-"$cps" image-create --root image --config image.kdl
-"$cps" plan --root image --output install.json install editors/basic editors/advanced
+"$cps" image create --root image --config image.kdl
+"$cps" install --root image -n --save-plan install.json editors/basic editors/advanced
 "$cps" apply --root image install.json
 assert_links image editor-advanced
 test -f image/usr/bin/editor-basic
 test -f image/usr/bin/editor-advanced
 
-"$cps" plan --root image --output prefer.json set-mediator editor --provider editors/basic
+"$cps" mediator set --root image -n --save-plan prefer.json editor editors/basic
 cp -a --reflink=auto -- image staged
 "$cps" apply --root staged prefer.json
 assert_links image editor-advanced
 assert_links staged editor-basic
-"$cps" mediator --root staged --json | jq -e '.[0] | .preferred == "editors/basic" and .selected == "editors/basic"'
-"$cps" image-lock --root staged --export bundle
-"$cps" image-create --root replica --config image.kdl --bundle bundle
-"$cps" plan --root replica --output install-lock.json install-lock bundle/image.lock.json
+"$cps" mediator list --root staged --json | jq -e '.[0] | .preferred == "editors/basic" and .selected == "editors/basic"'
+"$cps" image lock --root staged --export bundle
+"$cps" image create --root replica --config image.kdl --bundle bundle
+"$cps" install --root replica -n --save-plan install-lock.json --lock bundle/image.lock.json
 "$cps" apply --root replica install-lock.json
 assert_links replica editor-basic
 
-"$cps" plan --root staged --output remove.json remove editors/basic
+"$cps" remove --root staged -n --save-plan remove.json editors/basic
 "$cps" apply --root staged remove.json
 assert_links staged editor-advanced
-"$cps" mediator --root staged --json | jq -e '.[0] | .preferred == "editors/basic" and .selected == "editors/advanced"'
-"$cps" plan --root staged --output reinstall.json install editors/basic
+"$cps" mediator list --root staged --json | jq -e '.[0] | .preferred == "editors/basic" and .selected == "editors/advanced"'
+"$cps" install --root staged -n --save-plan reinstall.json editors/basic
 "$cps" apply --root staged reinstall.json
 assert_links staged editor-basic
-"$cps" plan --root staged --output reset.json set-mediator editor
+"$cps" mediator set --root staged -n --save-plan reset.json editor
 "$cps" apply --root staged reset.json
 assert_links staged editor-advanced
 echo 'Verified mediated defaults, persistent preferences, a cloned root, and offline reprovisioning'

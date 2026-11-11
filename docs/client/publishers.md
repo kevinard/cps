@@ -44,7 +44,7 @@ changing the image. [IPS publisher search order and stickiness](https://docs.ora
 name. Use `list --available --all-versions` to see every publisher's catalog
 entries, or a full package ID with `info --available` to inspect a particular one.
 
-`plan install` and `plan exact-install` accept the
+`install` and `install --exact` accept the
 [package selectors](queries.md#package-selectors-and-versions): names,
 `NAME@VERSION`, `cps://PUBLISHER/NAME`, and full package IDs. A
 publisher-qualified request can select a lower-priority publisher for a new
@@ -138,7 +138,7 @@ CPS verifies the replacement catalogs with the pinned trust roots and
 checks them against the image's catalog checkpoints. Signed profiles validate
 their primary catalog and every pinned companion together. An index-only cache works once
 it contains the required signed catalogs. Package payloads are fetched during
-the normal plan and apply workflow. Relocation invalidates outstanding plans
+the next change that needs them. Relocation invalidates outstanding plans
 and preserves the installed packages, boot identity, and applied checkpoints.
 Use the new paths in the KDL configuration used for subsequent mirror syncs.
 
@@ -213,7 +213,7 @@ fails an update whatever the [refresh policy](#refresh-policy-for-mirror-publish
 
 ## Refresh policy for mirror publishers
 
-`upgrade` and `check-updates` refresh publishers added with a mirror URL
+`upgrade` and `upgrade --check` refresh publishers added with a mirror URL
 before planning. By default, any refresh failure stops the update, so an
 image never keeps using an outdated catalog without notice. To let updates
 continue through a mirror outage, declare a policy for that publisher in
@@ -239,12 +239,12 @@ short-lived TUF timestamp, typically every day. A deferred publisher stays
 usable until the earlier of `max-staleness-hours` after its last successful
 refresh and the expiry of the trust root its current catalog is signed under.
 
-`cps status` and `cps check-updates` show each mirror publisher's last
+`cps status` and `cps upgrade --check` show each mirror publisher's last
 successful refresh, the expiry of its verified TUF timestamp, the expiry of
 the trust root its cached current catalog is signed under, and its policy,
 for example
 `Publisher extras: refreshed 5 hours ago, metadata expires 2026-11-11T00:00:00Z, trust root expires 2027-06-01T00:00:00Z, fail when unavailable`.
-The JSON report of `check-updates` lists them in `publisher_freshness` with
+The JSON report of `upgrade --check` lists them in `publisher_freshness` with
 `last_refreshed` as Unix seconds, `age_seconds`, `metadata_expires`,
 `trust_root_expires`, the policy's `defer_unavailable_hours`, and
 `beyond_policy`, which is true when the cache is too old to defer, its

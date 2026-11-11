@@ -99,12 +99,12 @@ fn source_date_epoch() -> Result<Option<u32>> {
 
 pub(crate) fn check_package_write_root(root: &Root) -> Result<()> {
     root.offline_path().context(
-        "use the system commands or boot-env stage-btrfs to prepare package changes from an \
+        "use the system commands or cps boot stage to prepare package changes from an \
              installed root",
     )?;
     ensure!(
         !is_registered_btrfs(root)?,
-        "use boot-env stage-btrfs to prepare package changes from a registered Btrfs root"
+        "use cps boot stage to prepare package changes from a registered Btrfs root"
     );
     Ok(())
 }

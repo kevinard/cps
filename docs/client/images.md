@@ -12,7 +12,8 @@ one, which applies equally to [the running system](system.md).
 
 ## On this page
 
-- [Plan, fetch, validate, and apply](#plan-fetch-validate-and-apply)
+- [Change an image](#change-an-image)
+- [Save, review, and apply a plan](#save-review-and-apply-a-plan)
 - [How a transaction runs](#how-a-transaction-runs)
 - [Recover an interrupted transaction](#recover-an-interrupted-transaction)
 - [Abort a transaction](#abort-a-transaction)
@@ -23,30 +24,54 @@ one, which applies equally to [the running system](system.md).
 - [Repair files or restore vendor defaults](#repair-files-or-restore-vendor-defaults)
 - [Shared-library regressions](#shared-library-regressions)
 
-## Plan, fetch, validate, and apply
+## Change an image
 
-A saved plan is a JSON document with `"format": 1`. It records the request,
-the image revision, the selected signed catalogs, and every planned write.
-Run the workflow from the directory containing the image.
+The commands that change [the running system](system.md) change an image
+when you pass `--root`. Run them from the directory containing the image.
 
 ```sh
-cps plan --root image --output upgrade.json update
-cps fetch --root image --plan upgrade.json
-cps validate --root image upgrade.json
+cps install --root image demo/hello
+cps upgrade --root image
+cps remove --root image demo/hello
+```
+
+Each command plans the change from the image's cached catalogs, prints it,
+and asks for confirmation. It then fetches and verifies the payloads and
+applies the change. Pass `-y` to skip the prompt in scripts, and `-n` to
+print the change without applying it.
+
+The plan lists the package changes and the effects that follow from them,
+such as `Replace usr/share/demo with a symbolic link to demo2`,
+`Recompose PACKAGE` for a [facet change](configuration.md#facets-and-variants-on-an-existing-image),
+or `Run trigger PACKAGE:NAME`, and the payload bytes that it needs.
+
+Publish a new package version or [synchronize your mirror](mirrors.md)
+before an upgrade. The quickstart repository needs a second package
+version before `upgrade` can select a change.
+
+`freeze`, `unfreeze`, `mark`, `facet set`, `variant set`, `mediator set`,
+and `config resolve` work the same way. The running system does not
+support them, so use them with `--root`.
+
+## Save, review, and apply a plan
+
+To review a change before it is applied, or to apply the exact same change
+later, save the plan instead of applying it.
+
+```sh
+cps upgrade --root image -n --save-plan upgrade.json
+cps fetch --root image upgrade.json
+cps apply --root image -n upgrade.json
 cps apply --root image upgrade.json
 ```
 
-Publish a new package version or [synchronize your mirror](mirrors.md)
-before planning an update. The quickstart repository needs a second package
-version before the update plan can select a change.
-
-`plan` prints the package changes and the effects that follow from them,
-such as `Replace usr/share/demo with a symbolic link to demo2`,
-`Recompose PACKAGE` for a [facet change](configuration.md#facets-and-variants-on-an-existing-image),
-or `Run trigger PACKAGE:NAME`, and the payload bytes that it needs. `fetch`
-fills the cache for the saved plan. `validate` is an optional preflight, and
-`apply` repeats its checks before writing package files. Once CPS has
-recorded the transaction, the verified staged payloads let it finish offline.
+A saved plan is a JSON document with `"format": 1`. It records the request,
+the image revision, the selected signed catalogs, and every planned write.
+`-n --save-plan` writes the plan and prints it. `fetch` fills the cache for
+the saved plan. `apply -n` is an optional preflight that checks the plan
+against the cached payloads, and `apply` repeats its checks before writing
+package files. Once CPS has recorded the transaction, the verified staged
+payloads let it finish offline.
 
 A plan applies only to the revision it was made for. After any other change
 commits, apply reports `stale plan for revision N`, and you plan again.
@@ -59,8 +84,8 @@ package ID; see [package selectors](queries.md#package-selectors-and-versions).
 
 ## How a transaction runs
 
-Apply, `cps install` and the other system commands, and `boot-env` staging
-all run the same journaled transaction.
+`cps install` and the other change commands, `cps apply`, and
+`cps boot stage` all run the same journaled transaction.
 
 1. **Check.** CPS verifies the plan against the image revision and its
    catalog pins, stages and verifies every new payload, and checks the paths
@@ -153,7 +178,7 @@ them.
   limit (300 seconds unless the trigger sets another), stops the
   transaction with a message such as
   `trigger test/summary:summary failed with exit status: 42`. Package files
-  are already written, and `transaction status` reports
+  are already written, and `cps status --root image` reports
   `Offline actions pending`. Fix the cause, if it is in the image, and
   [resume](#recover-an-interrupted-transaction): CPS journals each finished
   trigger, so resume runs only the remaining ones. If the handler itself is
@@ -170,14 +195,14 @@ staged payloads remain in the image, the committed revision is unchanged,
 and CPS refuses other plans until you finish it one way or the other.
 
 ```sh
-cps transaction status --root image
-cps transaction progress --root image upgrade.json
+cps status --root image
+cps status --root image --plan upgrade.json
 ```
 
-`transaction status` shows the pending plan and its phase: `File writes
+`status` shows the pending plan and its phase: `File writes
 pending` while CPS is writing files, `Offline actions pending` (or `Live
 actions pending`) once only actions remain, or `Abort in progress`. It also
-names the command that finishes the transaction. `transaction progress`
+names the command that finishes the transaction. `status --plan`
 reports the phase of one saved plan as JSON:
 
 | Phase | Meaning |
@@ -189,21 +214,21 @@ reports the phase of one saved plan as JSON:
 | `superseded` | The image moved to another revision. Plan again. |
 | `applied` | The plan committed. `revision` is the revision it created. |
 
-The boot phases that `cps status --plan` adds are described in
+The boot phases that `cps status --plan` adds on the running system are described in
 [Manage a running system](system.md#follow-a-saved-plan).
 
 ### Choose a recovery command
 
 | Situation | Running system | Inactive image |
 | --- | --- | --- |
-| The process was interrupted, or a trigger, systemd action, or kernel preparation failed and you fixed the cause | `sudo cps resume` | `cps transaction resume --root image`, or `apply` with the same plan |
-| Resume reports that managed files are damaged | `sudo cps resume --repair` | `cps transaction resume --root image --repair` |
-| You no longer want the change, or cannot fix its cause | `sudo cps transaction abort` | `cps transaction abort --root image` |
+| The process was interrupted, or a trigger, systemd action, or kernel preparation failed and you fixed the cause | `sudo cps resume` | `cps resume --root image`, or `apply` with the same plan |
+| Resume reports that managed files are damaged | `sudo cps resume --repair` | `cps resume --root image --repair` |
+| You no longer want the change, or cannot fix its cause | `sudo cps abort` | `cps abort --root image` |
 | Abort lists payloads it cannot find | add `--fetch` | add `--fetch` |
-| An abort was interrupted or a trigger failed during it | run `sudo cps transaction abort` again | run `cps transaction abort --root image` again |
-| No transaction is pending, but managed files are damaged | `sudo cps repair` | [`plan repair`](#repair-files-or-restore-vendor-defaults) |
-| You want the vendor default of an edited configuration file | `sudo cps revert PATH` | [`plan revert`](#repair-files-or-restore-vendor-defaults) |
-| A staged change waits for a reboot that you no longer want | `sudo cps boot-env discard-trial` | |
+| An abort was interrupted or a trigger failed during it | run `sudo cps abort` again | run `cps abort --root image` again |
+| No transaction is pending, but managed files are damaged | `sudo cps repair` | [`cps repair --root image`](#repair-files-or-restore-vendor-defaults) |
+| You want the vendor default of an edited configuration file | `sudo cps revert PATH` | [`cps revert --root image PATH`](#repair-files-or-restore-vendor-defaults) |
+| A staged change waits for a reboot that you no longer want | `sudo cps boot discard-trial` | |
 
 Resume is the usual choice: it finishes the change you planned, and works
 offline from the staged payloads. Abort returns to the committed revision.
@@ -215,7 +240,7 @@ instead.
 ### Resume
 
 ```sh
-cps transaction resume --root image
+cps resume --root image
 ```
 
 Resume uses the verified plan and staged payloads from the image journal.
@@ -233,7 +258,7 @@ an action keeps failing, or when you no longer want the change, return the
 image to its committed revision instead.
 
 ```sh
-cps transaction abort --root image
+cps abort --root image
 ```
 
 On the running system, omit `--root`; see
@@ -271,24 +296,23 @@ If any are missing, abort changes nothing and lists each path with the
 payload digest, size, and the committed package that declares it.
 
 ```sh
-cps transaction abort --root image --fetch
+cps abort --root image --fetch
 ```
 
 `--fetch` downloads those payloads from each publisher's mirror first. The
 committed manifests pin their digests and sizes. Contents that no package
 declares, such as a locally edited configuration file that a `revert` plan
 already replaced, cannot be fetched. Restore those paths from a backup and
-abort again, or finish the transaction with `transaction resume`.
+abort again, or finish the transaction with `resume`.
 
 ### An interrupted abort
 
 Abort is journaled like apply. It records the decision in the pending
 record first, and from then on the transaction only goes back:
-`transaction status` reports `Abort in progress`, `transaction progress`
+`status` reports `Abort in progress`, `status --plan`
 reports the `aborting` phase, and `apply` with the same plan refuses. Run
-`transaction abort` again to finish it. `transaction resume`, and
-`cps resume` on the running system, also finish an abort in progress, but
-only `transaction abort --fetch` downloads missing payloads.
+`abort` again to finish it. `resume` also finishes an abort in progress,
+but only `abort --fetch` downloads missing payloads.
 
 Each restored path is checked against both its state after and before the
 transaction, so finishing an abort is idempotent. Each trigger that the
@@ -364,13 +388,14 @@ Resume and abort recognize every intermediate state:
 ## Inspect transaction history
 
 ```sh
-cps transaction history --root image
-cps transaction show --root image PLAN_SHA256
+cps history --root image
+cps history --root image PLAN_SHA256
 ```
 
-`transaction history` lists completed plans, newest first, with their
-revision and operation. The default limit is 20 entries. `transaction show`
-prints a JSON record of the request, package changes, catalog digests, and
+`history` lists completed plans, newest first, with their
+revision and operation. The default limit is 20 entries; change it with
+`--limit`, and add `--json` for the list as JSON. With a plan digest,
+`history` prints a JSON record of the request, package changes, catalog digests, and
 planned action counts. The record commits with the image state, works
 offline, and follows the source image's history when staging a boot
 environment. History uses commit order within a revision and omits
@@ -430,42 +455,41 @@ the root subvolume, so each boot environment snapshot carries the package
 state that matches its files. After a transaction commits or aborts, CPS
 clears its recovery copies in `/usr/lib/sysimage/cps/stage`.
 
-`/var` is not part of an image. `image-create` makes `var` an empty
+`/var` is not part of an image. `cps image create` makes `var` an empty
 directory, the mount point of a `/var` that the
 [boot environments share](../setups/btrfs.md#share-var-between-boot-environments),
 and no package can ship anything in it. CPS never writes there in an
 inactive image: offline systemd actions defer their tmpfiles rules for `/var`
 to boot, and trigger handlers see an empty `/var`.
 [Packages never ship /var](../maintainer/manifests.md#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd)
-explains what packages declare instead. `image-create` needs an empty
+explains what packages declare instead. `image create` needs an empty
 directory, or one that holds only an empty `var` directory, such as a newly
 created `/var` subvolume that an installer mounted there first.
 
 ## Reconcile or remove packages
 
-Use `plan exact-install NAME ...` to reconcile an image to the named
-packages and their required dependencies. The plan previews packages that
-would be removed. Use `plan remove NAME ...` to remove selected packages
-from committed image state while offline. Removal fails if a package that
-remains still requires one of those packages. Both operations preserve
-locally edited files declared with `preserve=#true`. A saved install,
-exact-install, remove, or update plan can also be applied to a copy of the
+Use `cps install --root image --exact NAME ...` to reconcile an image to
+the named packages and their required dependencies. The plan previews
+packages that would be removed. Use `cps remove --root image NAME ...` to
+remove selected packages from committed image state while offline. Removal
+fails if a package that remains still requires one of those packages. Both
+operations preserve locally edited files declared with `preserve=#true`. A
+saved install, remove, or upgrade plan can also be applied to a copy of the
 image, or staged in a Btrfs snapshot with
-[`boot-env stage-btrfs`](../setups/btrfs.md#capturing-a-running-btrfs-root).
+[`cps boot stage`](../setups/btrfs.md#capturing-a-running-btrfs-root).
 
-Use `cps plan --root image --output cleanup.json autoremove` to preview
-removing unused dependencies. CPS solves from the explicitly installed
+Use `cps autoremove --root image -n` to preview removing unused
+dependencies. CPS solves from the explicitly installed
 packages using their installed versions and the installed dependency
 candidates. It keeps the dependencies needed by that solution, including a
 compatible alternative and any conditional dependencies that apply. The
-plan and apply work offline. Use `plan mark explicit` to keep an installed
-dependency before planning cleanup.
+change works offline. Use `cps mark --root image explicit NAME` to keep an
+installed dependency before the cleanup.
 
 ## Repair files or restore vendor defaults
 
-Use `cps plan --root image --output repair.json repair [NAME ...]` to repair
-selected installed packages, or omit the names to check all installed packages.
-Apply the saved plan with `cps apply --root image repair.json`. CPS restores
+Use `cps repair --root image [NAME ...]` to repair selected installed
+packages, or omit the names to check all installed packages. CPS restores
 managed files, symlinks, and missing directories from the installed manifests.
 It restores ownership and permissions on explicit directories in place.
 Package payloads come from the configured local repository or cache and are
@@ -473,12 +497,12 @@ checked against the installed digests before any writes. Repair keeps local
 edits and deletions on files declared with `preserve=#true` and restores the
 installed permissions and ownership of files that are present. A repair that
 only fixes preserved configuration metadata works offline. Resolve path
-type conflicts involving directories or special files before retrying the plan.
+type conflicts involving directories or special files before retrying.
 
-Use `plan repair --path /path` for an exact path and any necessary parent
-directories or hard links. To intentionally replace an edited or removed
-preserved file with the defaults from its installed package, use
-`plan revert /path` and apply the saved plan. Revert uses the installed
+Use `cps repair --root image --path /path` for an exact path and any
+necessary parent directories or hard links. To intentionally replace an
+edited or removed preserved file with the defaults from its installed
+package, use `cps revert --root image /path`. Revert uses the installed
 package payload and clears any pending vendor proposal for that path.
 
 ## Shared-library regressions
@@ -498,8 +522,8 @@ plans, live updates, and staged upgrades. It models managed library resolution
 and reports regressions from a verified baseline. Unmanaged libraries, loader
 cache and environment settings, and runtime `dlopen` calls are outside its
 scope. Plans and dry runs can still be generated before payloads are available.
-Use `cps fetch --root image --plan upgrade.json` followed by
-`cps validate --root image upgrade.json` to check a saved plan and its
+Use `cps fetch --root image upgrade.json` followed by
+`cps apply --root image -n upgrade.json` to check a saved plan and its
 cached payloads, filesystem metadata support, and ELF regressions before
 apply. Validation uses disposable staging and leaves the image revision and
 journal untouched. Apply repeats the checks against the current image.

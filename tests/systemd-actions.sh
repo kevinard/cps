@@ -58,11 +58,11 @@ package "test/systemd-actions" publisher="canopa" version="1.0.0-0" {
 MANIFEST
 
 publish() {
-    "$cps" publish --repo repo --proto proto --signing-key private.der package.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der package.kdl
 }
 publish
-"$cps" image-create --root base --repo repo --publisher canopa --trust-root repo/trust/1.json
-"$cps" plan --root base --output install.json install test/systemd-actions
+"$cps" image create --root base --repo repo --trust-root repo/trust/1.json
+"$cps" install --root base -n --save-plan install.json test/systemd-actions
 "$cps" apply --root base install.json
 
 mkdir -p base/etc/{systemd/system,systemd/system-preset,tmpfiles.d}
@@ -109,7 +109,7 @@ package "test/systemd-actions" publisher="canopa" version="2.0.0-0" {
 }
 MANIFEST
 publish
-"$cps" plan --root base --output upgrade.json update | tee preview.log
+"$cps" upgrade --root base -n --save-plan upgrade.json | tee preview.log
 grep -q "Offline systemd sysusers $scope.conf" preview.log
 grep -q "Offline systemd tmpfiles $scope.conf" preview.log
 grep -q "Offline systemd preset $enabled" preview.log
@@ -122,8 +122,8 @@ fi
 unchanged=usr/lib/systemd/system/multi-user.target
 cp -a base drifted
 printf 'unrelated drift\n' > "drifted/$unchanged"
-for command in validate apply; do
-    if "$cps" "$command" --root drifted upgrade.json > drift.log 2>&1; then
+for command in 'apply -n' apply; do
+    if "$cps" $command --root drifted upgrade.json > drift.log 2>&1; then
         echo "Expected $command to reject unrelated drift" >&2
         exit 1
     fi
@@ -131,7 +131,7 @@ for command in validate apply; do
 done
 test ! -e "drifted/usr/lib/systemd/system/$enabled"
 test ! -e drifted/etc/passwd
-"$cps" transaction status --root drifted | grep -Fx 'No pending transaction'
+"$cps" status --root drifted | grep -Fx 'No pending transaction'
 
 cp -a --reflink=auto -- base staged
 
@@ -197,9 +197,9 @@ if "$cps" verify --root recover > retry.log 2>&1; then
 fi
 grep -q 'incomplete transaction' retry.log
 cp "base/etc/tmpfiles.d/$scope.conf" recover/etc/tmpfiles.d/
-"$cps" transaction status --root recover > recovery-status.log
+"$cps" status --root recover > recovery-status.log
 grep -Fq 'Offline actions pending' recovery-status.log
-grep -Fq 'Recover with transaction resume' recovery-status.log
+grep -Fqx 'Recover with cps resume --root IMAGE, or undo with cps abort --root IMAGE' recovery-status.log
 # A change after the file phase can still leave plain resume stuck. Explicit
 # repair uses the original journal and verifies the exact recovery payload.
 cp -a base repair-pending
@@ -211,7 +211,7 @@ fi
 grep -q 'offline systemd tmpfiles failed' retry.log
 cp "base/etc/tmpfiles.d/$scope.conf" repair-pending/etc/tmpfiles.d/
 printf 'drift after file writes\n' > "repair-pending/$unchanged"
-if "$cps" transaction resume --root repair-pending > drift.log 2>&1; then
+if "$cps" resume --root repair-pending > drift.log 2>&1; then
     echo 'Expected ordinary resume to reject the damaged image' >&2
     exit 1
 fi
@@ -219,24 +219,24 @@ grep -Fq "inconsistent image: $unchanged" drift.log
 hash=$(sha256sum "base/$unchanged" | cut -d' ' -f1)
 mv "repo/blobs/$hash" saved-blob
 printf 'corrupt payload\n' > "repo/blobs/$hash"
-if "$cps" transaction resume --root repair-pending --repair > drift.log 2>&1; then
+if "$cps" resume --root repair-pending --repair > drift.log 2>&1; then
     echo 'Repair accepted a corrupt recovery payload' >&2
     exit 1
 fi
 grep -Fxq 'drift after file writes' "repair-pending/$unchanged"
 mv -f saved-blob "repo/blobs/$hash"
-"$cps" transaction resume --root repair-pending --repair
-"$cps" transaction status --root repair-pending | grep -Fx 'No pending transaction'
+"$cps" resume --root repair-pending --repair
+"$cps" status --root repair-pending | grep -Fx 'No pending transaction'
 cmp "base/$unchanged" "repair-pending/$unchanged"
 grep -q "^$user:x:$account_uid:$account_gid:" repair-pending/etc/passwd
 "$cps" verify --root repair-pending
 
 rm upgrade.json
 mv repo repo-offline
-"$cps" transaction resume --root recover
-"$cps" transaction status --root recover | grep -Fx 'No pending transaction'
-plan_id=$("$cps" transaction history --root recover --limit 1 | awk -F '\t' '$1 == 2 && $3 == "update" {print $2}')
-"$cps" transaction show --root recover "$plan_id" > completed.json
+"$cps" resume --root recover
+"$cps" status --root recover | grep -Fx 'No pending transaction'
+plan_id=$("$cps" history --root recover --limit 1 | awk -F '\t' '$1 == 2 && $3 == "upgrade" {print $2}')
+"$cps" history --root recover "$plan_id" > completed.json
 grep -Fq '"systemd_actions": 5' completed.json
 "$cps" verify --root recover
 test "$(grep -c "^$user:" recover/etc/passwd)" = 1
@@ -255,7 +255,7 @@ echo 'Verified sysusers, tmpfiles, and presets only changed the staged root'
 
 mv repo-offline repo
 # A retired vendor unit must lose links created by its preset.
-"$cps" plan --root staged --output remove.json remove test/systemd-actions
+"$cps" remove --root staged -n --save-plan remove.json test/systemd-actions
 "$cps" apply --root staged remove.json
 test ! -e "staged/usr/lib/systemd/system/$enabled"
 test ! -L "staged/$wants/$enabled"
@@ -271,10 +271,10 @@ package "test/optional-tmpfiles" publisher="canopa" version="1.0.0-0" {
 }
 MANIFEST
 publish
-"$cps" image-create --root facet-base --repo repo --publisher canopa --trust-root repo/trust/1.json --facet optional=false
-"$cps" plan --root facet-base --output facet-install.json install test/optional-tmpfiles
+"$cps" image create --root facet-base --repo repo --trust-root repo/trust/1.json --facet optional=false
+"$cps" install --root facet-base -n --save-plan facet-install.json test/optional-tmpfiles
 "$cps" apply --root facet-base facet-install.json
-"$cps" plan --root facet-base --output facet-enable.json change-facet optional=default | tee facet-preview.log
+"$cps" facet set --root facet-base -n --save-plan facet-enable.json optional=default | tee facet-preview.log
 grep -Fq "Offline systemd tmpfiles $facet_rule" facet-preview.log
 cp -a --reflink=auto -- facet-base facet-staged
 "$cps" apply --root facet-staged facet-enable.json

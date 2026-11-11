@@ -3567,7 +3567,7 @@ mirror "seed" root={anchor:?} metadata={:?} targets={:?}
     let bootstrap_root = work.join("bootstrap-image");
     create_configured_image(&bootstrap_root, &bootstrap_config)?;
     let error = plan(&bootstrap_root, Request::Update).unwrap_err();
-    assert!(format!("{error:#}").contains("plan install-profile first"));
+    assert!(format!("{error:#}").contains("cps install --profile first"));
     let bootstrap = plan(&bootstrap_root, Request::InstallProfile)?;
     assert_eq!(bootstrap.catalogs, saved.catalogs);
     assert_eq!(

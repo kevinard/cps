@@ -41,16 +41,16 @@ package "demo/app" publisher="canopa" version="1.0.0-0" {
     file "usr/bin/demo" mode="0755" uid=$uid gid=$gid
 }
 MANIFEST
-"$cps" publish --repo repo --proto app --signing-key canopa.der app.kdl
+"$cps" publish manifests --repo repo --proto app --key canopa.der app.kdl
 sed 's/version="1.0.0-0"/version="2.0.0-0"/; s/require "demo\/runtime"/require-any { package "demo\/runtime"; package "demo\/unused"; }/' \
     app.kdl > indirect.kdl
-"$cps" publish --repo repo --proto app --signing-key canopa.der indirect.kdl
+"$cps" publish manifests --repo repo --proto app --key canopa.der indirect.kdl
 base=$(cat repo/current)
 
 publish_runtime() {
     "$cps" manifest generate --proto runtime --publisher runtime --version "$1" \
         --uid "$uid" --gid "$gid" demo/runtime > runtime.kdl
-    "$cps" publish --repo companion --proto runtime --signing-key runtime.der runtime.kdl
+    "$cps" publish manifests --repo companion --proto runtime --key runtime.der runtime.kdl
 }
 write_policy() {
     cat > repo/publish-policy.kdl <<POLICY
@@ -75,7 +75,7 @@ refresh() {
 schema-version 1 kind="publish-release"
 release "canopa" base="$base" refresh-profiles=#true
 RELEASE
-    "$cps" repo publish-release --repo repo --signing-key canopa.der refresh.kdl
+    "$cps" publish release --repo repo --key canopa.der refresh.kdl
 }
 reject_refresh() {
     if refresh > rejected.log 2>&1; then
@@ -162,8 +162,8 @@ publisher "runtime" {
     trust-root "runtime.trust.json"
 }
 CONFIG
-"$cps" image-create --root image --config image.kdl
-"$cps" plan --root image --output install.json install-profile
+"$cps" image create --root image --config image.kdl
+"$cps" install --profile --root image -n --save-plan install.json
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine --runtime
 test -L image/usr/lib/libcps-demo.so.1

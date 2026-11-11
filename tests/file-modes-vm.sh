@@ -43,7 +43,7 @@ package "test/modes" publisher="modetest" version="$version.0.0-0" {
     dir "srv/shared" mode="2777" uid=0 gid=0
 }
 MANIFEST
-    "$cps" publish --repo root/repository --proto proto --signing-key private.der modes.kdl
+    "$cps" publish manifests --repo root/repository --proto proto --key private.der modes.kdl
 done
 cat > groups.kdl <<'MANIFEST'
 schema-version 1 kind="package-manifest"
@@ -51,7 +51,7 @@ package "test/groups" publisher="modetest" version="1.0.0-0" {
     dir "srv/shared" mode="2777" uid=0 gid=0
 }
 MANIFEST
-"$cps" publish --repo root/repository --proto proto --signing-key private.der groups.kdl
+"$cps" publish manifests --repo root/repository --proto proto --key private.der groups.kdl
 truncate -s 256M root.btrfs
 "${CPS_VM_MKFS_BTRFS:-mkfs.btrfs}" -q -f --rootdir root root.btrfs
 data_args=()

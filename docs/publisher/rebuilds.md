@@ -38,11 +38,11 @@ policy's `publisher` node to require the complete archive for every
 published version.
 
 ```sh
-cps repo publish-release --repo repo --signing-key release-private.der \
+cps publish release --repo repo --key release-private.der \
     --source-cache publisher-source-cache release.kdl
 ```
 
-`publish-bundle` accepts the same `--source-cache` option. CPS verifies the
+`publish bundle` accepts the same `--source-cache` option. CPS verifies the
 source bytes against the reviewed recipe and advances the catalog after the
 entire release passes validation. It reuses verified sources already stored
 in the repository. A recipe without sources needs no cache. With
@@ -55,9 +55,9 @@ published version, including withdrawn versions. For packages with archived
 recipes and manifests, use `repo archive-sources` to attach the sources.
 
 ```sh
-cps repo archive-sources --repo repo --signing-key release-private.der \
+cps repo archive-sources --repo repo --key release-private.der \
     --source-cache publisher-source-cache cps://canopa/demo/hello@1.0.0-0
-cps repo export --repo repo --publisher canopa --trust-root canopa.trust.json \
+cps repo export --repo repo --trust-root canopa.trust.json \
     --include-sources --output source-mirror-targets
 ```
 
@@ -72,7 +72,7 @@ Sign the exported targets through the same [TUF release process](mirrors.md).
 When the catalog requires source archives, `repo export` includes the
 source targets automatically. Sync checks the signed target digests and
 sizes before promoting the catalog. Both full and index-only sync leave
-source targets for an explicit `repo fetch-sources`.
+source targets for an explicit `source fetch-archived`.
 
 ## Rebuilding a published package
 
@@ -80,13 +80,13 @@ Extract the archived inputs, fetch the sources and toolchain, rebuild, and
 compare the result with the signed release.
 
 ```sh
-recipe=$(cps repo rebuild-inputs --repo /var/lib/cps/canopa --publisher canopa \
+recipe=$(cps repo rebuild-inputs --repo /var/lib/cps/canopa \
     --trust-root canopa.trust.json --output reviewed cps://canopa/demo/hello@1.0.0-0)
 cps source fetch --cache source-cache "$recipe"
-cps repo fetch-toolchain --toolchain-config toolchain.kdl "$recipe"
+cps recipe fetch-toolchain --toolchain-config toolchain.kdl "$recipe"
 cps build --toolchain-config toolchain.kdl --source-cache source-cache \
     --check-reproducible --output rebuilt "$recipe"
-cps repo verify-rebuild --repo /var/lib/cps/canopa --publisher canopa \
+cps repo verify-rebuild --repo /var/lib/cps/canopa \
     --trust-root canopa.trust.json --bundle rebuilt cps://canopa/demo/hello@1.0.0-0
 ```
 
@@ -102,8 +102,8 @@ repository or a synchronized source-inclusive mirror instead of contacting
 the recipe's upstream URLs. Use this command in place of `cps source fetch`.
 
 ```sh
-cps repo fetch-sources --repo /var/lib/cps/canopa --publisher canopa \
-    --trust-root canopa.trust.json --source-cache source-cache cps://canopa/demo/hello@1.0.0-0
+cps source fetch-archived --repo /var/lib/cps/canopa \
+    --trust-root canopa.trust.json --cache source-cache cps://canopa/demo/hello@1.0.0-0
 ```
 
 CPS checks the TUF target digest and size against the verified recipe
@@ -118,15 +118,15 @@ new mirror cache, sync each toolchain publisher with its catalog digest
 from the recipe.
 
 ```sh
-cps repo sync --repo /var/lib/cps/build/canopa --root tuf-root.json \
-    --metadata "$metadata_url" --targets "$targets_url" --publisher canopa \
-    --trust-root canopa.trust.json --index-only --require-catalog "$catalog_sha256"
+cps repo sync --repo /var/lib/cps/build/canopa --tuf-root tuf-root.json \
+    --url "$mirror_url" --trust-root canopa.trust.json \
+    --index-only --require-catalog "$catalog_sha256"
 ```
 
 Repeat `--require-catalog` when provisioning one cache for several recipes.
 The signed mirror release must advertise each digest as current or include
 it through `repo export --retain-catalog`. Point the toolchain configuration
-at the synchronized caches. `repo fetch-toolchain` resolves the pinned
+at the synchronized caches. `recipe fetch-toolchain` resolves the pinned
 selection with the same solver and builder trust policy as the build. It
 downloads and verifies the selected payloads across publishers. The build
 verifies those payloads again and runs offline.
@@ -142,7 +142,7 @@ catalog and its objects. CPS checks an older catalog against the
 publisher's current catalog before exporting it.
 
 ```sh
-cps repo export --repo toolchain-repo --publisher tools --trust-root tools.trust.json \
+cps repo export --repo toolchain-repo --trust-root tools.trust.json \
     --archive-catalog "$catalog_sha256" --output archive-targets
 ```
 
@@ -150,16 +150,15 @@ Sign the targets as a separate TUF repository and provision its trusted
 root to rebuilders. Use one archive cache per catalog pin.
 
 ```sh
-cps repo sync --repo "cache/tools/$catalog_sha256" --root archive-root.json \
-    --metadata "$archive_metadata_url" --targets "$archive_targets_url" \
-    --publisher tools --trust-root tools.trust.json --index-only \
+cps repo sync --repo "cache/tools/$catalog_sha256" --tuf-root archive-root.json \
+    --url "$archive_url" --trust-root tools.trust.json --index-only \
     --archive-catalog "$catalog_sha256"
 ```
 
 Point the toolchain configuration at that cache. The archive has no live
 catalog pointer and uses independent TUF replay state. CPS checks the exact
 pin in the signed archive metadata on sync and on later downloads.
-`repo rebuild-inputs` and `repo fetch-sources` can also use an archive
+`repo rebuild-inputs` and `source fetch-archived` can also use an archive
 cache with an explicit `--catalog` pin. The archive includes required
 source targets, and `--include-sources` adds optional sources recorded by
 the archived catalog.
@@ -179,7 +178,7 @@ verifying any one of them checks all of them: the rebuild must reproduce
 every package, and each package's catalog entry must name the same
 attestation, which proves the packages came from one build.
 
-To verify a signed rebuild, build with `--builder-signing-key` and pass
+To verify a signed rebuild, build with `--key` and pass
 that builder's provisioned public key to `repo verify-rebuild --witness-key`.
 CPS verifies the witness signature over the same statement, including the
 resolved toolchain and source pins. It checks that the key is distinct from
@@ -213,7 +212,7 @@ published manifest and payload digests. For a recipe that builds several
 packages, one attestation names all of them, and CPS checks the statement
 entries for the package being installed. Cached evidence works offline.
 
-Use `image-create --config` to provision this policy on a new image. CPS
+Use `image create --config` to provision this policy on a new image. CPS
 stores the public keys in the image state.
 
 To enable or replace build trust on an existing image, put the policy in

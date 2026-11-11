@@ -17,7 +17,7 @@ openssl genpkey -algorithm ED25519 -outform DER -out private.der
 publish() {
     printf 'schema-version 1 kind="package-manifest"\npackage "%s" publisher="canopa" version="1.0.0-0" {\n%s}\n' \
         "$1" "$2" > manifest.kdl
-    "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl
 }
 
 # The fixture handler records each run in a declared output and fails while
@@ -51,15 +51,15 @@ for name in first second; do
 done
 runs() { wc -l < image/etc/udev/hwdb.runs; }
 
-"$cps" image-create --root image --repo repo --publisher canopa --trust-root repo/trust/1.json
-"$cps" plan --root image --output install.json install test/first test/second > plan.log
+"$cps" image create --root image --repo repo --trust-root repo/trust/1.json
+"$cps" install --root image -n --save-plan install.json test/first test/second > plan.log
 rg -Fx 'Run trigger test/systemd:hwdb' plan.log
 "$cps" apply --root image install.json
 test "$(runs)" -eq 1
 "$tool" --root=image query test:cps:first-device | rg -Fx 'CPS_TEST=first'
 "$tool" --root=image query test:cps:second-device | rg -Fx 'CPS_TEST=second'
 "$cps" verify --root image --pristine
-"$cps" plan --root image --output remove.json remove test/first test/second
+"$cps" remove --root image -n --save-plan remove.json test/first test/second
 touch image/etc/udev/hwdb-fail
 if "$cps" apply --root image remove.json; then
     echo 'expected the hardware database helper to fail' >&2
@@ -68,10 +68,10 @@ fi
 test "$(runs)" -eq 1
 test ! -e image/usr/lib/udev/hwdb.d/first.hwdb
 test ! -e image/usr/lib/udev/hwdb.d/second.hwdb
-"$cps" transaction status --root image | rg -Fx 'Offline actions pending'
+"$cps" status --root image | rg -Fx 'Offline actions pending'
 rm image/etc/udev/hwdb-fail
 mv repo offline
-"$cps" transaction resume --root image
+"$cps" resume --root image
 test "$(runs)" -eq 2
 test ! -e image/etc/udev/hwdb.bin
 "$cps" verify --root image --pristine
@@ -79,22 +79,22 @@ test ! -e image/etc/udev/hwdb.bin
 # Aborting rebuilds the database from the restored files, and an abort that
 # the helper interrupts finishes on retry.
 mv offline repo
-"$cps" plan --root image --output install.json install test/first test/second > /dev/null
+"$cps" install --root image -n --save-plan install.json test/first test/second > /dev/null
 "$cps" apply --root image install.json
 test "$(runs)" -eq 3
-"$cps" plan --root image --output remove.json remove test/second
+"$cps" remove --root image -n --save-plan remove.json test/second
 touch image/etc/udev/hwdb-fail
 if "$cps" apply --root image remove.json; then
     echo 'expected the hardware database helper to fail' >&2
     exit 1
 fi
-if "$cps" transaction abort --root image; then
+if "$cps" abort --root image; then
     echo 'expected the hardware database helper to fail during the abort' >&2
     exit 1
 fi
-"$cps" transaction status --root image | rg -Fx 'Abort in progress'
+"$cps" status --root image | rg -Fx 'Abort in progress'
 rm image/etc/udev/hwdb-fail
-"$cps" transaction abort --root image
+"$cps" abort --root image
 test "$(runs)" -eq 4
 "$tool" --root=image query test:cps:second-device | rg -Fx 'CPS_TEST=second'
 "$cps" verify --root image --pristine

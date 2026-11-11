@@ -50,7 +50,7 @@ pub struct TrialDiscard {
 /// Failed and abandoned trials are always removed. With `keep`, known-good
 /// environments beyond the `keep` most recent are removed as well. The
 /// running, selected and default environments and their recorded fallbacks
-/// are never candidates, and each removal repeats every destroy-btrfs check.
+/// are never candidates, and each removal repeats every `cps boot destroy` check.
 ///
 /// `staged` names the root that the caller's transaction stages into. A
 /// trial booting that root is an interrupted activation that the caller
@@ -65,8 +65,8 @@ pub fn prune_btrfs_boot_environments(
     let volume = BtrfsVolume::open(volume_path)?;
     let planned = plan(esp, &volume, keep, staged)?;
     // The kernel refuses to delete the default subvolume, but only after
-    // destroy-btrfs has retired its boot entry. Skip it up front. If the
-    // lookup fails, destroy-btrfs still reports the refusal.
+    // `cps boot destroy` has retired its boot entry. Skip it up front. If the
+    // lookup fails, `cps boot destroy` still reports the refusal.
     let default = volume.default_subvolume().ok();
     let mut report = BootPruneReport::default();
     for (id, kind, subvolid) in planned {
@@ -267,7 +267,7 @@ fn candidates(
     let selected = policy.selected(entries);
     ensure!(
         selected.is_none_or(|entry| entry.tries.is_none()),
-        "a trial is pending; boot it, or cancel it with `cps boot-env discard-trial`, before \
+        "a trial is pending; boot it, or cancel it with `cps boot discard-trial`, before \
          pruning"
     );
     let mut kept: BTreeSet<&str> = protected.iter().map(String::as_str).collect();
@@ -306,7 +306,7 @@ fn candidates(
 }
 
 /// Spend the remaining attempts of an unselected systemd-boot trial so that
-/// destroy-btrfs accepts it. systemd-boot never selects an exhausted entry.
+/// `cps boot destroy` accepts it. systemd-boot never selects an exhausted entry.
 fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> Result<()> {
     let esp = std::fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
@@ -333,7 +333,7 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
             .selected(&entries)
             .is_none_or(|selected| selected.id != id)
             && !matches!(&policy, LoaderPolicy::Pinned { preferred: Some(preferred), .. } if preferred == id),
-        "trial {id} is selected for the next boot; cancel it with `cps boot-env discard-trial`"
+        "trial {id} is selected for the next boot; cancel it with `cps boot discard-trial`"
     );
     ensure!(
         volume.running()?.is_none_or(|(running, _)| running != id),

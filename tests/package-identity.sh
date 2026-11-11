@@ -22,7 +22,7 @@ package "imports/$name" publisher="imports" version="$upstream" upstream-version
     file "$path" mode="0644" uid=$(id -u) gid=$(id -g)
 }
 MANIFEST
-    "$cps" publish --repo repo --proto proto --signing-key private.der package.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der package.kdl
 done <<'FIXTURES'
 sqlite 3.54.1-1
 python 3.14.9-1
@@ -41,7 +41,7 @@ package "imports/release-candidate" publisher="imports" version="$version" {
     file "usr/share/imports/release-candidate" mode="0644" uid=$(id -u) gid=$(id -g)
 }
 MANIFEST
-    "$cps" publish --repo repo --proto proto --signing-key private.der package.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der package.kdl
 done
 
 cat > consumer.kdl <<'MANIFEST'
@@ -50,29 +50,29 @@ package "imports/consumer" publisher="imports" version="1.0" {
     require "imports/release-candidate" version=">=3.0.0~rc1-1, <3.0.0-1"
 }
 MANIFEST
-"$cps" publish --repo repo --proto proto --signing-key private.der consumer.kdl
+"$cps" publish manifests --repo repo --proto proto --key private.der consumer.kdl
 
 cat > architecture.kdl <<'MANIFEST'
 schema-version 1 kind="package-manifest"
 package "imports/arch" publisher="imports" version="1.0.0-0" architecture="x86_64"
 MANIFEST
-"$cps" publish --repo repo --proto proto --signing-key private.der architecture.kdl
+"$cps" publish manifests --repo repo --proto proto --key private.der architecture.kdl
 sed -i 's/x86_64/aarch64/' architecture.kdl
-if "$cps" publish --repo repo --proto proto --signing-key private.der architecture.kdl > conflict.log 2>&1; then
+if "$cps" publish manifests --repo repo --proto proto --key private.der architecture.kdl > conflict.log 2>&1; then
     echo 'expected a second architecture to conflict with an existing package ID' >&2
     exit 1
 fi
 grep -F 'was already published with different content' conflict.log
 
 for architecture in x86_64 aarch64; do
-    "$cps" image-create --root "$architecture" --repo repo --publisher imports \
+    "$cps" image create --root "$architecture" --repo repo \
         --trust-root repo/trust/1.json --arch "$architecture"
 done
 "$cps" search --root x86_64 imports/arch | grep -F 'imports/arch@1.0.0-0'
 test "$("$cps" search --root aarch64 imports/arch)" = $'PACKAGE\tSTATE\tSUMMARY'
 "$cps" info --root aarch64 --available imports/zlib@1:1.3.2-4 | grep -F 'upstream-version="1:1.3.2-4"'
 "$cps" info --root x86_64 --available imports/glibc@2.44+r50+g1848099f063e-1 | grep -F 'upstream-version="2.44+r50+g1848099f063e-1"'
-"$cps" plan --root x86_64 --output install.json install cps://imports/imports/zlib@1:1.3.2-4 imports/consumer
+"$cps" install --root x86_64 -n --save-plan install.json cps://imports/imports/zlib@1:1.3.2-4 imports/consumer
 "$cps" apply --root x86_64 install.json
 "$cps" info --root x86_64 imports/zlib | grep -F 'upstream-version="1:1.3.2-4"'
 "$cps" info --root x86_64 imports/release-candidate | grep -F 'version="3.0.0~rc10-1"'

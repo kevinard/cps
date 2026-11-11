@@ -171,7 +171,7 @@ package "test/raw-probe" publisher="captest" version="$version.0.0-0" {
     hardlink "bin/raw-probe-alias" target="bin/raw-probe"
 }
 MANIFEST
-        "$cps" publish --repo "$data/repo" --proto cap-proto --signing-key cap-private.der cap.kdl
+        "$cps" publish manifests --repo "$data/repo" --proto cap-proto --key cap-private.der cap.kdl
     done
 }
 
@@ -298,7 +298,7 @@ bb=/bin/busybox
 [ /etc/cps-vm-state -ef /etc/cps-vm-boot-state ]
 state=$("$bb" cat /etc/cps-vm-boot-state)
 if [ -f /etc/cps-vm-assert-facet ]; then
-    facets=$(/usr/bin/cps facet --root /)
+    facets=$(/usr/bin/cps facet list --root /)
     [ "$("$bb" cat /etc/cps-vm-optional.conf)" = 'local settings' ]
     if [ -f /usr/share/man/man1/cps-vm.1 ]; then
         state=$("$bb" cat /usr/share/man/man1/cps-vm.1)
@@ -364,7 +364,7 @@ if [ -f /etc/cps-vm-assert-cps-builds ]; then
     printf 'CPS_VM_CPS_BUILDS: %s verified\n' "$state"
 fi
 if [ -f /etc/cps-vm-assert-profile-protection ]; then
-    if /usr/bin/cps plan --root / --output /run/remove-profile.json remove test/boot-stack \
+    if /usr/bin/cps remove --root / -n --save-plan /run/remove-profile.json test/boot-stack \
         > /run/remove-profile.log 2>&1; then
         exit 1
     fi
@@ -382,7 +382,7 @@ if [ -f /etc/cps-vm-assert-package-intent ]; then
         *"$(printf 'cps://vm-profile/test/boot-stack@1.0.0-0\t-\troot')"*) ;;
         *) printf '%s\n' "$listing" >&2; exit 1 ;;
     esac
-    preview=$(/usr/bin/cps plan --root / --output /run/mark-intent.json mark explicit test/boot-stack)
+    preview=$(/usr/bin/cps mark --root / -n --save-plan /run/mark-intent.json explicit test/boot-stack)
     case "$preview" in
         *'Mark cps://vm-profile/test/boot-stack@1.0.0-0 as locally requested'*) ;;
         *) printf '%s\n' "$preview" >&2; exit 1 ;;
@@ -399,15 +399,15 @@ if [ -f /etc/cps-vm-assert-package-intent ]; then
 fi
 if [ -f /etc/cps-vm-frozen-sqlite ]; then
     frozen_version=$("$bb" cat /etc/cps-vm-frozen-sqlite)
-    listing=$(/usr/bin/cps freeze --root /)
+    listing=$(/usr/bin/cps list --root / --frozen)
     expected=$(printf 'system/sqlite\t%s\t"VM runtime compatibility"' "$frozen_version")
     case "$listing" in *"$expected"*) ;; *) printf '%s\n' "$listing" >&2; exit 1 ;; esac
-    preview=$(/usr/bin/cps plan --root / --output /run/unfreeze-runtime.json unfreeze system/sqlite)
+    preview=$(/usr/bin/cps unfreeze --root / -n --save-plan /run/unfreeze-runtime.json system/sqlite)
     case "$preview" in *'Unfreeze system/sqlite'*) ;; *) printf '%s\n' "$preview" >&2; exit 1 ;; esac
     printf 'CPS_VM_FREEZE: %s verified\n' "$state"
 fi
 if [ -f /etc/cps-vm-staged-transactions ]; then
-    listing=$(/usr/bin/cps freeze --root /)
+    listing=$(/usr/bin/cps list --root / --frozen)
     if [ "$state" = previous ]; then
         case "$listing" in *"$(printf 'test/boot-state\t')"*) exit 1 ;; esac
         printf 'CPS_VM_STAGED_TRANSACTIONS: previous unchanged\n'

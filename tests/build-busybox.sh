@@ -38,7 +38,7 @@ keypair release repo canopa-bootstrap
 bash "$project/tests/seed-native-c.sh" "$work/native-c" --busybox
 "$cps" manifest generate --proto "$work/native-c" --publisher seed --version 1.0.0-0 \
     build/native-c > native-c.kdl
-"$cps" publish --repo toolchain --proto "$work/native-c" --signing-key "$work/toolchain.der" native-c.kdl
+"$cps" publish manifests --repo toolchain --proto "$work/native-c" --key "$work/toolchain.der" native-c.kdl
 
 sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/busybox/$manifest" > busybox.kdl
 sed -e "s/@ARCH@/$(uname -m)/g" -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
@@ -55,9 +55,9 @@ if [[ -n $source_dir ]]; then
 else
     "$cps" source fetch --from "$work/inputs" --cache sources build.kdl
 fi
-"$cps" build --repo toolchain --publisher seed --trust-root toolchain.trust.json \
+"$cps" build --repo toolchain --trust-root toolchain.trust.json \
     --source-cache sources --output bundle --check-reproducible \
-    --builder-signing-key "$work/builder.der" build.kdl
+    --key "$work/builder.der" build.kdl
 
 mkdir -p repo
 cp builder-public.der repo/
@@ -69,14 +69,13 @@ publisher "canopa-bootstrap" {
     approve "system/busybox" version="$version" sha256="$recipe_sha256"
 }
 POLICY
-"$cps" publish-bundle --repo repo --signing-key "$work/release.der" --builder-key builder-public.der \
+"$cps" publish bundle --repo repo --key "$work/release.der" --builder-key builder-public.der \
     --recipe-sha256 "$recipe_sha256" bundle
-"$cps" repo attestation --repo repo --publisher canopa-bootstrap --trust-root release.trust.json \
+"$cps" repo attestation --repo repo --trust-root release.trust.json \
     "$package" > attestation.json
 (cat bundle/attestation.json; printf '\n') | cmp - attestation.json
-"$cps" image-create --root image --repo repo --publisher canopa-bootstrap --trust-root release.trust.json
-"$cps" plan --root image --output install.json install "$package"
-"$cps" apply --root image install.json
+"$cps" image create --root image --repo repo --trust-root release.trust.json
+"$cps" install --root image -y "$package"
 "$cps" verify --root image --pristine
 cmp "bundle/proto/$binary" "image/$binary"
 if [[ $manifest == busybox-usr.kdl ]]; then

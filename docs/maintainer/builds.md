@@ -70,7 +70,7 @@ are relative to `--sources` or the source cache. The toolchain package must
 provide the shell, compiler, and utilities through its dependencies.
 
 ```sh
-cps build --repo toolchain-cache --publisher canopa --trust-root canopa.trust.json \
+cps build --repo toolchain-cache --trust-root canopa.trust.json \
     --sources sources --output hello-build --check-reproducible hello.build.kdl
 ```
 
@@ -318,7 +318,7 @@ The rules for several packages:
 - Two packages cannot ship ELF objects with the same build ID, because their
   debug information can belong to only one package.
 - The bundle holds every expanded manifest, one attestation covers them
-  all, and `cps publish-bundle` publishes all of them in one signed catalog
+  all, and `cps publish bundle` publishes all of them in one signed catalog
   update. The publish policy must approve each package with the same recipe
   digest. See [Publish and retire packages](../publisher/publishing.md#publishing-policy).
 
@@ -338,7 +338,7 @@ no dependencies; see [debug symbols](manifests.md#example-debug-symbols).
 
 `debug.*` facets are off unless the image enables them, for example with
 `facet "debug.symbols" #true` in the image configuration or with a
-per-package rule such as `change-facet apps/lz:debug.symbols=true`.
+per-package rule such as `facet set apps/lz:debug.symbols=true`.
 Debuggers find the files by build ID. `objcopy` keeps the build ID note and
 the section order, so stripped outputs stay reproducible.
 
@@ -445,7 +445,7 @@ publisher "tools" {
 
 ```sh
 cps build --toolchain-config toolchain.kdl --source-cache source-cache \
-    --output bundle --check-reproducible --builder-signing-key builder.der example.build.kdl
+    --output bundle --check-reproducible --key builder.der example.build.kdl
 ```
 
 CPS verifies each trust root against its pin and reads the exact signed
@@ -465,7 +465,7 @@ rechecks existing objects before reuse. Recipes can share a cache by digest.
 
 ```sh
 cps source fetch --cache source-cache hello.build.kdl
-cps build --repo toolchain-cache --publisher canopa --trust-root canopa.trust.json \
+cps build --repo toolchain-cache --trust-root canopa.trust.json \
     --source-cache source-cache --output hello-build --check-reproducible hello.build.kdl
 ```
 
@@ -492,7 +492,7 @@ can contain `collect` rules, which the snapshot keeps. Write the script to
 unpack `$CPS_SOURCES/git.tar` before building.
 
 ```sh
-cps source git-snapshot --git-repo https://git.example.org/hello.git --branch main \
+cps source git-snapshot --git https://git.example.org/hello.git --branch main \
     --repo packages --trust-root canopa.trust.json --output snapshot hello.build.kdl
 cps source fetch --from snapshot/sources --cache source-cache snapshot/build.kdl
 ```
@@ -526,10 +526,10 @@ it remains eligible.
 ## Building and publishing with signed evidence
 
 ```sh
-cps build --repo toolchain-cache --publisher canopa --trust-root canopa.trust.json \
+cps build --repo toolchain-cache --trust-root canopa.trust.json \
     --sources sources --output hello-build --check-reproducible \
-    --builder-signing-key builder-private.der hello.build.kdl
-cps publish-bundle --repo repo --signing-key private.der --builder-key builder-public.der \
+    --key builder-private.der hello.build.kdl
+cps publish bundle --repo repo --key private.der --builder-key builder-public.der \
     --recipe-sha256 "$reviewed_recipe_sha256" hello-build
 ```
 
@@ -545,7 +545,7 @@ is a separate step with its own inputs.
 `--check-reproducible` repeats the build in a fresh sandbox with a different
 job count and requires identical file hashes and expanded manifests before
 making the bundle available. Both runs use the same worker kernel and CPU.
-`--builder-signing-key` requires it. The key accepts `PATH`, `file:PATH`, or
+The worker key that `--key` names requires it. The key accepts `PATH`, `file:PATH`, or
 `command:DESCRIPTOR`, so it can stay in a hardware token or KMS behind an
 [external signer](../publisher/mirrors.md#external-signer-protocol). The
 helper receives `CPS_SIGNER_CONTEXT=attestation`.
@@ -558,7 +558,7 @@ The bundle contains:
 | `templates/` | The pinned templates at their recipe paths |
 | `manifests/NAME.kdl` | Each package's expanded manifest, such as `manifests/apps/lz.kdl` |
 | `proto/` | The packaged regular-file payloads |
-| `attestation.json` | The signed build statement, with `--builder-signing-key` |
+| `attestation.json` | The signed build statement, with `--key` |
 
 The expanded manifests supply the packaged modes, owners, directory
 entries, and symlinks.
@@ -576,7 +576,7 @@ payloads from another run. Each package's catalog entry names the same
 attestation, and clients verify each package against its own manifest and
 payloads in that statement.
 
-`publish-bundle` verifies the statement and checks that each expanded
+`publish bundle` verifies the statement and checks that each expanded
 manifest is what its pinned template produces: the same metadata,
 dependencies, and explicit actions, followed only by collected and debug
 actions that follow its rules. It then streams the exact attested payloads

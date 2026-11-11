@@ -116,7 +116,7 @@ impl LoaderPolicy {
             ensure!(
                 preferred.is_none(),
                 "{LOADER} sets `preferred` without a CPS `default`. Remove the `preferred` line, \
-                 then select a known-good environment with `cps boot-env rollback`"
+                 then select a known-good environment with `cps boot rollback`"
             );
             return Ok(None);
         };
@@ -133,7 +133,7 @@ impl LoaderPolicy {
                 "{LOADER} sets `default {default}`, but CPS owns this key and expects \
                  `default <CPS entry ID>.conf` or `default {AUTO}`. Restore the CPS value, or \
                  remove the line and select a known-good environment with \
-                 `cps boot-env rollback --esp ESP ID`"
+                 `cps boot rollback --esp ESP ID`"
             )
         })?;
         let preferred = preferred
@@ -800,7 +800,7 @@ mod tests {
         let message = error("default arch.conf\n");
         assert!(message.contains("`default arch.conf`"), "{message}");
         assert!(message.contains("default <CPS entry ID>.conf"), "{message}");
-        assert!(message.contains("cps boot-env rollback"), "{message}");
+        assert!(message.contains("cps boot rollback"), "{message}");
         let message = error(&format!("default {BASE}.conf\npreferred @saved\n"));
         assert!(message.contains("`preferred @saved`"), "{message}");
         let message = error(&format!("default {BASE}.conf\ndefault {TRIAL}.conf\n"));

@@ -3,7 +3,7 @@
 [Documentation](../README.md) · [Setup guides](README.md)
 
 Installers and VM tests turn an inactive CPS root into a bootable GPT disk
-file with `cps boot-env image`, without root privileges, mounts, or loop
+file with `cps image disk`, without root privileges, mounts, or loop
 devices. The disk gets the same layout as an installed
 [Btrfs system](btrfs.md): a Btrfs top-level volume holding the root
 subvolume, an `environments` subvolume, and the shared `/var` subvolume, and
@@ -32,10 +32,8 @@ tmpfiles.d and sysusers.d declarations populate it, as described in
 
 ```sh
 mkdir -p volume/@environments volume/@var
-cps image-create --root volume/@ --config image.kdl
-cps plan --root volume/@ --output base.json install-profile
-cps fetch --root volume/@ --plan base.json
-cps apply --root volume/@ base.json
+cps image create --root volume/@ --config image.kdl
+cps install --root volume/@ -y --profile
 cps verify --root volume/@ --pristine
 ```
 
@@ -55,7 +53,7 @@ PARTUUID=ROOT-PARTUUID  /cps  btrfs  subvolid=5        0 0
 PARTUUID=ESP-PARTUUID   /efi  vfat   umask=0077        0 2
 ```
 
-With `--var`, `boot-env image` refuses a root whose `/etc/fstab` does not
+With `--var`, `image disk` refuses a root whose `/etc/fstab` does not
 mount that subvolume at `/var`.
 
 The image keeps owners, modes, links, extended attributes, and timestamps
@@ -66,7 +64,7 @@ by root on the installed system.
 
 ## Prepare the disk template
 
-`boot-env image` writes into a copy of a GPT disk template. The template has
+`image disk` writes into a copy of a GPT disk template. The template has
 512-byte sectors, one EFI System Partition with systemd-boot 262 or newer,
 and a Linux filesystem partition for the root. CPS formats that partition to
 its full size, so size it for the root and the environments staged later.
@@ -91,7 +89,7 @@ hold CPS boot entries or CPS boot files.
 ## Write the image
 
 ```sh
-cps boot-env image --btrfs-volume volume --root volume/@ \
+cps image disk --btrfs-volume volume --root volume/@ \
     --environments volume/@environments --var volume/@var --disk template.raw \
     --root-partuuid "$root_partuuid" --output disk.raw --options rw
 ```
@@ -115,12 +113,12 @@ disk file. It leaves the template and the volume directory unchanged.
 
 A manifest-managed kernel supplies its prepared kernel-install artifacts.
 For an image that ships boot files manually, pass `--kernel` and `--initrd`,
-as for [`activate-btrfs`](btrfs.md#activating-btrfs-roots). `--options` adds
+as for [`boot activate`](btrfs.md#activating-btrfs-roots). `--options` adds
 kernel arguments. CPS supplies `root=`, `rootfstype=`, and `rootflags=`.
 
 The root is booted by its PARTUUID, so the kernel needs no initramfs to find
 it. To boot by filesystem UUID instead, or with an encrypted root, register
-the root on the installed system with `activate-btrfs`.
+the root on the installed system with `boot activate`.
 
 ## Checks and failure cleanup
 

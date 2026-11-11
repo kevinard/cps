@@ -506,11 +506,11 @@ pub(crate) fn apply_to_image(
     if let Some(pending) = image.pending::<PendingRecord>()? {
         ensure!(
             pending.work().id == id,
-            "a different plan is pending; use transaction status to identify it"
+            "a different plan is pending; use cps status to identify it"
         );
         ensure!(
             !pending.aborting(),
-            "this plan is being aborted; finish with transaction abort, then apply it again"
+            "this plan is being aborted; finish with cps abort, then apply it again"
         );
         let state = image.state()?;
         return resume_pending(
@@ -831,9 +831,9 @@ fn abort_pending(
     ensure!(
         pending.is_live() == live,
         if pending.is_live() {
-            "the pending transaction changed the running system; abort it with cps transaction abort without --root"
+            "the pending transaction changed the running system; abort it with cps abort without --root"
         } else {
-            "the pending transaction belongs to an inactive image; abort it with cps transaction abort --root"
+            "the pending transaction belongs to an inactive image; abort it with cps abort --root"
         }
     );
     let plan = pending.recorded_plan()?.clone();

@@ -29,7 +29,7 @@ fragment and use the package name from the result.
 sudo cps search htop
 sudo cps install apps/htop
 htop
-sudo cps check-updates --json
+sudo cps upgrade --check --json
 sudo cps upgrade
 sudo cps status
 ```
@@ -55,7 +55,7 @@ their current versions. If an optional publisher fails during payload
 download, CPS previews a new distribution-only plan and asks for
 confirmation again unless you passed `--yes`. To use distribution
 publishers from the start, pass `--base-only` to `upgrade` or
-`check-updates`. This scope includes the primary publisher, signed profile
+`upgrade --check`. This scope includes the primary publisher, signed profile
 companions, and publishers declared in the system image configuration.
 Package dependencies still apply, so an incompatible installed add-on can
 hold back a base upgrade.
@@ -65,7 +65,7 @@ To build and install a package straight from a Git repository, see
 
 ## Check updates and diagnose held packages
 
-`check-updates --json` runs the upgrade planner on the running system.
+`upgrade --check --json` runs the upgrade planner on the running system.
 It refreshes configured mirrors as `upgrade` does. Use `--no-refresh` to
 check the cached catalogs. It only plans the transaction, so the installed
 system and boot selection stay as they are while the mirror cache can advance.
@@ -86,7 +86,7 @@ of each mirror publisher. A check with no actionable changes and only
 deferred publishers reports `deferred`. A check can report both actionable
 changes and held-back packages.
 
-Use `check-updates --explain library/libdisplay` to probe the newest
+Use `upgrade --check --explain library/libdisplay` to probe the newest
 held-back version of one package with the same catalog pins. The report
 includes the resulting solver or build-trust error, or indicates that the
 version fits when explicitly required. The probe leaves the normal upgrade
@@ -160,8 +160,8 @@ entry titled `Canopa backup`, which the next boot does not select. If a
 change breaks the system, select the backup and reboot:
 
 ```sh
-sudo cps boot-env list --esp /efi
-sudo cps boot-env rollback --esp /efi --btrfs-volume /cps "$backup_id"
+sudo cps boot list
+sudo cps boot rollback "$backup_id"
 ```
 
 Backups count toward the
@@ -200,7 +200,7 @@ to stage changes involving a package.
 
 While a trial is pending, system package commands refuse to change the
 running root, so the trial holds every package change. Boot into the
-trial, or cancel it with `sudo cps boot-env discard-trial`, which selects
+trial, or cancel it with `sudo cps boot discard-trial`, which selects
 the known-good fallback again. Before staging, CPS checks that the Btrfs
 filesystem has room for the new payloads, and by default it prunes old
 boot environments under the `boot-btrfs` retention policy. See
@@ -211,7 +211,7 @@ boot environments under the `boot-btrfs` retention policy. See
 The trial starts as a snapshot of the running root, so it does not see
 changes to `/etc` made after staging, such as a new password or user.
 When the system shuts down cleanly, for example with `systemctl reboot`,
-`cps-finalize-trial.service` runs `cps boot-env finalize-trial`. It compares
+`cps-finalize-trial.service` runs `cps boot finalize-trial`. It compares
 the running `/etc` and the trial's `/etc` with `/etc` as it was at staging,
 and carries each local change into the trial:
 
@@ -235,8 +235,8 @@ and carries each local change into the trial:
 After booting the trial, review what the merge kept aside:
 
 ```sh
-sudo cps config list --root /
-sudo cps config diff --root / /etc/hostname
+sudo cps config list
+sudo cps config diff /etc/hostname
 ```
 
 `config list` shows saved running versions as `saved local`, and
@@ -258,7 +258,7 @@ If a live change stops before it commits, because of a crash, a power loss,
 or a failed trigger or service job, `cps status` reports it:
 
 ```text
-Transaction 2fbac149… is incomplete. Run cps resume, or cps transaction abort to undo it.
+Transaction 2fbac149… is incomplete. Run cps resume, or cps abort to undo it.
 ```
 
 Other package commands refuse to run until you finish the transaction one
@@ -268,8 +268,8 @@ lists every case. In short:
 ```sh
 sudo cps resume
 sudo cps resume --repair
-sudo cps transaction abort
-sudo cps transaction abort --fetch
+sudo cps abort
+sudo cps abort --fetch
 ```
 
 - `cps resume` completes the transaction using the files saved in its
@@ -279,7 +279,7 @@ sudo cps transaction abort --fetch
   state from verified staged or cached payloads, including during the
   file-writing phase. Use it when resume reports that managed files differ.
   It keeps local edits to preserved configuration.
-- `cps transaction abort` undoes the change and keeps the committed package
+- `cps abort` undoes the change and keeps the committed package
   revision. Use it when you cannot fix the cause or no longer want the
   change. Run it without `--root`: CPS refuses to abort a live transaction
   as an inactive image, and the reverse.
@@ -300,7 +300,7 @@ restores services:
   them, so an abort after any interruption knows them.
 
 Once an abort starts, the transaction only goes back. `cps status` reports
-`Transaction … is being aborted. Run cps transaction abort.` Run that
+`Transaction … is being aborted. Run cps abort.` Run that
 command again to finish an interrupted or failed abort; `cps resume` also
 finishes it, without fetching. See
 [Abort a transaction](images.md#abort-a-transaction) for how abort restores
@@ -323,19 +323,20 @@ result outside the running and selected roots reports
 `inactive_boot_environment`. The boot phases refer to the plan that created
 that environment. A later live change reports its own transaction phase.
 
-The explicit `plan`, `fetch`, `apply`, and `boot-env` commands remain
-available for [administering images](images.md) and boot environments.
+The same commands take `--root` to change an
+[inactive image](images.md), where `cps fetch` and `cps apply` complete a
+saved plan. `cps boot` manages boot environments.
 
 ## Repair, restore defaults, and verify
 
 ```sh
-sudo cps verify --root / --quick
-sudo cps verify --root /
+sudo cps verify --quick
+sudo cps verify
 sudo cps repair --dry-run
 sudo cps revert /etc/example.conf
 ```
 
-`cps verify --root / --quick` checks the running system against its
+`cps verify --quick` checks the running system against its
 recorded file fingerprints, as the boot health unit does. Without `--quick`
 it hashes every managed file. See
 [Verify an image](images.md#verify-an-image-and-locate-its-state).
@@ -347,7 +348,7 @@ installed package's default configuration and clears the pending vendor
 proposal for that file. Both commands use the installed manifests and exact
 payload digests. Use `cps resume` if a live repair is interrupted.
 
-Use `cps repair --prepare-only` to build and verify a recovery root from the
+Use `cps repair --stage` to build and verify a recovery root from the
 running root. CPS also takes this route for a repair or revert that touches
 boot-sensitive files. The command prints the prepared root's path and leaves
 boot selection alone. During trial activation CPS verifies the staged

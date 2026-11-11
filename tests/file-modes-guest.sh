@@ -25,29 +25,29 @@ root=$work/image
 probe=/usr/local/libexec/mode-probe
 cps=/usr/bin/cps
 repo=/repository
-"$cps" image-create --root "$work/groups" --repo "$repo" --publisher modetest --trust-root /trust.json
-"$cps" plan --root "$work/groups" --output "$work/groups.json" install test/groups
+"$cps" image create --root "$work/groups" --repo "$repo" --trust-root /trust.json
+"$cps" install --root "$work/groups" -n --save-plan "$work/groups.json" test/groups
 if "$probe" no-fsetid "$cps" apply --root "$work/groups" "$work/groups.json" > "$work/group-denied" 2>&1; then exit 1; fi
 rejection=$("$bb" cat "$work/group-denied")
 case "$rejection" in *'did not retain the requested ownership and mode'*) ;; *) echo "$rejection"; exit 1 ;; esac
 test ! -e "$work/groups/srv/shared"
-test "$("$cps" transaction status --root "$work/groups")" = "$(printf 'Image revision 0\nNo pending transaction')"
+test "$("$cps" status --root "$work/groups")" = "$(printf 'Image revision 0\nNo pending transaction')"
 "$cps" verify --root "$work/groups" --pristine
-"$cps" image-create --root "$root" --repo "$repo" --publisher modetest --trust-root /trust.json
-"$cps" plan --root "$root" --output "$work/install.json" install test/modes@1.0.0-0
+"$cps" image create --root "$root" --repo "$repo" --trust-root /trust.json
+"$cps" install --root "$root" -n --save-plan "$work/install.json" test/modes@1.0.0-0
 if "$probe" no-fsetid "$cps" apply --root "$root" "$work/install.json" > "$work/denied" 2>&1; then exit 1; fi
 rejection=$("$bb" cat "$work/denied")
 case "$rejection" in *'did not retain the requested ownership and mode'*) ;; *) echo "$rejection"; exit 1 ;; esac
 test ! -e "$root/bin/helper"
-test "$("$cps" transaction status --root "$root")" = "$(printf 'Image revision 0\nNo pending transaction')"
+test "$("$cps" status --root "$root")" = "$(printf 'Image revision 0\nNo pending transaction')"
 "$cps" verify --root "$root" --pristine
 if "$probe" deny-link "$cps" apply --root "$root" "$work/install.json" > "$work/interrupted" 2>&1; then exit 1; fi
 test -f "$root/bin/helper"
 test ! -e "$root/bin/helper-link"
 test "$("$bb" stat -c '%a' "$root/bin/helper")" = 6755
-"$cps" transaction status --root "$root"
+"$cps" status --root "$root"
 "$bb" mv "$repo" /repository-offline
-"$cps" transaction resume --root "$root"
+"$cps" resume --root "$root"
 "$cps" verify --root "$root" --pristine
 test "$root/bin/helper" -ef "$root/bin/helper-link"
 "$probe" launch "$root/bin/helper-link" 0 0
@@ -60,21 +60,19 @@ chmod 0755 "$root/bin/helper"
 chmod 0777 "$root/tmp" "$root/srv/shared"
 if "$cps" verify --root "$root" > "$work/drift" 2>&1; then exit 1; fi
 "$bb" mv /repository-offline "$repo"
-"$cps" plan --root "$root" --output "$work/repair.json" repair
-"$cps" apply --root "$root" "$work/repair.json"
+"$cps" repair --root "$root" -y
 "$cps" verify --root "$root" --pristine
 test "$root/bin/helper" -ef "$root/bin/helper-link"
 test "$("$bb" stat -c '%a' "$root/tmp")" = 1777
 test "$("$bb" stat -c '%a' "$root/srv/shared")" = 2777
 "$probe" launch "$root/bin/helper-link" 0 0
-"$cps" plan --root "$root" --output "$work/clone.json" install test/modes@1.0.0-0
+"$cps" install --root "$root" -n --save-plan "$work/clone.json" test/modes@1.0.0-0
 cp -a --reflink=auto -- "$root" "$work/clone"
 "$cps" apply --root "$work/clone" "$work/clone.json"
 "$cps" verify --root "$work/clone" --pristine
 "$probe" launch "$work/clone/bin/helper-link" 0 0
 for version in 2 3 4; do
-    "$cps" plan --root "$root" --output "$work/update.json" install "test/modes@$version.0.0-0"
-    "$cps" apply --root "$root" "$work/update.json"
+    "$cps" install --root "$root" -y "test/modes@$version.0.0-0"
     "$cps" verify --root "$root" --pristine
     test "$root/bin/helper" -ef "$root/bin/helper-link"
     case "$version" in

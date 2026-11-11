@@ -13,11 +13,10 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$output"
 
 original="$work/original"
-"$cps" image-create --root "$original" --repo "$runtime/runtime-seed" \
-    --publisher canopa-runtime-seed --trust-root "$runtime/runtime-seed.trust.json"
-"$cps" plan --root "$original" --output "$work/original.json" install \
+"$cps" image create --root "$original" --repo "$runtime/runtime-seed" \
+    --trust-root "$runtime/runtime-seed.trust.json"
+"$cps" install --root "$original" -y \
     cps://canopa-runtime-seed/system/elf-runtime
-"$cps" apply --root "$original" "$work/original.json"
 "$cps" verify --root "$original" --pristine
 
 openssl genpkey -algorithm ED25519 -outform DER -out "$work/release.der"
@@ -34,11 +33,10 @@ for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.
     install -Dm755 "$original/$path" "$work/proto/usr/lib/${path##*/}"
 done
 for package in filesystem elf-runtime; do
-    "$cps" publish --repo repo --proto "$work/proto" --signing-key "$work/release.der" "$package.kdl"
+    "$cps" publish manifests --repo repo --proto "$work/proto" --key "$work/release.der" "$package.kdl"
 done
-"$cps" image-create --root image --repo repo --publisher canopa-usr-base --trust-root release.trust.json
-"$cps" plan --root image --output install.json install cps://canopa-usr-base/system/elf-runtime@1.0.0-1
-"$cps" apply --root image install.json
+"$cps" image create --root image --repo repo --trust-root release.trust.json
+"$cps" install --root image -y cps://canopa-usr-base/system/elf-runtime@1.0.0-1
 "$cps" verify --root image --pristine
 test "$(readlink image/lib64)" = usr/lib
 cmp "$original/lib64/ld-linux-x86-64.so.2" image/usr/lib/ld-linux-x86-64.so.2

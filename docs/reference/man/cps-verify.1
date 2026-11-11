@@ -4,10 +4,11 @@
 \&cps\-verify \- \&Check an image against its installed manifests, offline
 .SH SYNOPSIS
 .HP 4
-.B \&cps verify [OPTIONS] \-\-root <ROOT>
+.B \&cps verify [OPTIONS]
 .SH OPTIONS
-.PP
-.B \&\-\-root <ROOT>
+.TP
+.B \&\-\-root <IMAGE>
+\&Image root (default: the running system) [default: /]
 .TP
 .B \&\-\-pristine
 \&Require an inactive root with pristine package paths and no unmanaged entries
@@ -23,8 +24,9 @@
 .TP
 .B \&\-\-runtime
 \&Audit the installed managed ELF interpreter and shared\-library closure
-.PP
+.TP
 .B \&\-\-library\-dir <PATH>
+\&Extra library directory for \-\-runtime
 .TP
 .B \&\-h, \-\-help
 \&Print help

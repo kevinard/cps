@@ -23,7 +23,7 @@ root itself, and mount shared data from other subvolumes or filesystems.
   mounted top level. CPS keeps the image state and managed paths in that
   subvolume. Create the `/var` subvolume beside it, as described in
   [Share /var between boot environments](btrfs.md#share-var-between-boot-environments),
-  and add its line to the root's `/etc/fstab`. `image-create` makes `var`
+  and add its line to the root's `/etc/fstab`. `image create` makes `var`
   the empty mount point, or accepts the new, empty `/var` subvolume already
   mounted there. The packages' tmpfiles.d declarations populate it on the
   first boot.
@@ -36,15 +36,13 @@ and capabilities declared in the base manifests. Set `root` to the absolute
 path of the target directory or subvolume.
 
 ```sh
-cps image-create --root "$root" --config image.kdl
-cps plan --root "$root" --output base.json install-profile
-cps fetch --root "$root" --plan base.json
-cps apply --root "$root" base.json
+cps image create --root "$root" --config image.kdl
+cps install --root "$root" -y --profile
 cps verify --root "$root" --pristine
 ```
 
 If you assemble the base directly from a local repository, use
-`plan install PACKAGE...` with the set of packages that supplies your
+`cps install --root "$root" PACKAGE...` with the set of packages that supplies your
 bootable system. For a managed kernel, include the package that provides
 the kernel actions, and a package with an
 [initramfs trigger](../maintainer/triggers.md#generate-an-initramfs) if the

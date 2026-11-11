@@ -59,7 +59,7 @@ if [[ -n $kernel_fixture ]]; then
     kernel_name=${kernel_name#cps://canopa-kernel/}
     trial_release=$(cat "$kernel_fixture/kernel-release")
     grep -Fx 'CONFIG_BTRFS_FS=y' "$kernel_fixture/image/usr/lib/modules/$trial_release/config"
-    "$cps" repo attestation --repo "$kernel_fixture/repo" --publisher canopa-kernel \
+    "$cps" repo attestation --repo "$kernel_fixture/repo" \
         --trust-root "$kernel_fixture/release.trust.json" "$kernel_package" >/dev/null
     test "$trial_release" != "${CPS_VM_KERNEL_RELEASE:-$(uname -r)}"
 fi
@@ -85,7 +85,7 @@ publish() {
         printf '    require "%s" version="=%s"\n}\n' "$kernel_name" "${kernel_package##*@}" >> linked.kdl
         mv linked.kdl manifest.kdl
     fi
-    "$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
+    "$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl
 }
 base_packages=(test/live-root)
 if [[ $git_installs == 1 ]]; then
@@ -93,15 +93,14 @@ if [[ $git_installs == 1 ]]; then
         "$work/git-build" "$work/private.der"
     "$cps" manifest generate --proto git-build --publisher test --version 1.0.0-0 \
         --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
-    "$cps" publish --repo repo --proto git-build --signing-key private.der git-build.kdl
+    "$cps" publish manifests --repo repo --proto git-build --key private.der git-build.kdl
     base_packages+=(system/git-build)
 fi
 publish 1.0.0-0
 mkdir files
 root="$work/files/@"
-"$cps" image-create --root "$root" --repo "$work/repo" --publisher test --trust-root public.trust.json
-"$cps" plan --root "$root" --output install.json install "${base_packages[@]}"
-"$cps" apply --root "$root" install.json
+"$cps" image create --root "$root" --repo "$work/repo" --trust-root public.trust.json
+"$cps" install --root "$root" -y "${base_packages[@]}"
 if [[ -n $kernel_fixture ]]; then
     cat > kernel-builders.kdl <<POLICY
 schema-version 1 kind="build-trust"
@@ -126,11 +125,11 @@ UNIT
         chmod 755 app/usr/bin/cps-demo service/usr/bin/cps-demo-service
         "$cps" manifest generate --proto service --publisher test --version "$version" \
             --uid "$(id -u)" --gid "$(id -g)" test/cps-demo-service > service.kdl
-        "$cps" publish --repo repo --proto service --signing-key private.der service.kdl
+        "$cps" publish manifests --repo repo --proto service --key private.der service.kdl
         "$cps" manifest generate --proto app --publisher test --version "$version" \
             --uid "$(id -u)" --gid "$(id -g)" test/cps-demo > app.kdl
         sed -i '$i\    require "test/cps-demo-service" version="='"$version"'"' app.kdl
-        "$cps" publish --repo repo --proto app --signing-key private.der app.kdl
+        "$cps" publish manifests --repo repo --proto app --key private.der app.kdl
         cp repo/current "catalog-$version"
     done
 fi
@@ -342,20 +341,20 @@ if [ "$version" = "$trial_version" ]; then
         echo 'CPS_VM_BTRFS_BOOT: trial blessed'
     else
         echo 'CPS_VM_BTRFS_BOOT: trial default after reboot'
-        cps boot-env list --esp /efi
+        cps boot list --esp /efi
         before=$(sha256sum /efi/loader/loader.conf)
-        if cps boot-env rollback --esp /efi > /run/rejected 2>&1; then exit 1; fi
-        $bb grep -F -e '--btrfs-volume <BTRFS_VOLUME>' /run/rejected
+        if cps boot rollback --esp /efi > /run/rejected 2>&1; then exit 1; fi
+        $bb grep -F 'reading /etc/cps/image.kdl' /run/rejected
         test "$(sha256sum /efi/loader/loader.conf)" = "$before"
         parent=$($bb cat /volume/@captures/base-id)
         entry="/efi/loader/entries/$parent.conf"
         $bb cp "$entry" /run/base-entry
         $bb sed 's/^# cps-btrfs-uuid .*/# cps-btrfs-uuid 11111111-1111-4111-8111-111111111111/' /run/base-entry > "$entry"
-        if cps boot-env rollback --esp /efi --btrfs-volume /volume > /run/rejected 2>&1; then exit 1; fi
+        if cps boot rollback --esp /efi --btrfs-volume /volume > /run/rejected 2>&1; then exit 1; fi
         $bb grep -F 'Btrfs subvolume identity differs' /run/rejected
         test "$(sha256sum /efi/loader/loader.conf)" = "$before"
         $bb cat /run/base-entry > "$entry"
-        cps boot-env rollback --esp /efi --btrfs-volume /volume
+        cps boot rollback --esp /efi --btrfs-volume /volume
     fi
     $bb sync
     exec $bb reboot -f
@@ -373,7 +372,7 @@ if [ -f /etc/cps-btrfs-destroy-failed ]; then
         test -f "$entry" || continue
         id=${entry##*/}
         id=${id%%+*}
-        cps boot-env destroy-btrfs --esp /efi --btrfs-volume /volume "$id"
+        cps boot destroy --esp /efi --btrfs-volume /volume "$id"
         test ! -e "/efi/EFI/cps/$id"
         found=true
     done
@@ -406,18 +405,18 @@ CONFIG
     test -n "$failed"
     boot_state() { find /efi/loader /efi/EFI/cps -type f -exec sha256sum '{}' +; }
     before=$(boot_state)
-    cps boot-env prune --config "$config" --dry-run > /run/prune
+    cps boot prune --config "$config" -n > /run/prune
     $bb grep -Fx "Would remove failed trial $failed" /run/prune
     test "$(boot_state)" = "$before"
     test -d /volume/@captures/trial/root
-    cps boot-env discard-trial --config "$config" > /run/discard
+    cps boot discard-trial --config "$config" > /run/discard
     $bb cat /run/discard
     $bb grep -Fx "Removed failed trial $failed" /run/discard
     test ! -e "/efi/EFI/cps/$failed"
     test -z "$(find /efi/loader/entries -name "$failed*")"
     test ! -e /volume/@captures/trial/root
-    test "$(cps boot-env prune --config "$config")" = 'Nothing to prune'
-    test "$(cps boot-env discard-trial --config "$config")" = 'No pending or failed trial'
+    test "$(cps boot prune --config "$config")" = 'Nothing to prune'
+    test "$(cps boot discard-trial --config "$config")" = 'No pending or failed trial'
     cps verify --root /
     echo 'CPS_VM_BTRFS_DISCARD: failed trial discarded, nothing left to prune'
 fi
@@ -453,7 +452,7 @@ if [ -f /etc/cps-btrfs-trial-kernel ]; then
 else
     cps publisher set-repository --root / --repo test=/repository
 fi
-cps plan --root / --output /captures/upgrade.json update
+cps upgrade --root / -n --save-plan /captures/upgrade.json
 printf 'captured local state\n' > /etc/cps-capture-local
 state_dir=usr/lib/sysimage/cps
 if [ -d /.cps ]; then state_dir=.cps; fi
@@ -461,7 +460,7 @@ before=$(sha256sum "/$state_dir/state.sqlite")
 reject() {
     expected=$1
     shift
-    if cps boot-env capture "$@" > /tmp/rejected 2>&1; then
+    if cps boot capture "$@" > /tmp/rejected 2>&1; then
         echo 'Capture unexpectedly succeeded'
         exit 1
     fi
@@ -486,7 +485,7 @@ $bb mkdir -p /var/lib
 btrfs subvolume create /var/lib/machines
 echo 'machine image' > /var/lib/machines/image
 $bb chmod 0710 /var/lib/machines
-cps boot-env capture --source / --output /captures/excluded --exclude-subvolume /nested
+cps boot capture --source / --output /captures/excluded --exclude-subvolume /nested
 for path in var/lib/machines nested; do
     test -d "/captures/excluded/root/$path"
     test -z "$($bb ls -A "/captures/excluded/root/$path")"
@@ -506,9 +505,9 @@ reject 'image verification failed' --source / --output /captures/corrupt
 test ! -e /captures/corrupt
 $bb cat /tmp/version > /etc/cps-capture-version
 test -z "$(find /captures -maxdepth 1 -name '.cps-capture-*')"
-cps boot-env capture --source / --output /captures/race > /tmp/first 2>&1 &
+cps boot capture --source / --output /captures/race > /tmp/first 2>&1 &
 first=$!
-cps boot-env capture --source / --output /captures/race > /tmp/second 2>&1 &
+cps boot capture --source / --output /captures/race > /tmp/second 2>&1 &
 second=$!
 successes=0
 if wait "$first"; then successes=$((successes + 1)); fi
@@ -517,7 +516,7 @@ test "$successes" = 1
 test -z "$(find /captures -maxdepth 1 -name '.cps-capture-*')"
 btrfs subvolume delete /captures/race/root
 $bb rmdir /captures/race
-result=$(cps boot-env capture --source / --output /captures/base)
+result=$(cps boot capture --source / --output /captures/base)
 echo "$result"
 btrfs property get /captures/base/root ro | $bb grep -Fx 'ro=true'
 cmp "/$state_dir/state.sqlite" "/captures/base/root/$state_dir/state.sqlite"
@@ -527,20 +526,20 @@ printf 'running local state\n' > /etc/cps-capture-local
 test "$($bb cat /captures/base/root/etc/cps-capture-local)" = 'captured local state'
 cps verify --root /captures/base/root
 btrfs subvolume snapshot /captures/base/root /captures/writable
-if cps boot-env stage-btrfs --source /captures/writable --output /captures/rejected /captures/upgrade.json > /tmp/rejected 2>&1; then exit 1; fi
+if cps boot stage --source /captures/writable --output /captures/rejected /captures/upgrade.json > /tmp/rejected 2>&1; then exit 1; fi
 $bb grep -F 'requires a read-only baseline' /tmp/rejected
 btrfs subvolume delete /captures/writable
 blob=$(printf '2.0.0-0\n' | sha256sum)
 blob=${blob%% *}
 $bb mv "/repository/blobs/$blob" /tmp/payload
-if cps boot-env stage-btrfs --source /captures/base/root --output /captures/rejected /captures/upgrade.json > /tmp/rejected 2>&1; then exit 1; fi
+if cps boot stage --source /captures/base/root --output /captures/rejected /captures/upgrade.json > /tmp/rejected 2>&1; then exit 1; fi
 $bb grep -F 'opening repository payload' /tmp/rejected
 test ! -e /captures/rejected
 test -z "$(find /captures -maxdepth 1 -name '.cps-capture-*')"
 $bb mv /tmp/payload "/repository/blobs/$blob"
-cps boot-env stage-btrfs --source /captures/base/root --output /captures/trial /captures/upgrade.json > /tmp/first 2>&1 &
+cps boot stage --source /captures/base/root --output /captures/trial /captures/upgrade.json > /tmp/first 2>&1 &
 first=$!
-cps boot-env stage-btrfs --source /captures/base/root --output /captures/trial /captures/upgrade.json > /tmp/second 2>&1 &
+cps boot stage --source /captures/base/root --output /captures/trial /captures/upgrade.json > /tmp/second 2>&1 &
 second=$!
 successes=0
 if wait "$first"; then successes=$((successes + 1)); fi
@@ -552,16 +551,13 @@ btrfs property get "$stage" ro | $bb grep -Fx 'ro=false'
 test "$($bb stat -c %i "$stage")" = 256
 test "$($bb cat "$stage/etc/cps-capture-version")" = 2.0.0-0
 if [ -f /etc/cps-btrfs-staged-transactions ]; then
-    cps plan --root "$stage" --output /tmp/review-freeze.json freeze --reason 'Review staged desktop' test/live-root
-    cps apply --root "$stage" /tmp/review-freeze.json
+    cps freeze --root "$stage" -y --reason 'Review staged desktop' test/live-root
     $bb cat /repository/review-catalog > /repository/current
-    cps plan --root "$stage" --output /tmp/held.json update
-    cps plan --root "$stage" --output /tmp/unfreeze.json unfreeze test/live-root
-    cps apply --root "$stage" /tmp/unfreeze.json
+    cps upgrade --root "$stage" -n --save-plan /tmp/held.json
+    cps unfreeze --root "$stage" -y test/live-root
     if cps apply --root "$stage" /tmp/held.json > /tmp/rejected 2>&1; then exit 1; fi
     $bb grep -F 'stale plan' /tmp/rejected
-    cps plan --root "$stage" --output /tmp/review-upgrade.json update
-    cps apply --root "$stage" /tmp/review-upgrade.json
+    cps upgrade --root "$stage" -y
     test "$($bb cat "$stage/etc/cps-capture-version")" = 3.0.0-0
     echo 'CPS_VM_STAGED_TRANSACTIONS: unfroze and upgraded the private Btrfs root'
 fi
@@ -589,7 +585,7 @@ echo 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the runnin
 if [ -f /etc/cps-btrfs-boot ]; then
     boot_options='console=ttyS0 loglevel=3 init=/init-systemd'
     if [ -x /usr/local/libexec/cps-system-workflow ]; then boot_options="rw $boot_options"; fi
-    base=$(cps boot-env activate-btrfs --known-good --root /volume/@ --btrfs-volume /volume \
+    base=$(cps boot activate --known-good --root /volume/@ --btrfs-volume /volume \
         --esp /efi --root-partuuid "$root_uuid" --options "$boot_options")
     base=${base#Activated }
     echo "$base" > /captures/base-id
@@ -598,30 +594,30 @@ if [ -f /etc/cps-btrfs-boot ]; then
         $bb sync
         exit 0
     fi
-    cps boot-env capture --source / --output /captures/protected
-    cps boot-env stage-btrfs --source /captures/protected/root --output /captures/protected-trial /captures/upgrade.json
+    cps boot capture --source / --output /captures/protected
+    cps boot stage --source /captures/protected/root --output /captures/protected-trial /captures/upgrade.json
     test "$($bb cat /captures/protected-trial/root/etc/cps-capture-version)" = 2.0.0-0
     btrfs subvolume delete /captures/protected-trial/root /captures/protected/root
     $bb rmdir /captures/protected-trial /captures/protected
     before=$(sha256sum /efi/loader/loader.conf)
-    entries_before=$(cps boot-env list --esp /efi)
+    entries_before=$(cps boot list --esp /efi)
     if $bb dd if=/dev/zero of=/efi/cps-space-test bs=1M > /tmp/full 2>&1; then exit 1; fi
     $bb grep -F 'No space left on device' /tmp/full
     $bb sync
-    if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume \
+    if cps boot activate --root /volume/@captures/trial/root --btrfs-volume /volume \
         --esp /efi --root-partuuid "$root_uuid" --options "$boot_options" > /tmp/full 2>&1; then exit 1; fi
     $bb grep -F 'insufficient free space on the EFI system partition' /tmp/full
-    $bb grep -F 'cps boot-env prune' /tmp/full
+    $bb grep -F 'cps boot prune' /tmp/full
     test "$(sha256sum /efi/loader/loader.conf)" = "$before"
-    test "$(cps boot-env list --esp /efi)" = "$entries_before"
+    test "$(cps boot list --esp /efi)" = "$entries_before"
     $bb rm /efi/cps-space-test
     $bb sync
     echo 'CPS_VM_BTRFS_BOOT: full ESP left the known-good entry selected'
-    if cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume/@ \
+    if cps boot activate --root /volume/@captures/trial/root --btrfs-volume /volume/@ \
         --esp /efi --root-partuuid "$root_uuid" > /tmp/rejected 2>&1; then exit 1; fi
     $bb grep -F 'top-level subvolume' /tmp/rejected
     test "$(sha256sum /efi/loader/loader.conf)" = "$before"
-    cps plan --root /volume/@captures/trial/root --output /tmp/mark.json mark explicit test/live-root
+    cps mark --root /volume/@captures/trial/root -n --save-plan /tmp/mark.json explicit test/live-root
     staged_state=$(sha256sum "/volume/@captures/trial/root/$state_dir/state.sqlite")
     $bb mkfifo /tmp/release
     flock --shared "/volume/@captures/trial/root/$state_dir/lock" sh -c ': > /tmp/locked; read released < /tmp/release' &
@@ -635,7 +631,7 @@ if [ -f /etc/cps-btrfs-boot ]; then
         test "$attempts" -lt 1000
         $bb sleep 0.01
     done
-    cps boot-env activate-btrfs --root /volume/@captures/trial/root --btrfs-volume /volume \
+    cps boot activate --root /volume/@captures/trial/root --btrfs-volume /volume \
         --esp /efi --root-partuuid "$root_uuid" --options 'console=ttyS0 loglevel=3 init=/init-systemd'
     echo released > /tmp/release
     wait "$holding"
@@ -648,7 +644,7 @@ if [ -f /etc/cps-btrfs-boot ]; then
     test "${base_state%% *}" != "${staged_state%% *}"
     printf '%s\n' "${base_state%% *}" > /captures/rollback-base.sha256
     printf '%s\n' "${staged_state%% *}" > /captures/rollback-trial.sha256
-    cps boot-env list --esp /efi
+    cps boot list --esp /efi
     echo 'CPS_VM_BTRFS_BOOT: retried trial activation after freeing ESP space'
     umount /efi
     umount /volume

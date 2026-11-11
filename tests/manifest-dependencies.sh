@@ -54,8 +54,8 @@ publish_package() {
     local publisher=$1 version=$2 name=$3
     "$cps" manifest generate --proto "$publisher" --publisher "$publisher" \
         --version "$version" "$name" > "$publisher.kdl"
-    "$cps" publish --repo "$publisher-repo" --proto "$publisher" \
-        --signing-key "$publisher.der" "$publisher.kdl" >/dev/null
+    "$cps" publish manifests --repo "$publisher-repo" --proto "$publisher" \
+        --key "$publisher.der" "$publisher.kdl" >/dev/null
 }
 publish_package runtime 1.0.0-0 demo/runtime
 runtime_pin=$(cat runtime-repo/current)
@@ -68,7 +68,7 @@ provides "$library/CPS_DEMO_1.0"
 GENERATED
 grep -rlF "provides \"$library/CPS_DEMO_1.0\"" runtime-repo/manifests > /dev/null
 if sed '/^package .* {$/a\    provides "cap/elf/x86_64/libcps-demo.so.1"' runtime.kdl > authored.kdl &&
-    "$cps" publish --repo runtime-repo --proto runtime --signing-key runtime.der authored.kdl 2> authored.log; then
+    "$cps" publish manifests --repo runtime-repo --proto runtime --key runtime.der authored.kdl 2> authored.log; then
     echo 'publication accepted an authored ELF capability' >&2
     exit 1
 fi

@@ -10,13 +10,16 @@
 .B \&<TERM>
 .SH OPTIONS
 .TP
-.B \&\-\-root <ROOT>
-\&[default: /]
-.PP
+.B \&\-\-root <IMAGE>
+\&Image root (default: the running system) [default: /]
+.TP
 .B \&\-\-installed
+\&Search installed packages instead of the signed catalogs
 .TP
 .B \&\-\-file
 \&Match an exact path or basename in the signed catalogs
+.PP
+.B \&\-\-json
 .TP
 .B \&\-h, \-\-help
 \&Print help

@@ -40,19 +40,16 @@ publisher "canopa" {
 }
 CONFIG
 
-"$cps" publish --repo repo --proto proto --signing-key private.der hello.kdl
-"$cps" image-create --root image --config image.kdl
-"$cps" plan --root image --output install.json install demo/hello
-"$cps" fetch --root image --plan install.json
-"$cps" validate --root image install.json
-"$cps" apply --root image install.json
+"$cps" publish manifests --repo repo --proto proto --key private.der hello.kdl
+"$cps" image create --root image --config image.kdl
+"$cps" install --root image -y demo/hello
 "$cps" verify --root image --pristine
 cat image/usr/share/cps-demo/hello
 ```
 
 You should see `Hello from Canopa`. The temporary directory holds the
 prototype tree, a throwaway signing key, the signed repository with its trust
-root, the saved plan, and the installed image.
+root, and the installed image.
 
 - `repo trust init` creates version 1 of the publisher's
   [trust root](concepts.md#publishers-catalogs-and-trust) in
@@ -60,12 +57,15 @@ root, the saved plan, and the installed image.
   only catalog key. The image configuration pins that file. A production
   publisher keeps its root keys offline and separate from its catalog keys, as
   described in [Publisher trust root](publisher/publishing.md#publisher-trust-root).
-- `publish` reads the file contents from `proto`, stores the payload, and
-  signs a new catalog that lists `demo/hello`.
-- `plan`, `fetch`, `validate`, and `apply` are the steps of every
-  [transaction](concepts.md#images-and-transactions): resolve and save the
-  change, download and verify its payloads, check the plan against them, and
-  write the files and commit the new image revision.
+- `publish manifests` reads the file contents from `proto`, stores the
+  payload, and signs a new catalog that lists `demo/hello`.
+- `install --root image` runs every step of a
+  [transaction](concepts.md#images-and-transactions): it resolves the change,
+  downloads and verifies its payloads, writes the files, and commits the new
+  image revision. `-y` confirms the displayed change without a prompt. To
+  review a change before it is applied, save the plan with
+  `-n --save-plan`, as described in
+  [Inactive images](client/images.md#save-review-and-apply-a-plan).
 - `verify --pristine` checks every installed file against its manifest and
   confirms that the image holds nothing unmanaged.
 

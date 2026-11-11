@@ -23,7 +23,8 @@ pub enum Scope {
     AllAvailableVersions,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     Explicit,
     Dependency,
@@ -40,7 +41,7 @@ impl fmt::Display for Status {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct PackageRow {
     pub id: String,
     pub name: String,
@@ -163,7 +164,7 @@ impl fmt::Display for ProfileRole {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct PackageIntentRow {
     pub id: String,
     pub requested: bool,
@@ -746,7 +747,7 @@ fn verify_installed_metadata(image: &Image) -> Result<()> {
     image.verify_catalog_archives(&state)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct FileMatch {
     pub package: String,
     pub path: String,

@@ -24,7 +24,7 @@ guides use. If CPS already manages your machine, go directly to the
 ## [Clients](client/README.md)
 
 - [Install, upgrade, and recover a running system](client/system.md)
-- [Plan, apply, resume, and abort changes to an inactive image](client/images.md)
+- [Change an inactive image and resume or abort a change](client/images.md)
 - [Find packages, inspect ownership, and explain dependencies](client/queries.md)
 - [Manage freezes, facets, variants, configuration updates, and mediators](client/configuration.md)
 - [Configure publishers, trust roots, and refresh policy](client/publishers.md)

@@ -11,11 +11,11 @@ if [ -f "$captures/destroy-phase" ]; then phase=$($bb cat "$captures/destroy-pha
 
 if [ -z "$phase" ]; then
     echo "$current" > "$captures/retained-id"
-    cps plan --root / --output "$captures/cleanup-plan.json" mark explicit test/live-root
-    cps boot-env capture --source / --output "$captures/cleanup-base"
-    cps boot-env stage-btrfs --source "$captures/cleanup-base/root" \
+    cps mark --root / -n --save-plan "$captures/cleanup-plan.json" explicit test/live-root
+    cps boot capture --source / --output "$captures/cleanup-base"
+    cps boot stage --source "$captures/cleanup-base/root" \
         --output "$captures/cleanup-trial" "$captures/cleanup-plan.json"
-    next=$(cps boot-env activate-btrfs --root "$captures/cleanup-trial/root" \
+    next=$(cps boot activate --root "$captures/cleanup-trial/root" \
         --btrfs-volume /volume --esp /efi --root-partuuid "$root_uuid" \
         --options 'console=ttyS0 loglevel=3 init=/init-systemd')
     next=${next#Activated }
@@ -47,19 +47,19 @@ reject() {
     expected=$1
     id=$2
     before=$(boot_state)
-    if cps boot-env destroy-btrfs --esp /efi --btrfs-volume /volume "$id" > /run/rejected 2>&1; then exit 1; fi
+    if cps boot destroy --esp /efi --btrfs-volume /volume "$id" > /run/rejected 2>&1; then exit 1; fi
     if ! $bb grep -F "$expected" /run/rejected; then $bb cat /run/rejected; exit 1; fi
     test "$(boot_state)" = "$before"
 }
 reject 'selected boot environment' "$current"
-cps boot-env rollback --esp /efi --btrfs-volume /volume "$current"
+cps boot rollback --esp /efi --btrfs-volume /volume "$current"
 reject "selected environment's fallback" "$retained"
-cps boot-env rollback --esp /efi --btrfs-volume /volume "$retained"
+cps boot rollback --esp /efi --btrfs-volume /volume "$retained"
 reject 'inactive image root' "$current"
-cps boot-env rollback --esp /efi --btrfs-volume /volume "$current"
-cps boot-env rollback --esp /efi --btrfs-volume /volume "$base"
+cps boot rollback --esp /efi --btrfs-volume /volume "$current"
+cps boot rollback --esp /efi --btrfs-volume /volume "$base"
 reject "running environment's fallback" "$retained"
-cps boot-env rollback --esp /efi --btrfs-volume /volume "$current"
+cps boot rollback --esp /efi --btrfs-volume /volume "$current"
 
 old_mount="/run/old root$($bb printf '\377')"
 $bb mkdir "$old_mount"
@@ -92,32 +92,32 @@ echo released > /run/release-destroy
 wait "$holding"
 
 before=$(boot_state)
-cps boot-env destroy-btrfs --esp /efi --btrfs-volume /volume --dry-run "$base"
+cps boot destroy --esp /efi --btrfs-volume /volume -n "$base"
 test "$(boot_state)" = "$before"
 kept=$(sha256sum "/efi/EFI/cps/$current/vmlinuz.efi" "/efi/EFI/cps/$retained/vmlinuz.efi" /efi/EFI/BOOT/BOOTX64.EFI /efi/loader/loader.conf)
 # mkfs made @ the filesystem default. The kernel refuses its destruction,
 # after CPS has durably retired its boot entry. Resume after moving that default.
-if cps boot-env destroy-btrfs --esp /efi --btrfs-volume /volume "$base" > /run/interrupted 2>&1; then exit 1; fi
+if cps boot destroy --esp /efi --btrfs-volume /volume "$base" > /run/interrupted 2>&1; then exit 1; fi
 $bb grep -F 'deleting the registered Btrfs subvolume by ID' /run/interrupted
 test -d /volume/@
 test ! -e "$entry"
 test -f "/efi/loader/entries/$base.cps-destroy"
-cps boot-env list --esp /efi > /run/retiring
+cps boot list --esp /efi > /run/retiring
 $bb grep "retiring.*$base" /run/retiring
-if cps boot-env activate-btrfs --known-good --root /volume/@ --btrfs-volume /volume \
+if cps boot activate --known-good --root /volume/@ --btrfs-volume /volume \
     --esp /efi --root-partuuid "$root_uuid" > /run/rejected 2>&1; then exit 1; fi
 $bb grep -F 'is retiring' /run/rejected
 btrfs subvolume set-default 5 /volume
-if /usr/local/libexec/cps-vm-deny-unlink cps boot-env destroy-btrfs \
+if /usr/local/libexec/cps-vm-deny-unlink cps boot destroy \
     --esp /efi --btrfs-volume /volume "$base" > /run/cleanup-interrupted 2>&1; then exit 1; fi
 $bb cat /run/cleanup-interrupted
 $bb grep -F 'Input/output error' /run/cleanup-interrupted
 test ! -e /volume/@
 test -f "/efi/loader/entries/$base.cps-destroy"
 test -f "/efi/EFI/cps/$base/vmlinuz.efi"
-cps boot-env list --esp /efi > /run/retiring
+cps boot list --esp /efi > /run/retiring
 $bb grep "retiring.*$base" /run/retiring
-cps boot-env destroy-btrfs --esp /efi --btrfs-volume /volume "$base"
+cps boot destroy --esp /efi --btrfs-volume /volume "$base"
 test ! -e /volume/@
 test ! -e "/efi/loader/entries/$base.cps-destroy"
 test ! -e "/efi/EFI/cps/$base"
@@ -127,6 +127,6 @@ cps verify --root "$captures/trial/root"
 cps verify --root /
 echo 'CPS_VM_BTRFS_DESTROY: retired old root and artifacts after retry'
 echo done > "$captures/destroy-phase"
-cps boot-env rollback --esp /efi --btrfs-volume /volume
+cps boot rollback --esp /efi --btrfs-volume /volume
 $bb sync
 exec $bb reboot -f

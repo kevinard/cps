@@ -150,12 +150,12 @@ outputs were removed.
 
 ## Reruns, resume, and abort
 
-A trigger that fails leaves the transaction pending. `transaction resume`,
-or `resume` on a live system, runs the remaining triggers. CPS journals each
+A trigger that fails leaves the transaction pending. `cps resume`, with
+`--root` for an inactive image, runs the remaining triggers. CPS journals each
 finished trigger, and a trigger interrupted before CPS journaled its success
 runs again.
 
-`transaction abort` regenerates outputs too. After it restores the files,
+`cps abort` regenerates outputs too. After it restores the files,
 CPS plans the triggers of the change from the pending packages back to the
 committed ones and runs them with the same rules:
 
@@ -167,7 +167,7 @@ committed ones and runs them with the same rules:
 
 The abort journals each finished trigger as well, so an abort that a
 failing or interrupted handler stops runs only the remaining triggers when
-`transaction abort` or `transaction resume` finishes it. If one of these
+`abort` or `resume` finishes it. If one of these
 triggers regenerates the initramfs of the committed kernel, the abort also
 prepares that kernel again. See
 [abort a transaction](../client/images.md#abort-a-transaction).
@@ -267,7 +267,7 @@ kernel. Kernel packages then omit `initrd=#true` and do not ship the file.
 A kernel package that ships its own initrd conflicts with the generator, so
 an image uses one or the other. When the trigger runs, CPS prepares the
 selected kernel again with the new initramfs and records its digest with the
-prepared artifacts, and `boot-env activate-btrfs` checks it like a packaged one.
+prepared artifacts, and `boot activate` checks it like a packaged one.
 Because the output is under `usr/lib/modules`, changes that run this trigger
 are staged.
 

@@ -7,9 +7,19 @@
 .B \&cps <COMMAND>
 .SH DESCRIPTION
 CPS manages Linux images using signed package catalogs.
-Use the system commands on a registered CPS Btrfs root.
-For an inactive image, save a plan, fetch and validate its payloads,
-and apply the plan to the image.
+The commands that change packages act on the running system,
+a registered CPS Btrfs root described by
+.IR /etc/cps/image.kdl .
+With
+.B \&\-\-root
+they act on an inactive image instead: they plan the change,
+fetch its payloads, and apply it.
+With
+.B \&\-\-dry\-run \-\-save\-plan
+they save the plan for
+.BR cps-fetch (1)
+and
+.BR cps-apply (1).
 .PP
 A package selector can be a name, a name with an exact version,
 or a publisher-qualified name such as
@@ -18,91 +28,64 @@ Supported selectors depend on the command.
 .SH COMMANDS
 .TP
 .B \&cps\-install(1)
-\&Install packages on the running system
-.TP
-.B \&cps\-upgrade(1)
-\&Upgrade the system and stage changes that require a reboot
-.TP
-.B \&cps\-check\-updates(1)
-\&Check for upgrades and report any blockers or reboot requirement
+\&Install packages
 .TP
 .B \&cps\-remove(1)
-\&Remove installed packages and stage changes that require a reboot
+\&Remove installed packages
 .TP
 .B \&cps\-autoremove(1)
-\&Remove unused dependencies and stage changes that require a reboot
+\&Remove dependencies no longer needed by explicitly installed packages
+.TP
+.B \&cps\-upgrade(1)
+\&Upgrade the installed packages, or report available upgrades with \-\-check
 .TP
 .B \&cps\-repair(1)
-\&Restore damaged managed files on the running system
+\&Restore damaged managed files
 .TP
 .B \&cps\-revert(1)
-\&Restore vendor defaults for preserved configuration on the running system
-.TP
-.B \&cps\-status(1)
-\&Show an interrupted change or a system waiting for reboot
-.TP
-.B \&cps\-resume(1)
-\&Finish an interrupted live package transaction
-.TP
-.B \&cps\-source(1)
-\&Prepare pinned package sources for offline builds
-.TP
-.B \&cps\-build(1)
-\&Build a package with verified inputs in an offline sandbox
-.TP
-.B \&cps\-develop(1)
-\&Run a shell or command with a recipe's verified toolchain and sources
-.TP
-.B \&cps\-manifest(1)
-\&Prepare a package manifest for review
-.TP
-.B \&cps\-build\-order(1)
-\&Print recipes in dependency order for building
-.TP
-.B \&cps\-rebuild\-plan(1)
-\&List the packages and recipes to rebuild after packages change
-.TP
-.B \&cps\-recipe(1)
-\&Maintain build recipes
-.TP
-.B \&cps\-publish(1)
-\&Publish manifests and their payloads to a local repository in one signed catalog update
-.TP
-.B \&cps\-publish\-bundle(1)
-\&Publish a reproducible build bundle after verifying its worker signature and reviewed recipe
-.TP
-.B \&cps\-repo(1)
-\&Export or synchronize a signed repository release
-.TP
-.B \&cps\-image\-diff(1)
-\&Compare committed package state between two roots, offline
-.TP
-.B \&cps\-image\-lock(1)
-\&Print a portable lock for an image's committed package composition
-.TP
-.B \&cps\-image\-create(1)
-\&Initialize an empty directory as an image
-.TP
-.B \&cps\-publisher(1)
-\&Manage an image's ordered set of trusted publishers
-.TP
-.B \&cps\-config(1)
-\&Review pending changes to preserved configuration
-.TP
-.B \&cps\-facet(1)
-\&List facet rules, or show which rule decides each named facet
-.TP
-.B \&cps\-variant(1)
-\&List the image's variant values, including arch
-.TP
-.B \&cps\-mediator(1)
-\&Show preferred and active providers for mediated links
+\&Restore vendor defaults for preserved configuration files
 .TP
 .B \&cps\-freeze(1)
-\&List persistent package version freezes, offline
+\&Freeze installed or explicitly named versions until they are unfrozen
+.TP
+.B \&cps\-unfreeze(1)
+\&Lift package version freezes
+.TP
+.B \&cps\-mark(1)
+\&Change local request marks without installing or removing packages
+.TP
+.B \&cps\-facet(1)
+\&List or change facet rules
+.TP
+.B \&cps\-variant(1)
+\&List or change variants other than arch
+.TP
+.B \&cps\-mediator(1)
+\&List or select providers for mediated links
+.TP
+.B \&cps\-config(1)
+\&Review and resolve pending changes to preserved configuration
+.TP
+.B \&cps\-fetch(1)
+\&Fetch the verified payloads required by a saved plan
+.TP
+.B \&cps\-apply(1)
+\&Apply or resume a saved plan
+.TP
+.B \&cps\-status(1)
+\&Show an interrupted transaction, a pending reboot, or a saved plan's progress
+.TP
+.B \&cps\-resume(1)
+\&Finish an interrupted transaction
+.TP
+.B \&cps\-abort(1)
+\&Undo an interrupted transaction and keep the committed revision
+.TP
+.B \&cps\-history(1)
+\&List completed transactions, most recent first, or show one as JSON
 .TP
 .B \&cps\-list(1)
-\&List installed packages or versions in the configured signed catalogs
+\&List installed packages, available versions, local intent, or freezes
 .TP
 .B \&cps\-search(1)
 \&Search for packages by name, summary, or a file they ship
@@ -114,40 +97,52 @@ Supported selectors depend on the command.
 \&Show package candidates, publisher order, and image constraints
 .TP
 .B \&cps\-owner(1)
-\&Show installed package IDs that own an exact image path, offline
+\&Show installed package IDs that own an exact image path
 .TP
 .B \&cps\-contents(1)
-\&List the paths owned by an installed package, offline
+\&List the paths owned by an installed package
 .TP
 .B \&cps\-deps(1)
-\&List the installed packages that satisfy a package's direct requirements, offline
+\&List the installed packages that satisfy a package's direct requirements
 .TP
 .B \&cps\-rdeps(1)
-\&List the installed packages that directly depend on a package, offline
+\&List the installed packages that directly depend on a package
 .TP
 .B \&cps\-why(1)
-\&Explain why a package is installed, offline
-.TP
-.B \&cps\-plan(1)
-\&Preview and save a package transaction
-.TP
-.B \&cps\-fetch(1)
-\&Fetch the verified payloads required by a saved plan
-.TP
-.B \&cps\-validate(1)
-\&Validate a saved plan against cached payloads before applying it
-.TP
-.B \&cps\-apply(1)
-\&Apply or resume a saved plan
-.TP
-.B \&cps\-transaction(1)
-\&Inspect, resume, or abort an interrupted image transaction
+\&Explain why a package is installed
 .TP
 .B \&cps\-verify(1)
 \&Check an image against its installed manifests, offline
 .TP
-.B \&cps\-boot\-env(1)
+.B \&cps\-publisher(1)
+\&Manage an image's ordered set of trusted publishers
+.TP
+.B \&cps\-image(1)
+\&Create, compare, lock, and write images
+.TP
+.B \&cps\-boot(1)
 \&Stage, activate, and manage boot environments
+.TP
+.B \&cps\-source(1)
+\&Prepare pinned package sources for offline builds
+.TP
+.B \&cps\-recipe(1)
+\&Maintain build recipes and plan builds
+.TP
+.B \&cps\-manifest(1)
+\&Prepare a package manifest for review
+.TP
+.B \&cps\-build(1)
+\&Build a package with verified inputs in an offline sandbox
+.TP
+.B \&cps\-develop(1)
+\&Run a shell or command with a recipe's verified toolchain and sources
+.TP
+.B \&cps\-publish(1)
+\&Publish manifests, build bundles, or releases to a local repository
+.TP
+.B \&cps\-repo(1)
+\&Manage a publisher repository, its trust root, and its TUF mirrors
 .TP
 .B \&cps help [COMMAND ...]
 \&Show help for CPS or a specific subcommand.
@@ -169,11 +164,13 @@ Package database, transaction staging, prepared kernel files, and vendor configu
 .EX
 \&cps search editor
 \&sudo cps upgrade \-\-dry\-run
-\&cps plan \-\-root image \-\-output update.json update
-\&cps apply \-\-root image update.json
+\&cps install \-\-root image \-\-yes apps/editor
+\&cps upgrade \-\-root image \-\-dry\-run \-\-save\-plan upgrade.json
+\&cps fetch \-\-root image upgrade.json
+\&cps apply \-\-root image upgrade.json
 .EE
 .SH SEE ALSO
 .BR cps-install (1),
-.BR cps-plan (1),
+.BR cps-apply (1),
 .BR cps-repo (1),
-.BR cps-boot-env (1)
+.BR cps-boot (1)

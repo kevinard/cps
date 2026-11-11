@@ -68,7 +68,7 @@ impl std::fmt::Display for RetryBaseOnly {
 
 impl std::error::Error for RetryBaseOnly {}
 
-/// The result of `cps boot-env finalize-trial`.
+/// The result of `cps boot finalize-trial`.
 #[derive(Debug)]
 pub enum Finalized {
     /// No trial is selected to replace the running root at the next boot.
@@ -260,6 +260,12 @@ impl System {
     pub fn with_base_only(mut self, enabled: bool) -> Self {
         self.base_only = enabled;
         self
+    }
+
+    /// The configured EFI System Partition and Btrfs top-level volume.
+    pub fn boot_paths(&self) -> (&Path, &Path) {
+        let boot = self.boot();
+        (&boot.esp, &boot.volume)
     }
 
     fn boot(&self) -> &BtrfsConfig {
@@ -569,7 +575,8 @@ impl System {
                         | Request::RepairPaths { .. }
                         | Request::Revert { .. }
                 ),
-            "unsupported system package request"
+            "the running system supports only install, remove, autoremove, upgrade, repair, \
+             and revert; apply this change to an inactive image with --root"
         );
         self.check_running()?;
         let deferred = self.refresh_for_request(&request, refresh)?;
@@ -622,7 +629,7 @@ impl System {
                 )?;
                 let id = self.backup_running().context(
                     "creating the backup boot environment before the live change. Remove old \
-                     environments with `cps boot-env prune`, or set live-backup=#false in \
+                     environments with `cps boot prune`, or set live-backup=#false in \
                      boot-btrfs to change the running root without a backup",
                 )?;
                 eprintln!("Saved the running system as boot environment {id}");
@@ -746,7 +753,7 @@ impl System {
                     Err(cancel) => error.context(format!(
                         "merging /etc into trial {id} failed, and cancelling the trial also \
                          failed ({cancel:#}). The next boot starts the trial without the local \
-                         changes made since staging; cancel it with `cps boot-env \
+                         changes made since staging; cancel it with `cps boot \
                          discard-trial` to keep them"
                     )),
                 })
@@ -1153,7 +1160,7 @@ pub fn arm_finalize() {
     if let Err(error) = result {
         eprintln!(
             "Warning: could not request the /etc merge at shutdown ({FINALIZE_FLAG}: {error}). \
-             Run `cps boot-env finalize-trial --arm`, or local changes made before the reboot \
+             Run `cps boot finalize-trial --arm`, or local changes made before the reboot \
              stay out of the trial"
         );
     }

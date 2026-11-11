@@ -5,7 +5,7 @@ The generated distribution has realistic dependency fan-out: every package
 requires a handful of lower-numbered packages (so low numbers act as core
 libraries), some packages use require-any, capabilities, and recommendations,
 and every package version carries many file actions. Versions are published
-with batched `cps publish` calls, so one signed catalog update admits many
+with batched `cps publish manifests` calls, so one signed catalog update admits many
 manifests.
 
 Typical scale run with a release build:
@@ -220,8 +220,8 @@ def main():
         proto, paths = stage(version, numbers)
         started = time.perf_counter()
         for start in range(0, len(paths), options.batch):
-            run("publish", "--repo", "repo", "--proto", proto,
-                "--signing-key", "private.der", *paths[start:start + options.batch])
+            run("publish", "manifests", "--repo", "repo", "--proto", proto,
+                "--key", "private.der", *paths[start:start + options.batch])
         timings[label] = round(time.perf_counter() - started, 4)
         progress()
         shutil.rmtree(proto)
@@ -229,40 +229,40 @@ def main():
     everything = range(options.packages)
     for version in range(1, options.versions):
         publish_version(version, everything, f"publish_version_{version}")
-    run("image-create", "--root", "image", "--repo", "repo",
-        "--publisher", PUBLISHER, "--trust-root", "repo/trust/1.json")
-    run("plan", "--root", "image", "--output", "install.json",
-        "install", package_name(workload), label="plan_install")
+    run("image", "create", "--root", "image", "--repo", "repo",
+        "--trust-root", "repo/trust/1.json")
+    run("install", "--root", "image", "-n", "--save-plan", "install.json",
+        package_name(workload), label="plan_install")
     run("apply", "--root", "image", "install.json", label="apply_install")
     publish_version(options.versions, everything, f"publish_version_{options.versions}")
-    run("plan", "--root", "image", "--output", "upgrade.json",
-        "update", label="plan_upgrade")
+    run("upgrade", "--root", "image", "-n", "--save-plan", "upgrade.json",
+        label="plan_upgrade")
     run("apply", "--root", "image", "upgrade.json", label="apply_upgrade")
 
     # Publishing one more package into the large catalog should cost what the
     # change costs, not what the catalog costs.
     model.append(("    require \"bench/pkg-000000\"\n", []))
     proto, paths = stage(1, [options.packages])
-    run("publish", "--repo", "repo", "--proto", proto, "--signing-key", "private.der",
+    run("publish", "manifests", "--repo", "repo", "--proto", proto, "--key", "private.der",
         *paths, label="publish_one_package")
     shutil.rmtree(proto)
-    run("plan", "--root", "image", "--output", "single.json",
-        "install", package_name(options.packages), label="plan_install_after_publish")
+    run("install", "--root", "image", "-n", "--save-plan", "single.json",
+        package_name(options.packages), label="plan_install_after_publish")
 
     run("verify", "--root", "image", "--pristine", label="verify_offline")
     # Every file has a distinct basename, as most distribution files do.
     lookup = ("search", "--root", "image", "--file", f"pkg-{workload:06}-000")
     run(*lookup, label="file_search_manifests")
-    run("repo", "index-files", "--repo", "repo", "--publisher", PUBLISHER,
-        "--signing-key", "private.der", label="publish_file_index")
+    run("repo", "index-files", "--repo", "repo", "--key", "private.der",
+        label="publish_file_index")
     run(*lookup, label="file_search_index")
     if not options.skip_mirror:
-        run("repo", "export", "--repo", "repo", "--publisher", PUBLISHER,
+        run("repo", "export", "--repo", "repo",
             "--trust-root", "repo/trust/1.json", "--output", "targets", label="export")
         mirror = subprocess.check_output([tuf, "targets", "mirror", "1"], text=True).strip()
-        sync = ("repo", "sync", "--repo", "cache", "--root", "mirror/root.json",
+        sync = ("repo", "sync", "--repo", "cache", "--tuf-root", "mirror/root.json",
                 "--metadata", mirror + "metadata/", "--targets", mirror + "targets/",
-                "--publisher", PUBLISHER, "--trust-root", "repo/trust/1.json", "--index-only")
+                "--trust-root", "repo/trust/1.json", "--index-only")
         run(*sync, label="refresh_empty_cache")
         run(*sync, label="refresh_existing_cache")
     print(json.dumps({

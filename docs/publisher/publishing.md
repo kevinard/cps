@@ -4,8 +4,8 @@
 
 A publisher controls a catalog, the trust root that authorizes its signing
 keys, and the policy that decides what enters the catalog. Use
-`cps publish` for reviewed manifests and a prototype tree in a simple local
-repository. Use `cps publish-bundle` or `cps repo publish-release` for
+`cps publish manifests` for reviewed manifests and a prototype tree in a simple local
+repository. Use `cps publish bundle` or `cps publish release` for
 repositories that require signed build evidence.
 
 ## On this page
@@ -121,7 +121,7 @@ Publish a reviewed manifest with its prototype tree, signing with the
 catalog keys.
 
 ```sh
-cps publish --repo repo --proto proto --signing-key private.der hello.kdl
+cps publish manifests --repo repo --proto proto --key private.der hello.kdl
 ```
 
 Publication validates each manifest and rejects actions under `var`, which
@@ -138,13 +138,13 @@ A catalog is a signed root that commits to up to 256 content-addressed
 shards, each holding the records of the package names whose SHA-256 shares
 a one-byte prefix. See [Signed catalog format](#signed-catalog-format).
 
-`cps publish` accepts any number of manifests that share one prototype
+`cps publish manifests` accepts any number of manifests that share one prototype
 tree and publishes them in a single signed catalog, so a distribution signs
 one catalog per batch instead of one per package. The batch is atomic: if
 any manifest fails, the current catalog stays unchanged.
 
 ```sh
-cps publish --repo repo --proto proto --signing-key private.der manifests/*.kdl
+cps publish manifests --repo repo --proto proto --key private.der manifests/*.kdl
 ```
 
 A plain publication reads and rewrites only the shards that hold the
@@ -161,8 +161,8 @@ rebuild, see [Plan builds across recipes](../maintainer/orchestration.md).
 
 ### Sign with several catalog keys or an external signer
 
-Every `--signing-key`, every trust root `--key`, and
-`CPS_RELEASE_SIGNING_KEY` accept `PATH`, `file:PATH`, or
+Every `--key` of the publishing, repository, and trust root commands, and
+`CPS_RELEASE_SIGNING_KEY`, accept `PATH`, `file:PATH`, or
 `command:DESCRIPTOR`. A descriptor names an external signer that holds the
 Ed25519 key. Its `public-key` is the key that the trust root lists, and CPS
 checks each returned signature against it before using it. The helper
@@ -171,14 +171,14 @@ receives `CPS_SIGNER_CONTEXT` set to `catalog`, `trust-root`, or
 [External signer protocol](mirrors.md#external-signer-protocol).
 
 Every catalog carries exactly the catalog threshold of signatures. Repeat
-`--signing-key` once for each required catalog key. Every publishing
+`--key` once for each required catalog key. Every publishing
 command takes the same set, and CPS rejects a key that the newest trust
 root version does not list as a catalog key.
 
 ```sh
-cps publish --repo repo --proto proto \
-    --signing-key command:/etc/cps/signers/catalog-a.signer.kdl \
-    --signing-key command:/etc/cps/signers/catalog-b.signer.kdl hello.kdl
+cps publish manifests --repo repo --proto proto \
+    --key command:/etc/cps/signers/catalog-a.signer.kdl \
+    --key command:/etc/cps/signers/catalog-b.signer.kdl hello.kdl
 ```
 
 All the catalog keys sign in one command on the publishing host. To keep
@@ -202,8 +202,8 @@ publisher "canopa" {
 }
 ```
 
-Protected repositories accept packages through `publish-bundle` and
-`repo publish-release`. CPS checks the verified worker key and recipe digest
+Protected repositories accept packages through `publish bundle` and
+`publish release`. CPS checks the verified worker key and recipe digest
 against the policy, independently of the command-line arguments. The
 publisher signs the protection flag into the catalog, and later publication
 fails if the policy file is missing. Keep bootstrap packages in a separate
@@ -250,7 +250,7 @@ pinned recipe on each worker and pass the additional signed statements with
 `--witness`. The publishing policy defaults to one worker key.
 
 ```sh
-cps publish-bundle --repo repo --signing-key private.der --builder-key worker-a-public.der \
+cps publish bundle --repo repo --key private.der --builder-key worker-a-public.der \
     --recipe-sha256 "$reviewed_recipe_sha256" \
     --witness worker-b-public.der=worker-b-build/attestation.json worker-a-build
 ```
@@ -280,7 +280,7 @@ release "canopa" base="<reviewed catalog SHA-256>" {
 ```
 
 ```sh
-cps repo publish-release --repo repo --signing-key private.der release.kdl
+cps publish release --repo repo --key private.der release.kdl
 ```
 
 A release can list any number of bundles. CPS checks the base under the
@@ -415,8 +415,8 @@ Publish the exact current catalog again under the newest trust root version
 with its catalog keys:
 
 ```sh
-cps repo resign --repo repo --publisher canopa \
-    --signing-key catalog-a.der --signing-key catalog-c.der --base "$(cat repo/current)"
+cps repo resign --repo repo \
+    --key catalog-a.der --key catalog-c.der --base "$(cat repo/current)"
 ```
 
 The successor has the next sequence and reuses every shard. Then
@@ -458,8 +458,8 @@ To withdraw an exact version, use the publisher's catalog keys on the
 publishing repository, then export and sign a new TUF release.
 
 ```sh
-cps repo withdraw --repo repo --signing-key private.der cps://canopa/demo/hello@1.0.0-0
-cps repo withdrawals --repo repo --publisher canopa --trust-root repo/trust/1.json
+cps repo withdraw --repo repo --key private.der cps://canopa/demo/hello@1.0.0-0
+cps repo withdrawals --repo repo --trust-root repo/trust/1.json
 ```
 
 The signed withdrawal records the original manifest digest and prevents
@@ -476,7 +476,7 @@ Withdrawal records stay in every successor catalog until a publisher prunes
 them, as described in the next section.
 
 To retire a package name as part of a rolling release, add an `obsolete`
-action to the KDL file for `repo publish-release`.
+action to the KDL file for `publish release`.
 
 ```kdl
 schema-version 1 kind="publish-release"
@@ -498,7 +498,7 @@ An obsoletion reserves the name at its publisher's position in the search
 order. A higher version can reintroduce the package, while the cutoff and
 earlier withdrawals remain in the signed history. Saved plans still use
 their pinned catalogs. Inspect the cutoffs with
-`cps repo obsoletions --repo repo --publisher canopa --trust-root repo/trust/1.json`.
+`cps repo obsoletions --repo repo --trust-root repo/trust/1.json`.
 
 ## Pruning withdrawal history
 
@@ -507,7 +507,7 @@ prune the records withdrawn at or before a catalog sequence from the
 reviewed current catalog.
 
 ```sh
-cps repo prune-withdrawals --repo repo --publisher canopa --signing-key private.der \
+cps repo prune-withdrawals --repo repo --key private.der \
     --base "$reviewed_catalog_sha256" --through 120
 ```
 
@@ -559,7 +559,7 @@ freeze or other constraints, or the successor is installed from another
 publisher, CPS blocks the upgrade. If the source belongs to the protected
 signed composition, the new signed profile must include the successor.
 
-Use `cps upgrade --dry-run` or `cps check-updates --json` to preview the
+Use `cps upgrade --dry-run` or `cps upgrade --check --json` to preview the
 transaction. Other catalog-based package changes wait until the rename has
 been applied.
 

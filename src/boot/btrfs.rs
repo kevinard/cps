@@ -171,7 +171,7 @@ fn check_staging_space(parent: &Root, source: &Path, plan: &Plan) -> Result<()> 
         available >= needed,
         "insufficient free space on the Btrfs filesystem to stage this transaction: {} available, \
          {} needed ({} of payloads, {} of kernel artifacts and a {} reserve). Remove old boot \
-         environments with `cps boot-env prune`, or free space on the filesystem, then retry",
+         environments with `cps boot prune`, or free space on the filesystem, then retry",
         super::mib(available),
         super::mib(needed),
         super::mib(payload),

@@ -51,7 +51,7 @@ pub fn resolve<'a, T, P: PackageInfo + 'a>(
                 spec.version
                     .as_ref()
                     .is_none_or(|version| version == &frozen.version),
-                "{name} is frozen at {}{}; use plan unfreeze before changing its version",
+                "{name} is frozen at {}{}; use cps unfreeze before changing its version",
                 frozen.version,
                 freeze::reason_suffix(frozen)
             );
@@ -202,7 +202,7 @@ pub fn resolve<'a, T, P: PackageInfo + 'a>(
         result
     } else {
         result.with_context(|| {
-            format!("resolving package selection with freezes: {}; use plan unfreeze to lift a constraint", available.freezes.iter().map(|(name, frozen)| format!("{name}@{}{}", frozen.version, freeze::reason_suffix(frozen))).collect::<Vec<_>>().join(", "))
+            format!("resolving package selection with freezes: {}; use cps unfreeze to lift a constraint", available.freezes.iter().map(|(name, frozen)| format!("{name}@{}{}", frozen.version, freeze::reason_suffix(frozen))).collect::<Vec<_>>().join(", "))
         })
     }
 }

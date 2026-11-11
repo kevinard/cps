@@ -78,7 +78,7 @@ The bundled deployment adapter has its own variables, listed in
 
 1. On the signing host, run `bash ci/release.sh prepare REQUEST /path/to/new-snapshot`.
    CPS reads the reviewed `REQUEST/release.kdl` and its bundle references.
-   Preparation runs `cps repo publish-release --prepare`, which signs the
+   Preparation runs `cps publish release --prepare`, which signs the
    candidate without advancing the catalog pointer, and exports a private
    snapshot of content-addressed repository objects. The production catalog
    pointer and mirror are unchanged. Record the candidate and base digests.

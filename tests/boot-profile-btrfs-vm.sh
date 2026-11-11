@@ -57,7 +57,7 @@ cp "$next_kernel_fixture/builder-public.der" canopa-kernel-next-builder.der
     printf '    builder-key "../../canopa-kernel-builder.der"\n    builder-key "../../canopa-kernel-next-builder.der"\n'
     for fixture in "$kernel_fixture" "$next_kernel_fixture"; do
         package=$(cat "$fixture/kernel-package")
-        "$cps" repo attestation --repo "$fixture/repo" --publisher canopa-kernel \
+        "$cps" repo attestation --repo "$fixture/repo" \
             --trust-root "$fixture/release.trust.json" "$package" > /dev/null
         recipe=$(sha256sum "$fixture/build.kdl"); recipe=${recipe%% *}
         printf '    approve "system/kernel-qemu" version="%s" sha256="%s"\n' "${package##*@}" "$recipe"
@@ -66,7 +66,7 @@ cp "$next_kernel_fixture/builder-public.der" canopa-kernel-next-builder.der
 } > repos/canopa-kernel/publish-policy.kdl
 for fixture in "$kernel_fixture" "$next_kernel_fixture"; do
     recipe=$(sha256sum "$fixture/build.kdl"); recipe=${recipe%% *}
-    "$cps" publish-bundle --repo repos/canopa-kernel --signing-key canopa-kernel-private.der \
+    "$cps" publish bundle --repo repos/canopa-kernel --key canopa-kernel-private.der \
         --builder-key "$fixture/builder-public.der" --recipe-sha256 "$recipe" "$fixture/bundle"
 done
 publishers=(vm-test canopa canopa-kernel canopa-systemd canopa-usr-base canopa-util-linux canopa-bootstrap canopa-utilities)
@@ -100,7 +100,7 @@ StandardError=inherit
 UNIT
 "$cps" manifest generate --proto runtime --publisher vm-test --version 1.0.0-0 \
     --uid "$(id -u)" --gid "$(id -g)" test/btrfs-harness > runtime.kdl
-"$cps" publish --repo repos/vm-test --proto runtime --signing-key vm-test-private.der runtime.kdl
+"$cps" publish manifests --repo repos/vm-test --proto runtime --key vm-test-private.der runtime.kdl
 
 publish_desktop() {
     mkdir -p desktop/etc
@@ -108,7 +108,7 @@ publish_desktop() {
     printf '%s\n' "$3" > desktop/etc/cps-btrfs-release
     "$cps" manifest generate --proto desktop --publisher vm-test --version "$1" \
         --uid "$(id -u)" --gid "$(id -g)" test/desktop > desktop.kdl
-    "$cps" publish --repo repos/vm-test --proto desktop --signing-key vm-test-private.der desktop.kdl
+    "$cps" publish manifests --repo repos/vm-test --proto desktop --key vm-test-private.der desktop.kdl
 }
 publish_desktop 1.0.0-0 previous "$release"
 cps_version=$(sed -n 's/^package .* version="\([^"]*\)".*/\1/p' "$cps_fixture/cps.kdl")
@@ -128,7 +128,7 @@ package "test/btrfs-stack" publisher="vm-profile" version="$1" {
     require "system/kernel-qemu" version="=$2"
 }
 MANIFEST
-    "$cps" publish --repo repos/vm-profile --proto desktop --signing-key vm-profile-private.der stack.kdl
+    "$cps" publish manifests --repo repos/vm-profile --proto desktop --key vm-profile-private.der stack.kdl
 }
 publish_stack 1.0.0-0 "${kernel_package##*@}"
 next_kernel_package=$(cat "$next_kernel_fixture/kernel-package")
@@ -153,7 +153,7 @@ refresh_profile() {
     } > repos/vm-profile/publish-policy.kdl
     printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
         "$(cat repos/vm-profile/current)" > release.kdl
-    "$cps" repo publish-release --repo repos/vm-profile --signing-key vm-profile-private.der release.kdl
+    "$cps" publish release --repo repos/vm-profile --key vm-profile-private.der release.kdl
 }
 refresh_profile 1.0.0-0
 {
@@ -163,11 +163,9 @@ refresh_profile 1.0.0-0
     done
 } > image.kdl
 mkdir files
-"$cps" image-create --root files/@ --config image.kdl
-"$cps" plan --root files/@ --output install.json install-profile
-"$cps" apply --root files/@ install.json
-"$cps" plan --root files/@ --output freeze.json freeze --reason 'Review before upgrade' test/desktop
-"$cps" apply --root files/@ freeze.json
+"$cps" image create --root files/@ --config image.kdl
+"$cps" install --root files/@ --profile -y
+"$cps" freeze --root files/@ -y --reason 'Review before upgrade' test/desktop
 "$cps" verify --root files/@ --pristine
 for fixture_path in "canopa:$cps_fixture:usr/bin/cps" \
     "canopa-systemd:$systemd_fixture:usr/lib/systemd/systemd" \

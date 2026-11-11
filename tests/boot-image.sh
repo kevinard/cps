@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build offline Btrfs disk images with boot-env image, without root or a VM.
+# Build offline Btrfs disk images with image disk, without root or a VM.
 set -euo pipefail
 export LC_ALL=C
 umask 022
@@ -26,14 +26,13 @@ openssl genpkey -algorithm ED25519 -outform DER -out private.der
 "$cps" repo trust init --repo repo --publisher test --key private.der >/dev/null
 "$cps" manifest generate --proto proto --publisher test --version 1.0.0-0 \
     --uid "$(id -u)" --gid "$(id -g)" test/payload > manifest.kdl
-"$cps" publish --repo repo --proto proto --signing-key private.der manifest.kdl
+"$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl
 root=volume/@
 mkdir -p volume/@environments
-created=$("$cps" image-create --root "$root" --repo repo --publisher test --trust-root repo/trust/1.json)
+created=$("$cps" image create --root "$root" --repo repo --trust-root repo/trust/1.json)
 id=${created#Created image }
 id=${id%% at *}
-"$cps" plan --root "$root" --output install.json install test/payload
-"$cps" apply --root "$root" install.json
+"$cps" install --root "$root" -y test/payload
 chmod 0750 "$root"
 setfattr -n user.cps-root -v root-data "$root"
 printf 'local data\n' > "$root/local-state"
@@ -63,7 +62,7 @@ template template.raw "$efi"
 image() {
     local output=$1 disk=${2:-template.raw}
     shift $(($# < 2 ? $# : 2))
-    "$cps" boot-env image --btrfs-volume volume --root "$root" --environments volume/@environments \
+    "$cps" image disk --btrfs-volume volume --root "$root" --environments volume/@environments \
         --disk "$disk" --root-partuuid "$root_uuid" --output "$output" --options 'rw quiet' "$@"
 }
 partition() { dd if="$1" of="$2" bs=1M skip=65 count=300 status=none; }
@@ -159,13 +158,13 @@ touch volume/@environments/stray
 reject 'environments directory must be empty' busy.raw image busy.raw
 rm volume/@environments/stray
 reject 'directly inside the volume directory' nested.raw \
-    "$cps" boot-env image --btrfs-volume volume --root "$root/bin" --environments volume/@environments \
+    "$cps" image disk --btrfs-volume volume --root "$root/bin" --environments volume/@environments \
     --disk template.raw --root-partuuid "$root_uuid" --output nested.raw
 reject 'rootflags and rootfstype' flags.raw \
-    "$cps" boot-env image --btrfs-volume volume --root "$root" --environments volume/@environments \
+    "$cps" image disk --btrfs-volume volume --root "$root" --environments volume/@environments \
     --disk template.raw --root-partuuid "$root_uuid" --output flags.raw --options rootflags=subvol=@
 reject 'not a GPT Linux filesystem partition' other.raw \
-    "$cps" boot-env image --btrfs-volume volume --root "$root" --environments volume/@environments \
+    "$cps" image disk --btrfs-volume volume --root "$root" --environments volume/@environments \
     --disk template.raw --root-partuuid "$esp_uuid" --output other.raw
 reject 'already has CPS boot files' reused.raw image reused.raw disk.raw
 printf 'MZ#### LoaderInfo: systemd-boot 255.4 ####' > old-loader.efi
