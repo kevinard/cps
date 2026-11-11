@@ -165,13 +165,13 @@ fn state_digest(state: &StateDelta) -> Result<String> {
     Ok(hex::encode(sha.finalize()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct TransactionStatus {
     pub revision: u64,
     pub pending: Option<PendingTransaction>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct PendingTransaction {
     pub plan_id: String,
     pub target_revision: u64,
@@ -686,17 +686,7 @@ fn resume_image(
 
 fn check_live_plan(plan: &Plan, stage_packages: &BTreeSet<String>) -> Result<()> {
     ensure!(
-        matches!(
-            plan.request,
-            Request::Install { .. }
-                | Request::Update
-                | Request::UpdateProfile
-                | Request::Remove { .. }
-                | Request::Autoremove
-                | Request::Repair { .. }
-                | Request::RepairPaths { .. }
-                | Request::Revert { .. }
-        ),
+        plan.request.applies_live(),
         "this request cannot be applied live"
     );
     if let Some(reason) = plan.boot_reason(stage_packages) {

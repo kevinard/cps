@@ -50,8 +50,9 @@ before an upgrade. The quickstart repository needs a second package
 version before `upgrade` can select a change.
 
 `freeze`, `unfreeze`, `mark`, `facet set`, `variant set`, `mediator set`,
-and `config resolve` work the same way. The running system does not
-support them, so use them with `--root`.
+and `config resolve` work the same way, with `--root` or on the running
+system. Only `install --profile` and `install --lock` require `--root`,
+because they provision a new, empty image.
 
 ## Save, review, and apply a plan
 
@@ -203,7 +204,9 @@ cps status --root image --plan upgrade.json
 pending` while CPS is writing files, `Offline actions pending` (or `Live
 actions pending`) once only actions remain, or `Abort in progress`. It also
 names the command that finishes the transaction. `status --plan`
-reports the phase of one saved plan as JSON:
+reports the phase of one saved plan. Add `--json` to either form for a
+report that scripts can read; JSON spells the phases as below, and the text
+report uses spaces instead of underscores:
 
 | Phase | Meaning |
 | --- | --- |
@@ -395,8 +398,8 @@ cps history --root image PLAN_SHA256
 `history` lists completed plans, newest first, with their
 revision and operation. The default limit is 20 entries; change it with
 `--limit`, and add `--json` for the list as JSON. With a plan digest,
-`history` prints a JSON record of the request, package changes, catalog digests, and
-planned action counts. The record commits with the image state, works
+`history` prints the recorded request, package changes, catalog digests,
+and planned action counts, and `--json` prints the full record. The record commits with the image state, works
 offline, and follows the source image's history when staging a boot
 environment. History uses commit order within a revision and omits
 wall-clock timestamps so independently provisioned images can still match
@@ -441,7 +444,7 @@ links of presets, which point to a unit under `/usr/lib/systemd/system`.
 Local configuration, such as a mask or an administrator's tmpfiles file,
 is still reported.
 
-Use `verify --package NAME` or `verify --path /path` to limit on-disk
+Use `verify NAME` or `verify --path /path` to limit on-disk
 checks to the selected managed files while still authenticating image
 metadata. Both also accept `--quick`.
 

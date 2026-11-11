@@ -117,6 +117,12 @@ pub enum Request {
 }
 
 impl Request {
+    /// Whether the running system can apply this request. Provisioning a
+    /// release profile or a lock only makes sense for a new, empty image.
+    pub fn applies_live(&self) -> bool {
+        !matches!(self, Self::InstallProfile | Self::InstallLock { .. })
+    }
+
     /// The cps command that makes this request, as `cps history` shows it.
     pub fn operation(&self) -> &'static str {
         match self {
@@ -279,6 +285,21 @@ impl Plan {
             .iter()
             .find(|write| write.boot_sensitive())
             .map(|write| format!("the transaction changes {}", write.path))
+    }
+
+    /// Whether applying the plan changes the image, including settings such
+    /// as freezes, rules, and preferences that leave every file alone.
+    pub(crate) fn changes_image(&self) -> bool {
+        self.has_changes()
+            || !self.freeze_changes.is_empty()
+            || !self.recomposed.is_empty()
+            || self.config_update_revision.is_some()
+            || matches!(
+                self.request,
+                Request::ChangeFacet { .. }
+                    | Request::ChangeVariant { .. }
+                    | Request::SetMediator { .. }
+            )
     }
 
     pub(crate) fn has_changes(&self) -> bool {

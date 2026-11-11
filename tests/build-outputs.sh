@@ -249,7 +249,7 @@ publisher "seed" {
 }
 CONFIG
 "$cps" image create --root image --config image.kdl
-"$cps" info --root image --available demo/app > info.kdl
+"$cps" info --manifest --root image --available demo/app > info.kdl
 grep -F 'license="MIT OR Apache-2.0"' info.kdl
 grep -E 'homepage="https://example.org/app/"' info.kdl
 "$cps" install --root image -n --save-plan install.json demo/app

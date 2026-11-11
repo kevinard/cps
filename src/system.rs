@@ -181,7 +181,7 @@ impl Change {
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.plan.has_changes()
+        !self.plan.changes_image()
     }
 
     pub fn packages(&self) -> &[PackageChange] {
@@ -564,19 +564,10 @@ impl System {
         choose: Option<&mut SelectSource<'_>>,
         git_updates: &[String],
     ) -> Result<Change> {
-        let uses_current_catalogs = matches!(request, Request::Install { .. } | Request::Update);
         ensure!(
-            uses_current_catalogs
-                || matches!(
-                    request,
-                    Request::Remove { .. }
-                        | Request::Autoremove
-                        | Request::Repair { .. }
-                        | Request::RepairPaths { .. }
-                        | Request::Revert { .. }
-                ),
-            "the running system supports only install, remove, autoremove, upgrade, repair, \
-             and revert; apply this change to an inactive image with --root"
+            request.applies_live(),
+            "{} provisions a new image; run it with --root on an empty image",
+            request.operation()
         );
         self.check_running()?;
         let deferred = self.refresh_for_request(&request, refresh)?;
@@ -1074,7 +1065,11 @@ impl System {
 
     fn refresh_for_request(&self, request: &Request, refresh: bool) -> Result<BTreeSet<String>> {
         let upgrade = matches!(request, Request::Update);
-        if refresh && (upgrade || matches!(request, Request::Install { .. })) {
+        let installs = matches!(
+            request,
+            Request::Install { .. } | Request::ExactInstall { .. }
+        );
+        if refresh && (upgrade || installs) {
             self.refresh_configured_mirrors(upgrade)?;
         }
         if upgrade && (refresh || self.base_only) {

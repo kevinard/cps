@@ -4,7 +4,11 @@
 \&cps\-list \- \&List installed packages, available versions, local intent, or freezes
 .SH SYNOPSIS
 .HP 4
-.B \&cps list [OPTIONS]
+.B \&cps list [OPTIONS] [PATTERN]...
+.SH ARGUMENTS
+.TP
+.B \&[PATTERN]...
+\&Only list packages whose name, or its last component, matches one of these patterns; * and ? are wildcards
 .SH OPTIONS
 .TP
 .B \&\-\-root <IMAGE>

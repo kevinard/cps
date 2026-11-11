@@ -9,11 +9,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use cps::query::{
-    PackageRow, Scope, direct_dependencies, explain_package, list_facets, list_package_intent,
-    list_packages, package_contents, package_manifest, path_owners, reverse_dependencies,
-    search_files,
+    ManifestSource, PackageInfo, PackageRow, Scope, direct_dependencies, explain_package,
+    list_facets, list_package_intent, list_packages, package_contents, package_info, path_owners,
+    reverse_dependencies, search_files,
 };
 use cps::system::{self, System, UpdateStatus};
 use cps::{
@@ -78,48 +78,91 @@ struct ChangeOptions {
     /// Skip recommended packages when resolving the transaction
     #[arg(long)]
     no_recommends: bool,
-    /// Use the currently cached catalogs (images always plan from their cache)
-    #[arg(long, conflicts_with = "root")]
-    no_refresh: bool,
     /// Stage the change in a new Btrfs trial boot environment, or for repair and revert a
     /// verified recovery root, instead of changing the running root
     #[arg(long, conflicts_with = "root")]
     stage: bool,
+    /// Set by install and upgrade, the only changes that refresh catalogs
+    #[arg(skip)]
+    no_refresh: bool,
 }
+
+const INSTALL_EXAMPLES: &str = "\
+Examples:
+  cps install apps/htop                    Install on the running system
+  cps install -n apps/htop                 Preview the transaction only
+  cps install --root image -y apps/htop    Install into an offline image
+  cps install --root image -n --save-plan plan.json apps/htop
+                                           Save the plan for cps fetch and cps apply
+  cps install --git https://example.org/tool.git --track-branch main";
+
+const UPGRADE_EXAMPLES: &str = "\
+Examples:
+  cps upgrade --check                      Report available upgrades and blockers
+  cps upgrade                              Upgrade the running system
+  cps upgrade --stage                      Stage the upgrade in a trial boot environment
+  cps upgrade --root image -y              Upgrade an offline image";
 
 #[derive(Subcommand)]
 enum Command {
     /// Install packages
+    #[command(after_help = INSTALL_EXAMPLES)]
     Install {
         #[command(flatten)]
         change: ChangeOptions,
+        /// Use the currently cached catalogs
+        #[arg(long, conflicts_with = "root")]
+        no_refresh: bool,
         /// Reconcile the image to exactly these packages and their dependencies
         #[arg(long, conflicts_with_all = ["profile", "lock", "git"])]
         exact: bool,
         /// Install the configured signed release profile into an image with no packages
-        #[arg(long, conflicts_with_all = ["packages", "lock", "git"])]
+        #[arg(
+            long,
+            requires = "root",
+            conflicts_with_all = ["packages", "lock", "git"],
+            help_heading = "Image provisioning"
+        )]
         profile: bool,
         /// Install the exact composition of this image lock into a newly created image
-        #[arg(long, value_name = "LOCK", conflicts_with_all = ["packages", "git"])]
+        #[arg(
+            long,
+            value_name = "LOCK",
+            requires = "root",
+            conflicts_with_all = ["packages", "git"],
+            help_heading = "Image provisioning"
+        )]
         lock: Option<PathBuf>,
         /// Build and install the package described by cps.kdl in this Git repository
-        #[arg(long, requires = "git_ref", conflicts_with_all = ["packages", "root"])]
+        #[arg(
+            long,
+            value_name = "URL",
+            requires = "git_ref",
+            conflicts_with_all = ["packages", "root"],
+            help_heading = "Git source"
+        )]
         git: Option<String>,
         /// Pin the Git install to a full commit ID
-        #[arg(long, requires = "git", group = "git_ref")]
+        #[arg(long, requires = "git", group = "git_ref", help_heading = "Git source")]
         commit: Option<String>,
         /// Follow this branch when running cps upgrade
-        #[arg(long, requires = "git", group = "git_ref")]
+        #[arg(long, requires = "git", group = "git_ref", help_heading = "Git source")]
         track_branch: Option<String>,
         /// Require Git signatures from the signers in ssh:PATH or openpgp:PATH
-        #[arg(long, requires = "git", value_name = "FORMAT:PATH")]
+        #[arg(
+            long,
+            requires = "git",
+            value_name = "FORMAT:PATH",
+            help_heading = "Git source"
+        )]
         allowed_signers: Option<String>,
         /// Which Git object must carry the allowed signature
         #[arg(
             long,
             requires = "allowed_signers",
             value_enum,
-            default_value = "commit"
+            default_value = "commit",
+            help_heading = "Git source"
         )]
         require_signed: GitSignedArg,
         /// Packages to install, optionally with a publisher and version
@@ -142,9 +185,13 @@ enum Command {
         change: ChangeOptions,
     },
     /// Upgrade the installed packages, or report available upgrades with --check
+    #[command(after_help = UPGRADE_EXAMPLES)]
     Upgrade {
         #[command(flatten)]
         change: ChangeOptions,
+        /// Use the currently cached catalogs
+        #[arg(long, conflicts_with = "root")]
+        no_refresh: bool,
         /// Report upgrades, blockers, and any reboot requirement without changing anything
         #[arg(
             long,
@@ -253,12 +300,14 @@ enum Command {
     Status {
         #[command(flatten)]
         target: Target,
-        /// Report progress for this saved plan as JSON
+        /// Report the progress of this saved plan instead
         #[arg(long, value_name = "PLAN")]
         plan: Option<PathBuf>,
         /// Validate an unapplied plan against cached payloads
         #[arg(long, requires = "plan")]
         validate: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Finish an interrupted transaction
     Resume {
@@ -276,14 +325,14 @@ enum Command {
         #[arg(long)]
         fetch: bool,
     },
-    /// List completed transactions, most recent first, or show one as JSON
+    /// List completed transactions, most recent first, or show one
     History {
         #[command(flatten)]
         image: Image,
         /// Show at most this many transactions
         #[arg(long, default_value_t = 20, conflicts_with = "plan")]
         limit: u32,
-        #[arg(long, conflicts_with = "plan")]
+        #[arg(long)]
         json: bool,
         /// Show the recorded details of this completed plan
         #[arg(value_name = "PLAN_SHA256")]
@@ -307,6 +356,10 @@ enum Command {
         frozen: bool,
         #[arg(long)]
         json: bool,
+        /// Only list packages whose name, or its last component, matches one of these
+        /// patterns; * and ? are wildcards
+        #[arg(value_name = "PATTERN")]
+        patterns: Vec<String>,
     },
     /// Search for packages by name, summary, or a file they ship
     Search {
@@ -322,13 +375,18 @@ enum Command {
         json: bool,
         term: String,
     },
-    /// Show an installed or available package's manifest in KDL
+    /// Describe an installed package, or the newest available version of another
     Info {
         #[command(flatten)]
         image: Image,
-        /// Show the manifest from the signed catalogs
+        /// Describe the newest version in the signed catalogs even when the package is installed
         #[arg(long)]
         available: bool,
+        /// Print the whole verified manifest in KDL
+        #[arg(long, conflicts_with = "json")]
+        manifest: bool,
+        #[arg(long)]
+        json: bool,
         #[arg(value_name = "NAME[@VERSION]")]
         package: String,
     },
@@ -393,8 +451,8 @@ enum Command {
         /// Require an inactive root with pristine package paths and no unmanaged entries
         #[arg(long, conflicts_with_all = ["packages", "paths"])]
         pristine: bool,
-        /// Limit file verification to the installed package
-        #[arg(long = "package", value_name = "PACKAGE")]
+        /// Limit file verification to these installed packages
+        #[arg(value_name = "PACKAGE")]
         packages: Vec<String>,
         /// Limit file verification to this managed path
         #[arg(long = "path", value_name = "PATH")]
@@ -444,7 +502,7 @@ enum Command {
         #[command(flatten)]
         inputs: BuildInputs,
         /// New directory for the build bundle: recipe, templates, manifests, and proto tree
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         /// Build twice in fresh sandboxes and require identical outputs
         #[arg(long)]
@@ -657,7 +715,7 @@ enum ImageCommand {
         #[arg(long)]
         root_partuuid: String,
         /// New disk file to write
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         /// Kernel path in the root, for images without kernel-install artifacts
         #[arg(long, default_value = "boot/vmlinuz")]
@@ -732,7 +790,7 @@ enum BootCommand {
         #[arg(long)]
         source: PathBuf,
         /// New directory containing the staged root/ subvolume
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         /// Start the staged root with an empty directory for this nested subvolume
         #[arg(long, value_name = "PATH")]
@@ -773,7 +831,7 @@ enum BootCommand {
         #[arg(long)]
         source: PathBuf,
         /// New path in a separate subvolume on the same Btrfs filesystem
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         /// Capture an empty directory for this nested subvolume
         #[arg(long, value_name = "PATH")]
@@ -825,21 +883,24 @@ enum BootCommand {
 #[derive(Args)]
 struct BuildInputs {
     /// Local repository of the toolchain publisher
-    #[arg(long, required_unless_present = "toolchain_config")]
+    #[arg(long, requires = "trust_root")]
     repo: Option<PathBuf>,
     /// Trust root file that matches the recipe's key-sha256 pin and names the publisher
-    #[arg(long, required_unless_present = "toolchain_config")]
+    #[arg(long, requires = "repo")]
     trust_root: Option<PathBuf>,
     /// Worker-local repository and trust key locations for the pinned publishers
+    /// [default: $CPS_TOOLCHAIN_CONFIG unless --repo is given]
     #[arg(long, conflicts_with_all = ["repo", "trust_root"])]
     toolchain_config: Option<PathBuf>,
     /// Directory of the recipe's source inputs at their recipe paths
-    #[arg(long, required_unless_present = "source_cache")]
+    #[arg(long)]
     sources: Option<PathBuf>,
     /// Source cache filled by cps source fetch or cps source import
+    /// [default: $CPS_SOURCE_CACHE unless --sources is given]
     #[arg(long, conflicts_with = "sources")]
     source_cache: Option<PathBuf>,
     /// Build worker limits: time, scratch space, file, output, and log sizes, and jobs
+    /// [default: $CPS_WORKER_CONFIG]
     #[arg(long)]
     worker_config: Option<PathBuf>,
     /// Override a build option declared in the recipe
@@ -859,6 +920,29 @@ struct PreparedBuildInputs<'a> {
 
 impl BuildInputs {
     fn prepare(&mut self) -> Result<PreparedBuildInputs<'_>> {
+        let from_env = |name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        if self.repo.is_none() && self.toolchain_config.is_none() {
+            self.toolchain_config = from_env("CPS_TOOLCHAIN_CONFIG");
+        }
+        if self.sources.is_none() && self.source_cache.is_none() {
+            self.source_cache = from_env("CPS_SOURCE_CACHE");
+        }
+        if self.worker_config.is_none() {
+            self.worker_config = from_env("CPS_WORKER_CONFIG");
+        }
+        ensure!(
+            self.toolchain_config.is_some() || self.repo.is_some(),
+            "select the toolchain with --toolchain-config or CPS_TOOLCHAIN_CONFIG, or with \
+             --repo and --trust-root"
+        );
+        ensure!(
+            self.sources.is_some() || self.source_cache.is_some(),
+            "select the build sources with --sources, --source-cache, or CPS_SOURCE_CACHE"
+        );
         if let Some(trust_root) = &self.trust_root {
             self.publisher = pinned_publisher(trust_root)?;
         }
@@ -938,7 +1022,7 @@ enum SourceCommand {
         #[arg(long)]
         trust_root: PathBuf,
         /// New directory for the pinned recipe, manifest, and archive
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         /// Build recipe template with a pinned package manifest
         recipe: PathBuf,
@@ -1325,7 +1409,7 @@ enum TrustCommand {
         publisher: Option<String>,
         #[command(flatten)]
         membership: TrustMembership,
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
     },
     /// Sign a trust root draft and write detached signatures
@@ -1335,7 +1419,7 @@ enum TrustCommand {
         /// Root key that signs: PATH, file:PATH, or command:DESCRIPTOR (repeat)
         #[arg(long, value_name = "KEY", required = true)]
         key: Vec<PathBuf>,
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
     },
     /// Combine a draft with its signatures and store it as the next version
@@ -1557,7 +1641,7 @@ enum RepoCommand {
         #[arg(long)]
         catalog: Option<String>,
         /// New directory for the authenticated inputs
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         package_id: String,
     },
@@ -1585,7 +1669,7 @@ enum RepoCommand {
         /// Pinned trust root of the publisher, which also names it
         #[arg(long)]
         trust_root: PathBuf,
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         /// Include a historical catalog and its objects in this mirror release
         #[arg(long = "retain-catalog")]
@@ -1630,7 +1714,7 @@ enum RepoCommand {
         #[arg(long, value_name = "TIME")]
         timestamp_expires: String,
         /// New directory for the signed metadata and targets
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
         /// Directory written by `cps repo export`
         export: PathBuf,
@@ -1659,7 +1743,7 @@ enum RepoCommand {
         #[arg(long, value_name = "TIME")]
         timestamp_expires: String,
         /// New directory for timestamp.json and any re-signed snapshot
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
     },
     /// Verify and cache a release from a TUF mirror
@@ -2200,7 +2284,8 @@ fn change_system(
         }
         return Ok(());
     }
-    if recovery {
+    // Recovery and settings changes are described by their plan summary.
+    if recovery || change.packages().is_empty() {
         println!("{}", change.summary());
     } else {
         print_package_changes(change.packages());
@@ -2314,7 +2399,8 @@ fn check_system_updates(
 fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Install {
-            change: options,
+            change: mut options,
+            no_refresh,
             exact,
             profile,
             lock,
@@ -2325,6 +2411,7 @@ fn run(command: Command) -> Result<ExitCode> {
             require_signed,
             packages,
         } => {
+            options.no_refresh = no_refresh;
             let signatures = allowed_signers
                 .map(|signers| {
                     system::GitSignatures::new(
@@ -2360,17 +2447,19 @@ fn run(command: Command) -> Result<ExitCode> {
             change(options, request, false, false, source)?;
         }
         Command::Upgrade {
-            change: options,
+            change: mut options,
+            no_refresh,
             check,
             explain,
             json,
             force_rollout,
             base_only,
         } => {
+            options.no_refresh = no_refresh;
             if check {
                 return check_system_updates(
                     &options.target.config,
-                    !options.no_refresh,
+                    !no_refresh,
                     json,
                     base_only,
                     explain.as_deref(),
@@ -2654,24 +2743,21 @@ fn run(command: Command) -> Result<ExitCode> {
             target,
             plan,
             validate,
-        } => match target.root {
-            Some(root) => {
-                if let Some(path) = plan {
-                    let progress = cps::transaction_progress(&root, &load_plan(&path)?, validate)?;
-                    print_json(&progress)?;
-                    return Ok(ExitCode::SUCCESS);
-                }
-                print_image_status(&root)?;
-            }
-            None => {
+            json,
+        } => match (target.root, plan) {
+            (Some(root), Some(path)) => print_progress(
+                &cps::transaction_progress(&root, &load_plan(&path)?, validate)?,
+                json,
+            )?,
+            (Some(root), None) => print_image_status(&root, json)?,
+            (None, Some(path)) => {
                 let system = System::load(&target.config)?;
-                if let Some(path) = plan {
-                    let progress = system.transaction_progress(&load_plan(&path)?, validate)?;
-                    print_json(&progress)?;
-                    return Ok(ExitCode::SUCCESS);
-                }
-                print_system_status(&system)?;
+                print_progress(
+                    &system.transaction_progress(&load_plan(&path)?, validate)?,
+                    json,
+                )?;
             }
+            (None, None) => print_system_status(&System::load(&target.config)?, json)?,
         },
         Command::Resume { target, repair } => match target.root {
             Some(root) => {
@@ -2738,7 +2824,12 @@ fn run(command: Command) -> Result<ExitCode> {
             plan,
         } => {
             if let Some(plan) = plan {
-                print_json(&transaction_details(&image.root, &plan)?)?;
+                let entry = transaction_details(&image.root, &plan)?;
+                if json {
+                    print_json(&entry)?;
+                } else {
+                    print_history_entry(&entry);
+                }
             } else {
                 let history = transaction_history(&image.root, limit)?;
                 if json {
@@ -2759,10 +2850,17 @@ fn run(command: Command) -> Result<ExitCode> {
             intent,
             frozen,
             json,
+            patterns,
         } => {
             let root = image.root;
+            let wanted = |name: &str| {
+                patterns.is_empty() || patterns.iter().any(|pattern| name_matches(pattern, name))
+            };
+            let matched;
             if frozen {
-                let freezes = list_freezes(&root)?;
+                let mut freezes = list_freezes(&root)?;
+                freezes.retain(|name, _| wanted(name));
+                matched = !freezes.is_empty();
                 if json {
                     print_json(&freezes)?;
                 } else {
@@ -2776,7 +2874,9 @@ fn run(command: Command) -> Result<ExitCode> {
                     }
                 }
             } else if intent {
-                let rows = list_package_intent(&root)?;
+                let mut rows = list_package_intent(&root)?;
+                rows.retain(|row| wanted(&row.name));
+                matched = !rows.is_empty();
                 if json {
                     print_json(&rows)?;
                 } else {
@@ -2793,13 +2893,20 @@ fn run(command: Command) -> Result<ExitCode> {
                     (true, false) => Scope::Available,
                     _ => Scope::Installed,
                 };
-                let rows = list_packages(&root, scope)?;
+                let mut rows = list_packages(&root, scope)?;
+                rows.retain(|row| wanted(&row.name));
+                matched = !rows.is_empty();
                 if json {
                     print_json(&rows)?;
                 } else {
                     print_packages(rows, false)?;
                 }
             }
+            ensure!(
+                matched || patterns.is_empty(),
+                "no package matches {}",
+                patterns.join(", ")
+            );
         }
         Command::Search {
             image,
@@ -2912,10 +3019,26 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Info {
             image,
             available,
+            manifest,
+            json,
             package,
         } => {
-            let manifest = package_manifest(&image.root, &package, available)?;
-            std::io::stdout().lock().write_all(manifest.as_bytes())?;
+            let source = if available {
+                ManifestSource::Catalog
+            } else {
+                ManifestSource::InstalledOrCatalog
+            };
+            if manifest {
+                let text = cps::query::manifest_from(&image.root, &package, source)?;
+                std::io::stdout().lock().write_all(text.as_bytes())?;
+            } else {
+                let info = package_info(&image.root, &package, source)?;
+                if json {
+                    print_json(&info)?;
+                } else {
+                    print_package_info(&info);
+                }
+            }
         }
         Command::Owner { image, json, path } => {
             print_lines(path_owners(&image.root, &path)?, json)?
@@ -3033,8 +3156,98 @@ fn run(command: Command) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_image_status(root: &Path) -> Result<()> {
+/// Whether a package name, or its last component, matches a `*`/`?` pattern.
+fn name_matches(pattern: &str, name: &str) -> bool {
+    fn glob(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((b'*', rest)) => (0..=text.len()).any(|skip| glob(rest, &text[skip..])),
+            Some((b'?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
+            Some((byte, rest)) => text.first() == Some(byte) && glob(rest, &text[1..]),
+        }
+    }
+    let last = name.rsplit('/').next().unwrap_or(name);
+    glob(pattern.as_bytes(), name.as_bytes()) || glob(pattern.as_bytes(), last.as_bytes())
+}
+
+fn print_package_info(info: &PackageInfo) {
+    let version = match (&info.installed_version, info.installed) {
+        (_, true) => format!("{} (installed)", info.version),
+        (Some(installed), false) => format!("{} (available; {installed} installed)", info.version),
+        (None, false) => format!("{} (available)", info.version),
+    };
+    let rows = [
+        ("Name", Some(info.name.as_str())),
+        ("Publisher", Some(info.publisher.as_str())),
+        ("Version", Some(version.as_str())),
+        ("Upstream", info.upstream_version.as_deref()),
+        ("Summary", info.summary.as_deref()),
+        ("License", info.license.as_deref()),
+        ("Homepage", info.homepage.as_deref()),
+        ("Package ID", Some(info.id.as_str())),
+    ];
+    for (label, value) in rows {
+        if let Some(value) = value {
+            println!("{:<11}{value}", format!("{label}:"));
+        }
+    }
+}
+
+fn print_progress(progress: &cps::TransactionProgress, json: bool) -> Result<()> {
+    if json {
+        return print_json(progress);
+    }
+    let phase = serde_json::to_value(progress.phase)?;
+    let phase = phase.as_str().unwrap_or_default().replace('_', " ");
+    println!("Plan {}", progress.plan_id);
+    println!("Phase {phase}");
+    println!("Revision {}", progress.revision);
+    if let Some(environment) = &progress.boot_environment {
+        println!("Boot environment {environment}");
+    }
+    Ok(())
+}
+
+fn print_history_entry(entry: &cps::HistoryEntry) {
+    let details = &entry.details;
+    println!("Plan {}", entry.plan_id);
+    println!(
+        "Revision {} from {} revision {}",
+        entry.revision, details.base_image, details.base_revision
+    );
+    println!("Operation {}", details.request.operation());
+    print_package_changes(&details.package_changes);
+    for change in &details.intent_changes {
+        let mark = if change.requested {
+            "locally requested"
+        } else {
+            "automatic"
+        };
+        println!("Mark {} as {mark}", change.package);
+    }
+    for change in &details.freeze_changes {
+        match &change.to {
+            Some(frozen) => println!("Freeze {} at {}", change.name, frozen.version),
+            None => println!("Unfreeze {}", change.name),
+        }
+    }
+    println!(
+        "{} path changes, {} payload bytes, {} systemd actions",
+        details.planned_path_changes, details.payload_bytes, details.systemd_actions
+    );
+    if let Some(release) = &details.kernel_release {
+        println!("Kernel {release}");
+    }
+    for (publisher, catalog) in &details.catalogs {
+        println!("Catalog {publisher} {catalog}");
+    }
+}
+
+fn print_image_status(root: &Path, json: bool) -> Result<()> {
     let status = transaction_status(root)?;
+    if json {
+        return print_json(&status);
+    }
     let Some(pending) = status.pending else {
         println!("Image revision {}", status.revision);
         println!("No pending transaction");
@@ -3065,9 +3278,27 @@ fn print_image_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn print_system_status(system: &System) -> Result<()> {
+fn print_system_status(system: &System, json: bool) -> Result<()> {
     let (running, entries) = system.boot_status()?;
     let status = transaction_status(Path::new("/"))?;
+    let next_boot = entries
+        .iter()
+        .find(|entry| entry.is_default && entry.id != running)
+        .map(|entry| entry.id.clone());
+    let trial = entries
+        .iter()
+        .any(|entry| entry.id == running && entry.tries_left.is_some());
+    let freshness = system.publisher_freshness();
+    if json {
+        return print_json(&serde_json::json!({
+            "running": running,
+            "revision": status.revision,
+            "pending": status.pending,
+            "next_boot": next_boot,
+            "trial": trial,
+            "publishers": freshness?,
+        }));
+    }
     println!("Running {running}, package revision {}", status.revision);
     if let Some(pending) = status.pending {
         if pending.aborting {
@@ -3082,20 +3313,14 @@ fn print_system_status(system: &System) -> Result<()> {
             );
         }
     }
-    if let Some(next) = entries
-        .iter()
-        .find(|entry| entry.is_default && entry.id != running)
-    {
-        println!("Reboot pending into {}.", next.id);
-    } else if entries
-        .iter()
-        .any(|entry| entry.id == running && entry.tries_left.is_some())
-    {
+    if let Some(next) = next_boot {
+        println!("Reboot pending into {next}.");
+    } else if trial {
         println!("This system is running as a trial.");
     } else {
         println!("No reboot pending.");
     }
-    match system.publisher_freshness() {
+    match freshness {
         Ok(report) => report.iter().for_each(|freshness| println!("{freshness}")),
         Err(error) => eprintln!("cps: cannot report publisher freshness: {error:#}"),
     }
@@ -4188,8 +4413,84 @@ fn run_repo(command: RepoCommand) -> Result<()> {
     Ok(())
 }
 
+/// Top-level commands by task, in the order `cps --help` lists them.
+const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Change packages",
+        &[
+            "install",
+            "remove",
+            "autoremove",
+            "upgrade",
+            "repair",
+            "revert",
+            "freeze",
+            "unfreeze",
+            "mark",
+        ],
+    ),
+    (
+        "Inspect packages",
+        &[
+            "list", "search", "info", "policy", "owner", "contents", "deps", "rdeps", "why",
+            "verify",
+        ],
+    ),
+    (
+        "Configure an image",
+        &["facet", "variant", "mediator", "config", "publisher"],
+    ),
+    (
+        "Transactions and recovery",
+        &["status", "history", "resume", "abort", "fetch", "apply"],
+    ),
+    ("Images and boot environments", &["image", "boot"]),
+    (
+        "Build packages",
+        &["source", "recipe", "manifest", "build", "develop"],
+    ),
+    ("Publish packages", &["publish", "repo"]),
+];
+
+const TOP_LEVEL_EXAMPLES: &str = "\
+Commands act on the running system unless --root names an offline image.
+Run cps COMMAND --help for a command's options and examples.";
+
+/// The command line, with its top-level commands listed by task.
+fn cli() -> clap::Command {
+    let command = Cli::command();
+    let width = command
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().len())
+        .max()
+        .unwrap_or(0);
+    let mut groups = String::new();
+    for (heading, names) in COMMAND_GROUPS {
+        groups.push_str(&format!("{heading}:\n"));
+        for name in *names {
+            let about = command
+                .find_subcommand(name)
+                .and_then(|subcommand| subcommand.get_about())
+                .map(|about| about.to_string())
+                .unwrap_or_default();
+            groups.push_str(&format!("  {name:<width$}  {about}\n"));
+        }
+        groups.push('\n');
+    }
+    command
+        .help_template(format!(
+            "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{groups}\
+             Options:\n{{options}}{{after-help}}"
+        ))
+        .after_help(TOP_LEVEL_EXAMPLES)
+}
+
 fn main() -> ExitCode {
-    match run(Cli::parse().command) {
+    let command = match Cli::from_arg_matches(&cli().get_matches()) {
+        Ok(cli) => cli.command,
+        Err(error) => error.exit(),
+    };
+    match run(command) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("cps: {error:#}");
@@ -4220,7 +4521,23 @@ mod tests {
 
     #[test]
     fn command_line_is_consistent() {
-        with_stack(|| Cli::command().debug_assert());
+        with_stack(|| super::cli().debug_assert());
+    }
+
+    #[test]
+    fn help_lists_every_command_in_one_group() {
+        let command = Cli::command();
+        let mut grouped: Vec<_> = super::COMMAND_GROUPS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        let mut commands: Vec<_> = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .collect();
+        grouped.sort_unstable();
+        commands.sort_unstable();
+        assert_eq!(grouped, commands);
     }
 
     #[test]
@@ -4385,9 +4702,64 @@ mod tests {
     fn install_sources() {
         let error = parse(&["install"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-        let error = parse(&["install", "--profile", "pkg"]).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert!(parse(&["install", "--root", "img", "--profile", "pkg"]).is_err());
         parse(&["install", "--lock", "l.json", "--root", "img"]).unwrap();
+    }
+
+    #[test]
+    fn review_follow_ups_parse() {
+        with_stack(review_follow_ups);
+    }
+
+    fn review_follow_ups() {
+        parse(&["verify", "apps/htop", "--path", "usr/bin/htop"]).unwrap();
+        parse(&["status", "--json"]).unwrap();
+        parse(&["status", "--root", "img", "--plan", "p.json", "--json"]).unwrap();
+        parse(&["history", "--json", "0123"]).unwrap();
+        parse(&["list", "htop", "lib*"]).unwrap();
+        parse(&["info", "--manifest", "apps/htop"]).unwrap();
+        parse(&["image", "lock", "--export", "out"]).unwrap();
+        parse(&[
+            "repo",
+            "export",
+            "--repo",
+            "r",
+            "--trust-root",
+            "t",
+            "-o",
+            "out",
+        ])
+        .unwrap();
+        parse(&["build", "-o", "out", "r.kdl"]).unwrap();
+        parse(&["freeze", "--stage", "apps/htop"]).unwrap();
+        for args in [
+            ["info", "--manifest", "--json", "apps/htop"].as_slice(),
+            &["install", "--profile"],
+            &["install", "--lock", "l.json"],
+            &["remove", "--no-refresh", "apps/htop"],
+            &["build", "--repo", "r", "-o", "out", "r.kdl"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn list_patterns_match_names_or_their_last_component() {
+        for (pattern, name, expected) in [
+            ("htop", "apps/htop", true),
+            ("apps/htop", "apps/htop", true),
+            ("lib*", "library/libc", true),
+            ("library/*", "library/libc", true),
+            ("h?op", "apps/htop", true),
+            ("top", "apps/htop", false),
+            ("apps", "apps/htop", false),
+        ] {
+            assert_eq!(
+                super::name_matches(pattern, name),
+                expected,
+                "{pattern} {name}"
+            );
+        }
     }
 
     #[test]

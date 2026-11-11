@@ -4,7 +4,11 @@
 \&cps\-verify \- \&Check an image against its installed manifests, offline
 .SH SYNOPSIS
 .HP 4
-.B \&cps verify [OPTIONS]
+.B \&cps verify [OPTIONS] [PACKAGE]...
+.SH ARGUMENTS
+.TP
+.B \&[PACKAGE]...
+\&Limit file verification to these installed packages
 .SH OPTIONS
 .TP
 .B \&\-\-root <IMAGE>
@@ -12,9 +16,6 @@
 .TP
 .B \&\-\-pristine
 \&Require an inactive root with pristine package paths and no unmanaged entries
-.TP
-.B \&\-\-package <PACKAGE>
-\&Limit file verification to the installed package
 .TP
 .B \&\-\-path <PATH>
 \&Limit file verification to this managed path

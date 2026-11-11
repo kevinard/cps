@@ -99,7 +99,7 @@ CPS never installs an optional package on its own.
 
 The catalog signs each package's summary and manifest digest, and the digest
 covers every other field. To change the metadata of a published package,
-publish a new version. `cps info NAME` prints the whole manifest.
+publish a new version. `cps info --manifest NAME` prints the whole manifest.
 
 ## Versions
 

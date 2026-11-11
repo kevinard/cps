@@ -88,9 +88,11 @@ fetches before it applies the change. The change can be staged in a boot
 environment and resumed like an ordinary plan. Rules also apply to packages
 that you install later.
 
-The running system does not support `facet set` or `variant set`. To
-change facets or variants on a running Btrfs system, capture the root, save
-a plan against the capture, and stage it, as described in
+On the running system, `facet set` and `variant set` work like any other
+change. CPS applies them live unless a path they write needs a reboot, and
+then stages them in a trial boot environment. Pass `--stage` to stage the
+change in every case. To review the change against a copy first, capture
+the root, save a plan against the capture, and stage it, as described in
 [Capturing a running Btrfs root](../setups/btrfs.md#capturing-a-running-btrfs-root).
 
 Disabling a facet records the identity and fingerprint of any edited or

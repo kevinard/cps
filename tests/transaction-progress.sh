@@ -26,7 +26,7 @@ done
 "$cps" install --root image -n --save-plan two.json test/two
 
 progress() {
-    "$cps" status --root image "${@:1:$#-1}" --plan "${@: -1}"
+    "$cps" status --json --root image "${@:1:$#-1}" --plan "${@: -1}"
 }
 planned=$(progress one.json)
 plan_id=$(jq -er '.plan_id | select(test("^[0-9a-f]{64}$"))' <<< "$planned")
@@ -44,7 +44,7 @@ test ! -e image/one
 progress one.json | jq -e --arg id "$plan_id" \
     '.plan_id == $id and .phase == "applied" and .revision == 1'
 progress two.json | jq -e '.phase == "superseded" and .revision == 1'
-if "$cps" status --root other --plan one.json; then
+if "$cps" status --json --root other --plan one.json; then
     echo 'a plan from an unrelated image must fail' >&2
     exit 1
 fi

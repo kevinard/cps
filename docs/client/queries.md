@@ -51,11 +51,13 @@ lists them. The full rules are in [Versions](../maintainer/manifests.md#versions
 
 ```sh
 cps list --root image
+cps list --root image 'lib*' editor
 cps list --root image --intent
 cps list --root image --available --all-versions
 cps search --root image hello
 cps info --root image demo/hello
 cps info --root image --available demo/hello@1.0.0-0
+cps info --root image --manifest demo/hello
 cps policy --root image --probe demo/hello@1.0.0-0
 ```
 
@@ -63,16 +65,26 @@ cps policy --root image --probe demo/hello@1.0.0-0
 With `--available` it shows the newest version of each package in the
 signed catalog, and `--all-versions` adds every version from every
 publisher. `list --intent` shows effective local requests separately from
-the roles in the applied signed profile.
+the roles in the applied signed profile, and `list --frozen` shows
+[freezes](configuration.md) with their reasons. Name patterns narrow any
+of these lists: a pattern matches the full name or its last component, so
+`editor` matches `apps/editor`, and `*` and `?` are wildcards. `list` fails
+when no package matches.
 
 `search` matches name and summary fragments case-insensitively and shows the
 signed summary when present. Use `--installed` to search installed packages.
 Add `--json` to `list` or `search` for machine-readable output.
 
-`info` prints the verified manifest in KDL, including the summary, license,
-and homepage, optional dependency descriptions, requirements, triggers, and
-file actions. It accepts any selector. Installed queries work offline.
-Available queries use the configured local repository or cache.
+`info` describes a package from its verified manifest: name, publisher,
+version, upstream version, summary, license, and homepage. It shows the
+installed package, and the newest available version when the package is
+not installed. `--available` shows the catalog version even when the
+package is installed, with the installed version next to it. `--manifest`
+prints the whole verified manifest in KDL, with optional dependency
+descriptions, requirements, triggers, and file actions, and `--json` prints
+the description as JSON. `info` accepts any selector. Installed queries
+work offline. Available queries use the configured local repository or
+cache.
 
 `policy` lists candidate versions in publisher order with their verified
 catalog pins, the preferred source, active freeze, signed profile manifests,

@@ -167,6 +167,7 @@ impl fmt::Display for ProfileRole {
 #[derive(Debug, Serialize)]
 pub struct PackageIntentRow {
     pub id: String,
+    pub name: String,
     pub requested: bool,
     pub profile: ProfileRole,
 }
@@ -335,6 +336,7 @@ pub(crate) fn intent_row(
     };
     PackageIntentRow {
         id: manifest.id(),
+        name: name.clone(),
         requested: intent.local.contains(name),
         profile,
     }
@@ -988,8 +990,83 @@ fn matches_installed(package: &Installed, selector: &PackageSpec<'_>) -> bool {
             .is_none_or(|publisher| publisher == manifest.publisher)
 }
 
+/// Where `cps info` looks for a package's manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManifestSource {
+    /// The installed package only.
+    Installed,
+    /// The configured signed catalogs only.
+    Catalog,
+    /// The installed package, or the catalogs when it is not installed.
+    InstalledOrCatalog,
+}
+
+/// A package's identity and descriptive metadata, as `cps info` shows it.
+#[derive(Debug, Serialize)]
+pub struct PackageInfo {
+    pub id: String,
+    pub name: String,
+    pub publisher: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// Whether this manifest is the installed one rather than a catalog entry.
+    pub installed: bool,
+    /// The installed version when the manifest comes from a catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+}
+
 /// Return the verified manifest for a package in KDL.
 pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<String> {
+    let source = if from_catalog {
+        ManifestSource::Catalog
+    } else {
+        ManifestSource::Installed
+    };
+    manifest_from(root, spec, source)
+}
+
+/// Return the verified manifest for a package from `source` in KDL.
+pub fn manifest_from(root: &Path, spec: &str, source: ManifestSource) -> Result<String> {
+    Ok(manifest_text(&select_manifest(root, spec, source)?.0))
+}
+
+/// Describe a package from its verified manifest.
+pub fn package_info(root: &Path, spec: &str, source: ManifestSource) -> Result<PackageInfo> {
+    let (manifest, installed) = select_manifest(root, spec, source)?;
+    let is_installed = installed.as_ref() == Some(&manifest.version);
+    Ok(PackageInfo {
+        id: format!(
+            "cps://{}/{}@{}",
+            manifest.publisher, manifest.name, manifest.version
+        ),
+        name: manifest.name,
+        publisher: manifest.publisher,
+        version: manifest.version.to_string(),
+        upstream_version: manifest.upstream_version,
+        summary: manifest.summary,
+        license: manifest.license,
+        homepage: manifest.homepage,
+        installed: is_installed && source != ManifestSource::Catalog,
+        installed_version: installed
+            .filter(|_| !is_installed || source == ManifestSource::Catalog)
+            .map(|version| version.to_string()),
+    })
+}
+
+/// The selected verified manifest and the installed version of the package.
+fn select_manifest(
+    root: &Path,
+    spec: &str,
+    source: ManifestSource,
+) -> Result<(Manifest, Option<Version>)> {
     let selector = PackageSpec::parse(spec)?;
     let image = Image::open_query(root)?;
     image.require_clean()?;
@@ -1009,6 +1086,16 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
             .version
             .as_ref()
             .is_none_or(|wanted| wanted == version)
+    };
+    let installed_version = installed
+        .as_ref()
+        .map(|package| package.published.manifest.version.clone());
+    let from_catalog = match source {
+        ManifestSource::Installed => false,
+        ManifestSource::Catalog => true,
+        ManifestSource::InstalledOrCatalog => !installed
+            .as_ref()
+            .is_some_and(|package| matches_installed(package, &selector)),
     };
     let package = if from_catalog {
         let settings = image.settings()?;
@@ -1059,7 +1146,7 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
                     })?;
                 let package =
                     read_package(&publisher.repo, &publisher.name, &entry.id, &entry.entry)?;
-                return Ok(manifest_text(&package.manifest));
+                return Ok((package.manifest, installed_version));
             }
         }
         anyhow::bail!("package is absent from the signed catalog: {spec}")
@@ -1072,5 +1159,5 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
     if package.manifest.summary.is_some() || !package.manifest.optional_dependencies.is_empty() {
         verify_installed_metadata(&image)?;
     }
-    Ok(manifest_text(&package.manifest))
+    Ok((package.manifest, installed_version))
 }

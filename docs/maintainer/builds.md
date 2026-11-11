@@ -448,6 +448,19 @@ cps build --toolchain-config toolchain.kdl --source-cache source-cache \
     --output bundle --check-reproducible --key builder.der example.build.kdl
 ```
 
+A worker that builds many recipes can set the inputs once in its
+environment. When the matching option is absent, `build` and `develop` read
+`CPS_TOOLCHAIN_CONFIG` for `--toolchain-config`, `CPS_SOURCE_CACHE` for
+`--source-cache`, and `CPS_WORKER_CONFIG` for `--worker-config`. An explicit
+`--repo` with `--trust-root`, or `--sources`, takes precedence over the
+variable it replaces. CPS never picks up a configuration file from the
+current directory, so every input remains one that the caller chose.
+
+```sh
+export CPS_TOOLCHAIN_CONFIG=$PWD/toolchain.kdl CPS_SOURCE_CACHE=$PWD/source-cache
+cps build -o bundle --check-reproducible --key builder.der example.build.kdl
+```
+
 CPS verifies each trust root against its pin and reads the exact signed
 catalog from its local repository. Build evidence records the ordered pins
 and each selected package's publisher, version, and manifest digest. When a

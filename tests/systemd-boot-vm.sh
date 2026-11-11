@@ -942,7 +942,7 @@ if $profiled; then
     test ! -e "$staged_root/etc/cps-vm-previous-default"
     "$cps" info --root "$staged_root" --available test/previous-default > /dev/null
     trial_plan=$("$cps" history --root "$staged_root" --limit 2 | awk -F '\t' -v revision="$((base_revision + 1))" '$1 == revision && $3 == "upgrade (profile)" {print $2}')
-    "$cps" history --root "$staged_root" "$trial_plan" > trial-history.json
+    "$cps" history --json --root "$staged_root" "$trial_plan" > trial-history.json
     grep -Fq "\"kernel_release\": \"$trial_release\"" trial-history.json
     grep -Fq "\"base_revision\": $base_revision" trial-history.json
     "$cps" history --root base --limit 2 | grep -Fq $'\tinstall --profile'

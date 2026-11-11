@@ -86,7 +86,7 @@ installed commit. It reports a branch rewrite and leaves that package at its
 installed commit. `--dry-run` shows available Git commits without building,
 and `--no-refresh` uses the installed Git selections. CPS stages tracked
 updates in a new boot environment for rollback. `cps info NAME` shows the
-installed commit as `upstream-version`. That manifest is part of the boot
+installed commit as its upstream version. That manifest is part of the boot
 environment, so rollback restores the commit and the installed files
 together.
 

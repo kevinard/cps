@@ -13,6 +13,7 @@ This page covers what differs on the running root.
 - [Search, install, and upgrade](#search-install-and-upgrade)
 - [Check updates and diagnose held packages](#check-updates-and-diagnose-held-packages)
 - [Remove packages and select publishers](#remove-packages-and-select-publishers)
+- [Freeze packages and change settings](#freeze-packages-and-change-settings)
 - [How live changes apply](#how-live-changes-apply)
 - [Stage changes for the next boot](#stage-changes-for-the-next-boot)
   - [Local changes before the reboot](#local-changes-before-the-reboot)
@@ -120,6 +121,21 @@ Press Enter for the first choice or enter a number. Use
 select a version; see [package selectors](queries.md#package-selectors-and-versions).
 `--yes` and `--dry-run` use the configured search order. Installed packages
 keep their original publisher.
+
+## Freeze packages and change settings
+
+```sh
+sudo cps freeze --reason "Wait for the driver update" library/libdisplay
+cps list --frozen
+sudo cps unfreeze library/libdisplay
+```
+
+`freeze`, `unfreeze`, and `mark` only change recorded package state, so
+they apply at once and need no backup environment. `facet set`,
+`variant set`, `mediator set`, and `config resolve` can change files, and
+apply like `install`: live, or staged when a written path needs a reboot.
+`--stage` stages any of them. See [Configure an image](configuration.md)
+for what each one does.
 
 ## How live changes apply
 
@@ -310,9 +326,10 @@ files and what it cannot undo.
 
 Pass `--save-plan PATH` to a system package command to record the exact plan
 it displays. This also works with `--dry-run`. Use
-`cps status --plan PATH` to follow it in JSON. The report includes the
-plan's SHA-256, its phase, the revision, and the boot environment when
-applicable. Add `--validate` to check cached payloads for a plan that has
+`cps status --plan PATH` to follow it, and add `--json` for a report that
+scripts can read. The report includes the plan's SHA-256, its phase, the
+revision, and the boot environment when applicable. The JSON report spells
+phases in snake case, such as `prepared_for_boot`. Add `--validate` to check cached payloads for a plan that has
 not been applied yet. `payload_validated` describes the check made during
 that invocation. CPS rechecks the payloads at apply time.
 

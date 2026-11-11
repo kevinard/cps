@@ -25,11 +25,11 @@
 .B \&\-\-no\-recommends
 \&Skip recommended packages when resolving the transaction
 .TP
-.B \&\-\-no\-refresh
-\&Use the currently cached catalogs (images always plan from their cache)
-.TP
 .B \&\-\-stage
 \&Stage the change in a new Btrfs trial boot environment, or for repair and revert a verified recovery root, instead of changing the running root
+.TP
+.B \&\-\-no\-refresh
+\&Use the currently cached catalogs
 .TP
 .B \&\-\-check
 \&Report upgrades, blockers, and any reboot requirement without changing anything
@@ -48,5 +48,18 @@
 .TP
 .B \&\-h, \-\-help
 \&Print help
+.SH EXAMPLES
+.TP
+.B \&cps upgrade \-\-check
+\&Report available upgrades and blockers
+.TP
+.B \&cps upgrade
+\&Upgrade the running system
+.TP
+.B \&cps upgrade \-\-stage
+\&Stage the upgrade in a trial boot environment
+.TP
+.B \&cps upgrade \-\-root image \-y
+\&Upgrade an offline image
 .SH SEE ALSO
 .BR cps (1)

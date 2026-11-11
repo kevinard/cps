@@ -167,5 +167,5 @@ CONFIG
 "$cps" apply --root image install.json
 "$cps" verify --root image --pristine --runtime
 test -L image/usr/lib/libcps-demo.so.1
-"$cps" info --root image demo/runtime | grep -F 'version="3.0.0-0"'
+"$cps" info --manifest --root image demo/runtime | grep -F 'version="3.0.0-0"'
 echo 'Verified generated library capabilities and the signed ELF profile with a merged /usr and a companion publisher'

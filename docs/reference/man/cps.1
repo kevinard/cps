@@ -26,6 +26,7 @@ or a publisher-qualified name such as
 .BR \&cps://canopa/apps/editor@1.0.0\-0 .
 Supported selectors depend on the command.
 .SH COMMANDS
+.SS "\&Change packages"
 .TP
 .B \&cps\-install(1)
 \&Install packages
@@ -53,36 +54,7 @@ Supported selectors depend on the command.
 .TP
 .B \&cps\-mark(1)
 \&Change local request marks without installing or removing packages
-.TP
-.B \&cps\-facet(1)
-\&List or change facet rules
-.TP
-.B \&cps\-variant(1)
-\&List or change variants other than arch
-.TP
-.B \&cps\-mediator(1)
-\&List or select providers for mediated links
-.TP
-.B \&cps\-config(1)
-\&Review and resolve pending changes to preserved configuration
-.TP
-.B \&cps\-fetch(1)
-\&Fetch the verified payloads required by a saved plan
-.TP
-.B \&cps\-apply(1)
-\&Apply or resume a saved plan
-.TP
-.B \&cps\-status(1)
-\&Show an interrupted transaction, a pending reboot, or a saved plan's progress
-.TP
-.B \&cps\-resume(1)
-\&Finish an interrupted transaction
-.TP
-.B \&cps\-abort(1)
-\&Undo an interrupted transaction and keep the committed revision
-.TP
-.B \&cps\-history(1)
-\&List completed transactions, most recent first, or show one as JSON
+.SS "\&Inspect packages"
 .TP
 .B \&cps\-list(1)
 \&List installed packages, available versions, local intent, or freezes
@@ -91,7 +63,7 @@ Supported selectors depend on the command.
 \&Search for packages by name, summary, or a file they ship
 .TP
 .B \&cps\-info(1)
-\&Show an installed or available package's manifest in KDL
+\&Describe an installed package, or the newest available version of another
 .TP
 .B \&cps\-policy(1)
 \&Show package candidates, publisher order, and image constraints
@@ -113,15 +85,49 @@ Supported selectors depend on the command.
 .TP
 .B \&cps\-verify(1)
 \&Check an image against its installed manifests, offline
+.SS "\&Configure an image"
+.TP
+.B \&cps\-facet(1)
+\&List or change facet rules
+.TP
+.B \&cps\-variant(1)
+\&List or change variants other than arch
+.TP
+.B \&cps\-mediator(1)
+\&List or select providers for mediated links
+.TP
+.B \&cps\-config(1)
+\&Review and resolve pending changes to preserved configuration
 .TP
 .B \&cps\-publisher(1)
 \&Manage an image's ordered set of trusted publishers
+.SS "\&Transactions and recovery"
+.TP
+.B \&cps\-status(1)
+\&Show an interrupted transaction, a pending reboot, or a saved plan's progress
+.TP
+.B \&cps\-history(1)
+\&List completed transactions, most recent first, or show one
+.TP
+.B \&cps\-resume(1)
+\&Finish an interrupted transaction
+.TP
+.B \&cps\-abort(1)
+\&Undo an interrupted transaction and keep the committed revision
+.TP
+.B \&cps\-fetch(1)
+\&Fetch the verified payloads required by a saved plan
+.TP
+.B \&cps\-apply(1)
+\&Apply or resume a saved plan
+.SS "\&Images and boot environments"
 .TP
 .B \&cps\-image(1)
 \&Create, compare, lock, and write images
 .TP
 .B \&cps\-boot(1)
 \&Stage, activate, and manage boot environments
+.SS "\&Build packages"
 .TP
 .B \&cps\-source(1)
 \&Prepare pinned package sources for offline builds
@@ -137,6 +143,7 @@ Supported selectors depend on the command.
 .TP
 .B \&cps\-develop(1)
 \&Run a shell or command with a recipe's verified toolchain and sources
+.SS "\&Publish packages"
 .TP
 .B \&cps\-publish(1)
 \&Publish manifests, build bundles, or releases to a local repository

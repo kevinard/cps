@@ -18,21 +18,21 @@
 \&Trust root file that matches the recipe's key\-sha256 pin and names the publisher
 .TP
 .B \&\-\-toolchain\-config <TOOLCHAIN_CONFIG>
-\&Worker\-local repository and trust key locations for the pinned publishers
+\&Worker\-local repository and trust key locations for the pinned publishers [default: $CPS_TOOLCHAIN_CONFIG unless \-\-repo is given]
 .TP
 .B \&\-\-sources <SOURCES>
 \&Directory of the recipe's source inputs at their recipe paths
 .TP
 .B \&\-\-source\-cache <SOURCE_CACHE>
-\&Source cache filled by cps source fetch or cps source import
+\&Source cache filled by cps source fetch or cps source import [default: $CPS_SOURCE_CACHE unless \-\-sources is given]
 .TP
 .B \&\-\-worker\-config <WORKER_CONFIG>
-\&Build worker limits: time, scratch space, file, output, and log sizes, and jobs
+\&Build worker limits: time, scratch space, file, output, and log sizes, and jobs [default: $CPS_WORKER_CONFIG]
 .TP
 .B \&\-\-option <NAME=VALUE>
 \&Override a build option declared in the recipe
 .TP
-.B \&\-\-output <OUTPUT>
+.B \&\-o, \-\-output <OUTPUT>
 \&New directory for the build bundle: recipe, templates, manifests, and proto tree
 .TP
 .B \&\-\-check\-reproducible

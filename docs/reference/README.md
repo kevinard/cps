@@ -3,8 +3,8 @@
 [Documentation](../README.md) · [Quickstart](../quickstart.md) ·
 [Concepts](../concepts.md)
 
-Use `cps --help` to list commands and `cps COMMAND --help` for arguments
-and options. For a nested command, use the full path, for example
+Use `cps --help` to list commands by task and `cps COMMAND --help` for
+arguments, options, and examples. For a nested command, use the full path, for example
 `cps repo sync --help` or `cps repo trust rotate --help`. Follow the
 synopsis for the command you are using.
 
@@ -13,9 +13,13 @@ they change the running system described by `--config`, which defaults to
 `/etc/cps/image.kdl`. With `--root IMAGE`, they change that inactive image:
 they plan the change, ask for confirmation, fetch its payloads, and apply
 it. `-y` confirms without a prompt, `-n` previews the change, and
-`--save-plan PLAN` writes the plan for `cps fetch` and `cps apply`. Query
-commands read the running system unless you pass `--root`, and many accept
-`--json`. Signing commands take the private key as `--key`.
+`--save-plan PLAN` writes the plan for `cps fetch` and `cps apply`.
+`--stage` stages a change on the running system in a trial boot
+environment, and `install` and `upgrade` accept `--no-refresh` to plan from
+the cached catalogs. Query and status commands read the running system
+unless you pass `--root`, print text, and accept `--json` for scripts.
+Signing commands take the private key as `--key`, and commands that write a
+new directory or file take it as `-o`/`--output`.
 
 ## Man pages
 

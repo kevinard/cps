@@ -236,7 +236,7 @@ mv repo repo-offline
 "$cps" resume --root recover
 "$cps" status --root recover | grep -Fx 'No pending transaction'
 plan_id=$("$cps" history --root recover --limit 1 | awk -F '\t' '$1 == 2 && $3 == "upgrade" {print $2}')
-"$cps" history --root recover "$plan_id" > completed.json
+"$cps" history --json --root recover "$plan_id" > completed.json
 grep -Fq '"systemd_actions": 5' completed.json
 "$cps" verify --root recover
 test "$(grep -c "^$user:" recover/etc/passwd)" = 1

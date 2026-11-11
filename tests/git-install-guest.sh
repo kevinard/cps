@@ -10,7 +10,7 @@ pinned=$work/pinned
 
 check_package() {
     test "$($bb cat "/usr/share/git-$1")" = "$2"
-    cps info "test/git-$1" | $bb grep -E "upstream-version=\"?$3\"?( |$)"
+    cps info --manifest "test/git-$1" | $bb grep -E "upstream-version=\"?$3\"?( |$)"
 }
 
 if [ -f "$work/git-phase" ]; then

@@ -65,7 +65,7 @@ install_base image
 
 # Publication generated the soname and version requirements of demo/app,
 # so the solver refuses to drop their provider.
-"$cps" info --root image demo/app | grep -Fx "    require-capability \"$library_capability\""
+"$cps" info --manifest --root image demo/app | grep -Fx "    require-capability \"$library_capability\""
 reject_plan remove demo/runtime
 "$cps" mark --root image -n --save-plan mark.json automatic demo/runtime
 "$cps" apply --root image mark.json

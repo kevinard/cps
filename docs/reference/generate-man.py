@@ -15,13 +15,17 @@ def read_help(binary, command):
         env={**os.environ, "LC_ALL": "C", "NO_COLOR": "1"},
     ).rstrip()
     description, body = output.split("\n\nUsage: ", 1)
-    synopsis, *blocks = re.split(r"\n\n(?=(?:Arguments|Commands|Options):\n)", body)
+    synopsis, *blocks = re.split(r"\n\n(?=[A-Z][^\n]*:\n)", body)
     sections = {}
     for block in blocks:
         heading, rows = block.split(":\n", 1)
         entries = []
         for line in rows.splitlines():
             if not line.strip():
+                continue
+            if not line.startswith(" "):
+                # Unindented text after a section is closing prose, such as after_help notes.
+                sections.setdefault(NOTES, []).append((line, ""))
                 continue
             if line.startswith("          "):
                 term, detail = entries[-1]
@@ -31,6 +35,25 @@ def read_help(binary, command):
             entries.append((term, detail))
         sections[heading] = entries
     return description, synopsis, sections
+
+
+NOTES = "Notes"
+NOT_COMMANDS = {"Arguments", "Options", "Examples", NOTES}
+
+
+def command_groups(sections):
+    """The help sections that list subcommands: Commands, or the top level's task groups."""
+    return {
+        heading: [(name, summary) for name, summary in entries if name != "help"]
+        for heading, entries in sections.items()
+        if heading not in NOT_COMMANDS
+        and entries
+        and all(not name.startswith("-") and " " not in name for name, _ in entries)
+    }
+
+
+def command_names(sections):
+    return [name for entries in command_groups(sections).values() for name, _ in entries]
 
 
 def roff(value):
@@ -67,6 +90,9 @@ def format_help(description, synopsis, sections, nested=False):
     elif "\n" in description or ". " in description:
         lines += [".SH DESCRIPTION", roff(description.replace("\n", " "))]
     for heading, entries in sections.items():
+        if heading == NOTES:
+            lines += [".PP", roff(" ".join(text for text, _ in entries))]
+            continue
         if nested:
             lines += [".PP", f".B {heading}"]
         else:
@@ -81,7 +107,7 @@ def command_page(binary, command):
     summary = description.splitlines()[0].partition(". ")[0].rstrip(".")
     lines = page_header(name, summary, synopsis)
     lines += format_help(description, synopsis, sections)
-    if "Commands" in sections:
+    if command_names(sections):
         lines.append(".SH SUBCOMMAND REFERENCE")
         lines += subcommand_reference(binary, command, sections)
     lines += [".SH SEE ALSO", ".BR cps (1)"]
@@ -91,21 +117,19 @@ def command_page(binary, command):
 def subcommand_reference(binary, command, sections):
     """Document every subcommand, including nested groups such as cps repo trust."""
     lines = []
-    for child, _ in sections["Commands"]:
-        if child == "help":
-            continue
+    for child in command_names(sections):
         child_command = (*command, child)
         help_text = read_help(binary, child_command)
         lines.append(f'.SS "{roff("cps " + " ".join(child_command))}"')
         lines += format_help(*help_text, nested=True)
-        if "Commands" in help_text[2]:
+        if command_names(help_text[2]):
             lines += subcommand_reference(binary, child_command, help_text[2])
     return lines
 
 
 def manual(binary):
     _, synopsis, sections = read_help(binary, ())
-    names = [name for name, _ in sections["Commands"] if name != "help"]
+    names = command_names(sections)
     lines = page_header("cps", "Canopa Package System", synopsis)
     lines += [
         ".SH DESCRIPTION",
@@ -130,13 +154,12 @@ def manual(binary):
         "Supported selectors depend on the command.",
         ".SH COMMANDS",
     ]
-    entries = [
-        (f"cps-{name}(1)", summary)
-        for name, summary in sections["Commands"]
-        if name != "help"
-    ]
-    entries.append(("cps help [COMMAND ...]", "Show help for CPS or a specific subcommand."))
-    lines += definition_list(entries)
+    for heading, entries in command_groups(sections).items():
+        lines.append(f'.SS "{roff(heading)}"')
+        lines += definition_list([(f"cps-{name}(1)", summary) for name, summary in entries])
+    lines += definition_list(
+        [("cps help [COMMAND ...]", "Show help for CPS or a specific subcommand.")]
+    )
     lines += [".SH OPTIONS", *definition_list(sections["Options"])]
     lines += [
         ".SH FILES",

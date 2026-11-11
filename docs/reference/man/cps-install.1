@@ -29,22 +29,27 @@
 .B \&\-\-no\-recommends
 \&Skip recommended packages when resolving the transaction
 .TP
-.B \&\-\-no\-refresh
-\&Use the currently cached catalogs (images always plan from their cache)
-.TP
 .B \&\-\-stage
 \&Stage the change in a new Btrfs trial boot environment, or for repair and revert a verified recovery root, instead of changing the running root
 .TP
+.B \&\-\-no\-refresh
+\&Use the currently cached catalogs
+.TP
 .B \&\-\-exact
 \&Reconcile the image to exactly these packages and their dependencies
+.TP
+.B \&\-h, \-\-help
+\&Print help (see a summary with '\-h')
+.SH IMAGE PROVISIONING
 .TP
 .B \&\-\-profile
 \&Install the configured signed release profile into an image with no packages
 .TP
 .B \&\-\-lock <LOCK>
 \&Install the exact composition of this image lock into a newly created image
+.SH GIT SOURCE
 .TP
-.B \&\-\-git <GIT>
+.B \&\-\-git <URL>
 \&Build and install the package described by cps.kdl in this Git repository
 .TP
 .B \&\-\-commit <COMMIT>
@@ -58,8 +63,20 @@
 .TP
 .B \&\-\-require\-signed <REQUIRE_SIGNED>
 \&Which Git object must carry the allowed signature Possible values: \- commit: The installed commit itself \- tag:    An annotated tag that points at the installed commit [default: commit]
+.SH EXAMPLES
 .TP
-.B \&\-h, \-\-help
-\&Print help (see a summary with '\-h')
+.B \&cps install apps/htop
+\&Install on the running system
+.TP
+.B \&cps install \-n apps/htop
+\&Preview the transaction only
+.TP
+.B \&cps install \-\-root image \-y apps/htop
+\&Install into an offline image
+.TP
+.B \&cps install \-\-root image \-n \-\-save\-plan plan.json apps/htop
+\&Save the plan for cps fetch and cps apply
+.PP
+.B \&cps install \-\-git https://example.org/tool.git \-\-track\-branch main
 .SH SEE ALSO
 .BR cps (1)

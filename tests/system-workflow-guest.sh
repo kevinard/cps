@@ -39,7 +39,7 @@ if [ "$version" = 2.0.0-0 ]; then
     $bb grep -Fx 'alice:x:1000:1000::/home/alice:/bin/sh' /etc/passwd
     test ! -e /run/cps/finalize-trial
     echo 'CPS_VM_SYSTEM: /etc edits made after staging reached the trial'
-    progress=$(cps status --plan /volume/@captures/upgrade.json)
+    progress=$(cps status --json --plan /volume/@captures/upgrade.json)
     printf '%s\n' "$progress" | $bb grep -F '"phase": "booted_known_good"'
     printf '%s\n' "$progress" | $bb grep -F "$($bb cat /volume/@captures/upgrade-plan-id)"
     echo 'CPS_VM_SYSTEM: staged upgrade booted with the live package'
@@ -110,7 +110,7 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     test "$(cps-demo)" = 2.0.0-0
     cps verify --root /
     cps status | $bb grep -Fx 'No reboot pending.'
-    cps status --plan /volume/@captures/upgrade.json | $bb grep -F '"phase": "inactive_boot_environment"'
+    cps status --json --plan /volume/@captures/upgrade.json | $bb grep -F '"phase": "inactive_boot_environment"'
     echo 'CPS_VM_SYSTEM: rolled back to the base with the live package'
 
     # Removals must use installed state even when a configured mirror is unavailable.
@@ -164,7 +164,7 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     test "$(environments)" = "$before"
     test ! -e /usr/bin/cps-demo
     cps install --yes --save-plan /run/cps-install.json test/cps-demo
-    cps status --plan /run/cps-install.json | $bb grep -F '"phase": "applied"'
+    cps status --json --plan /run/cps-install.json | $bb grep -F '"phase": "applied"'
     test "$(cps-demo)" = 1.0.0-0
     test "$(environments)" = "$before"
     # The live install saved the previous root without selecting it.
@@ -180,7 +180,7 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     recovery=$(cps repair --yes --stage --save-plan /run/cps-repair.json --path /usr/bin/cps-demo)
     recovery=$(printf '%s\n' "$recovery" | $bb sed -n 's/^Prepared recovery root //p')
     test -n "$recovery"
-    cps status --plan /run/cps-repair.json | $bb grep -F '"phase": "prepared_for_boot"'
+    cps status --json --plan /run/cps-repair.json | $bb grep -F '"phase": "prepared_for_boot"'
     test "$($bb cat /usr/bin/cps-demo)" = damaged
     test "$("$recovery/usr/bin/cps-demo")" = 1.0.0-0
     cps verify --root "$recovery"
@@ -190,6 +190,18 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     test "$(cps-demo)" = 1.0.0-0
     test "$(environments)" = "$before"
     echo 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image'
+    # Settings changes apply to the running system and need no backup.
+    cps freeze --dry-run test/cps-demo | $bb grep -Fx 'Freeze test/cps-demo at 1.0.0-0'
+    cps freeze --yes --reason 'Hold for the test' test/cps-demo
+    cps list --frozen cps-demo | $bb grep -F 'test/cps-demo	1.0.0-0	"Hold for the test"'
+    cps mark --yes automatic test/cps-demo
+    cps list --intent cps-demo | $bb grep -F '	-	'
+    cps mark --yes explicit test/cps-demo
+    cps unfreeze --yes test/cps-demo
+    test "$(cps list --frozen)" = "$(printf 'PACKAGE\tVERSION\tREASON')"
+    test "$(environments)" = "$before"
+    cps history --limit 4 | $bb grep -F '	freeze'
+    echo 'CPS_VM_SYSTEM: froze, marked, and unfroze a package on the running system'
     report=$(cps upgrade --check --no-refresh --json)
     printf '%s\n' "$report" | $bb grep -F '"status": "up_to_date"'
     printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
@@ -214,13 +226,13 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     : > /run/cps-demo-fail
     if cps upgrade --yes > /run/rejected 2>&1; then exit 1; fi
     $bb grep -F 'live systemd restart failed' /run/rejected
-    cps status --plan /volume/@captures/live-upgrade.json | $bb grep -F '"phase": "applying"'
+    cps status --json --plan /volume/@captures/live-upgrade.json | $bb grep -F '"phase": "applying"'
     if systemctl is-active --quiet cps-demo.service; then exit 1; fi
     exec $bb reboot -nf
 fi
 before=$(environments)
 cps resume
-cps status --plan /volume/@captures/live-upgrade.json | $bb grep -F '"phase": "applied"'
+cps status --json --plan /volume/@captures/live-upgrade.json | $bb grep -F '"phase": "applied"'
 echo 'CPS_VM_SYSTEM: resumed a failed live restart after reboot'
 test "$(cps-demo)" = 2.0.0-0
 verify_service 2.0.0-0
@@ -236,10 +248,10 @@ else
     cps upgrade --dry-run | $bb grep -F 'test/live-root declares requires-reboot in its manifest'
 fi
 cps upgrade --dry-run --save-plan /volume/@captures/upgrade.json
-cps status --plan /volume/@captures/upgrade.json | $bb grep -F '"phase": "planned"'
-cps status --plan /volume/@captures/upgrade.json --validate | $bb grep -F '"phase": "payload_validated"'
+cps status --json --plan /volume/@captures/upgrade.json | $bb grep -F '"phase": "planned"'
+cps status --json --plan /volume/@captures/upgrade.json --validate | $bb grep -F '"phase": "payload_validated"'
 cps upgrade --yes --save-plan /volume/@captures/upgrade.json
-progress=$(cps status --plan /volume/@captures/upgrade.json)
+progress=$(cps status --json --plan /volume/@captures/upgrade.json)
 printf '%s\n' "$progress" | $bb grep -F '"phase": "staged_for_boot"'
 printf '%s\n' "$progress" | $bb sed -n 's/^ *"plan_id": "\([0-9a-f]*\)",$/\1/p' > /volume/@captures/upgrade-plan-id
 test -s /volume/@captures/upgrade-plan-id

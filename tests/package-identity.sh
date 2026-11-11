@@ -70,10 +70,10 @@ for architecture in x86_64 aarch64; do
 done
 "$cps" search --root x86_64 imports/arch | grep -F 'imports/arch@1.0.0-0'
 test "$("$cps" search --root aarch64 imports/arch)" = $'PACKAGE\tSTATE\tSUMMARY'
-"$cps" info --root aarch64 --available imports/zlib@1:1.3.2-4 | grep -F 'upstream-version="1:1.3.2-4"'
-"$cps" info --root x86_64 --available imports/glibc@2.44+r50+g1848099f063e-1 | grep -F 'upstream-version="2.44+r50+g1848099f063e-1"'
+"$cps" info --manifest --root aarch64 --available imports/zlib@1:1.3.2-4 | grep -F 'upstream-version="1:1.3.2-4"'
+"$cps" info --manifest --root x86_64 --available imports/glibc@2.44+r50+g1848099f063e-1 | grep -F 'upstream-version="2.44+r50+g1848099f063e-1"'
 "$cps" install --root x86_64 -n --save-plan install.json cps://imports/imports/zlib@1:1.3.2-4 imports/consumer
 "$cps" apply --root x86_64 install.json
-"$cps" info --root x86_64 imports/zlib | grep -F 'upstream-version="1:1.3.2-4"'
-"$cps" info --root x86_64 imports/release-candidate | grep -F 'version="3.0.0~rc10-1"'
+"$cps" info --manifest --root x86_64 imports/zlib | grep -F 'upstream-version="1:1.3.2-4"'
+"$cps" info --manifest --root x86_64 imports/release-candidate | grep -F 'version="3.0.0~rc10-1"'
 "$cps" verify --root x86_64
