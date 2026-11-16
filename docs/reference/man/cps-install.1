@@ -38,6 +38,9 @@
 .B \&\-\-exact
 \&Reconcile the image to exactly these packages and their dependencies
 .TP
+.B \&\-\-build\-deps
+\&Install the build dependencies from each package's verified archived recipe
+.TP
 .B \&\-h, \-\-help
 \&Print help (see a summary with '\-h')
 .SH IMAGE PROVISIONING
@@ -70,6 +73,9 @@
 .TP
 .B \&cps install \-n apps/htop
 \&Preview the transaction only
+.TP
+.B \&cps install \-\-build\-deps apps/htop
+\&Install the package's build dependencies
 .TP
 .B \&cps install \-\-root image \-y apps/htop
 \&Install into an offline image

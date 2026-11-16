@@ -571,7 +571,11 @@ impl System {
         );
         self.check_running()?;
         let deferred = self.refresh_for_request(&request, refresh)?;
-        if let (Request::Install { packages }, Some(choose)) = (&mut request, choose) {
+        if let (
+            Request::Install { packages } | Request::InstallBuildDeps { packages },
+            Some(choose),
+        ) = (&mut request, choose)
+        {
             select_install_sources(Path::new(ROOT), packages, choose)?;
         }
         let (plan, services) = plan_system(
@@ -1067,7 +1071,9 @@ impl System {
         let upgrade = matches!(request, Request::Update);
         let installs = matches!(
             request,
-            Request::Install { .. } | Request::ExactInstall { .. }
+            Request::Install { .. }
+                | Request::InstallBuildDeps { .. }
+                | Request::ExactInstall { .. }
         );
         if refresh && (upgrade || installs) {
             self.refresh_configured_mirrors(upgrade)?;

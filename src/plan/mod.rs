@@ -61,6 +61,9 @@ pub enum Request {
     Install {
         packages: Vec<String>,
     },
+    InstallBuildDeps {
+        packages: Vec<String>,
+    },
     ExactInstall {
         packages: Vec<String>,
     },
@@ -127,6 +130,7 @@ impl Request {
     pub fn operation(&self) -> &'static str {
         match self {
             Self::Install { .. } => "install",
+            Self::InstallBuildDeps { .. } => "install --build-deps",
             Self::ExactInstall { .. } => "install --exact",
             Self::InstallProfile => "install --profile",
             Self::InstallLock { .. } => "install --lock",
@@ -844,6 +848,7 @@ fn plan_with_state(
         && matches!(
             request,
             Request::Install { .. }
+                | Request::InstallBuildDeps { .. }
                 | Request::ExactInstall { .. }
                 | Request::Update
                 | Request::UpdateProfile
@@ -1261,11 +1266,36 @@ fn build_with_update_diagnostics(
                 );
             }
             let requested = match &request {
-                Request::Install { packages } | Request::ExactInstall { packages } => {
-                    catalogs::requested(&state, packages)?
-                }
+                Request::Install { packages }
+                | Request::InstallBuildDeps { packages }
+                | Request::ExactInstall { packages } => catalogs::requested(&state, packages)?,
                 Request::InstallLock { lock } => lock.selectors(),
                 _ => BTreeMap::new(),
+            };
+            let mut build_dependencies = Vec::new();
+            let build_catalogs = if matches!(request, Request::InstallBuildDeps { .. }) {
+                let selected = catalogs::load(
+                    image,
+                    &state,
+                    &requested,
+                    saved,
+                    false,
+                    deferred_publishers,
+                    update::Rollout {
+                        force: false,
+                        advisories: None,
+                    },
+                    None,
+                )?;
+                build_dependencies = catalogs::build_dependencies(&state, &selected, &requested)?;
+                Some(selected)
+            } else {
+                None
+            };
+            let requested = if build_catalogs.is_some() {
+                catalogs::requested(&state, &build_dependencies)?
+            } else {
+                requested
             };
             catalogs = catalogs::load(
                 image,
@@ -1282,6 +1312,12 @@ fn build_with_update_diagnostics(
                 },
                 lock,
             )?;
+            if let Some(selected) = build_catalogs {
+                ensure!(
+                    selected.pins == catalogs.pins,
+                    "publisher catalogs changed while resolving build dependencies; retry the install"
+                );
+            }
             // A shared Git catalog can contain approved builds from other boot roots.
             // Only a transaction that selected an exact version can advance this root.
             catalogs.candidates.packages.retain(|package| {

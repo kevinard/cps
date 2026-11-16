@@ -355,6 +355,15 @@ rebuild_recipe=$("$cps" repo rebuild-inputs --repo repo --trust-root canopa.trus
     --output rebuild-inputs cps://canopa/demo/app-data@1.2.0-1)
 cmp app.kdl rebuild-inputs/source/app.kdl
 cmp app-data.kdl rebuild-inputs/source/app-data.kdl
+"$cps" image create --root build-deps-image --config image.kdl
+"$cps" install --root build-deps-image --build-deps -n --save-plan build-deps.json demo/app-data
+test ! -e build-deps-image/bin/sh
+"$cps" apply --root build-deps-image build-deps.json
+test -x build-deps-image/bin/sh
+test ! -e build-deps-image/usr/bin/hello
+test ! -e build-deps-image/usr/share/app/data.txt
+"$cps" install --root build-deps-image --build-deps -y cps://canopa/demo/app@1.2.0-1
+"$cps" history --root build-deps-image | grep -F 'install --build-deps'
 verify_rebuild() {
     "$cps" repo verify-rebuild --repo repo --trust-root canopa.trust.json "$@"
 }

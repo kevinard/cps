@@ -49,6 +49,7 @@ pub mod release;
 mod shards;
 mod source_archive;
 pub(crate) use git_snapshots::{assign_git_version, lock_snapshot_series};
+pub(crate) use rebuild::build_recipe;
 pub use rebuild::{export_rebuild_inputs, verify_rebuild};
 pub(crate) use shards::{CATALOG_ROOT_LIMIT, SHARD_LIMIT, SHARD_OBJECTS};
 use shards::{Shard, shard_of, shard_of_id};

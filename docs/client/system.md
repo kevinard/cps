@@ -11,6 +11,7 @@ This page covers what differs on the running root.
 ## On this page
 
 - [Search, install, and upgrade](#search-install-and-upgrade)
+- [Install a package's build dependencies](#install-a-packages-build-dependencies)
 - [Check updates and diagnose held packages](#check-updates-and-diagnose-held-packages)
 - [Remove packages and select publishers](#remove-packages-and-select-publishers)
 - [Freeze packages and change settings](#freeze-packages-and-change-settings)
@@ -63,6 +64,40 @@ hold back a base upgrade.
 
 To build and install a package straight from a Git repository, see
 [Install and track a branch](../maintainer/git.md#install-and-track-a-branch).
+
+## Install a package's build dependencies
+
+Install the packages requested by a published package's build recipe without
+installing the package itself or running its build script:
+
+```sh
+sudo cps install --build-deps apps/htop
+sudo cps install --build-deps --dry-run cps://canopa/apps/htop@1.0.0-0
+cps install --root build-image --build-deps --yes apps/htop apps/other
+```
+
+The publisher must have [archived the build inputs](../publisher/rebuilds.md#archive-build-inputs).
+CPS selects the newest available version of each named package, or the exact
+version when specified, using the configured publisher order and installed
+packages' sticky publishers. It verifies the archived recipe, templates, and
+their binding to the admitted build attestation, including configured builder
+trust policies, then installs the union of the recipes' `toolchain` package
+requests and their dependencies. Selecting any output of a multi-package build
+uses the same recipe. Missing or invalid build evidence stops the transaction.
+
+These are normal installations into the running system or the selected image:
+the client's current catalogs, signed release profile, freezes, facets, and
+publisher policies apply. Explicit publisher and version selectors in the
+recipe remain requirements. The recipe's historical toolchain catalog and
+key pins do not replace the client's configuration, so this does not recreate
+the original build environment. Use [`cps develop`](../maintainer/builds.md#debugging-a-recipe-in-its-build-environment)
+with the archived recipe and a toolchain configuration for that.
+
+The requested build packages are marked explicitly installed; their transitive
+dependencies are automatic. Normal confirmation, `--no-recommends`, `--stage`,
+`--dry-run`, and `--save-plan` behavior applies. Saved plans retain both the
+original package request and the catalogs used to verify its build requirements.
+`--build-deps` cannot be combined with `--exact`, `--profile`, `--lock`, or `--git`.
 
 ## Check updates and diagnose held packages
 

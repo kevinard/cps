@@ -279,6 +279,68 @@ pub(super) fn requested<'a>(
     Ok(requested)
 }
 
+pub(super) fn build_dependencies(
+    state: &State,
+    catalogs: &Catalogs,
+    requested: &BTreeMap<&str, PackageSpec<'_>>,
+) -> Result<Vec<String>> {
+    let mut dependencies = BTreeSet::new();
+    for (name, spec) in requested {
+        let candidate = catalogs
+            .candidates
+            .packages
+            .iter()
+            .filter(|package| {
+                package.name() == *name
+                    && spec
+                        .publisher
+                        .is_none_or(|publisher| publisher == package.publisher())
+                    && spec
+                        .version
+                        .as_ref()
+                        .is_none_or(|version| version == package.version())
+                    && catalogs
+                        .candidates
+                        .obsoletions
+                        .get(*name)
+                        .is_none_or(|cutoff| package.version().semantic() > cutoff.semantic())
+            })
+            .max_by(|left, right| left.version().cmp(right.version()))
+            .with_context(|| {
+                format!("no available package matches {name} for build dependencies")
+            })?;
+        let publisher = state
+            .publishers
+            .get(candidate.publisher())
+            .context("missing build dependency publisher")?;
+        if let Some(builds) = catalogs.builds.get(&publisher.name) {
+            builds.evidence.verify_policies(
+                &publisher.repo,
+                &candidate.load()?,
+                builds.profile_trust.as_ref(),
+                publisher.build_trust.as_ref(),
+            )?;
+        }
+        let recipe = crate::repo::build_recipe(
+            &publisher.repo,
+            &publisher.name,
+            &publisher.key,
+            &candidate.id(),
+            &catalogs.pins[&publisher.name],
+        )
+        .with_context(|| format!("reading build dependencies for {}", candidate.id()))?;
+        ensure!(
+            recipe.arch == state.settings.arch,
+            "build recipe for {} targets architecture {}, expected {}",
+            candidate.id(),
+            recipe.arch,
+            state.settings.arch
+        );
+        dependencies.extend(recipe.packages);
+    }
+    Ok(dependencies.into_iter().collect())
+}
+
 pub(super) fn load(
     image: &Image,
     state: &State,

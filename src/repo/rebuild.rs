@@ -121,6 +121,17 @@ pub(super) fn read_archived(repo: &Path, catalog: &Catalog, id: &str) -> Result<
     })
 }
 
+pub(crate) fn build_recipe(
+    repo: &Path,
+    publisher: &str,
+    key: &[u8],
+    id: &str,
+    pin: &str,
+) -> Result<build::BuildRecipe> {
+    let catalog = selected_catalog(repo, publisher, key, id, Some(pin))?;
+    Ok(read_archived(repo, &catalog, id)?.evidence.recipe)
+}
+
 /// Extract an authenticated build recipe, its templates, and the admitted attestation.
 /// Returns the path to the recipe in the new directory.
 pub fn export_rebuild_inputs(

@@ -91,6 +91,7 @@ const INSTALL_EXAMPLES: &str = "\
 Examples:
   cps install apps/htop                    Install on the running system
   cps install -n apps/htop                 Preview the transaction only
+  cps install --build-deps apps/htop       Install the package's build dependencies
   cps install --root image -y apps/htop    Install into an offline image
   cps install --root image -n --save-plan plan.json apps/htop
                                            Save the plan for cps fetch and cps apply
@@ -116,6 +117,9 @@ enum Command {
         /// Reconcile the image to exactly these packages and their dependencies
         #[arg(long, conflicts_with_all = ["profile", "lock", "git"])]
         exact: bool,
+        /// Install the build dependencies from each package's verified archived recipe
+        #[arg(long, conflicts_with_all = ["exact", "profile", "lock", "git"])]
+        build_deps: bool,
         /// Install the configured signed release profile into an image with no packages
         #[arg(
             long,
@@ -2422,6 +2426,7 @@ fn run(command: Command) -> Result<ExitCode> {
             change: mut options,
             no_refresh,
             exact,
+            build_deps,
             profile,
             lock,
             git,
@@ -2461,6 +2466,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 Request::InstallProfile
             } else if exact {
                 Request::ExactInstall { packages }
+            } else if build_deps {
+                Request::InstallBuildDeps { packages }
             } else {
                 Request::Install { packages }
             };
@@ -4552,6 +4559,51 @@ mod tests {
     #[test]
     fn command_line_is_consistent() {
         with_stack(|| super::cli().debug_assert());
+    }
+
+    #[test]
+    fn build_dependency_install_requires_packages_and_conflicts_with_other_modes() {
+        with_stack(|| {
+            for args in [
+                vec!["install", "--build-deps", "apps/tool"],
+                vec!["install", "--build-deps", "apps/tool@1.0.0-0", "apps/other"],
+                vec![
+                    "install",
+                    "--root",
+                    "image",
+                    "--build-deps",
+                    "--dry-run",
+                    "--save-plan",
+                    "plan.json",
+                    "apps/tool",
+                ],
+            ] {
+                assert!(parse(&args).is_ok(), "{args:?}");
+            }
+            assert_eq!(
+                parse(&["install", "--build-deps"]).unwrap_err().kind(),
+                ErrorKind::MissingRequiredArgument
+            );
+            for extra in [
+                vec!["--exact"],
+                vec!["--root", "image", "--profile"],
+                vec!["--root", "image", "--lock", "lock.json"],
+                vec![
+                    "--git",
+                    "https://example.org/tool.git",
+                    "--track-branch",
+                    "main",
+                ],
+            ] {
+                let mut args = vec!["install", "--build-deps", "apps/tool"];
+                args.extend(extra);
+                assert_eq!(
+                    parse(&args).unwrap_err().kind(),
+                    ErrorKind::ArgumentConflict,
+                    "{args:?}"
+                );
+            }
+        });
     }
 
     #[test]

@@ -76,6 +76,12 @@ source targets for an explicit `source fetch-archived`.
 
 ## Rebuilding a published package
 
+Clients can install a package's verified build requirements into their current
+system or an image with [`cps install --build-deps PACKAGE`](../client/system.md#install-a-packages-build-dependencies).
+That uses normal client installation policy and current catalogs, not the
+historical toolchain pins. Follow this workflow instead to recreate the pinned
+build environment.
+
 Extract the archived inputs, fetch the sources and toolchain, rebuild, and
 compare the result with the signed release.
 

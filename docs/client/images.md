@@ -54,6 +54,10 @@ and `config resolve` work the same way, with `--root` or on the running
 system. Only `install --profile` and `install --lock` require `--root`,
 because they provision a new, empty image.
 
+Use `cps install --root image --build-deps PACKAGE` to install a published
+package's [verified build requirements](system.md#install-a-packages-build-dependencies)
+without installing the package or executing its recipe.
+
 ## Save, review, and apply a plan
 
 To review a change before it is applied, or to apply the exact same change

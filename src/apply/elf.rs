@@ -30,6 +30,7 @@ pub(super) fn applies(plan: &Plan, state: &State) -> bool {
     matches!(
         plan.request,
         Request::Install { .. }
+            | Request::InstallBuildDeps { .. }
             | Request::ExactInstall { .. }
             | Request::Remove { .. }
             | Request::Autoremove
