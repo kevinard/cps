@@ -72,11 +72,35 @@ build_id=$(readelf -n sources/hello | sed -n 's/^ *Build ID: \([0-9a-f]*\)$/\1/p
 test -n "$build_id"
 debug_path="usr/lib/debug/.build-id/${build_id:0:2}/${build_id:2}.debug"
 
+# Relocatable objects have no build IDs. Archives may contain repeated member
+# names; retain their index and all members so they still link after stripping.
+mkdir -p one two
+# Incompressible code data makes accidental duplication visible even when the
+# sidecar is compressed. Fat LTO also serializes this data in compiler sections.
+python3 - <<'PYTHON'
+import random
+from pathlib import Path
+payload = random.Random(42).randbytes(65536)
+Path("one/answer.c").write_text(
+    "const unsigned char payload[] = {" + ",".join(map(str, payload)) + "};\n"
+    "int answer(void) { return 40; }\n"
+)
+PYTHON
+printf '%s\n' 'int extra(void) { return 2; }' > two/answer.c
+cc -g -O1 -flto -ffat-lto-objects -c one/answer.c -o one/answer.o
+cc -g -O1 -c two/answer.c -o two/answer.o
+cp one/answer.o sources/answer.o
+cc -O1 -c one/answer.c -o sources/plain.o
+cp sources/plain.o long_plain_archive_member_name.o
+ar qcD sources/libanswer.a one/answer.o two/answer.o long_plain_archive_member_name.o
+ranlib -D sources/libanswer.a
+
 cat > app.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/app" publisher="canopa" summary="Demo application" license="MIT OR Apache-2.0" homepage="https://example.org/app/" {
     require "demo/app-data" version="={version}"
     collect "usr/bin/*" uid=$uid gid=$gid
+    collect "usr/lib/*" uid=$uid gid=$gid
     collect "usr/include/**" uid=$uid gid=$gid
     collect "usr/share/man/**" uid=$uid gid=$gid
     collect "usr/share/locale/*/**" uid=$uid gid=$gid
@@ -89,6 +113,9 @@ package "demo/app-data" publisher="canopa" license="CC0-1.0" {
 }
 MANIFEST
 script='    install -Dm755 "$CPS_SOURCES/hello" "$DESTDIR/usr/bin/hello"
+    for object in answer.o libanswer.a plain.o; do
+        install -Dm644 "$CPS_SOURCES/$object" "$DESTDIR/usr/lib/$object"
+    done
     ln -s hello "$DESTDIR/usr/bin/hi"
     mkdir -p "$DESTDIR/usr/include" "$DESTDIR/usr/share/man/man1" "$DESTDIR/usr/share/app" \
         "$DESTDIR/usr/share/locale/pt_BR/LC_MESSAGES" "$DESTDIR/usr/share/doc/app"
@@ -111,6 +138,9 @@ build architecture="$arch" epoch=1700000000 {
     manifest "app-data.kdl" sha256="$(sha app-data.kdl)"
 $1
     source "hello" sha256="$(sha sources/hello)" size=$(wc -c < sources/hello)
+    source "answer.o" sha256="$(sha sources/answer.o)" size=$(wc -c < sources/answer.o)
+    source "libanswer.a" sha256="$(sha sources/libanswer.a)" size=$(wc -c < sources/libanswer.a)
+    source "plain.o" sha256="$(sha sources/plain.o)" size=$(wc -c < sources/plain.o)
     script """
 $2
     """
@@ -151,11 +181,57 @@ absent '\.(symtab|debug_info)' sections
 readelf -S "first/proto/$debug_path" | grep -F .debug_info
 test "$(readelf -n "first/proto/$debug_path" | sed -n 's/^ *Build ID: //p')" = "$build_id"
 
+# Linkable objects lose only debug sections. Their optional deltas restore
+# complete objects and archives when static dependencies need debugging.
+printf '%s\n' 'int answer(void); int extra(void);' \
+    'int main(void) { return answer() + extra() != 42; }' > link.c
+for object in answer.o libanswer.a; do
+    delta="usr/lib/debug/usr/lib/$object.cps-debug"
+    grep -E "file \"?$delta\"? mode=\"0644\" .* facet=\"?debug.symbols\"?" "$app"
+    readelf -SW "first/proto/usr/lib/$object" > sections
+    absent '\] \.(debug_|zdebug_)' sections
+    grep -F .symtab sections
+    "$cps" debug restore "first/proto/usr/lib/$object" \
+        --symbols "first/proto/$delta" --output "restored-$object"
+    # Binutils normalizes archive headers/indexes while making the temporary
+    # unstripped copy. Restoration must match that entire normalized file.
+    objcopy --enable-deterministic-archives "sources/$object" "expected-$object"
+    cmp "expected-$object" "restored-$object"
+    test "$(wc -c < "first/proto/$delta")" -lt "$(( $(wc -c < "sources/$object") / 4 ))"
+    readelf -SW "restored-$object" | grep -F .debug_info
+done
+cc link.c first/proto/usr/lib/libanswer.a -o linked
+./linked
+cc link.c restored-libanswer.a -o linked-debug
+./linked-debug
+cc -r first/proto/usr/lib/answer.o -o linked.o
+cc -r restored-answer.o -o restored-linked.o
+expect_failure 'debug delta does not match the stripped file' \
+    "$cps" debug restore sources/plain.o \
+    --symbols first/proto/usr/lib/debug/usr/lib/answer.o.cps-debug --output wrong.o
+test ! -e wrong.o
+expect_failure 'output must not exist' \
+    "$cps" debug restore first/proto/usr/lib/answer.o \
+    --symbols first/proto/usr/lib/debug/usr/lib/answer.o.cps-debug --output restored-answer.o
+cmp sources/answer.o restored-answer.o
+cmp sources/plain.o first/proto/usr/lib/plain.o
+test ! -e first/proto/usr/lib/debug/usr/lib/plain.o.cps-debug
+ar t sources/libanswer.a > expected-members
+ar t first/proto/usr/lib/libanswer.a > stripped-members
+cmp expected-members stripped-members
+test "$(wc -l < stripped-members)" = 3
+# A debugger sees source lines and types after the static objects are restored.
+readelf --debug-dump=info linked-debug | grep -F DW_AT_name > debug-names
+grep -F one/answer.c debug-names
+grep -F two/answer.c debug-names
+
 # Without stripping the installed object ships unchanged.
 recipe '    discard "usr/share/doc/**"
     strip #false' "$script" > unstripped.kdl
 build --output unstripped unstripped.kdl
 cmp sources/hello unstripped/proto/usr/bin/hello
+cmp sources/answer.o unstripped/proto/usr/lib/answer.o
+cmp sources/libanswer.a unstripped/proto/usr/lib/libanswer.a
 absent usr/lib/debug unstripped/manifests/demo/app.kdl
 
 # Installed files that no output claims fail the build.
@@ -257,6 +333,22 @@ grep -E 'homepage="https://example.org/app/"' info.kdl
 test -x image/usr/bin/hello
 test -e image/usr/share/app/data.txt
 test ! -e "image/$debug_path"
+test ! -e image/usr/lib/debug/usr/lib/answer.o.cps-debug
+test ! -e image/usr/lib/debug/usr/lib/libanswer.a.cps-debug
+
+# Enabling debug symbols installs the matching data, and disabling them drops
+# it without changing the executable or the linkable objects.
+"$cps" facet set --root image -y demo/app:debug.symbols=true
+cmp "first/proto/$debug_path" "image/$debug_path"
+for object in answer.o libanswer.a; do
+    cmp "first/proto/usr/lib/debug/usr/lib/$object.cps-debug" "image/usr/lib/debug/usr/lib/$object.cps-debug"
+done
+"$cps" facet set --root image -y demo/app:debug.symbols=false
+test ! -e "image/$debug_path"
+test ! -e image/usr/lib/debug/usr/lib/answer.o.cps-debug
+test ! -e image/usr/lib/debug/usr/lib/libanswer.a.cps-debug
+cmp first/proto/usr/bin/hello image/usr/bin/hello
+cmp first/proto/usr/lib/libanswer.a image/usr/lib/libanswer.a
 
 # Rebuild verification covers every output of the admitted build.
 rebuild_recipe=$("$cps" repo rebuild-inputs --repo repo --trust-root canopa.trust.json \

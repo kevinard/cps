@@ -324,10 +324,12 @@ The rules for several packages:
 
 ## Stripping and debug information
 
-By default, `cps build` strips the ELF executables and shared objects that
-the packages ship and keeps their debug information in the same package.
-For each object with symbols or DWARF sections and a GNU build ID, CPS runs
-the toolchain's `objcopy` inside the sandbox after the script finishes.
+By default, `cps build` strips native ELF executables, shared objects,
+relocatable objects, and static archives that the packages ship and keeps
+their debug information in the same package.
+For each executable or shared object with symbols or DWARF sections, CPS
+requires a GNU build ID and runs the toolchain's `objcopy` inside the sandbox
+after the script finishes.
 `objcopy --only-keep-debug` writes
 `usr/lib/debug/.build-id/xx/yyyy.debug`, where `xxyyyy` is the build ID in
 hex, and `objcopy --strip-unneeded` strips the shipped object in place. The
@@ -342,12 +344,52 @@ per-package rule such as `facet set apps/lz:debug.symbols=true`.
 Debuggers find the files by build ID. `objcopy` keeps the build ID note and
 the section order, so stripped outputs stay reproducible.
 
-CPS skips files that are not native ELF executables or shared objects, such
-as scripts, static archives, relocatable objects and kernel modules, EFI
-images, and objects for another architecture. An object with symbols but no
-build ID fails the build; link it with `-Wl,--build-id`. The toolchain must
-provide `objcopy` when any shipped object needs stripping. Write
+Relocatable objects (including uncompressed kernel modules) and static
+archives need their symbol tables and relocations for linking. When they
+contain debug sections, CPS uses `objcopy --strip-debug`, preserving that
+linker data. It stores a compressed debug delta at
+`usr/lib/debug/ORIGINAL_PATH.cps-debug` with facet `debug.symbols`. For
+example, `usr/lib/libexample.a` has its delta at
+`usr/lib/debug/usr/lib/libexample.a.cps-debug`. These objects do not need
+build IDs. The delta contains removed debug information and the metadata
+needed to restore the unstripped file; unchanged sections, including code
+and LTO data, are referenced from the normal file rather than stored again.
+Objects with no debug sections are left untouched.
+
+Enable the facet, then restore a complete object or archive before linking
+a program whose static dependencies need debugging:
+
+```sh
+cps debug restore /usr/lib/libexample.a \
+    --symbols /usr/lib/debug/usr/lib/libexample.a.cps-debug \
+    --output ./libexample-debug.a
+cc -g main.c ./libexample-debug.a -o example
+```
+
+`cps debug restore` verifies that the delta matches the exact stripped file
+and checks the restored file's SHA-256 before creating the output. Its output
+must be a new path. It needs no external reconstruction tools. Enabling the
+facet leaves the normal linker paths unchanged; the `.cps-debug` files are
+inputs to restoration, not linker inputs. Restoration preserves the complete
+unstripped ELF and archive layout, including debug relocations, archive
+indexes, member order, and repeated member names. Archive metadata is
+normalized during splitting for reproducibility.
+
+LTO compiler sections (`.gnu.lto_*` and `.gnu.debuglto_*`) stay in the normal
+objects because the compiler may need them even for a non-debug link. The
+delta reuses identical copies of these sections from the normal objects.
+
+CPS skips scripts, EFI images, objects for another architecture, compressed
+kernel modules, thin archives, and archives containing foreign or non-ELF
+members such as LLVM bitcode. An executable or shared object with symbols
+but no build ID fails the build; link it with `-Wl,--build-id`. The toolchain
+must provide `objcopy` when any shipped object needs stripping. Write
 `strip #false` in the `build` block to ship objects as installed.
+
+This processing happens during a build. Previously published packages need
+a revision bump and a rebuild to split any debug information they still
+carry in their normal files; changing an image's facets does not rewrite
+those payloads.
 
 ## Parallel jobs
 

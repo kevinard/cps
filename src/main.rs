@@ -513,6 +513,11 @@ enum Command {
         /// Build recipe to run
         recipe: PathBuf,
     },
+    /// Restore debug information for static archives and relocatable objects
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
     /// Run a shell or command with a recipe's verified toolchain and sources
     Develop {
         #[command(flatten)]
@@ -534,6 +539,21 @@ enum Command {
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Recreate an unstripped file from its stripped file and CPS debug delta
+    Restore {
+        /// Installed stripped object or archive
+        input: PathBuf,
+        /// Matching .cps-debug file from the debug.symbols facet
+        #[arg(long)]
+        symbols: PathBuf,
+        /// New path for the restored object or archive (must not exist)
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -3129,6 +3149,16 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("Built {id} at {}", output.display());
             }
         }
+        Command::Debug { command } => match command {
+            DebugCommand::Restore {
+                input,
+                symbols,
+                output,
+            } => {
+                cps::restore_debug(&input, &symbols, &output)?;
+                println!("Restored {}", output.display());
+            }
+        },
         Command::Develop {
             mut inputs,
             workspace,
@@ -4447,7 +4477,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("Images and boot environments", &["image", "boot"]),
     (
         "Build packages",
-        &["source", "recipe", "manifest", "build", "develop"],
+        &["source", "recipe", "manifest", "build", "develop", "debug"],
     ),
     ("Publish packages", &["publish", "repo"]),
 ];

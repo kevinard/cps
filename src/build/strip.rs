@@ -1,14 +1,20 @@
 //! Strip ELF outputs and split their debug information into the same package.
 //!
-//! CPS selects the ELF executables and shared objects that an output ships,
+//! CPS selects the native ELF objects and static archives that an output ships,
 //! then runs `objcopy` from the pinned toolchain inside the build sandbox. The
 //! debug information moves to `usr/lib/debug/.build-id/xx/yyyy.debug`, where
 //! `xxyyyy` is the GNU build ID, and ships as a file action with facet
 //! `debug.symbols` in the package that ships the stripped object. `objcopy`
 //! keeps the build ID note and the section order, so a reproducible build stays
-//! reproducible.
+//! reproducible. Relocatable objects and archives retain their linker symbols;
+//! debug deltas live under `usr/lib/debug/` with their original paths plus
+//! `.cps-debug`. Unchanged code and LTO sections remain in the ordinary file.
 
-use std::{collections::BTreeMap, fs, io::Read};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Read,
+};
 
 use anyhow::{Context, Result, ensure};
 use object::{Object, ObjectSection, elf};
@@ -18,13 +24,21 @@ use crate::{
     model::{Action, Manifest},
 };
 
-use super::expand::{DEBUG_FACET, debug_path};
+use super::expand::{DEBUG_FACET, debug_delta_path, debug_path};
 
-/// One ELF object to strip.
+/// One ELF object or archive to strip.
 pub(crate) struct Split {
     pub path: String,
     /// The debug file to create, or none when another object already provides it.
     pub debug: Option<String>,
+    /// Preserve code, relocations and linker symbols in the ordinary file.
+    pub linkable: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum Symbols {
+    BuildId(Vec<u8>),
+    Linkable,
 }
 
 fn machine(arch: &str) -> Option<u16> {
@@ -35,33 +49,61 @@ fn machine(arch: &str) -> Option<u16> {
     }
 }
 
-/// The GNU build ID of an unstripped native executable or shared object.
-fn inspect(bytes: &[u8], arch: &str, path: &str) -> Result<Option<Vec<u8>>> {
+fn native_elf<'a>(bytes: &'a [u8], arch: &str) -> Option<(object::File<'a>, u16)> {
     if !bytes.starts_with(b"\x7fELF") {
-        return Ok(None);
+        return None;
     }
-    let Ok(file) = object::File::parse(bytes) else {
-        return Ok(None);
-    };
+    let file = object::File::parse(bytes).ok()?;
     let header_type = match &file {
         object::File::Elf64(file) => file.elf_header().e_type.get(file.endian()),
         object::File::Elf32(file) => file.elf_header().e_type.get(file.endian()),
-        _ => return Ok(None),
+        _ => return None,
     };
     let machine_type = match &file {
         object::File::Elf64(file) => file.elf_header().e_machine.get(file.endian()),
         object::File::Elf32(file) => file.elf_header().e_machine.get(file.endian()),
-        _ => return Ok(None),
+        _ => return None,
     };
-    if !matches!(header_type, elf::ET_EXEC | elf::ET_DYN) || Some(machine_type) != machine(arch) {
-        return Ok(None);
-    }
-    let debug = file.sections().any(|section| {
+    (Some(machine_type) == machine(arch)).then_some((file, header_type))
+}
+
+fn has_debug(file: &object::File<'_>) -> bool {
+    file.sections().any(|section| {
         section.name().is_ok_and(|name| {
-            name == ".symtab" || name.starts_with(".debug_") || name.starts_with(".zdebug_")
+            name.starts_with(".debug_")
+                || name.starts_with(".zdebug_")
+                || name.starts_with(".stab")
+                || name.starts_with(".gnu.linkonce.wi.")
         })
-    });
-    if !debug {
+    })
+}
+
+/// Choose a split strategy without mistaking required linker symbols for debug data.
+fn inspect(bytes: &[u8], arch: &str, path: &str) -> Result<Option<Symbols>> {
+    if bytes.starts_with(b"!<arch>\n") {
+        let archive = object::read::archive::ArchiveFile::parse(bytes)
+            .with_context(|| format!("reading static archive {path}"))?;
+        let mut debug = false;
+        for member in archive.members() {
+            let member = member.with_context(|| format!("reading archive member in {path}"))?;
+            let bytes = member.data(bytes)?;
+            let Some((file, elf::ET_REL)) = native_elf(bytes, arch) else {
+                // Do not rewrite mixed-format or foreign archives (including bitcode).
+                return Ok(None);
+            };
+            debug |= has_debug(&file);
+        }
+        return Ok(debug.then_some(Symbols::Linkable));
+    }
+    let Some((file, header_type)) = native_elf(bytes, arch) else {
+        return Ok(None);
+    };
+    if header_type == elf::ET_REL {
+        return Ok(has_debug(&file).then_some(Symbols::Linkable));
+    }
+    if !matches!(header_type, elf::ET_EXEC | elf::ET_DYN)
+        || !(has_debug(&file) || file.section_by_name(".symtab").is_some())
+    {
         return Ok(None);
     }
     let id = file
@@ -72,10 +114,10 @@ fn inspect(bytes: &[u8], arch: &str, path: &str) -> Result<Option<Vec<u8>>> {
         .with_context(|| {
             format!("{path} has symbols but no GNU build ID; link it with -Wl,--build-id or set strip #false in the recipe")
         })?;
-    Ok(Some(id.to_vec()))
+    Ok(Some(Symbols::BuildId(id.to_vec())))
 }
 
-/// Choose the shipped ELF objects to strip and the debug file for each build ID.
+/// Choose the shipped objects to strip and the debug file for each one.
 /// Returns the strip plan and, for each output index, its debug file actions.
 pub(crate) fn plan(
     root: &Root,
@@ -85,6 +127,10 @@ pub(crate) fn plan(
     let mut splits = Vec::new();
     let mut debug_actions = vec![Vec::new(); outputs.len()];
     let mut owners = BTreeMap::<Vec<u8>, usize>::new();
+    let packaged_paths: BTreeSet<_> = outputs
+        .iter()
+        .flat_map(|output| output.action.iter().map(Action::path))
+        .collect();
     for (index, manifest) in outputs.iter().enumerate() {
         for action in &manifest.action {
             let Action::File {
@@ -100,49 +146,59 @@ pub(crate) fn plan(
             if path.starts_with("usr/lib/debug/") {
                 continue;
             }
-            // Read only the magic number of files that cannot be ELF objects.
+            // Read only the magic number of files that cannot be ELF objects or archives.
             let mut file = root.file(path)?;
             let mut bytes = Vec::new();
-            file.by_ref().take(4).read_to_end(&mut bytes)?;
-            if bytes != b"\x7fELF" {
+            file.by_ref().take(8).read_to_end(&mut bytes)?;
+            if !bytes.starts_with(b"\x7fELF") && bytes != b"!<arch>\n" {
                 continue;
             }
             file.read_to_end(&mut bytes)?;
-            let Some(id) = inspect(&bytes, arch, path)? else {
+            let Some(symbols) = inspect(&bytes, arch, path)? else {
                 continue;
             };
-            let debug = match owners.get(&id) {
-                Some(&owner) => {
-                    ensure!(
-                        owner == index,
-                        "{} and {} ship ELF objects with the same build ID; their debug information can belong to only one output",
-                        outputs[owner].name,
-                        manifest.name
-                    );
-                    None
-                }
-                None => {
-                    owners.insert(id.clone(), index);
-                    let debug = debug_path(&id);
-                    debug_actions[index].push(Action::File {
-                        path: debug.clone(),
-                        mode: "0644".into(),
-                        uid: *uid,
-                        gid: *gid,
-                        preserve: false,
-                        facet: Some(DEBUG_FACET.into()),
-                        variants: variants.clone(),
-                        sha256: None,
-                        size: None,
-                        capabilities: None,
-                        original_name: None,
-                    });
-                    Some(debug)
-                }
+            let linkable = symbols == Symbols::Linkable;
+            let debug = match symbols {
+                Symbols::Linkable => Some(debug_delta_path(path)),
+                Symbols::BuildId(id) => match owners.get(&id) {
+                    Some(&owner) => {
+                        ensure!(
+                            owner == index,
+                            "{} and {} ship ELF objects with the same build ID; their debug information can belong to only one output",
+                            outputs[owner].name,
+                            manifest.name
+                        );
+                        None
+                    }
+                    None => {
+                        owners.insert(id.clone(), index);
+                        Some(debug_path(&id))
+                    }
+                },
             };
+            if let Some(debug) = &debug {
+                ensure!(
+                    !packaged_paths.contains(debug.as_str()),
+                    "generated debug file {debug} conflicts with a packaged path"
+                );
+                debug_actions[index].push(Action::File {
+                    path: debug.clone(),
+                    mode: "0644".into(),
+                    uid: *uid,
+                    gid: *gid,
+                    preserve: false,
+                    facet: Some(DEBUG_FACET.into()),
+                    variants: variants.clone(),
+                    sha256: None,
+                    size: None,
+                    capabilities: None,
+                    original_name: None,
+                });
+            }
             splits.push(Split {
                 path: path.clone(),
                 debug,
+                linkable,
             });
         }
     }
@@ -163,25 +219,42 @@ pub(crate) fn script(splits: &[Split]) -> String {
         if let Some(debug) = &split.debug {
             let debug = format!("/out/{debug}");
             let directory = debug.rsplit_once('/').map_or("/out", |(parent, _)| parent);
+            let flags = if split.linkable {
+                "--enable-deterministic-archives "
+            } else {
+                "--only-keep-debug "
+            };
             script.push_str(&format!(
-                "mkdir -p {}\nobjcopy --only-keep-debug {object} {}\n",
+                "mkdir -p {}\nobjcopy {flags}{object} {}\n",
                 quote(directory),
                 quote(&debug)
             ));
         }
-        script.push_str(&format!("objcopy --strip-unneeded {object}\n"));
+        if split.linkable {
+            // LTO's serialized compiler data can reference these debug sections.
+            // Removing them can make even a non-debug static link fail.
+            script.push_str(&format!(
+                "objcopy --enable-deterministic-archives --strip-debug --keep-section='.gnu.lto_*' --keep-section='.gnu.debuglto_*' {object}\n"
+            ));
+        } else {
+            script.push_str(&format!("objcopy --strip-unneeded {object}\n"));
+        }
     }
     script
 }
 
-/// Check that each planned debug file exists, and give it a fixed mode.
+/// Turn temporary linkable copies into debug deltas and fix debug file modes.
 pub(crate) fn finish(output: &std::path::Path, splits: &[Split]) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    for debug in splits.iter().filter_map(|split| split.debug.as_ref()) {
+    for split in splits {
+        let Some(debug) = &split.debug else { continue };
         let path = output.join(debug);
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("objcopy did not create {debug}"))?;
         ensure!(metadata.is_file(), "{debug} is not a regular file");
+        if split.linkable {
+            crate::debug::create_delta(&output.join(&split.path), &path)?;
+        }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
     }
     Ok(())
@@ -197,10 +270,12 @@ mod tests {
             Split {
                 path: "usr/bin/it's".into(),
                 debug: Some(debug_path(&[0x12, 0x34])),
+                linkable: false,
             },
             Split {
                 path: "usr/bin/copy".into(),
                 debug: None,
+                linkable: false,
             },
         ]);
         assert!(script.contains("mkdir -p '/out/usr/lib/debug/.build-id/12'\n"));
@@ -222,7 +297,10 @@ mod tests {
             .sections()
             .any(|section| section.name().is_ok_and(|name| name == ".symtab"));
         match (has_symbols, file.build_id()?) {
-            (true, Some(id)) => assert_eq!(inspect(&own, arch, "test")?, Some(id.to_vec())),
+            (true, Some(id)) => assert_eq!(
+                inspect(&own, arch, "test")?,
+                Some(Symbols::BuildId(id.to_vec()))
+            ),
             (true, None) => assert!(inspect(&own, arch, "test").is_err()),
             (false, _) => assert_eq!(inspect(&own, arch, "test")?, None),
         }

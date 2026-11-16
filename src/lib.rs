@@ -2,6 +2,7 @@ mod apply;
 mod attestation;
 mod boot;
 mod build;
+mod debug;
 mod file_caps;
 mod generate;
 mod git_install;
@@ -35,6 +36,7 @@ pub use build::{
     build_with_worker, develop, fetch_toolchain, prepare_git_snapshot, prepare_git_snapshot_ref,
     sources::{fetch_sources, fetch_sources_with_local, import_sources},
 };
+pub use debug::restore_debug;
 pub use generate::{
     check_manifest_dependencies, generate_manifest, generate_manifest_for_architecture,
     generated_dependencies, suggest_dependencies,

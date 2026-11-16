@@ -78,7 +78,7 @@ jobs:
               export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
               for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
                   package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror boot-image \
-                  recipe-orchestration; do
+                  recipe-orchestration build-outputs; do
                 bash "tests/$test.sh"
               done
               bash tests/transaction-progress.sh

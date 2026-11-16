@@ -346,7 +346,7 @@ pub(crate) fn check_expansion(template: &Template, expanded: &Manifest, strip: b
     );
     for action in &expanded.action[explicit.len()..] {
         let path = action.path();
-        if strip && is_debug_action(action) {
+        if strip && is_debug_action(action, &expanded.action) {
             continue;
         }
         let rule = first_rule(template, path)
@@ -403,10 +403,18 @@ pub(crate) fn debug_path(build_id: &[u8]) -> String {
     format!("usr/lib/debug/.build-id/{}/{}.debug", &hex[..2], &hex[2..])
 }
 
-fn is_debug_action(action: &Action) -> bool {
+/// The debug delta for a relocatable object or static archive.
+pub(crate) fn debug_delta_path(path: &str) -> String {
+    format!("usr/lib/debug/{path}.cps-debug")
+}
+
+fn is_debug_action(action: &Action, actions: &[Action]) -> bool {
     let Action::File {
         path,
         mode,
+        uid,
+        gid,
+        variants,
         preserve: false,
         facet: Some(facet),
         capabilities: None,
@@ -416,20 +424,30 @@ fn is_debug_action(action: &Action) -> bool {
     else {
         return false;
     };
-    let name = path
+    let build_id = path
         .strip_prefix("usr/lib/debug/.build-id/")
         .and_then(|rest| rest.split_once('/'))
-        .and_then(|(prefix, name)| Some((prefix, name.strip_suffix(".debug")?)));
-    mode == "0644"
-        && facet == DEBUG_FACET
-        && name.is_some_and(|(prefix, name)| {
+        .and_then(|(prefix, name)| Some((prefix, name.strip_suffix(".debug")?)))
+        .is_some_and(|(prefix, name)| {
             prefix.len() == 2
                 && !name.is_empty()
                 && prefix
                     .bytes()
                     .chain(name.bytes())
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
+        });
+    let delta = path
+        .strip_prefix("usr/lib/debug/")
+        .and_then(|path| path.strip_suffix(".cps-debug"))
+        .is_some_and(|source_path| {
+            !source_path.starts_with("usr/lib/debug/")
+                && actions.iter().any(|source| matches!(source,
+                    Action::File { path, uid: source_uid, gid: source_gid, variants: source_variants, .. }
+                        if path == source_path
+                            && (uid, gid, variants) == (source_uid, source_gid, source_variants)
+                ))
+        });
+    mode == "0644" && facet == DEBUG_FACET && (build_id || delta)
 }
 
 #[cfg(test)]
@@ -702,6 +720,33 @@ package "runtime/libcc" publisher="canopa" {
         );
         check_expansion(&templates[0], compiler, true)?;
         assert!(check_expansion(&templates[0], compiler, false).is_err());
+
+        // Debug deltas without build IDs must correspond to a packaged file
+        // and carry the same owner and variants.
+        compiler.action.push(Action::File {
+            path: debug_delta_path("usr/lib/cc/x"),
+            mode: "0644".into(),
+            uid: 0,
+            gid: 0,
+            preserve: false,
+            facet: Some(DEBUG_FACET.into()),
+            variants: BTreeMap::new(),
+            sha256: None,
+            size: None,
+            capabilities: None,
+            original_name: None,
+        });
+        check_expansion(&templates[0], compiler, true)?;
+        let mut changed = compiler.clone();
+        if let Some(Action::File { uid, .. }) = changed.action.last_mut() {
+            *uid = 1;
+        }
+        assert!(check_expansion(&templates[0], &changed, true).is_err());
+        let mut changed = compiler.clone();
+        if let Some(Action::File { path, .. }) = changed.action.last_mut() {
+            *path = debug_delta_path("usr/lib/not-packaged.a");
+        }
+        assert!(check_expansion(&templates[0], &changed, true).is_err());
 
         let mut changed = compiler.clone();
         changed.dependency.clear();
