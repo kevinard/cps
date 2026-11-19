@@ -191,7 +191,7 @@ case ${1:-} in
         mirror=$(realpath -e -- "${CPS_MIRROR_DIR:?Set CPS_MIRROR_DIR to the HTTPS document directory}")
         timestamp=$mirror/metadata/timestamp.json
         deployed=$repo/.ci-deployed-catalog
-        state=$repo/.ci-tuf-state.json
+        state=$repo/.tuf-publication.json
         if [[ ! -e $deployed && ! -L $deployed ]]; then
             [[ ! -e $state && ! -L $state && ! -e $timestamp && ! -L $timestamp ]] ||
                 fail 'Run deploy-current to record the deployed catalog before refreshing.'

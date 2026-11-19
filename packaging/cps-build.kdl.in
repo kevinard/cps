@@ -27,6 +27,12 @@ build architecture="@ARCH@" epoch=@EPOCH@ {
     install -Dm644 packaging/systemd/cps-finalize-trial.path "$DESTDIR/usr/lib/systemd/system/cps-finalize-trial.path"
     install -Dm644 packaging/systemd/cps-finalize-trial.service "$DESTDIR/usr/lib/systemd/system/cps-finalize-trial.service"
     install -Dm644 packaging/systemd/cps-uefi-bless.service "$DESTDIR/usr/lib/systemd/system/cps-uefi-bless.service"
+    install -Dm644 packaging/systemd/cps-mirror-rank.service "$DESTDIR/usr/lib/systemd/system/cps-mirror-rank.service"
+    install -Dm644 packaging/systemd/cps-mirror-rank.timer "$DESTDIR/usr/lib/systemd/system/cps-mirror-rank.timer"
+    install -Dm644 packaging/systemd/cps-repo-refresh@.service "$DESTDIR/usr/lib/systemd/system/cps-repo-refresh@.service"
+    install -Dm644 packaging/systemd/cps-repo-refresh@.timer "$DESTDIR/usr/lib/systemd/system/cps-repo-refresh@.timer"
+    install -Dm644 packaging/systemd/cps-repo-replicate@.service "$DESTDIR/usr/lib/systemd/system/cps-repo-replicate@.service"
+    install -Dm644 packaging/systemd/cps-repo-replicate@.timer "$DESTDIR/usr/lib/systemd/system/cps-repo-replicate@.timer"
     install -Dm644 LICENSE "$DESTDIR/usr/share/licenses/cps/LICENSE"
     """
 }

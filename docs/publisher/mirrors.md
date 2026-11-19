@@ -11,6 +11,12 @@ for how the two layers fit together.
 
 ## On this page
 
+- [Quick setup](#quick-setup)
+  - [Create the publisher](#create-the-publisher)
+  - [Serve the origin](#serve-the-origin)
+  - [Full replica](#full-replica)
+  - [LAN read-through cache](#lan-read-through-cache)
+  - [Publish a mirror list](#publish-a-mirror-list)
 - [Export a release](#export-a-release)
 - [Sign the export](#sign-the-export)
 - [Sharded targets and delta payloads](#sharded-targets-and-delta-payloads)
@@ -23,6 +29,180 @@ for how the two layers fit together.
 - [Rotating publisher keys on a mirror](#rotating-publisher-keys-on-a-mirror)
 - [Rotating a mirror's TUF root](#rotating-a-mirrors-tuf-root)
 - [Publishing and verifying signed mirror release notes](#publishing-and-verifying-signed-mirror-release-notes)
+
+## Quick setup
+
+A repository has three parts: a private **workspace** on the signing host,
+an **origin** web root that serves the signed tree, and optional **mirrors**.
+Mirrors are full replicas or LAN read-through caches. Every mirror serves the
+same signed TUF repository, so mirrors hold no keys, and clients verify
+everything they download.
+
+### Create the publisher
+
+`cps repo init` creates a private workspace. It generates separate Ed25519
+keys for the CPS publisher root and catalog, the TUF root, and the four
+online TUF roles (`targets`, `snapshot`, `timestamp`, and `objects-*`), each
+with a one-signature threshold. Both initial trust roots expire after one
+year. Renew or rotate before then. For threshold signers or keys held
+elsewhere, use the manual workflows below.
+
+```sh
+workspace=/var/lib/cps-publish/canopa
+cps repo init --publisher canopa --output "$workspace"
+cps publish manifests --repo "$workspace/repo" --key "$workspace/keys/catalog.der" \
+    --proto proto package.kdl
+```
+
+| Path in the workspace | Holds |
+| --- | --- |
+| `repo/` | The publishing repository and its trust roots, `repo/trust/N.json` |
+| `keys/catalog.der` | The catalog key, used for each publication |
+| `keys/tuf/` | The online TUF role keys, used by `repo deploy` and `repo refresh` |
+| `offline/` | The publisher root key and the TUF root key. Move them to offline storage after setup |
+| `tuf-root.json` | The original signed TUF root |
+| `mirrors.kdl` | Optional: the [public mirror list](#publish-a-mirror-list) to sign for clients |
+
+Give clients the original `tuf-root.json` and `repo/trust/1.json` over a
+trusted channel. Mirrors use the origin's signing identity: never generate
+keys for a mirror.
+
+### Serve the origin
+
+Prepare DNS and a TLS certificate for the HTTPS host name. Create a
+dedicated web root outside the workspace, on the same filesystem as its
+parent directory, and readable by the web server. Then generate the web
+server configuration and deploy:
+
+```sh
+origin=/srv/cps/canopa
+install -d -m 0755 "$origin"
+cps repo nginx-config --host packages.example.org --tls-cert /etc/tls/packages.crt \
+    --tls-key /etc/tls/packages.key --web-root "/canopa=$origin" \
+    > /etc/nginx/conf.d/packages.example.org.conf
+nginx -t && systemctl reload nginx
+cps repo deploy --workspace "$workspace" --output "$origin"
+```
+
+Run `cps repo deploy` after each publication. It exports the current
+catalog, signs it with the TUF keys, verifies the result from the original
+root as a new client would, and adds the new files beside the served ones.
+It replaces `metadata/timestamp.json` last, so clients only ever see a
+complete release. The generated configuration serves versioned files as
+immutable and refuses every other path.
+
+`--web-root PREFIX=DIR` serves the web root under a path prefix, here
+`https://packages.example.org/canopa/`, the base URL clients use. Without a
+prefix it is served at the top of the host. One host can serve several
+publishers: generate one server for the host and repeat `--web-root` for
+each publisher, such as `--web-root /runtime=/srv/cps/runtime`. Two
+generated servers for the same host name would conflict in NGINX.
+
+Timestamps expire after 7 days by default. Re-sign them daily on the signing
+host. The template timer runs as root unless a drop-in sets `User=` to the
+signing account:
+
+```sh
+systemctl enable --now cps-repo-refresh@canopa.timer
+```
+
+The timer runs `cps repo refresh --workspace /var/lib/cps-publish/canopa
+--output /srv/cps/canopa`. Set `WORKSPACE` and `WEB_ROOT` in
+`/etc/cps/repositories/canopa.conf` to use other paths. A refresh needs only
+the timestamp key, and the snapshot key when the snapshot would expire
+first, so a refresh host can hold only those. A refresh re-signs the
+deployed catalog, even after a newer catalog was published but not yet
+deployed, so holding a publication back never lets the served metadata
+expire.
+
+`cps repo deploy` records the versions it reserved and published in
+`repo/.tuf-publication.json`. Back it up with the repository. See
+[Deploying and refreshing](#deploying-and-refreshing) for every option.
+
+### Full replica
+
+A full replica serves every published file even when the origin is down.
+`cps repo replicate` reads the source like a client: it follows the signed
+timestamp to every file of the release and checks each file's signed length
+and digest. It reuses served files by hard link once their digest matches,
+and fetches damaged ones again. It records the files it verified in
+`.NAME.replica-verified.json` beside the replica, so a run after a
+timestamp refresh does not hash the whole repository again; a file changed
+since is hashed. It keeps the previous release's files for clients that are
+mid-download. A run that finds the release it already serves changes
+nothing. Files are world-readable whatever the umask. Before it replaces the
+served tree, it verifies the staged tree from the TUF root. It keeps serving
+its last good release when the source is unreachable or serves expired,
+forged, or older metadata.
+
+```sh
+cps repo nginx-config --host packages-dr.example.org --tls-cert /etc/tls/dr.crt \
+    --tls-key /etc/tls/dr.key --web-root /canopa=/srv/cps/canopa \
+    > /etc/nginx/conf.d/packages-dr.example.org.conf
+cps repo replicate --tuf-root /etc/cps/repositories/canopa.tuf-root.json \
+    --output /srv/cps/canopa https://packages.example.org/canopa
+```
+
+The source is an `https://` base URL, or an absolute path for a replica on
+the origin's host. To update the replica every 15 minutes, write
+`SOURCE=https://packages.example.org/canopa` to
+`/etc/cps/repositories/canopa.conf`, install the original TUF root at
+`/etc/cps/repositories/canopa.tuf-root.json`, and enable the timer:
+
+```sh
+systemctl enable --now cps-repo-replicate@canopa.timer
+```
+
+A failed run leaves the replica as it was and fails the service, so
+monitoring sees it. Each run prints the timestamp version it serves and when
+it expires. A replica serves its last release only while that release's
+signed metadata is valid. Keep it within the timestamp lifetime of the
+origin.
+
+### LAN read-through cache
+
+A cache saves upstream bandwidth without storing the whole repository. Its
+host needs only NGINX: no CPS, no keys.
+
+```sh
+cps repo nginx-config --host packages.lan.example.org --tls-cert /etc/tls/lan.crt \
+    --tls-key /etc/tls/lan.key --cache-dir /var/cache/nginx/cps \
+    --upstream /canopa=https://packages.example.org/canopa --max-size 20g
+```
+
+Clients then use `https://packages.lan.example.org/canopa/`. Repeat
+`--upstream PREFIX=URL` to cache several publishers on one host; they share
+the cache directory and its size limit.
+
+The configuration caches versioned metadata and targets, which never change,
+merges concurrent misses, and ignores query strings. It forwards
+`metadata/timestamp.json` and `publisher.json` without caching them, so
+clients always see the origin's freshness. Restrict network access to the
+intended clients, make the fleet trust the LAN certificate, and give NGINX
+write access to the cache directory. Pass `--ca-bundle` when the system CA
+bundle should not verify the upstream. Clients list the cache first in their
+[local mirror list](../client/publishers.md#mirror-lists).
+
+### Publish a mirror list
+
+Clients can fetch from every public mirror without configuring them. Write
+the list to `mirrors.kdl` in the workspace, and the next `cps repo deploy`
+signs it as the `mirrors` TUF target:
+
+```kdl
+schema-version 1 kind="mirror-list"
+mirror "https://packages.example.org/canopa/" region="eu"
+mirror "https://mirror.example.net/canopa/" region="us"
+mirror "https://packages-dr.example.org/canopa/"
+```
+
+Each mirror is an `https://` base URL that holds `metadata/` and `targets/`.
+`region` is optional: up to 32 letters, digits, or hyphens that clients can
+prefer. A list holds at most 64 mirrors. Clients cache the list from each
+verified sync and use it with their own [mirror list](../client/publishers.md#mirror-lists).
+Because the targets role signs it, a mirror cannot add itself or remove
+others. Outside a workspace, pass `--mirror-list FILE` to `cps repo deploy`
+or `cps repo export`.
 
 ## Export a release
 
@@ -84,9 +264,9 @@ The output directory holds `targets/`, with consistent-snapshot names, and
 snapshot roles, and `timestamp.json`. `--release-expires` sets the targets
 and snapshot expiry and `--timestamp-expires` the timestamp expiry. Use a
 version higher than every version published or reserved before. Publish the
-targets and versioned metadata before `timestamp.json`. The
-[bundled deployment adapter](#serving-a-basic-https-mirror) does all of
-this, keeps the version state, and verifies the result before publishing.
+targets and versioned metadata before `timestamp.json`. `cps repo deploy` does all of this, keeps the version record, and verifies
+the result before publishing. See
+[Serving a basic HTTPS mirror](#serving-a-basic-https-mirror).
 
 Any TUF repository tool that writes consistent snapshots can also sign an
 export, for example
@@ -102,8 +282,8 @@ so after a publication a cache downloads the new root and only the shards
 that changed. Sync downloads missing shards, manifests, attestations, and
 rebuild metadata in bounded parallel batches.
 
-`sign-export` keeps `current`, `publisher`, `trust-root.json`, and
-`retained` in the top-level targets role and places every content target
+`sign-export` keeps `current`, `publisher`, `trust-root.json`, `mirrors`,
+and `retained` in the top-level targets role and places every content target
 in one of 16 delegated roles, `objects-0` to `objects-f`, by the first
 hexadecimal digit of the SHA-256 of its name. Each release signs all 16
 roles, including empty ones, because a TUF snapshot cannot drop a role
@@ -135,33 +315,46 @@ name is `payload-delta-v1-<base SHA-256>-<result SHA-256>`.
 
 ## Serving a basic HTTPS mirror
 
-The bundled adapter [`ci/deploy-mirror.sh`](../../ci/deploy-mirror.sh)
-exports, signs, verifies, and publishes a catalog to a directory served by
-a static HTTPS server. Install `jq` and `flock` on the signing host.
-Provision an existing, writable directory for this publisher. The adapter
-stages files in the parent directory, which must also be writable and on
-the same filesystem. Point the server at the mirror directory.
+`cps repo deploy` exports, signs, verifies, and publishes the current catalog
+to a directory served by a static HTTPS server. `cps repo refresh` keeps its
+timestamp fresh. Provision an existing, writable web root for each publisher.
+Both commands stage files in its parent directory, which must also be
+writable and on the same filesystem. Point the server at the web root.
 
-Configure these absolute paths as workflow variables or shell environment
-variables when invoking the adapter directly.
+With `--workspace DIR`, the paths default to a [`cps repo init`](#create-the-publisher)
+workspace. Each option overrides its default:
 
-| Variable | Value |
-| --- | --- |
-| `CPS_BIN` | The CPS executable |
-| `CPS_MIRROR_DIR` | The directory served over HTTPS |
-| `CPS_MIRROR_TRUST_ROOT` | The publisher [trust root](publishing.md#publisher-trust-root) file that clients pin, used to verify the catalog and published in `publisher.json` |
-| `CPS_MIRROR_TUF_ROOT` | Original signed TUF root JSON used to bootstrap and verify the rotation chain |
-| `CPS_MIRROR_TUF_ACTIVE_ROOT` | Optional current or next signed TUF root JSON, with consistent snapshots enabled |
-| `CPS_MIRROR_TUF_KEYS` | Directory of TUF release key sources, described in [Release keys and external signers](#release-keys-and-external-signers) |
-| `CPS_MIRROR_TARGETS_LIFETIME` | Optional targets and snapshot lifetime for a deployment, such as `90 days` (default `30 days`) |
-| `CPS_MIRROR_SNAPSHOT_LIFETIME` | Optional lifetime of a snapshot re-signed by a refresh (default `30 days`) |
-| `CPS_MIRROR_TIMESTAMP_LIFETIME` | Optional timestamp lifetime (default `7 days`) |
-| `CPS_MIRROR_OBJECTS_THRESHOLD` | Optional signatures required on each `objects-*` delegation (default 1) |
-| `CPS_MIRROR_INITIAL_VERSION` | Only for recovering lost signer state, see below |
+| Option | Default in a workspace | Value |
+| --- | --- | --- |
+| `--repo` | `repo` | The publishing repository |
+| `--tuf-root` | `tuf-root.json` | Original signed TUF root, used to bootstrap and verify the rotation chain |
+| `--active-tuf-root` | the newest root the web root publishes, else the original root | Current or next signed TUF root, with consistent snapshots enabled |
+| `--trust-root` | `repo/trust/1.json` | The publisher [trust root](publishing.md#publisher-trust-root) that clients pin, used to verify the catalog and published in `publisher.json` |
+| `--key-dir` | `keys/tuf` | Directory of TUF release key sources, described in [Release keys and external signers](#release-keys-and-external-signers) |
+| `--mirror-list` | `mirrors.kdl`, when present | The [public mirror list](#publish-a-mirror-list) to sign. `deploy` only |
+| `--output`, `-o` | none | The directory served over HTTPS |
 
-Lifetimes are a number of `days` or `hours`. Keep the publisher's keys and
-all TUF private keys outside the HTTPS directory. The adapter refuses a key
-directory inside the mirror and a mirror inside the publishing repository.
+| Option | Default | Value |
+| --- | --- | --- |
+| `--targets-lifetime` | `30d` | Targets and snapshot lifetime for a deployment |
+| `--snapshot-lifetime` | `30d` | Lifetime of a snapshot re-signed by a refresh |
+| `--timestamp-lifetime` | `7d` | Timestamp lifetime |
+| `--objects-threshold` | 1 | Signatures required on each `objects-*` delegation |
+| `--initial-version` | none | Only for recovering a lost publication record, see below |
+
+Lifetimes are a number of days or hours, such as `90d` or `12h`. Keep the
+publisher's keys and all TUF private keys outside the web root. CPS refuses a
+key directory inside the web root and a web root inside the publishing
+repository.
+
+The release pipeline in [`ci/release.sh`](release-process.md) calls the
+adapter [`ci/deploy-mirror.sh`](../../ci/deploy-mirror.sh), which runs the
+same commands. It takes the paths from `CPS_MIRROR_DIR`,
+`CPS_MIRROR_TUF_ROOT`, `CPS_MIRROR_TUF_ACTIVE_ROOT`, `CPS_MIRROR_TRUST_ROOT`,
+`CPS_MIRROR_TUF_KEYS`, and `CPS_MIRROR_LIST`, and the settings from
+`CPS_MIRROR_TARGETS_LIFETIME`, `CPS_MIRROR_SNAPSHOT_LIFETIME`,
+`CPS_MIRROR_TIMESTAMP_LIFETIME`, `CPS_MIRROR_OBJECTS_THRESHOLD`, and
+`CPS_MIRROR_INITIAL_VERSION`.
 
 ### Provisioning the TUF root
 
@@ -211,49 +404,47 @@ separately so two remain available if one is lost.
 
 ### Deploying and refreshing
 
-To deploy the current catalog, export the variables above and run this from
-a checkout after building CPS. Set `repo` to the local publishing
-repository.
-
 ```sh
-export CPS_BIN="$PWD/target/release/cps"
-CPS_RELEASE_REPO="$repo" CPS_RELEASE_PUBLISHER=canopa \
-    CPS_RELEASE_DEPLOY="$PWD/ci/deploy-mirror.sh" \
-    bash ci/release.sh deploy-current "$(cat "$repo/current")"
+cps repo deploy --repo "$repo" --tuf-root root.json --trust-root repo/trust/1.json \
+    --key-dir release-keys --output /srv/cps/canopa
 ```
 
-The adapter verifies the staged release from the bootstrap root as a new
-client would, publishes `publisher.json` with the bootstrap TUF root and
-the publisher trust root, and publishes the new timestamp last. Install the
-signed TUF root at `/etc/cps/tuf-root.json` on clients for URL-only
-registration. Serve `metadata/timestamp.json` with revalidation so clients
-see the latest version promptly.
+`--catalog SHA256` deploys only if that catalog is still current, which a
+release pipeline uses to deploy exactly what it approved. The command
+verifies the staged release from the original root as a new client would,
+publishes `publisher.json` with the original TUF root and the publisher
+trust root, and publishes the new timestamp last. Install the signed TUF
+root at `/etc/cps/tuf-root.json` on clients for URL-only registration. The
+generated NGINX configuration serves `metadata/timestamp.json` with
+revalidation so clients see the latest version promptly.
 
 Clients fail an update when they cannot refresh a URL-added publisher,
 unless their image allows a bounded deferral. See
 [Refresh policy for mirror publishers](../client/publishers.md#refresh-policy-for-mirror-publishers).
-Keep the timestamp fresh: schedule `bash ci/release.sh refresh-mirror`
-daily with `CPS_MIRROR_DIR` and the deployment adapter configured. It
-re-signs the deployed catalog's metadata when the last signed timestamp has
-48 hours or less left, or when its bytes are missing or differ at the
-origin. The refresh needs only the timestamp key, and the snapshot key when
+Keep the timestamp fresh with `cps repo refresh` daily, for example with
+`cps-repo-refresh@NAME.timer`. Each run signs a new timestamp for the
+deployed catalog. It needs only the timestamp key, and the snapshot key when
 the snapshot is about to expire. See
 [Refreshing metadata without the targets key](#refreshing-metadata-without-the-targets-key).
+`bash ci/release.sh refresh-mirror` does the same for the release pipeline,
+and skips the refresh while the last signed timestamp has more than 48 hours
+left.
 
-The bundled adapter reserves versions and records the published timestamp
-and snapshot fingerprints in `.ci-tuf-state.json` in the private publishing
+Both commands reserve versions and record the published timestamp and
+snapshot fingerprints in `.tuf-publication.json` in the private publishing
 repository with `"format": 1`. Back up that file with the repository and
-keep it private to the signing account. A custom adapter that keeps no such
-record refreshes on each scheduled run.
+keep it private to the signing account. The web root is never trusted for
+versions or fingerprints.
 
-If signer state is lost, restore a trusted backup or set
-`CPS_MIRROR_INITIAL_VERSION` to the highest version previously published or
-reserved, from signing-host records. Run `deploy-current` with that setting
-once to create the protected state, then remove the setting. A new mirror
-starts at version 1.
+If the record is lost, restore a trusted backup, or pass `--initial-version`
+with the highest version previously published or reserved, from
+signing-host records. Deploy once with that setting to create the record. A
+new web root starts at version 1.
 
 Run `bash tests/deploy-mirror.sh` to exercise publishing and syncing a
-disposable mirror with the same adapter. It needs `tuftool`.
+disposable mirror through the release adapter. It needs `tuftool`. Run
+`bash tests/repository-infrastructure.sh` to exercise the workspace,
+replicas, client failover, and mirror ranking.
 
 ## Release keys and external signers
 
@@ -292,13 +483,13 @@ or more times with `--objects-threshold N` to delegate them to their own
 keys. The targets role records these keys, so changing them takes effect
 with the next release.
 
-The bundled adapter reads key sources from the `CPS_MIRROR_TUF_KEYS`
-directory. For each role (`targets`, `snapshot`, `timestamp`, and
-optionally `objects`), it uses `ROLE.pem` and `ROLE-NAME.pem` as key files
-and `ROLE.signer.kdl` and `ROLE-NAME.signer.kdl` as signer descriptors. List
-several files for a role to meet its threshold. It reads only the roles
-that the operation needs, so a refresh host can hold just the timestamp
-key.
+`cps repo deploy` and `cps repo refresh` read key sources from the
+`--key-dir` directory. For each role (`targets`, `snapshot`, `timestamp`,
+and optionally `objects`), they use `ROLE.pem`, `ROLE.der`, and their
+`ROLE-NAME` forms as key files, and `ROLE.signer.kdl` and
+`ROLE-NAME.signer.kdl` as signer descriptors. List several files for a role
+to meet its threshold. Only the roles that the operation needs are read, so
+a refresh host can hold just the timestamp key.
 
 ```kdl
 schema-version 1 kind="signer"
@@ -334,14 +525,13 @@ new version to be higher than the snapshot's. The output directory holds
 `timestamp.json` and, when re-signed, `VERSION.snapshot.json`. Publish the
 snapshot before the timestamp.
 
-Run as `deploy-mirror.sh REPO PUBLISHER CATALOG refresh`, the bundled
-adapter uses this command for the catalog recorded as deployed. It locates
-the snapshot from its signer state and checks the published snapshot and
-roles against the recorded digests before signing. It re-signs the snapshot
+`cps repo refresh` uses this signing step for the catalog recorded as
+deployed. It locates the snapshot from its publication record and checks the
+published snapshot and roles against the recorded digests before signing. It re-signs the snapshot
 when it would expire within a day of the new timestamp, and fails if no
 snapshot key is present then. It warns when the targets role expires within
 14 days and fails once it has expired. A refresh requires the active root
-to be published already. Publish a new root with `deploy-current`.
+to be published already. Publish a new root with `cps repo deploy`.
 
 ### External signer protocol
 
@@ -381,8 +571,8 @@ and a new or re-signed catalog, deploy that catalog as usual. The export's
 `trust-root.json` target then carries the newest version for clients that
 add the publisher by URL.
 
-Point `CPS_MIRROR_TRUST_ROOT` at the newest trust root version so that new
-clients bootstrap from it. The adapter replaces the trust root in
+Pass the newest trust root version as `--trust-root` so that new clients
+bootstrap from it. `cps repo deploy` replaces the trust root in
 `publisher.json` only with a later version from the history of the catalog it
 deploys, and only after that catalog's timestamp is published. It refuses any
 other change to the bootstrap material, an older version than the one the
@@ -392,7 +582,7 @@ pinned an older version keep working after rotation.
 
 ## Rotating a mirror's TUF root
 
-Keep `CPS_MIRROR_TUF_ROOT` pointing to the original bootstrap root. On the
+Keep `--tuf-root` pointing to the original bootstrap root. On the
 offline signing machine, prepare a root one version higher than the current
 root. Sign it with enough keys to satisfy both the current and new root
 thresholds. With `tuftool`, first sign `next-root.json` with the new root
@@ -402,18 +592,19 @@ a 2-of-3 root, the two remaining keys can authorize a successor that
 revokes the third. A signature from a key authorized by both roots counts
 toward both thresholds.
 
-Copy the signed successor to the signing host and set
-`CPS_MIRROR_TUF_ACTIVE_ROOT` to its path. If you also rotated the online
-roles, point `CPS_MIRROR_TUF_KEYS` at the matching release keys. Run
-`deploy-current` for the deployed catalog digest. The active root must be
+Copy the signed successor to the signing host and pass its path as
+`--active-tuf-root`. If you also rotated the online roles, point
+`--key-dir` at the matching release keys. Run `cps repo deploy` for the
+deployed catalog. The active root must be
 the latest published root or its immediate successor.
 
-The adapter verifies the chain from the bootstrap root before publishing,
+`cps repo deploy` verifies the chain from the bootstrap root before publishing,
 retains every versioned root file, and publishes the new root just before
 the new timestamp, because the new root may revoke the old timestamp key.
-Existing clients pick up the successor on sync. Keep
-`CPS_MIRROR_TUF_ACTIVE_ROOT` set for later deployments and timestamp
-refreshes.
+Existing clients pick up the successor on sync. Later deployments and
+timestamp refreshes, including the refresh timer, sign with the newest root
+the web root publishes, so `--active-tuf-root` is needed only to introduce a
+new root. Replicas follow the rotation on their next run.
 
 ## Publishing and verifying signed mirror release notes
 

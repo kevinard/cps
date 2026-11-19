@@ -37,7 +37,10 @@ cps repo sync --repo /var/lib/cps/canopa --tuf-root canopa-root.json \
 `--trust-root` is the publisher's pinned trust root, which also names the
 publisher. `--url` is the base URL that holds `metadata/` and `targets/`.
 When the two directories live elsewhere, pass `--metadata URL` and
-`--targets URL` instead.
+`--targets URL` instead. Repeat `--fallback-url URL` to try up to four more
+base URLs for the same signed repository, in order, as described in
+[Mirror lists](publishers.md#mirror-lists). `repo sync` uses exactly the URLs
+you pass: it ignores local mirror lists and the publisher's signed list.
 
 Point `cps image create` or the KDL image configuration at this cache. Give
 write access to the account that runs sync and keep the cache outside all
@@ -163,6 +166,11 @@ mirror "runtime" root="runtime-root.json" metadata="https://packages.example.org
 cps repo sync-profile --config image.kdl --index-only
 cps image create --root image --config image.kdl
 ```
+
+Each `mirror` entry is the publisher's configured source. To add a LAN cache
+or other mirrors, write a [mirror list](publishers.md#mirror-lists) to
+the image's `/etc/cps/mirrors/NAME.kdl`. Only `cps repo sync-profile`
+without `--image` reads `mirrors/NAME.kdl` beside the KDL file instead.
 
 CPS verifies the primary release and requires each companion mirror to
 advertise the exact signed pin as its current or retained catalog. It

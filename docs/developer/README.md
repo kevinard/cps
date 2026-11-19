@@ -160,7 +160,7 @@ The scripts find CPS through one of two variables, defaulting to
 
 | Variable | Read by |
 | --- | --- |
-| `CPS_BIN` | `deploy-mirror.sh`, `hwdb-trigger.sh`, `mediators.sh`, `release-ci.sh`, `release-notes.sh`, `sharded-mirror.sh`, `systemd-actions.sh`, `triggers.sh`, and the VM tests |
+| `CPS_BIN` | `deploy-mirror.sh`, `repository-infrastructure.sh`, `hwdb-trigger.sh`, `mediators.sh`, `release-ci.sh`, `release-notes.sh`, `sharded-mirror.sh`, `systemd-actions.sh`, `triggers.sh`, and the VM tests |
 | `CPS_TEST_BINARY` | The other scenarios and the fixture builders |
 | `CPS_TUF_FIXTURE` | `sharded-mirror.sh`: the disposable TUF signer, defaulting to `target/debug/examples/tuf-fixture` |
 
@@ -170,7 +170,7 @@ CI sets both CPS variables to the same binary and runs this set:
 export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
 export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
 for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
-    package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror boot-image \
+    package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
     recipe-orchestration; do
   bash "tests/$test.sh"
 done
@@ -199,8 +199,9 @@ Every scenario uses OpenSSL to create disposable keys.
 | [`recipe-orchestration.sh`](../../tests/recipe-orchestration.sh) | Build order, cycle reports, pin refreshes and checks, and soname rebuild plans | A C compiler |
 | [`release-ci.sh`](../../tests/release-ci.sh) | Prepare, promote, widen, deploy, and refresh with a 2-of-2 catalog threshold and test adapters | `jq`, `rg` |
 | [`release-notes.sh`](../../tests/release-notes.sh) | Signed mirror release notes and publication retries with a local GitHub CLI fixture | `jq`, `rg`, `ssh-keygen`, Python 3 |
-| [`sharded-mirror.sh`](../../tests/sharded-mirror.sh) | The deployment adapter with sharded targets, signer state checks, and sync | `jq`, `flock`, the TUF fixture |
-| [`deploy-mirror.sh`](../../tests/deploy-mirror.sh) | Mirror publication, refresh with only the timestamp key, an external timestamp signer, TUF root rotation and 2-of-3 revocation, publisher catalog key rotation, and descriptor trust root updates | `tuftool`, `jq`, `flock`, `rg` |
+| [`sharded-mirror.sh`](../../tests/sharded-mirror.sh) | The deployment adapter with sharded targets, publication record checks, and sync | `jq`, the TUF fixture |
+| [`deploy-mirror.sh`](../../tests/deploy-mirror.sh) | `cps repo deploy` and `cps repo refresh` through the release adapter: publication, refresh with only the timestamp key, an external timestamp signer, TUF root rotation and 2-of-3 revocation, publisher catalog key rotation, and descriptor trust root updates | `tuftool`, `jq`, `rg` |
+| [`repository-infrastructure.sh`](../../tests/repository-infrastructure.sh) | `cps repo init`, workspace deployment with a signed mirror list, verified replicas that refuse rollback and corruption, client failover, mirror lists and ranking, and NGINX configurations | `jq` |
 | [`boot-image.sh`](../../tests/boot-image.sh) | Offline Btrfs disk images: layout, registration, metadata, reproducibility, the systemd-boot version check, rejections, and failure cleanup | btrfs-progs, dosfstools (`mkfs.fat`, `fsck.fat`), mtools, `sfdisk`, `setfattr` |
 
 An unprivileged caller can set `CPS_DISK_TOOLS_DIR` to the absolute path of

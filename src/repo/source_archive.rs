@@ -145,7 +145,7 @@ fn source_pins(recipe: &BuildRecipe) -> BTreeMap<&str, &FileDigest> {
         .collect()
 }
 
-fn contains(root: &Root, pin: &FileDigest) -> Result<bool> {
+pub(super) fn contains(root: &Root, pin: &FileDigest) -> Result<bool> {
     match root.file(&pin.sha256) {
         Ok(file) => {
             verify_cached(file, pin)?;

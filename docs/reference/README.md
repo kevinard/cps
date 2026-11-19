@@ -66,7 +66,9 @@ formatted output.
 | Prepare and build packages | [manifest](man/cps-manifest.1), [source](man/cps-source.1), [build](man/cps-build.1), [develop](man/cps-develop.1) | [Package maintainers](../maintainer/README.md) |
 | Order recipe builds, plan rebuilds, and refresh recipe pins | [recipe](man/cps-recipe.1) (`recipe order`, `recipe rebuilds`, `recipe repin`, `recipe fetch-toolchain`) | [Plan builds across recipes](../maintainer/orchestration.md) |
 | Publish packages and manage the publisher trust root | [publish](man/cps-publish.1) (`publish manifests`, `publish bundle`, `publish release`), [repo](man/cps-repo.1) (`repo trust`, `repo resign`, `repo withdraw`) | [Publish and retire packages](../publisher/publishing.md) |
-| Export, sign, sync, or refresh a mirror | [repo](man/cps-repo.1) (`repo export`, `repo sign-export`, `repo refresh-metadata`, `repo sync`) | [Serve a mirror](../publisher/mirrors.md) · [Mirror clients](../client/mirrors.md) |
+| Set up and serve a repository, its replicas, and LAN caches | [repo](man/cps-repo.1) (`repo init`, `repo deploy`, `repo refresh`, `repo replicate`, `repo nginx-config`) | [Quick setup](../publisher/mirrors.md#quick-setup) |
+| Export, sign, sync, or refresh a mirror by hand | [repo](man/cps-repo.1) (`repo export`, `repo sign-export`, `repo refresh-metadata`, `repo sync`) | [Serve a mirror](../publisher/mirrors.md) · [Mirror clients](../client/mirrors.md) |
+| Choose and rank the mirrors a client uses | [publisher](man/cps-publisher.1) (`publisher mirror list`, `publisher mirror rank`) | [Mirror lists](../client/publishers.md#mirror-lists) |
 | Create, name, inspect, or switch boot environments | [boot](man/cps-boot.1) | [Boot operations](../setups/boot-operations.md) |
 
 ## Configuration and data formats
@@ -84,6 +86,8 @@ KDL documents declare `schema-version 1` and a document `kind`.
 | KDL `build-trust` | [Verifying builds on images and workers](../publisher/rebuilds.md#verifying-builds-on-images-and-workers) |
 | KDL `publish-policy` and `publish-release` | [Publishing policy](../publisher/publishing.md#publishing-policy) and [coordinated releases](../publisher/publishing.md#publish-a-coordinated-release) |
 | KDL `signer` | [External signer protocol](../publisher/mirrors.md#external-signer-protocol) |
+| KDL `mirror-list` | [Local mirror lists](../client/publishers.md#mirror-lists) and [signed public mirror lists](../publisher/mirrors.md#publish-a-mirror-list) |
+| Publication record `.tuf-publication.json`, format 1 | [Deploying and refreshing](../publisher/mirrors.md#deploying-and-refreshing) |
 | Image state in SQLite, version 1 | [Verify an image and locate its state](../client/images.md#verify-an-image-and-locate-its-state) |
 | Saved plan in JSON, version 1 | [Save, review, and apply a plan](../client/images.md#save-review-and-apply-a-plan) |
 | Transaction history in JSON | [Inspect transaction history](../client/images.md#inspect-transaction-history) |

@@ -1,0 +1,14 @@
+# Update the verified replica %i. /etc/cps/repositories/%i.conf sets SOURCE,
+# an https:// base URL or a local web root, and may override the defaults:
+# replica /srv/cps/%i, TUF root /etc/cps/repositories/%i.tuf-root.json.
+[Unit]
+Description=Update the CPS replica %i
+Documentation=man:cps-repo(1)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=WEB_ROOT=/srv/cps/%i TUF_ROOT=/etc/cps/repositories/%i.tuf-root.json
+EnvironmentFile=/etc/cps/repositories/%i.conf
+ExecStart=/usr/bin/cps repo replicate --tuf-root ${TUF_ROOT} --output ${WEB_ROOT} ${SOURCE}

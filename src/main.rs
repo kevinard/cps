@@ -1306,6 +1306,11 @@ enum PublisherCommand {
         #[arg(long, required = true, value_name = "PUBLISHER=PATH", value_parser = parse_repository)]
         repo: Vec<(String, PathBuf)>,
     },
+    /// Show and rank the mirrors each publisher is fetched from
+    Mirror {
+        #[command(subcommand)]
+        command: MirrorCommand,
+    },
     /// Replace a publisher's locally configured builder keys and threshold
     SetBuildTrust {
         #[command(flatten)]
@@ -1336,6 +1341,84 @@ enum PublisherCommand {
         name: String,
     },
 }
+
+#[derive(Subcommand)]
+enum MirrorCommand {
+    /// Show each publisher's mirrors in the order the next operation tries them
+    #[command(after_help = MIRROR_LIST_EXAMPLES)]
+    List {
+        #[command(flatten)]
+        image: Image,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+        /// Publishers to show (default: every publisher fetched from mirrors)
+        names: Vec<String>,
+    },
+    /// Probe every mirror's signed timestamp and order mirrors by freshness and speed
+    #[command(after_help = MIRROR_RANK_EXAMPLES)]
+    Rank {
+        #[command(flatten)]
+        image: Image,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+        /// Publishers to rank (default: every publisher fetched from mirrors)
+        names: Vec<String>,
+    },
+}
+
+const MIRROR_LIST_EXAMPLES: &str = "Examples:
+  sudo cps publisher mirror list
+  sudo cps publisher mirror list canopa --json
+
+Mirrors from /etc/cps/mirrors/NAME.kdl come first, then the configured
+source and the publisher's signed mirror list, in ranked order. The mirror
+state is private to the account that syncs the image, usually root.";
+
+const MIRROR_RANK_EXAMPLES: &str = "Examples:
+  sudo cps publisher mirror rank
+  sudo cps publisher mirror rank canopa
+
+Enable cps-mirror-rank.timer to rank weekly. The next operation tries
+mirrors in the ranked order; mirrors from /etc/cps/mirrors/NAME.kdl stay first.";
+
+const DEPLOY_EXAMPLES: &str = "Examples:
+  cps repo deploy --workspace /srv/cps-signing/canopa -o /srv/cps-www/canopa
+  cps repo deploy --repo repo --tuf-root root.json --trust-root trust/1.json \\
+      --key-dir keys --catalog SHA256 -o /srv/cps-www/canopa
+
+The private record of published versions is .tuf-publication.json in the
+publishing repository. Back it up with the repository.";
+
+const REFRESH_EXAMPLES: &str = "Examples:
+  cps repo refresh --workspace /srv/cps-signing/canopa -o /srv/cps-www/canopa
+
+A refresh re-signs the deployed catalog, even after a newer one is published
+but not yet deployed. It needs only the timestamp key, and the snapshot key
+when the snapshot would expire first. Enable cps-repo-refresh@NAME.timer to
+run it daily.";
+
+const REPLICATE_EXAMPLES: &str = "Examples:
+  cps repo replicate --tuf-root canopa-root.json -o /srv/cps-www/canopa \\
+      https://packages.example.org/canopa
+  cps repo replicate --tuf-root canopa-root.json -o /srv/replica/canopa /srv/cps-www/canopa
+
+The replica keeps serving its last verified release when the source is
+unreachable or serves expired, forged, or older metadata.
+Enable cps-repo-replicate@NAME.timer to run it every 15 minutes.";
+
+const NGINX_EXAMPLES: &str = "Examples:
+  cps repo nginx-config --host packages.example.org --tls-cert cert.pem \\
+      --tls-key key.pem --web-root /canopa=/srv/cps-www/canopa \\
+      --web-root /runtime=/srv/cps-www/runtime
+  cps repo nginx-config --host packages.lan.example.org --tls-cert cert.pem \\
+      --tls-key key.pem --cache-dir /var/cache/nginx/cps \\
+      --upstream /canopa=https://packages.example.org/canopa --max-size 50g
+
+Each publisher is served under its PREFIX, so a client's mirror URL is
+https://HOST/PREFIX. Generate one server for each host, listing all of its
+publishers. Include the output in NGINX's http block and run nginx -t.";
 
 fn parse_witness(value: &str) -> std::result::Result<BuildWitness, String> {
     let (key, attestation) = value.split_once('=').ok_or("expected KEY=ATTESTATION")?;
@@ -1591,23 +1674,173 @@ struct MirrorUrls {
     /// URL of the mirror's targets directory, when it is not under --url
     #[arg(long, requires = "metadata")]
     targets: Option<String>,
+    /// Additional base URL for the same signed mirror (repeat in preference order, at most 4)
+    #[arg(long = "fallback-url", value_name = "URL")]
+    fallback_urls: Vec<String>,
 }
 
 impl MirrorUrls {
-    fn resolve(self) -> (String, String) {
+    fn resolve(self) -> Result<release::Mirror> {
         match (self.url, self.metadata, self.targets) {
-            (Some(base), _, _) => {
-                let base = base.trim_end_matches('/');
-                (format!("{base}/metadata/"), format!("{base}/targets/"))
-            }
-            (None, Some(metadata), Some(targets)) => (metadata, targets),
+            (Some(base), _, _) => release::Mirror::from_base(&base),
+            (None, Some(metadata), Some(targets)) => release::Mirror::new(&metadata, &targets),
             _ => unreachable!("clap requires --url or --metadata with --targets"),
-        }
+        }?
+        .with_fallbacks(&self.fallback_urls)
+    }
+}
+
+/// The publishing repository, roots, and keys behind one web root.
+#[derive(Args)]
+struct PublicationArgs {
+    /// Workspace created by `cps repo init`, which supplies the defaults below
+    #[arg(long, value_name = "DIR")]
+    workspace: Option<PathBuf>,
+    /// Publishing repository (default: WORKSPACE/repo)
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Original signed TUF root that clients pin (default: WORKSPACE/tuf-root.json)
+    #[arg(long)]
+    tuf_root: Option<PathBuf>,
+    /// Rotated TUF root to sign with (default: the newest root the web root publishes, else --tuf-root)
+    #[arg(long)]
+    active_tuf_root: Option<PathBuf>,
+    /// Publisher trust root that clients pin (default: WORKSPACE/repo/trust/1.json)
+    #[arg(long)]
+    trust_root: Option<PathBuf>,
+    /// TUF role keys: ROLE.pem, ROLE.der, ROLE.signer.kdl, or ROLE-NAME.* (default: WORKSPACE/keys/tuf)
+    #[arg(long, value_name = "DIR")]
+    key_dir: Option<PathBuf>,
+    /// How long each timestamp is valid, such as 7d or 12h
+    #[arg(long, value_name = "LIFETIME", default_value = "7d", value_parser = release::parse_lifetime)]
+    timestamp_lifetime: std::time::Duration,
+    /// How long a re-signed snapshot is valid
+    #[arg(long, value_name = "LIFETIME", default_value = "30d", value_parser = release::parse_lifetime)]
+    snapshot_lifetime: std::time::Duration,
+    /// HTTPS document directory that serves the repository
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+struct ResolvedPublication {
+    repo: PathBuf,
+    tuf_root: PathBuf,
+    trust_root: PathBuf,
+    key_dir: PathBuf,
+}
+
+impl PublicationArgs {
+    fn resolve(&self) -> Result<ResolvedPublication> {
+        let default = |value: &Option<PathBuf>, relative: &str, flag: &str| {
+            value
+                .clone()
+                .or_else(|| {
+                    self.workspace
+                        .as_ref()
+                        .map(|workspace| workspace.join(relative))
+                })
+                .with_context(|| format!("pass --workspace or {flag}"))
+        };
+        Ok(ResolvedPublication {
+            repo: default(&self.repo, "repo", "--repo")?,
+            tuf_root: default(&self.tuf_root, "tuf-root.json", "--tuf-root")?,
+            trust_root: default(&self.trust_root, "repo/trust/1.json", "--trust-root")?,
+            key_dir: default(&self.key_dir, "keys/tuf", "--key-dir")?,
+        })
     }
 }
 
 #[derive(Subcommand)]
 enum RepoCommand {
+    /// Create a private publishing workspace with separate CPS and TUF keys
+    Init {
+        #[arg(long)]
+        publisher: String,
+        /// New directory for the publishing repository, keys, and public trust roots
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Sign the current catalog with TUF and publish it to a web root
+    #[command(after_help = DEPLOY_EXAMPLES)]
+    Deploy {
+        #[command(flatten)]
+        publication: PublicationArgs,
+        /// Exact current catalog to deploy (default: the current catalog)
+        #[arg(long, value_name = "SHA256")]
+        catalog: Option<String>,
+        /// Sign this list of public mirrors for clients (default: WORKSPACE/mirrors.kdl, if present)
+        #[arg(long, value_name = "FILE")]
+        mirror_list: Option<PathBuf>,
+        /// How long the targets and snapshot metadata are valid
+        #[arg(long, value_name = "LIFETIME", default_value = "30d", value_parser = release::parse_lifetime)]
+        targets_lifetime: std::time::Duration,
+        /// Signatures required on each objects-* delegation, from the
+        /// KEY_DIR/objects.* keys (default keys: the first targets key)
+        #[arg(long, default_value = "1")]
+        objects_threshold: std::num::NonZeroU64,
+        /// For a web root whose publication record was lost: the highest
+        /// metadata version it already serves, from trusted records
+        #[arg(long, value_name = "VERSION")]
+        initial_version: Option<u64>,
+    },
+    /// Re-sign a deployed web root's timestamp, and its snapshot before it expires
+    #[command(after_help = REFRESH_EXAMPLES)]
+    Refresh {
+        #[command(flatten)]
+        publication: PublicationArgs,
+        /// Refuse unless the web root serves this catalog SHA-256
+        #[arg(long)]
+        catalog: Option<String>,
+    },
+    /// Copy a deployed web root into a verified full replica
+    #[command(after_help = REPLICATE_EXAMPLES)]
+    Replicate {
+        /// The original signed TUF root that clients pin
+        #[arg(long)]
+        tuf_root: PathBuf,
+        /// Replica web root to create or update
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Source web root: an https:// base URL, or an absolute path on this host
+        source: String,
+    },
+    /// Print an NGINX server for a web root, a replica, or a LAN cache
+    #[command(after_help = NGINX_EXAMPLES)]
+    NginxConfig {
+        /// HTTPS host name of the server
+        #[arg(long)]
+        host: String,
+        /// TLS certificate chain
+        #[arg(long)]
+        tls_cert: PathBuf,
+        /// TLS private key
+        #[arg(long)]
+        tls_key: PathBuf,
+        /// Serve this web root or replica from disk, under PREFIX (default /) (repeat for several publishers)
+        #[arg(
+            long,
+            value_name = "[PREFIX=]DIR",
+            required_unless_present = "cache_dir",
+            conflicts_with = "cache_dir"
+        )]
+        web_root: Vec<String>,
+        /// Run a read-through cache that stores files in this directory
+        #[arg(long, value_name = "DIR", requires = "upstream")]
+        cache_dir: Option<PathBuf>,
+        /// Base URL of a web root to cache, such as https://packages.example.org/canopa, under PREFIX (default /) (repeat for several publishers)
+        #[arg(long, value_name = "[PREFIX=]URL", requires = "cache_dir")]
+        upstream: Vec<String>,
+        /// Largest size of the cache
+        #[arg(long, default_value = "20g", requires = "cache_dir")]
+        max_size: String,
+        /// CA certificates that verify the upstream server
+        #[arg(
+            long,
+            default_value = "/etc/ssl/certs/ca-certificates.crt",
+            requires = "cache_dir"
+        )]
+        ca_bundle: PathBuf,
+    },
     /// Create, rotate, sign, and inspect the publisher trust root
     Trust {
         #[command(subcommand)]
@@ -1759,6 +1992,9 @@ enum RepoCommand {
         /// Include archived build sources as TUF targets
         #[arg(long)]
         include_sources: bool,
+        /// Sign this list of public mirrors (kind="mirror-list") for clients
+        #[arg(long, value_name = "FILE", conflicts_with = "archive_catalog")]
+        mirror_list: Option<PathBuf>,
     },
     /// Sign an exported mirror with sharded TUF targets metadata
     SignExport {
@@ -3560,6 +3796,38 @@ fn run_publisher(command: PublisherCommand) -> Result<ExitCode> {
         PublisherCommand::SetRepository { image, repo } => {
             set_publisher_repositories(&image.root, &repo)?;
         }
+        PublisherCommand::Mirror { command } => {
+            let (report, json) = match command {
+                MirrorCommand::List { image, json, names } => {
+                    (release::list_publisher_mirrors(&image.root, &names)?, json)
+                }
+                MirrorCommand::Rank { image, json, names } => {
+                    (release::rank_publisher_mirrors(&image.root, &names)?, json)
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.is_empty() {
+                println!("No publisher is fetched from TUF mirrors.");
+            } else {
+                for (index, publisher) in report.iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    print!("{publisher}");
+                }
+            }
+            let failed = report
+                .iter()
+                .filter(|publisher| publisher.error.is_some())
+                .map(|publisher| publisher.publisher.as_str())
+                .collect::<Vec<_>>();
+            ensure!(
+                failed.is_empty(),
+                "could not rank the mirrors of {}",
+                failed.join(", ")
+            );
+        }
         PublisherCommand::SetBuildTrust {
             image,
             policy,
@@ -4235,6 +4503,130 @@ fn run_publish(command: PublishCommand) -> Result<()> {
 
 fn run_repo(command: RepoCommand) -> Result<()> {
     match command {
+        RepoCommand::Init { publisher, output } => {
+            release::init_publisher(&output, &publisher)?;
+            println!("Initialized publisher {publisher} in {}", output.display());
+        }
+        RepoCommand::Deploy {
+            publication,
+            catalog,
+            mirror_list,
+            targets_lifetime,
+            objects_threshold,
+            initial_version,
+        } => {
+            let paths = publication.resolve()?;
+            let mirror_list = mirror_list.or_else(|| {
+                publication
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.join("mirrors.kdl"))
+                    .filter(|path| path.exists())
+            });
+            println!(
+                "{}",
+                release::deploy_mirror(
+                    &release::Publication {
+                        repo: &paths.repo,
+                        output: &publication.output,
+                        tuf_root: &paths.tuf_root,
+                        active_tuf_root: publication.active_tuf_root.as_deref(),
+                        trust_root: &paths.trust_root,
+                        keys: &paths.key_dir,
+                        mirror_list: mirror_list.as_deref(),
+                        lifetimes: release::Lifetimes {
+                            targets: targets_lifetime,
+                            snapshot: publication.snapshot_lifetime,
+                            timestamp: publication.timestamp_lifetime,
+                        },
+                        objects_threshold,
+                        initial_version,
+                    },
+                    catalog.as_deref(),
+                )?
+            );
+        }
+        RepoCommand::Refresh {
+            publication,
+            catalog,
+        } => {
+            let paths = publication.resolve()?;
+            println!(
+                "{}",
+                release::refresh_mirror(
+                    &release::Publication {
+                        repo: &paths.repo,
+                        output: &publication.output,
+                        tuf_root: &paths.tuf_root,
+                        active_tuf_root: publication.active_tuf_root.as_deref(),
+                        trust_root: &paths.trust_root,
+                        keys: &paths.key_dir,
+                        mirror_list: None,
+                        lifetimes: release::Lifetimes {
+                            snapshot: publication.snapshot_lifetime,
+                            timestamp: publication.timestamp_lifetime,
+                            ..release::Lifetimes::default()
+                        },
+                        objects_threshold: std::num::NonZeroU64::MIN,
+                        initial_version: None,
+                    },
+                    catalog.as_deref()
+                )?
+            );
+        }
+        RepoCommand::Replicate {
+            tuf_root,
+            output,
+            source,
+        } => println!("{}", release::replicate(&source, &tuf_root, &output)?),
+        RepoCommand::NginxConfig {
+            host,
+            tls_cert,
+            tls_key,
+            web_root,
+            cache_dir,
+            upstream,
+            max_size,
+            ca_bundle,
+        } => {
+            let server = release::WebServer {
+                host: &host,
+                certificate: &tls_cert,
+                key: &tls_key,
+            };
+            let mounts = |specs: &[String]| {
+                specs
+                    .iter()
+                    .map(|spec| release::Mount::parse(spec))
+                    .collect::<Result<Vec<_>>>()
+            };
+            let roots = mounts(&web_root)?;
+            let roots = roots
+                .iter()
+                .map(|mount| release::Mount {
+                    prefix: mount.prefix.clone(),
+                    source: Path::new(&mount.source),
+                })
+                .collect::<Vec<_>>();
+            let upstreams = mounts(&upstream)?;
+            let upstreams = upstreams
+                .iter()
+                .map(|mount| release::Mount {
+                    prefix: mount.prefix.clone(),
+                    source: mount.source.as_str(),
+                })
+                .collect::<Vec<_>>();
+            let config = match &cache_dir {
+                None => release::WebConfig::Static { roots: &roots },
+                Some(directory) => release::WebConfig::Cache {
+                    directory,
+                    upstreams: &upstreams,
+                    max_size: &max_size,
+                    ca_bundle: &ca_bundle,
+                },
+            };
+            print!("{}", release::nginx_config(&server, &config)?);
+        }
         RepoCommand::Trust { command } => run_trust(command)?,
         RepoCommand::WidenRollout {
             repo,
@@ -4361,6 +4753,7 @@ fn run_repo(command: RepoCommand) -> Result<()> {
             delta_from,
             include_sources,
             archive_catalog,
+            mirror_list,
         } => {
             let publisher = pinned_publisher(&trust_root)?;
             let hash = if let Some(catalog) = archive_catalog {
@@ -4387,6 +4780,9 @@ fn run_repo(command: RepoCommand) -> Result<()> {
             } else {
                 release::export_with_retained(&repo, &publisher, &trust_root, &output, &retained)?
             };
+            if let Some(list) = mirror_list {
+                release::export_mirror_list(&output, &list)?;
+            }
             println!("Exported {hash}");
         }
         RepoCommand::SignExport {
@@ -4446,13 +4842,12 @@ fn run_repo(command: RepoCommand) -> Result<()> {
             archive_catalog,
         } => {
             let publisher = pinned_publisher(&trust_root)?;
-            let (metadata, targets) = mirror.resolve();
+            let mirror = mirror.resolve()?;
             let hash = if let Some(catalog) = archive_catalog {
-                release::sync_archive(
+                release::sync_archive_mirrors(
                     &repo,
                     &tuf_root,
-                    &metadata,
-                    &targets,
+                    release::MirrorSources::explicit(mirror),
                     &publisher,
                     &trust_root,
                     release::ArchiveSyncOptions {
@@ -4461,11 +4856,10 @@ fn run_repo(command: RepoCommand) -> Result<()> {
                     },
                 )?
             } else {
-                release::sync_with_required_catalogs(
+                release::sync_mirrors(
                     &repo,
                     &tuf_root,
-                    &metadata,
-                    &targets,
+                    release::MirrorSources::explicit(mirror),
                     &publisher,
                     &trust_root,
                     release::SyncOptions {
@@ -5041,9 +5435,18 @@ mod tests {
             parse(&args)
         };
         sync(&["--url", "https://m.example/"]).unwrap();
+        sync(&[
+            "--url",
+            "https://m.example/",
+            "--fallback-url",
+            "https://origin.example/",
+        ])
+        .unwrap();
         sync(&["--metadata", "file:///m/", "--targets", "file:///t/"]).unwrap();
         assert!(sync(&[]).is_err());
         assert!(sync(&["--metadata", "file:///m/"]).is_err());
         assert!(sync(&["--url", "https://m/", "--metadata", "m", "--targets", "t"]).is_err());
+        parse(&["publisher", "mirror", "rank", "canopa"]).unwrap();
+        parse(&["publisher", "mirror", "list", "--json"]).unwrap();
     }
 }

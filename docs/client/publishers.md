@@ -11,6 +11,8 @@ searches its publishers in a fixed order.
 - [Publisher order](#publisher-order)
 - [Add, reorder, and remove publishers](#add-reorder-and-remove-publishers)
 - [Add a publisher from an HTTPS mirror](#add-a-publisher-from-an-https-mirror)
+- [Mirror lists](#mirror-lists)
+  - [Rank mirrors](#rank-mirrors)
 - [Move publisher repositories](#move-publisher-repositories)
 - [Pinned trust roots](#pinned-trust-roots)
 - [Refresh policy for mirror publishers](#refresh-policy-for-mirror-publishers)
@@ -122,6 +124,93 @@ environments directory, so it is available across boots. Use `--cache PATH`
 for a different location, which is required when adding to an offline image
 with `--root`. Add `--build-trust POLICY` to
 [require build evidence](#require-build-evidence) from the start.
+
+## Mirror lists
+
+A publisher can be fetched from several mirrors. Every mirror serves the
+same signed repository and CPS verifies everything it downloads, so a mirror
+is only a transport: the publisher's identity comes from its TUF root and
+trust root, never from a URL. CPS combines three sources, in this order:
+
+1. **Your local list**, `/etc/cps/mirrors/NAME.kdl`. Its mirrors are always
+   tried first, in file order. Use it for a LAN cache, or to exclude a
+   mirror or ignore the publisher's list.
+2. **The configured source**: the URL the publisher was added from, or the
+   `mirror` entry of the [image configuration](mirrors.md#synchronizing-a-signed-profile).
+3. **The publisher's signed list** of public mirrors, which CPS caches from
+   each verified sync. Mirrors cannot change it.
+
+```kdl
+schema-version 1 kind="mirror-list"
+// Tried first, in this order.
+mirror "https://packages.lan.example.org/canopa/"
+// Never used.
+exclude "https://slow.example.net/canopa/"
+// Prefer the publisher's mirrors in these regions.
+region "eu"
+// Set #false to use only the mirrors above and the configured source.
+signed-mirrors #true
+```
+
+The file's name is the publisher's name. Each mirror is a base URL that
+holds `metadata/` and `targets/`. For an offline image the list lives at
+`IMAGE/etc/cps/mirrors/NAME.kdl`, wherever the image's configuration file
+is. Only `cps repo sync-profile` without `--image` reads `mirrors/NAME.kdl`
+beside the configuration file. Changes apply to the next operation. Nothing
+needs to be re-added.
+
+Each operation, such as a refresh, a sync, or a payload fetch, tries the
+mirrors in order until one completes, up to five mirrors, so only the first
+five candidates matter. Any failure caused
+by what a mirror served moves on to the next one: an outage, a timeout, a
+missing file, and also a signature, digest, expiry, or rollback failure.
+Trying another mirror is always safe, because each one is verified the same
+way. A mirror that is behind the newest release CPS has seen fails as a
+rollback, so a stale mirror never takes a client back. Each mirror gets its
+own transfer deadline, so a stalled mirror leaves time for the next one.
+When every mirror fails, CPS reports the most serious failure. A
+verification failure is reported before an expiry, and an expiry before an
+outage. A mirror that is merely behind counts as an outage when another
+mirror failed for a different reason, since replicas lag their origin
+between syncs. When every mirror serves older metadata, that is a rollback. The
+reported failure also decides whether the
+[refresh policy](#refresh-policy-for-mirror-publishers) may defer.
+
+### Rank mirrors
+
+`cps publisher mirror rank` fetches each candidate's signed
+`metadata/timestamp.json` and verifies it against the publisher's trusted
+TUF root. Mirrors that serve the newest valid timestamp come first, fastest
+first. Mirrors that are behind, expired, unverifiable, or unreachable go
+last. Signatures make freshness impossible to fake, so no central status
+service is needed. Like a sync, ranking follows the root history each
+mirror publishes, so mirrors already signing with the publisher's rotated
+keys rank current. Your local list's mirrors stay first whatever their rank.
+A publisher that cannot be ranked, such as one never synced, keeps its
+previous order. The others are still ranked, and the command then fails.
+
+```sh
+sudo cps publisher mirror rank
+sudo cps publisher mirror list canopa
+```
+
+```text
+Publisher canopa (ranked 0 hours ago)
+  1. https://packages.lan.example.org/canopa/ [local] current, timestamp 412, 3 ms
+  2. https://packages.example.org/canopa/ [signed, eu] current, timestamp 412, 41 ms
+  3. https://mirror.example.net/canopa/ [signed, us] behind, timestamp 409, 120 ms
+  4. https://slow.example.org/canopa/ [configured] unreachable: …
+```
+
+Ranking contacts every candidate, which tells each mirror that this host
+uses the publisher. It runs only when you ask, or weekly once you enable
+the timer:
+
+```sh
+sudo systemctl enable --now cps-mirror-rank.timer
+```
+
+Pass `--json` to either command for machine-readable output.
 
 ## Move publisher repositories
 

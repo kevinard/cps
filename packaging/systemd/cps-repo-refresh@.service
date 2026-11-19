@@ -1,0 +1,14 @@
+# Re-sign the TUF timestamp of the web root %i on its signing host.
+# Defaults: workspace /var/lib/cps-publish/%i, web root /srv/cps/%i.
+# Override WORKSPACE and WEB_ROOT in /etc/cps/repositories/%i.conf, and run
+# as the signing account with a drop-in that sets User=.
+[Unit]
+Description=Refresh the TUF timestamp of CPS web root %i
+Documentation=man:cps-repo(1)
+
+[Service]
+Type=oneshot
+Environment=WORKSPACE=/var/lib/cps-publish/%i WEB_ROOT=/srv/cps/%i
+EnvironmentFile=-/etc/cps/repositories/%i.conf
+ExecStart=/usr/bin/cps repo refresh --workspace ${WORKSPACE} --output ${WEB_ROOT}
+UMask=0077

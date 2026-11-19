@@ -33,8 +33,9 @@ use crate::{
     plan::{UpdateDiagnostics, UpdateSelection, inspect_update, plan_system},
     query::{InstallSource, SelectSource, select_install_sources},
     release::{
-        PublisherFreshness, SyncOptions, prune_system_payloads, refresh_url_publishers,
-        sync_profile_for_image, sync_with_options, url_publisher_freshness,
+        Mirror, MirrorSources, PublisherFreshness, SyncOptions, image_config_dir,
+        prune_system_payloads, refresh_url_publishers, sync_mirrors, sync_profile_for_image,
+        url_publisher_freshness,
     },
     systemd::LiveServices,
     transaction_progress,
@@ -1208,22 +1209,28 @@ impl System {
             return Ok(());
         }
         eprintln!("Refreshing package catalogs…");
+        // The image's local mirror lists, as `cps publisher mirror` reads them.
+        let config_dir = &image_config_dir(Path::new(ROOT));
         if definition.release_profile.is_some() {
             sync_profile_for_image(&self.config, true, Path::new(ROOT))?;
         } else {
             for publisher in &definition.publishers {
                 if let Some(mirror) = definition.mirrors.get(&publisher.name) {
-                    sync_with_options(
+                    sync_mirrors(
                         &publisher.repository,
                         &mirror.root,
-                        &mirror.metadata,
-                        &mirror.targets,
+                        MirrorSources::publisher(
+                            Mirror::new(&mirror.metadata, &mirror.targets)?,
+                            config_dir,
+                            &publisher.name,
+                        ),
                         &publisher.name,
                         &publisher.trust_key,
                         SyncOptions {
                             index_only: true,
                             image: Some(Path::new(ROOT)),
                         },
+                        &[],
                     )?;
                 }
             }

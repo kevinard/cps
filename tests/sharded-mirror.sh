@@ -42,7 +42,7 @@ for version in 1 2 3; do
         "public/metadata/$version.targets.json"
     jq -e '.signed.meta | length == 17' "public/metadata/$version.snapshot.json"
 done
-state=repo/.ci-tuf-state.json
+state=repo/.tuf-publication.json
 jq -e '.format == 1 and .version == 3' "$state"
 cp "$state" signer-state.json
 cp public/metadata/timestamp.json timestamp.json
@@ -52,7 +52,7 @@ for filter in 'del(.format)' '.format = 2'; do
         echo 'The mirror signer accepted an unsupported state format' >&2
         exit 1
     fi
-    grep -F 'Invalid TUF publication state' deploy.log
+    grep -F 'invalid publication record' deploy.log
     cmp public/metadata/timestamp.json timestamp.json
 done
 cat signer-state.json > "$state"

@@ -7,6 +7,12 @@ package "system/cps" publisher="canopa" version="0.1.0-40" architecture="x86_64"
     file "usr/lib/systemd/system/cps-boot-health.service" mode="0644" uid=0 gid=0
     file "usr/lib/systemd/system/cps-finalize-trial.path" mode="0644" uid=0 gid=0
     file "usr/lib/systemd/system/cps-finalize-trial.service" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/cps-mirror-rank.service" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/cps-mirror-rank.timer" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/cps-repo-refresh@.service" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/cps-repo-refresh@.timer" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/cps-repo-replicate@.service" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/cps-repo-replicate@.timer" mode="0644" uid=0 gid=0
     file "usr/lib/systemd/system/cps-uefi-bless.service" mode="0644" uid=0 gid=0
     file "usr/share/licenses/cps/LICENSE" mode="0644" uid=0 gid=0
     symlink "usr/lib/systemd/system/boot-complete.target.requires/cps-boot-health.service" target="../cps-boot-health.service" uid=0 gid=0

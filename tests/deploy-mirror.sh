@@ -42,6 +42,11 @@ sync_mirror() {
 
 publish 1
 first=$(cat repo/current)
+if "$project/ci/deploy-mirror.sh" repo runtime "$first" 2> publisher.log; then
+    echo 'A deployment for another publisher was accepted' >&2
+    exit 1
+fi
+rg -F 'The trust root is for publisher canopa, not runtime' publisher.log
 deploy "$first"
 sync_mirror "$first"
 # The trust-root.json target is the newest trust root of the deployed catalog.
@@ -75,7 +80,7 @@ cmp original-timestamp.json public/metadata/timestamp.json
 mv -- timestamp.pem keys/timestamp.pem
 
 # Simulate an interrupted publication, then forge the untrusted origin's version.
-state=repo/.ci-tuf-state.json
+state=repo/.tuf-publication.json
 jq '.version = 2 | .published = null' "$state" > state.json
 install -m 0600 state.json "$state"
 cp public/metadata/{1,2}.targets.json
@@ -194,7 +199,8 @@ jq -e '.signed.version == 4' new-cache/.tuf/trusted/root.json
 export CPS_MIRROR_TUF_ACTIVE_ROOT=$work/root-v4.json
 mkdir offline-keys
 mv -- next-keys/targets.pem next-keys/snapshot.pem offline-keys/
-refresh() { "$project/ci/deploy-mirror.sh" repo canopa "$1" refresh; }
+# Like the refresh timer, a refresh finds the active root on the web root.
+refresh() { CPS_MIRROR_TUF_ACTIVE_ROOT= "$project/ci/deploy-mirror.sh" repo canopa "$1" refresh; }
 before=$(jq -er '.signed.version' public/metadata/timestamp.json)
 snapshot=$(jq -er '.signed.meta["snapshot.json"].version' public/metadata/timestamp.json)
 if deploy "$second"; then
@@ -231,7 +237,7 @@ if refresh "$second" > forgery.log 2>&1; then
     echo 'A refresh signed over an altered snapshot' >&2
     exit 1
 fi
-rg -F 'differs from the signer record' forgery.log
+rg -F 'differs from the publication record' forgery.log
 cat saved-snapshot.json > "$snapshot_file"
 cmp before-forgery.json public/metadata/timestamp.json
 

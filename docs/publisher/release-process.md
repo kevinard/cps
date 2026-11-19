@@ -139,17 +139,20 @@ the mirror serves the requested digest and checks the cohort's health. Exit
 ## Deploy and refresh the mirror
 
 The deployment adapter receives the repository, publisher, and exact
-catalog digest. The bundled adapter exports and verifies that catalog,
+catalog digest. The bundled adapter runs
+[`cps repo deploy`](mirrors.md#serving-a-basic-https-mirror), which exports and verifies that catalog,
 publishes `publisher.json` with its TUF root and the publisher trust root
 that clients pin, and publishes the new timestamp last. The release script
 records successful deployment in `.ci-deployed-catalog`. If deployment
 fails after local promotion, retry on the signing host with
 `bash ci/release.sh deploy-current CURRENT_SHA256`.
 
-Schedule `bash ci/release.sh refresh-mirror` daily. It calls the adapter
-with a fourth argument, `refresh`, for the catalog recorded as deployed.
-The adapter then re-signs only the mirror metadata that is about to expire
-and must not need the targets or publisher keys. The release script removes
+Schedule `bash ci/release.sh refresh-mirror` daily. While the last signed
+timestamp has more than 48 hours left and is unchanged at the origin, it
+does nothing. Otherwise it calls the adapter with a fourth argument,
+`refresh`, for the catalog recorded as deployed. The bundled adapter then
+runs `cps repo refresh`, which re-signs only the mirror metadata that is
+about to expire and needs neither the targets nor the publisher keys. The release script removes
 `CPS_RELEASE_SIGNING_KEY` from the adapter's environment for every
 deployment and refresh.
 

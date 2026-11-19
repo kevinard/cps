@@ -7,6 +7,21 @@
 .B \&cps repo <COMMAND>
 .SH COMMANDS
 .TP
+.B \&init
+\&Create a private publishing workspace with separate CPS and TUF keys
+.TP
+.B \&deploy
+\&Sign the current catalog with TUF and publish it to a web root
+.TP
+.B \&refresh
+\&Re\-sign a deployed web root's timestamp, and its snapshot before it expires
+.TP
+.B \&replicate
+\&Copy a deployed web root into a verified full replica
+.TP
+.B \&nginx\-config
+\&Print an NGINX server for a web root, a replica, or a LAN cache
+.TP
 .B \&trust
 \&Create, rotate, sign, and inspect the publisher trust root
 .TP
@@ -68,6 +83,205 @@
 .B \&\-h, \-\-help
 \&Print help
 .SH SUBCOMMAND REFERENCE
+.SS "\&cps repo init"
+\&Create a private publishing workspace with separate CPS and TUF keys
+.PP
+.B \&cps repo init \-\-publisher <PUBLISHER> \-\-output <OUTPUT>
+.PP
+.B Options
+.PP
+.B \&\-\-publisher <PUBLISHER>
+.TP
+.B \&\-o, \-\-output <OUTPUT>
+\&New directory for the publishing repository, keys, and public trust roots
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps repo deploy"
+\&Sign the current catalog with TUF and publish it to a web root
+.PP
+.B \&cps repo deploy [OPTIONS] \-\-output <OUTPUT>
+.PP
+.B Options
+.TP
+.B \&\-\-workspace <DIR>
+\&Workspace created by `cps repo init`, which supplies the defaults below
+.TP
+.B \&\-\-repo <REPO>
+\&Publishing repository (default: WORKSPACE/repo)
+.TP
+.B \&\-\-tuf\-root <TUF_ROOT>
+\&Original signed TUF root that clients pin (default: WORKSPACE/tuf\-root.json)
+.TP
+.B \&\-\-active\-tuf\-root <ACTIVE_TUF_ROOT>
+\&Rotated TUF root to sign with (default: the newest root the web root publishes, else \-\-tuf\-root)
+.TP
+.B \&\-\-trust\-root <TRUST_ROOT>
+\&Publisher trust root that clients pin (default: WORKSPACE/repo/trust/1.json)
+.TP
+.B \&\-\-key\-dir <DIR>
+\&TUF role keys: ROLE.pem, ROLE.der, ROLE.signer.kdl, or ROLE\-NAME.* (default: WORKSPACE/keys/tuf)
+.TP
+.B \&\-\-timestamp\-lifetime <LIFETIME>
+\&How long each timestamp is valid, such as 7d or 12h [default: 7d]
+.TP
+.B \&\-\-snapshot\-lifetime <LIFETIME>
+\&How long a re\-signed snapshot is valid [default: 30d]
+.TP
+.B \&\-o, \-\-output <OUTPUT>
+\&HTTPS document directory that serves the repository
+.TP
+.B \&\-\-catalog <SHA256>
+\&Exact current catalog to deploy (default: the current catalog)
+.TP
+.B \&\-\-mirror\-list <FILE>
+\&Sign this list of public mirrors for clients (default: WORKSPACE/mirrors.kdl, if present)
+.TP
+.B \&\-\-targets\-lifetime <LIFETIME>
+\&How long the targets and snapshot metadata are valid [default: 30d]
+.TP
+.B \&\-\-objects\-threshold <OBJECTS_THRESHOLD>
+\&Signatures required on each objects\-* delegation, from the KEY_DIR/objects.* keys (default keys: the first targets key) [default: 1]
+.TP
+.B \&\-\-initial\-version <VERSION>
+\&For a web root whose publication record was lost: the highest metadata version it already serves, from trusted records
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.PP
+\&The private record of published versions is .tuf\-publication.json in the publishing repository. Back it up with the repository.
+.PP
+.B Examples
+.PP
+.B \&cps repo deploy \-\-workspace /srv/cps\-signing/canopa \-o /srv/cps\-www/canopa
+.PP
+.B \&cps repo deploy \-\-repo repo \-\-tuf\-root root.json \-\-trust\-root trust/1.json \e
+.PP
+.B \&\-\-key\-dir keys \-\-catalog SHA256 \-o /srv/cps\-www/canopa
+.SS "\&cps repo refresh"
+\&Re\-sign a deployed web root's timestamp, and its snapshot before it expires
+.PP
+.B \&cps repo refresh [OPTIONS] \-\-output <OUTPUT>
+.PP
+.B Options
+.TP
+.B \&\-\-workspace <DIR>
+\&Workspace created by `cps repo init`, which supplies the defaults below
+.TP
+.B \&\-\-repo <REPO>
+\&Publishing repository (default: WORKSPACE/repo)
+.TP
+.B \&\-\-tuf\-root <TUF_ROOT>
+\&Original signed TUF root that clients pin (default: WORKSPACE/tuf\-root.json)
+.TP
+.B \&\-\-active\-tuf\-root <ACTIVE_TUF_ROOT>
+\&Rotated TUF root to sign with (default: the newest root the web root publishes, else \-\-tuf\-root)
+.TP
+.B \&\-\-trust\-root <TRUST_ROOT>
+\&Publisher trust root that clients pin (default: WORKSPACE/repo/trust/1.json)
+.TP
+.B \&\-\-key\-dir <DIR>
+\&TUF role keys: ROLE.pem, ROLE.der, ROLE.signer.kdl, or ROLE\-NAME.* (default: WORKSPACE/keys/tuf)
+.TP
+.B \&\-\-timestamp\-lifetime <LIFETIME>
+\&How long each timestamp is valid, such as 7d or 12h [default: 7d]
+.TP
+.B \&\-\-snapshot\-lifetime <LIFETIME>
+\&How long a re\-signed snapshot is valid [default: 30d]
+.TP
+.B \&\-o, \-\-output <OUTPUT>
+\&HTTPS document directory that serves the repository
+.TP
+.B \&\-\-catalog <CATALOG>
+\&Refuse unless the web root serves this catalog SHA\-256
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.PP
+\&A refresh re\-signs the deployed catalog, even after a newer one is published but not yet deployed. It needs only the timestamp key, and the snapshot key when the snapshot would expire first. Enable cps\-repo\-refresh@NAME.timer to run it daily.
+.PP
+.B Examples
+.PP
+.B \&cps repo refresh \-\-workspace /srv/cps\-signing/canopa \-o /srv/cps\-www/canopa
+.SS "\&cps repo replicate"
+\&Copy a deployed web root into a verified full replica
+.PP
+.B \&cps repo replicate \-\-tuf\-root <TUF_ROOT> \-\-output <OUTPUT> <SOURCE>
+.PP
+.B Arguments
+.TP
+.B \&<SOURCE>
+\&Source web root: an https:// base URL, or an absolute path on this host
+.PP
+.B Options
+.TP
+.B \&\-\-tuf\-root <TUF_ROOT>
+\&The original signed TUF root that clients pin
+.TP
+.B \&\-o, \-\-output <OUTPUT>
+\&Replica web root to create or update
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.PP
+\&The replica keeps serving its last verified release when the source is unreachable or serves expired, forged, or older metadata. Enable cps\-repo\-replicate@NAME.timer to run it every 15 minutes.
+.PP
+.B Examples
+.PP
+.B \&cps repo replicate \-\-tuf\-root canopa\-root.json \-o /srv/cps\-www/canopa \e
+.PP
+.B \&https://packages.example.org/canopa
+.PP
+.B \&cps repo replicate \-\-tuf\-root canopa\-root.json \-o /srv/replica/canopa /srv/cps\-www/canopa
+.SS "\&cps repo nginx\-config"
+\&Print an NGINX server for a web root, a replica, or a LAN cache
+.PP
+.B \&cps repo nginx\-config [OPTIONS] \-\-host <HOST> \-\-tls\-cert <TLS_CERT> \-\-tls\-key <TLS_KEY>
+.PP
+.B Options
+.TP
+.B \&\-\-host <HOST>
+\&HTTPS host name of the server
+.TP
+.B \&\-\-tls\-cert <TLS_CERT>
+\&TLS certificate chain
+.TP
+.B \&\-\-tls\-key <TLS_KEY>
+\&TLS private key
+.TP
+.B \&\-\-web\-root <[PREFIX=]DIR>
+\&Serve this web root or replica from disk, under PREFIX (default /) (repeat for several publishers)
+.TP
+.B \&\-\-cache\-dir <DIR>
+\&Run a read\-through cache that stores files in this directory
+.TP
+.B \&\-\-upstream <[PREFIX=]URL>
+\&Base URL of a web root to cache, such as https://packages.example.org/canopa, under PREFIX (default /) (repeat for several publishers)
+.TP
+.B \&\-\-max\-size <MAX_SIZE>
+\&Largest size of the cache [default: 20g]
+.TP
+.B \&\-\-ca\-bundle <CA_BUNDLE>
+\&CA certificates that verify the upstream server [default: /etc/ssl/certs/ca\-certificates.crt]
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.PP
+\&Each publisher is served under its PREFIX, so a client's mirror URL is https://HOST/PREFIX. Generate one server for each host, listing all of its publishers. Include the output in NGINX's http block and run nginx \-t.
+.PP
+.B Examples
+.PP
+.B \&cps repo nginx\-config \-\-host packages.example.org \-\-tls\-cert cert.pem \e
+.PP
+.B \&\-\-tls\-key key.pem \-\-web\-root /canopa=/srv/cps\-www/canopa \e
+.PP
+.B \&\-\-web\-root /runtime=/srv/cps\-www/runtime
+.PP
+.B \&cps repo nginx\-config \-\-host packages.lan.example.org \-\-tls\-cert cert.pem \e
+.PP
+.B \&\-\-tls\-key key.pem \-\-cache\-dir /var/cache/nginx/cps \e
+.PP
+.B \&\-\-upstream /canopa=https://packages.example.org/canopa \-\-max\-size 50g
 .SS "\&cps repo trust"
 \&Create, rotate, sign, and inspect the publisher trust root
 .PP
@@ -460,6 +674,9 @@
 .B \&\-\-include\-sources
 \&Include archived build sources as TUF targets
 .TP
+.B \&\-\-mirror\-list <FILE>
+\&Sign this list of public mirrors (kind=\(dqmirror\-list\(dq) for clients
+.TP
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps repo sign\-export"
@@ -560,6 +777,9 @@
 .TP
 .B \&\-\-targets <TARGETS>
 \&URL of the mirror's targets directory, when it is not under \-\-url
+.TP
+.B \&\-\-fallback\-url <URL>
+\&Additional base URL for the same signed mirror (repeat in preference order, at most 4)
 .TP
 .B \&\-\-trust\-root <TRUST_ROOT>
 \&Pinned trust root of the publisher, which also names it

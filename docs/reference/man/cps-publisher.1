@@ -16,6 +16,9 @@
 .B \&set\-repository
 \&Replace one or more local repository paths as a single change
 .TP
+.B \&mirror
+\&Show and rank the mirrors each publisher is fetched from
+.TP
 .B \&set\-build\-trust
 \&Replace a publisher's locally configured builder keys and threshold
 .TP
@@ -99,6 +102,82 @@
 .TP
 .B \&\-h, \-\-help
 \&Print help
+.SS "\&cps publisher mirror"
+\&Show and rank the mirrors each publisher is fetched from
+.PP
+.B \&cps publisher mirror <COMMAND>
+.PP
+.B Commands
+.TP
+.B \&list
+\&Show each publisher's mirrors in the order the next operation tries them
+.TP
+.B \&rank
+\&Probe every mirror's signed timestamp and order mirrors by freshness and speed
+.TP
+.B \&help
+\&Print this message or the help of the given subcommand(s)
+.PP
+.B Options
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps publisher mirror list"
+\&Show each publisher's mirrors in the order the next operation tries them
+.PP
+.B \&cps publisher mirror list [OPTIONS] [NAMES]...
+.PP
+.B Arguments
+.TP
+.B \&[NAMES]...
+\&Publishers to show (default: every publisher fetched from mirrors)
+.PP
+.B Options
+.TP
+.B \&\-\-root <IMAGE>
+\&Image root (default: the running system) [default: /]
+.TP
+.B \&\-\-json
+\&Print JSON instead of text
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.PP
+\&Mirrors from /etc/cps/mirrors/NAME.kdl come first, then the configured source and the publisher's signed mirror list, in ranked order. The mirror state is private to the account that syncs the image, usually root.
+.PP
+.B Examples
+.PP
+.B \&sudo cps publisher mirror list
+.PP
+.B \&sudo cps publisher mirror list canopa \-\-json
+.SS "\&cps publisher mirror rank"
+\&Probe every mirror's signed timestamp and order mirrors by freshness and speed
+.PP
+.B \&cps publisher mirror rank [OPTIONS] [NAMES]...
+.PP
+.B Arguments
+.TP
+.B \&[NAMES]...
+\&Publishers to rank (default: every publisher fetched from mirrors)
+.PP
+.B Options
+.TP
+.B \&\-\-root <IMAGE>
+\&Image root (default: the running system) [default: /]
+.TP
+.B \&\-\-json
+\&Print JSON instead of text
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.PP
+\&Enable cps\-mirror\-rank.timer to rank weekly. The next operation tries mirrors in the ranked order; mirrors from /etc/cps/mirrors/NAME.kdl stay first.
+.PP
+.B Examples
+.PP
+.B \&sudo cps publisher mirror rank
+.PP
+.B \&sudo cps publisher mirror rank canopa
 .SS "\&cps publisher set\-build\-trust"
 \&Replace a publisher's locally configured builder keys and threshold
 .PP

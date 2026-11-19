@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
-    ImageGuard, Mirror, SyncSelection, SyncSource, cache::record_profile_pins, digest, lock_repo,
-    record_catalog_checkpoint, stage_release,
+    ImageGuard, Mirror, MirrorSources, SyncSelection, SyncSource, cache::record_profile_pins,
+    digest, image_config_dir, lock_repo, record_catalog_checkpoint, stage_release,
 };
 
 /// Materialize a signed profile's catalog set before advancing its primary pointer.
@@ -59,6 +59,16 @@ pub fn sync_profile_with_payloads(
 ) -> Result<String> {
     let guard = image.map(ImageGuard::open).transpose()?;
     let definition = read_image_definition(config)?;
+    // An image's local mirror lists live in IMAGE/etc/cps/mirrors, where
+    // `cps publisher mirror` reads them. Without an image, they live beside
+    // the configuration.
+    let config_dir = match image {
+        Some(image) => image_config_dir(image),
+        None => std::fs::canonicalize(config)?
+            .parent()
+            .context("missing image configuration directory")?
+            .to_owned(),
+    };
     let name = definition
         .release_profile
         .as_deref()
@@ -73,7 +83,11 @@ pub fn sync_profile_with_payloads(
                 .with_context(|| format!("missing mirror for publisher {}", publisher.name))?;
             SyncSource::new(
                 &mirror.root,
-                Mirror::new(&mirror.metadata, &mirror.targets)?,
+                MirrorSources::publisher(
+                    Mirror::new(&mirror.metadata, &mirror.targets)?,
+                    &config_dir,
+                    &publisher.name,
+                ),
                 &publisher.name,
                 &publisher.trust_key,
             )

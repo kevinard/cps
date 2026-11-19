@@ -20,7 +20,8 @@ use crate::{
     repo::{
         BuildAudit, BuildReceipt, CatalogCheckpoint, CatalogPin, Published, ReleaseProfile,
         audit_installed_builds, canonical_repo, catalog_index, read_selected_catalog,
-        release::sync_url_publisher, release_profile,
+        release::{image_config_dir, sync_url_publisher},
+        release_profile,
     },
 };
 
@@ -198,6 +199,7 @@ pub fn add_publisher_from_url(
         );
     }
     drop(image);
+    let config_dir = image_config_dir(root);
 
     match cache.symlink_metadata() {
         Ok(metadata) => {
@@ -205,13 +207,13 @@ pub fn add_publisher_from_url(
                 metadata.is_dir() && cache.join("current").is_file(),
                 "use a new directory or an already synchronized mirror cache"
             );
-            sync_url_publisher(&cache, url, trusted_root, name, key)?;
+            sync_url_publisher(&cache, url, &config_dir, trusted_root, name, key)?;
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let scratch = tempfile::Builder::new()
                 .prefix(".cps-mirror-")
                 .tempdir_in(&parent)?;
-            sync_url_publisher(scratch.path(), url, trusted_root, name, key)?;
+            sync_url_publisher(scratch.path(), url, &config_dir, trusted_root, name, key)?;
             let directory = File::open(&parent)?;
             renameat_with(
                 &directory,

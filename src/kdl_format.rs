@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(crate) mod build;
+pub(crate) mod mirror_list;
 pub(crate) mod publish_policy;
 pub(crate) mod publish_release;
 pub(crate) mod signer;

@@ -1355,6 +1355,85 @@ publisher "seed" {{ repository {:?}; trust-root {:?}; }}
     assert!(!cache.exists());
     assert_eq!(crate::list_publishers(&main.root)?.len(), 2);
     assert_eq!(add(&extras.trust, &cache)?, cache);
+    // A local mirror list puts an unreachable mirror first. Every later
+    // refresh and payload fetch fails over to the configured URL.
+    let missing = Url::from_directory_path(extras._dir.path().join("missing-mirror")).unwrap();
+    fs::create_dir_all(main.root.join("etc/cps/mirrors"))?;
+    fs::write(
+        main.root.join("etc/cps/mirrors/extras.kdl"),
+        format!("schema-version 1 kind=\"mirror-list\"\nmirror \"{missing}\"\n"),
+    )?;
+    let listed = mirror_release::list_publisher_mirrors(&main.root, &["extras".to_owned()])?;
+    assert_eq!(
+        listed[0]
+            .mirrors
+            .iter()
+            .map(|mirror| (mirror.url.as_str(), mirror.source))
+            .collect::<Vec<_>>(),
+        [
+            (missing.as_str(), mirror_release::MirrorSource::Local),
+            (
+                format!("{url}/").as_str(),
+                mirror_release::MirrorSource::Configured
+            ),
+        ]
+    );
+    assert_eq!(
+        fs::read_to_string(cache.join(".tuf/endpoints"))?,
+        format!("{url}/metadata/ {url}/targets/\n")
+    );
+    // Ranking follows a mirror's root history: a mirror that serves a release
+    // under a rotated root is current, and the one still on the old release
+    // is behind, although the client has not synced the new root yet.
+    let rotated_anchor = work.join("rotated-root.json");
+    let rotated_key = work.join("rotated-key.der");
+    sign_root(&rotated_anchor, &rotated_key, Some(&tuf_key))?;
+    let rotated = work.join("rotated-mirror");
+    sign_publisher_release(
+        &extras,
+        &rotated,
+        2,
+        fresh,
+        &rotated_anchor,
+        &rotated_key,
+        "extras",
+    )?;
+    let rotated = Url::from_directory_path(&rotated).unwrap();
+    let list = main.root.join("etc/cps/mirrors/extras.kdl");
+    fs::write(
+        &list,
+        format!("schema-version 1 kind=\"mirror-list\"\nmirror \"{rotated}\"\n"),
+    )?;
+    let ranked = mirror_release::rank_publisher_mirrors(&main.root, &["extras".to_owned()])?;
+    let statuses = ranked[0]
+        .mirrors
+        .iter()
+        .map(|mirror| {
+            (
+                mirror.url.as_str(),
+                mirror.probe.as_ref().map(|probe| probe.status),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        [
+            (
+                rotated.as_str(),
+                Some(mirror_release::MirrorStatus::Current)
+            ),
+            (
+                format!("{url}/").as_str(),
+                Some(mirror_release::MirrorStatus::Behind)
+            ),
+        ]
+    );
+    // Restore the unreachable local mirror and its recorded order.
+    fs::write(
+        &list,
+        format!("schema-version 1 kind=\"mirror-list\"\nmirror \"{missing}\"\n"),
+    )?;
+    mirror_release::rank_publisher_mirrors(&main.root, &["extras".to_owned()])?;
     assert!(
         apply(&main.root, &previous)
             .unwrap_err()
@@ -5801,6 +5880,166 @@ publisher "seed" {{
         panic!("audit accepted a different signed profile catalog");
     };
     assert!(format!("{error:#}").contains("archived catalog digest mismatch"));
+    Ok(())
+}
+
+#[test]
+fn mirror_failover_covers_outages_corruption_and_stale_mirrors() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let work = fixture._dir.path();
+    let anchor = work.join("root.json");
+    let tuf_key = work.join("tuf-key.der");
+    sign_root(&anchor, &tuf_key, None)?;
+    let corrupt = work.join("corrupt");
+    let replica = work.join("replica");
+    let missing = work.join("missing");
+    let cache = work.join("cache");
+    let content = "payload";
+    fixture.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        fixture.file(COMPOSITOR, content, "0755", "")?,
+    )?;
+    let fresh = Timestamp::now().checked_add(jiff::Span::new().hours(24))?;
+    sign_release(&fixture, &replica, 1, fresh, &anchor, &tuf_key)?;
+    // The first mirror serves valid metadata and a damaged payload.
+    fs::create_dir(&corrupt)?;
+    for directory in ["metadata", "targets"] {
+        fs::create_dir(corrupt.join(directory))?;
+        for entry in fs::read_dir(replica.join(directory))? {
+            let entry = entry?;
+            fs::copy(
+                entry.path(),
+                corrupt.join(directory).join(entry.file_name()),
+            )?;
+        }
+    }
+    let blob = digest(content.as_bytes());
+    fs::write(
+        corrupt.join("targets").join(format!("{blob}.blobs-{blob}")),
+        b"damaged",
+    )?;
+    let url = |path: &Path| Url::from_directory_path(path).unwrap().to_string();
+    let sync = |cache: &Path, mirrors: &[&Path], index_only| {
+        let (first, rest) = mirrors.split_first().unwrap();
+        mirror_release::sync_mirrors(
+            cache,
+            &anchor,
+            mirror_release::MirrorSources::explicit(
+                mirror_release::Mirror::from_base(&url(first))?
+                    .with_fallbacks(&rest.iter().map(|path| url(path)).collect::<Vec<_>>())?,
+            ),
+            "canopa",
+            &fixture.trust,
+            mirror_release::SyncOptions {
+                index_only,
+                image: None,
+            },
+            &[],
+        )
+    };
+    // An outage, then a digest failure, both move on to the next mirror.
+    sync(
+        &work.join("full-cache"),
+        &[&missing, &corrupt, &replica],
+        false,
+    )?;
+    assert_eq!(
+        fs::read_to_string(work.join("full-cache/blobs").join(&blob))?,
+        content
+    );
+    sync(&cache, &[&corrupt, &missing, &replica], true)?;
+    assert_eq!(
+        fs::read_to_string(cache.join(".tuf/endpoints"))?,
+        format!(
+            "{0}metadata/ {0}targets/\n{1}metadata/ {1}targets/\n{2}metadata/ {2}targets/\n",
+            url(&corrupt),
+            url(&missing),
+            url(&replica)
+        )
+    );
+    // Payload fetches use the recorded order and fail over the same way.
+    create_image(
+        &fixture.root,
+        &cache,
+        "canopa",
+        &fixture.trust,
+        "x86_64",
+        BTreeMap::new(),
+    )?;
+    let install = plan(
+        &fixture.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    fetch_plan(&fixture.root, &install)?;
+    apply(&fixture.root, &install)?;
+    assert_eq!(fs::read_to_string(fixture.root.join(COMPOSITOR))?, content);
+
+    // When every mirror fails, the verification failure is reported, not the outage.
+    let error = sync(&work.join("failed-cache"), &[&missing, &corrupt], false).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("all 2 mirrors tried"), "{message}");
+    assert!(message.contains(&url(&corrupt)), "{message}");
+
+    // A mirror that is merely behind counts as an outage when other mirrors
+    // were tried too, so it never turns an outage into a security failure.
+    let newer = work.join("newer");
+    sign_release(&fixture, &newer, 2, fresh, &anchor, &tuf_key)?;
+    let behind = work.join("behind-cache");
+    sync(&behind, &[&newer], true)?;
+    let message = format!(
+        "{:#}",
+        sync(&behind, &[&missing, &corrupt], true).unwrap_err()
+    );
+    assert!(
+        message.contains(&url(&missing)) && !message.contains(&url(&corrupt)),
+        "{message}"
+    );
+    let message = format!(
+        "{:#}",
+        sync(&behind, &[&corrupt, &missing], true).unwrap_err()
+    );
+    assert!(
+        message.contains("the mirror is behind the trusted metadata"),
+        "{message}"
+    );
+    // When every mirror serves older metadata, alone or together, it is a rollback.
+    let stale = work.join("stale");
+    sign_release(&fixture, &stale, 1, fresh, &anchor, &tuf_key)?;
+    for mirrors in [
+        &[corrupt.as_path()][..],
+        &[corrupt.as_path(), stale.as_path()][..],
+    ] {
+        let error = sync(&behind, mirrors, true).unwrap_err();
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<TufError>(),
+                Some(TufError::OlderMetadata { .. })
+            )) && !format!("{error:#}").contains("behind the trusted metadata"),
+            "{error:#}"
+        );
+    }
+
+    // A newer release under a rotated root moves the replica ahead. The
+    // stale mirror's timestamp is signed by the retired key, so the client
+    // rejects it and fails over to the replica.
+    let next_anchor = work.join("next-root.json");
+    let next_key = work.join("next-key.der");
+    sign_root(&next_anchor, &next_key, Some(&tuf_key))?;
+    fs::remove_dir_all(&replica)?;
+    sign_release(&fixture, &replica, 2, fresh, &next_anchor, &next_key)?;
+    sync(&cache, &[&replica], true)?;
+    sync(&cache, &[&corrupt, &replica], true)?;
+    let root: serde_json::Value =
+        serde_json::from_slice(&fs::read(cache.join(".tuf/trusted/root.json"))?)?;
+    assert_eq!(root["signed"]["version"], 2);
+    let error = sync(&cache, &[&corrupt], true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Signature threshold of 1 not met for role timestamp"),
+        "{error:#}"
+    );
     Ok(())
 }
 

@@ -49,9 +49,11 @@ const TIMESTAMP_LIMIT: u64 = TUF_LIMITS.max_timestamp_size;
 const ROLE_LIMIT: u64 = TUF_LIMITS.max_targets_size;
 const _: () = assert!(TUF_LIMITS.max_snapshot_size == ROLE_LIMIT);
 const PUBLISHER_NAME_TARGET: &str = "publisher";
+/// The bootstrap descriptor at the top of a deployed web root.
+const DESCRIPTOR: &str = "publisher.json";
+const DESCRIPTOR_LIMIT: u64 = 1024 * 1024;
 /// The newest trust root of the current catalog, for publisher discovery.
 const TRUST_ROOT_TARGET: &str = "trust-root.json";
-const ENDPOINTS_LIMIT: u64 = 8192;
 const METADATA_DOWNLOADS: usize = 8;
 const PAYLOAD_DOWNLOADS: usize = 8;
 const PAYLOAD_ZSTD_LEVEL: i32 = 3;
@@ -186,87 +188,36 @@ impl std::fmt::Display for MetadataTooLarge {
 
 impl std::error::Error for MetadataTooLarge {}
 
-fn endpoint(value: &str) -> Result<Url> {
-    let url = Url::parse(value)?;
-    ensure!(
-        matches!(url.scheme(), "file" | "https")
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.path().ends_with('/'),
-        "mirror endpoint must be a directory URL with a trailing slash, using https:// or file://"
-    );
-    Ok(url)
-}
-
 mod archive;
 mod bootstrap;
 mod cache;
 mod delta;
+mod deploy;
+mod mirrors;
 mod profile;
+mod provision;
+mod replica;
+mod web_config;
+mod web_files;
 pub(crate) use archive::ArchiveCache;
 pub use bootstrap::PublisherBootstrap;
 pub use cache::{
     CacheRetention, PruneReport, RetainedRoot, prune_payloads, prune_payloads_with_locks,
 };
 pub(crate) use cache::{prune_system_payloads, prune_with_registered_roots};
+pub use deploy::{Lifetimes, Publication, deploy_mirror, parse_lifetime, refresh_mirror};
+use mirrors::{Endpoint, MAX_ATTEMPTS, SIGNED_MIRRORS_LIMIT, check_signed_list};
+pub use mirrors::{
+    Mirror, MirrorEntry, MirrorProbe, MirrorSource, MirrorSources, MirrorStatus, PublisherMirrors,
+    list_publisher_mirrors, rank_publisher_mirrors,
+};
+pub(crate) use mirrors::{SIGNED_MIRRORS_TARGET, image_config_dir};
 pub use profile::{
     ProfilePayloads, sync_profile, sync_profile_for_image, sync_profile_with_payloads,
 };
-
-#[derive(Clone)]
-struct Mirror {
-    metadata: Url,
-    targets: Url,
-}
-
-impl Mirror {
-    fn new(metadata: &str, targets: &str) -> Result<Self> {
-        Ok(Self {
-            metadata: endpoint(metadata)?,
-            targets: endpoint(targets)?,
-        })
-    }
-
-    fn from_base(base: &str) -> Result<Self> {
-        Self::from_base_url(&mirror_base(base)?)
-    }
-
-    fn from_base_url(base: &Url) -> Result<Self> {
-        Self::new(
-            base.join("metadata/")?.as_str(),
-            base.join("targets/")?.as_str(),
-        )
-    }
-
-    fn read(state: &Root) -> Result<Self> {
-        let config = String::from_utf8(read_limited(
-            state
-                .file("endpoints")
-                .context("run repo sync to configure this cache's mirror")?,
-            ENDPOINTS_LIMIT,
-        )?)?;
-        let mut lines = config.lines();
-        let (Some(metadata), Some(targets), None) = (lines.next(), lines.next(), lines.next())
-        else {
-            anyhow::bail!("invalid cached mirror endpoints");
-        };
-        Self::new(metadata, targets)
-    }
-
-    fn document(&self) -> String {
-        format!("{}\n{}\n", self.metadata, self.targets)
-    }
-}
-
-fn mirror_base(base: &str) -> Result<Url> {
-    if base.ends_with('/') {
-        endpoint(base)
-    } else {
-        endpoint(&format!("{base}/"))
-    }
-}
+pub use provision::init_publisher;
+pub use replica::replicate;
+pub use web_config::{Mount, WebConfig, WebServer, nginx_config};
 
 fn read_tuf_root(path: &Path) -> Result<Vec<u8>> {
     (|| read_limited(File::open(path)?, ROOT_LIMIT))()
@@ -411,6 +362,27 @@ pub fn sync_with_required_catalogs(
     options: SyncOptions<'_>,
     required: &[String],
 ) -> Result<String> {
+    sync_mirrors(
+        repo,
+        trusted_root,
+        MirrorSources::explicit(Mirror::new(metadata_url, targets_url)?),
+        publisher,
+        trust_key,
+        options,
+        required,
+    )
+}
+
+/// Verify and cache a release from the first of `sources` that can serve it.
+pub fn sync_mirrors(
+    repo: &Path,
+    trusted_root: &Path,
+    sources: MirrorSources,
+    publisher: &str,
+    trust_key: &Path,
+    options: SyncOptions<'_>,
+    required: &[String],
+) -> Result<String> {
     ensure!(
         required.len() <= MAX_RETAINED + 1,
         "too many required catalogs"
@@ -423,12 +395,7 @@ pub fn sync_with_required_catalogs(
         })
         .collect::<Result<Vec<_>>>()?;
     let pins = required.iter().collect::<Vec<_>>();
-    let source = SyncSource::new(
-        trusted_root,
-        Mirror::new(metadata_url, targets_url)?,
-        publisher,
-        trust_key,
-    )?;
+    let source = SyncSource::new(trusted_root, sources, publisher, trust_key)?;
     let guard = options.image.map(ImageGuard::open).transpose()?;
     if let Some(guard) = &guard {
         ensure!(
@@ -465,20 +432,30 @@ fn sync_current_locked(
 }
 
 /// Prepare an independent mirror cache and record its original root for refreshes.
+///
+/// `config_dir` holds the image's local mirror lists, `mirrors/NAME.kdl`.
 pub(crate) fn sync_url_publisher(
     repo: &Path,
     base: &str,
+    config_dir: &Path,
     trusted_root: &Path,
     publisher: &str,
     trust_key: &Path,
 ) -> Result<()> {
-    let source = SyncSource::new(trusted_root, Mirror::from_base(base)?, publisher, trust_key)?;
+    let source = SyncSource::new(
+        trusted_root,
+        MirrorSources::publisher(Mirror::from_base(base)?, config_dir, publisher),
+        publisher,
+        trust_key,
+    )?;
     let _lock = lock_repo(repo)?;
     if path_present(&repo.join("current"))? {
         let directory =
             open_state(repo).context("use a new directory or a synchronized TUF cache")?;
+        // Only the configured source identifies the cache. Mirror lists may change.
         ensure!(
-            Mirror::read(&directory)?.document() == source.mirror.document(),
+            Mirror::read_configured(&directory)?.document()
+                == source.sources.configured().document(),
             "the cache is configured for a different mirror URL"
         );
     }
@@ -493,6 +470,109 @@ pub(crate) fn sync_url_publisher(
     sync_current_locked(repo, &source, false, &[], None)?;
     write_atomic(&refresh_root, &source.anchor, true)?;
     record_refresh(repo)
+}
+
+/// A mirror could not serve what the operation needs, such as a target that
+/// is missing or shorter than its signed length. Another mirror may serve it.
+#[derive(Debug)]
+struct MirrorContent(String);
+
+impl std::fmt::Display for MirrorContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MirrorContent {}
+
+/// One of several mirrors served metadata older than the cache already
+/// trusts. Replicas lag behind their origin between syncs, so when another
+/// mirror failed for a different reason this counts as unavailability.
+#[derive(Debug)]
+struct MirrorBehind;
+
+impl std::fmt::Display for MirrorBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the mirror is behind the trusted metadata")
+    }
+}
+
+fn rolled_back(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<tough::error::Error>(),
+            Some(tough::error::Error::OlderMetadata { .. })
+        )
+    })
+}
+
+/// Whether an error came from what a mirror served, rather than from local state.
+fn mirror_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<tough::error::Error>()
+            || cause.is::<TransportError>()
+            || cause.is::<MetadataTooLarge>()
+            || cause.is::<MirrorContent>()
+    })
+}
+
+/// Run one operation against each mirror, best first, until one completes.
+///
+/// Any failure caused by what a mirror served, including a signature,
+/// expiry, rollback, or digest failure, moves on to the next mirror: every
+/// mirror is verified the same way, so trying another is always safe. Local
+/// failures stop at once. When every mirror fails, the most serious failure
+/// is reported: verification, then expiry, then unavailability. A mirror
+/// that is merely behind counts as unavailable when another mirror failed
+/// otherwise; when every mirror serves older metadata, it is a rollback.
+fn try_mirrors<T>(
+    publisher: &str,
+    mirror: &Mirror,
+    mut attempt: impl FnMut(&Endpoint) -> Result<T>,
+) -> Result<T> {
+    let candidates = &mirror.endpoints[..mirror.endpoints.len().min(MAX_ATTEMPTS)];
+    let mut failures = Vec::new();
+    for (index, endpoint) in candidates.iter().enumerate() {
+        match attempt(endpoint) {
+            Ok(value) => return Ok(value),
+            Err(error) if mirror_failure(&error) => {
+                let error = error.context(format!("using mirror {endpoint}"));
+                if index + 1 < candidates.len() {
+                    eprintln!("Warning: {error:#}. Trying the next mirror.");
+                }
+                failures.push(error);
+            }
+            // A local or catalog failure is the same whichever mirror served it.
+            Err(error) => return Err(error),
+        }
+    }
+    let count = failures.len();
+    // When every mirror serves older metadata, that is a rollback, not lag.
+    if failures.iter().any(|error| !rolled_back(error)) {
+        failures = failures
+            .into_iter()
+            .map(|error| {
+                if rolled_back(&error) {
+                    error.context(MirrorBehind)
+                } else {
+                    error
+                }
+            })
+            .collect();
+    }
+    let severity = |error: &anyhow::Error| match classify_refresh_failure(error) {
+        RefreshFailure::Security => 2,
+        RefreshFailure::Expired => 1,
+        RefreshFailure::Unavailable => 0,
+    };
+    let worst = (0..count)
+        .max_by_key(|&index| (severity(&failures[index]), std::cmp::Reverse(index)))
+        .expect("tried at least one mirror");
+    let error = failures.swap_remove(worst);
+    if count == 1 {
+        return Err(error);
+    }
+    Err(error.context(format!("all {count} mirrors tried for {publisher} failed")))
 }
 
 /// How a client treats a URL-added publisher whose mirror cannot be refreshed.
@@ -565,6 +645,9 @@ enum RefreshFailure {
 }
 
 fn classify_refresh_failure(error: &anyhow::Error) -> RefreshFailure {
+    if error.downcast_ref::<MirrorBehind>().is_some() {
+        return RefreshFailure::Unavailable;
+    }
     let mut transport = false;
     let mut expired = false;
     for cause in error.chain() {
@@ -731,7 +814,11 @@ pub(crate) fn refresh_url_publishers(
                 publisher: &publisher.name,
                 key: publisher.key.clone(),
                 anchor: read_limited(directory.file(REFRESH_ROOT)?, ROOT_LIMIT)?,
-                mirror: Mirror::read(&directory)?,
+                sources: MirrorSources::publisher(
+                    Mirror::read_configured(&directory)?,
+                    &image_config_dir(root),
+                    &publisher.name,
+                ),
             };
             sync_current_locked(repo, &source, false, &[], Some(&guard))?;
             record_refresh(repo)
@@ -782,13 +869,26 @@ pub fn sync_archive(
     trust_key: &Path,
     options: ArchiveSyncOptions<'_>,
 ) -> Result<String> {
-    validate_digest(options.catalog)?;
-    let source = SyncSource::new(
+    sync_archive_mirrors(
+        repo,
         trusted_root,
-        Mirror::new(metadata_url, targets_url)?,
+        MirrorSources::explicit(Mirror::new(metadata_url, targets_url)?),
         publisher,
         trust_key,
-    )?;
+        options,
+    )
+}
+
+pub fn sync_archive_mirrors(
+    repo: &Path,
+    trusted_root: &Path,
+    sources: MirrorSources,
+    publisher: &str,
+    trust_key: &Path,
+    options: ArchiveSyncOptions<'_>,
+) -> Result<String> {
+    validate_digest(options.catalog)?;
+    let source = SyncSource::new(trusted_root, sources, publisher, trust_key)?;
     let _lock = lock_repo(repo)?;
     stage_release(
         repo,
@@ -796,11 +896,7 @@ pub fn sync_archive(
         !options.index_only,
         SyncSelection::Archive(options.catalog),
     )?;
-    write_atomic(
-        &repo.join(".tuf/endpoints"),
-        source.mirror.document().as_bytes(),
-        false,
-    )?;
+    source.sources.record(repo, &open_state(repo)?)?;
     Ok(options.catalog.to_owned())
 }
 
@@ -860,6 +956,16 @@ impl ImageGuard {
 struct StagedRelease {
     current: String,
     retained: Vec<String>,
+    signed_mirrors: SignedMirrors,
+}
+
+/// What a sync found of the publisher's signed mirror list. It is kept only
+/// once the release it came with is promoted.
+enum SignedMirrors {
+    /// An archive sync does not read the list.
+    Unchanged,
+    Listed(Vec<u8>),
+    Absent,
 }
 
 struct StagedMirror {
@@ -882,28 +988,24 @@ struct SyncSource<'a> {
     publisher: &'a str,
     key: Vec<u8>,
     anchor: Vec<u8>,
-    mirror: Mirror,
+    sources: MirrorSources,
 }
 
 impl<'a> SyncSource<'a> {
     fn new(
         trusted_root: &Path,
-        mirror: Mirror,
+        sources: MirrorSources,
         publisher: &'a str,
         trust_key: &Path,
     ) -> Result<Self> {
         validate_publisher(publisher)?;
         let key = read_trust_root(trust_key)?;
         let anchor = read_tuf_root(trusted_root)?;
-        ensure!(
-            mirror.document().len() as u64 <= ENDPOINTS_LIMIT,
-            "mirror endpoints exceed the size limit"
-        );
         Ok(Self {
             publisher,
             key,
             anchor,
-            mirror,
+            sources,
         })
     }
 
@@ -916,11 +1018,13 @@ impl<'a> SyncSource<'a> {
         if let Some(binding) = binding {
             write_atomic(&state.join(PROFILE_BINDING), binding.as_bytes(), true)?;
         }
-        write_atomic(
-            &state.join("endpoints"),
-            self.mirror.document().as_bytes(),
-            false,
-        )?;
+        let signed = state.join(mirrors::SIGNED);
+        match &release.signed_mirrors {
+            SignedMirrors::Listed(bytes) => write_atomic(&signed, bytes, false)?,
+            SignedMirrors::Absent if path_present(&signed)? => std::fs::remove_file(&signed)?,
+            SignedMirrors::Absent | SignedMirrors::Unchanged => {}
+        }
+        self.sources.record(repo, &open_state(repo)?)?;
         write_atomic(
             &repo.join("current"),
             format!("{}\n", release.current).as_bytes(),
@@ -933,6 +1037,7 @@ impl<'a> SyncSource<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum SyncSelection<'a> {
     Current {
         binding: Option<&'a str>,
@@ -984,7 +1089,7 @@ fn initialize_cache(
     }
     let directory = open_state(repo)?;
     let trusted_exists = path_present(&state.join("trusted"))?;
-    let ready = published || path_present(&state.join("endpoints"))?;
+    let ready = published || path_present(&state.join(mirrors::ENDPOINTS))?;
     let archive = path_present(&state.join(ARCHIVE))?;
     match selection {
         SyncSelection::Current { .. } => ensure!(
@@ -1039,43 +1144,39 @@ fn stage_release(
 ) -> Result<(StagedRelease, StagedMirror)> {
     let state = repo.join(".tuf");
     let directory = initialize_cache(repo, source, &selection)?;
-    let scratch = TempDir::new_in(&state)?;
+    let mirror = source.sources.resolve(&directory)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let (release, verified) = runtime.block_on(async {
-        let verified = load_mirror(
-            &state,
-            &directory,
-            scratch.path(),
-            source.mirror.clone(),
-            Some(source.anchor.clone()),
-        )
-        .await?;
-        prepare_objects(repo)?;
-        let release = match selection {
-            SyncSelection::Current {
-                required,
-                guard,
-                defer_checkpoint,
-                ..
-            } => {
-                materialize(
-                    repo,
-                    &verified,
-                    source,
-                    full,
+    let (release, verified, scratch) = try_mirrors(source.publisher, &mirror, |endpoint| {
+        runtime.block_on(async {
+            let (verified, scratch) =
+                load_mirror(&state, &directory, endpoint, Some(source.anchor.clone())).await?;
+            prepare_objects(repo)?;
+            let release = match selection {
+                SyncSelection::Current {
                     required,
                     guard,
                     defer_checkpoint,
-                )
-                .await
-            }
-            SyncSelection::Archive(pin) => {
-                materialize_archive(repo, &verified, source, full, pin).await
-            }
-        }?;
-        Ok::<_, anyhow::Error>((release, verified))
+                    ..
+                } => {
+                    materialize(
+                        repo,
+                        &verified,
+                        source,
+                        full,
+                        required,
+                        guard,
+                        defer_checkpoint,
+                    )
+                    .await
+                }
+                SyncSelection::Archive(pin) => {
+                    materialize_archive(repo, &verified, source, full, pin).await
+                }
+            }?;
+            Ok((release, verified, scratch))
+        })
     })?;
     Ok((
         release,
@@ -1087,15 +1188,17 @@ fn stage_release(
     ))
 }
 
+/// Verify one mirror's TUF metadata from the cache's trusted state.
 async fn load_mirror(
     state: &Path,
     directory: &Root,
-    scratch: &Path,
-    mirror: Mirror,
+    endpoint: &Endpoint,
     anchor: Option<Vec<u8>>,
-) -> Result<Repository> {
+) -> Result<(Repository, TempDir)> {
+    let scratch = TempDir::new_in(state)?;
+    // Each attempt has its own deadline, so a stalled mirror leaves time for the next.
     let transport = MirrorTransport::new(
-        (mirror.metadata.scheme() == "https" || mirror.targets.scheme() == "https")
+        (endpoint.metadata.scheme() == "https" || endpoint.targets.scheme() == "https")
             .then(|| https_client().build())
             .transpose()?,
     )?;
@@ -1103,15 +1206,15 @@ async fn load_mirror(
     let trusted_exists = path_present(&trusted)?;
     let root = if trusted_exists {
         directory.dir("trusted")?;
-        copy_checkpoint(&trusted, scratch)?;
+        copy_checkpoint(&trusted, scratch.path())?;
         read_limited(directory.file("trusted/root.json")?, ROOT_LIMIT)?
     } else {
         anchor.context("TUF cache is missing its trusted metadata")?
     };
-    let result = RepositoryLoader::new(&root, mirror.metadata, mirror.targets)
+    let result = RepositoryLoader::new(&root, endpoint.metadata.clone(), endpoint.targets.clone())
         .transport(transport)
         .limits(TUF_LIMITS)
-        .datastore(scratch)
+        .datastore(scratch.path())
         .load()
         .await;
     if let Ok(verified) = &result {
@@ -1119,10 +1222,11 @@ async fn load_mirror(
     }
     // The library writes root, timestamp and snapshot only after verifying each role.
     // Retain that progress even when a later role or the release contents fail to download.
-    if path_present(&scratch.join("root.json"))? {
-        checkpoint(state, scratch, trusted_exists)?;
+    if path_present(&scratch.path().join("root.json"))? {
+        checkpoint(state, scratch.path(), trusted_exists)?;
     }
-    result.context("verifying TUF metadata")
+    let verified = result.context("verifying TUF metadata")?;
+    Ok((verified, scratch))
 }
 
 fn check_mirror_mode(state: &Path, verified: &Repository) -> Result<()> {
@@ -1219,24 +1323,29 @@ fn fetch_payload_set<'a>(
     let directory = open_state(repo)?;
     check_cache_origin(&directory, publisher, key)?;
     let mirror = Mirror::read(&directory)?;
-    let scratch = TempDir::new_in(&state)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
-        let verified = load_mirror(&state, &directory, scratch.path(), mirror, None).await?;
-        let mut full = Vec::new();
-        for (hash, length, base) in missing {
-            if let (Some(root), Some(base)) = (root, base)
-                && try_delta(&verified, repo, root, base, hash, length)
-                    .await
-                    .is_ok()
-            {
-                continue;
+    try_mirrors(publisher, &mirror, |endpoint| {
+        runtime.block_on(async {
+            let (verified, _scratch) = load_mirror(&state, &directory, endpoint, None).await?;
+            let mut full = Vec::new();
+            for &(hash, length, base) in &missing {
+                // An earlier mirror may have delivered it before failing.
+                if cached_object(repo, &format!("blobs/{hash}"), hash, length)? {
+                    continue;
+                }
+                if let (Some(root), Some(base)) = (root, base)
+                    && try_delta(&verified, repo, root, base, hash, length)
+                        .await
+                        .is_ok()
+                {
+                    continue;
+                }
+                full.push((hash, length));
             }
-            full.push((hash, length));
-        }
-        fetch_verified_payloads(&verified, repo, full).await
+            fetch_verified_payloads(&verified, repo, full).await
+        })
     })
 }
 
@@ -1418,29 +1527,43 @@ pub(super) fn fetch_source_archives(
     let directory = open_state(repo)?;
     check_cache_origin(&directory, publisher, key)?;
     let mirror = Mirror::read(&directory)?;
-    let scratch = TempDir::new_in(&state)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
-        let verified = load_mirror(&state, &directory, scratch.path(), mirror, None).await?;
-        let output = Root::fd_path(destination.as_file());
-        let verified = &verified;
-        let output = &output;
-        stream::iter(missing)
-            .map(|pin| async move {
-                let name = format!("{}/{}", source_archive::OBJECTS, pin.sha256);
-                let (target_name, target) =
-                    checked_target(verified, &name, pin.size, Some(&pin.sha256), Some(pin.size))
-                        .with_context(|| {
-                            format!("checking archived source {} on the mirror", pin.sha256)
-                        })?;
-                let temp = download_target(verified, &name, &target_name, target, output).await?;
-                publish_verified(destination, temp, pin)
-            })
-            .buffer_unordered(PAYLOAD_DOWNLOADS)
-            .try_for_each(|()| async { Ok(()) })
-            .await
+    try_mirrors(publisher, &mirror, |endpoint| {
+        runtime.block_on(async {
+            let (verified, _scratch) = load_mirror(&state, &directory, endpoint, None).await?;
+            let output = Root::fd_path(destination.as_file());
+            let verified = &verified;
+            let output = &output;
+            // An earlier mirror may have delivered some before failing.
+            let mut wanted = Vec::new();
+            for &pin in &missing {
+                if !super::source_archive::contains(destination, pin)? {
+                    wanted.push(pin);
+                }
+            }
+            stream::iter(wanted)
+                .map(|pin| async move {
+                    let name = format!("{}/{}", source_archive::OBJECTS, pin.sha256);
+                    let (target_name, target) = checked_target(
+                        verified,
+                        &name,
+                        pin.size,
+                        Some(&pin.sha256),
+                        Some(pin.size),
+                    )
+                    .with_context(|| {
+                        format!("checking archived source {} on the mirror", pin.sha256)
+                    })?;
+                    let temp =
+                        download_target(verified, &name, &target_name, target, output).await?;
+                    publish_verified(destination, temp, pin)
+                })
+                .buffer_unordered(PAYLOAD_DOWNLOADS)
+                .try_for_each(|()| async { Ok(()) })
+                .await
+        })
     })
 }
 
@@ -1473,6 +1596,7 @@ async fn materialize(
         .await?
         .context("missing catalog pointer download")?;
     let hash = parse_current(&String::from_utf8(read_limited(pointer.reopen()?, 65)?)?)?;
+    let signed_mirrors = signed_mirror_list(verified, repo).await?;
     fetch_catalog(verified, repo, &hash).await?;
     // A current catalog becomes the rollback anchor, so its trust root must
     // be unexpired. Retained and archived catalogs are historical pins.
@@ -1531,8 +1655,10 @@ async fn materialize(
     for pin in required {
         ensure!(
             pin.sha256 == hash || retained_hashes.contains(&pin.sha256),
-            "mirror for {publisher} does not advertise required catalog {} as current or retained",
-            pin.sha256
+            MirrorContent(format!(
+                "mirror for {publisher} does not advertise required catalog {} as current or retained",
+                pin.sha256
+            ))
         );
     }
     collect_rebuild_objects(&catalog, &mut rebuild_objects, &mut attestations);
@@ -1543,7 +1669,37 @@ async fn materialize(
     Ok(StagedRelease {
         current: hash,
         retained: retained_hashes,
+        signed_mirrors,
     })
+}
+
+/// Read the publisher's verified mirror list for the next mirror resolution.
+/// An invalid list is the publisher's mistake, not the mirror's, so it is
+/// ignored with a warning instead of failing the sync.
+async fn signed_mirror_list(verified: &Repository, repo: &Path) -> Result<SignedMirrors> {
+    let listed = verified
+        .targets()
+        .signed
+        .find_target(&TargetName::new(SIGNED_MIRRORS_TARGET)?, false)
+        .is_ok();
+    if listed {
+        let file = download(
+            verified,
+            SIGNED_MIRRORS_TARGET,
+            repo,
+            SIGNED_MIRRORS_LIMIT,
+            None,
+            None,
+        )
+        .await?
+        .context("missing signed mirror list download")?;
+        let bytes = read_limited(file.reopen()?, SIGNED_MIRRORS_LIMIT)?;
+        match check_signed_list(&bytes) {
+            Ok(_) => return Ok(SignedMirrors::Listed(bytes)),
+            Err(error) => eprintln!("Warning: ignoring the publisher's mirror list: {error:#}"),
+        }
+    }
+    Ok(SignedMirrors::Absent)
 }
 
 async fn materialize_archive(
@@ -1573,6 +1729,7 @@ async fn materialize_archive(
     Ok(StagedRelease {
         current: hash.to_owned(),
         retained: Vec::new(),
+        signed_mirrors: SignedMirrors::Unchanged,
     })
 }
 
@@ -1835,7 +1992,7 @@ async fn download_target(
     let stream = verified
         .read_target(target_name)
         .await?
-        .with_context(|| format!("missing TUF target {name}"))?;
+        .ok_or_else(|| MirrorContent(format!("missing TUF target {name}")))?;
     pin_mut!(stream);
     let mut written = 0u64;
     while let Some(bytes) = stream
@@ -1846,10 +2003,13 @@ async fn download_target(
         written = written
             .checked_add(bytes.len() as u64)
             .filter(|length| *length <= target.length)
-            .with_context(|| format!("download exceeds signed length for {name}"))?;
+            .ok_or_else(|| MirrorContent(format!("download exceeds signed length for {name}")))?;
         file.write_all(&bytes)?;
     }
-    ensure!(written == target.length, "short download for {name}");
+    ensure!(
+        written == target.length,
+        MirrorContent(format!("short download for {name}"))
+    );
     file.as_file().sync_all()?;
     Ok(file)
 }
@@ -2061,6 +2221,18 @@ fn export_targets(
     )?;
     directory.sync_all()?;
     Ok(hash)
+}
+
+/// Add the publisher's signed mirror list to an export of the current catalog.
+pub fn export_mirror_list(output: &Path, list: &Path) -> Result<()> {
+    let bytes = read_limited(File::open(list)?, SIGNED_MIRRORS_LIMIT)
+        .with_context(|| format!("reading mirror list {}", list.display()))?;
+    check_signed_list(&bytes)?;
+    ensure!(
+        path_present(&output.join("current"))?,
+        "only an export of the current catalog carries a mirror list"
+    );
+    write_atomic(&output.join(SIGNED_MIRRORS_TARGET), &bytes, true)
 }
 
 fn export_catalog(

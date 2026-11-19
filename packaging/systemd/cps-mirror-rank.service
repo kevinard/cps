@@ -1,0 +1,9 @@
+[Unit]
+Description=Rank the TUF mirrors of each CPS publisher
+Documentation=man:cps-publisher(1)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cps publisher mirror rank

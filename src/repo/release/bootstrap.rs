@@ -5,8 +5,9 @@ use tough::{Repository, RepositoryLoader};
 use url::Url;
 
 use super::{
-    ENDPOINTS_LIMIT, Mirror, MirrorTransport, PUBLISHER_NAME_TARGET, TRUST_ROOT_TARGET,
-    checked_target, download_target, mirror_base, read_tuf_root,
+    MirrorTransport, PUBLISHER_NAME_TARGET, TRUST_ROOT_TARGET, checked_target, download_target,
+    mirrors::{Endpoint, mirror_base},
+    read_tuf_root,
 };
 use crate::{
     model::{digest, validate_publisher},
@@ -35,11 +36,7 @@ impl PublisherBootstrap {
             url.scheme() == "https",
             "publisher discovery requires HTTPS"
         );
-        let mirror = Mirror::from_base_url(&url)?;
-        ensure!(
-            mirror.document().len() as u64 <= ENDPOINTS_LIMIT,
-            "mirror endpoints exceed the size limit"
-        );
+        let mirror = Endpoint::from_base(&url)?;
         let tuf_root = read_tuf_root(trusted_root)?;
         let scratch = tempfile::tempdir()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -48,8 +45,9 @@ impl PublisherBootstrap {
         let (name, trust_root) = runtime.block_on(async {
             let timeout = Duration::from_secs(30);
             let client = https_client().timeout(timeout).build()?;
+            let transport = MirrorTransport::with_deadline(Some(client), timeout)?;
             let verified = RepositoryLoader::new(&tuf_root, mirror.metadata, mirror.targets)
-                .transport(MirrorTransport::with_deadline(Some(client), timeout)?)
+                .transport(transport)
                 .datastore(scratch.path())
                 .load()
                 .await
@@ -164,7 +162,7 @@ mod tests {
 
         let anchor = read_tuf_root(&root)?;
         let url = Url::from_directory_path(&mirror).expect("local mirror URL");
-        let endpoints = Mirror::from_base_url(&url)?;
+        let endpoints = Endpoint::from_base(&url)?;
         let scratch = tempfile::tempdir()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

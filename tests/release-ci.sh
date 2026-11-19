@@ -195,7 +195,7 @@ export CPS_MIRROR_DIR=$work/mirror
 mkdir -p "$CPS_MIRROR_DIR/metadata"
 timestamp=$CPS_MIRROR_DIR/metadata/timestamp.json
 : > "$CPS_TEST_LOG"
-state=$work/repo/.ci-tuf-state.json
+state=$work/repo/.tuf-publication.json
 timestamp_expires() {
     jq -n --arg expires "$(date -u --date="$1" '+%Y-%m-%dT%H:%M:%SZ')" \
         '{signed: {expires: $expires}}' > "$timestamp"

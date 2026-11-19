@@ -22,8 +22,8 @@ use tough::{
 };
 
 use super::{
-    ARCHIVE, PUBLISHER_NAME_TARGET, RETAINED, ROLE_LIMIT, ROOT_LIMIT, TIMESTAMP_LIMIT,
-    TRUST_ROOT_TARGET,
+    ARCHIVE, PUBLISHER_NAME_TARGET, RETAINED, ROLE_LIMIT, ROOT_LIMIT, SIGNED_MIRRORS_TARGET,
+    TIMESTAMP_LIMIT, TRUST_ROOT_TARGET,
 };
 use crate::{
     model::digest,
@@ -217,7 +217,7 @@ fn read_root(path: &Path) -> Result<Signed<Root>> {
 }
 
 /// Stage signed output beside its destination and publish it as a new directory.
-fn publish_stage(output: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+pub(super) fn publish_stage(output: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let parent = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -336,7 +336,12 @@ pub fn sign_export(request: SignExport<'_>) -> Result<()> {
                 }
                 if matches!(
                     name.resolved(),
-                    "current" | ARCHIVE | RETAINED | PUBLISHER_NAME_TARGET | TRUST_ROOT_TARGET
+                    "current"
+                        | ARCHIVE
+                        | RETAINED
+                        | PUBLISHER_NAME_TARGET
+                        | TRUST_ROOT_TARGET
+                        | SIGNED_MIRRORS_TARGET
                 ) {
                     editor.add_target(name, target)?;
                 } else {

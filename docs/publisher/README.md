@@ -8,6 +8,11 @@ A small local repository can publish reviewed prototypes directly. A
 distribution repository can require reproducible builds, independently
 verified workers, and checked image compositions.
 
+For a new repository, start with the [publisher and mirror quick setup](mirrors.md#quick-setup):
+`cps repo init` creates the keys, `cps repo deploy` serves the origin,
+`cps repo replicate` keeps full replicas, and `cps repo nginx-config` writes
+the web server configuration for each, including LAN caches.
+
 1. Decide where each key lives, create the publisher trust root with its
    offline root keys and online catalog keys, and configure admission
    requirements before the first publication. Publish many packages in one
