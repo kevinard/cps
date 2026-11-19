@@ -94,6 +94,11 @@ cc -O1 -c one/answer.c -o sources/plain.o
 cp sources/plain.o long_plain_archive_member_name.o
 ar qcD sources/libanswer.a one/answer.o two/answer.o long_plain_archive_member_name.o
 ranlib -D sources/libanswer.a
+# A module signature covers the whole file and sits after the ELF container, so
+# stripping would invalidate it. This trailer has the kernel's layout: struct
+# module_signature (here with an empty signature) and the marker.
+cp two/answer.o sources/signed.ko
+printf '\0\0\0\0\0\0\0\0\0\0\0\0~Module signature appended~\n' >> sources/signed.ko
 
 cat > app.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
@@ -113,7 +118,7 @@ package "demo/app-data" publisher="canopa" license="CC0-1.0" {
 }
 MANIFEST
 script='    install -Dm755 "$CPS_SOURCES/hello" "$DESTDIR/usr/bin/hello"
-    for object in answer.o libanswer.a plain.o; do
+    for object in answer.o libanswer.a plain.o signed.ko; do
         install -Dm644 "$CPS_SOURCES/$object" "$DESTDIR/usr/lib/$object"
     done
     ln -s hello "$DESTDIR/usr/bin/hi"
@@ -141,6 +146,7 @@ $1
     source "answer.o" sha256="$(sha sources/answer.o)" size=$(wc -c < sources/answer.o)
     source "libanswer.a" sha256="$(sha sources/libanswer.a)" size=$(wc -c < sources/libanswer.a)
     source "plain.o" sha256="$(sha sources/plain.o)" size=$(wc -c < sources/plain.o)
+    source "signed.ko" sha256="$(sha sources/signed.ko)" size=$(wc -c < sources/signed.ko)
     script """
 $2
     """
@@ -216,6 +222,10 @@ expect_failure 'output must not exist' \
 cmp sources/answer.o restored-answer.o
 cmp sources/plain.o first/proto/usr/lib/plain.o
 test ! -e first/proto/usr/lib/debug/usr/lib/plain.o.cps-debug
+# Signed modules with debug sections ship byte-for-byte unchanged.
+readelf -SW sources/signed.ko | grep -F .debug_info
+cmp sources/signed.ko first/proto/usr/lib/signed.ko
+test ! -e first/proto/usr/lib/debug/usr/lib/signed.ko.cps-debug
 ar t sources/libanswer.a > expected-members
 ar t first/proto/usr/lib/libanswer.a > stripped-members
 cmp expected-members stripped-members

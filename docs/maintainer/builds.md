@@ -381,7 +381,12 @@ delta reuses identical copies of these sections from the normal objects.
 
 CPS skips scripts, EFI images, objects for another architecture, compressed
 kernel modules, thin archives, and archives containing foreign or non-ELF
-members such as LLVM bitcode. An executable or shared object with symbols
+members such as LLVM bitcode. It also leaves signed kernel modules (files
+ending in `~Module signature appended~`) byte-for-byte unchanged: the
+signature covers the whole file, including debug sections, so stripping
+would stop the module from loading on kernels that require valid
+signatures. Strip modules before signing them if they should ship without
+debug information. An executable or shared object with symbols
 but no build ID fails the build; link it with `-Wl,--build-id`. The toolchain
 must provide `objcopy` when any shipped object needs stripping. Write
 `strip #false` in the `build` block to ship objects as installed.

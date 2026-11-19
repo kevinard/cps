@@ -9,6 +9,8 @@
 //! reproducible. Relocatable objects and archives retain their linker symbols;
 //! debug deltas live under `usr/lib/debug/` with their original paths plus
 //! `.cps-debug`. Unchanged code and LTO sections remain in the ordinary file.
+//! Signed kernel modules ship unchanged because their signature covers the
+//! whole file, including debug sections.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -40,6 +42,9 @@ enum Symbols {
     BuildId(Vec<u8>),
     Linkable,
 }
+
+/// The marker that ends a Linux module signature appended outside the ELF container.
+const MODULE_SIGNATURE: &[u8] = b"~Module signature appended~\n";
 
 fn machine(arch: &str) -> Option<u16> {
     match arch {
@@ -94,6 +99,10 @@ fn inspect(bytes: &[u8], arch: &str, path: &str) -> Result<Option<Symbols>> {
             debug |= has_debug(&file);
         }
         return Ok(debug.then_some(Symbols::Linkable));
+    }
+    if bytes.ends_with(MODULE_SIGNATURE) {
+        // Any rewrite, even of debug sections, invalidates an appended signature.
+        return Ok(None);
     }
     let Some((file, header_type)) = native_elf(bytes, arch) else {
         return Ok(None);
@@ -310,6 +319,75 @@ mod tests {
             "x86_64"
         };
         assert_eq!(inspect(&own, other, "test")?, None);
+        Ok(())
+    }
+
+    /// A minimal little-endian ELF64 relocatable object with one debug section.
+    fn relocatable_with_debug(arch: &str) -> Vec<u8> {
+        let names = b"\0.debug_info\0.shstrtab\0";
+        let debug = b"debug";
+        let mut bytes = vec![0; 64];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&elf::ET_REL.to_le_bytes());
+        bytes[18..20].copy_from_slice(&machine(arch).unwrap().to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&3u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&2u16.to_le_bytes());
+        let debug_offset = bytes.len() as u64;
+        bytes.extend_from_slice(debug);
+        let names_offset = bytes.len() as u64;
+        bytes.extend_from_slice(names);
+        bytes.resize(bytes.len().next_multiple_of(8), 0);
+        let headers = bytes.len() as u64;
+        bytes[40..48].copy_from_slice(&headers.to_le_bytes());
+        let mut section = |name: u32, kind: u32, offset: u64, size: u64| {
+            let mut header = [0; 64];
+            header[..4].copy_from_slice(&name.to_le_bytes());
+            header[4..8].copy_from_slice(&kind.to_le_bytes());
+            header[24..32].copy_from_slice(&offset.to_le_bytes());
+            header[32..40].copy_from_slice(&size.to_le_bytes());
+            header[48..56].copy_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&header);
+        };
+        section(0, elf::SHT_NULL, 0, 0);
+        section(1, elf::SHT_PROGBITS, debug_offset, debug.len() as u64);
+        section(13, elf::SHT_STRTAB, names_offset, names.len() as u64);
+        bytes
+    }
+
+    #[test]
+    fn signed_modules_are_left_unchanged() -> Result<()> {
+        let arch = "x86_64";
+        let module = relocatable_with_debug(arch);
+        assert_eq!(inspect(&module, arch, "plain.ko")?, Some(Symbols::Linkable));
+
+        // struct module_signature with an empty signature, then the marker.
+        let mut signed = module.clone();
+        signed.extend_from_slice(&[0; 12]);
+        signed.extend_from_slice(MODULE_SIGNATURE);
+        assert!(native_elf(&signed, arch).is_some());
+        assert_eq!(inspect(&signed, arch, "signed.ko")?, None);
+
+        let mut archive = b"!<arch>\n".to_vec();
+        archive.extend_from_slice(
+            format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                "plain.o/",
+                0,
+                0,
+                0,
+                644,
+                module.len()
+            )
+            .as_bytes(),
+        );
+        archive.extend_from_slice(&module);
+        assert_eq!(
+            inspect(&archive, arch, "libplain.a")?,
+            Some(Symbols::Linkable)
+        );
         Ok(())
     }
 }
