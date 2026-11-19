@@ -27,8 +27,9 @@ pub use apply::{
 pub use boot::{
     Activation, BootEnvironment, BootImage, EtcConflict, EtcMergeReport,
     activate_btrfs_boot_environment, capture_boot_environment, create_boot_image,
-    destroy_btrfs_boot_environment, last_etc_merge, list_boot_environments, preview_btrfs_rollback,
-    rollback_btrfs_boot_environment, saved_etc_versions, stage_btrfs_boot_environment,
+    destroy_btrfs_boot_environment, last_etc_merge, list_boot_environments, mount_boot_environment,
+    preview_btrfs_rollback, rename_boot_environment, rollback_btrfs_boot_environment,
+    saved_etc_versions, stage_btrfs_boot_environment, unmount_boot_environment,
 };
 pub use build::{
     BuildOptions, BuildSettings, BuildToolchain, BuildWorker, GitSnapshotRef, SourceLayout, build,

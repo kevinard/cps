@@ -48,6 +48,36 @@ if [ "$version" = 2.0.0-0 ]; then
     $bb grep -F 'Would select cps-' /run/cps-rollback-preview
     $bb grep -F 'test/live-root:' /run/cps-rollback-preview
     test "$($bb sha256sum /efi/loader/loader.conf)" = "$loader_before"
+    current=$($bb cat /run/cps-vm-id)
+    cps boot create before-maintenance
+    if cps boot create before-maintenance > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'already in use' /run/rejected
+    listing=$(cps boot list)
+    printf '%s\n' "$listing" | $bb awk -F '\t' -v current="$current" '
+        $1 == "*" && $3 == current { current_selected=1 }
+        $1 == "-" && $2 == "known-good" && $6 == "before-maintenance" { copy_inactive=1 }
+        END { exit !(current_selected && copy_inactive) }
+    '
+    cps boot rename before-maintenance checkpoint
+    cps boot create before-maintenance
+    cps boot destroy before-maintenance
+    inspection=/run/cps-inspect/checkpoint
+    $bb mkdir -p "$inspection"
+    cps boot mount checkpoint "$inspection"
+    test "$($bb cat "$inspection/etc/cps-capture-version")" = 2.0.0-0
+    if $bb touch "$inspection/etc/write-test" > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'Read-only file system' /run/rejected
+    if cps boot destroy --dry-run checkpoint > /run/rejected 2>&1; then exit 1; fi
+    $bb grep -F 'mounted Btrfs root' /run/rejected
+    if cps boot unmount "$current" "$inspection" > /run/rejected 2>&1; then exit 1; fi
+    cps boot unmount checkpoint "$inspection"
+    test ! -e "$inspection/etc"
+    cps boot activate checkpoint
+    cps boot list | $bb awk -F '\t' '$1 == "*" && $6 == "checkpoint" { found=1 } END { exit !found }'
+    cps boot activate "$current"
+    cps boot destroy --dry-run checkpoint
+    cps boot destroy checkpoint
+    echo 'CPS_VM_SYSTEM: managed named boot environments by name and ID'
     cps boot rollback --esp /efi --btrfs-volume /volume
     $bb sync
     exec $bb reboot -f
@@ -85,7 +115,7 @@ if [ -f /volume/@captures/cli-upgrade ] && [ -f /volume/@captures/backup-rollbac
     cps status | $bb grep -Fx 'No reboot pending.'
     echo 'CPS_VM_SYSTEM: booted the backup taken before a live removal'
     : > /volume/@captures/backup-booted
-    cps boot rollback --esp /efi --btrfs-volume /volume "$($bb cat /volume/@captures/main-id)"
+    cps boot activate --esp /efi --btrfs-volume /volume "$($bb cat /volume/@captures/main-id)"
     $bb sync
     exec $bb reboot -f
 fi
@@ -149,7 +179,7 @@ if [ -f /volume/@captures/cli-upgrade ]; then
     # Undo the configuration edits on this root; the autoremove phase repeats them.
     $bb cp /run/cps-image.kdl /etc/cps/image.kdl
     $bb mv /repository/offline-current /repository/current
-    cps boot rollback --esp /efi --btrfs-volume /volume "$backup"
+    cps boot activate --esp /efi --btrfs-volume /volume "$backup"
     echo 'CPS_VM_SYSTEM: removed a package live after saving a backup environment'
     $bb sync
     exec $bb reboot -f

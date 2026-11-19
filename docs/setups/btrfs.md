@@ -58,7 +58,7 @@ stage-package "system/systemd"
 | `uki` | `#false` | Boot [signed UKIs](#signed-ukis-for-btrfs-roots) with systemd-boot. |
 | `uefi` | `#false` | Boot signed UKIs [directly from UEFI](#direct-uefi-boot-for-btrfs-roots). |
 | `tries` | 2, or 1 with `uefi` | Boot attempts for a trial, from 1 to 99. Direct UEFI trials allow exactly one. |
-| `keep-environments` | 3 | Known-good environments to keep, from 1 to 99. See [Retention and pruning](#retention-and-pruning). |
+| `keep-environments` | 3 | Unnamed known-good environments to keep, from 1 to 99. See [Retention and pruning](#retention-and-pruning). |
 | `auto-prune` | `#true` | Prune old known-good environments automatically. |
 | `live-backup` | `#true` | Save the running root as a [backup environment](#backups-before-live-changes) before each live change. |
 | `exclude-subvolume` | | A child node naming a [nested subvolume](#nested-subvolumes), relative to the root, that new roots start empty. Repeat it for more paths. |
@@ -399,7 +399,7 @@ can run on the running root before it saves the backup.
 
 ```sh
 sudo cps boot list
-sudo cps boot rollback "$backup_id"
+sudo cps boot activate "$backup_id"
 ```
 
 The snapshot shares all data with the running root. CPS verifies it with
@@ -514,7 +514,7 @@ cps boot destroy --esp /efi --btrfs-volume /mnt/cps-volume --dry-run "$old_id"
 cps boot destroy --esp /efi --btrfs-volume /mnt/cps-volume "$old_id"
 ```
 
-`boot list`, `boot rollback`, and `boot destroy` read `--esp` and
+`boot list`, `boot activate`, `boot rollback`, and `boot destroy` read `--esp` and
 `--btrfs-volume` from the `boot-btrfs` node in `/etc/cps/image.kdl`, or the
 file named by `--config`, when you omit them.
 
@@ -565,9 +565,10 @@ From the rest, it removes:
 - Abandoned trials, which still have attempts left but are no longer
   selected, for example after a rollback. Prune first renames the entry to
   zero attempts, which systemd-boot never selects, and then destroys it.
-- Known-good environments older than the `keep-environments` newest ones.
-  The protected environments above count toward that number when they are
-  among the newest, and are kept in any case.
+- Unnamed known-good environments older than the `keep-environments` newest
+  unnamed ones. Protected environments are kept in any case. [Named
+  environments](boot-operations.md#manage-named-environments) do not count
+  toward the limit and must be destroyed explicitly.
 
 Trials and known-good environments are removed oldest first. Each removal
 repeats all the `boot destroy` checks, including the mount, nested
@@ -585,8 +586,8 @@ each [backup](#backups-before-live-changes), and `cps boot bless`
 prunes after it promotes a trial. Automatic pruning reports problems as
 warnings and never blocks the transaction. With `auto-prune=#false`, staging
 still removes failed and abandoned trials but keeps every known-good
-environment. Pruning also removes empty `upgrade-*` and `backup-*`
-directories left in `environments`.
+environment. Pruning also removes empty `upgrade-*`, `backup-*`, and
+`named-*` directories left in `environments`.
 
 The prune before staging keeps the trial of an interrupted activation of the
 same change, whose root is that change's `upgrade-*/root`, so that the retry

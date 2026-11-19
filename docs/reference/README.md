@@ -67,7 +67,7 @@ formatted output.
 | Order recipe builds, plan rebuilds, and refresh recipe pins | [recipe](man/cps-recipe.1) (`recipe order`, `recipe rebuilds`, `recipe repin`, `recipe fetch-toolchain`) | [Plan builds across recipes](../maintainer/orchestration.md) |
 | Publish packages and manage the publisher trust root | [publish](man/cps-publish.1) (`publish manifests`, `publish bundle`, `publish release`), [repo](man/cps-repo.1) (`repo trust`, `repo resign`, `repo withdraw`) | [Publish and retire packages](../publisher/publishing.md) |
 | Export, sign, sync, or refresh a mirror | [repo](man/cps-repo.1) (`repo export`, `repo sign-export`, `repo refresh-metadata`, `repo sync`) | [Serve a mirror](../publisher/mirrors.md) · [Mirror clients](../client/mirrors.md) |
-| Stage, activate, prune, or roll back a boot environment | [boot](man/cps-boot.1) | [Boot setup guides](../setups/README.md) |
+| Create, name, inspect, or switch boot environments | [boot](man/cps-boot.1) | [Boot operations](../setups/boot-operations.md) |
 
 ## Configuration and data formats
 

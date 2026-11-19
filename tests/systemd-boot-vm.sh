@@ -1013,7 +1013,7 @@ $bb chmod 0755 /volume/@environments
 cps boot list --esp /efi
 if [ "$mode" = rollback ]; then
     # Pin the base, so the trial is selected with `preferred`.
-    cps boot rollback --esp /efi --btrfs-volume /volume "$base_id"
+    cps boot activate --esp /efi --btrfs-volume /volume "$base_id"
 fi
 cps boot capture --source /volume/@ --output /volume/@environments/base
 cps boot stage --source /volume/@environments/base/root \
@@ -1042,7 +1042,7 @@ id=${result#Activated }
 [ ! -e "/efi/loader/entries/$id+9.conf" ]
 if [ "$mode" = rollback ]; then
     $bb grep -Fx "preferred $id+2.conf" /efi/loader/loader.conf || $bb grep -Fx "preferred $id.conf" /efi/loader/loader.conf
-    reject 'is not known-good' cps boot rollback --esp /efi --btrfs-volume /volume "$id"
+    reject 'is not known-good' cps boot activate --esp /efi --btrfs-volume /volume "$id"
 fi
 # Simulate an offline change after checked activation.
 case "$mode" in

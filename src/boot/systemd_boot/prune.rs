@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{CWD, FlockOperation, RenameFlags, renameat_with};
 
 use super::{
-    Inventory, NO_SELECTION, destroy, destroy_btrfs_boot_environment, inventory, lock_esp,
+    Inventory, NO_SELECTION, destroy, inventory, lock_esp,
     policy::{BootEntry, LoaderPolicy},
     rollback,
 };
@@ -48,7 +48,7 @@ pub struct TrialDiscard {
 /// Remove environments the retention policy no longer needs.
 ///
 /// Failed and abandoned trials are always removed. With `keep`, known-good
-/// environments beyond the `keep` most recent are removed as well. The
+/// unnamed environments beyond the `keep` most recent are removed as well. The
 /// running, selected and default environments and their recorded fallbacks
 /// are never candidates, and each removal repeats every `cps boot destroy` check.
 ///
@@ -85,13 +85,7 @@ pub fn prune_btrfs_boot_environments(
             kind,
             dry_run,
             |dry_run| exhaust_trial(esp, &volume, &id, dry_run),
-            |dry_run, exhausted| {
-                if exhausted {
-                    destroy::check_exhausted_destruction(esp, volume_path, &id)
-                } else {
-                    destroy_btrfs_boot_environment(esp, volume_path, &id, dry_run).map(drop)
-                }
-            },
+            |dry_run, exhausted| destroy::prune(esp, volume_path, &id, dry_run, exhausted),
         );
         match result {
             Ok(()) => report.removed.push((id, kind)),
@@ -292,7 +286,7 @@ fn candidates(
     if let Some(keep) = keep {
         let known_good: Vec<_> = ordered
             .iter()
-            .filter(|entry| entry.tries.is_none())
+            .filter(|entry| entry.tries.is_none() && entry.name.is_none())
             .collect();
         let excess = known_good.len().saturating_sub(keep);
         removals.extend(
@@ -379,6 +373,7 @@ mod tests {
         BootEntry {
             path: format!("{}.conf", id(revision)).into(),
             id: id(revision),
+            name: None,
             revision,
             tries,
             description: String::new(),
@@ -465,6 +460,21 @@ mod tests {
                 (7, BootRemoval::KnownGood),
                 (8, BootRemoval::KnownGood)
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn named_environments_are_kept_outside_the_retention_count() -> Result<()> {
+        let mut entries: Vec<_> = (3..=6)
+            .map(|revision| entry(revision, None, None))
+            .collect();
+        entries[0].name = Some("old-checkpoint".into());
+        entries[3].name = Some("new-checkpoint".into());
+        let policy = LoaderPolicy::pinned(&id(5));
+        assert_eq!(
+            removed(&candidates(&entries, &policy, &[], Some(1))?),
+            [(4, BootRemoval::KnownGood)]
         );
         Ok(())
     }

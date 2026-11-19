@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{AtFlags, FileType, FlockOperation, RenameFlags, flock, renameat_with, unlinkat};
 
 use super::{
-    Inventory, inventory, lock_esp,
+    Inventory, inventory, lock_esp, manage,
     policy::{self, BootEntry, LoaderPolicy},
     uefi, verify_fallback_artifacts,
 };
@@ -58,21 +58,31 @@ pub fn destroy_btrfs_boot_environment(
     id: &str,
     dry_run: bool,
 ) -> Result<String> {
-    destroy(esp, volume, id, dry_run, false)
+    destroy(esp, volume, id, dry_run, false, false)
 }
 
-/// Run every `cps boot destroy` check for a trial as if its remaining boot
-/// attempts were already spent, without changing anything.
-pub(super) fn check_exhausted_destruction(esp: &Path, volume: &Path, id: &str) -> Result<()> {
-    destroy(esp, volume, id, true, true).map(drop)
+pub(super) fn prune(
+    esp: &Path,
+    volume: &Path,
+    id: &str,
+    dry_run: bool,
+    exhausted: bool,
+) -> Result<()> {
+    destroy(esp, volume, id, dry_run, exhausted, true).map(drop)
 }
 
-fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) -> Result<String> {
+fn destroy(
+    esp: &Path,
+    volume: &Path,
+    selector: &str,
+    dry_run: bool,
+    exhausted: bool,
+    prune: bool,
+) -> Result<String> {
     ensure!(
         dry_run || !exhausted,
         "only a dry run can assume exhaustion"
     );
-    policy::entry_identity(id)?;
     let volume = BtrfsVolume::open(volume)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let esp_lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
@@ -83,6 +93,19 @@ fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) 
     } = inventory(&esp, &esp_lock, false)?;
     let policy = policy.context("no CPS boot environments registered")?;
     let mut retiring = pending(&esp)?;
+    // An interrupted destruction resumes, so a retiring record wins, and a
+    // live entry with the same ID fails the duplicate check below.
+    let id = if retiring
+        .iter()
+        .any(|entry| manage::matches(entry, selector))
+    {
+        manage::find(&retiring, selector)?
+    } else {
+        manage::find(&entries, selector)?
+    }
+    .id
+    .clone();
+    let id = id.as_str();
     let resumed = retiring.iter().position(|entry| entry.id == id);
     let target = if let Some(index) = resumed {
         ensure!(
@@ -98,6 +121,10 @@ fn destroy(esp: &Path, volume: &Path, id: &str, dry_run: bool, exhausted: bool) 
         entries.remove(index)
     };
     let mut target = target;
+    ensure!(
+        !prune || resumed.is_some() || target.tries.is_some() || target.name.is_none(),
+        "use `cps boot destroy` to remove a named boot environment"
+    );
     if exhausted && target.tries.is_some() {
         target.tries = Some(0);
     }
@@ -377,6 +404,7 @@ mod tests {
         BootEntry {
             path: format!("{id}.conf").into(),
             id,
+            name: None,
             revision,
             tries,
             description: String::new(),

@@ -1,9 +1,12 @@
 mod destroy;
 pub(super) mod loader;
+mod manage;
 pub(super) mod policy;
 mod prune;
 mod uefi;
 pub use destroy::destroy_btrfs_boot_environment;
+pub(crate) use manage::validate_name as validate_environment_name;
+pub use manage::{mount_boot_environment, rename_boot_environment, unmount_boot_environment};
 pub use prune::{
     BootPruneReport, BootRemoval, TrialDiscard, discard_btrfs_trial, prune_btrfs_boot_environments,
 };
@@ -46,6 +49,7 @@ const ESP_MARGIN: u64 = 1024 * 1024;
 #[derive(Debug)]
 pub struct BootEnvironment {
     pub id: String,
+    pub name: Option<String>,
     pub title: String,
     /// Empty when the entry boots by Btrfs filesystem UUID.
     pub root_partuuid: String,
@@ -127,6 +131,7 @@ pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
         .map(|(entry, is_retiring)| BootEnvironment {
             is_default: selected.as_deref() == Some(&entry.id),
             id: entry.id,
+            name: entry.name,
             title: entry.title,
             root_partuuid: entry.root.partuuid().unwrap_or_default().to_owned(),
             root_uuid: match entry.root {
@@ -270,10 +275,7 @@ fn rollback_target<'a>(
 }
 
 fn find_known_good<'a>(entries: &'a [BootEntry], id: &str) -> Result<&'a BootEntry> {
-    let entry = entries
-        .iter()
-        .find(|entry| entry.id == id)
-        .with_context(|| format!("unknown boot environment {id}"))?;
+    let entry = manage::find(entries, id)?;
     ensure!(
         entry.tries.is_none(),
         "boot environment {id} is not known-good"
@@ -535,7 +537,7 @@ pub(super) fn activate(
     volume: &BtrfsVolume,
     mode: BootMode,
 ) -> Result<String> {
-    activate_as(root, esp, activation, volume, mode, false)
+    activate_as(root, esp, activation, volume, mode, false, None)
 }
 
 /// Register a read-only backup of the running Btrfs root as a known-good
@@ -546,8 +548,9 @@ pub(super) fn register_backup(
     activation: &Activation,
     volume: &BtrfsVolume,
     mode: BootMode,
+    name: Option<&str>,
 ) -> Result<String> {
-    activate_as(root, esp, activation, volume, mode, true)
+    activate_as(root, esp, activation, volume, mode, true, name)
 }
 
 fn activate_as(
@@ -557,7 +560,12 @@ fn activate_as(
     volume: &BtrfsVolume,
     mode: BootMode,
     backup: bool,
+    name: Option<&str>,
 ) -> Result<String> {
+    ensure!(
+        backup || name.is_none(),
+        "only a known-good backup is named when it is registered"
+    );
     ensure!(
         !backup || activation.known_good,
         "a backup is a known-good Btrfs environment"
@@ -648,11 +656,15 @@ fn activate_as(
             );
         }
     }
+    let retiring = destroy::pending(&esp)?;
     ensure!(
-        !destroy::pending(&esp)?.iter().any(|entry| entry.id == id),
+        !retiring.iter().any(|entry| entry.id == id),
         "this boot environment is retiring; finish it with `cps boot destroy`"
     );
     let existing_entry = existing.iter().find(|entry| entry.id == id);
+    if let Some(name) = name {
+        manage::require_unused_name(existing.iter().chain(&retiring), name, &id)?;
+    }
     if let Some(entry) = existing_entry {
         ensure!(
             sign_uki == entry.uki.is_some(),
@@ -706,6 +718,9 @@ fn activate_as(
             uefi::ARMED,
             firmware.armed_boot(existing_entry)?
         ));
+    }
+    if let Some(name) = name.or_else(|| existing_entry.and_then(|entry| entry.name.as_deref())) {
+        description = manage::named_description(&description, name);
     }
     ensure!(
         description.len() <= policy::MAX_ENTRY_BYTES,
@@ -860,6 +875,9 @@ fn activate_as(
             initrd_sha256.as_deref(),
         )?;
     }
+    if backup && let Some(firmware) = &firmware {
+        firmware.register(&id)?;
+    }
     if let Some(entry) = existing_entry {
         File::open(&entry.path)?.sync_all()?;
         File::open(&entries)?.sync_all()?;
@@ -874,10 +892,7 @@ fn activate_as(
         install_text(&entries.join(&file), &description)?;
     }
     if let Some(firmware) = firmware {
-        if backup {
-            // Rollback promotes the option; until then BootOrder is unchanged.
-            firmware.register(&id)?;
-        } else if fallback.is_none() || select_trial {
+        if !backup && (fallback.is_none() || select_trial) {
             firmware.activate(&id, fallback.is_some())?;
         }
     } else if let Some(fallback) = fallback.as_deref().filter(|_| prefer_trial) {
@@ -1276,6 +1291,7 @@ mod tests {
         BootEntry {
             path: format!("{id}.conf").into(),
             id: id.into(),
+            name: None,
             revision,
             tries,
             description: String::new(),

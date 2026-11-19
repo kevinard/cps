@@ -106,6 +106,11 @@ pub(crate) fn backup_running_btrfs(output: &Path, excluded: &[String]) -> Result
     snapshot_environment(Path::new("/"), output, Snapshot::Backup, true, excluded)
 }
 
+/// Whether a snapshot is still read-only, as it is until it is registered.
+pub(crate) fn is_read_only(root: &Root) -> Result<bool> {
+    Ok(subvolume_flags(root)? & READ_ONLY != 0)
+}
+
 /// Make a read-only environment writable before it is booted.
 pub(crate) fn make_writable(root: &Root) -> Result<()> {
     let flags = subvolume_flags(root)?;

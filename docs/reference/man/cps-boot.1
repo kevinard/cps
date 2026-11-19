@@ -10,14 +10,26 @@
 .B \&list
 \&List registered boot environments and the configured default
 .TP
+.B \&create
+\&Snapshot the running system as a named environment without selecting it
+.TP
+.B \&rename
+\&Name or rename a known\-good environment without changing its boot ID
+.TP
+.B \&mount
+\&Mount a registered environment read\-only for inspection
+.TP
+.B \&unmount
+\&Unmount an environment's inspection mount
+.TP
 .B \&rollback
-\&Select a known\-good environment for the next boot
+\&Activate the recorded fallback of the configured default for the next boot
 .TP
 .B \&stage
 \&Stage a saved plan in a writable Btrfs snapshot of a read\-only baseline
 .TP
 .B \&activate
-\&Publish a boot entry for a root on a mounted Btrfs volume
+\&Select a known\-good environment for the next boot, or publish a boot entry for a root
 .TP
 .B \&capture
 \&Capture a running CPS Btrfs root as a directory with a read\-only root/
@@ -59,15 +71,99 @@
 .TP
 .B \&\-h, \-\-help
 \&Print help
-.SS "\&cps boot rollback"
-\&Select a known\-good environment for the next boot
+.SS "\&cps boot create"
+\&Snapshot the running system as a named environment without selecting it
 .PP
-.B \&cps boot rollback [OPTIONS] [ID]
+.B \&cps boot create [OPTIONS] <NAME>
 .PP
 .B Arguments
 .TP
-.B \&[ID]
-\&Environment ID. Defaults to the previous known\-good environment
+.B \&<NAME>
+\&Name for the new known\-good environment
+.PP
+.B Options
+.TP
+.B \&\-\-config <CONFIG>
+\&[default: /etc/cps/image.kdl]
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps boot rename"
+\&Name or rename a known\-good environment without changing its boot ID
+.PP
+.B \&cps boot rename [OPTIONS] <ENVIRONMENT> <NAME>
+.PP
+.B Arguments
+.TP
+.B \&<ENVIRONMENT>
+\&Environment name or ID
+.TP
+.B \&<NAME>
+\&New name for the environment
+.PP
+.B Options
+.TP
+.B \&\-\-config <CONFIG>
+\&Distribution configuration that names the ESP [default: /etc/cps/image.kdl]
+.TP
+.B \&\-\-esp <ESP>
+\&Mount point of the EFI System Partition (default: from \-\-config)
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps boot mount"
+\&Mount a registered environment read\-only for inspection
+.PP
+.B \&cps boot mount [OPTIONS] <ENVIRONMENT> <PATH>
+.PP
+.B Arguments
+.TP
+.B \&<ENVIRONMENT>
+\&Environment name or ID
+.TP
+.B \&<PATH>
+\&Existing empty directory owned by root
+.PP
+.B Options
+.TP
+.B \&\-\-config <CONFIG>
+\&Distribution configuration that names the ESP and Btrfs volume [default: /etc/cps/image.kdl]
+.TP
+.B \&\-\-esp <ESP>
+\&Mount point of the EFI System Partition (default: from \-\-config)
+.TP
+.B \&\-\-btrfs\-volume <BTRFS_VOLUME>
+\&Mounted Btrfs top\-level volume holding the roots (default: from \-\-config)
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps boot unmount"
+\&Unmount an environment's inspection mount
+.PP
+.B \&cps boot unmount [OPTIONS] <ENVIRONMENT> <PATH>
+.PP
+.B Arguments
+.TP
+.B \&<ENVIRONMENT>
+\&Environment name or ID
+.TP
+.B \&<PATH>
+\&Path where the environment was mounted
+.PP
+.B Options
+.TP
+.B \&\-\-config <CONFIG>
+\&Distribution configuration that names the ESP [default: /etc/cps/image.kdl]
+.TP
+.B \&\-\-esp <ESP>
+\&Mount point of the EFI System Partition (default: from \-\-config)
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps boot rollback"
+\&Activate the recorded fallback of the configured default for the next boot
+.PP
+.B \&cps boot rollback [OPTIONS]
 .PP
 .B Options
 .TP
@@ -81,7 +177,7 @@
 \&Mounted Btrfs top\-level volume holding the roots (default: from \-\-config)
 .TP
 .B \&\-n, \-\-dry\-run
-\&Compare the configured default with the rollback root without changing boot selection
+\&Compare the configured default with the fallback without changing boot selection
 .TP
 .B \&\-\-paths
 \&Include managed file actions and ownership in the preview. Requires \-\-dry\-run
@@ -113,17 +209,37 @@
 .B \&\-h, \-\-help
 \&Print help
 .SS "\&cps boot activate"
-\&Publish a boot entry for a root on a mounted Btrfs volume
+\&Select a known\-good environment for the next boot, or publish a boot entry for a root
 .PP
-.B \&cps boot activate [OPTIONS] \-\-root <ROOT> \-\-btrfs\-volume <BTRFS_VOLUME> \-\-esp <ESP>
+.B \&cps boot activate [OPTIONS] [ENVIRONMENT]
+.PP
+.B Arguments
+.TP
+.B \&[ENVIRONMENT]
+\&Known\-good environment name or ID to select
 .PP
 .B Options
-.PP
-.B \&\-\-root <ROOT>
-.PP
-.B \&\-\-btrfs\-volume <BTRFS_VOLUME>
-.PP
+.TP
+.B \&\-\-config <CONFIG>
+\&Distribution configuration that names the ESP and Btrfs volume [default: /etc/cps/image.kdl]
+.TP
 .B \&\-\-esp <ESP>
+\&Mount point of the EFI System Partition (default: from \-\-config)
+.TP
+.B \&\-\-btrfs\-volume <BTRFS_VOLUME>
+\&Mounted Btrfs top\-level volume holding the roots (default: from \-\-config)
+.TP
+.B \&\-n, \-\-dry\-run
+\&Compare the configured default with the environment without changing boot selection
+.TP
+.B \&\-\-paths
+\&Include managed file actions and ownership in the preview. Requires \-\-dry\-run
+.TP
+.B \&\-\-json
+\&Print the preview as JSON. Requires \-\-dry\-run
+.TP
+.B \&\-\-root <ROOT>
+\&Publish a boot entry for this Btrfs root instead of selecting an existing entry
 .TP
 .B \&\-\-root\-partuuid <ROOT_PARTUUID>
 \&Use a direct GPT root partition instead of the mounted Btrfs filesystem UUID
@@ -174,7 +290,7 @@
 .B Arguments
 .TP
 .B \&<ID>
-\&Environment ID to retire, as shown by boot list
+\&Environment name or ID to retire, as shown by boot list
 .PP
 .B Options
 .TP
@@ -203,7 +319,7 @@
 \&[default: /etc/cps/image.kdl]
 .TP
 .B \&\-\-keep <KEEP>
-\&Known\-good environments to keep, overriding keep\-environments
+\&Unnamed known\-good environments to keep, overriding keep\-environments
 .TP
 .B \&\-n, \-\-dry\-run
 \&Check and list the removals without changing anything

@@ -128,7 +128,7 @@ if [ "$state" = trial ]; then
         # Both roots must now be known-good, with the trial selected by default.
         case "$listing" in *'trial ('*) exit 1 ;; esac
         printf 'CPS_VM_SIGNED_BTRFS: trial default after reboot\n'
-        cps boot rollback --esp /efi --btrfs-volume /volume "$base"
+        cps boot activate --esp /efi --btrfs-volume /volume "$base"
     fi
     "$bb" sync
     exec "$bb" reboot -f

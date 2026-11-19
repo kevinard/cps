@@ -680,6 +680,7 @@ mod tests {
         BootEntry {
             path: PathBuf::from(format!("{id}{}.conf", if trial { "+1" } else { "" })),
             id: id.to_owned(),
+            name: None,
             revision: if trial { 2 } else { 1 },
             tries: trial.then_some(1),
             description: if trial {

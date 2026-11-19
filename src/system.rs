@@ -17,9 +17,10 @@ use crate::{
     ReleaseAdvisory, Request, TransactionPhase, TransactionProgress,
     apply::{PublisherFetchError, abort_live, apply_live, repair_pending_live, resume_live},
     boot::{
-        backup_running_btrfs, discard_btrfs_trial, entry_id, etc_merge, make_writable,
-        pending_trial, prune_btrfs_boot_environments, rollback_btrfs_boot_environment,
-        stage_running_btrfs, with_running_environment,
+        backup_running_btrfs, discard_btrfs_trial, entry_id, etc_merge, is_read_only,
+        make_writable, pending_trial, prune_btrfs_boot_environments,
+        rollback_btrfs_boot_environment, stage_running_btrfs, validate_environment_name,
+        with_running_environment,
     },
     fetch_plan,
     git_install::{GitBuild, GitSource, GitStore},
@@ -697,7 +698,7 @@ impl System {
         }
         let id = boot
             .activation
-            .register_btrfs_backup(&root, &boot.volume, &boot.esp, boot.uki, boot.uefi)
+            .register_btrfs_backup(&root, &boot.volume, &boot.esp, boot.uki, boot.uefi, None)
             .with_context(|| format!("registering the backup at {}", root.display()))?;
         // The snapshot stays read-only until it is verified and registered.
         // The boot menu can start it, so it must then be writable like any
@@ -708,6 +709,83 @@ impl System {
             self.prune_quietly(Some(boot.keep_environments), None);
         }
         Ok(id)
+    }
+
+    /// Create a named, known-good snapshot without selecting it for boot.
+    ///
+    /// Like a backup, the snapshot directory is keyed by the running image
+    /// and revision, so a retry after an interruption reuses a snapshot only
+    /// when it holds the same revision. A snapshot stays read-only until it
+    /// is registered.
+    pub fn create_boot_environment(&self, name: &str) -> Result<String> {
+        validate_environment_name(name)?;
+        let _lock = self.lock()?;
+        self.check_running()?;
+        let boot = self.boot();
+        let settings = Image::open_query(Path::new(ROOT))?.settings()?;
+        let entries = list_boot_environments(&boot.esp)?;
+        for slot in 0_u64.. {
+            let output = boot.environments.join(format!(
+                "named-{name}-{}-{}.{slot}",
+                settings.id, settings.revision
+            ));
+            let root = output.join("root");
+            if root.try_exists()? {
+                let snapshot = Image::open_query(&root)?.settings()?;
+                let id = entry_id(&snapshot.id, snapshot.boot_revision());
+                match entries.iter().find(|entry| entry.id == id) {
+                    None => {}
+                    // An interrupted create may have stopped before this step.
+                    Some(entry)
+                        if entry.name.as_deref() == Some(name)
+                            && !entry.is_retiring
+                            && is_read_only(&Root::open(&root)?)? =>
+                    {
+                        make_writable(&Root::open(&root)?)?;
+                        return Ok(id);
+                    }
+                    Some(_) => continue,
+                }
+            } else {
+                // Fail before taking a snapshot. Registration checks again
+                // under the ESP lock.
+                ensure!(
+                    !entries
+                        .iter()
+                        .any(|entry| entry.name.as_deref() == Some(name)),
+                    "boot environment name {name} is already in use"
+                );
+                if output.try_exists()? {
+                    fs::remove_dir(&output).with_context(|| {
+                        format!("removing the empty snapshot directory {}", output.display())
+                    })?;
+                }
+                // Make room on the ESP for the environment's boot files.
+                self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments), None);
+                backup_running_btrfs(&output, &boot.exclude_subvolumes)?;
+            }
+            let id = boot
+                .activation
+                .register_btrfs_backup(
+                    &root,
+                    &boot.volume,
+                    &boot.esp,
+                    boot.uki,
+                    boot.uefi,
+                    Some(name),
+                )
+                .with_context(|| {
+                    format!("registering the named environment at {}", root.display())
+                })?;
+            make_writable(&Root::open(&root)?).with_context(|| {
+                format!(
+                    "making the named environment at {} writable",
+                    root.display()
+                )
+            })?;
+            return Ok(id);
+        }
+        unreachable!()
     }
 
     /// Merge the running /etc into the trial selected for the next boot.
@@ -962,7 +1040,9 @@ impl System {
         for child in children.flatten() {
             let name = child.file_name();
             let name = name.to_string_lossy();
-            if (name.starts_with("upgrade-") || name.starts_with("backup-"))
+            if (name.starts_with("upgrade-")
+                || name.starts_with("backup-")
+                || name.starts_with("named-"))
                 && child.file_type().is_ok_and(|kind| kind.is_dir())
             {
                 // Fails harmlessly while the directory still holds a root.

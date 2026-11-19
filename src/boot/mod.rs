@@ -29,7 +29,7 @@ use crate::{
 };
 
 pub(crate) use btrfs::{
-    backup_running_btrfs, excluded_subvolumes, make_writable, stage_running_btrfs,
+    backup_running_btrfs, excluded_subvolumes, is_read_only, make_writable, stage_running_btrfs,
 };
 pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub use btrfs_boot::{
@@ -45,9 +45,12 @@ pub use etc_merge::{
 pub use offline::{BootImage, create_boot_image};
 pub use systemd_boot::{
     Activation, BootEnvironment, BootPruneReport, BootRemoval, TrialDiscard,
-    destroy_btrfs_boot_environment, list_boot_environments,
+    destroy_btrfs_boot_environment, list_boot_environments, mount_boot_environment,
+    rename_boot_environment, unmount_boot_environment,
 };
-pub(crate) use systemd_boot::{discard_btrfs_trial, prune_btrfs_boot_environments};
+pub(crate) use systemd_boot::{
+    discard_btrfs_trial, prune_btrfs_boot_environments, validate_environment_name,
+};
 
 fn check_staging_plan(base: &Image, plan: &Plan) -> Result<()> {
     ensure!(

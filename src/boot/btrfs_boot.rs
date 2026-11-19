@@ -149,6 +149,14 @@ pub(super) struct BtrfsRecord {
 }
 
 impl BtrfsRecord {
+    /// Whether `root` is the root of this record's subvolume, wherever it is mounted.
+    pub fn describes(&self, root: &Root) -> Result<bool> {
+        let info = subvolume_info(root)?;
+        Ok(info.treeid == self.subvolid
+            && uuid_string(&info.uuid) == self.uuid
+            && uuid_string(&filesystem_info(root)?.fsid) == self.fsid)
+    }
+
     pub fn parse(entry: &str, options: &str) -> Result<Option<Self>> {
         let values = [
             field(entry, FSID)?,
@@ -467,6 +475,7 @@ impl Activation {
         esp: &Path,
         uki: bool,
         uefi: bool,
+        name: Option<&str>,
     ) -> Result<String> {
         let volume = BtrfsVolume::open(volume)?;
         let mode = if uefi {
@@ -484,7 +493,7 @@ impl Activation {
             tries: 1,
             known_good: true,
         };
-        systemd_boot::register_backup(root, esp, &activation, &volume, mode)
+        systemd_boot::register_backup(root, esp, &activation, &volume, mode, name)
     }
 }
 

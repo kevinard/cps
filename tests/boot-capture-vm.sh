@@ -685,20 +685,23 @@ truncate -s 512M source.btrfs
 "$formatter" -q -f --rootdir files --subvol default:@ --subvol rw:@captures source.btrfs
 root_drive=source.btrfs
 if [[ $native_boot == 1 ]]; then
-    truncate -s 640M disk.raw
+    esp_mib=96
+    if [[ $system_commands == 1 ]]; then esp_mib=160; fi
+    root_mib=$((1 + esp_mib))
+    truncate -s "$((544 + esp_mib))M" disk.raw
     sfdisk --quiet disk.raw <<PARTITIONS
 label: gpt
 unit: sectors
-start=2048,size=196608,type=uefi,uuid=9a138d0b-f9aa-4a2a-b527-93392ad7e812
-start=198656,size=1048576,type=linux,uuid=$root_uuid
+start=2048,size=$((esp_mib * 2048)),type=uefi,uuid=9a138d0b-f9aa-4a2a-b527-93392ad7e812
+start=$((root_mib * 2048)),size=1048576,type=linux,uuid=$root_uuid
 PARTITIONS
     mkdir -p esp/EFI/BOOT
     cp "${CPS_VM_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}" esp/EFI/BOOT/BOOTX64.EFI
-    truncate -s 96M esp.fat
+    truncate -s "${esp_mib}M" esp.fat
     mkfs.fat -F 32 esp.fat >/dev/null
     mcopy -s -i esp.fat esp/EFI ::/
     dd if=esp.fat of=disk.raw bs=1M seek=1 conv=notrunc,sparse status=none
-    dd if=source.btrfs of=disk.raw bs=1M seek=97 conv=notrunc,sparse status=none
+    dd if=source.btrfs of=disk.raw bs=1M seek="$root_mib" conv=notrunc,sparse status=none
     root_drive=disk.raw
 fi
 data_args=()
@@ -767,6 +770,7 @@ if [[ $native_boot == 1 ]]; then
         grep -E '^Merged /etc into cps-[0-9a-f-]+: [1-9][0-9]* applied' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: /etc edits made after staging reached the trial' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: staged upgrade booted with the live package' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: managed named boot environments by name and ID' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: rolled back to the base with the live package' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: removed a package live after saving a backup environment' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: booted the backup taken before a live removal' uefi.log.clean

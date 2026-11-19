@@ -20,6 +20,7 @@ const LOADER: &str = "loader/loader.conf";
 pub(super) const MAX_ENTRY_BYTES: usize = 64 * 1024;
 pub(super) const ENTRY_FORMAT_FIELD: &str = "# cps-boot-entry-version ";
 pub(super) const ENTRY_FORMAT: &str = "1";
+pub(super) const NAME_FIELD: &str = "# cps-name ";
 
 /// The boot selection CPS owns in loader.conf.
 ///
@@ -204,19 +205,27 @@ impl LoaderPolicy {
             .transpose()
             .context("loader.conf is not UTF-8")?;
         let content = self.render(existing)?;
-        let parent = path.parent().context("missing loader directory")?;
         if existing == Some(content.as_str()) {
             File::open(path)?.sync_all()?;
+            let parent = path.parent().context("missing loader directory")?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
         } else {
-            let mut temp = NamedTempFile::new_in(parent)?;
-            temp.write_all(content.as_bytes())?;
-            temp.as_file().sync_all()?;
-            // On VFAT the renamed file's size is durable only with its inode.
-            temp.persist(path)?.sync_all()?;
+            replace_file(path, content.as_bytes())
         }
-        File::open(parent)?.sync_all()?;
-        Ok(())
     }
+}
+
+/// Atomically and durably replace a file on the ESP.
+pub(super) fn replace_file(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path.parent().context("missing ESP directory")?;
+    let mut temp = NamedTempFile::new_in(parent)?;
+    temp.write_all(content)?;
+    temp.as_file().sync_all()?;
+    // On VFAT the renamed file's size is durable only with its inode.
+    temp.persist(path)?.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Whether systemd-boot waits at its menu indefinitely for this timeout.
@@ -367,6 +376,7 @@ pub(super) fn check_parent(parent: &str, child: &str) -> Result<()> {
 pub(super) struct BootEntry {
     pub path: PathBuf,
     pub id: String,
+    pub name: Option<String>,
     pub revision: u64,
     pub tries: Option<u32>,
     pub description: String,
@@ -569,9 +579,18 @@ pub(super) fn read_entry(path: PathBuf, name: &str) -> Result<BootEntry> {
         check_parent(parent, id).with_context(|| format!("invalid parent for {id}"))?;
     }
     let parent = parent.map(str::to_owned);
+    // A name is a label, not part of the entry's identity. An invalid one,
+    // such as a hand edit, is ignored so that every boot command, `boot
+    // rename` among them, still reads the inventory.
+    let name = field(&description, NAME_FIELD)
+        .ok()
+        .flatten()
+        .filter(|name| super::manage::validate_name(name).is_ok())
+        .map(str::to_owned);
     Ok(BootEntry {
         path,
         id: id.to_owned(),
+        name,
         revision,
         tries,
         description,

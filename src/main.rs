@@ -25,13 +25,14 @@ use cps::{
     export_rebuild_inputs, fetch_build_sources, fetch_plan_with_archives, fetch_sources,
     fetch_sources_with_local, fetch_toolchain, generate_manifest_for_architecture, import_sources,
     list_boot_environments, list_config_updates, list_freezes, list_obsoletions, list_publishers,
-    list_withdrawals, pinned_publisher, plan_with_options, prefer_publisher,
-    prepare_git_snapshot_ref, publish_witnessed_bundle_with_sources, read_attestation,
-    read_worker_config, release, remove_publisher, repair_pending_transaction,
-    repository_publisher, resume_transaction, rollback_btrfs_boot_environment,
-    set_publisher_build_trust, set_publisher_repositories, stage_btrfs_boot_environment,
-    suggest_dependencies, transaction_details, transaction_history, transaction_status, verify,
-    verify_pristine, verify_rebuild, withdraw_package,
+    list_withdrawals, mount_boot_environment, pinned_publisher, plan_with_options,
+    prefer_publisher, prepare_git_snapshot_ref, publish_witnessed_bundle_with_sources,
+    read_attestation, read_worker_config, release, remove_publisher, rename_boot_environment,
+    repair_pending_transaction, repository_publisher, resume_transaction,
+    rollback_btrfs_boot_environment, set_publisher_build_trust, set_publisher_repositories,
+    stage_btrfs_boot_environment, suggest_dependencies, transaction_details, transaction_history,
+    transaction_status, unmount_boot_environment, verify, verify_pristine, verify_rebuild,
+    withdraw_package,
 };
 use serde::Serialize;
 
@@ -793,11 +794,53 @@ enum BootCommand {
         #[arg(long)]
         esp: Option<PathBuf>,
     },
-    /// Select a known-good environment for the next boot
+    /// Snapshot the running system as a named environment without selecting it
+    Create {
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+        /// Name for the new known-good environment
+        name: String,
+    },
+    /// Name or rename a known-good environment without changing its boot ID
+    Rename {
+        /// Distribution configuration that names the ESP
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+        /// Mount point of the EFI System Partition (default: from --config)
+        #[arg(long)]
+        esp: Option<PathBuf>,
+        /// Environment name or ID
+        environment: String,
+        /// New name for the environment
+        name: String,
+    },
+    /// Mount a registered environment read-only for inspection
+    Mount {
+        #[command(flatten)]
+        location: BootLocation,
+        /// Environment name or ID
+        environment: String,
+        /// Existing empty directory owned by root
+        path: PathBuf,
+    },
+    /// Unmount an environment's inspection mount
+    Unmount {
+        /// Distribution configuration that names the ESP
+        #[arg(long, default_value = system::CONFIG)]
+        config: PathBuf,
+        /// Mount point of the EFI System Partition (default: from --config)
+        #[arg(long)]
+        esp: Option<PathBuf>,
+        /// Environment name or ID
+        environment: String,
+        /// Path where the environment was mounted
+        path: PathBuf,
+    },
+    /// Activate the recorded fallback of the configured default for the next boot
     Rollback {
         #[command(flatten)]
         location: BootLocation,
-        /// Compare the configured default with the rollback root without changing boot selection
+        /// Compare the configured default with the fallback without changing boot selection
         #[arg(short = 'n', long)]
         dry_run: bool,
         /// Include managed file actions and ownership in the preview. Requires --dry-run.
@@ -806,8 +849,6 @@ enum BootCommand {
         /// Print the preview as JSON. Requires --dry-run.
         #[arg(long, requires = "dry_run")]
         json: bool,
-        /// Environment ID. Defaults to the previous known-good environment.
-        id: Option<String>,
     },
     /// Stage a saved plan in a writable Btrfs snapshot of a read-only baseline
     Stage {
@@ -821,33 +862,44 @@ enum BootCommand {
         exclude_subvolume: Vec<String>,
         plan: PathBuf,
     },
-    /// Publish a boot entry for a root on a mounted Btrfs volume
+    /// Select a known-good environment for the next boot, or publish a boot entry for a root
     Activate {
-        #[arg(long)]
-        root: PathBuf,
-        #[arg(long)]
-        btrfs_volume: PathBuf,
-        #[arg(long)]
-        esp: PathBuf,
+        #[command(flatten)]
+        location: BootLocation,
+        /// Known-good environment name or ID to select
+        #[arg(required_unless_present = "root")]
+        environment: Option<String>,
+        /// Compare the configured default with the environment without changing boot selection
+        #[arg(short = 'n', long, conflicts_with = "root")]
+        dry_run: bool,
+        /// Include managed file actions and ownership in the preview. Requires --dry-run.
+        #[arg(long, requires = "dry_run")]
+        paths: bool,
+        /// Print the preview as JSON. Requires --dry-run.
+        #[arg(long, requires = "dry_run")]
+        json: bool,
+        /// Publish a boot entry for this Btrfs root instead of selecting an existing entry
+        #[arg(long, conflicts_with = "environment", requires_all = ["btrfs_volume", "esp"])]
+        root: Option<PathBuf>,
         /// Use a direct GPT root partition instead of the mounted Btrfs filesystem UUID
-        #[arg(long)]
+        #[arg(long, requires = "root")]
         root_partuuid: Option<String>,
-        #[arg(long, default_value = "boot/vmlinuz")]
+        #[arg(long, requires = "root", default_value = "boot/vmlinuz")]
         kernel: String,
-        #[arg(long)]
+        #[arg(long, requires = "root")]
         initrd: Option<String>,
         /// Build a snapshot-specific UKI and sign it with the host's sbctl key
-        #[arg(long)]
+        #[arg(long, requires = "root")]
         uki: bool,
         /// Sign a UKI and boot it directly from UEFI, with a one-shot trial
-        #[arg(long)]
+        #[arg(long, requires = "root")]
         uefi: bool,
-        #[arg(long, default_value = "")]
+        #[arg(long, requires = "root", default_value = "")]
         options: String,
         /// Trial attempts (default 2, or 1 with --uefi)
-        #[arg(long)]
+        #[arg(long, requires = "root")]
         tries: Option<u32>,
-        #[arg(long)]
+        #[arg(long, requires = "root")]
         known_good: bool,
     },
     /// Capture a running CPS Btrfs root as a directory with a read-only root/
@@ -868,14 +920,14 @@ enum BootCommand {
         /// Run every check without changing anything
         #[arg(short = 'n', long)]
         dry_run: bool,
-        /// Environment ID to retire, as shown by boot list
+        /// Environment name or ID to retire, as shown by boot list
         id: String,
     },
     /// Remove old environments and failed trials under the boot-btrfs retention policy
     Prune {
         #[arg(long, default_value = system::CONFIG)]
         config: PathBuf,
-        /// Known-good environments to keep, overriding keep-environments
+        /// Unnamed known-good environments to keep, overriding keep-environments
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=99))]
         keep: Option<u64>,
         /// Check and list the removals without changing anything
@@ -3632,6 +3684,30 @@ fn run_image(command: ImageCommand) -> Result<()> {
     Ok(())
 }
 
+/// Select a known-good environment, or the recorded fallback, for the next boot.
+fn select_boot_environment(
+    location: BootLocation,
+    environment: Option<&str>,
+    dry_run: bool,
+    paths: bool,
+    json: bool,
+) -> Result<()> {
+    let (esp, volume) = location.resolve()?;
+    if dry_run {
+        let (target, diff) = cps::preview_btrfs_rollback(&esp, &volume, environment, paths)?;
+        if json {
+            print_json(&serde_json::json!({"target": target, "diff": diff}))?;
+        } else {
+            println!("Would select {target} for the next boot");
+            print_image_diff(&diff, false)?;
+        }
+    } else {
+        let id = rollback_btrfs_boot_environment(&esp, &volume, environment)?;
+        println!("Selected {id} for the next boot");
+    }
+    Ok(())
+}
+
 fn run_boot(command: BootCommand) -> Result<ExitCode> {
     match command {
         BootCommand::List { config, esp } => {
@@ -3649,7 +3725,7 @@ fn run_boot(command: BootCommand) -> Result<ExitCode> {
                 } else {
                     "ROOT PARTUUID"
                 };
-                println!("DEFAULT\tSTATUS\tID\t{header}\tTITLE");
+                println!("DEFAULT\tSTATUS\tID\t{header}\tTITLE\tNAME");
                 for environment in environments {
                     let marker = if environment.is_default { "*" } else { "-" };
                     let status = if environment.is_retiring {
@@ -3669,11 +3745,52 @@ fn run_boot(command: BootCommand) -> Result<ExitCode> {
                         None => environment.root_partuuid,
                     };
                     println!(
-                        "{marker}\t{status}\t{}\t{root}\t{}",
-                        environment.id, environment.title
+                        "{marker}\t{status}\t{}\t{root}\t{}\t{}",
+                        environment.id,
+                        environment.title,
+                        environment.name.as_deref().unwrap_or("-")
                     );
                 }
             }
+        }
+        BootCommand::Create { config, name } => {
+            let id = System::load(&config)?.create_boot_environment(&name)?;
+            println!("Created {name} ({id})");
+        }
+        BootCommand::Rename {
+            config,
+            esp,
+            environment,
+            name,
+        } => {
+            let esp = match esp {
+                Some(esp) => esp,
+                None => System::load(&config)?.boot_paths().0.to_owned(),
+            };
+            let id = rename_boot_environment(&esp, &environment, &name)?;
+            println!("Named {id} {name}");
+        }
+        BootCommand::Mount {
+            location,
+            environment,
+            path,
+        } => {
+            let (esp, volume) = location.resolve()?;
+            mount_boot_environment(&esp, &volume, &environment, &path)?;
+            println!("Mounted {environment} read-only at {}", path.display());
+        }
+        BootCommand::Unmount {
+            config,
+            esp,
+            environment,
+            path,
+        } => {
+            let esp = match esp {
+                Some(esp) => esp,
+                None => System::load(&config)?.boot_paths().0.to_owned(),
+            };
+            unmount_boot_environment(&esp, &environment, &path)?;
+            println!("Unmounted {}", path.display());
         }
         BootCommand::Destroy {
             location,
@@ -3696,27 +3813,19 @@ fn run_boot(command: BootCommand) -> Result<ExitCode> {
             dry_run,
             paths,
             json,
-            id,
-        } => {
-            let (esp, volume) = location.resolve()?;
-            if dry_run {
-                let (target, diff) =
-                    cps::preview_btrfs_rollback(&esp, &volume, id.as_deref(), paths)?;
-                if json {
-                    print_json(&serde_json::json!({"target": target, "diff": diff}))?;
-                } else {
-                    println!("Would select {target} for the next boot");
-                    print_image_diff(&diff, false)?;
-                }
-                return Ok(ExitCode::SUCCESS);
-            }
-            let id = rollback_btrfs_boot_environment(&esp, &volume, id.as_deref())?;
-            println!("Selected {id} for the next boot");
-        }
+        } => select_boot_environment(location, None, dry_run, paths, json)?,
         BootCommand::Activate {
+            location,
+            environment: Some(environment),
+            dry_run,
+            paths,
+            json,
+            ..
+        } => select_boot_environment(location, Some(&environment), dry_run, paths, json)?,
+        BootCommand::Activate {
+            location,
+            environment: None,
             root,
-            btrfs_volume,
-            esp,
             root_partuuid,
             kernel,
             initrd,
@@ -3725,7 +3834,10 @@ fn run_boot(command: BootCommand) -> Result<ExitCode> {
             options,
             tries,
             known_good,
+            ..
         } => {
+            let (esp, btrfs_volume) = location.resolve()?;
+            let root = root.context("specify an environment or --root")?;
             let activation = Activation {
                 root_partuuid,
                 kernel,
@@ -4559,6 +4671,70 @@ mod tests {
     #[test]
     fn command_line_is_consistent() {
         with_stack(|| super::cli().debug_assert());
+    }
+
+    #[test]
+    fn boot_activation_accepts_an_environment_or_explicit_root() {
+        with_stack(|| {
+            for args in [
+                vec!["boot", "activate", "before-update"],
+                vec!["boot", "activate", "-n", "--json", "before-update"],
+                vec!["boot", "rollback", "-n", "--paths"],
+                vec![
+                    "boot",
+                    "activate",
+                    "before-update",
+                    "--esp",
+                    "/efi",
+                    "--btrfs-volume",
+                    "/volume",
+                ],
+                vec![
+                    "boot",
+                    "activate",
+                    "--root",
+                    "/volume/@",
+                    "--esp",
+                    "/efi",
+                    "--btrfs-volume",
+                    "/volume",
+                    "--known-good",
+                ],
+            ] {
+                assert!(parse(&args).is_ok(), "{args:?}: {:?}", parse(&args));
+            }
+            for args in [
+                vec!["boot", "activate"],
+                vec!["boot", "activate", "--root", "/volume/@"],
+                vec!["boot", "activate", "before-update", "--known-good"],
+                vec!["boot", "activate", "--paths", "before-update"],
+                vec!["boot", "rollback", "before-update"],
+                vec![
+                    "boot",
+                    "activate",
+                    "--dry-run",
+                    "--root",
+                    "/volume/@",
+                    "--esp",
+                    "/efi",
+                    "--btrfs-volume",
+                    "/volume",
+                ],
+                vec![
+                    "boot",
+                    "activate",
+                    "before-update",
+                    "--root",
+                    "/volume/@",
+                    "--esp",
+                    "/efi",
+                    "--btrfs-volume",
+                    "/volume",
+                ],
+            ] {
+                assert!(parse(&args).is_err(), "{args:?}");
+            }
+        });
     }
 
     #[test]

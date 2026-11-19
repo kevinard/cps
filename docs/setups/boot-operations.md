@@ -10,6 +10,7 @@ terms are defined in [Boot environments](../concepts.md#boot-environments).
 ## On this page
 
 - [List environments](#list-environments)
+- [Manage named environments](#manage-named-environments)
 - [Trials and blessing](#trials-and-blessing)
 - [Roll back](#roll-back)
 - [Clean up environments](#clean-up-environments)
@@ -22,10 +23,9 @@ terms are defined in [Boot environments](../concepts.md#boot-environments).
 cps boot list
 ```
 
-`boot list`, `boot rollback`, and `boot destroy` read the ESP and the Btrfs
-volume from the `boot-btrfs` node in `/etc/cps/image.kdl`. Pass `--config`
-for another configuration, or `--esp` and `--btrfs-volume` to name them
-directly.
+Boot management commands use the `boot-btrfs` node in `/etc/cps/image.kdl`
+by default. Pass `--config` for another configuration. Commands that work
+offline also accept `--esp` and, where needed, `--btrfs-volume`.
 
 Each line shows one environment, newest first.
 
@@ -36,10 +36,54 @@ Each line shows one environment, newest first.
 | `ID` | `cps-IMAGE-REVISION`, from the root's image identity and revision. |
 | `ROOT` | The PARTUUID of the root's Btrfs partition. When any entry selects its root by Btrfs filesystem UUID, the column shows `UUID=` or `PARTUUID=` before each identifier. |
 | `TITLE` | The entry title, which includes the Linux release for manifest-managed kernels. A [backup](btrfs.md#backups-before-live-changes) of a running Btrfs root is titled `Canopa backup`. |
+| `NAME` | The user-assigned name, or `-` for an unnamed environment. |
 
 CPS entries declare their metadata format with `# cps-boot-entry-version 1`
 and record SHA-256 digests of their boot files. CPS checks those files before
 it uses an entry as a fallback or rollback target.
+
+## Manage named environments
+
+```sh
+sudo cps boot create before-upgrade
+sudo cps boot rename before-upgrade baseline
+sudo mkdir /mnt/baseline
+sudo cps boot mount baseline /mnt/baseline
+sudo cps boot unmount baseline /mnt/baseline
+sudo cps boot activate baseline
+```
+
+`create` snapshots the running, registered known-good root and publishes it
+without changing which environment boots next. It requires that the running
+root is already selected for the next boot and no trial is pending. The name
+must be 1–48 lowercase ASCII letters, digits, hyphens, or underscores, start
+with a letter or digit, and not start with `cps-`. Like a
+[backup](btrfs.md#backups-before-live-changes), `create` prunes first with
+`auto-prune` to make room on the ESP, and keeps the snapshot read-only until
+it is registered. A retry after an interruption reuses the snapshot only while
+the running root is at the same revision. `rename` can also assign a
+first name to a known-good environment by ID. It changes neither the boot ID
+nor the directory or loader selection. You can continue to use the ID in
+place of the name.
+
+`mount` exposes a read-only view of the registered root, without mounting
+shared filesystems such as `/var`. The target must be an existing empty
+directory; it and its parent must be owned and writable only by root.
+`unmount` takes the same environment and directory and refuses a busy or
+nonmatching mount. It matches the mount against the entry's Btrfs subvolume
+only, so it works even when the root fails the checks that `mount` runs.
+Both commands need Linux 5.12 or newer.
+
+`activate NAME` verifies and selects an existing known-good environment for
+the next boot; it does not reboot the system. `activate --dry-run NAME`
+previews the change, as described in [Roll back](#roll-back). To publish a
+root prepared by `boot stage`, continue to use `activate --root` with the
+explicit boot paths.
+
+Named environments are retained outside the pruning count. To remove one,
+use `sudo cps boot destroy --dry-run NAME` first, then `sudo cps boot destroy
+NAME` when the environment is no longer selected, running, mounted or needed
+as a fallback.
 
 ## Trials and blessing
 
@@ -76,14 +120,16 @@ staging into the trial.
 
 ## Roll back
 
-`rollback` selects the fallback of the environment currently selected for the
-next boot, or of the running direct UEFI trial. Pass a known-good environment
-ID to select a specific root, or when the selection has no recorded fallback.
+`activate` selects a known-good environment, by name or ID, for the next
+boot. `rollback` is a shortcut that activates the fallback of the environment
+currently selected for the next boot, or of the running direct UEFI trial.
+When the selection has no recorded fallback, activate an environment by name
+or ID instead.
 
 ```sh
 cps boot rollback
 # A specific known-good environment.
-cps boot rollback "$environment_id"
+cps boot activate "$environment"
 ```
 
 Before changing the selection, CPS checks the target's boot files against
@@ -93,11 +139,11 @@ identity and revision. For an entry that boots by PARTUUID, CPS reads the
 parent GPT disk of the mounted ESP and checks that the Btrfs device is that
 partition, so it needs read access to the disk.
 
-For a Btrfs [backup](btrfs.md#backups-before-live-changes), rollback first
+For a Btrfs [backup](btrfs.md#backups-before-live-changes), activation first
 clears the read-only flag if an interrupted backup left it set. It then writes the target as
 `default` in `loader.conf` and removes any `preferred` trial selection. With direct UEFI boot, it instead cancels a
 pending `BootNext`, marks that trial as exhausted, and moves the target to the
-front of `BootOrder`. Rollback keeps every environment and its files.
+front of `BootOrder`. Activation keeps every environment and its files.
 
 ## Clean up environments
 
@@ -118,14 +164,16 @@ created independently.
 cps image diff base staged
 cps image diff base staged --paths --json
 cps boot rollback --dry-run
+cps boot activate --dry-run "$environment"
 ```
 
 The diff reports changes to package identity, manifest digest, local
 requests, and signed profile roles. `--paths` adds changes to managed file
 actions and owners. It reads committed metadata, so use `cps verify` to check
-the files on disk. The Btrfs rollback preview compares the environment
-selected for the next boot with the rollback target and leaves the selection
-unchanged. It accepts an environment ID, `--paths`, and `--json` as well.
+the files on disk. The Btrfs preview compares the environment
+selected for the next boot with the target and leaves the selection
+unchanged. Both `rollback` and `activate` accept `--paths` and `--json` with
+`--dry-run`.
 
 ## The loader configuration
 
@@ -150,7 +198,7 @@ you set one of these:
 
 - A `default` that is neither `cps-*.conf` nor a CPS entry ID followed by
   `.conf`. Restore the CPS value, or delete the line and select a known-good
-  environment with `cps boot rollback ID`.
+  environment with `cps boot activate ID`.
 - A `preferred` that is not a CPS entry, a `preferred` with
   `default cps-*.conf`, or a `preferred` without a `default`. Delete the line
   to cancel the trial selection.

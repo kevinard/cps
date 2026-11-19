@@ -212,7 +212,7 @@ change breaks the system, select the backup and reboot:
 
 ```sh
 sudo cps boot list
-sudo cps boot rollback "$backup_id"
+sudo cps boot activate "$backup_id"
 ```
 
 Backups count toward the
