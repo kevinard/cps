@@ -754,12 +754,12 @@ pub(crate) fn describe(path: &Path) -> Result<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::repo::keys::SigningKey;
-    use ring::signature::Ed25519KeyPair;
+    use aws_lc_rs::signature::Ed25519KeyPair;
 
     /// Keys reloadable from their PKCS#8 documents, with public key files.
     pub(crate) struct Keys {
         dir: tempfile::TempDir,
-        documents: Vec<ring::pkcs8::Document>,
+        documents: Vec<aws_lc_rs::pkcs8::Document>,
     }
 
     impl Keys {
@@ -768,7 +768,7 @@ pub(crate) mod tests {
             let mut documents = Vec::new();
             for index in 0..count {
                 let document =
-                    Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+                    Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
                 fs::write(dir.path().join(format!("{index}.der")), document.as_ref())?;
                 let key: SigningKey = Ed25519KeyPair::from_pkcs8(document.as_ref())
                     .unwrap()

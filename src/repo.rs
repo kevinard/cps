@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use ring::signature::Ed25519KeyPair;
+use aws_lc_rs::signature::Ed25519KeyPair;
 use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -1604,11 +1604,45 @@ fn parse_public_key(bytes: &[u8]) -> Result<&[u8]> {
     Ok(key)
 }
 
+/// The PKCS#8 v1 prefix of an Ed25519 private key, as OpenSSL writes it; the
+/// 32-byte seed follows.
+const PKCS8_V1: &[u8] = b"\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20";
+/// The PKCS#8 v2 prefix of an Ed25519 private key, as RFC 8410 and earlier CPS
+/// builds write it; the seed follows, then [`PKCS8_V2_PUBLIC`] and the 32-byte
+/// public key.
+const PKCS8_V2: &[u8] = b"\x30\x51\x02\x01\x01\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20";
+const PKCS8_V2_PUBLIC: &[u8] = b"\x81\x21\x00";
+
+/// Read an Ed25519 private key in DER PKCS#8: version 1 as OpenSSL writes it,
+/// or version 2 with a public key that must match the seed. CPS parses these
+/// exact layouts itself, so which keys load does not depend on the crypto
+/// library.
 pub(crate) fn read_signing_key(path: &Path) -> Result<Ed25519KeyPair> {
     let bytes = read_limited(File::open(path)?, 1024)
         .with_context(|| format!("reading signing key {}", path.display()))?;
-    Ed25519KeyPair::from_pkcs8_maybe_unchecked(&bytes)
-        .map_err(|e| anyhow::anyhow!("invalid Ed25519 PKCS#8 signing key: {e}"))
+    parse_signing_key(&bytes).with_context(|| format!("reading signing key {}", path.display()))
+}
+
+pub(crate) fn parse_signing_key(bytes: &[u8]) -> Result<Ed25519KeyPair> {
+    let invalid = || anyhow::anyhow!("expected an Ed25519 PKCS#8 private key in DER");
+    if let Some(seed) = bytes.strip_prefix(PKCS8_V1) {
+        ensure!(seed.len() == 32, invalid());
+        return Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| invalid());
+    }
+    let rest = bytes.strip_prefix(PKCS8_V2).ok_or_else(invalid)?;
+    let (seed, rest) = rest.split_at_checked(32).ok_or_else(invalid)?;
+    let public = rest.strip_prefix(PKCS8_V2_PUBLIC).ok_or_else(invalid)?;
+    ensure!(public.len() == 32, invalid());
+    Ed25519KeyPair::from_seed_and_public_key(seed, public)
+        .map_err(|_| anyhow::anyhow!("the Ed25519 public key does not match the seed"))
+}
+
+/// A new Ed25519 private key in DER PKCS#8 version 1, the form OpenSSL writes.
+pub(crate) fn generate_signing_key() -> Result<Vec<u8>> {
+    let mut seed = [0; 32];
+    aws_lc_rs::rand::SecureRandom::fill(&aws_lc_rs::rand::SystemRandom::new(), &mut seed)
+        .map_err(|_| anyhow::anyhow!("generating an Ed25519 key"))?;
+    Ok([PKCS8_V1, &seed].concat())
 }
 
 fn read_current(repo: &Path) -> Result<String> {
@@ -3724,7 +3758,7 @@ mod tests {
         fs::create_dir_all(repo)?;
         fs::write(
             &key,
-            Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap(),
+            Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap(),
         )?;
         let path = init_trust(repo, publisher, &key, None)?;
         Ok((Publication::open(repo, &key)?, read_trust_root(&path)?))
@@ -3847,7 +3881,7 @@ mod tests {
         let key = work.path().join("key.der");
         fs::write(
             &key,
-            Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap(),
+            Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap(),
         )?;
         // Repository setup syncs to disk and can be slow under load. Retry
         // with a longer lifetime if the trust root expired during setup.

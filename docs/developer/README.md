@@ -128,7 +128,14 @@ Before the tests it runs the lints, which must pass without warnings:
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps
+python3 ci/check-dependencies.py
 ```
+
+[`check-dependencies.py`](../../ci/check-dependencies.py) keeps one crypto
+implementation, aws-lc-rs, in the build: it fails when `ring` enters the
+dependency graph, or when a crate resolves to a second version not listed
+in [`duplicate-crates.txt`](../../ci/duplicate-crates.txt). Review a new
+duplicate, then run it with `--update` to accept it.
 
 Pass a name filter to run part of the suite, for example
 `cargo test --locked tests::transitions` or `cargo test --locked shards`.

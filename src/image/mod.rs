@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use ring::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 use rustix::{
     fs::{FlockOperation, RenameFlags, flock, renameat_with},

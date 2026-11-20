@@ -1,8 +1,8 @@
 use std::{fs, num::NonZeroU64, path::Path};
 
 use anyhow::{Context, Result};
+use aws_lc_rs::{rand::SystemRandom, signature::Ed25519KeyPair};
 use jiff::Timestamp;
-use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
 use tough::{
     editor::{RepositoryEditor, signed::PathExists},
     key_source::{KeySource, LocalKeySource},

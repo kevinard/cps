@@ -54,6 +54,7 @@ jobs:
             cargo fmt --check
             cargo clippy --frozen --all-targets -- -D warnings
             cargo doc --frozen --no-deps
+            python3 ci/check-dependencies.py
           '
       - name: Build and test
         run: |

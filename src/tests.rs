@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Result;
-use ring::{
+use aws_lc_rs::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
 };

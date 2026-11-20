@@ -756,7 +756,7 @@ fn subjects(input: Vec<Subject>) -> Result<BTreeMap<String, FileDigest>> {
 mod tests {
     use super::*;
     use crate::kdl_format::parse_manifest;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
     fn attestation_envelopes_have_one_spelling() -> Result<()> {
@@ -818,7 +818,7 @@ build architecture="x86_64" epoch=1700000000 {{
         let manifest_bytes = b"schema-version 1 kind=\"package-manifest\"\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
         let recipe = parse(&recipe_bytes)?;
         let manifest = parse_manifest(std::str::from_utf8(manifest_bytes)?)?;
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
         let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let proto = tempfile::tempdir()?;
         let bytes = sign(

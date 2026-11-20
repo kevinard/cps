@@ -458,11 +458,11 @@ pub(crate) fn refresh_metadata(request: RefreshMetadata<'_>) -> Result<()> {
                     "the snapshot expired at {}; re-sign it with snapshot keys",
                     snapshot.signed.expires
                 );
-                let hash = ring::digest::digest(&ring::digest::SHA256, &bytes);
+                let hash = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
                 (
                     Metafile {
                         hashes: Some(Hashes {
-                            sha256: Decoded::from(hash.as_ref().to_vec()),
+                            sha256: Decoded::from(hash.to_vec()),
                             _extra: HashMap::new(),
                         }),
                         length: Some(bytes.len() as u64),
@@ -508,9 +508,10 @@ mod tests {
     }
 
     fn generate(path: &Path) -> Result<Key> {
-        let document =
-            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-                .expect("generate TUF key");
+        let document = aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(
+            &aws_lc_rs::rand::SystemRandom::new(),
+        )
+        .expect("generate TUF key");
         fs::write(path, document.as_ref())?;
         Ok(parse_keypair(document.as_ref())?.tuf_key())
     }
@@ -553,7 +554,7 @@ mod tests {
         };
         let canonical = root.canonical_form()?;
         let root_key = fs::read(&keys["root"][0])?;
-        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&root_key).expect("root key");
+        let pair = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(&root_key).expect("root key");
         let signed = Signed {
             signatures: vec![Signature {
                 keyid: parse_keypair(&root_key)?.tuf_key().key_id()?,

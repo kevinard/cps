@@ -351,12 +351,14 @@ mod tests {
         let root_key = key();
         let documents: Vec<_> = (0..3)
             .map(|_| {
-                ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-                    .unwrap()
+                aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(
+                    &aws_lc_rs::rand::SystemRandom::new(),
+                )
+                .unwrap()
             })
             .collect();
         let load = |index: usize| -> crate::repo::keys::SigningKey {
-            ring::signature::Ed25519KeyPair::from_pkcs8(documents[index].as_ref())
+            aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(documents[index].as_ref())
                 .unwrap()
                 .into()
         };

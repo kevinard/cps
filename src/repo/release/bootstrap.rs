@@ -137,9 +137,11 @@ mod tests {
         let key = publisher.join("key.der");
         fs::write(
             &key,
-            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-                .unwrap()
-                .as_ref(),
+            aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(
+                &aws_lc_rs::rand::SystemRandom::new(),
+            )
+            .unwrap()
+            .as_ref(),
         )?;
         let trust_path = crate::repo::init_trust(&publisher, "extras", &key, None)?;
         let key = fs::read(trust_path)?;

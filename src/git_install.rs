@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
+
 use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -592,10 +592,9 @@ impl GitStore {
         if !path.try_exists()? {
             let stage = TempDir::new_in(parent)?;
             fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700))?;
-            let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-                .map_err(|_| anyhow::anyhow!("generating Git publisher signing key"))?;
+            let key = crate::repo::generate_signing_key()?;
             let private = stage.path().join("private.der");
-            fs::write(&private, key.as_ref())?;
+            fs::write(&private, key)?;
             fs::set_permissions(&private, fs::Permissions::from_mode(0o600))?;
             read_signing_key(&private)?;
             fs::create_dir(stage.path().join("repo"))?;

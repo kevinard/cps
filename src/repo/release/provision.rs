@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
+use aws_lc_rs::signature::Ed25519KeyPair;
 use tough::{
     schema::{Role, RoleKeys, RoleType, Root, Signature, Signed},
     sign::{Sign, parse_keypair},
@@ -104,15 +104,14 @@ pub(crate) fn init_publisher(output: &Path, publisher: &str) -> Result<()> {
 }
 
 fn generate(path: &Path) -> Result<Vec<u8>> {
-    let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-        .map_err(|error| anyhow::anyhow!("generating Ed25519 key: {error}"))?;
+    let document = crate::repo::generate_signing_key()?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(document.as_ref())?;
+    file.write_all(&document)?;
     file.sync_all()?;
-    Ok(document.as_ref().to_vec())
+    Ok(document)
 }
