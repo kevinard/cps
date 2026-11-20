@@ -130,7 +130,11 @@ cc -pie -nostdlib -Wl,-e,_start -o app/usr/bin/app app.c foo1/usr/lib/libfoo.so.
 publish() {
     "$cps" manifest generate --proto "$1" --publisher canopa --version "$2" \
         --uid "$uid" --gid "$gid" "$3" > "$4.kdl"
-    if [[ -n ${5:-} ]]; then sed -i "/^package .* {\$/a\\    require \"$5\"" "$4.kdl"; fi
+    if [[ -n ${5:-} ]]; then
+        # Canonical manifests have no empty block, so give a childless package one.
+        sed -i -E 's/^(package .*[^{])$/\1 {\n}/' "$4.kdl"
+        sed -i "/^package .* {\$/a\\    require \"$5\"" "$4.kdl"
+    fi
     "$cps" publish manifests --repo repo --proto "$1" --key private.der "$4.kdl" > /dev/null
 }
 publish foo1 1.0.0-0 lib/foo foo1

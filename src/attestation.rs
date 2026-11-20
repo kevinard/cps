@@ -486,7 +486,9 @@ fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>
     let (_, signature) = signatures
         .iter()
         .find(|(signer, _)| *signer == id)
-        .context("the attestation has no signature by the builder key")?;
+        .with_context(|| {
+            format!("invalid builder attestation signature: none is by builder key {id}")
+        })?;
     verify_signatures(
         "builder attestation",
         &pae(&payload),

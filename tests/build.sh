@@ -794,7 +794,8 @@ protected_image changed-architecture changed-architecture-image
 expect_failure 'No candidates were found for demo/hello' \
     "$cps" install --root changed-architecture-image -n --save-plan rejected.json demo/hello
 protected_image repeated-signature repeated-signature-image
-expect_failure 'requires 2 trusted builder signatures, found 1' \
+# A bad signature in a trusted builder's slot rejects the evidence outright.
+expect_failure 'invalid build attestation signature by key' \
     "$cps" install --root repeated-signature-image -n --save-plan rejected.json demo/hello
 
 protected_image witnessed guarded
