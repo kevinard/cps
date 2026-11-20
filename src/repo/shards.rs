@@ -107,6 +107,12 @@ impl Root {
     pub(super) fn decode(payload: &[u8]) -> Result<Self> {
         let root: Self = serde_json::from_slice(payload).context("invalid catalog root")?;
         ensure!(root.format == ROOT_FORMAT, "unsupported catalog format");
+        // One signed byte string must mean one thing: duplicate keys, other
+        // spellings, and reordered maps are rejected, not reinterpreted.
+        ensure!(
+            serde_json::to_vec(&root)? == payload,
+            "catalog root payload is not canonical"
+        );
         ensure!(root.sequence > 0, "invalid publisher catalog sequence");
         ensure!(
             root.pruned_through < root.sequence,
@@ -238,6 +244,10 @@ pub(super) fn decode_shard(bytes: &[u8], hash: &str) -> Result<Arc<Shard>> {
     }
     let shard: Shard =
         serde_json::from_slice(bytes).with_context(|| format!("invalid catalog shard {hash}"))?;
+    ensure!(
+        serde_json::to_vec(&shard)? == bytes,
+        "catalog shard {hash} is not canonical"
+    );
     shard
         .validate()
         .with_context(|| format!("checking catalog shard {hash}"))?;

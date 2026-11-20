@@ -3980,6 +3980,11 @@ mod tests {
         assert_eq!(read(&current)?.sequence, 1);
         let bytes = read_object(repo.path(), "catalogs", &current, CATALOG_ROOT_LIMIT)?;
         let payload = shards::open(&bytes)?.payload;
+        // A signed payload in any other spelling is refused too, so a second
+        // parser cannot read a different root from the same signed bytes.
+        let spaced = [b"{ ".as_slice(), &payload[1..]].concat();
+        let error = shards::Root::decode(&spaced).unwrap_err();
+        assert!(format!("{error:#}").contains("not canonical"), "{error:#}");
         // Any other spelling of the same root is a different, unsigned object.
         let mut envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
         for respelled in [
