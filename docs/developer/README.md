@@ -15,11 +15,18 @@
 
 ## Build CPS
 
-Build on Linux with `/proc` and kernel support for `openat2`. Install a Rust
-toolchain that supports the crate's 2024 edition and locked dependencies, a
-C linker, pkg-config, and the SQLite and libseccomp development libraries.
+Build on Linux with `/proc` and kernel support for `openat2`. Install Rust
+1.99 or later, a C linker, pkg-config, and the SQLite and libseccomp
+development libraries. `Cargo.toml` declares 1.99 as `rust-version`, and
+[`rust-toolchain.toml`](../../rust-toolchain.toml) selects the exact
+toolchain CI uses, with Clippy and rustfmt, when you build through rustup.
 The [CI Dockerfile](../../ci/Dockerfile) and its [Rust archive hashes](../../ci/rust-dist.sha256)
 describe the pinned build environment used by the project.
+
+Release binaries do not come from a CI workflow. CPS builds and signs itself
+from [`packaging/cps-build.kdl.in`](../../packaging/cps-build.kdl.in), as
+described in [Build the CPS package fixture](build-fixtures.md#building-cps-itself),
+so a release carries the same signed provenance as every other package.
 
 Run these commands from the checkout root.
 
@@ -111,6 +118,14 @@ TMPDIR=$PWD/target/tmp cargo test --locked
 ```
 
 Create `target/tmp` first. CI runs `cargo test --frozen --all-targets`.
+Before the tests it runs the lints, which must pass without warnings:
+
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps
+```
+
 Pass a name filter to run part of the suite, for example
 `cargo test --locked tests::transitions` or `cargo test --locked shards`.
 The unit tests need no privileges. Some use host tools:
@@ -169,15 +184,19 @@ CI sets both CPS variables to the same binary and runs this set:
 ```sh
 export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
 export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
-for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
-    package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
+for test in package-identity manifest-dependencies elf-transactions elf-profile systemd-actions \
+    hwdb-trigger triggers mediators package-freezes git-snapshots sources build build-outputs \
+    release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
     recipe-orchestration; do
   bash "tests/$test.sh"
 done
 bash tests/transaction-progress.sh
 ```
 
-Every scenario uses OpenSSL to create disposable keys.
+Every scenario uses OpenSSL to create disposable keys. Only
+`systemd-build-worker.sh`, which needs a systemd user session, is left for
+manual runs. [`ci/run.sh`](../../ci/run.sh) runs a command in the CI image
+as your own user, the way the workflow does.
 
 | Scenario | Covers | Also needs |
 | --- | --- | --- |

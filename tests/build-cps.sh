@@ -323,6 +323,9 @@ else
 fi
 "$cps" apply --root image install.json
 cmp bundle/proto/usr/bin/cps image/usr/bin/cps
+for page in "$source_tree"/docs/reference/man/*.1; do
+    cmp "$page" "image/usr/share/man/man1/${page##*/}"
+done
 if [[ -n $trust_version ]]; then
     cmp "$trust_root" image/etc/cps/tuf-root.json
     test "$(stat -c %a image/etc/cps/tuf-root.json)" = 644

@@ -222,6 +222,11 @@ inheritance, offline recovery, repair, clone isolation, and privilege
 removal as root in the guest. It needs a C compiler with static libc,
 `strip`, `mkfs.btrfs`, and the common QEMU, kernel, and BusyBox settings.
 
+The CI boot job runs it with the pinned VM kernel, next to the systemd-boot
+and Btrfs capture scenarios, on every change and nightly.
+`boot-profile-btrfs-vm.sh` stays a manual run because it needs the full
+chain of signed fixtures.
+
 ## Rebuild the VM fixtures after packaging changes
 
 The signed fixtures pin their manifests by digest, so a change under

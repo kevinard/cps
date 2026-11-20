@@ -37,7 +37,7 @@ jobs:
     if: github.event_name != 'schedule'
     needs: dependency-audit
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -46,49 +46,38 @@ jobs:
         run: docker build --target transactions -t cps-ci ci
       - name: Allow unprivileged Bubblewrap sandboxes for trigger handlers
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Fetch dependencies
+        run: ci/run.sh -- cargo fetch --locked
+      - name: Lint
+        run: |
+          ci/run.sh --network none --env RUSTDOCFLAGS='-D warnings' -- bash -euc '
+            cargo fmt --check
+            cargo clippy --frozen --all-targets -- -D warnings
+            cargo doc --frozen --no-deps
+          '
       - name: Build and test
         run: |
-          mkdir -p "$RUNNER_TEMP/cps-cargo" "$RUNNER_TEMP/cps-tmp"
-          # The runner's UID needs an account in the container: ssh-keygen
-          # refuses to run without one.
-          docker run --rm cps-ci cat /etc/passwd > "$RUNNER_TEMP/cps-passwd"
-          docker run --rm cps-ci cat /etc/group > "$RUNNER_TEMP/cps-group"
-          printf 'runner:x:%s:%s::/tmp:/usr/bin/bash\n' "$(id -u)" "$(id -g)" >> "$RUNNER_TEMP/cps-passwd"
-          printf 'runner:x:%s:\n' "$(id -g)" >> "$RUNNER_TEMP/cps-group"
-          run_ci() {
-            # Tests keep their images on the runner's disk: overlayfs, the
-            # container's own /tmp, cannot hold a trigger handler's overlay.
-            docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
-              --env TMPDIR="$RUNNER_TEMP/cps-tmp" \
-              --volume "$RUNNER_TEMP/cps-passwd:/etc/passwd:ro" \
-              --volume "$RUNNER_TEMP/cps-group:/etc/group:ro" \
+          ci/run.sh --network none \
               --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-              --security-opt systempaths=unconfined \
-              --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
-              --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$PWD" "$@"
-          }
-          run_ci cps-ci bash -euc '
-            cargo fetch --locked
+              --security-opt systempaths=unconfined -- bash -euc '
+            cargo test --frozen --all-targets
+            cargo build --frozen --bin cps --example tuf-fixture
+            python3 docs/reference/generate-man.py --cps target/debug/cps --check
+            export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
+            export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
+            for test in package-identity manifest-dependencies elf-transactions elf-profile systemd-actions \
+                hwdb-trigger triggers mediators package-freezes git-snapshots sources build build-outputs \
+                release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
+                recipe-orchestration; do
+              bash "tests/$test.sh"
+            done
+            bash tests/transaction-progress.sh
           '
-          run_ci --network none cps-ci bash -euc '
-              cargo test --frozen --all-targets
-              cargo build --frozen --bin cps --example tuf-fixture
-              python3 docs/reference/generate-man.py --cps target/debug/cps --check
-              export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
-              export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
-              for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
-                  package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
-                  recipe-orchestration build-outputs; do
-                bash "tests/$test.sh"
-              done
-              bash tests/transaction-progress.sh
-            '
 
   boot:
-    if: github.event_name != 'schedule'
     needs: dependency-audit
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -97,24 +86,7 @@ jobs:
         run: docker build --target boot -t cps-ci ci
       - name: Build the pinned kernel and exercise boot recovery
         run: |
-          mkdir -p "$RUNNER_TEMP/cps-cargo" "$RUNNER_TEMP/cps-tmp"
-          # The runner's UID needs an account in the container: ssh-keygen
-          # refuses to run without one.
-          docker run --rm cps-ci cat /etc/passwd > "$RUNNER_TEMP/cps-passwd"
-          docker run --rm cps-ci cat /etc/group > "$RUNNER_TEMP/cps-group"
-          printf 'runner:x:%s:%s::/tmp:/usr/bin/bash\n' "$(id -u)" "$(id -g)" >> "$RUNNER_TEMP/cps-passwd"
-          printf 'runner:x:%s:\n' "$(id -g)" >> "$RUNNER_TEMP/cps-group"
-          run_ci() {
-            # Tests keep their images on the runner's disk: overlayfs, the
-            # container's own /tmp, cannot hold a trigger handler's overlay.
-            docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env RUNNER_TEMP \
-              --env TMPDIR="$RUNNER_TEMP/cps-tmp" \
-              --volume "$RUNNER_TEMP/cps-passwd:/etc/passwd:ro" \
-              --volume "$RUNNER_TEMP/cps-group:/etc/group:ro" \
-              --env CARGO_HOME="$RUNNER_TEMP/cps-cargo" --volume "$PWD:$PWD" \
-              --volume "$RUNNER_TEMP:$RUNNER_TEMP" --workdir "$PWD" "$@"
-          }
-          run_ci -i cps-ci bash -euo pipefail <<'DOWNLOAD'
+          ci/run.sh -i -- bash -euo pipefail <<'DOWNLOAD'
           cargo fetch --locked
           recipe=packaging/kernel-qemu/build.kdl.in
           read -r archive checksum url < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" url="(https:[^"]+)"$/\1 \2 \3/p' "$recipe")
@@ -122,7 +94,7 @@ jobs:
           curl --fail --location --proto '=https' --retry 3 --output "$archive" "$url"
           printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
           DOWNLOAD
-          run_ci --network none -i cps-ci bash -euo pipefail <<'VM'
+          ci/run.sh --network none -i -- bash -euo pipefail <<'VM'
           workspace=$PWD
           recipe=packaging/kernel-qemu/build.kdl.in
           read -r archive checksum < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" url="https:[^"]+"$/\1 \2/p' "$recipe")
@@ -146,6 +118,7 @@ jobs:
           export CPS_VM_FAT_BUILTIN=1 CPS_VM_TIMEOUT=600
           export CPS_BIN="$PWD/target/release/cps" CPS_VM_KERNEL="$RUNNER_TEMP/cps-vmlinuz"
           bash tests/systemd-boot-vm.sh health-fail
+          bash tests/file-modes-vm.sh
           CPS_VM_BTRFS_BOOT=1 CPS_VM_SYSTEM_COMMANDS=1 bash tests/boot-capture-vm.sh
           CPS_VM_BTRFS_BOOT=1 CPS_VM_BTRFS_HEALTH_FAIL=1 CPS_VM_BTRFS_DISCARD_FAILED=1 \
             bash tests/boot-capture-vm.sh

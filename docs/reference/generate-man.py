@@ -190,6 +190,23 @@ def manual(binary):
     }
 
 
+MANIFEST = Path(__file__).resolve().parents[2] / "packaging" / "cps.kdl"
+PAGE_LINE = re.compile(r'^    file "usr/share/man/man1/([^"/]+\.1)" .*\n', re.MULTILINE)
+
+
+def packaged(manifest, pages):
+    """Return the CPS package manifest with one doc.man file action per page."""
+    text = PAGE_LINE.sub("", manifest)
+    lines = "".join(
+        f'    file "usr/share/man/man1/{name}" mode="0644" uid=0 gid=0 facet="doc.man"\n'
+        for name in sorted(pages)
+    )
+    anchor = '    file "usr/share/licenses/cps/LICENSE"'
+    if anchor not in text:
+        raise SystemExit(f"{MANIFEST} has no LICENSE file action to place the man pages before")
+    return text.replace(anchor, lines + anchor, 1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cps", type=Path, required=True, help="CPS executable to query")
@@ -206,6 +223,9 @@ def main():
                 stale.add(name)
         if stale:
             parser.exit(1, "Regenerate CPS man pages: " + ", ".join(sorted(stale)) + "\n")
+        manifest = MANIFEST.read_text(encoding="utf-8")
+        if packaged(manifest, pages) != manifest:
+            parser.exit(1, f"Regenerate CPS man pages: {MANIFEST} does not list them all\n")
         return
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -213,6 +233,8 @@ def main():
         (args.output / name).unlink()
     for name, content in pages.items():
         (args.output / name).write_text(content, encoding="utf-8")
+    manifest = MANIFEST.read_text(encoding="utf-8")
+    MANIFEST.write_text(packaged(manifest, pages), encoding="utf-8")
 
 
 if __name__ == "__main__":
