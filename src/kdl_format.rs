@@ -27,11 +27,67 @@ pub(crate) mod publish_release;
 pub(crate) mod signer;
 pub(crate) mod worker;
 
-const SCHEMA_VERSION: u32 = 1;
+/// A kind of KDL document CPS reads, named by its `schema-version` header.
+///
+/// Each kind has its own schema version, so a change to one format leaves files
+/// of every other kind valid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Kind {
+    PackageManifest,
+    BuildRecipe,
+    GitPackage,
+    GitToolchain,
+    ToolchainConfig,
+    BuildTrust,
+    BuildWorker,
+    ImageConfig,
+    MirrorList,
+    PublishPolicy,
+    PublishRelease,
+    Signer,
+}
+
+impl Kind {
+    /// The `kind` property of the header.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::PackageManifest => "package-manifest",
+            Self::BuildRecipe => "build-recipe",
+            Self::GitPackage => "git-package",
+            Self::GitToolchain => "git-toolchain",
+            Self::ToolchainConfig => "toolchain-config",
+            Self::BuildTrust => "build-trust",
+            Self::BuildWorker => "build-worker",
+            Self::ImageConfig => "image-config",
+            Self::MirrorList => "mirror-list",
+            Self::PublishPolicy => "publish-policy",
+            Self::PublishRelease => "publish-release",
+            Self::Signer => "signer",
+        }
+    }
+
+    /// The only schema version CPS reads and writes for this kind.
+    pub(crate) const fn version(self) -> u32 {
+        match self {
+            Self::PackageManifest => MANIFEST_FORMAT,
+            Self::BuildRecipe
+            | Self::GitPackage
+            | Self::GitToolchain
+            | Self::ToolchainConfig
+            | Self::BuildTrust
+            | Self::BuildWorker
+            | Self::ImageConfig
+            | Self::MirrorList
+            | Self::PublishPolicy
+            | Self::PublishRelease
+            | Self::Signer => 1,
+        }
+    }
+}
+
 /// Action properties named `variant.NAME` select by variant.
 const VARIANT_PREFIX: &str = "variant.";
 const VARIANT_PROPERTY: &str = "variant.*";
-const MANIFEST_KIND: &str = "package-manifest";
 
 struct Fields<'a> {
     args: Vec<&'a KdlValue>,
@@ -158,19 +214,16 @@ fn variant_value(value: &KdlValue) -> Result<String> {
         .context("variant values must be strings, #true, or #false")
 }
 
-fn schema(doc: &KdlDocument, kind: &str) -> Result<()> {
-    schema_version(doc, SCHEMA_VERSION, kind)
-}
-
-fn schema_version(doc: &KdlDocument, version: u32, kind: &str) -> Result<()> {
+fn schema(doc: &KdlDocument, kind: Kind) -> Result<()> {
     let fields = Fields::read(one(doc, "schema-version")?, 1, &["kind"], false)?;
+    let (name, version) = (kind.name(), kind.version());
     ensure!(
-        fields.args[0].as_integer() == Some(i128::from(version)),
-        "expected schema-version {version} for {kind}"
+        fields.required_string("kind")? == name,
+        "expected schema-version kind={name:?}"
     );
     ensure!(
-        fields.required_string("kind")? == kind,
-        "expected schema-version kind={kind:?}"
+        fields.args[0].as_integer() == Some(i128::from(version)),
+        "expected schema-version {version} for {name}"
     );
     Ok(())
 }
@@ -187,9 +240,9 @@ fn one<'a>(doc: &'a KdlDocument, name: &str) -> Result<&'a KdlNode> {
     Ok(node)
 }
 
-fn document(text: &str) -> Result<KdlDocument> {
-    text.parse()
-        .map_err(|error: kdl::KdlError| anyhow::anyhow!("invalid KDL: {error:?}"))
+/// Parse KDL 2.0 only, whatever features other crates enable on `kdl`.
+pub(crate) fn document(text: &str) -> Result<KdlDocument> {
+    KdlDocument::parse_v2(text).map_err(|error| anyhow::anyhow!("invalid KDL: {error:?}"))
 }
 
 pub(crate) fn parse_manifest(text: &str) -> Result<Manifest> {
@@ -205,7 +258,7 @@ pub(crate) fn parse_package(
     default_version: Option<&crate::model::Version>,
 ) -> Result<(Manifest, bool)> {
     let doc = document(text)?;
-    schema_version(&doc, MANIFEST_FORMAT, MANIFEST_KIND)?;
+    schema(&doc, Kind::PackageManifest)?;
     let package = one(&doc, "package")?;
     ensure!(
         doc.nodes().len() == 2,
@@ -565,7 +618,7 @@ fn schema_header(version: u32, kind: &str) -> KdlNode {
 pub(crate) fn manifest_text(manifest: &Manifest) -> String {
     let mut doc = KdlDocument::new();
     doc.nodes_mut()
-        .push(schema_header(manifest.format, MANIFEST_KIND));
+        .push(schema_header(manifest.format, Kind::PackageManifest.name()));
     let mut package = KdlNode::new("package");
     package.push(manifest.name.as_str());
     package.insert("publisher", manifest.publisher.as_str());
@@ -786,7 +839,7 @@ pub(crate) fn read_build_trust(path: &Path) -> Result<BuildTrustConfig> {
         .context("missing build trust policy directory")?;
     let bytes = read_limited(File::open(&path)?, 1024 * 1024)?;
     let doc = document(std::str::from_utf8(&bytes)?)?;
-    schema(&doc, "build-trust")?;
+    schema(&doc, Kind::BuildTrust)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected only schema-version and build-trust"
@@ -889,7 +942,7 @@ pub(crate) fn read_image_definition(path: &Path) -> Result<ImageDefinition> {
 
 fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
     let doc = document(text)?;
-    schema(&doc, "image-config")?;
+    schema(&doc, Kind::ImageConfig)?;
     let mut config = ImageDefinition {
         publishers: Vec::new(),
         arch: std::env::consts::ARCH.to_owned(),
@@ -1355,6 +1408,8 @@ mod tests {
             input.replace(" kind=\"package-manifest\"", ""),
             input.replace("package-manifest", "build-recipe"),
             input.replace("schema-version 1", "schema-version 2"),
+            // KDL 1.0 spellings are not KDL 2.0, whatever features enable on kdl.
+            input.replace("1.0.0-0\"", "1.0.0-0\" requires-reboot=true"),
         ] {
             assert!(parse_manifest(&invalid).is_err(), "{invalid}");
         }

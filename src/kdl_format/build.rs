@@ -17,18 +17,16 @@ use crate::model::{
 use crate::repo::read_limited;
 
 use super::{
-    Fields, MANIFEST_KIND, PublisherConfig, SCHEMA_VERSION, document, one, publisher_config,
-    schema, schema_header,
+    Fields, Kind, PublisherConfig, document, one, publisher_config, schema, schema_header,
 };
 
 pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
 /// The most packages that one build can produce.
 pub(crate) const MAX_OUTPUTS: usize = 64;
-const RECIPE_KIND: &str = "build-recipe";
 
 pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, String)> {
     let doc = document(text)?;
-    schema(&doc, "git-package")?;
+    schema(&doc, Kind::GitPackage)?;
     ensure!(
         doc.nodes().len() == 3,
         "expected schema-version, package, and build in cps.kdl"
@@ -36,9 +34,10 @@ pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, Str
     let mut package = one(&doc, "package")?.clone();
     package.insert("publisher", publisher);
     let mut manifest = KdlDocument::new();
-    manifest
-        .nodes_mut()
-        .extend([schema_header(MANIFEST_FORMAT, MANIFEST_KIND), package]);
+    manifest.nodes_mut().extend([
+        schema_header(MANIFEST_FORMAT, Kind::PackageManifest.name()),
+        package,
+    ]);
     let manifest = super::parse_manifest(&manifest.to_string())?;
 
     let mut build = one(&doc, "build")?.clone();
@@ -49,9 +48,10 @@ pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, Str
     );
     children.nodes_mut().push(KdlNode::new("manifest"));
     let mut recipe = KdlDocument::new();
-    recipe
-        .nodes_mut()
-        .extend([schema_header(SCHEMA_VERSION, RECIPE_KIND), build]);
+    recipe.nodes_mut().extend([
+        schema_header(Kind::BuildRecipe.version(), Kind::BuildRecipe.name()),
+        build,
+    ]);
     Ok((manifest, recipe.to_string()))
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn git_toolchain_template(template: &str, config: &Path) -> Result<St
         RECIPE_LIMIT,
     )?;
     let pins = document(std::str::from_utf8(&bytes)?)?;
-    schema(&pins, "git-toolchain")?;
+    schema(&pins, Kind::GitToolchain)?;
     ensure!(
         pins.nodes().len() == 2,
         "expected schema-version and toolchain in {}",
@@ -432,7 +432,7 @@ pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, Publ
         .context("missing toolchain configuration directory")?
         .to_owned();
     let doc = document(std::str::from_utf8(&bytes)?)?;
-    schema(&doc, "toolchain-config")?;
+    schema(&doc, Kind::ToolchainConfig)?;
     let mut publishers = BTreeMap::new();
     for node in doc.nodes() {
         match node.name().value() {
@@ -454,7 +454,7 @@ pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, Publ
 
 pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     let doc = document(text)?;
-    schema(&doc, RECIPE_KIND)?;
+    schema(&doc, Kind::BuildRecipe)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and build nodes"
@@ -705,7 +705,7 @@ build architecture="x86_64" epoch=1700000000 {
         )?;
         assert_eq!(manifest.format, 1);
         assert_eq!(manifest.publisher, "local");
-        schema(&document(&recipe)?, RECIPE_KIND)?;
+        schema(&document(&recipe)?, Kind::BuildRecipe)?;
         Ok(())
     }
 

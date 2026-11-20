@@ -73,7 +73,9 @@ formatted output.
 
 ## Configuration and data formats
 
-KDL documents declare `schema-version 1` and a document `kind`.
+KDL documents are KDL 2.0 and start with a `schema-version N kind="KIND"`
+header. Each kind has its own schema version, so a change to one format
+leaves files of every other kind valid. Every kind is at version 1.
 
 | File | Where to start |
 | --- | --- |
@@ -105,7 +107,7 @@ command and subcommand with `LC_ALL=C` and `NO_COLOR=1`, and turns the
 description, usage line, arguments, commands, and options into roff. The
 first sentence of a command's description becomes its page summary.
 Command names, syntax, and option descriptions come from the clap
-definitions and doc comments in `src/main.rs`, so edit help there, never
+definitions and doc comments in `src/cli.rs`, so edit help there, never
 the generated pages. The `cps(1)` description, files, and examples are
 fixed text in the script.
 

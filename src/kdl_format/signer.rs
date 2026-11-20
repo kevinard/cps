@@ -37,7 +37,7 @@ pub(crate) fn read_signer(path: &Path) -> Result<SignerDescriptor> {
 
 fn parse_signer(text: &str, parent: &Path) -> Result<SignerDescriptor> {
     let doc = document(text)?;
-    schema(&doc, "signer")?;
+    schema(&doc, super::Kind::Signer)?;
     for node in doc.nodes() {
         let name = node.name().value();
         ensure!(

@@ -21,7 +21,7 @@ pub(crate) fn read_worker_config(path: &Path) -> Result<BuildWorker> {
 
 fn parse(text: &str) -> Result<BuildWorker> {
     let doc = document(text)?;
-    schema(&doc, "build-worker")?;
+    schema(&doc, super::Kind::BuildWorker)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and worker nodes"

@@ -20,8 +20,6 @@ use crate::{
     },
 };
 
-const RECIPE_KIND: &str = "build-recipe";
-
 /// One package that a recipe produces, read from its manifest.
 #[derive(Debug, Default)]
 struct Produced {
@@ -188,9 +186,7 @@ fn parse_document(path: &Path, limit: u64) -> Result<KdlDocument> {
     if is_template(path) {
         text = fill_placeholders(&text);
     }
-    text.parse().map_err(|error: kdl::KdlError| {
-        anyhow::anyhow!("invalid KDL in {}: {error:?}", path.display())
-    })
+    crate::kdl_format::document(&text).with_context(|| format!("reading {}", path.display()))
 }
 
 fn document_kind(doc: &KdlDocument) -> Option<&str> {
@@ -199,9 +195,9 @@ fn document_kind(doc: &KdlDocument) -> Option<&str> {
 
 fn is_recipe(path: &Path) -> Result<bool> {
     // Other KDL documents and unparseable templates are not recipes.
-    Ok(parse_document(path, RECIPE_LIMIT)
-        .ok()
-        .is_some_and(|doc| document_kind(&doc) == Some(RECIPE_KIND)))
+    Ok(parse_document(path, RECIPE_LIMIT).ok().is_some_and(|doc| {
+        document_kind(&doc) == Some(crate::kdl_format::Kind::BuildRecipe.name())
+    }))
 }
 
 fn argument(node: &KdlNode) -> Option<&str> {
@@ -1024,9 +1020,7 @@ pub(crate) fn repin_recipes(
         if is_template(&path) {
             check = fill_placeholders(&check);
         }
-        let parsed: KdlDocument = check
-            .parse()
-            .map_err(|error: kdl::KdlError| anyhow::anyhow!("invalid KDL: {error:?}"))?;
+        let parsed = crate::kdl_format::document(&check)?;
         ensure!(
             pending.iter().all(Option::is_none) && Pins::read(&parsed) == expected,
             "{} spells a pin in a form that repin does not rewrite; edit it by hand",

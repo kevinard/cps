@@ -65,8 +65,12 @@ and update the affected guide examples.
 
 ## Code layout
 
-[`src/main.rs`](../../src/main.rs) parses arguments and dispatches to the
-library in [`src/lib.rs`](../../src/lib.rs). Each area below has its own
+[`src/cli.rs`](../../src/cli.rs) parses arguments and dispatches to the
+other modules, and [`src/main.rs`](../../src/main.rs) only calls it. The
+crate is a library so that the binary and its tests share code, but nothing
+in it is a public API: items are `pub(crate)`, the crate warns on
+unreachable `pub` items, and code that only tests call is compiled only for
+tests, so the compiler reports dead code. Each area below has its own
 module.
 
 | Area | Modules |
