@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(crate) mod build;
+pub(crate) mod canonical;
 pub(crate) mod mirror_list;
 pub(crate) mod publish_policy;
 pub(crate) mod publish_release;
@@ -615,6 +616,7 @@ fn schema_header(version: u32, kind: &str) -> KdlNode {
     schema
 }
 
+/// The canonical KDL text of a manifest, whose bytes are signed and digested.
 pub(crate) fn manifest_text(manifest: &Manifest) -> String {
     let mut doc = KdlDocument::new();
     doc.nodes_mut()
@@ -807,8 +809,7 @@ pub(crate) fn manifest_text(manifest: &Manifest) -> String {
         children.push(node);
     }
     doc.nodes_mut().push(package);
-    doc.autoformat();
-    doc.to_string()
+    canonical::write(&doc).expect("manifests hold only strings, integers, and booleans")
 }
 
 pub(crate) struct PublisherConfig {
@@ -1413,6 +1414,17 @@ mod tests {
         ] {
             assert!(parse_manifest(&invalid).is_err(), "{invalid}");
         }
+        Ok(())
+    }
+
+    /// The golden manifest uses every manifest node and property, and is the
+    /// canonical text of itself: a change to the bytes CPS writes for a
+    /// manifest changes every published digest, so it must be deliberate.
+    #[test]
+    fn manifest_text_matches_the_golden_bytes() -> Result<()> {
+        let golden = include_str!("../tests/golden/package-manifest.kdl");
+        let manifest = parse_manifest(golden)?;
+        assert_eq!(manifest_text(&manifest), golden);
         Ok(())
     }
 

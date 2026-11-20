@@ -76,10 +76,12 @@ formatted output.
 KDL documents are KDL 2.0 and start with a `schema-version N kind="KIND"`
 header. Each kind has its own schema version, so a change to one format
 leaves files of every other kind valid. Every kind is at version 1.
+[Format specifications](formats.md) gives the exact bytes of the signed and
+persisted formats whose spelling matters, each with a golden fixture.
 
 | File | Where to start |
 | --- | --- |
-| KDL `package-manifest` | [Actions, dependency declarations, and versions](../maintainer/manifests.md) |
+| KDL `package-manifest` | [Actions, dependency declarations, and versions](../maintainer/manifests.md), and the [canonical text CPS signs](formats.md#canonical-manifest-text) |
 | Signed publisher catalog root and shards in JSON, version 1 | [Signed catalog format](../publisher/publishing.md#signed-catalog-format) |
 | Publisher trust root in JSON, version 1 | [Publisher trust root](../publisher/publishing.md#publisher-trust-root) |
 | KDL `build-recipe`, `toolchain-config`, and `build-worker` | [Pinned toolchains, sources, and limits](../maintainer/builds.md) |
