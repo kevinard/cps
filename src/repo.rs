@@ -37,12 +37,13 @@ const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
 mod git_snapshots;
 mod keys;
+pub(crate) use keys::PublicKey;
 pub(crate) use keys::{KeySpecs, trust::TrustDraft};
+pub(crate) use keys::{OtherSigners, Purpose, SigningKey, verify_signatures};
 use keys::{
-    PublicKey, Signers,
+    Signers,
     trust::{self, Freshness, TrustChain},
 };
-pub(crate) use keys::{Purpose, SigningKey};
 pub(crate) mod profiles;
 mod rebuild;
 pub(crate) mod release;

@@ -3,7 +3,8 @@
 //! Catalog roots and trust roots share one envelope: canonical JSON holding a
 //! base64 payload and signatures sorted by key ID. Each kind of document signs
 //! under its own domain prefix, so a signature for one kind never verifies as
-//! another.
+//! another. Build attestations use DSSE, the in-toto envelope, decoded just as
+//! strictly. Every envelope checks its signatures with [`verify_signatures`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -398,55 +399,79 @@ impl Envelope {
         domain: &Domain,
         authorized: &BTreeSet<PublicKey>,
     ) -> Result<BTreeSet<PublicKey>> {
-        let message = domain.message(&self.validate(domain)?);
-        let by_id: BTreeMap<String, &PublicKey> =
-            authorized.iter().map(|key| (digest(key), key)).collect();
-        let mut signers = BTreeSet::new();
-        for signature in &self.signatures {
-            let key = by_id.get(&signature.keyid).with_context(|| {
-                format!(
-                    "{} is signed by unauthorized key {}",
-                    domain.what, signature.keyid
-                )
-            })?;
-            UnparsedPublicKey::new(&ED25519, key)
-                .verify(&message, &signature.bytes()?)
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "invalid {} signature by key {}",
-                        domain.what,
-                        signature.keyid
-                    )
-                })?;
-            signers.insert(**key);
-        }
-        Ok(signers)
+        self.verify_with(domain, authorized, OtherSigners::Reject)
     }
-}
 
-impl Envelope {
     /// Verify the signatures by authorized keys and ignore any other key ID.
     pub(crate) fn verify_known(
         &self,
         domain: &Domain,
         authorized: &BTreeSet<PublicKey>,
     ) -> Result<BTreeSet<PublicKey>> {
-        let known: BTreeSet<String> = authorized.iter().map(|key| digest(key)).collect();
-        let signatures: Vec<_> = self
+        self.verify_with(domain, authorized, OtherSigners::Ignore)
+    }
+
+    fn verify_with(
+        &self,
+        domain: &Domain,
+        authorized: &BTreeSet<PublicKey>,
+        others: OtherSigners,
+    ) -> Result<BTreeSet<PublicKey>> {
+        let message = domain.message(&self.validate(domain)?);
+        let signatures = self
             .signatures
             .iter()
-            .filter(|signature| known.contains(&signature.keyid))
-            .cloned()
-            .collect();
-        if signatures.is_empty() {
-            return Ok(BTreeSet::new());
-        }
-        Self {
-            signed: self.signed.clone(),
-            signatures,
-        }
-        .verify(domain, authorized)
+            .map(|signature| Ok((signature.keyid.as_str(), signature.bytes()?)))
+            .collect::<Result<Vec<_>>>()?;
+        verify_signatures(
+            domain.what,
+            &message,
+            signatures.iter().map(|(id, sig)| (*id, sig)),
+            authorized,
+            others,
+        )
     }
+}
+
+/// Which signatures [`verify_signatures`] accepts besides authorized ones.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum OtherSigners {
+    /// A signature by any other key rejects the document.
+    Reject,
+    /// Signatures by other keys are skipped: a build attestation may carry
+    /// witnesses that this image does not trust.
+    Ignore,
+}
+
+/// Verify the signatures of `message` by authorized keys and return those
+/// keys. Each signature names its key by the SHA-256 of the raw Ed25519 public
+/// key. A signature by an authorized key that does not verify rejects the
+/// document, whatever the threshold, so a document never carries a bad
+/// signature by a trusted key.
+pub(crate) fn verify_signatures<'a>(
+    what: &str,
+    message: &[u8],
+    signatures: impl IntoIterator<Item = (&'a str, &'a [u8; 64])>,
+    authorized: &BTreeSet<PublicKey>,
+    others: OtherSigners,
+) -> Result<BTreeSet<PublicKey>> {
+    let by_id: BTreeMap<String, &PublicKey> =
+        authorized.iter().map(|key| (digest(key), key)).collect();
+    let mut signers = BTreeSet::new();
+    for (key_id, signature) in signatures {
+        let Some(key) = by_id.get(key_id) else {
+            ensure!(
+                others == OtherSigners::Ignore,
+                "{what} is signed by unauthorized key {key_id}"
+            );
+            continue;
+        };
+        UnparsedPublicKey::new(&ED25519, key)
+            .verify(message, signature)
+            .map_err(|_| anyhow::anyhow!("invalid {what} signature by key {key_id}"))?;
+        signers.insert(**key);
+    }
+    Ok(signers)
 }
 
 /// Seal a payload with exactly the signers' signatures.

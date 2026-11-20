@@ -636,6 +636,17 @@ payloads from another run. Each package's catalog entry names the same
 attestation, and clients verify each package against its own manifest and
 payloads in that statement.
 
+CPS reads the envelope in one byte form, as strictly as a
+[catalog envelope](../publisher/publishing.md#signed-catalog-format): compact
+JSON with the fields `payloadType`, `payload`, and `signatures` in that
+order; `payloadType` exactly `application/vnd.in-toto+json`; padded standard
+base64 for the payload and each signature; and 1 to 16 signatures sorted by
+unique `keyid`, each the lowercase SHA-256 of the raw Ed25519 public key with
+a 64-byte signature. An envelope in any other spelling, or with a signature
+it cannot decode, is rejected rather than read around. A signature by a key
+the reader trusts must verify; signatures by other keys, such as witnesses
+an image does not trust, are skipped.
+
 `publish bundle` verifies the statement and checks that each expanded
 manifest is what its pinned template produces: the same metadata,
 dependencies, and explicit actions, followed only by collected and debug
