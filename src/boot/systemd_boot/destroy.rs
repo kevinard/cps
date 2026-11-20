@@ -52,7 +52,7 @@ fn entries_dir(esp: &Path) -> Result<&'static str> {
 }
 
 /// Retire an inactive Btrfs root and its private boot artifacts, with retryable cleanup.
-pub fn destroy_btrfs_boot_environment(
+pub(crate) fn destroy_btrfs_boot_environment(
     esp: &Path,
     volume: &Path,
     id: &str,

@@ -1,7 +1,9 @@
 mod dependencies;
 pub(crate) mod elf;
 
-pub use dependencies::{check_manifest_dependencies, generated_dependencies, suggest_dependencies};
+pub(crate) use dependencies::{
+    check_manifest_dependencies, generated_dependencies, suggest_dependencies,
+};
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -26,7 +28,8 @@ struct LinkGroup {
 }
 
 /// Generate an unsigned manifest for review before publishing.
-pub fn generate_manifest(
+#[cfg(test)]
+pub(crate) fn generate_manifest(
     proto: &Path,
     publisher: &str,
     name: &str,
@@ -38,7 +41,7 @@ pub fn generate_manifest(
 }
 
 /// Generate an unsigned manifest for a portable or architecture-specific package.
-pub fn generate_manifest_for_architecture(
+pub(crate) fn generate_manifest_for_architecture(
     proto: &Path,
     publisher: &str,
     name: &str,

@@ -69,7 +69,7 @@ const MAX_RETAINED: usize = 32;
 const RETAINED_LIMIT: u64 = (65 * MAX_RETAINED) as u64;
 
 mod sign;
-pub use sign::{RefreshMetadata, ReleaseKeys, SignExport, refresh_metadata, sign_export};
+pub(crate) use sign::{RefreshMetadata, ReleaseKeys, SignExport, refresh_metadata, sign_export};
 const CHECKPOINT_FILES: [(&str, u64); 4] = [
     ("root.json", ROOT_LIMIT),
     ("timestamp.json", TIMESTAMP_LIMIT),
@@ -200,24 +200,23 @@ mod replica;
 mod web_config;
 mod web_files;
 pub(crate) use archive::ArchiveCache;
-pub use bootstrap::PublisherBootstrap;
-pub use cache::{
-    CacheRetention, PruneReport, RetainedRoot, prune_payloads, prune_payloads_with_locks,
-};
+pub(crate) use bootstrap::PublisherBootstrap;
+#[cfg(test)]
+pub(crate) use cache::prune_payloads;
+pub(crate) use cache::{CacheRetention, PruneReport, prune_payloads_with_locks};
 pub(crate) use cache::{prune_system_payloads, prune_with_registered_roots};
-pub use deploy::{Lifetimes, Publication, deploy_mirror, parse_lifetime, refresh_mirror};
+pub(crate) use deploy::{Lifetimes, Publication, deploy_mirror, parse_lifetime, refresh_mirror};
 use mirrors::{Endpoint, MAX_ATTEMPTS, SIGNED_MIRRORS_LIMIT, check_signed_list};
-pub use mirrors::{
-    Mirror, MirrorEntry, MirrorProbe, MirrorSource, MirrorSources, MirrorStatus, PublisherMirrors,
-    list_publisher_mirrors, rank_publisher_mirrors,
-};
+pub(crate) use mirrors::{Mirror, MirrorSources, list_publisher_mirrors, rank_publisher_mirrors};
+#[cfg(test)]
+pub(crate) use mirrors::{MirrorSource, MirrorStatus};
 pub(crate) use mirrors::{SIGNED_MIRRORS_TARGET, image_config_dir};
-pub use profile::{
-    ProfilePayloads, sync_profile, sync_profile_for_image, sync_profile_with_payloads,
-};
-pub use provision::init_publisher;
-pub use replica::replicate;
-pub use web_config::{Mount, WebConfig, WebServer, nginx_config};
+#[cfg(test)]
+pub(crate) use profile::sync_profile;
+pub(crate) use profile::{ProfilePayloads, sync_profile_for_image, sync_profile_with_payloads};
+pub(crate) use provision::init_publisher;
+pub(crate) use replica::replicate;
+pub(crate) use web_config::{Mount, WebConfig, WebServer, nginx_config};
 
 fn read_tuf_root(path: &Path) -> Result<Vec<u8>> {
     (|| read_limited(File::open(path)?, ROOT_LIMIT))()
@@ -281,7 +280,8 @@ fn checkpoint(state: &Path, scratch: &Path, trusted_exists: bool) -> Result<()> 
 }
 
 /// Verify TUF metadata and materialize the reachable CPS release in a local cache.
-pub fn sync(
+#[cfg(test)]
+pub(crate) fn sync(
     repo: &Path,
     trusted_root: &Path,
     metadata_url: &str,
@@ -301,7 +301,8 @@ pub fn sync(
 }
 
 /// Verify and cache release metadata, leaving payloads for plan-specific fetches.
-pub fn sync_index(
+#[cfg(test)]
+pub(crate) fn sync_index(
     repo: &Path,
     trusted_root: &Path,
     metadata_url: &str,
@@ -324,12 +325,13 @@ pub fn sync_index(
 }
 
 #[derive(Default)]
-pub struct SyncOptions<'a> {
+pub(crate) struct SyncOptions<'a> {
     pub index_only: bool,
     pub image: Option<&'a Path>,
 }
 
-pub fn sync_with_options(
+#[cfg(test)]
+pub(crate) fn sync_with_options(
     repo: &Path,
     trusted_root: &Path,
     metadata_url: &str,
@@ -352,7 +354,8 @@ pub fn sync_with_options(
 
 /// Sync only if the authenticated mirror also advertises all the requested catalog pins.
 #[allow(clippy::too_many_arguments)]
-pub fn sync_with_required_catalogs(
+#[cfg(test)]
+pub(crate) fn sync_with_required_catalogs(
     repo: &Path,
     trusted_root: &Path,
     metadata_url: &str,
@@ -374,7 +377,7 @@ pub fn sync_with_required_catalogs(
 }
 
 /// Verify and cache a release from the first of `sources` that can serve it.
-pub fn sync_mirrors(
+pub(crate) fn sync_mirrors(
     repo: &Path,
     trusted_root: &Path,
     sources: MirrorSources,
@@ -582,12 +585,12 @@ fn try_mirrors<T>(
 /// but only while its last successful refresh is younger than the limit.
 /// Signature, rollback, and digest failures always fail.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
-pub struct RefreshPolicy {
+pub(crate) struct RefreshPolicy {
     pub defer_unavailable_hours: Option<u64>,
 }
 
 impl RefreshPolicy {
-    pub const MAX_STALENESS_HOURS: u64 = 366 * 24;
+    pub(crate) const MAX_STALENESS_HOURS: u64 = 366 * 24;
 
     fn describe(&self) -> String {
         match self.defer_unavailable_hours {
@@ -599,7 +602,7 @@ impl RefreshPolicy {
 
 /// The freshness of one URL-added publisher's verified metadata.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct PublisherFreshness {
+pub(crate) struct PublisherFreshness {
     pub publisher: String,
     pub policy: RefreshPolicy,
     /// Unix time of the last successful refresh.
@@ -854,13 +857,14 @@ pub(crate) fn refresh_url_publishers(
     Ok(deferred)
 }
 
-pub struct ArchiveSyncOptions<'a> {
+pub(crate) struct ArchiveSyncOptions<'a> {
     pub catalog: &'a str,
     pub index_only: bool,
 }
 
 /// Cache one exact catalog from a separate, authenticated archive mirror.
-pub fn sync_archive(
+#[cfg(test)]
+pub(crate) fn sync_archive(
     repo: &Path,
     trusted_root: &Path,
     metadata_url: &str,
@@ -879,7 +883,7 @@ pub fn sync_archive(
     )
 }
 
-pub fn sync_archive_mirrors(
+pub(crate) fn sync_archive_mirrors(
     repo: &Path,
     trusted_root: &Path,
     sources: MirrorSources,
@@ -2015,12 +2019,17 @@ async fn download_target(
 }
 
 /// Export the signed catalog and its reachable objects as a tree of TUF targets.
-pub fn export(repo: &Path, publisher: &str, trust_key: &Path, output: &Path) -> Result<String> {
+pub(crate) fn export(
+    repo: &Path,
+    publisher: &str,
+    trust_key: &Path,
+    output: &Path,
+) -> Result<String> {
     export_with_retained(repo, publisher, trust_key, output, &[])
 }
 
 /// Include retained signed catalogs and their objects in the current TUF target set.
-pub fn export_with_retained(
+pub(crate) fn export_with_retained(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,
@@ -2039,7 +2048,7 @@ pub fn export_with_retained(
 }
 
 /// Also include large source targets attached to the signed catalog.
-pub fn export_with_sources(
+pub(crate) fn export_with_sources(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,
@@ -2058,7 +2067,7 @@ pub fn export_with_sources(
 }
 
 /// Include optional payload patches based on earlier signed catalogs.
-pub fn export_with_deltas(
+pub(crate) fn export_with_deltas(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,
@@ -2079,7 +2088,7 @@ pub fn export_with_deltas(
 }
 
 /// Export a pinned catalog to a separate archive target set without a live pointer.
-pub fn export_archive(
+pub(crate) fn export_archive(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,
@@ -2224,7 +2233,7 @@ fn export_targets(
 }
 
 /// Add the publisher's signed mirror list to an export of the current catalog.
-pub fn export_mirror_list(output: &Path, list: &Path) -> Result<()> {
+pub(crate) fn export_mirror_list(output: &Path, list: &Path) -> Result<()> {
     let bytes = read_limited(File::open(list)?, SIGNED_MIRRORS_LIMIT)
         .with_context(|| format!("reading mirror list {}", list.display()))?;
     check_signed_list(&bytes)?;

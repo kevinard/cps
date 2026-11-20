@@ -212,7 +212,7 @@ impl Reason {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct EtcConflict {
+pub(crate) struct EtcConflict {
     pub path: String,
     pub reason: String,
     /// The saved running version, relative to the root, if there was one.
@@ -222,7 +222,7 @@ pub struct EtcConflict {
 
 /// What a merge carried into the trial.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct EtcMergeReport {
+pub(crate) struct EtcMergeReport {
     pub revision: u64,
     /// Paths copied from, or removed as on, the running system.
     pub applied: Vec<String>,
@@ -236,7 +236,7 @@ pub struct EtcMergeReport {
 }
 
 impl EtcMergeReport {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.applied.is_empty()
             && self.merged.is_empty()
             && self.config_updates.is_empty()
@@ -284,7 +284,8 @@ fn stash_name(completed: &BTreeSet<String>, revision: u64) -> String {
 }
 
 /// The report of the last merge into a root.
-pub fn last_report(root: &Path) -> Result<Option<EtcMergeReport>> {
+#[cfg(test)]
+pub(crate) fn last_report(root: &Path) -> Result<Option<EtcMergeReport>> {
     let state = Root::open(root)?.open_image_state()?;
     match state.read_file(REPORT) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -1399,7 +1400,7 @@ fn write_private(state: &Root, name: &str, bytes: &[u8]) -> Result<()> {
 }
 
 /// Saved running versions in a root: (revision, path, saved copy).
-pub fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
+pub(crate) fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
     let root = Root::open(root)?;
     let prefix = format!("{CONFIG_UPDATES_DIRECTORY}/{STASH}");
     let stash = match root.dir(&prefix) {

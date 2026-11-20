@@ -17,12 +17,12 @@ use tempfile::TempDir;
 use url::Url;
 
 use crate::{
-    BuildSettings, BuildWorker, GitSnapshotRef, SourceLayout,
+    BuildSettings, BuildToolchain, BuildWorker, GitSnapshotRef, SourceLayout,
     build::{
         read_expanded_output,
         snapshot::{ARCHIVE, archive_commit, checkout, git, object_format},
     },
-    build_with_toolchain_config, fetch_sources_with_local,
+    fetch_sources_with_local,
     image::root::Root,
     kdl_format::{
         build::{
@@ -54,7 +54,7 @@ pub(crate) struct GitSource {
 /// package is installed and on every tracked-branch upgrade.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct GitSignatures {
+pub(crate) struct GitSignatures {
     format: GitSignatureFormat,
     allowed_signers: PathBuf,
     require: GitSignedObject,
@@ -69,14 +69,14 @@ enum GitSignatureFormat {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum GitSignedObject {
+pub(crate) enum GitSignedObject {
     Commit,
     Tag,
 }
 
 impl GitSignatures {
     /// Parse `ssh:PATH` or `openpgp:PATH`.
-    pub fn new(signers: &str, require: GitSignedObject) -> Result<Self> {
+    pub(crate) fn new(signers: &str, require: GitSignedObject) -> Result<Self> {
         let (format, path) = signers
             .split_once(':')
             .context("use ssh:PATH or openpgp:PATH for the allowed signers")?;
@@ -298,7 +298,7 @@ impl GitSource {
 }
 
 #[derive(Debug)]
-pub struct GitChange {
+pub(crate) struct GitChange {
     pub package: String,
     pub url: String,
     pub branch: Option<String>,
@@ -504,9 +504,9 @@ fn build_package(path: &Path, toolchain: &Path) -> Result<()> {
     let output = worker.join("bundle");
     if !geteuid().is_root() {
         fetch_sources_with_local(&recipe, &cache, &sources)?;
-        build_with_toolchain_config(
+        crate::build::build(
             &recipe,
-            toolchain,
+            BuildToolchain::Config(toolchain),
             BuildSettings {
                 sources: &cache,
                 output: &output,
@@ -515,6 +515,7 @@ fn build_package(path: &Path, toolchain: &Path) -> Result<()> {
             },
             SourceLayout::Cache,
             &BuildWorker::default(),
+            &std::collections::BTreeMap::new(),
         )?;
         return Ok(());
     }

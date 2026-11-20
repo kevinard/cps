@@ -34,9 +34,9 @@ use crate::{
 };
 
 pub(crate) use catalogs::{CandidateSet, claim_source};
-pub use config::{ConfigChoice, ConfigUpdate, config_diff_inputs, list_config_updates};
-pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
-pub use intent::{IntentChange, MarkChoice};
+pub(crate) use config::{ConfigChoice, config_diff_inputs, list_config_updates};
+pub(crate) use freeze::{FreezeChange, FrozenPackage, list_freezes};
+pub(crate) use intent::{IntentChange, MarkChoice};
 use order::WriteOrder;
 pub(crate) use paths::{
     check_directory, choose_mediators, effective_paths, hardlink_groups, mediator_offers,
@@ -46,7 +46,7 @@ pub(crate) use rename::Renames;
 pub(crate) use resolve::{
     Candidates, Retention, check as check_dependencies, resolve as resolve_packages,
 };
-pub use update::{HeldBackUpdate, PhasedUpdateDeferred};
+pub(crate) use update::{HeldBackUpdate, PhasedUpdateDeferred};
 
 fn is_config_update(path: &str) -> bool {
     path.strip_prefix(CONFIG_UPDATES_DIRECTORY)
@@ -57,7 +57,7 @@ const PLAN_FORMAT: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Request {
+pub(crate) enum Request {
     Install {
         packages: Vec<String>,
     },
@@ -122,12 +122,12 @@ pub enum Request {
 impl Request {
     /// Whether the running system can apply this request. Provisioning a
     /// release profile or a lock only makes sense for a new, empty image.
-    pub fn applies_live(&self) -> bool {
+    pub(crate) fn applies_live(&self) -> bool {
         !matches!(self, Self::InstallProfile | Self::InstallLock { .. })
     }
 
     /// The cps command that makes this request, as `cps history` shows it.
-    pub fn operation(&self) -> &'static str {
+    pub(crate) fn operation(&self) -> &'static str {
         match self {
             Self::Install { .. } => "install",
             Self::InstallBuildDeps { .. } => "install --build-deps",
@@ -175,7 +175,7 @@ pub(crate) struct ConfigMove {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackageChange {
+pub(crate) struct PackageChange {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher: Option<String>,
@@ -195,7 +195,7 @@ struct Transfer {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Plan {
+pub(crate) struct Plan {
     format: u32,
     // Required to distinguish the current schema from development format 1 plans.
     pub(crate) install_recommends: bool,
@@ -316,7 +316,7 @@ impl Plan {
             || self.kernel_install.is_some()
     }
 
-    pub fn deferred_publishers(&self) -> &BTreeSet<String> {
+    pub(crate) fn deferred_publishers(&self) -> &BTreeSet<String> {
         &self.deferred_publishers
     }
 
@@ -385,7 +385,7 @@ impl Plan {
         }
     }
 
-    pub fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         let mut lines = vec![format!(
             "Image {} at revision {}",
             self.image, self.base_revision
@@ -707,11 +707,12 @@ impl Plan {
     }
 }
 
-pub fn plan(path: &Path, request: Request) -> Result<Plan> {
+pub(crate) fn plan(path: &Path, request: Request) -> Result<Plan> {
     plan_with_options(path, request, PlanOptions::default())
 }
 
-pub fn plan_with_recommends(
+#[cfg(test)]
+pub(crate) fn plan_with_recommends(
     path: &Path,
     request: Request,
     install_recommends: bool,
@@ -727,7 +728,7 @@ pub fn plan_with_recommends(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct PlanOptions {
+pub(crate) struct PlanOptions {
     pub install_recommends: bool,
     pub force_phased_update: bool,
 }
@@ -741,7 +742,11 @@ impl Default for PlanOptions {
     }
 }
 
-pub fn plan_with_options(path: &Path, request: Request, options: PlanOptions) -> Result<Plan> {
+pub(crate) fn plan_with_options(
+    path: &Path,
+    request: Request,
+    options: PlanOptions,
+) -> Result<Plan> {
     Ok(plan_image(path, request, options, None)?.0)
 }
 
@@ -1009,6 +1014,7 @@ pub(crate) fn build(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_with_update_diagnostics(
     image: &Image,
     mut state: State,
@@ -1373,11 +1379,15 @@ fn build_with_update_diagnostics(
                 .filter(|_| track_profile_intent)
                 .map(|intent| {
                     let mut retained = intent.local.clone();
-                    retained.extend(state.installed.iter().filter_map(|(name, package)| {
-                        deferred_publishers
-                            .contains(&package.published.manifest.publisher)
-                            .then(|| name.clone())
-                    }));
+                    retained.extend(
+                        state
+                            .installed
+                            .iter()
+                            .filter(|(_, package)| {
+                                deferred_publishers.contains(&package.published.manifest.publisher)
+                            })
+                            .map(|(name, _)| name.clone()),
+                    );
                     retained
                 });
             let select = |state: &State, requirements: &BTreeMap<&str, PackageSpec<'_>>| {

@@ -77,7 +77,7 @@ const SCRATCH: &str = "triggers";
 /// A trigger declared by a package manifest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Trigger {
+pub(crate) struct Trigger {
     pub name: String,
     /// The image-relative handler executable, shipped by the same package.
     #[serde(default, skip_serializing_if = "Option::is_none")]

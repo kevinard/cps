@@ -6,8 +6,7 @@ use jiff::Timestamp;
 use tough::{editor::signed::PathExists, error::Error as TufError, schema::RoleType};
 use url::Url;
 
-#[path = "../../tests/support/tuf.rs"]
-mod tuf;
+use crate::test_tuf as tuf;
 use tuf::sign_root;
 
 use super::*;

@@ -80,7 +80,7 @@ pub(super) fn named_description(description: &str, name: &str) -> String {
 }
 
 /// Set a user-facing name without changing the environment's boot identity.
-pub fn rename_boot_environment(esp: &Path, selector: &str, name: &str) -> Result<String> {
+pub(crate) fn rename_boot_environment(esp: &Path, selector: &str, name: &str) -> Result<String> {
     validate_name(name)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
@@ -107,7 +107,7 @@ pub fn rename_boot_environment(esp: &Path, selector: &str, name: &str) -> Result
 }
 
 /// Attach a nonrecursive, read-only inspection mount of a registered root.
-pub fn mount_boot_environment(
+pub(crate) fn mount_boot_environment(
     esp: &Path,
     volume: &Path,
     selector: &str,
@@ -174,7 +174,7 @@ pub fn mount_boot_environment(
 ///
 /// The mount is matched against the entry's Btrfs record alone, so that a
 /// root failing its boot checks can still be unmounted, and then destroyed.
-pub fn unmount_boot_environment(esp: &Path, selector: &str, target: &Path) -> Result<()> {
+pub(crate) fn unmount_boot_environment(esp: &Path, selector: &str, target: &Path) -> Result<()> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let entries = inventory(&esp, &lock, false)?.entries;

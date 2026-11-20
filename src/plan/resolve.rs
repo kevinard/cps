@@ -36,7 +36,7 @@ impl Retention<'_> {
 
 pub(crate) type Package<'a> = &'a dyn PackageInfo;
 
-pub fn resolve<'a, T, P: PackageInfo + 'a>(
+pub(crate) fn resolve<'a, T, P: PackageInfo + 'a>(
     installed: &'a BTreeMap<String, Installed>,
     available: Candidates<'_, impl IntoIterator<Item = &'a P>>,
     requested: &BTreeMap<&str, PackageSpec<'_>>,
@@ -293,7 +293,7 @@ fn selected_matches(
     }
 }
 
-pub fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
+pub(crate) fn check(installed: &BTreeMap<String, Installed>) -> Result<()> {
     let selected: BTreeMap<_, _> = installed
         .iter()
         .map(|(name, pkg)| (name.as_str(), &pkg.published))

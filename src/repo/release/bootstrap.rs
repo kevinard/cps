@@ -20,7 +20,7 @@ use crate::{
 
 const PUBLISHER_NAME_LIMIT: u64 = 2 * 1024 * 1024;
 
-pub struct PublisherBootstrap {
+pub(crate) struct PublisherBootstrap {
     pub name: String,
     pub url: Url,
     pub tuf_root: Vec<u8>,
@@ -30,7 +30,7 @@ pub struct PublisherBootstrap {
 
 impl PublisherBootstrap {
     /// Discover the publisher and its trust root using a locally trusted TUF root.
-    pub fn fetch(base: &str, trusted_root: &Path) -> Result<Self> {
+    pub(crate) fn fetch(base: &str, trusted_root: &Path) -> Result<Self> {
         let url = mirror_base(base)?;
         ensure!(
             url.scheme() == "https",
@@ -63,18 +63,18 @@ impl PublisherBootstrap {
     }
 
     /// The SHA-256 of the trusted TUF root document.
-    pub fn tuf_root_fingerprint(&self) -> String {
+    pub(crate) fn tuf_root_fingerprint(&self) -> String {
         digest(&self.tuf_root)
     }
 
     /// The publisher, version, expiry, and key fingerprints of the trust root.
-    pub fn describe(&self) -> Result<String> {
+    pub(crate) fn describe(&self) -> Result<String> {
         Ok(Pinned::parse(&self.trust_root)?.root().to_string())
     }
 
     /// Require the trust root to name exactly these root key fingerprints, so
     /// provisioning does not depend on trusting the first mirror response.
-    pub fn check_root_keys(&self, expected: &[String]) -> Result<()> {
+    pub(crate) fn check_root_keys(&self, expected: &[String]) -> Result<()> {
         trust::check_expected_root_keys(Pinned::parse(&self.trust_root)?.root(), expected)
     }
 }
@@ -117,12 +117,9 @@ async fn read_target(
 }
 
 #[cfg(test)]
-#[path = "../../../tests/support/tuf.rs"]
-mod tuf;
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_tuf as tuf;
     use std::fs;
     use tough::editor::signed::PathExists;
 
@@ -168,16 +165,18 @@ mod tests {
             .enable_all()
             .build()?;
         let load = || {
-            runtime.block_on(
-                RepositoryLoader::new(
-                    &anchor,
-                    endpoints.metadata.clone(),
-                    endpoints.targets.clone(),
+            runtime
+                .block_on(
+                    RepositoryLoader::new(
+                        &anchor,
+                        endpoints.metadata.clone(),
+                        endpoints.targets.clone(),
+                    )
+                    .transport(MirrorTransport::new(None).expect("default transfer limits"))
+                    .datastore(scratch.path())
+                    .load(),
                 )
-                .transport(MirrorTransport::new(None).expect("default transfer limits"))
-                .datastore(scratch.path())
-                .load(),
-            )
+                .map_err(anyhow::Error::from)
         };
         let verified = load()?;
         let identity = runtime.block_on(verified_identity(&verified, scratch.path()))?;

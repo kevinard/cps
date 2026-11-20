@@ -37,21 +37,21 @@ pub(super) enum LoaderPolicy {
 }
 
 impl LoaderPolicy {
-    pub fn pinned(id: &str) -> Self {
+    pub(super) fn pinned(id: &str) -> Self {
         Self::Pinned {
             default: id.to_owned(),
             preferred: None,
         }
     }
 
-    pub fn trial(base: &str, candidate: &str) -> Self {
+    pub(super) fn trial(base: &str, candidate: &str) -> Self {
         Self::Pinned {
             default: base.to_owned(),
             preferred: Some(candidate.to_owned()),
         }
     }
 
-    pub fn selected<'a>(&self, entries: &'a [BootEntry]) -> Option<&'a BootEntry> {
+    pub(super) fn selected<'a>(&self, entries: &'a [BootEntry]) -> Option<&'a BootEntry> {
         match self {
             Self::Automatic => entries
                 .iter()
@@ -73,7 +73,7 @@ impl LoaderPolicy {
     }
 
     /// Read the CPS selection. A missing file or `default` line selects nothing.
-    pub fn read(path: &Path) -> Result<Option<Self>> {
+    pub(super) fn read(path: &Path) -> Result<Option<Self>> {
         let Some(bytes) = read_regular(path)? else {
             return Ok(None);
         };
@@ -197,7 +197,7 @@ impl LoaderPolicy {
         Ok(content)
     }
 
-    pub fn write(&self, path: &Path) -> Result<()> {
+    pub(super) fn write(&self, path: &Path) -> Result<()> {
         let existing = read_regular(path)?;
         let existing = existing
             .as_deref()
@@ -257,7 +257,7 @@ pub(super) struct LoaderOverrides {
 impl LoaderOverrides {
     /// Reject firmware variables that would stall the boot menu or select a
     /// different entry than the CPS selection in loader.conf.
-    pub fn check(&self, policy: Option<&LoaderPolicy>) -> Result<()> {
+    pub(super) fn check(&self, policy: Option<&LoaderPolicy>) -> Result<()> {
         for (name, value, one_shot, clear) in [
             (
                 "LoaderConfigTimeout",
@@ -462,14 +462,14 @@ impl BootRoot {
         Ok(Self::Btrfs(btrfs.fsid.clone()))
     }
 
-    pub fn partuuid(&self) -> Result<&str> {
+    pub(crate) fn partuuid(&self) -> Result<&str> {
         match self {
             Self::Partition(uuid) => Ok(uuid),
             Self::Btrfs(_) => anyhow::bail!("expected a root PARTUUID"),
         }
     }
 
-    pub fn argument(&self) -> String {
+    pub(crate) fn argument(&self) -> String {
         match self {
             Self::Partition(uuid) => format!("PARTUUID={uuid}"),
             Self::Btrfs(uuid) => format!("UUID={uuid}"),

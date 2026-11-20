@@ -11,21 +11,21 @@ use crate::{
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FrozenPackage {
+pub(crate) struct FrozenPackage {
     pub version: Version,
     pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FreezeChange {
+pub(crate) struct FreezeChange {
     pub name: String,
     pub from: Option<FrozenPackage>,
     pub to: Option<FrozenPackage>,
 }
 
 /// Read committed package freezes without contacting a repository.
-pub fn list_freezes(root: &Path) -> Result<BTreeMap<String, FrozenPackage>> {
+pub(crate) fn list_freezes(root: &Path) -> Result<BTreeMap<String, FrozenPackage>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     Ok(image.state()?.settings.freezes)

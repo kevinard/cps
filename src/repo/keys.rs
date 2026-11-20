@@ -140,7 +140,7 @@ impl SigningKey {
 
 /// One or more signing key specifications: `PATH`, `file:PATH`, or
 /// `command:DESCRIPTOR`.
-pub trait KeySpecs {
+pub(crate) trait KeySpecs {
     fn key_specs(&self) -> Vec<&Path>;
 }
 

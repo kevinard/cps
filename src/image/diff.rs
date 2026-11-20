@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
-pub struct ImagePackage {
+pub(crate) struct ImagePackage {
     pub publisher: String,
     pub version: Version,
     pub manifest_sha256: String,
@@ -22,7 +22,7 @@ pub struct ImagePackage {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ImageMetadata {
+pub(crate) struct ImageMetadata {
     pub id: String,
     pub revision: u64,
     pub architecture: String,
@@ -37,7 +37,7 @@ pub struct ImageMetadata {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ImageChange<T> {
+pub(crate) struct ImageChange<T> {
     pub name: String,
     pub before: Option<T>,
     pub after: Option<T>,
@@ -45,10 +45,10 @@ pub struct ImageChange<T> {
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct ImagePath(Managed);
+pub(crate) struct ImagePath(Managed);
 
 #[derive(Debug, Serialize)]
-pub struct ImageDiff {
+pub(crate) struct ImageDiff {
     pub before: ImageMetadata,
     pub after: ImageMetadata,
     pub packages: Vec<ImageChange<ImagePackage>>,
@@ -133,7 +133,7 @@ fn changes<T: PartialEq>(
 }
 
 /// Compare the committed package state of two roots without reading payloads.
-pub fn image_diff(before: &Path, after: &Path, paths: bool) -> Result<ImageDiff> {
+pub(crate) fn image_diff(before: &Path, after: &Path, paths: bool) -> Result<ImageDiff> {
     let read = |root: &Path| -> Result<Snapshot> { Snapshot::read(&Image::open_query(root)?) };
     let before = read(before).with_context(|| format!("reading {}", before.display()))?;
     let after = read(after).with_context(|| format!("reading {}", after.display()))?;

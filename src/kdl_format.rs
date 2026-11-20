@@ -192,7 +192,7 @@ fn document(text: &str) -> Result<KdlDocument> {
         .map_err(|error: kdl::KdlError| anyhow::anyhow!("invalid KDL: {error:?}"))
 }
 
-pub fn parse_manifest(text: &str) -> Result<Manifest> {
+pub(crate) fn parse_manifest(text: &str) -> Result<Manifest> {
     parse_package(text, |_| Ok(false), None).map(|(manifest, _)| manifest)
 }
 
@@ -562,7 +562,7 @@ fn schema_header(version: u32, kind: &str) -> KdlNode {
     schema
 }
 
-pub fn manifest_text(manifest: &Manifest) -> String {
+pub(crate) fn manifest_text(manifest: &Manifest) -> String {
     let mut doc = KdlDocument::new();
     doc.nodes_mut()
         .push(schema_header(manifest.format, MANIFEST_KIND));
@@ -756,41 +756,6 @@ pub fn manifest_text(manifest: &Manifest) -> String {
     doc.nodes_mut().push(package);
     doc.autoformat();
     doc.to_string()
-}
-
-pub struct ImageConfig {
-    pub publisher: String,
-    pub repository: PathBuf,
-    pub trust_key: PathBuf,
-    pub arch: String,
-    pub policy: ImagePolicy,
-}
-
-pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
-    let ImageDefinition {
-        mut publishers,
-        arch,
-        policy,
-        release_profile,
-        image_id,
-        ..
-    } = read_image_definition(path)?;
-    ensure!(
-        image_id.is_none(),
-        "use create_configured_image for an explicit image-id"
-    );
-    ensure!(
-        publishers.len() == 1 && release_profile.is_none() && publishers[0].build_trust.is_none(),
-        "use create_configured_image for multiple publishers, a release profile, or build trust"
-    );
-    let publisher = publishers.pop().expect("one publisher");
-    Ok(ImageConfig {
-        publisher: publisher.name,
-        repository: publisher.repository,
-        trust_key: publisher.trust_key,
-        arch,
-        policy,
-    })
 }
 
 pub(crate) struct PublisherConfig {

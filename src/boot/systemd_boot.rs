@@ -4,10 +4,12 @@ mod manage;
 pub(super) mod policy;
 mod prune;
 mod uefi;
-pub use destroy::destroy_btrfs_boot_environment;
+pub(crate) use destroy::destroy_btrfs_boot_environment;
 pub(crate) use manage::validate_name as validate_environment_name;
-pub use manage::{mount_boot_environment, rename_boot_environment, unmount_boot_environment};
-pub use prune::{
+pub(crate) use manage::{
+    mount_boot_environment, rename_boot_environment, unmount_boot_environment,
+};
+pub(crate) use prune::{
     BootPruneReport, BootRemoval, TrialDiscard, discard_btrfs_trial, prune_btrfs_boot_environments,
 };
 
@@ -47,7 +49,7 @@ const NO_SELECTION: &str = "loader/loader.conf selects no CPS boot environment; 
 const ESP_MARGIN: u64 = 1024 * 1024;
 
 #[derive(Debug)]
-pub struct BootEnvironment {
+pub(crate) struct BootEnvironment {
     pub id: String,
     pub name: Option<String>,
     pub title: String,
@@ -104,7 +106,7 @@ fn inventory(esp: &Path, lock: &File, direct: bool) -> Result<Inventory> {
     })
 }
 
-pub fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
+pub(crate) fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let _lock = lock_esp(&esp, FlockOperation::LockShared)?;
     let Inventory {
@@ -440,7 +442,7 @@ pub(super) fn pending_trial(
     }))
 }
 
-pub struct Activation {
+pub(crate) struct Activation {
     /// Boot the root by this GPT partition instead of the Btrfs filesystem UUID.
     pub root_partuuid: Option<String>,
     pub kernel: String,
@@ -486,7 +488,7 @@ pub(super) struct BootFiles {
 }
 
 impl BootFiles {
-    pub fn open(image: &Image, state: &State, activation: &Activation) -> Result<Self> {
+    pub(super) fn open(image: &Image, state: &State, activation: &Activation) -> Result<Self> {
         if let Some(artifacts) = kernel::selected(&state.installed, &state.paths)? {
             ensure!(
                 activation.kernel == "boot/vmlinuz" && activation.initrd.is_none(),

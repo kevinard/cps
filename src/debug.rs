@@ -213,7 +213,7 @@ fn restore(stripped: &mut File, symbols: impl Read, output: &mut File) -> Result
 /// Restore an unstripped object or archive from its installed file and debug
 /// delta. The output must be a new path; both inputs remain untouched. Hashes
 /// bind the symbols to the exact stripped file and verify the restored bytes.
-pub fn restore_debug(stripped: &Path, symbols: &Path, output: &Path) -> Result<()> {
+pub(crate) fn restore_debug(stripped: &Path, symbols: &Path, output: &Path) -> Result<()> {
     let mut stripped = File::open(stripped)
         .with_context(|| format!("opening stripped file {}", stripped.display()))?;
     let symbols = File::open(symbols)

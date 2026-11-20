@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-pub fn init_publisher(output: &Path, publisher: &str) -> Result<()> {
+pub(crate) fn init_publisher(output: &Path, publisher: &str) -> Result<()> {
     validate_publisher(publisher)?;
     super::sign::publish_stage(output, |stage| {
         fs::set_permissions(stage, fs::Permissions::from_mode(0o700))?;

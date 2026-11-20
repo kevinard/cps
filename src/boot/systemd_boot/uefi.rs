@@ -38,7 +38,7 @@ pub(super) struct Firmware {
 }
 
 impl Firmware {
-    pub fn open(esp: &Path, locked_esp: &File) -> Result<Self> {
+    pub(super) fn open(esp: &Path, locked_esp: &File) -> Result<Self> {
         let dir = Path::new(EFIVARFS);
         let lock = File::open(dir).context("direct UEFI boot requires mounted efivarfs")?;
         ensure!(
@@ -92,7 +92,7 @@ impl Firmware {
         Ok(number)
     }
 
-    pub fn inventory(&self, entries: &mut [BootEntry]) -> Result<Option<LoaderPolicy>> {
+    pub(super) fn inventory(&self, entries: &mut [BootEntry]) -> Result<Option<LoaderPolicy>> {
         let mut default = None;
         let mut preferred = None;
         for entry in entries {
@@ -138,23 +138,23 @@ impl Firmware {
         Ok(default.map(|default| LoaderPolicy::Pinned { default, preferred }))
     }
 
-    pub fn armed_boot<'a>(&'a self, entry: Option<&'a BootEntry>) -> Result<&'a str> {
+    pub(super) fn armed_boot<'a>(&'a self, entry: Option<&'a BootEntry>) -> Result<&'a str> {
         if let Some(entry) = entry {
             return field(&entry.description, ARMED)?.context("missing UEFI trial boot identity");
         }
         Ok(&self.boot_id)
     }
 
-    pub fn can_arm(&self, entry: &BootEntry) -> Result<bool> {
+    pub(super) fn can_arm(&self, entry: &BootEntry) -> Result<bool> {
         Ok(is_trial(entry) && self.armed_boot(Some(entry))? == self.boot_id)
     }
 
-    pub fn require_no_next(&self) -> Result<()> {
+    pub(super) fn require_no_next(&self) -> Result<()> {
         ensure!(self.next.is_none(), "a firmware boot is already scheduled");
         Ok(())
     }
 
-    pub fn check_next(&self, entries: &[BootEntry], cancelling: bool) -> Result<()> {
+    pub(super) fn check_next(&self, entries: &[BootEntry], cancelling: bool) -> Result<()> {
         if let Some(next) = self.next {
             for entry in entries
                 .iter()
@@ -197,7 +197,7 @@ impl Firmware {
         Ok(())
     }
 
-    pub fn activate(&self, id: &str, trial: bool) -> Result<()> {
+    pub(super) fn activate(&self, id: &str, trial: bool) -> Result<()> {
         ensure!(
             boot_number("BootNext")? == self.next,
             "BootNext changed during activation"
@@ -231,11 +231,11 @@ impl Firmware {
 
     /// Create the firmware option of a known-good environment without
     /// changing the boot selection.
-    pub fn register(&self, id: &str) -> Result<()> {
+    pub(super) fn register(&self, id: &str) -> Result<()> {
         self.ensure_option(id).map(drop)
     }
 
-    pub fn rollback(&self, esp: &Path, id: &str, entries: &[BootEntry]) -> Result<()> {
+    pub(super) fn rollback(&self, esp: &Path, id: &str, entries: &[BootEntry]) -> Result<()> {
         self.check_next(entries, true)?;
         let target = self
             .option(id)?
@@ -272,7 +272,10 @@ impl Firmware {
         self.promote(target)
     }
 
-    pub fn running_trial<'a>(&self, entries: &'a [BootEntry]) -> Result<Option<&'a BootEntry>> {
+    pub(super) fn running_trial<'a>(
+        &self,
+        entries: &'a [BootEntry],
+    ) -> Result<Option<&'a BootEntry>> {
         for entry in entries
             .iter()
             .filter(|entry| is_trial(entry) || is_verified(entry))
@@ -287,7 +290,7 @@ impl Firmware {
         Ok(None)
     }
 
-    pub fn bless(&self, esp: &Path, entry: &BootEntry, parent: &BootEntry) -> Result<()> {
+    pub(super) fn bless(&self, esp: &Path, entry: &BootEntry, parent: &BootEntry) -> Result<()> {
         let number = self
             .option(&entry.id)?
             .context("missing UEFI trial boot option")?;
@@ -340,7 +343,7 @@ impl Firmware {
         Ok(())
     }
 
-    pub fn check_removal(&self, id: &str) -> Result<Option<u16>> {
+    pub(super) fn check_removal(&self, id: &str) -> Result<Option<u16>> {
         let number = self.option(id)?;
         self.check_references(id, number)?;
         if let Some(number) = number {
@@ -354,7 +357,7 @@ impl Firmware {
         Ok(number)
     }
 
-    pub fn remove(&self, id: &str) -> Result<()> {
+    pub(super) fn remove(&self, id: &str) -> Result<()> {
         if let Some(number) = self.check_removal(id)? {
             ensure!(
                 boot_number("BootNext")? != Some(number),
@@ -617,8 +620,10 @@ fn references_path(data: &[u8], expected: &str) -> Result<bool> {
             .try_into()?,
     ) as usize;
     let description = data[6..]
-        .chunks_exact(2)
-        .position(|c| c == [0, 0])
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .position(|c| c == &[0, 0])
         .context("unterminated firmware boot description")?;
     let start = 6 + 2 * (description + 1);
     let mut path = data

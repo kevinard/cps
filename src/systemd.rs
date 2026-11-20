@@ -33,7 +33,7 @@ pub(crate) enum Action {
 }
 
 impl Action {
-    pub fn kind(&self) -> &str {
+    pub(crate) fn kind(&self) -> &str {
         match self {
             Self::Sysusers(_) => "sysusers",
             Self::Tmpfiles(_) => "tmpfiles",
@@ -41,13 +41,13 @@ impl Action {
         }
     }
 
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             Self::Sysusers(name) | Self::Tmpfiles(name) | Self::Preset(name) => name,
         }
     }
 
-    pub fn path(&self) -> String {
+    pub(crate) fn path(&self) -> String {
         let directory = match self {
             Self::Sysusers(_) => "usr/lib/sysusers.d",
             Self::Tmpfiles(_) => "usr/lib/tmpfiles.d",
@@ -56,7 +56,7 @@ impl Action {
         format!("{directory}/{}", self.name())
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let name = self.name();
         let valid_suffix = match self {
             Self::Sysusers(_) | Self::Tmpfiles(_) => name.ends_with(".conf"),

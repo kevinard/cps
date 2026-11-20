@@ -19,7 +19,8 @@ None of them builds, schedules, or publishes. Run `cps build` and
 
 `cps recipe order` reads every build recipe in the given files and
 directories and prints the recipe paths in an order where each recipe comes
-after the recipes it needs. `--explain` adds the reasons under each recipe.
+after the recipes it needs. `--explain` adds, under each recipe, the
+packages it builds and the reasons for its place.
 
 ```sh
 cps recipe order packaging
@@ -28,8 +29,11 @@ cps recipe order --explain packaging/runtime packaging/cps-build.kdl.in
 
 ```text
 packaging/runtime/libseccomp.build.kdl.in
+    builds system/libseccomp
 packaging/runtime/sqlite.build.kdl.in
+    builds system/sqlite
 packaging/cps-build.kdl.in
+    builds system/cps
     after packaging/runtime/libseccomp.build.kdl.in: system/cps requires system/libseccomp
     after packaging/runtime/sqlite.build.kdl.in: system/cps requires system/sqlite
 ```

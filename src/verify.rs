@@ -18,7 +18,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct Finding {
+pub(crate) struct Finding {
     pub is_error: bool,
     pub message: String,
 }
@@ -48,7 +48,7 @@ impl Checked {
 }
 
 /// Check an image, hashing every managed regular file.
-pub fn verify(path: &Path) -> Result<Vec<Finding>> {
+pub(crate) fn verify(path: &Path) -> Result<Vec<Finding>> {
     verify_image(&Image::open_query(path)?)
 }
 
@@ -61,12 +61,12 @@ pub fn verify(path: &Path) -> Result<Vec<Finding>> {
 /// recorded when it last hashed the file is not read again. Use full
 /// verification to detect changes made below the filesystem, such as an
 /// edited block device, or by someone who resets the system clock.
-pub fn verify_quick(path: &Path) -> Result<Vec<Finding>> {
+pub(crate) fn verify_quick(path: &Path) -> Result<Vec<Finding>> {
     verify_image_quick(&Image::open_query(path)?)
 }
 
 /// Audit the entire installed managed ELF closure without executing its binaries.
-pub fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
+pub(crate) fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
@@ -86,7 +86,7 @@ pub fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
     runtime::audit_installed(&image.root, &paths, &state.settings.arch, library_dirs)
 }
 
-pub fn verify_selected(
+pub(crate) fn verify_selected(
     root: &Path,
     packages: &[String],
     paths: &[String],
@@ -161,7 +161,7 @@ pub(crate) fn selected_paths<'a>(
     Ok(selected)
 }
 
-pub fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
+pub(crate) fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     image

@@ -16,20 +16,20 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
-pub enum ConfigChoice {
+pub(crate) enum ConfigChoice {
     Local,
     Vendor,
 }
 
 #[derive(Debug)]
-pub struct ConfigUpdate {
+pub(crate) struct ConfigUpdate {
     pub path: String,
     pub revision: u64,
     pub vendor_copy: String,
     pub vendor_available: bool,
 }
 
-pub fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
+pub(crate) fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let state = image.state()?;
@@ -58,7 +58,7 @@ pub fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
 
 /// Copy the local and verified vendor inputs for a pending configuration diff.
 /// Both outputs must be empty and the vendor output must be readable for hashing.
-pub fn config_diff_inputs(
+pub(crate) fn config_diff_inputs(
     root: &Path,
     path: &str,
     local: &mut File,

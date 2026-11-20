@@ -37,7 +37,7 @@ struct FatEntry {
 }
 
 impl Esp {
-    pub fn read(
+    pub(super) fn read(
         disk: &OfflineDisk,
         partition: &PartitionExtent,
         work: &Path,
@@ -150,7 +150,7 @@ impl Esp {
     }
 
     /// Refuse an ESP that already holds CPS boot files.
-    pub fn require_no_boot_files(&self) -> Result<()> {
+    pub(super) fn require_no_boot_files(&self) -> Result<()> {
         if self.has_directory("", "EFI")? {
             for name in ["cps", "cps-uefi"] {
                 ensure!(
@@ -163,7 +163,7 @@ impl Esp {
     }
 
     /// Copy out the systemd-boot binaries that firmware can start.
-    pub fn read_loaders(&self) -> Result<()> {
+    pub(super) fn read_loaders(&self) -> Result<()> {
         if !self.has_directory("", "EFI")? {
             return Ok(());
         }
@@ -258,7 +258,7 @@ impl Esp {
             .collect())
     }
 
-    pub fn write<'a>(
+    pub(super) fn write<'a>(
         &self,
         disk: &OfflineDisk,
         partition: &PartitionExtent,

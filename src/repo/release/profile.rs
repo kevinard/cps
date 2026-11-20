@@ -22,11 +22,16 @@ use super::{
 };
 
 /// Materialize a signed profile's catalog set before advancing its primary pointer.
-pub fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
+#[cfg(test)]
+pub(crate) fn sync_profile(config: &Path, index_only: bool) -> Result<String> {
     sync_profile_with_payloads(config, ProfilePayloads::from_index_only(index_only), None)
 }
 
-pub fn sync_profile_for_image(config: &Path, index_only: bool, root: &Path) -> Result<String> {
+pub(crate) fn sync_profile_for_image(
+    config: &Path,
+    index_only: bool,
+    root: &Path,
+) -> Result<String> {
     sync_profile_with_payloads(
         config,
         ProfilePayloads::from_index_only(index_only),
@@ -35,7 +40,7 @@ pub fn sync_profile_for_image(config: &Path, index_only: bool, root: &Path) -> R
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub enum ProfilePayloads {
+pub(crate) enum ProfilePayloads {
     All,
     IndexOnly,
     Composition,
@@ -52,7 +57,7 @@ impl ProfilePayloads {
 }
 
 /// Verify and cache a signed profile with the requested payload coverage.
-pub fn sync_profile_with_payloads(
+pub(crate) fn sync_profile_with_payloads(
     config: &Path,
     payloads: ProfilePayloads,
     image: Option<&Path>,

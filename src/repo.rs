@@ -37,7 +37,7 @@ const PUBLISH_POLICY: &str = "publish-policy.kdl";
 
 mod git_snapshots;
 mod keys;
-pub use keys::{KeySpecs, trust::TrustDraft};
+pub(crate) use keys::{KeySpecs, trust::TrustDraft};
 use keys::{
     PublicKey, Signers,
     trust::{self, Freshness, TrustChain},
@@ -45,15 +45,15 @@ use keys::{
 pub(crate) use keys::{Purpose, SigningKey};
 pub(crate) mod profiles;
 mod rebuild;
-pub mod release;
+pub(crate) mod release;
 mod shards;
 mod source_archive;
 pub(crate) use git_snapshots::{assign_git_version, lock_snapshot_series};
 pub(crate) use rebuild::build_recipe;
-pub use rebuild::{export_rebuild_inputs, verify_rebuild};
+pub(crate) use rebuild::{export_rebuild_inputs, verify_rebuild};
 pub(crate) use shards::{CATALOG_ROOT_LIMIT, SHARD_LIMIT, SHARD_OBJECTS};
 use shards::{Shard, shard_of, shard_of_id};
-pub use source_archive::{archive_build_sources, fetch_build_sources};
+pub(crate) use source_archive::{archive_build_sources, fetch_build_sources};
 
 /// A publisher catalog: the signed root fields and the records of the shards
 /// that were loaded. Catalogs read for clients are always complete.
@@ -133,7 +133,7 @@ pub(crate) struct ReleaseProfile {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReleaseAdvisory {
+pub(crate) struct ReleaseAdvisory {
     pub id: String,
     pub package: String,
     pub publisher: String,
@@ -1263,14 +1263,14 @@ struct Retired {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Published {
+pub(crate) struct Published {
     pub sha256: String,
     pub manifest: Manifest,
     document: String,
 }
 
 impl Published {
-    pub fn verify(&self) -> Result<()> {
+    pub(crate) fn verify(&self) -> Result<()> {
         self.manifest.validate(true)?;
         ensure!(
             parse_manifest(&self.document)? == self.manifest,
@@ -1297,7 +1297,7 @@ fn load_manifest(repo: &Path, sha256: String) -> Result<Published> {
     })
 }
 
-pub struct Snapshot {
+pub(crate) struct Snapshot {
     pub sha256: String,
     pub packages: Vec<Published>,
     pub(crate) builds: BuildEvidence,
@@ -1504,7 +1504,7 @@ fn verify_package_attestation(bytes: &[u8], trust: &BuildTrust, package: &Publis
 }
 
 #[derive(Default)]
-pub struct BuildAudit {
+pub(crate) struct BuildAudit {
     pub verified: usize,
     pub failures: Vec<String>,
     pub(crate) receipts: Vec<BuildReceipt>,
@@ -1559,13 +1559,13 @@ fn read_key_der(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Read a raw Ed25519 public key from a DER file, such as a builder key.
-pub fn read_key(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_key(path: &Path) -> Result<Vec<u8>> {
     parse_public_key(&read_key_der(path)?).map(<[u8]>::to_vec)
 }
 
 /// Read a publisher's pinned trust root file. Its signatures are checked
 /// against its own root keys and its canonical bytes are returned.
-pub fn read_trust_root(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_trust_root(path: &Path) -> Result<Vec<u8>> {
     trust::read_pinned(path)
 }
 
@@ -1581,13 +1581,13 @@ pub(crate) fn trust_root_publisher(pinned: &[u8]) -> Result<String> {
 }
 
 /// The publisher that a pinned trust root file names.
-pub fn pinned_publisher(path: &Path) -> Result<String> {
+pub(crate) fn pinned_publisher(path: &Path) -> Result<String> {
     trust_root_publisher(&read_trust_root(path)?)
         .with_context(|| format!("reading the publisher of {}", path.display()))
 }
 
 /// The publisher whose trust root a publication repository holds.
-pub fn repository_publisher(repo: &Path) -> Result<String> {
+pub(crate) fn repository_publisher(repo: &Path) -> Result<String> {
     let store = trust::Store::read(repo)?
         .with_context(|| format!("repository {} has no trust root", repo.display()))?;
     Ok(store.verified.current().publisher.clone())
@@ -1924,7 +1924,12 @@ fn decode_root(
     Ok(catalog)
 }
 
-pub fn read_attestation(repo: &Path, publisher: &str, key: &Path, id: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_attestation(
+    repo: &Path,
+    publisher: &str,
+    key: &Path,
+    id: &str,
+) -> Result<Vec<u8>> {
     let (catalog, _) = read_current_catalog(repo, publisher, &read_trust_root(key)?)?;
     let hash = catalog
         .package_record(id)
@@ -1933,7 +1938,7 @@ pub fn read_attestation(repo: &Path, publisher: &str, key: &Path, id: &str) -> R
     read_object(repo, "attestations", hash, ATTESTATION_LIMIT)
 }
 
-pub fn snapshot(
+pub(crate) fn snapshot(
     repo: &Path,
     publisher: &str,
     key: &[u8],
@@ -2307,7 +2312,7 @@ pub(crate) fn take_profile(
     })
 }
 
-pub fn list_obsoletions(repo: &Path, publisher: &str, key: &Path) -> Result<Vec<String>> {
+pub(crate) fn list_obsoletions(repo: &Path, publisher: &str, key: &Path) -> Result<Vec<String>> {
     let index = catalog_index(repo, publisher, &read_trust_root(key)?, None)?;
     Ok(index
         .obsoletions
@@ -2431,7 +2436,8 @@ fn prepare_objects(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn publish(
+#[cfg(test)]
+pub(crate) fn publish(
     repo: &Path,
     proto: &Path,
     recipe: &Path,
@@ -2442,7 +2448,7 @@ pub fn publish(
 }
 
 /// Publish many manifests from one proto tree in a single signed catalog update.
-pub fn publish_batch(
+pub(crate) fn publish_batch(
     repo: &Path,
     proto: &Path,
     recipes: &[PathBuf],
@@ -2488,7 +2494,11 @@ fn exact_publisher(id: &str) -> Result<&str> {
         .context("expected a full package ID with publisher and version")
 }
 
-pub fn withdraw_package(repo: &Path, key: &(impl KeySpecs + ?Sized), id: &str) -> Result<()> {
+pub(crate) fn withdraw_package(
+    repo: &Path,
+    key: &(impl KeySpecs + ?Sized),
+    id: &str,
+) -> Result<()> {
     let publisher = exact_publisher(id)?;
     let key = Publication::open(repo, key)?;
     Root::open(repo)?;
@@ -2521,7 +2531,7 @@ pub fn withdraw_package(repo: &Path, key: &(impl KeySpecs + ?Sized), id: &str) -
 /// Publish a successor of the exact current catalog that carries the
 /// repository's newest trust root history, signed by its catalog keys. After
 /// a trust root rotation this is how clients learn of revoked keys.
-pub fn resign_catalog(
+pub(crate) fn resign_catalog(
     repo: &Path,
     publisher: &str,
     key: &(impl KeySpecs + ?Sized),
@@ -2549,7 +2559,7 @@ fn lock_trust(repo: &Path) -> Result<(File, Option<trust::Store>)> {
 
 /// Create a repository's first trust root with one key as its only root key
 /// and its only catalog key: a 1-of-1 setup. Returns the trust root's path.
-pub fn init_trust(
+pub(crate) fn init_trust(
     repo: &Path,
     publisher: &str,
     key: &Path,
@@ -2578,19 +2588,19 @@ pub fn init_trust(
 }
 
 /// The unsigned payload of the repository's next trust root version.
-pub fn draft_trust(repo: &Path, change: &TrustDraft<'_>) -> Result<Vec<u8>> {
+pub(crate) fn draft_trust(repo: &Path, change: &TrustDraft<'_>) -> Result<Vec<u8>> {
     let store = trust::Store::read(repo)?;
     trust::draft(store.as_ref().map(|store| store.verified.current()), change)?.encode()
 }
 
 /// Detached signatures over a trust root draft, one JSON object per line.
-pub fn sign_trust(draft: &Path, keys: &(impl KeySpecs + ?Sized)) -> Result<Vec<u8>> {
+pub(crate) fn sign_trust(draft: &Path, keys: &(impl KeySpecs + ?Sized)) -> Result<Vec<u8>> {
     trust::sign_detached(&trust::read_draft(draft)?, &Signers::open(keys)?)
 }
 
 /// Combine a draft with detached signatures and signing keys, verify it as
 /// the repository's next trust root version, and store it.
-pub fn commit_trust(
+pub(crate) fn commit_trust(
     repo: &Path,
     draft: &Path,
     signatures: &[PathBuf],
@@ -2616,7 +2626,7 @@ pub fn commit_trust(
 }
 
 /// Draft, sign, and store the next trust root version in one step.
-pub fn rotate_trust(
+pub(crate) fn rotate_trust(
     repo: &Path,
     change: &TrustDraft<'_>,
     keys: &(impl KeySpecs + ?Sized),
@@ -2653,11 +2663,11 @@ pub(crate) fn renew_trust(repo: &Path, key: &Path, days: i64) -> Result<bool> {
 }
 
 /// Describe a trust root file, or a repository's newest trust root version.
-pub fn show_trust(path: &Path) -> Result<String> {
+pub(crate) fn show_trust(path: &Path) -> Result<String> {
     trust::describe(path)
 }
 
-pub fn list_withdrawals(
+pub(crate) fn list_withdrawals(
     repo: &Path,
     publisher: &str,
     key: &Path,
@@ -2670,7 +2680,8 @@ pub fn list_withdrawals(
         .collect())
 }
 
-pub fn publish_bundle(
+#[cfg(test)]
+pub(crate) fn publish_bundle(
     repo: &Path,
     bundle: &Path,
     key: &(impl KeySpecs + ?Sized),
@@ -2681,12 +2692,13 @@ pub fn publish_bundle(
 }
 
 #[derive(Clone)]
-pub struct BuildWitness {
+pub(crate) struct BuildWitness {
     pub key: PathBuf,
     pub attestation: PathBuf,
 }
 
-pub fn publish_witnessed_bundle(
+#[cfg(test)]
+pub(crate) fn publish_witnessed_bundle(
     repo: &Path,
     bundle: &Path,
     key: &(impl KeySpecs + ?Sized),
@@ -2705,7 +2717,7 @@ pub fn publish_witnessed_bundle(
     )
 }
 
-pub fn publish_witnessed_bundle_with_sources(
+pub(crate) fn publish_witnessed_bundle_with_sources(
     repo: &Path,
     bundle: &Path,
     key: &(impl KeySpecs + ?Sized),
@@ -2773,7 +2785,8 @@ fn verify_publication(
     Ok((bundle.subdir("proto")?, manifests, verified))
 }
 
-pub fn publish_release(
+#[cfg(test)]
+pub(crate) fn publish_release(
     repo: &Path,
     key: &(impl KeySpecs + ?Sized),
     document: &Path,
@@ -2781,7 +2794,8 @@ pub fn publish_release(
     publish_release_with_sources(repo, key, document, None)
 }
 
-pub fn publish_release_with_sources(
+#[cfg(test)]
+pub(crate) fn publish_release_with_sources(
     repo: &Path,
     key: &(impl KeySpecs + ?Sized),
     document: &Path,
@@ -2791,7 +2805,7 @@ pub fn publish_release_with_sources(
 }
 
 #[derive(Clone, Copy)]
-pub enum ReleaseMode<'a> {
+pub(crate) enum ReleaseMode<'a> {
     Publish,
     Prepare,
     RequireCandidate(&'a str),
@@ -2810,7 +2824,7 @@ impl ReleaseMode<'_> {
     }
 }
 
-pub fn publish_release_with_mode(
+pub(crate) fn publish_release_with_mode(
     repo: &Path,
     key: &(impl KeySpecs + ?Sized),
     document: &Path,
@@ -3264,7 +3278,7 @@ pub(crate) fn search_file_index(
 }
 
 /// Enable signed per-shard file lookup indexes for this publisher's catalogs.
-pub fn enable_file_index(
+pub(crate) fn enable_file_index(
     repo: &Path,
     publisher: &str,
     key: &(impl KeySpecs + ?Sized),
@@ -3286,7 +3300,7 @@ pub fn enable_file_index(
 }
 
 /// Widen an admitted composition's rollout while retaining every other release field.
-pub fn widen_rollout(
+pub(crate) fn widen_rollout(
     repo: &Path,
     publisher: &str,
     key: &(impl KeySpecs + ?Sized),
@@ -3332,7 +3346,7 @@ pub fn widen_rollout(
 /// that name them still resolve while their objects are kept. A tombstone keeps
 /// the manifest digest: the ID cannot be republished, and installed copies
 /// still verify against later catalogs.
-pub fn prune_withdrawals(
+pub(crate) fn prune_withdrawals(
     repo: &Path,
     publisher: &str,
     key: &(impl KeySpecs + ?Sized),
@@ -3661,7 +3675,7 @@ fn store_blob(
     Ok(FileDigest { sha256: hash, size })
 }
 
-pub fn stage_blob(repo: &Path, node: &Node, destination: &mut File) -> Result<()> {
+pub(crate) fn stage_blob(repo: &Path, node: &Node, destination: &mut File) -> Result<()> {
     let Node::File { sha256, .. } = node else {
         anyhow::bail!("expected a file payload");
     };
@@ -3672,7 +3686,7 @@ pub fn stage_blob(repo: &Path, node: &Node, destination: &mut File) -> Result<()
     copy_payload(&source, node, destination)
 }
 
-pub fn canonical_repo(repo: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_repo(repo: &Path) -> Result<PathBuf> {
     fs::canonicalize(repo).with_context(|| format!("opening repository {}", repo.display()))
 }
 

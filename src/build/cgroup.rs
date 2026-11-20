@@ -24,7 +24,7 @@ pub(super) struct Cgroup {
 }
 
 impl Cgroup {
-    pub fn create(limits: &CgroupLimits) -> Result<Self> {
+    pub(super) fn create(limits: &CgroupLimits) -> Result<Self> {
         let path = fs::canonicalize(&limits.root)
             .with_context(|| format!("opening delegated cgroup {}", limits.root.display()))?;
         let parent = Root::open(&path)?;
@@ -70,11 +70,11 @@ impl Cgroup {
         Ok(group)
     }
 
-    pub fn processes(&self) -> Result<File> {
+    pub(super) fn processes(&self) -> Result<File> {
         self.control("cgroup.procs")
     }
 
-    pub fn killer(&self) -> Result<File> {
+    pub(super) fn killer(&self) -> Result<File> {
         self.control("cgroup.kill")
     }
 
@@ -83,7 +83,7 @@ impl Cgroup {
             .with_context(|| format!("opening build cgroup {name}; enable cpu, memory and pids on the delegated parent"))
     }
 
-    pub fn oom_killed(&self) -> Result<bool> {
+    pub(super) fn oom_killed(&self) -> Result<bool> {
         let events = fs::read_to_string(self.path.join("memory.events"))?;
         Ok(events
             .lines()
@@ -91,7 +91,7 @@ impl Cgroup {
             .any(|count| count.trim() != "0"))
     }
 
-    pub fn finish(&self) -> Result<()> {
+    pub(super) fn finish(&self) -> Result<()> {
         kill(&mut self.killer()?).context("terminating remaining build cgroup tasks")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

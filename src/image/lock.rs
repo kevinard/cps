@@ -26,7 +26,7 @@ const BUNDLE_REPOSITORIES: &str = "repositories";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImageLock {
+pub(crate) struct ImageLock {
     format: u32,
     kind: LockKind,
     pub(crate) architecture: String,
@@ -67,7 +67,7 @@ struct LockedPackage {
 }
 
 /// Capture the installed package composition and its signed catalog pins.
-pub fn capture_image_lock(root: &Path) -> Result<ImageLock> {
+pub(crate) fn capture_image_lock(root: &Path) -> Result<ImageLock> {
     let image = Image::open_query(root)?;
     capture(&image).map(|(lock, _)| lock)
 }
@@ -146,7 +146,7 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
 }
 
 /// Export the locked composition and the verified objects needed for offline provisioning.
-pub fn export_image_bundle(root: &Path, output: &Path) -> Result<()> {
+pub(crate) fn export_image_bundle(root: &Path, output: &Path) -> Result<()> {
     let image = Image::open_query(root)?;
     let (lock, state) = capture(&image)?;
     ensure!(
@@ -211,7 +211,7 @@ pub fn export_image_bundle(root: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn read_image_lock(path: &Path) -> Result<ImageLock> {
+pub(crate) fn read_image_lock(path: &Path) -> Result<ImageLock> {
     let load = || -> Result<ImageLock> {
         let bytes = read_limited(File::open(path)?, CATALOG_LIMIT)?;
         let lock: ImageLock = serde_json::from_slice(&bytes)?;
@@ -428,13 +428,21 @@ impl ImageLock {
 }
 
 /// Initialize a fresh root with the local trust configuration and locked profile.
-pub fn create_image_from_lock(path: &Path, config: &Path, lock: &ImageLock) -> Result<String> {
+pub(crate) fn create_image_from_lock(
+    path: &Path,
+    config: &Path,
+    lock: &ImageLock,
+) -> Result<String> {
     let config = crate::kdl_format::read_image_definition(config)?;
     create_locked(path, config, lock, false)
 }
 
 /// Use the bundle's repositories with publisher keys and policy from local configuration.
-pub fn create_image_from_bundle(path: &Path, config: &Path, bundle: &Path) -> Result<String> {
+pub(crate) fn create_image_from_bundle(
+    path: &Path,
+    config: &Path,
+    bundle: &Path,
+) -> Result<String> {
     let mut config = crate::kdl_format::read_image_definition(config)?;
     let bundle = fs::canonicalize(bundle)?;
     let lock = read_image_lock(&bundle.join(BUNDLE_LOCK))?;

@@ -37,7 +37,7 @@ use crate::{
 const FILESYSTEM: &str = "root.btrfs";
 
 /// What `cps image disk` turns into a bootable disk.
-pub struct BootImage<'a> {
+pub(crate) struct BootImage<'a> {
     /// Directory that becomes the Btrfs top-level volume.
     pub volume: &'a Path,
     /// Inactive CPS root in the volume directory, for the root subvolume.
@@ -57,7 +57,7 @@ pub struct BootImage<'a> {
 }
 
 /// Write a Btrfs root and its known-good boot entry to a new copy of a GPT disk.
-pub fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
+pub(crate) fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
     let epoch = source_date_epoch()?;
     let partuuid = canonical_partuuid(spec.root_partuuid)?;
     let activation = Activation {

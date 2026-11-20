@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[derive(Debug, Serialize)]
-pub struct HistoryEntry {
+pub(crate) struct HistoryEntry {
     pub plan_id: String,
     pub revision: u64,
     pub details: TransactionDetails,
@@ -19,7 +19,7 @@ pub struct HistoryEntry {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct TransactionDetails {
+pub(crate) struct TransactionDetails {
     pub base_image: String,
     pub base_revision: u64,
     pub request: Request,
@@ -37,12 +37,12 @@ pub struct TransactionDetails {
     pub kernel_release: Option<String>,
 }
 
-pub fn transaction_history(root: &Path, limit: u32) -> Result<Vec<HistoryEntry>> {
+pub(crate) fn transaction_history(root: &Path, limit: u32) -> Result<Vec<HistoryEntry>> {
     ensure!(limit > 0, "history limit must be positive");
     read(root, None, limit)
 }
 
-pub fn transaction_details(root: &Path, plan_id: &str) -> Result<HistoryEntry> {
+pub(crate) fn transaction_details(root: &Path, plan_id: &str) -> Result<HistoryEntry> {
     validate_digest(plan_id).context("invalid transaction plan digest")?;
     read(root, Some(plan_id), 1)?
         .pop()

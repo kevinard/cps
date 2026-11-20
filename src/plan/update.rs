@@ -13,7 +13,7 @@ use crate::{
 
 /// The signed target profile is outside this image's rollout cohort.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct PhasedUpdateDeferred {
+pub(crate) struct PhasedUpdateDeferred {
     pub publisher: String,
     pub profile: String,
     pub catalog: String,
@@ -107,7 +107,7 @@ pub(super) fn check_rollout(
 
 /// A newer catalog version outside the actionable upgrade plan.
 #[derive(Debug, Serialize)]
-pub struct HeldBackUpdate {
+pub(crate) struct HeldBackUpdate {
     pub name: String,
     pub publisher: String,
     pub installed: Version,

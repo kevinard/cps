@@ -30,7 +30,7 @@ const READ_ONLY: u64 = 1 << 1;
 /// Space kept free beyond the plan's payloads and kernel artifacts for metadata.
 const STAGING_RESERVE: u64 = 32 * 1024 * 1024;
 /// Nested subvolumes that systemd creates on Btrfs. Staged roots get an empty directory.
-pub const DEFAULT_EXCLUDED_SUBVOLUMES: [&str; 2] = ["var/lib/machines", "var/lib/portables"];
+pub(super) const DEFAULT_EXCLUDED_SUBVOLUMES: [&str; 2] = ["var/lib/machines", "var/lib/portables"];
 
 // Linux UAPI btrfs_ioctl_vol_args_v2. The reserved union is zeroed.
 #[repr(C)]
@@ -54,7 +54,7 @@ const _: () = assert!(size_of::<VolumeArgs>() == 4096);
 /// Publish a verified read-only snapshot inside a new capture directory.
 ///
 /// Nested subvolumes at the default paths and at `excluded` become empty directories.
-pub fn capture_boot_environment(
+pub(crate) fn capture_boot_environment(
     source: &Path,
     output: &Path,
     excluded: &[String],
@@ -75,7 +75,7 @@ enum Snapshot<'a> {
 }
 
 /// Stage a saved plan in a new writable Btrfs snapshot of an inactive baseline.
-pub fn stage_btrfs_boot_environment(
+pub(crate) fn stage_btrfs_boot_environment(
     source: &Path,
     output: &Path,
     plan: &Plan,

@@ -26,17 +26,17 @@ use crate::{
 pub(crate) const OBJECTS: &str = "sha256";
 
 /// Fetch missing pinned inputs over HTTPS and verify every object in the recipe.
-pub fn fetch_sources(recipe: &Path, cache: &Path) -> Result<usize> {
+pub(crate) fn fetch_sources(recipe: &Path, cache: &Path) -> Result<usize> {
     cache_sources(recipe, cache, None, true)
 }
 
 /// Prefer local recipe inputs and fetch missing ones over HTTPS.
-pub fn fetch_sources_with_local(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
+pub(crate) fn fetch_sources_with_local(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
     cache_sources(recipe, cache, Some(Root::open(from)?), true)
 }
 
 /// Verify and cache pinned inputs from a local directory, offline.
-pub fn import_sources(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
+pub(crate) fn import_sources(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
     cache_sources(recipe, cache, Some(Root::open(from)?), false)
 }
 

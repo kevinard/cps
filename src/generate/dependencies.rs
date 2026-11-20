@@ -35,7 +35,7 @@ type Package<'a> = (&'a str, &'a Version, &'a str);
 /// shows them with their providers in the pinned catalogs and suggests
 /// path-based `require` lines for what it cannot generate: ELF interpreters,
 /// shebang interpreters, path-named libraries, and facet or variant content.
-pub fn suggest_dependencies(
+pub(crate) fn suggest_dependencies(
     proto: &Path,
     manifest: &Path,
     config: &Path,
@@ -46,7 +46,7 @@ pub fn suggest_dependencies(
 }
 
 /// Check that every detected external provider has a direct manifest requirement.
-pub fn check_manifest_dependencies(
+pub(crate) fn check_manifest_dependencies(
     proto: &Path,
     manifest: &Path,
     config: &Path,
@@ -57,7 +57,7 @@ pub fn check_manifest_dependencies(
 }
 
 /// Print the declarations that publication would generate from a prototype.
-pub fn generated_dependencies(proto: &Path, manifest: &Path) -> Result<String> {
+pub(crate) fn generated_dependencies(proto: &Path, manifest: &Path) -> Result<String> {
     let manifest = read_manifest(manifest)?;
     let root = Root::open(proto)?;
     Ok(

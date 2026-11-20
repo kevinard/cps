@@ -41,7 +41,7 @@ pub(super) struct DiskStage<'a> {
 }
 
 impl<'a> DiskStage<'a> {
-    pub fn new(source: &Path, output: &'a Path) -> Result<Self> {
+    pub(super) fn new(source: &Path, output: &'a Path) -> Result<Self> {
         let name = output
             .file_name()
             .context("expected a new disk file name")?;
@@ -100,11 +100,11 @@ impl<'a> DiskStage<'a> {
         })
     }
 
-    pub fn directory(&self) -> PathBuf {
+    pub(super) fn directory(&self) -> PathBuf {
         Root::fd_path(self.stage.as_file())
     }
 
-    pub fn publish(self) -> Result<()> {
+    pub(super) fn publish(self) -> Result<()> {
         let checked = self.disk.file.metadata()?;
         let published = self.stage.file(DISK)?.metadata()?;
         ensure!(
@@ -188,7 +188,7 @@ impl OfflineDisk {
     }
 
     /// Read the GPT using the device's logical block size, or 512 bytes for an image file.
-    pub fn from_sized_file(file: File, bytes: u64) -> Result<Self> {
+    pub(super) fn from_sized_file(file: File, bytes: u64) -> Result<Self> {
         let sector = logical_sector_size(&file)?;
         let partitions = read_partitions(&file, bytes, sector)?;
         Ok(Self {
@@ -199,7 +199,7 @@ impl OfflineDisk {
     }
 
     /// The logical block size used for GPT LBAs on this disk.
-    pub fn sector_size(&self) -> u64 {
+    pub(super) fn sector_size(&self) -> u64 {
         self.sector
     }
 
@@ -221,7 +221,7 @@ impl OfflineDisk {
     }
 
     /// The disk's only EFI System Partition.
-    pub fn esp(&self) -> Result<&PartitionExtent> {
+    pub(super) fn esp(&self) -> Result<&PartitionExtent> {
         let mut found = self
             .partitions
             .values()
@@ -237,11 +237,11 @@ impl OfflineDisk {
     }
 
     /// The Linux filesystem partition that will hold the root.
-    pub fn root(&self, partuuid: &str) -> Result<&PartitionExtent> {
+    pub(super) fn root(&self, partuuid: &str) -> Result<&PartitionExtent> {
         self.partition(&canonical_partuuid(partuuid)?, LINUX_FILESYSTEM)
     }
 
-    pub fn check_device_extents(
+    pub(super) fn check_device_extents(
         &self,
         root: &str,
         target: (u64, u64),
@@ -255,11 +255,11 @@ impl OfflineDisk {
         self.check_esp_extent(esp)
     }
 
-    pub fn check_esp_extent(&self, esp: (u64, u64)) -> Result<()> {
+    pub(super) fn check_esp_extent(&self, esp: (u64, u64)) -> Result<()> {
         self.esp_uuid_at(esp).map(|_| ())
     }
 
-    pub fn esp_uuid_at(&self, esp: (u64, u64)) -> Result<&str> {
+    pub(super) fn esp_uuid_at(&self, esp: (u64, u64)) -> Result<&str> {
         self.partitions
             .iter()
             .find_map(|(uuid, part)| {
@@ -269,7 +269,7 @@ impl OfflineDisk {
             .context("mounted filesystem does not match a GPT EFI System Partition")
     }
 
-    pub fn read_partition(&self, part: &PartitionExtent, output: &mut File) -> Result<()> {
+    pub(super) fn read_partition(&self, part: &PartitionExtent, output: &mut File) -> Result<()> {
         let mut disk = &self.file;
         disk.seek(SeekFrom::Start(part.offset))?;
         let read = io::copy(&mut disk.take(part.bytes), output)?;
@@ -280,7 +280,7 @@ impl OfflineDisk {
         Ok(())
     }
 
-    pub fn write_partition(&self, part: &PartitionExtent, payload: &File) -> Result<String> {
+    pub(super) fn write_partition(&self, part: &PartitionExtent, payload: &File) -> Result<String> {
         write_extent(&self.file, part.offset, part.bytes, payload)
     }
 }

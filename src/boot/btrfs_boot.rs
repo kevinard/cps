@@ -150,14 +150,14 @@ pub(super) struct BtrfsRecord {
 
 impl BtrfsRecord {
     /// Whether `root` is the root of this record's subvolume, wherever it is mounted.
-    pub fn describes(&self, root: &Root) -> Result<bool> {
+    pub(super) fn describes(&self, root: &Root) -> Result<bool> {
         let info = subvolume_info(root)?;
         Ok(info.treeid == self.subvolid
             && uuid_string(&info.uuid) == self.uuid
             && uuid_string(&filesystem_info(root)?.fsid) == self.fsid)
     }
 
-    pub fn parse(entry: &str, options: &str) -> Result<Option<Self>> {
+    pub(super) fn parse(entry: &str, options: &str) -> Result<Option<Self>> {
         let values = [
             field(entry, FSID)?,
             field(entry, UUID)?,
@@ -202,14 +202,14 @@ impl BtrfsRecord {
         }))
     }
 
-    pub fn render(&self) -> String {
+    pub(super) fn render(&self) -> String {
         format!(
             "{FSID}{}\n{UUID}{}\n{SUBVOLUME}{}\n{PATH}{}\n",
             self.fsid, self.uuid, self.subvolid, self.path
         )
     }
 
-    pub fn same_subvolume(&self, other: &Self) -> bool {
+    pub(super) fn same_subvolume(&self, other: &Self) -> bool {
         self.fsid == other.fsid
             && (self.subvolid == other.subvolid
                 || self.uuid == other.uuid
@@ -224,7 +224,7 @@ pub(super) struct BtrfsVolume {
 }
 
 impl BtrfsVolume {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub(super) fn open(path: &Path) -> Result<Self> {
         let path = fs::canonicalize(path).context("opening the Btrfs top-level volume")?;
         let root = Root::open(&path)?;
         ensure!(
@@ -267,7 +267,7 @@ impl BtrfsVolume {
         Ok(device)
     }
 
-    pub fn record(&self, root: &Root, path: &Path) -> Result<BtrfsRecord> {
+    pub(super) fn record(&self, root: &Root, path: &Path) -> Result<BtrfsRecord> {
         let path = path
             .strip_prefix(&self.path)
             .context("the root must be beneath --btrfs-volume")?
@@ -298,14 +298,19 @@ impl BtrfsVolume {
         })
     }
 
-    pub fn boot_root(&self, partuuid: Option<&str>) -> Result<BootRoot> {
+    pub(super) fn boot_root(&self, partuuid: Option<&str>) -> Result<BootRoot> {
         match partuuid {
             Some(uuid) => Ok(BootRoot::Partition(canonical_partuuid(uuid)?)),
             None => Ok(BootRoot::Btrfs(self.fsid.clone())),
         }
     }
 
-    pub fn check_boot_device(&self, esp: &Path, locked: &File, root: &BootRoot) -> Result<()> {
+    pub(super) fn check_boot_device(
+        &self,
+        esp: &Path,
+        locked: &File,
+        root: &BootRoot,
+    ) -> Result<()> {
         match root {
             BootRoot::Partition(uuid) => {
                 mounted_root_disk(esp, locked, &self.single_device()?, uuid)?;
@@ -321,7 +326,7 @@ impl BtrfsVolume {
         Ok(())
     }
 
-    pub fn check_fsid(&self, fsid: &str) -> Result<()> {
+    pub(super) fn check_fsid(&self, fsid: &str) -> Result<()> {
         ensure!(
             self.has_fsid(fsid),
             "the boot entry belongs to a different Btrfs filesystem"
@@ -329,17 +334,27 @@ impl BtrfsVolume {
         Ok(())
     }
 
-    pub fn has_fsid(&self, fsid: &str) -> bool {
+    pub(super) fn has_fsid(&self, fsid: &str) -> bool {
         fsid == self.fsid
     }
 
-    pub fn verify(&self, record: &BtrfsRecord, image_id: &str, revision: u64) -> Result<Image> {
+    pub(super) fn verify(
+        &self,
+        record: &BtrfsRecord,
+        image_id: &str,
+        revision: u64,
+    ) -> Result<Image> {
         let image = self.open_image(record, image_id, revision)?;
         check_image_integrity(&image)?;
         Ok(image)
     }
 
-    pub fn open_image(&self, record: &BtrfsRecord, image_id: &str, revision: u64) -> Result<Image> {
+    pub(super) fn open_image(
+        &self,
+        record: &BtrfsRecord,
+        image_id: &str,
+        revision: u64,
+    ) -> Result<Image> {
         let root = self.open_registered(record, &super::entry_id(image_id, revision))?;
         let image = Image::open_query_root(root)?;
         let settings = image.settings()?;
@@ -350,7 +365,7 @@ impl BtrfsVolume {
         Ok(image)
     }
 
-    pub fn open_registered(&self, record: &BtrfsRecord, id: &str) -> Result<Root> {
+    pub(super) fn open_registered(&self, record: &BtrfsRecord, id: &str) -> Result<Root> {
         self.check_fsid(&record.fsid)?;
         let root = self.root.subvolume(&record.path)?;
         ensure!(
@@ -364,7 +379,7 @@ impl BtrfsVolume {
         Ok(root)
     }
 
-    pub fn destroy(&self, record: &BtrfsRecord, root: &Root) -> Result<()> {
+    pub(super) fn destroy(&self, record: &BtrfsRecord, root: &Root) -> Result<()> {
         ensure!(
             self.record(root, &self.path.join(&record.path))? == *record,
             "Btrfs subvolume changed before destruction"
@@ -373,7 +388,7 @@ impl BtrfsVolume {
     }
 
     /// The filesystem's default subvolume ID, which the kernel refuses to delete.
-    pub fn default_subvolume(&self) -> Result<u64> {
+    pub(super) fn default_subvolume(&self) -> Result<u64> {
         // The root tree's directory item named "default" points at the default subvolume.
         const ROOT_TREE: u64 = 1;
         const ROOT_TREE_DIR: u64 = 6;
@@ -401,12 +416,12 @@ impl BtrfsVolume {
         default_from_search(&args.buf, args.key.nr_items)
     }
 
-    pub fn running_parent(&self) -> Result<Option<String>> {
+    pub(super) fn running_parent(&self) -> Result<Option<String>> {
         Ok(self.running()?.and_then(|(_, parent)| parent))
     }
 
     /// The registered entry ID of the running root on this volume, and its recorded parent.
-    pub fn running(&self) -> Result<Option<(String, Option<String>)>> {
+    pub(super) fn running(&self) -> Result<Option<(String, Option<String>)>> {
         let root = Root::open(Path::new("/"))?;
         if fstatfs(root.as_file())?.f_type != libc::BTRFS_SUPER_MAGIC
             || uuid_string(&filesystem_info(&root)?.fsid) != self.fsid
@@ -436,31 +451,31 @@ impl BtrfsVolume {
     }
 }
 
-pub fn activate_btrfs_boot_environment(
-    root: &Path,
-    volume: &Path,
-    esp: &Path,
-    activation: &Activation,
-) -> Result<String> {
-    let volume = BtrfsVolume::open(volume)?;
-    systemd_boot::activate(root, esp, activation, &volume, BootMode::Split)
-}
-
 impl Activation {
     /// Activate a Btrfs root, using the mounted filesystem UUID when no PARTUUID is supplied.
-    pub fn activate_btrfs(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
+    pub(crate) fn activate_btrfs(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
         let volume = BtrfsVolume::open(volume)?;
         systemd_boot::activate(root, esp, self, &volume, BootMode::Split)
     }
 
     /// Build and sign a UKI for the exact Btrfs subvolume being activated.
-    pub fn activate_btrfs_uki(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
+    pub(crate) fn activate_btrfs_uki(
+        &self,
+        root: &Path,
+        volume: &Path,
+        esp: &Path,
+    ) -> Result<String> {
         let volume = BtrfsVolume::open(volume)?;
         systemd_boot::activate(root, esp, self, &volume, BootMode::Uki)
     }
 
     /// Activate a signed UKI using the firmware's one-shot boot selection.
-    pub fn activate_btrfs_uefi(&self, root: &Path, volume: &Path, esp: &Path) -> Result<String> {
+    pub(crate) fn activate_btrfs_uefi(
+        &self,
+        root: &Path,
+        volume: &Path,
+        esp: &Path,
+    ) -> Result<String> {
         let volume = BtrfsVolume::open(volume)?;
         systemd_boot::activate(root, esp, self, &volume, BootMode::Uefi)
     }
@@ -501,7 +516,7 @@ pub(crate) fn bless_uefi(esp: &Path, volume: &Path) -> Result<Option<String>> {
     systemd_boot::bless_uefi(esp, &BtrfsVolume::open(volume)?)
 }
 
-pub fn rollback_btrfs_boot_environment(
+pub(crate) fn rollback_btrfs_boot_environment(
     esp: &Path,
     volume: &Path,
     id: Option<&str>,
@@ -511,7 +526,7 @@ pub fn rollback_btrfs_boot_environment(
 }
 
 /// Preview rollback from the configured default without changing boot selection.
-pub fn preview_btrfs_rollback(
+pub(crate) fn preview_btrfs_rollback(
     esp: &Path,
     volume: &Path,
     id: Option<&str>,

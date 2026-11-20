@@ -22,7 +22,7 @@ use super::{parent, read_templates};
 pub(crate) const ARCHIVE: &str = "git.tar";
 
 #[derive(Clone, Copy, Debug)]
-pub enum GitSnapshotRef<'a> {
+pub(crate) enum GitSnapshotRef<'a> {
     Branch(&'a str),
     Tag(&'a str),
     Commit(&'a str),
@@ -37,7 +37,7 @@ impl GitSnapshotRef<'_> {
     }
 
     /// Describe the source recorded in the snapshot manifest.
-    pub fn provenance(self, commit: &str) -> String {
+    pub(crate) fn provenance(self, commit: &str) -> String {
         match self {
             Self::Branch(branch) => format!("{branch}@{commit}"),
             Self::Tag(tag) => format!("tag:{tag}@{commit}"),
@@ -46,27 +46,8 @@ impl GitSnapshotRef<'_> {
     }
 }
 
-/// Prepare a pinned build recipe for the selected branch tip and reserve its package version.
-pub fn prepare_git_snapshot(
-    recipe_path: &Path,
-    git_repo: &OsStr,
-    branch: &str,
-    repo: &Path,
-    trust_key: &Path,
-    output: &Path,
-) -> Result<(String, String)> {
-    prepare_git_snapshot_ref(
-        recipe_path,
-        git_repo,
-        GitSnapshotRef::Branch(branch),
-        repo,
-        trust_key,
-        output,
-    )
-}
-
 /// Prepare a pinned build recipe for a branch, tag, or full commit ID.
-pub fn prepare_git_snapshot_ref(
+pub(crate) fn prepare_git_snapshot_ref(
     recipe_path: &Path,
     git_repo: &OsStr,
     source: GitSnapshotRef<'_>,

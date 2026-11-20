@@ -166,13 +166,13 @@ fn state_digest(state: &StateDelta) -> Result<String> {
 }
 
 #[derive(Debug, Serialize)]
-pub struct TransactionStatus {
+pub(crate) struct TransactionStatus {
     pub revision: u64,
     pub pending: Option<PendingTransaction>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct PendingTransaction {
+pub(crate) struct PendingTransaction {
     pub plan_id: String,
     pub target_revision: u64,
     pub files_ready: bool,
@@ -184,7 +184,7 @@ pub struct PendingTransaction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TransactionPhase {
+pub(crate) enum TransactionPhase {
     Planned,
     PayloadValidated,
     Blocked,
@@ -200,7 +200,7 @@ pub enum TransactionPhase {
 }
 
 #[derive(Debug, Serialize)]
-pub struct TransactionProgress {
+pub(crate) struct TransactionProgress {
     pub plan_id: String,
     pub phase: TransactionPhase,
     /// Committed revision, or the recorded transaction revision if already applied.
@@ -209,7 +209,7 @@ pub struct TransactionProgress {
     pub boot_environment: Option<String>,
 }
 
-pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
+pub(crate) fn transaction_status(path: &Path) -> Result<TransactionStatus> {
     let image = Image::open_query(path)?;
     let settings = image.settings()?;
     let pending = image
@@ -239,7 +239,7 @@ pub fn transaction_status(path: &Path) -> Result<TransactionStatus> {
 }
 
 /// Report progress for the exact saved plan, optionally checking cached payloads now.
-pub fn transaction_progress(
+pub(crate) fn transaction_progress(
     path: &Path,
     plan: &Plan,
     validate: bool,
@@ -293,7 +293,7 @@ struct OwnedPayload<'a> {
 
 type PublisherPayloads<'a> = (&'a Publisher, BTreeMap<&'a str, OwnedPayload<'a>>);
 
-pub fn apply(path: &Path, plan: &Plan) -> Result<u64> {
+pub(crate) fn apply(path: &Path, plan: &Plan) -> Result<u64> {
     apply_with(path, plan, |_| {})
 }
 
@@ -308,12 +308,12 @@ impl std::fmt::Display for PublisherFetchError {
 
 impl std::error::Error for PublisherFetchError {}
 
-pub fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
+pub(crate) fn fetch_plan(path: &Path, plan: &Plan) -> Result<usize> {
     fetch_plan_with_archives(path, plan, &[])
 }
 
 /// Fetch verified plan payloads and recover exact historical pins from provisioned archives.
-pub fn fetch_plan_with_archives(
+pub(crate) fn fetch_plan_with_archives(
     path: &Path,
     plan: &Plan,
     archive_caches: &[(String, PathBuf)],
@@ -420,7 +420,7 @@ fn check_plan_revision(settings: &Settings, plan: &Plan) -> Result<()> {
 }
 
 /// Check a saved plan against cached payloads using disposable image-local staging.
-pub fn validate_plan(path: &Path, plan: &Plan) -> Result<()> {
+pub(crate) fn validate_plan(path: &Path, plan: &Plan) -> Result<()> {
     let image = Image::open_query(path)?;
     validate_in_image(&image, plan)
 }
@@ -647,12 +647,12 @@ fn changed_paths(plan: &Plan) -> BTreeSet<&str> {
         .collect()
 }
 
-pub fn resume_transaction(path: &Path) -> Result<Option<u64>> {
+pub(crate) fn resume_transaction(path: &Path) -> Result<Option<u64>> {
     resume_image(Image::open_for_apply(path)?, false, None)
 }
 
 /// Restore damaged managed paths from verified local payloads and resume.
-pub fn repair_pending_transaction(path: &Path) -> Result<Option<u64>> {
+pub(crate) fn repair_pending_transaction(path: &Path) -> Result<Option<u64>> {
     resume_image(Image::open_for_apply(path)?, false, Some(&BTreeSet::new()))
 }
 
@@ -776,7 +776,7 @@ fn resume_pending(
 /// committed revision, which the abort leaves unchanged. Returns that
 /// revision, or `None` without a pending transaction. With `fetch`, missing
 /// package payloads are downloaded from each publisher's mirror first.
-pub fn abort_transaction(path: &Path, fetch: bool) -> Result<Option<u64>> {
+pub(crate) fn abort_transaction(path: &Path, fetch: bool) -> Result<Option<u64>> {
     abort_image(Image::open_for_apply(path)?, false, fetch, |_| {})
 }
 

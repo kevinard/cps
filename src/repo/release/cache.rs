@@ -174,21 +174,21 @@ fn keep_profile_pins(state: &Root, catalogs: &mut BTreeSet<String>) -> Result<()
 }
 
 #[derive(Default)]
-pub struct CacheRetention<'a> {
+pub(crate) struct CacheRetention<'a> {
     pub catalogs: &'a [String],
     pub images: &'a [PathBuf],
     pub plans: &'a [Plan],
 }
 
 #[derive(Debug)]
-pub struct PruneReport {
+pub(crate) struct PruneReport {
     pub blobs: Vec<(String, u64)>,
     pub bytes: u64,
     pub registered_roots: Vec<RetainedRoot>,
 }
 
 #[derive(Debug)]
-pub struct RetainedRoot {
+pub(crate) struct RetainedRoot {
     pub id: String,
     pub package_payloads: usize,
     pub catalog: Option<String>,
@@ -214,7 +214,8 @@ pub(super) fn record_retention(state: &Path, release: &StagedRelease) -> Result<
 }
 
 /// Preview or remove payloads outside the current, retained and explicitly kept sets.
-pub fn prune_payloads(
+#[cfg(test)]
+pub(crate) fn prune_payloads(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,
@@ -225,7 +226,7 @@ pub fn prune_payloads(
 }
 
 /// Also keep payloads from the exact selected packages in saved image locks.
-pub fn prune_payloads_with_locks(
+pub(crate) fn prune_payloads_with_locks(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,

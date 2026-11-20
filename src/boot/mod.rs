@@ -31,19 +31,16 @@ use crate::{
 pub(crate) use btrfs::{
     backup_running_btrfs, excluded_subvolumes, is_read_only, make_writable, stage_running_btrfs,
 };
-pub use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
-pub use btrfs_boot::{
-    activate_btrfs_boot_environment, preview_btrfs_rollback, rollback_btrfs_boot_environment,
-};
+pub(crate) use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
 pub(crate) use btrfs_boot::{
     bless_uefi, pending_trial, with_registered_images, with_running_environment,
 };
-pub use etc_merge::{
-    EtcConflict, EtcMergeReport, last_report as last_etc_merge,
-    saved_versions as saved_etc_versions,
-};
-pub use offline::{BootImage, create_boot_image};
-pub use systemd_boot::{
+pub(crate) use btrfs_boot::{preview_btrfs_rollback, rollback_btrfs_boot_environment};
+#[cfg(test)]
+pub(crate) use etc_merge::last_report as last_etc_merge;
+pub(crate) use etc_merge::{EtcMergeReport, saved_versions as saved_etc_versions};
+pub(crate) use offline::{BootImage, create_boot_image};
+pub(crate) use systemd_boot::{
     Activation, BootEnvironment, BootPruneReport, BootRemoval, TrialDiscard,
     destroy_btrfs_boot_environment, list_boot_environments, mount_boot_environment,
     rename_boot_environment, unmount_boot_environment,

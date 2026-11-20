@@ -17,7 +17,7 @@ use crate::{
 
 /// Why prune removes an environment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BootRemoval {
+pub(crate) enum BootRemoval {
     /// An interrupted destruction left a retirement record.
     Retiring,
     /// The trial used up its boot attempts or was cancelled.
@@ -29,7 +29,7 @@ pub enum BootRemoval {
 }
 
 #[derive(Debug, Default)]
-pub struct BootPruneReport {
+pub(crate) struct BootPruneReport {
     /// Environments removed, or that a dry run would remove, oldest first.
     pub removed: Vec<(String, BootRemoval)>,
     /// Environments that could not be removed, with the reason.
@@ -37,7 +37,7 @@ pub struct BootPruneReport {
 }
 
 #[derive(Debug)]
-pub struct TrialDiscard {
+pub(crate) struct TrialDiscard {
     /// The pending or running trial whose selection was cancelled.
     pub cancelled: Option<String>,
     /// The cancelled trial is the running system and stays until reboot.
@@ -55,7 +55,7 @@ pub struct TrialDiscard {
 /// `staged` names the root that the caller's transaction stages into. A
 /// trial booting that root is an interrupted activation that the caller
 /// resumes, so it stays while its activation can still complete.
-pub fn prune_btrfs_boot_environments(
+pub(crate) fn prune_btrfs_boot_environments(
     esp: &Path,
     volume_path: &Path,
     keep: Option<usize>,
@@ -111,7 +111,7 @@ fn remove(
 }
 
 /// Cancel the pending or running trial, then remove every failed trial that is not running.
-pub fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscard> {
+pub(crate) fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscard> {
     let volume = BtrfsVolume::open(volume_path)?;
     let running = volume.running()?.map(|(id, _)| id);
     let pending = {

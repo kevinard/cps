@@ -28,7 +28,7 @@ use crate::{
     model::{Node, copy_payload, digest_reader, validate_path},
 };
 
-pub struct Root(File);
+pub(crate) struct Root(File);
 
 pub(crate) enum ReplacementSource<'a> {
     Staged(File),
@@ -177,7 +177,7 @@ impl DirSyncs {
 }
 
 impl Root {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let fd = open(
             path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -187,7 +187,7 @@ impl Root {
         Ok(Self(fd.into()))
     }
 
-    pub fn fd_path(file: &File) -> PathBuf {
+    pub(crate) fn fd_path(file: &File) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
     }
 
@@ -212,7 +212,7 @@ impl Root {
         }
     }
 
-    pub fn offline_path(&self) -> Result<PathBuf> {
+    pub(crate) fn offline_path(&self) -> Result<PathBuf> {
         let image = self.0.metadata()?;
         let host = fs::metadata("/")?;
         ensure!(
@@ -228,7 +228,7 @@ impl Root {
         Ok(path)
     }
 
-    pub fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&self) -> Result<()> {
         Ok(rustix::fs::syncfs(&self.0)?)
     }
 
@@ -243,7 +243,7 @@ impl Root {
         .into())
     }
 
-    pub fn dir(&self, path: &str) -> Result<File> {
+    pub(crate) fn dir(&self, path: &str) -> Result<File> {
         validate_path(path)?;
         Ok(self.open_relative(path, OFlags::RDONLY | OFlags::DIRECTORY)?)
     }
@@ -336,14 +336,14 @@ impl Root {
         Ok(())
     }
 
-    pub fn file(&self, path: &str) -> Result<File> {
+    pub(crate) fn file(&self, path: &str) -> Result<File> {
         validate_path(path)?;
         let file = self.open_relative(path, OFlags::RDONLY | OFlags::NONBLOCK)?;
         ensure!(file.metadata()?.is_file(), "{path} is not a regular file");
         Ok(file)
     }
 
-    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.file(path)?.read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -359,7 +359,7 @@ impl Root {
         }
     }
 
-    pub fn inspect(&self, path: &str) -> Result<Option<Node>> {
+    pub(crate) fn inspect(&self, path: &str) -> Result<Option<Node>> {
         validate_path(path)?;
         self.inspect_inner(path)
             .with_context(|| format!("inspecting {path}"))
@@ -526,7 +526,7 @@ impl Root {
         Ok(file)
     }
 
-    pub fn replace(
+    pub(crate) fn replace(
         &self,
         path: &str,
         node: &Node,
@@ -759,7 +759,7 @@ impl Root {
         Ok(())
     }
 
-    pub fn remove_file(&self, path: &str) -> Result<()> {
+    pub(crate) fn remove_file(&self, path: &str) -> Result<()> {
         let mut syncs = DirSyncs::default();
         self.remove_file_deferred(path, &mut syncs)?;
         self.sync_dirs(&mut syncs, None)
@@ -831,7 +831,7 @@ impl Root {
         Ok(())
     }
 
-    pub fn remove_empty_dir(&self, path: &str, syncs: &mut DirSyncs) -> Result<bool> {
+    pub(crate) fn remove_empty_dir(&self, path: &str, syncs: &mut DirSyncs) -> Result<bool> {
         validate_path(path)?;
         let entry = match self.open_relative(path, OFlags::PATH | OFlags::DIRECTORY) {
             Ok(entry) => entry,
@@ -861,7 +861,7 @@ impl Root {
         Ok(())
     }
 
-    pub fn repair_directory(&self, path: &str, before: &Node, after: &Node) -> Result<bool> {
+    pub(crate) fn repair_directory(&self, path: &str, before: &Node, after: &Node) -> Result<bool> {
         let Node::Dir { mode: old_mode, .. } = *before else {
             anyhow::bail!("expected directory metadata at {path}");
         };

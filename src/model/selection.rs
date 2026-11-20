@@ -26,11 +26,11 @@ static NO_VARIANTS: BTreeMap<String, String> = BTreeMap::new();
 static NO_PACKAGE_FACETS: PackageFacets = BTreeMap::new();
 
 /// Per-package facet rules: package name or `prefix/*` glob to facet pattern to rule.
-pub type PackageFacets = BTreeMap<String, BTreeMap<String, PackageFacet>>;
+pub(crate) type PackageFacets = BTreeMap<String, BTreeMap<String, PackageFacet>>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackageFacet {
+pub(crate) struct PackageFacet {
     pub value: bool,
     /// Also apply the rule to the installed dependency closure of the package.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -129,7 +129,7 @@ fn best<'r, V: Copy + 'r>(
 /// The rule that decided a facet value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
-pub enum FacetSource {
+pub(crate) enum FacetSource {
     /// A per-package override, written `PACKAGE:FACET`.
     Package { rule: String },
     /// A per-package override applied with its dependencies, reached from `root`.
@@ -504,7 +504,7 @@ impl Resolved<'_> {
 
 /// The facet and variant policy of an image, as configured or recorded in a lock.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ImagePolicy {
+pub(crate) struct ImagePolicy {
     pub facets: BTreeMap<String, bool>,
     pub package_facets: PackageFacets,
     pub variants: BTreeMap<String, String>,
@@ -534,7 +534,12 @@ impl ImagePolicy {
     }
 
     /// Add one `[PACKAGE:]FACET` rule, refusing duplicates.
-    pub fn insert_facet(&mut self, key: &str, value: bool, with_dependencies: bool) -> Result<()> {
+    pub(crate) fn insert_facet(
+        &mut self,
+        key: &str,
+        value: bool,
+        with_dependencies: bool,
+    ) -> Result<()> {
         let inserted = match parse_facet_key(key)? {
             (None, facet) => {
                 ensure!(!with_dependencies, "{key} is not a per-package facet rule");
@@ -667,7 +672,7 @@ pub(crate) fn validate_policy(
 
 impl ImagePolicy {
     /// Add one `NAME=VALUE` variant, refusing duplicates and the arch variant.
-    pub fn insert_variant(&mut self, entry: &str) -> Result<()> {
+    pub(crate) fn insert_variant(&mut self, entry: &str) -> Result<()> {
         let (name, value) = entry
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("expected NAME=VALUE"))?;

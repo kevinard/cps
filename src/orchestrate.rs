@@ -42,7 +42,7 @@ struct Recipe {
 
 /// A recipe in build order with the recipes it follows and why.
 #[derive(Debug)]
-pub struct QueuedRecipe {
+pub(crate) struct QueuedRecipe {
     pub recipe: PathBuf,
     pub packages: Vec<String>,
     pub after: Vec<(PathBuf, String)>,
@@ -50,7 +50,7 @@ pub struct QueuedRecipe {
 
 /// Recipes in dependency order, with diagnostics for recipes read only in part.
 #[derive(Debug)]
-pub struct BuildOrder {
+pub(crate) struct BuildOrder {
     pub recipes: Vec<QueuedRecipe>,
     pub warnings: Vec<String>,
 }
@@ -58,7 +58,7 @@ pub struct BuildOrder {
 /// Order the recipes found under `paths` so that each recipe follows the
 /// recipes producing its toolchain packages and the runtime dependencies of
 /// its own packages.
-pub fn build_order(paths: &[PathBuf]) -> Result<BuildOrder> {
+pub(crate) fn build_order(paths: &[PathBuf]) -> Result<BuildOrder> {
     let (recipes, warnings) = read_recipes(paths)?;
     let graph = Graph::new(&recipes)?;
     let order = graph.order(&recipes)?;
@@ -449,7 +449,7 @@ impl Graph {
 
 /// One package version that changed, and how its capabilities changed.
 #[derive(Debug)]
-pub struct ChangedPackage {
+pub(crate) struct ChangedPackage {
     pub id: String,
     pub previous: Option<String>,
     pub removed: Vec<String>,
@@ -458,7 +458,7 @@ pub struct ChangedPackage {
 
 /// A package to rebuild, with each reason and its recipe when known.
 #[derive(Debug)]
-pub struct Rebuild {
+pub(crate) struct Rebuild {
     pub id: String,
     pub reasons: Vec<String>,
     /// Whether it requires a capability that the change removed, such as a
@@ -468,7 +468,7 @@ pub struct Rebuild {
 }
 
 #[derive(Debug)]
-pub struct RebuildPlan {
+pub(crate) struct RebuildPlan {
     pub changed: Vec<ChangedPackage>,
     pub rebuilds: Vec<Rebuild>,
     /// Recipes of the rebuilt packages, in build order.
@@ -484,7 +484,7 @@ struct Offered<'a> {
 
 /// List the packages and recipes that must be rebuilt after the `changed`
 /// packages, from the signed dependency summaries of pinned catalogs.
-pub fn rebuild_plan(
+pub(crate) fn rebuild_plan(
     config: &Path,
     pins: &[String],
     changed: &[String],
@@ -692,7 +692,7 @@ pub fn rebuild_plan(
 /// The pins that `cps recipe repin` refreshes. Each field selects one kind
 /// of pin; the others stay as written.
 #[derive(Debug, Default)]
-pub struct RepinRequest {
+pub(crate) struct RepinRequest {
     /// New toolchain catalog digests, each `PUBLISHER=SHA256`.
     pub catalogs: Vec<String>,
     /// Publisher trust root files whose SHA-256 becomes the `key-sha256` of
@@ -710,7 +710,7 @@ pub struct RepinRequest {
 /// One rewritten pin, such as `toolchain seed catalog` or
 /// `source busybox-1.38.0.tar.bz2 size`.
 #[derive(Debug, PartialEq, Eq)]
-pub struct PinChange {
+pub(crate) struct PinChange {
     pub pin: String,
     pub from: String,
     pub to: String,
@@ -718,7 +718,7 @@ pub struct PinChange {
 
 /// A recipe whose pins changed.
 #[derive(Debug)]
-pub struct RepinnedRecipe {
+pub(crate) struct RepinnedRecipe {
     pub recipe: PathBuf,
     pub changes: Vec<PinChange>,
     /// The digest of the rewritten recipe, for publish-policy approvals.
@@ -727,7 +727,7 @@ pub struct RepinnedRecipe {
 }
 
 #[derive(Debug, Default)]
-pub struct RepinReport {
+pub(crate) struct RepinReport {
     pub recipes: Vec<RepinnedRecipe>,
     /// Pins that could not be checked, such as a source found in no directory.
     pub warnings: Vec<String>,
@@ -853,7 +853,7 @@ fn file_pin(path: &Path) -> Result<(i128, String)> {
 /// Refresh the selected pins of every recipe under `paths`, keeping
 /// comments and formatting. With `write` false nothing is written, which
 /// serves both dry runs and staleness checks.
-pub fn repin_recipes(
+pub(crate) fn repin_recipes(
     paths: &[PathBuf],
     request: &RepinRequest,
     write: bool,

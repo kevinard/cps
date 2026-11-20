@@ -317,7 +317,7 @@ fn intact(path: &Path, name: &str, length: u64, sha256: &str, verified: &Verifie
 }
 
 /// Update a replica of `source` at `output`. Returns a summary line.
-pub fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String> {
+pub(crate) fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String> {
     let anchor = read_tuf_root(tuf_root)?;
     let name = output
         .file_name()

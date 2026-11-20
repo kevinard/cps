@@ -73,7 +73,7 @@ pub(crate) struct DormantConfig {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Settings {
+pub(crate) struct Settings {
     pub format: u32,
     pub id: String,
     pub revision: u64,
@@ -115,7 +115,7 @@ pub(crate) fn publisher_generation_is_initial(generation: &u64) -> bool {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct BootParent {
+pub(crate) struct BootParent {
     pub id: String,
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,7 +244,7 @@ impl Settings {
         Ok(())
     }
 
-    pub fn directory(&self) -> Node {
+    pub(crate) fn directory(&self) -> Node {
         Node::Dir {
             mode: 0o755,
             uid: self.uid,
@@ -254,7 +254,7 @@ impl Settings {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Publisher {
+pub(crate) struct Publisher {
     pub name: String,
     pub repo: PathBuf,
     pub key: Vec<u8>,
@@ -405,7 +405,7 @@ impl Publisher {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Installed {
+pub(crate) struct Installed {
     pub published: Published,
     pub explicit: bool,
 }
@@ -422,7 +422,7 @@ impl Installed {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Managed {
+pub(crate) struct Managed {
     pub node: Node,
     pub owners: BTreeSet<String>,
     pub preserve: bool,
@@ -432,7 +432,7 @@ pub struct Managed {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct State {
+pub(crate) struct State {
     pub settings: Settings,
     #[serde(rename = "publisher")]
     pub(crate) publishers: Publishers,
@@ -447,7 +447,7 @@ pub struct State {
 /// Publishers cannot change in a transaction, so the delta omits them.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct StateDelta {
+pub(crate) struct StateDelta {
     pub settings: Settings,
     /// New or changed packages, or `null` for removed packages.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -630,7 +630,7 @@ fn save_file_records(
     Ok(())
 }
 
-pub struct Image {
+pub(crate) struct Image {
     db: Connection,
     pub root: Root,
     pub(crate) state_dir: Root,
@@ -661,7 +661,7 @@ fn new_identity() -> Result<String> {
     ))
 }
 
-pub fn create_image(
+pub(crate) fn create_image(
     path: &Path,
     repo: &Path,
     publisher: &str,
@@ -680,12 +680,13 @@ pub fn create_image(
     )
 }
 
-pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
+#[cfg(test)]
+pub(crate) fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
     create_configured_image_at(path, config, None, None)
 }
 
 /// Initialize a configured image at an explicit historical or candidate catalog.
-pub fn create_configured_image_at(
+pub(crate) fn create_configured_image_at(
     path: &Path,
     config: &Path,
     catalog: Option<&str>,
@@ -929,7 +930,7 @@ fn decode_rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<BTreeM
 }
 
 impl Image {
-    pub fn open(path: &Path, exclusive: bool) -> Result<Self> {
+    pub(crate) fn open(path: &Path, exclusive: bool) -> Result<Self> {
         Self::open_database(
             Root::open(path)?,
             exclusive,
@@ -1067,7 +1068,7 @@ impl Image {
         Ok(settings)
     }
 
-    pub fn state(&self) -> Result<State> {
+    pub(crate) fn state(&self) -> Result<State> {
         let settings = self.settings()?;
         let publishers = self.publishers()?;
         ensure!(
@@ -1143,7 +1144,7 @@ impl Image {
         })
     }
 
-    pub fn fork_for_boot(&self, parent: BootParent) -> Result<Settings> {
+    pub(crate) fn fork_for_boot(&self, parent: BootParent) -> Result<Settings> {
         self.require_clean()?;
         let mut settings = self.settings()?;
         ensure!(
@@ -1214,7 +1215,7 @@ impl Image {
         )
     }
 
-    pub fn stage(&self) -> Result<Root> {
+    pub(crate) fn stage(&self) -> Result<Root> {
         self.state_dir.subdir("stage")
     }
 
@@ -1225,7 +1226,7 @@ impl Image {
         builds::read(&self.db, manifest)
     }
 
-    pub fn pending<T: DeserializeOwned>(&self) -> Result<Option<T>> {
+    pub(crate) fn pending<T: DeserializeOwned>(&self) -> Result<Option<T>> {
         let record = self
             .db
             .query_row("SELECT data FROM pending WHERE id=1", [], |row| {
@@ -1237,7 +1238,7 @@ impl Image {
             .transpose()
     }
 
-    pub fn require_clean(&self) -> Result<()> {
+    pub(crate) fn require_clean(&self) -> Result<()> {
         let pending: bool =
             self.db
                 .query_row("SELECT EXISTS(SELECT 1 FROM pending)", [], |row| row.get(0))?;
@@ -1253,7 +1254,7 @@ impl Image {
         catalogs::verify(&self.db, state)
     }
 
-    pub fn record_pending(
+    pub(crate) fn record_pending(
         &mut self,
         data: &impl Serialize,
         next: &State,
@@ -1307,7 +1308,7 @@ impl Image {
         Ok(records)
     }
 
-    pub fn update_pending(&self, data: &impl Serialize) -> Result<()> {
+    pub(crate) fn update_pending(&self, data: &impl Serialize) -> Result<()> {
         let changed = self.db.execute(
             "UPDATE pending SET data=?1 WHERE id=1",
             [serde_json::to_string(data)?],
@@ -1316,7 +1317,7 @@ impl Image {
         Ok(())
     }
 
-    pub fn applied(&self, plan: &str) -> Result<Option<u64>> {
+    pub(crate) fn applied(&self, plan: &str) -> Result<Option<u64>> {
         Ok(self
             .db
             .query_row(

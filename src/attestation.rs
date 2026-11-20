@@ -41,7 +41,7 @@ pub(crate) struct BuildTrust {
 }
 
 impl BuildTrust {
-    pub fn load(minimum_builders: usize, paths: &[PathBuf]) -> Result<Self> {
+    pub(crate) fn load(minimum_builders: usize, paths: &[PathBuf]) -> Result<Self> {
         ensure!(
             paths.len() <= MAX_BUILDERS,
             "at most {MAX_BUILDERS} builder keys are supported"
@@ -61,7 +61,7 @@ impl BuildTrust {
         Ok(trust)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.keys.len() <= MAX_BUILDERS
                 && (1..=self.keys.len()).contains(&self.minimum_builders),
@@ -70,7 +70,7 @@ impl BuildTrust {
         Ok(())
     }
 
-    pub fn check_publisher_key(&self, key: &[u8]) -> Result<()> {
+    pub(crate) fn check_publisher_key(&self, key: &[u8]) -> Result<()> {
         ensure!(
             !self.keys.iter().any(|builder| builder.as_slice() == key),
             "builder and publisher must use distinct keys"
@@ -79,14 +79,19 @@ impl BuildTrust {
     }
 
     /// Require every builder key to differ from every key of a pinned trust root.
-    pub fn check_publisher_trust(&self, trust_root: &[u8]) -> Result<()> {
+    pub(crate) fn check_publisher_trust(&self, trust_root: &[u8]) -> Result<()> {
         for key in trust_root_keys(trust_root)? {
             self.check_publisher_key(&key)?;
         }
         Ok(())
     }
 
-    pub fn verify(&self, bytes: &[u8], manifest: &Manifest, published: FileDigest) -> Result<()> {
+    pub(crate) fn verify(
+        &self,
+        bytes: &[u8],
+        manifest: &Manifest,
+        published: FileDigest,
+    ) -> Result<()> {
         let (payload, signatures) = decode_envelope(bytes)?;
         let message = pae(&payload);
         let mut valid = 0;
@@ -285,7 +290,7 @@ pub(crate) struct VerifiedBuild {
 }
 
 impl VerifiedBuild {
-    pub fn add_witness(&mut self, bytes: &[u8], key: &[u8]) -> Result<()> {
+    pub(crate) fn add_witness(&mut self, bytes: &[u8], key: &[u8]) -> Result<()> {
         let builder = digest(key);
         ensure!(
             !self.signatures.contains_key(&builder),
@@ -300,11 +305,11 @@ impl VerifiedBuild {
         Ok(())
     }
 
-    pub fn builders(&self) -> impl ExactSizeIterator<Item = &str> {
+    pub(crate) fn builders(&self) -> impl ExactSizeIterator<Item = &str> {
         self.signatures.keys().map(String::as_str)
     }
 
-    pub fn envelope(&self) -> Result<Vec<u8>> {
+    pub(crate) fn envelope(&self) -> Result<Vec<u8>> {
         envelope(
             &self.payload,
             self.signatures
@@ -587,12 +592,12 @@ pub(crate) struct RebuildEvidence {
 
 impl RebuildEvidence {
     /// The IDs of every package that the admitted build produced.
-    pub fn packages(&self) -> &[String] {
+    pub(crate) fn packages(&self) -> &[String] {
         &self.packages
     }
 
     /// The digest of the published manifest that the admitted build names for a package.
-    pub fn published_manifest(&self, id: &str) -> Result<&str> {
+    pub(crate) fn published_manifest(&self, id: &str) -> Result<&str> {
         let name = &crate::model::PackageSpec::parse(id)?.name;
         self.subjects
             .iter()
@@ -602,7 +607,7 @@ impl RebuildEvidence {
     }
 
     /// The payload digests that the admitted build names, by output path.
-    pub fn admitted_artifacts(&self) -> BTreeMap<String, FileDigest> {
+    pub(crate) fn admitted_artifacts(&self) -> BTreeMap<String, FileDigest> {
         self.subjects
             .iter()
             .filter_map(|subject| {
@@ -614,7 +619,7 @@ impl RebuildEvidence {
 
     /// Check a rebuilt bundle's expanded manifests against the admitted build,
     /// and return the admitted payload digests of every output.
-    pub fn check_outputs(&self, bundle: &Root) -> Result<BTreeMap<String, FileDigest>> {
+    pub(crate) fn check_outputs(&self, bundle: &Root) -> Result<BTreeMap<String, FileDigest>> {
         let manifests = expanded_outputs(bundle, &self.recipe, &self.templates, &self.packages)?;
         let claimed = self
             .subjects
@@ -624,7 +629,7 @@ impl RebuildEvidence {
         Ok(claimed_artifacts(&manifests, claimed, &bundle.subdir("proto")?)?.0)
     }
 
-    pub fn check_witness(&self, envelope: &[u8], key: &[u8]) -> Result<()> {
+    pub(crate) fn check_witness(&self, envelope: &[u8], key: &[u8]) -> Result<()> {
         let message = pae(&self.payload);
         let public = UnparsedPublicKey::new(&ED25519, key);
         ensure!(

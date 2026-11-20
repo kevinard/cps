@@ -483,7 +483,7 @@ impl Store {
 /// Membership changes for the next trust root version. Empty key lists and
 /// absent thresholds keep the previous version's values.
 #[derive(Default)]
-pub struct TrustDraft<'a> {
+pub(crate) struct TrustDraft<'a> {
     pub publisher: Option<&'a str>,
     pub root_keys: &'a [PathBuf],
     pub root_threshold: Option<usize>,
