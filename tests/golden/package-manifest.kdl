@@ -16,7 +16,8 @@ package "demo/editor" publisher="canopa" version="2.1.0-3" upstream-version="2.1
     mediate "usr/bin/editor" group="editor" priority=20
     dir "usr/share/editor" mode="0755"
     file "usr/bin/editor-2" mode="0755" sha256="9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" size=4 capabilities="cap_net_bind_service=ep"
-    file "etc/editor.conf" mode="0644" preserve=#true original-name="demo/editor:etc/editor.conf"
+    file "etc/editor.conf" mode="0640" preserve=#true original-name="demo/editor:etc/editor.conf" group="editor"
+    symlink "usr/share/editor/state" target="/run/editor" owner="editor" group="editor"
     file "usr/share/man/man1/editor.1" mode="0644" facet="doc.man"
     file "usr/lib/editor/x86.so" mode="0755" architecture="x86_64" variant.debug="false"
     symlink "usr/bin/ed2" target="editor-2"
