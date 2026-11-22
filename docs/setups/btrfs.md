@@ -239,7 +239,12 @@ makes the trial the default. It then applies the
 
 Use `--uefi` for manual trial activation. With the ESP mounted on the
 machine, `boot list`, Btrfs rollback, `boot destroy`, and `prune` use
-the firmware entries. After a failed trial boots the fallback, the next
+the firmware entries. CPS recognizes its firmware option by what it boots,
+the ESP's GPT partition and `\EFI\cps\ID\uki.efi`, and not by its exact
+bytes, so firmware that adds optional data, changes the option's attributes
+or expands its device path does not lose track of the environment. A
+second option that boots the same file makes CPS stop, because it could not
+tell which option firmware would use. After a failed trial boots the fallback, the next
 staged change removes the failed trial, or run
 [`cps boot discard-trial`](#discarding-a-trial). CPS preserves an
 unrelated `BootNext` and reports it if it conflicts with activation or
