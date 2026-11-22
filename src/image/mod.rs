@@ -1160,12 +1160,34 @@ impl Image {
             StateOwner::Caller => {}
             StateOwner::Adopting => {
                 let (uid, gid) = match adopting {
-                    Some(creator) => creator,
+                    // Once the adoption is recorded only the marker is left,
+                    // and adopting the image again just removes it.
+                    Some(creator) if settings.uid == 0 => creator,
+                    Some(creator) => {
+                        ensure!(
+                            creator == (settings.uid, settings.gid),
+                            "the adoption marker names UID {}, but the image belongs to UID {}",
+                            creator.0,
+                            settings.uid
+                        );
+                        creator
+                    }
                     None => {
                         ensure!(settings.uid != 0, "the image already belongs to root");
                         (settings.uid, settings.gid)
                     }
                 };
+                // The creator controls the database, so its recorded owner
+                // must also be the user who owns the image's state.
+                if settings.uid != 0
+                    && let Some(owner) = checker.creator()
+                {
+                    ensure!(
+                        owner == uid,
+                        "the image records UID {uid} as its creator, but its state belongs to \
+                         UID {owner}"
+                    );
+                }
                 image.root.accounts().adopt_from_creator(uid, gid);
             }
         }
@@ -1401,12 +1423,22 @@ impl Image {
     /// The creator's user and group while root's adoption of the image is
     /// unfinished. The marker is written before adoption changes any owner
     /// and removed once the image records root as its owner.
+    ///
+    /// Only root writes the marker, so a marker that root does not own is
+    /// one the creator planted, and is refused.
     pub(crate) fn adoption(&self) -> Result<Option<(u32, u32)>> {
-        let text = match self.state_dir.read_file(ADOPTING) {
-            Ok(bytes) => String::from_utf8(bytes)?,
+        let mut file = match self.state_dir.file(ADOPTING) {
+            Ok(file) => file,
             Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => return Ok(None),
             Err(error) => return Err(error),
         };
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+            "/{STATE_DIRECTORY}/{ADOPTING} was not written by root"
+        );
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)?;
         let creator = text
             .trim()
             .split_once(':')

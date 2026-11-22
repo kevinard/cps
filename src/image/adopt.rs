@@ -104,8 +104,8 @@ pub(crate) fn adopt_image(path: &Path) -> Result<u32> {
     let checked = crate::verify::check_uncommitted(&image, &adopted)?;
     if let Some(finding) = checked.errors().next() {
         anyhow::bail!(
-            "the adopted image does not match its packages: {}; repair it as its creator, or \
-             fix it and run `cps image adopt` again",
+            "the adopted image does not match its packages: {}; correct that path in the \
+             image and run `cps image adopt` again",
             finding.message
         );
     }

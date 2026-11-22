@@ -103,6 +103,12 @@ pub(crate) struct OwnerCheck {
 }
 
 impl OwnerCheck {
+    /// The one user other than root who owns the checked paths, if any,
+    /// while root adopts an image.
+    pub(crate) fn creator(&self) -> Option<u32> {
+        self.creator
+    }
+
     pub(crate) fn check(&mut self, what: &str, metadata: &fs::Metadata) -> Result<()> {
         let uid = metadata.uid();
         match self.owner {

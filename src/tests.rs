@@ -4611,9 +4611,14 @@ fn image_state_that_another_user_could_change_is_refused() -> Result<()> {
     std::os::unix::fs::symlink("state.sqlite", state.join("state.sqlite-wal"))?;
     refused("state.sqlite-wal is not a regular file");
     fs::remove_file(state.join("state.sqlite-wal"))?;
-    // An unfinished adoption by root leaves the image to `image adopt`.
+    // An unfinished adoption by root leaves the image to `image adopt`, and
+    // only root writes the marker of one.
     fs::write(state.join("adopting"), "1000:1000\n")?;
-    refused("root's adoption of this image did not finish");
+    refused(if rustix::process::geteuid().is_root() {
+        "root's adoption of this image did not finish"
+    } else {
+        "adopting was not written by root"
+    });
     fs::remove_file(state.join("adopting"))?;
     crate::image::Image::open_query(&f.root)?;
     if !rustix::process::geteuid().is_root() {
