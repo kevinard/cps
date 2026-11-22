@@ -13,7 +13,7 @@ use rustix::{
 };
 
 use super::{
-    Activation, check_image_integrity,
+    Activation,
     device::{mounted_esp_disk, mounted_root_disk},
     systemd_boot::{
         self, BootMode, canonical_partuuid,
@@ -345,7 +345,10 @@ impl BtrfsVolume {
         revision: u64,
     ) -> Result<Image> {
         let image = self.open_image(record, image_id, revision)?;
-        check_image_integrity(&image)?;
+        // Matching fingerprints prove unchanged files without hashing whole
+        // roots for every rollback, activation, and pruned environment.
+        // `cps verify` hashes every file.
+        crate::verify::require_quick(&image)?;
         Ok(image)
     }
 

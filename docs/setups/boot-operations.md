@@ -135,7 +135,10 @@ cps boot activate "$environment"
 Before changing the selection, CPS checks the target's boot files against
 the digests in its entry. It then checks the registered filesystem and
 subvolume identity on the mounted top-level volume, and the root's CPS image
-identity and revision. For an entry that boots by PARTUUID, CPS reads the
+identity and revision, and verifies the root's packages. Files whose
+fingerprints match the ones CPS recorded are trusted without hashing them
+again, so a rollback stays fast on a large root; `cps verify` hashes every
+file. For an entry that boots by PARTUUID, CPS reads the
 parent GPT disk of the mounted ESP and checks that the Btrfs device is that
 partition, so it needs read access to the disk.
 
