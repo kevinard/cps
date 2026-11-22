@@ -123,17 +123,27 @@ expire.
 
 A full replica serves every published file even when the origin is down.
 `cps repo replicate` reads the source like a client: it follows the signed
-timestamp to every file of the release and checks each file's signed length
-and digest. It reuses served files by hard link once their digest matches,
-and fetches damaged ones again. It records the files it verified in
-`.NAME.replica-verified.json` beside the replica, so a run after a
-timestamp refresh does not hash the whole repository again; a file changed
-since is hashed. It keeps the previous release's files for clients that are
-mid-download. A run that finds the release it already serves changes
-nothing. Files are world-readable whatever the umask. Before it replaces the
-served tree, it verifies the staged tree from the TUF root. It keeps serving
-its last good release when the source is unreachable or serves expired,
-forged, or older metadata.
+timestamp to the snapshot and the targets roles, verifies that metadata from
+the TUF root, and only then copies the files the verified roles list,
+checking each file's signed length and digest. A release may have at most 32
+roles and 512 MiB of metadata, and remote transfers share the client
+[transfer deadline and throughput floor](../client/mirrors.md#transfer-limits), so a slow or
+hostile source cannot hold the replica for hours. It reuses served files by
+hard link once their digest matches, and fetches damaged ones again. It
+records the files it verified in `.NAME.replica-verified.json` beside the
+replica, so a run after a timestamp refresh does not hash the whole
+repository again; a file whose device, inode, size, or modification or
+change time differs is hashed. It keeps the previous release's files for
+clients that are mid-download. Files are world-readable whatever the umask,
+and the staged tree is flushed to disk before it replaces the served one.
+
+A run that finds the release it already serves still verifies the served
+tree from the TUF root, checks that it has not expired, and checks every
+file its release lists. When all of that holds, it changes nothing.
+Otherwise it warns and rebuilds the tree from the source, so a file lost to
+damage or an interrupted run is restored without a new release upstream.
+The replica keeps serving its last good release when the source is
+unreachable or serves expired, forged, or older metadata.
 
 ```sh
 cps repo nginx-config --host packages-dr.example.org --tls-cert /etc/tls/dr.crt \
