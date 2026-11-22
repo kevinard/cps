@@ -9,7 +9,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use rustix::fs::{FlockOperation, flock};
+use rustix::{
+    fs::{FlockOperation, flock},
+    io::Errno,
+};
 use serde::Serialize;
 
 use crate::{
@@ -257,6 +260,13 @@ impl Change {
     }
 }
 
+/// Proof that this process holds the boot environments lock. Methods that
+/// change boot environments take it, so a caller cannot forget the lock and
+/// no method takes it a second time.
+pub(crate) struct EnvironmentsLock {
+    _file: File,
+}
+
 impl System {
     pub(crate) fn load(config: &Path) -> Result<Self> {
         let definition = read_image_definition(config)?;
@@ -302,7 +312,9 @@ impl System {
     }
 
     /// Hold this across refresh, confirmation, and application.
-    pub(crate) fn lock(&self) -> Result<File> {
+    /// Take the boot environments lock, waiting for another CPS command
+    /// that holds it.
+    pub(crate) fn lock(&self) -> Result<EnvironmentsLock> {
         let boot = self.boot();
         let volume = fs::canonicalize(&boot.volume)?;
         let environments = fs::canonicalize(&boot.environments)?;
@@ -316,14 +328,23 @@ impl System {
             metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
             "the environments directory must be owned by root and writable only by root"
         );
-        flock(&lock, FlockOperation::LockExclusive)?;
-        Ok(lock)
+        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(Errno::WOULDBLOCK) => {
+                eprintln!("Waiting for another CPS command to release the boot environments");
+                flock(&lock, FlockOperation::LockExclusive)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(EnvironmentsLock { _file: lock })
     }
 
     /// Prune a system cache while retaining payloads for its registered boot roots
     /// and the given image locks.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prune_cache(
         &self,
+        _held: &EnvironmentsLock,
         repo: &Path,
         publisher: &str,
         key: &Path,
@@ -331,7 +352,6 @@ impl System {
         locks: &[crate::ImageLock],
         apply: bool,
     ) -> Result<crate::release::PruneReport> {
-        let _lock = self.lock()?;
         let boot = self.boot();
         crate::boot::with_registered_images(
             &boot.volume,
@@ -345,8 +365,7 @@ impl System {
         )
     }
 
-    // The system operation already holds the environments lock.
-    fn prune_after_transaction(&self) {
+    fn prune_after_transaction(&self, _held: &EnvironmentsLock) {
         let Some(versions) = self.definition.cache_keep_versions else {
             return;
         };
@@ -644,7 +663,7 @@ impl System {
         crate::fetch_plan_with_archives(Path::new(ROOT), plan, archives)
     }
 
-    pub(crate) fn apply(&self, change: &Change) -> Result<Option<String>> {
+    pub(crate) fn apply(&self, held: &EnvironmentsLock, change: &Change) -> Result<Option<String>> {
         self.check_running()?;
         if let Err(error) = fetch_plan(Path::new(ROOT), &change.plan) {
             if !self.base_only
@@ -674,7 +693,7 @@ impl System {
                     boot.activation.root_partuuid.as_deref(),
                     |_, _, _| Ok(()),
                 )?;
-                let id = self.backup_running().context(
+                let id = self.backup_running(held).context(
                     "creating the backup boot environment before the live change. Remove old \
                      environments with `cps boot prune`, or set live-backup=#false in \
                      boot-btrfs to change the running root without a backup",
@@ -693,12 +712,12 @@ impl System {
                     )
                 },
             )?;
-            self.prune_after_transaction();
+            self.prune_after_transaction(held);
             return Ok(None);
         }
 
-        self.prune_before_staging(change)?;
-        let root = self.stage_change(change)?;
+        self.prune_before_staging(held, change)?;
+        let root = self.stage_change(held, change)?;
         let id = if boot.uefi {
             boot.activation
                 .activate_btrfs_uefi(&root, &boot.volume, &boot.esp)
@@ -711,15 +730,15 @@ impl System {
         }
         .with_context(|| format!("activating the prepared environment at {}", root.display()))?;
         arm_finalize();
-        self.prune_after_transaction();
+        self.prune_after_transaction(held);
         Ok(Some(id))
     }
 
     /// Snapshot the running root as a known-good environment.
     ///
     /// A retry after an interrupted backup or an aborted live change reuses
-    /// the backup of the same revision. Callers hold the environments lock.
-    fn backup_running(&self) -> Result<String> {
+    /// the backup of the same revision.
+    fn backup_running(&self, held: &EnvironmentsLock) -> Result<String> {
         let boot = self.boot();
         let settings = Image::open_query(Path::new(ROOT))?.settings()?;
         let output = boot
@@ -744,7 +763,11 @@ impl System {
                 })?;
             }
             // Make room on the ESP for the backup's boot files.
-            self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments), None);
+            self.prune_quietly(
+                held,
+                boot.auto_prune.then_some(boot.keep_environments),
+                None,
+            );
             backup_running_btrfs(&output, &boot.exclude_subvolumes)?;
         }
         let id = boot
@@ -757,7 +780,7 @@ impl System {
         make_writable(&Root::open(&root)?)
             .with_context(|| format!("making the backup at {} writable", root.display()))?;
         if boot.auto_prune {
-            self.prune_quietly(Some(boot.keep_environments), None);
+            self.prune_quietly(held, Some(boot.keep_environments), None);
         }
         Ok(id)
     }
@@ -768,9 +791,12 @@ impl System {
     /// and revision, so a retry after an interruption reuses a snapshot only
     /// when it holds the same revision. A snapshot stays read-only until it
     /// is registered.
-    pub(crate) fn create_boot_environment(&self, name: &str) -> Result<String> {
+    pub(crate) fn create_boot_environment(
+        &self,
+        held: &EnvironmentsLock,
+        name: &str,
+    ) -> Result<String> {
         validate_environment_name(name)?;
-        let _lock = self.lock()?;
         self.check_running()?;
         let boot = self.boot();
         let settings = Image::open_query(Path::new(ROOT))?.settings()?;
@@ -812,7 +838,11 @@ impl System {
                     })?;
                 }
                 // Make room on the ESP for the environment's boot files.
-                self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments), None);
+                self.prune_quietly(
+                    held,
+                    boot.auto_prune.then_some(boot.keep_environments),
+                    None,
+                );
                 backup_running_btrfs(&output, &boot.exclude_subvolumes)?;
             }
             let id = boot
@@ -842,9 +872,8 @@ impl System {
     /// Merge the running /etc into the trial selected for the next boot.
     ///
     /// A failed merge leaves the trial's /etc as staged and cancels the
-    /// trial, so the next boot keeps every local change. Callers hold the
-    /// environments lock.
-    pub(crate) fn finalize_trial(&self) -> Result<Finalized> {
+    /// trial, so the next boot keeps every local change.
+    pub(crate) fn finalize_trial(&self, _held: &EnvironmentsLock) -> Result<Finalized> {
         let boot = self.boot();
         if let Err(error) = etc_merge::remove_leftovers(&Root::open(Path::new(ROOT))?) {
             eprintln!("Warning: could not remove /etc merge leftovers: {error:#}");
@@ -900,7 +929,11 @@ impl System {
     }
 
     /// Stage a recovery plan and verify the result before returning its root.
-    pub(crate) fn prepare_recovery(&self, change: &Change) -> Result<PathBuf> {
+    pub(crate) fn prepare_recovery(
+        &self,
+        held: &EnvironmentsLock,
+        change: &Change,
+    ) -> Result<PathBuf> {
         ensure!(
             change.plan.is_recovery(),
             "expected a repair or revert plan"
@@ -908,8 +941,8 @@ impl System {
         self.check_running()?;
         fetch_plan(Path::new(ROOT), &change.plan)
             .context("fetching the approved repair payloads")?;
-        self.prune_before_staging(change)?;
-        self.stage_change(change)
+        self.prune_before_staging(held, change)?;
+        self.stage_change(held, change)
     }
 
     /// The staging directory for `change`, which a retry reuses.
@@ -918,7 +951,7 @@ impl System {
         Ok(self.boot().environments.join(format!("upgrade-{plan_id}")))
     }
 
-    fn stage_change(&self, change: &Change) -> Result<PathBuf> {
+    fn stage_change(&self, _held: &EnvironmentsLock, change: &Change) -> Result<PathBuf> {
         let boot = self.boot();
         let plan_id = change.plan.id()?;
         let output = self.staging_directory(change)?;
@@ -959,15 +992,15 @@ impl System {
         Ok(root)
     }
 
-    pub(crate) fn resume(&self) -> Result<Option<u64>> {
-        self.resume_transaction(false)
+    pub(crate) fn resume(&self, held: &EnvironmentsLock) -> Result<Option<u64>> {
+        self.resume_transaction(held, false)
     }
 
-    pub(crate) fn resume_with_repair(&self) -> Result<Option<u64>> {
-        self.resume_transaction(true)
+    pub(crate) fn resume_with_repair(&self, held: &EnvironmentsLock) -> Result<Option<u64>> {
+        self.resume_transaction(held, true)
     }
 
-    fn resume_transaction(&self, repair: bool) -> Result<Option<u64>> {
+    fn resume_transaction(&self, held: &EnvironmentsLock, repair: bool) -> Result<Option<u64>> {
         let boot = self.boot();
         let revision = with_running_environment(
             &boot.volume,
@@ -982,13 +1015,13 @@ impl System {
                 }
             },
         )?;
-        self.prune_after_transaction();
+        self.prune_after_transaction(held);
         Ok(revision)
     }
 
     /// Abort the interrupted live transaction, returning the running root
     /// to its committed package revision.
-    pub(crate) fn abort(&self, fetch: bool) -> Result<Option<u64>> {
+    pub(crate) fn abort(&self, held: &EnvironmentsLock, fetch: bool) -> Result<Option<u64>> {
         let boot = self.boot();
         let revision = with_running_environment(
             &boot.volume,
@@ -996,7 +1029,7 @@ impl System {
             boot.activation.root_partuuid.as_deref(),
             |root, id, revision| abort_live(Image::open_for_live_apply(root, id, revision)?, fetch),
         )?;
-        self.prune_after_transaction();
+        self.prune_after_transaction(held);
         Ok(revision)
     }
 
@@ -1016,18 +1049,19 @@ impl System {
         if blessed.is_some() && boot.auto_prune {
             // The promoted trial is the new default, so older roots can retire.
             match self.lock() {
-                Ok(_lock) => self.prune_quietly(Some(boot.keep_environments), None),
+                Ok(held) => self.prune_quietly(&held, Some(boot.keep_environments), None),
                 Err(error) => eprintln!("Warning: could not prune boot environments: {error:#}"),
             }
         }
         Ok(blessed)
     }
 
-    /// Apply the retention policy. Callers hold the environments lock.
+    /// Apply the retention policy.
     ///
     /// `keep` overrides keep-environments. Failed and abandoned trials are always removed.
     pub(crate) fn prune_boot_environments(
         &self,
+        held: &EnvironmentsLock,
         keep: Option<usize>,
         dry_run: bool,
     ) -> Result<BootPruneReport> {
@@ -1040,16 +1074,16 @@ impl System {
             None,
         )?;
         if !dry_run {
-            self.remove_empty_staging_directories();
+            self.remove_empty_staging_directories(held);
         }
         Ok(report)
     }
 
-    /// Cancel a pending or running trial and remove failed trials. Callers hold the lock.
-    pub(crate) fn discard_trial(&self) -> Result<TrialDiscard> {
+    /// Cancel a pending or running trial and remove failed trials.
+    pub(crate) fn discard_trial(&self, held: &EnvironmentsLock) -> Result<TrialDiscard> {
         let boot = self.boot();
         let discard = discard_btrfs_trial(&boot.esp, &boot.volume)?;
-        self.remove_empty_staging_directories();
+        self.remove_empty_staging_directories(held);
         Ok(discard)
     }
 
@@ -1057,17 +1091,18 @@ impl System {
     ///
     /// The trial of an interrupted activation of `change` stays, so that
     /// staging and activation resume it.
-    fn prune_before_staging(&self, change: &Change) -> Result<()> {
+    fn prune_before_staging(&self, held: &EnvironmentsLock, change: &Change) -> Result<()> {
         let boot = self.boot();
         let staged = self.staging_directory(change)?.join("root");
         self.prune_quietly(
+            held,
             boot.auto_prune.then_some(boot.keep_environments),
             Some(&staged),
         );
         Ok(())
     }
 
-    fn prune_quietly(&self, keep: Option<usize>, staged: Option<&Path>) {
+    fn prune_quietly(&self, held: &EnvironmentsLock, keep: Option<usize>, staged: Option<&Path>) {
         let boot = self.boot();
         match prune_btrfs_boot_environments(&boot.esp, &boot.volume, keep, false, staged) {
             Ok(report) => {
@@ -1080,11 +1115,11 @@ impl System {
             }
             Err(error) => eprintln!("Warning: could not prune boot environments: {error:#}"),
         }
-        self.remove_empty_staging_directories();
+        self.remove_empty_staging_directories(held);
     }
 
     /// Remove `upgrade-*` directories left empty after their roots were destroyed.
-    fn remove_empty_staging_directories(&self) {
+    fn remove_empty_staging_directories(&self, _held: &EnvironmentsLock) {
         // Captures that an interrupted staging left behind hold whole roots.
         if let Err(error) = crate::boot::sweep_captures(&self.boot().environments) {
             eprintln!("Warning: could not remove abandoned staging captures: {error:#}");
@@ -1108,10 +1143,10 @@ impl System {
 
     pub(crate) fn transaction_progress(
         &self,
+        _held: &EnvironmentsLock,
         plan: &Plan,
         validate: bool,
     ) -> Result<TransactionProgress> {
-        let _lock = self.lock()?;
         let boot = self.boot();
         let (running, entries) = self.boot_status()?;
         let plan_id = plan.id()?;

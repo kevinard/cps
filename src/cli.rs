@@ -2540,7 +2540,7 @@ fn change_system(
         .with_install_recommends(!options.no_recommends)
         .with_force_phased_update(force_rollout)
         .with_base_only(base_only);
-    let _lock = system.lock()?;
+    let held = system.lock()?;
     let refresh = !options.no_refresh;
     let mut git_preview = false;
     let mut approve_git = |change: &system::GitChange| -> Result<bool> {
@@ -2641,19 +2641,23 @@ fn change_system(
     if options.dry_run {
         return Ok(());
     }
+    // Other CPS commands may run while the prompt waits. Apply checks that
+    // the plan is still current once the lock is held again.
+    drop(held);
     if !confirm(options.yes, "Proceed?")? {
         return Err(Canceled.into());
     }
+    let held = system.lock()?;
     if prepare_recovery {
-        let root = system.prepare_recovery(&change)?;
+        let root = system.prepare_recovery(&held, &change)?;
         println!("Prepared recovery root {}", root.display());
     } else {
-        match system.apply(&change) {
+        match system.apply(&held, &change) {
             Ok(Some(id)) => println!("Prepared {id}. Reboot when ready to use the new system."),
             Ok(None) => println!("Changes are available now."),
             Err(error) if error.downcast_ref::<system::RetryBaseOnly>().is_some() => {
                 eprintln!("Warning: {error:#}. Replanning with distribution publishers only.");
-                drop(_lock);
+                drop(held);
                 return change_system(options, Request::Update, force_rollout, true, None);
             }
             Err(error) => return Err(error),
@@ -2685,7 +2689,7 @@ fn system_plan(plan: &crate::Plan) -> Result<()> {
 fn apply_saved_system_plan(config: &Path, plan: crate::Plan, dry_run: bool) -> Result<()> {
     system_plan(&plan)?;
     let system = System::load(config)?;
-    let _lock = system.lock()?;
+    let held = system.lock()?;
     let change = system.saved_change(plan)?;
     println!("{}", change.summary());
     if dry_run {
@@ -2695,10 +2699,10 @@ fn apply_saved_system_plan(config: &Path, plan: crate::Plan, dry_run: bool) -> R
     }
     match change.mode() {
         crate::plan::SystemMode::Recovery => {
-            let root = system.prepare_recovery(&change)?;
+            let root = system.prepare_recovery(&held, &change)?;
             println!("Prepared recovery root {}", root.display());
         }
-        _ => match system.apply(&change)? {
+        _ => match system.apply(&held, &change)? {
             Some(id) => println!("Prepared {id}. Reboot when ready to use the new system."),
             None => println!("Changes are available now."),
         },
@@ -3169,8 +3173,9 @@ fn run(command: Command) -> Result<Exit> {
             (Some(root), None) => print_image_status(&root, json)?,
             (None, Some(path)) => {
                 let system = System::load(&target.config)?;
+                let held = system.lock()?;
                 print_progress(
-                    &system.transaction_progress(&load_plan(&path)?, validate)?,
+                    &system.transaction_progress(&held, &load_plan(&path)?, validate)?,
                     json,
                 )?;
             }
@@ -3197,14 +3202,14 @@ fn run(command: Command) -> Result<Exit> {
             }
             None => {
                 let system = System::load(&target.config)?;
-                let _lock = system.lock()?;
+                let held = system.lock()?;
                 let aborting = transaction_status(Path::new("/"))?
                     .pending
                     .is_some_and(|pending| pending.aborting);
                 let revision = if repair {
-                    system.resume_with_repair()?
+                    system.resume_with_repair(&held)?
                 } else {
-                    system.resume()?
+                    system.resume(&held)?
                 };
                 if let Some(revision) = revision {
                     if aborting {
@@ -3224,8 +3229,8 @@ fn run(command: Command) -> Result<Exit> {
                 abort_transaction(&root, fetch)?
             } else {
                 let system = System::load(&target.config)?;
-                let _lock = system.lock()?;
-                system.abort(fetch)?
+                let held = system.lock()?;
+                system.abort(&held, fetch)?
             };
             if let Some(revision) = revision {
                 println!("Aborted the pending transaction");
@@ -4199,7 +4204,8 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
             }
         }
         BootCommand::Create { config, name } => {
-            let id = System::load(&config)?.create_boot_environment(&name)?;
+            let system = System::load(&config)?;
+            let id = system.create_boot_environment(&system.lock()?, &name)?;
             println!("Created {name} ({id})");
         }
         BootCommand::Rename {
@@ -4314,15 +4320,15 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
             dry_run,
         } => {
             let system = System::load(&config)?;
-            let _lock = system.lock()?;
+            let held = system.lock()?;
             let keep = keep.map(usize::try_from).transpose()?;
-            let report = system.prune_boot_environments(keep, dry_run)?;
+            let report = system.prune_boot_environments(&held, keep, dry_run)?;
             return Ok(print_boot_prune(&report, dry_run, true));
         }
         BootCommand::DiscardTrial { config } => {
             let system = System::load(&config)?;
-            let _lock = system.lock()?;
-            let discard = system.discard_trial()?;
+            let held = system.lock()?;
+            let discard = system.discard_trial(&held)?;
             match &discard.cancelled {
                 Some(id) if discard.running => println!(
                     "Cancelled the running trial {id}. Reboot into its fallback; the next \
@@ -4338,7 +4344,7 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
         }
         BootCommand::FinalizeTrial { config, arm } => {
             let system = System::load(&config)?;
-            let _lock = system.lock()?;
+            let held = system.lock()?;
             if arm {
                 match system.arm_finalize()? {
                     Some(id) => println!("The /etc merge into {id} runs at shutdown"),
@@ -4346,7 +4352,7 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
                 }
                 return Ok(Exit::Ok);
             }
-            match system.finalize_trial()? {
+            match system.finalize_trial(&held)? {
                 system::Finalized::NoTrial => {
                     println!("No trial is selected for the next boot")
                 }
@@ -5130,7 +5136,9 @@ fn run_repo(command: RepoCommand) -> Result<()> {
                 plans: &plans,
             };
             let report = if let Some(config) = system_config {
-                System::load(&config)?.prune_cache(
+                let system = System::load(&config)?;
+                system.prune_cache(
+                    &system.lock()?,
                     &repo,
                     &publisher,
                     &trust_root,

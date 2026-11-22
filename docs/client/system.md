@@ -130,8 +130,10 @@ plan as selected.
 
 `reboot_required` is a boolean for the actionable plan and `reboot_reason`
 explains a required reboot. Both fields are `null` when the upgrade is
-blocked. The command exits with status 0 for a successful check with or
-without updates, and status 1 if blocked. Refresh progress goes to stderr.
+blocked. The command exits with status 3 when updates are available, 0
+when there are none or a rollout holds them back, and 1 if blocked; see
+[exit statuses](../reference/exit-status.md). Refresh progress goes to
+stderr.
 
 ## Remove packages and select publishers
 
@@ -172,6 +174,14 @@ apply like `install`: live, or staged when a written path needs a reboot.
 for what each one does.
 
 ## How live changes apply
+
+System commands that change the running root or its boot environments take
+turns: one that starts while another runs prints `Waiting for another CPS
+command to release the boot environments` and continues when the other
+finishes. The `Proceed?` prompt does not keep others waiting. Once you
+confirm, CPS takes its turn again and checks that the plan still matches the
+system, so a change that another command made meanwhile stops the stale
+plan instead of being overwritten.
 
 The preview lists what the change does to running services:
 
