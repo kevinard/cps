@@ -72,7 +72,7 @@ impl KernelPartition {
     }
 
     fn open_disk(&self) -> Result<OfflineDisk> {
-        OfflineDisk::from_sized_file(open_parent(&self.disk)?, sectors(&self.disk, "size")?)
+        OfflineDisk::from_device(open_parent(&self.disk)?, sectors(&self.disk, "size")?)
     }
 }
 

@@ -102,7 +102,10 @@ can be assembled and unlocked by the initramfs before it mounts that root.
   systemd-boot 262 or newer installed on it, since CPS selects trials with
   the `loader.conf` `preferred` key. CPS reads
   the GPT with the disk's logical block size, so disks with 512-byte and
-  4096-byte (4Kn) sectors both work. The ESP can be an automount point, as
+  4096-byte (4Kn) sectors both work. Commands on a running system read only
+  the primary GPT and check its CRCs, so a disk that was grown, whose backup
+  GPT is no longer at the end, keeps working. `cps image disk` checks both
+  copies of a disk it writes. The ESP can be an automount point, as
   created by `systemd-gpt-auto-generator` or an `x-systemd.automount` fstab
   entry. CPS opens the directory to trigger the mount, then checks that one
   writable VFAT mount sits on the trigger. It keeps the ESP open for the
