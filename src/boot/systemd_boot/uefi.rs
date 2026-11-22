@@ -188,7 +188,6 @@ impl Firmware {
         self.check_references(id, existing)?;
         if let Some(number) = existing {
             self.check_option(number, id)?;
-            self.enable(number)?;
             return Ok(number);
         }
         let number = (0..=u16::MAX)
@@ -207,12 +206,16 @@ impl Firmware {
     /// administrator cleared. Firmware skips an inactive option in
     /// `BootOrder` and may ignore it in `BootNext`, so a selected
     /// environment would not boot.
+    ///
+    /// Callers enable an option only once every other precondition of the
+    /// operation holds, and read no option they enabled again, since
+    /// `options` keeps the bytes the operation started with.
     fn enable(&self, number: u16) -> Result<()> {
-        let mut option = self
-            .options
-            .get(&number)
-            .context("missing firmware boot option")?
-            .clone();
+        // An option this operation created is written active.
+        let Some(option) = self.options.get(&number) else {
+            return Ok(());
+        };
+        let mut option = option.clone();
         let attributes = option
             .get_mut(..4)
             .context("invalid firmware boot option")?;
@@ -255,7 +258,10 @@ impl Firmware {
                     boot_order()? == self.order && boot_number("BootNext")?.is_none(),
                     "firmware boot selection changed during activation"
                 );
+                self.enable(number)?;
                 write_variable("BootNext", &number.to_le_bytes(), true)?;
+            } else {
+                self.enable(number)?;
             }
         } else {
             ensure!(
@@ -270,7 +276,8 @@ impl Firmware {
     /// Create the firmware option of a known-good environment without
     /// changing the boot selection.
     pub(super) fn register(&self, id: &str) -> Result<()> {
-        self.ensure_option(id).map(drop)
+        let number = self.ensure_option(id)?;
+        self.enable(number)
     }
 
     pub(super) fn rollback(&self, esp: &Path, id: &str, entries: &[BootEntry]) -> Result<()> {
@@ -279,7 +286,6 @@ impl Firmware {
             .option(id)?
             .context("missing firmware boot option for rollback")?;
         self.check_option(target, id)?;
-        self.enable(target)?;
         ensure!(
             boot_number("BootNext")? == self.next,
             "BootNext changed during rollback"
@@ -338,7 +344,6 @@ impl Firmware {
             .context("missing UEFI fallback boot option")?;
         self.check_option(number, &entry.id)?;
         self.check_option(fallback, &parent.id)?;
-        self.enable(number)?;
         ensure!(
             self.current == Some(number) && parent.tries.is_none(),
             "expected a running UEFI trial and a known-good fallback"
@@ -367,6 +372,11 @@ impl Firmware {
             boot_number("BootNext")?.is_none(),
             "BootNext is already scheduled"
         );
+        ensure!(
+            boot_order()? == self.order,
+            "BootOrder changed during the CPS operation"
+        );
+        self.enable(number)?;
         let order = preferred_order(&self.order, number);
         self.set_order(&order)
     }
@@ -1217,6 +1227,20 @@ mod tests {
         let option = variable(&option_name(3))?.context("missing option")?;
         assert_eq!(option[0] & LOAD_OPTION_ACTIVE, LOAD_OPTION_ACTIVE);
         assert_eq!(option[1..], load_option(&device(), BASE)?[1..]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_selection_that_fails_leaves_a_disabled_option_disabled() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let mut firmware = fake.firmware(&[42], Some(42), Some(42), &[], FIRST_BOOT)?;
+        let mut disabled = load_option(&device(), BASE)?;
+        disabled[0] &= !LOAD_OPTION_ACTIVE;
+        fake.set(&option_name(3), &disabled)?;
+        firmware.options.insert(3, disabled.clone());
+        let error = firmware.activate(BASE, false).unwrap_err();
+        assert!(format!("{error:#}").contains("BootNext already selects"));
+        assert_eq!(variable(&option_name(3))?, Some(disabled));
         Ok(())
     }
 
