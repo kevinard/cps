@@ -7318,3 +7318,47 @@ fn file_indexes_follow_publications_one_shard_at_a_time() -> Result<()> {
     assert_eq!(search_files(&f.root, "file-07")?.len(), 1);
     Ok(())
 }
+
+#[test]
+fn a_catalog_resigned_after_a_key_rotation_advances_the_image_trust() -> Result<()> {
+    let f = Fixture::new()?;
+    let rotated_key = Fixture::new()?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "first", "0755", "")?,
+    )?;
+    let first = fs::read_to_string(f.repo.join("current"))?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    let trust = |root: &Path| -> Result<_> {
+        let image = crate::image::Image::open_query(root)?;
+        Ok((image.publishers()?, image.settings()?.catalog_checkpoints))
+    };
+    let before = trust(&f.root)?;
+
+    // The publisher revokes its catalog key and re-signs the same packages.
+    let rotated = rotate_catalog_key(&f.repo, "canopa", first.trim(), &f.private, &rotated_key)?;
+    fs::write(f.repo.join("current"), format!("{rotated}\n"))?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(update.changes_image(), "{}", update.summary());
+    assert!(
+        update
+            .summary()
+            .contains("Advance the trusted catalog of canopa"),
+        "{}",
+        update.summary()
+    );
+    apply(&f.root, &update)?;
+    let after = trust(&f.root)?;
+    assert_ne!(after.0, before.0, "the pinned trust root did not advance");
+    assert_ne!(after.1, before.1, "the catalog checkpoint did not advance");
+    assert!(!plan(&f.root, Request::Update)?.changes_image());
+    Ok(())
+}

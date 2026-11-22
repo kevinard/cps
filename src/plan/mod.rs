@@ -212,6 +212,11 @@ pub(crate) struct Plan {
     deferred_publishers: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
+    /// Publishers whose trusted catalog checkpoint or pinned trust root the
+    /// plan advances, which is work even when no package changes, such as
+    /// after a publisher rotates a key and re-signs the same packages.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) trust_updates: BTreeSet<String>,
     pub(crate) request: Request,
     selected: BTreeMap<String, String>,
     package_changes: Vec<PackageChange>,
@@ -312,6 +317,7 @@ impl Plan {
     /// as freezes, rules, and preferences that leave every file alone.
     pub(crate) fn changes_image(&self) -> bool {
         self.has_changes()
+            || !self.trust_updates.is_empty()
             || !self.freeze_changes.is_empty()
             || !self.recomposed.is_empty()
             || self.config_update_revision.is_some()
@@ -357,6 +363,7 @@ impl Plan {
             git_updates: Vec::new(),
             deferred_publishers: BTreeSet::new(),
             catalogs: BTreeMap::new(),
+            trust_updates: BTreeSet::new(),
             request,
             selected: installed
                 .iter()
@@ -417,6 +424,9 @@ impl Plan {
         }
         if self.force_phased_update {
             lines.push("Allow upgrade outside the phased rollout".into());
+        }
+        for publisher in &self.trust_updates {
+            lines.push(format!("Advance the trusted catalog of {publisher}"));
         }
         for change in &self.package_changes {
             let name = change.publisher.as_ref().map_or_else(
@@ -1004,6 +1014,29 @@ fn check_profile_facets(
     Ok(())
 }
 
+/// The publishers whose catalog checkpoint or pinned trust root differs
+/// between the image's state before planning and the planned state.
+fn trust_updates_between(
+    (checkpoints, publishers): &(
+        BTreeMap<String, crate::repo::CatalogCheckpoint>,
+        crate::image::Publishers,
+    ),
+    next: &State,
+) -> BTreeSet<String> {
+    let mut changed: BTreeSet<String> = checkpoints
+        .keys()
+        .chain(next.settings.catalog_checkpoints.keys())
+        .filter(|name| checkpoints.get(*name) != next.settings.catalog_checkpoints.get(*name))
+        .cloned()
+        .collect();
+    for (before, after) in publishers.as_slice().iter().zip(next.publishers.as_slice()) {
+        if before.key != after.key {
+            changed.insert(after.name.clone());
+        }
+    }
+    changed
+}
+
 fn composition_paths(
     settings: &Settings,
     installed: &BTreeMap<String, Installed>,
@@ -1141,6 +1174,7 @@ fn build_with_update_diagnostics(
     let mut next_policy = None;
     let mut recomposed = BTreeSet::new();
     let mut update_profile = matches!(request, Request::UpdateProfile);
+    let mut trust_updates = BTreeSet::new();
     let (mut installed, paths) = match &request {
         Request::ChangeFacet { .. } | Request::ChangeVariant { .. } => {
             let mut policy = state.settings.policy();
@@ -1540,10 +1574,15 @@ fn build_with_update_diagnostics(
                     .local
                     .extend(requested.keys().map(|name| (*name).to_owned()));
             }
+            let previous = (
+                state.settings.catalog_checkpoints.clone(),
+                state.publishers.clone(),
+            );
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
             state
                 .publishers
                 .advance_pins(&state.settings.catalog_checkpoints)?;
+            trust_updates = trust_updates_between(&previous, &state);
             (installed, paths)
         }
     };
@@ -1570,6 +1609,7 @@ fn build_with_update_diagnostics(
         force_phased_update,
         git_updates: git_updates.to_vec(),
         deferred_publishers: deferred_publishers.clone(),
+        trust_updates,
         catalogs: catalogs.pins,
         systemd: systemd::plan_actions(&state, &installed, &paths),
         kernel_install,
