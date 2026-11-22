@@ -21,7 +21,7 @@ pub(crate) enum ConfigChoice {
     Vendor,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct ConfigUpdate {
     pub path: String,
     pub revision: u64,

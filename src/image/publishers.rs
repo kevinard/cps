@@ -59,6 +59,7 @@ pub(crate) fn register_git_publisher(
     )
 }
 
+#[derive(serde::Serialize)]
 pub(crate) struct PublisherInfo {
     pub name: String,
     pub repository: PathBuf,

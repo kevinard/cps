@@ -446,6 +446,9 @@ enum Command {
     Why {
         #[command(flatten)]
         image: Image,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
         #[arg(value_name = "PACKAGE")]
         package: String,
     },
@@ -471,6 +474,9 @@ enum Command {
         /// Extra library directory for --runtime
         #[arg(long = "library-dir", requires = "runtime", value_name = "PATH")]
         library_dirs: Vec<String>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Manage an image's ordered set of trusted publishers
     Publisher {
@@ -638,6 +644,9 @@ enum ConfigCommand {
     List {
         #[command(flatten)]
         image: Image,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Compare a preserved configuration file with its verified pending vendor copy
     Diff {
@@ -793,6 +802,9 @@ enum BootCommand {
         /// Mount point of the EFI System Partition (default: from --config)
         #[arg(long)]
         esp: Option<PathBuf>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Snapshot the running system as a named environment without selecting it
     Create {
@@ -1227,6 +1239,9 @@ enum RecipeCommand {
         /// Show the recipes that each recipe follows and why
         #[arg(long)]
         explain: bool,
+        /// Print JSON instead of text, with each recipe's packages and predecessors
+        #[arg(long, conflicts_with = "explain")]
+        json: bool,
         /// Recipe files or directories to search for recipes
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<PathBuf>,
@@ -1245,6 +1260,9 @@ enum RecipeCommand {
         /// Recipe files or directories that produce the packages
         #[arg(long = "recipes", value_name = "PATH")]
         recipes: Vec<PathBuf>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Fetch payloads for the toolchain pinned by a build recipe
     FetchToolchain {
@@ -1268,6 +1286,9 @@ enum PublisherCommand {
     List {
         #[command(flatten)]
         image: Image,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Verify and append a publisher to the image's search order
     Add {
@@ -1862,6 +1883,9 @@ enum RepoCommand {
         /// Pinned trust root of the publisher, which also names it
         #[arg(long)]
         trust_root: PathBuf,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Replace old withdrawal records with signed tombstones up to a catalog sequence
     PruneWithdrawals {
@@ -1884,6 +1908,9 @@ enum RepoCommand {
         /// Pinned trust root of the publisher, which also names it
         #[arg(long)]
         trust_root: PathBuf,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Publish the exact current catalog again under the newest trust root
     Resign {
@@ -3000,12 +3027,26 @@ fn run(command: Command) -> Result<Exit> {
             };
         }
         Command::Config {
-            command: ConfigCommand::List { image },
+            command: ConfigCommand::List { image, json },
         } => {
             let root = image.root;
             let updates = list_config_updates(&root)?;
             let saved = crate::saved_etc_versions(&root)?;
-            if updates.is_empty() && saved.is_empty() {
+            if json {
+                #[derive(Serialize)]
+                struct Saved<'a> {
+                    revision: &'a u64,
+                    path: &'a String,
+                    copy: &'a String,
+                }
+                print_json(&serde_json::json!({
+                    "pending": updates,
+                    "saved": saved
+                        .iter()
+                        .map(|(revision, path, copy)| Saved { revision, path, copy })
+                        .collect::<Vec<_>>(),
+                }))?;
+            } else if updates.is_empty() && saved.is_empty() {
                 println!("No pending configuration updates");
             } else {
                 println!("STATUS\tREVISION\tPATH\tVENDOR COPY");
@@ -3387,7 +3428,18 @@ fn run(command: Command) -> Result<Exit> {
             json,
             package,
         } => print_lines(reverse_dependencies(&image.root, &package)?, json)?,
-        Command::Why { image, package } => print_why(&image.root, &package)?,
+        Command::Why {
+            image,
+            json,
+            package,
+        } => {
+            let explanation = explain_package(&image.root, &package)?;
+            if json {
+                print_json(&explanation)?;
+            } else {
+                print_why(explanation)?;
+            }
+        }
         Command::Verify {
             image,
             pristine,
@@ -3396,6 +3448,7 @@ fn run(command: Command) -> Result<Exit> {
             quick,
             runtime,
             library_dirs,
+            json,
         } => {
             let root = image.root;
             let findings = if pristine {
@@ -3407,6 +3460,14 @@ fn run(command: Command) -> Result<Exit> {
             } else {
                 verify(&root)?
             };
+            let found = findings.iter().any(|finding| finding.is_error);
+            if json {
+                if runtime && !found {
+                    crate::verify_elf_runtime(&root, &library_dirs)?;
+                }
+                print_json(&findings)?;
+                return Ok(if found { Exit::Found } else { Exit::Ok });
+            }
             for finding in &findings {
                 if finding.is_error {
                     eprintln!("error: {}", finding.message);
@@ -3414,7 +3475,7 @@ fn run(command: Command) -> Result<Exit> {
                     println!("note: {}", finding.message);
                 }
             }
-            if findings.iter().any(|finding| finding.is_error) {
+            if found {
                 return Ok(Exit::Found);
             }
             if runtime {
@@ -3629,14 +3690,31 @@ fn print_system_status(system: &System, json: bool) -> Result<()> {
         .any(|entry| entry.id == running && entry.tries_left.is_some());
     let freshness = system.publisher_freshness();
     if json {
-        return print_json(&serde_json::json!({
-            "running": running,
-            "revision": status.revision,
-            "pending": status.pending,
-            "next_boot": next_boot,
-            "trial": trial,
-            "publishers": freshness?,
-        }));
+        /// The `--root` status fields, plus the running system's boot and
+        /// publisher state.
+        #[derive(Serialize)]
+        struct SystemStatus<'a> {
+            #[serde(flatten)]
+            transaction: &'a crate::apply::TransactionStatus,
+            running: &'a str,
+            next_boot: Option<String>,
+            trial: bool,
+            publishers: Vec<crate::repo::release::PublisherFreshness>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            publisher_error: Option<String>,
+        }
+        let (publishers, publisher_error) = match freshness {
+            Ok(report) => (report, None),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        };
+        return print_json(&SystemStatus {
+            transaction: &status,
+            running: &running,
+            next_boot,
+            trial,
+            publishers,
+            publisher_error,
+        });
     }
     println!("Running {running}, package revision {}", status.revision);
     if let Some(pending) = status.pending {
@@ -3666,8 +3744,7 @@ fn print_system_status(system: &System, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_why(root: &Path, package: &str) -> Result<()> {
-    let explanation = explain_package(root, package)?;
+fn print_why(explanation: crate::query::PackageExplanation) -> Result<()> {
     let intent = explanation.intent;
     let mut out = std::io::stdout().lock();
     writeln!(out, "{}", intent.id)?;
@@ -3711,10 +3788,15 @@ fn print_why(root: &Path, package: &str) -> Result<()> {
 
 fn run_publisher(command: PublisherCommand) -> Result<Exit> {
     match command {
-        PublisherCommand::List { image } => {
-            println!("PUBLISHER\tREPOSITORY");
-            for publisher in list_publishers(&image.root)? {
-                println!("{}\t{}", publisher.name, publisher.repository.display());
+        PublisherCommand::List { image, json } => {
+            let publishers = list_publishers(&image.root)?;
+            if json {
+                print_json(&publishers)?;
+            } else {
+                println!("PUBLISHER\tREPOSITORY");
+                for publisher in publishers {
+                    println!("{}\t{}", publisher.name, publisher.repository.display());
+                }
             }
         }
         PublisherCommand::Add {
@@ -3999,13 +4081,15 @@ fn select_boot_environment(
 
 fn run_boot(command: BootCommand) -> Result<Exit> {
     match command {
-        BootCommand::List { config, esp } => {
+        BootCommand::List { config, esp, json } => {
             let esp = match esp {
                 Some(esp) => esp,
                 None => System::load(&config)?.boot_paths().0.to_owned(),
             };
             let environments = list_boot_environments(&esp)?;
-            if environments.is_empty() {
+            if json {
+                print_json(&environments)?;
+            } else if environments.is_empty() {
                 println!("No boot environments registered");
             } else {
                 let by_filesystem = environments.iter().any(|entry| entry.root_uuid.is_some());
@@ -4343,10 +4427,18 @@ fn run_manifest(command: ManifestCommand) -> Result<Exit> {
 
 fn run_recipe(command: RecipeCommand) -> Result<Exit> {
     match command {
-        RecipeCommand::Order { explain, paths } => {
+        RecipeCommand::Order {
+            explain,
+            json,
+            paths,
+        } => {
             let order = crate::orchestrate::build_order(&paths)?;
             for warning in &order.warnings {
                 eprintln!("cps: {warning}");
+            }
+            if json {
+                print_json(&order.recipes)?;
+                return Ok(Exit::Ok);
             }
             for queued in order.recipes {
                 println!("{}", queued.recipe.display());
@@ -4363,10 +4455,15 @@ fn run_recipe(command: RecipeCommand) -> Result<Exit> {
             catalogs,
             changed,
             recipes,
+            json,
         } => {
             let plan = crate::orchestrate::rebuild_plan(&config, &catalogs, &changed, &recipes)?;
             for warning in &plan.warnings {
                 eprintln!("cps: {warning}");
+            }
+            if json {
+                print_json(&plan)?;
+                return Ok(Exit::Ok);
             }
             for change in plan.changed {
                 match change.previous {
@@ -4685,10 +4782,13 @@ fn run_repo(command: RepoCommand) -> Result<()> {
                 crate::resign_catalog(&repo, &publisher, &key, &base)?
             );
         }
-        RepoCommand::Obsoletions { repo, trust_root } => {
-            for id in list_obsoletions(&repo, &pinned_publisher(&trust_root)?, &trust_root)? {
-                println!("{id}");
-            }
+        RepoCommand::Obsoletions {
+            repo,
+            trust_root,
+            json,
+        } => {
+            let ids = list_obsoletions(&repo, &pinned_publisher(&trust_root)?, &trust_root)?;
+            print_lines(ids.into_iter().collect(), json)?;
         }
         RepoCommand::Attestation {
             repo,
@@ -4761,10 +4861,32 @@ fn run_repo(command: RepoCommand) -> Result<()> {
             withdraw_package(&repo, &key, &package_id)?;
             println!("Withdrawn {package_id}");
         }
-        RepoCommand::Withdrawals { repo, trust_root } => {
-            for (id, hash) in list_withdrawals(&repo, &pinned_publisher(&trust_root)?, &trust_root)?
-            {
-                println!("{id}\t{hash}");
+        RepoCommand::Withdrawals {
+            repo,
+            trust_root,
+            json,
+        } => {
+            let withdrawals =
+                list_withdrawals(&repo, &pinned_publisher(&trust_root)?, &trust_root)?;
+            if json {
+                #[derive(Serialize)]
+                struct Withdrawal {
+                    id: String,
+                    manifest_sha256: String,
+                }
+                print_json(
+                    &withdrawals
+                        .into_iter()
+                        .map(|(id, manifest_sha256)| Withdrawal {
+                            id,
+                            manifest_sha256,
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+            } else {
+                for (id, hash) in withdrawals {
+                    println!("{id}\t{hash}");
+                }
             }
         }
         RepoCommand::Export {

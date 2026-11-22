@@ -182,7 +182,7 @@ pub(crate) fn list_package_intent(root: &Path) -> Result<Vec<PackageIntentRow>> 
         .collect())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub(crate) struct PackageExplanation {
     pub intent: PackageIntentRow,
     pub profile_name: Option<String>,
@@ -191,13 +191,13 @@ pub(crate) struct PackageExplanation {
     pub path: Option<DependencyPath>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub(crate) struct DependencyPath {
     pub root: PackageIntentRow,
     pub steps: Vec<DependencyStep>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub(crate) struct DependencyStep {
     pub provider: String,
     pub requirement: String,

@@ -1,0 +1,14 @@
+applied_manifest
+freeze
+install_probe
+installed
+package
+preferred_publisher
+profile
+publishers.[].candidates.[].id
+publishers.[].candidates.[].manifest
+publishers.[].catalog
+publishers.[].name
+publishers.[].obsoleted_through
+publishers.[].requires_build_trust
+target_manifest

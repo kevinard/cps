@@ -51,7 +51,8 @@ local manual directory.
 
 Every command exits with a status from the [exit status table](exit-status.md):
 0 for success, 1 for an error, 2 for invalid usage, 3 when a check found
-something, and 4 when a prompt was declined.
+something, and 4 when a prompt was declined. Commands that list or inspect
+state print [JSON](json.md) with `--json`.
 
 ## Commands by task
 

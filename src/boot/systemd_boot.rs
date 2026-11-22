@@ -48,7 +48,7 @@ const NO_SELECTION: &str = "loader/loader.conf selects no CPS boot environment; 
 /// Free space kept on the ESP beyond the boot files of an activation.
 const ESP_MARGIN: u64 = 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct BootEnvironment {
     pub id: String,
     pub name: Option<String>,

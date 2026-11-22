@@ -17,7 +17,7 @@ use crate::{
     repo::profiles::runtime::{self, DEFAULT_LIBRARY_DIRS},
 };
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct Finding {
     pub is_error: bool,
     pub message: String,

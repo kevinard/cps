@@ -1,0 +1,14 @@
+[].details.base_image
+[].details.base_revision
+[].details.catalogs.canopa
+[].details.kernel_release
+[].details.package_changes.[].from
+[].details.package_changes.[].name
+[].details.package_changes.[].to
+[].details.payload_bytes
+[].details.planned_path_changes
+[].details.request.kind
+[].details.request.packages.[]
+[].details.systemd_actions
+[].plan_id
+[].revision

@@ -1,0 +1,13 @@
+dependents.[]
+intent.id
+intent.name
+intent.profile
+intent.requested
+path.root.id
+path.root.name
+path.root.profile
+path.root.requested
+path.steps.[].matching_providers
+path.steps.[].provider
+path.steps.[].requirement
+profile_name

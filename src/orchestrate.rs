@@ -39,11 +39,29 @@ struct Recipe {
 }
 
 /// A recipe in build order with the recipes it follows and why.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct QueuedRecipe {
     pub recipe: PathBuf,
     pub packages: Vec<String>,
+    #[serde(serialize_with = "serialize_after")]
     pub after: Vec<(PathBuf, String)>,
+}
+
+/// Each predecessor as an object with its recipe and the reason.
+fn serialize_after<S: serde::Serializer>(
+    after: &[(PathBuf, String)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(serde::Serialize)]
+    struct After<'a> {
+        recipe: &'a Path,
+        reason: &'a str,
+    }
+    serializer.collect_seq(
+        after
+            .iter()
+            .map(|(recipe, reason)| After { recipe, reason }),
+    )
 }
 
 /// Recipes in dependency order, with diagnostics for recipes read only in part.
@@ -444,7 +462,7 @@ impl Graph {
 }
 
 /// One package version that changed, and how its capabilities changed.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct ChangedPackage {
     pub id: String,
     pub previous: Option<String>,
@@ -453,7 +471,7 @@ pub(crate) struct ChangedPackage {
 }
 
 /// A package to rebuild, with each reason and its recipe when known.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct Rebuild {
     pub id: String,
     pub reasons: Vec<String>,
@@ -463,12 +481,13 @@ pub(crate) struct Rebuild {
     pub recipe: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct RebuildPlan {
     pub changed: Vec<ChangedPackage>,
     pub rebuilds: Vec<Rebuild>,
     /// Recipes of the rebuilt packages, in build order.
     pub recipes: Vec<PathBuf>,
+    #[serde(skip)]
     pub warnings: Vec<String>,
 }
 
