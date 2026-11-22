@@ -175,11 +175,19 @@ impl UpdateReport {
 impl Change {
     pub(crate) fn from_plan(plan: Plan, stage_packages: &BTreeSet<String>) -> Self {
         let boot_reason = plan.boot_reason(stage_packages);
-        Self {
+        let mut change = Self {
             plan,
             boot_reason,
             live_services: None,
-        }
+        };
+        change.record_mode();
+        change
+    }
+
+    /// Record in the plan how it runs, so the plan that `--save-plan` writes
+    /// and the plan that runs have the same bytes and ID.
+    fn record_mode(&mut self) {
+        self.plan.system = Some(self.mode());
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -235,9 +243,7 @@ impl Change {
 
     /// The plan to save, which records how it runs on the system.
     pub(crate) fn to_saved(&self) -> Plan {
-        let mut plan = self.plan.clone();
-        plan.system = Some(self.mode());
-        plan
+        self.plan.clone()
     }
 
     /// Route a nonempty change through the trial boot workflow.
@@ -246,6 +252,7 @@ impl Change {
             self.boot_reason
                 .get_or_insert_with(|| "--stage was requested".into());
         }
+        self.record_mode();
         self
     }
 }

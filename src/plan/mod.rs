@@ -1020,7 +1020,7 @@ pub(crate) fn build(
     saved: Option<&Plan>,
     install_recommends: bool,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
-    build_with_update_diagnostics(
+    let (mut plan, next, receipts) = build_with_update_diagnostics(
         image,
         state,
         request,
@@ -1029,7 +1029,10 @@ pub(crate) fn build(
         saved.is_some_and(|plan| plan.force_phased_update),
         None,
         UpdateSelection::default(),
-    )
+    )?;
+    // How a saved plan runs on the system is part of the plan.
+    plan.system = saved.and_then(|saved| saved.system);
+    Ok((plan, next, receipts))
 }
 
 #[allow(clippy::too_many_arguments)]

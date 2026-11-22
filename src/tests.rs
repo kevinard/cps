@@ -420,6 +420,37 @@ fn live_remove_recovers_offline_and_allows_autoremove() -> Result<()> {
 }
 
 #[test]
+fn a_plan_that_records_its_system_mode_applies_under_its_own_id() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "test/pkg",
+        "1.0.0-0",
+        f.file("usr/share/pkg", "pkg", "0644", "")?,
+    )?;
+    f.create()?;
+    let mut saved = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/pkg".into()],
+        },
+    )?;
+    saved.system = Some(crate::plan::SystemMode::Live);
+    let saved: Plan = serde_json::from_slice(&serde_json::to_vec(&saved)?)?;
+    assert_eq!(
+        crate::transaction_progress(&f.root, &saved, false)?.phase,
+        crate::TransactionPhase::Planned
+    );
+    // Apply checks the plan against one built again with the same mode, and
+    // records the transaction under the saved plan's ID.
+    apply(&f.root, &saved)?;
+    assert_eq!(
+        crate::transaction_progress(&f.root, &saved, false)?.phase,
+        crate::TransactionPhase::Applied
+    );
+    Ok(())
+}
+
+#[test]
 fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     use std::collections::BTreeSet;
 
@@ -485,19 +516,15 @@ fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     assert!(empty.boot_reason().is_none());
     let ordinary = Change::from_plan(install("apps/independent")?, &policy);
     assert!(ordinary.boot_reason().is_none());
-    // A saved plan records how it runs on the system, and only a system plan
-    // carries that record.
+    // A system plan records how it runs, and the plan that runs is the one
+    // that `--save-plan` writes, so both have one ID.
     use crate::plan::SystemMode;
-    assert_eq!(ordinary.saved_plan().system, None);
-    assert_eq!(ordinary.to_saved().system, Some(SystemMode::Live));
+    assert_eq!(ordinary.saved_plan().system, Some(SystemMode::Live));
+    assert_eq!(ordinary.to_saved(), *ordinary.saved_plan());
     let saved: Plan = serde_json::from_slice(&serde_json::to_vec(&ordinary.to_saved())?)?;
-    assert_eq!(saved, ordinary.to_saved());
+    assert_eq!(saved.id()?, ordinary.saved_plan().id()?);
     assert_eq!(serde_json::to_value(ordinary.to_saved())?["system"], "live");
-    assert!(
-        serde_json::to_value(ordinary.saved_plan())?
-            .get("system")
-            .is_none()
-    );
+
     assert_eq!(
         Change::from_plan(initial.clone(), &policy)
             .to_saved()
