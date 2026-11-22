@@ -7362,3 +7362,57 @@ fn a_catalog_resigned_after_a_key_rotation_advances_the_image_trust() -> Result<
     assert!(!plan(&f.root, Request::Update)?.changes_image());
     Ok(())
 }
+
+#[test]
+fn a_resumed_upgrade_keeps_its_trust_pin_advance() -> Result<()> {
+    let f = Fixture::new()?;
+    let rotated_key = Fixture::new()?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "first", "0755", "")?,
+    )?;
+    let first = fs::read_to_string(f.repo.join("current"))?;
+    f.create()?;
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Install {
+                packages: vec!["desktop/compositor".into()],
+            },
+        )?,
+    )?;
+    let rotated = rotate_catalog_key(&f.repo, "canopa", first.trim(), &f.private, &rotated_key)?;
+    fs::write(f.repo.join("current"), format!("{rotated}\n"))?;
+    let update = f.file(COMPOSITOR, "next", "0755", "")?;
+    fs::write(
+        &f.recipe,
+        format!(
+            "schema-version 1 kind=\"package-manifest\"\npackage \"desktop/compositor\" publisher=\"canopa\" version=\"2.0.0-0\" {{\n{update}}}\n"
+        ),
+    )?;
+    publish(&f.repo, &f.proto, &f.recipe, &rotated_key.private)?;
+
+    // The same upgrade, run through and interrupted then resumed, commits
+    // the same trust state.
+    let copy = f._dir.path().join("copy");
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(&f.root)
+        .arg(&copy)
+        .status()?;
+    assert!(status.success());
+    let upgrade = plan(&f.root, Request::Update)?;
+    apply(&f.root, &upgrade)?;
+    let saved = f._dir.path().join("upgrade.json");
+    interrupt_apply_at(&copy, &saved, &upgrade, COMPOSITOR)?;
+    crate::resume_transaction(&copy)?;
+    let trust = |root: &Path| -> Result<_> {
+        let image = crate::image::Image::open_query(root)?;
+        Ok((image.publishers()?, image.settings()?.catalog_checkpoints))
+    };
+    assert_eq!(trust(&copy)?, trust(&f.root)?);
+    assert_eq!(fs::read_to_string(copy.join(COMPOSITOR))?, "next");
+    Ok(())
+}

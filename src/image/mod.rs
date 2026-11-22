@@ -505,7 +505,8 @@ pub(crate) struct State {
 ///
 /// A pending transaction always applies to the committed revision it was
 /// planned against: the committed tables cannot change while it is pending.
-/// Publishers cannot change in a transaction, so the delta omits them.
+/// A transaction changes publishers only by advancing their pinned trust
+/// roots, and the delta records them only then.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateDelta {
@@ -516,6 +517,9 @@ pub(crate) struct StateDelta {
     /// New or changed managed paths, or `null` for removed paths.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) paths: BTreeMap<String, Option<Managed>>,
+    /// The publishers with their advanced trust pins, when any advanced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) publishers: Option<Publishers>,
 }
 
 fn changes<T: Clone + PartialEq>(
@@ -562,6 +566,7 @@ impl StateDelta {
             settings: next.settings.clone(),
             installed: changes(&base.installed, &next.installed),
             paths: changes(&base.paths, &next.paths),
+            publishers: (next.publishers != base.publishers).then(|| next.publishers.clone()),
         }
     }
 
@@ -571,6 +576,13 @@ impl StateDelta {
         next.settings = self.settings.clone();
         apply_changes(&mut next.installed, &self.installed, "package")?;
         apply_changes(&mut next.paths, &self.paths, "path")?;
+        if let Some(publishers) = &self.publishers {
+            ensure!(
+                base.publishers.advanced_to(publishers),
+                "the pending transaction changes publishers other than by advancing their trust roots"
+            );
+            next.publishers = publishers.clone();
+        }
         Ok(next)
     }
 }
