@@ -4524,6 +4524,65 @@ fn exact_install_and_remove_offline() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_mediated_link_conflicts_with_a_plain_path_whichever_provider_wins() -> Result<()> {
+    let f = Fixture::new()?;
+    let provider = |tool: &str, links: &[&str], priority: u32| -> Result<String> {
+        let mut actions = f.file(&format!("usr/lib/{tool}/bin"), tool, "0755", "")?;
+        for link in links {
+            actions += &format!(
+                "    symlink \"usr/bin/{link}\" target=\"../lib/{tool}/bin\"\n    \
+                 mediate \"usr/bin/{link}\" group=\"java\" priority={priority}\n"
+            );
+        }
+        Ok(actions)
+    };
+    f.package("java/a", "1.0.0-0", provider("a", &["java", "javac"], 10)?)?;
+    // java/r wins the group and offers no javac link.
+    f.package("java/r", "1.0.0-0", provider("r", &["java"], 20)?)?;
+    f.package(
+        "tools/q",
+        "1.0.0-0",
+        f.file("usr/bin/javac", "q", "0755", "")?,
+    )?;
+    f.package("lib/m", "1.0.0-0", "    require \"java/r\"\n".into())?;
+    f.package(
+        "lib/m",
+        "2.0.0-0",
+        "    require \"java/a\"\n    require \"java/r\"\n".into(),
+    )?;
+    f.package(
+        "apps/top",
+        "1.0.0-0",
+        "    require \"lib/m\"\n    require \"tools/q\"\n".into(),
+    )?;
+    f.create()?;
+    let error = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["java/a".into(), "java/r".into(), "tools/q".into()],
+        },
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    for detail in ["usr/bin/javac", "java/a", "tools/q"] {
+        assert!(message.contains(detail), "missing {detail} in {message}");
+    }
+    // The pair never fits, so the solver keeps the version without java/a.
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/top".into()],
+        },
+    )?;
+    assert!(
+        install.summary().contains("Install lib/m 1.0.0-0"),
+        "{}",
+        install.summary()
+    );
+    Ok(())
+}
+
 mod release;
 mod transitions;
 

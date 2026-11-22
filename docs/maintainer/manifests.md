@@ -723,6 +723,14 @@ the highest priority by default, with the package name breaking ties.
 Users inspect the choice with `cps mediator list` and change it with
 [`cps mediator set`](../client/configuration.md#choose-the-provider-of-a-mediated-link).
 
+Every package that offers a mediated link still claims its path, whether or
+not it is selected. Another package may offer the same path only in the
+same group. A package that ships an ordinary file, directory or link there,
+or below it, or a file where the link's parent directory belongs, conflicts
+with every package that offers the link. A conflict therefore never depends
+on which provider a group selects, and CPS can rule out that pair of
+packages once.
+
 ## Change the file layout between versions
 
 A new version can change any path's type. A directory can become a file

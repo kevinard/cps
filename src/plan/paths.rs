@@ -136,7 +136,12 @@ fn compose_paths(
     let mut paths: BTreeMap<String, Managed> = BTreeMap::new();
     let mut sizes = BTreeMap::new();
     let mut config_names = BTreeMap::new();
+    // Every applicable mediated link conflicts with other packages' paths,
+    // whichever provider wins its group, so a conflict always holds between
+    // the same two packages and the solver may reject that pair for good.
     let mut shared_paths = BTreeMap::<&str, (&str, &str)>::new();
+    let mut plain_paths = BTreeMap::<&str, &str>::new();
+    let mut offered = Vec::<(&str, &str)>::new();
     for (name, package) in installed {
         package.published.manifest.check_architecture(arch)?;
         let publisher = &package.published.manifest.publisher;
@@ -161,10 +166,19 @@ fn compose_paths(
                 {
                     return Err(PathConflict::new(path, owner, name).into());
                 }
+                if let Some(&owner) = plain_paths.get(path) {
+                    return Err(PathConflict::new(path, owner, name).into());
+                }
                 shared_paths.entry(path).or_insert((&link.group, name));
                 if winners[link.group.as_str()] != name {
+                    offered.push((path, name));
                     continue;
                 }
+            } else {
+                if let Some(&(_, owner)) = shared_paths.get(path) {
+                    return Err(PathConflict::new(path, owner, name).into());
+                }
+                plain_paths.insert(path, name);
             }
             let original_name = action.original_name();
             if action.preserve() {
@@ -230,6 +244,28 @@ fn compose_paths(
                     original_name: None,
                 });
             }
+        }
+    }
+    // A link that loses its group still may not sit below another package's
+    // file or above another package's path.
+    for (path, owner) in offered {
+        for (index, _) in path.match_indices('/') {
+            let parent = &path[..index];
+            if let Some(existing) = paths.get(parent)
+                && !existing.node.is_dir()
+            {
+                let parent_owner = existing.owners.first().expect("explicit path has an owner");
+                return Err(PathConflict::new(parent, parent_owner, owner).into());
+            }
+        }
+        let below = format!("{path}/");
+        if let Some((_, existing)) = paths
+            .range(below.clone()..)
+            .next()
+            .filter(|(child, _)| child.starts_with(&below))
+        {
+            let child_owner = existing.owners.first().expect("explicit path has an owner");
+            return Err(PathConflict::new(path, owner, child_owner).into());
         }
     }
     let parents: Vec<_> = parents
