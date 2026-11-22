@@ -48,9 +48,7 @@ pub(crate) fn resolve<'a, T, P: PackageInfo + 'a>(
     for (name, spec) in requested {
         if let Some(frozen) = available.freezes.get(*name) {
             ensure!(
-                spec.version
-                    .as_ref()
-                    .is_none_or(|version| version == &frozen.version),
+                spec.accepts(&frozen.version),
                 "{name} is frozen at {}{}; use cps unfreeze before changing its version",
                 frozen.version,
                 freeze::reason_suffix(frozen)
@@ -95,7 +93,8 @@ pub(crate) fn resolve<'a, T, P: PackageInfo + 'a>(
                     .is_some_and(|freeze| &freeze.version == version);
             let respelled = old.version.semantic() == version.semantic() && &old.version != version;
             if old.publisher != package.publisher()
-                || (old.version.semantic() > version.semantic() && pinned != Some(version))
+                || (old.version.semantic() > version.semantic()
+                    && !pinned.is_some_and(|pinned| pinned.semantic() == version.semantic()))
                 || (respelled && !named)
             {
                 continue;
@@ -109,7 +108,7 @@ pub(crate) fn resolve<'a, T, P: PackageInfo + 'a>(
         if spec.is_some_and(|spec| {
             spec.publisher
                 .is_some_and(|publisher| publisher != package.publisher())
-                || pinned.is_some_and(|pinned| pinned != version)
+                || !spec.accepts(version)
         }) {
             continue;
         }
@@ -120,11 +119,14 @@ pub(crate) fn resolve<'a, T, P: PackageInfo + 'a>(
         let current = installed
             .get(*name)
             .map(|pkg| pkg.published.sha256.as_str());
-        // Prefer the newest release, then the spelling that sorts last.
+        // Prefer the spelling a pin names, then the newest release, then the
+        // spelling that sorts last.
+        let pinned = requested.get(*name).and_then(|spec| spec.version.as_ref());
         versions.sort_by(|a, b| {
             let (a_current, b_current) = (current == Some(a.sha256()), current == Some(b.sha256()));
             (prefer_current && a_current)
                 .cmp(&(prefer_current && b_current))
+                .then_with(|| (pinned == Some(a.version())).cmp(&(pinned == Some(b.version()))))
                 .then_with(|| a.version().semantic().cmp(&b.version().semantic()))
                 .then_with(|| a.version().cmp(b.version()))
         });

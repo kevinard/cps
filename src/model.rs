@@ -164,6 +164,15 @@ pub(crate) struct PackageSpec<'a> {
 }
 
 impl<'a> PackageSpec<'a> {
+    /// Whether the selector's version, if any, names the same release as
+    /// `version`. A user writes `@1.0` for `1.0-0`; spelling decides only
+    /// between respellings of one release.
+    pub(crate) fn accepts(&self, version: &Version) -> bool {
+        self.version
+            .as_ref()
+            .is_none_or(|wanted| wanted.semantic() == version.semantic())
+    }
+
     pub(crate) fn parse(text: &'a str) -> Result<Self> {
         let (publisher, spec) = if let Some(spec) = text.strip_prefix("cps://") {
             let (publisher, spec) = spec.split_once('/').context("package ID has no name")?;
@@ -288,13 +297,38 @@ impl Dependency {
     }
 }
 
+/// A comparison in a version constraint. Every operator a manifest or a user
+/// can write compares release semantics, so `=1.0` matches `1.0-0`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum Operator {
+    /// The same spelling, which names one package ID. Only the planner uses
+    /// it; no constraint text parses to it.
+    Identical,
+    Equal,
+    AtLeast,
+    AtMost,
+    Above,
+    Below,
+}
+
+impl Operator {
+    /// Written operators, longest first so `>=` is not read as `>`.
+    const WRITTEN: [(&'static str, Self); 5] = [
+        (">=", Self::AtLeast),
+        ("<=", Self::AtMost),
+        ("=", Self::Equal),
+        (">", Self::Above),
+        ("<", Self::Below),
+    ];
+}
+
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
-pub(crate) struct VersionConstraint(Vec<(&'static str, Version)>);
+pub(crate) struct VersionConstraint(Vec<(Operator, Version)>);
 
 impl VersionConstraint {
     /// Match one package ID's exact spelling, unlike the semantic `=` operator.
     pub(crate) fn exact(version: Version) -> Self {
-        Self(vec![("==", version)])
+        Self(vec![(Operator::Identical, version)])
     }
 
     pub(crate) fn parse(constraint: Option<&str>) -> Result<Self> {
@@ -304,9 +338,9 @@ impl VersionConstraint {
         clauses
             .map(|clause| {
                 let clause = clause.trim();
-                let (operator, bound) = [">=", "<=", "=", ">", "<"]
+                let (operator, bound) = Operator::WRITTEN
                     .into_iter()
-                    .find_map(|op| clause.strip_prefix(op).map(|value| (op, value)))
+                    .find_map(|(text, op)| clause.strip_prefix(text).map(|value| (op, value)))
                     .with_context(|| format!("invalid constraint {clause:?}"))?;
                 Ok((operator, bound.trim_start().parse()?))
             })
@@ -317,16 +351,14 @@ impl VersionConstraint {
     /// Match by release semantics, so `2.0.0` satisfies `=2.0.0-0`.
     pub(crate) fn matches(&self, version: &Version) -> bool {
         self.0.iter().all(|(operator, bound)| {
-            if *operator == "==" {
-                return version == bound;
-            }
-            let (version, bound) = (version.semantic(), bound.semantic());
-            match *operator {
-                ">=" => version >= bound,
-                "<=" => version <= bound,
-                ">" => version > bound,
-                "<" => version < bound,
-                _ => version == bound,
+            let semantic = (version.semantic(), bound.semantic());
+            match operator {
+                Operator::Identical => version == bound,
+                Operator::Equal => semantic.0 == semantic.1,
+                Operator::AtLeast => semantic.0 >= semantic.1,
+                Operator::AtMost => semantic.0 <= semantic.1,
+                Operator::Above => semantic.0 > semantic.1,
+                Operator::Below => semantic.0 < semantic.1,
             }
         })
     }

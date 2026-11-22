@@ -140,13 +140,14 @@ So `1.0~rc1` < `1.0-rc1` < `1.0` < `1.0b3` < `1.0+b1` < `1.0-15-0` <
 
 Versions have a meaning and a spelling. `2.0.0`, `2.0.0-0`, and `0:02.0.0`
 have the same meaning: one release. Every newer-or-older decision uses the
-meaning: version constraints, upgrades, downgrade checks, obsoletion
-cutoffs, and the revisions that Git builds allocate. Identity uses the
-spelling: a package ID, an `@VERSION` selector, a freeze, and a signed
-composition name one exact spelling, so `@2.0.0` and `@2.0.0-0` are distinct
-packages. A plan never replaces an installed package with another spelling
-of the same release unless an `@VERSION` selector or a freeze names that
-spelling. When the installed package cannot stay, the plan holds back or
+meaning: version constraints, `@VERSION` selectors, upgrades, downgrade
+checks, obsoletion cutoffs, and the revisions that Git builds allocate.
+Identity uses the spelling: a package ID, a freeze, and a signed
+composition name one exact spelling, so `2.0.0` and `2.0.0-0` are distinct
+packages, and `@2.0.0` selects either, preferring the one spelled `2.0.0`. A
+plan never replaces an installed package with another spelling of the same
+release unless an `@VERSION` selector or a freeze spells the version that
+way. When the installed package cannot stay, the plan holds back or
 fails instead. Pick one spelling convention, such as always
 writing the revision, and keep it.
 

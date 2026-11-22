@@ -152,8 +152,7 @@ When a new package is available from several publishers, an interactive
 `install` shows a choice with the newest matching version from each.
 Press Enter for the first choice or enter a number. Use
 `cps://PUBLISHER/NAME` to select a publisher explicitly, and
-`NAME@VERSION` with the version spelled exactly as in the package ID to
-select a version; see [package selectors](queries.md#package-selectors-and-versions).
+`NAME@VERSION` to select a release; see [package selectors](queries.md#package-selectors-and-versions).
 `--yes` and `--dry-run` use the configured search order. Installed packages
 keep their original publisher.
 

@@ -39,10 +39,11 @@ and dependency cleanup remain allowed. The freeze survives removal and
 constrains later reinstallation.
 
 Specify `NAME@VERSION` to freeze a package that is not installed. A freeze
-matches the version exactly as it is spelled in the package ID, so
-`library/libdisplay@2.0.0` does not freeze `2.0.0-0`; see
+holds one package ID, so it records the version as spelled, and for an
+installed package it records the installed spelling: `library/libdisplay@2.0.0`
+freezes an installed `2.0.0-0` at `2.0.0-0`; see
 [package selectors](queries.md#package-selectors-and-versions). For an
-installed package, an explicit version must match the installed version.
+installed package, an explicit version must name the installed release.
 Publisher selectors check the selected installed package, while the stored
 constraint applies to the package name and version. This follows
 [IPS package freezes](https://docs.oracle.com/cd/E26502_01/html/E28984/gilfr.html)

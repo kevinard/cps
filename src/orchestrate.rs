@@ -568,9 +568,15 @@ pub(crate) fn rebuild_plan(
             );
         }
         let position = match &spec.version {
+            // Prefer the exact spelling, then another spelling of the release.
             Some(version) => versions
                 .iter()
                 .position(|candidate| &candidate.version == version)
+                .or_else(|| {
+                    versions
+                        .iter()
+                        .position(|candidate| candidate.version.semantic() == version.semantic())
+                })
                 .with_context(|| {
                     format!(
                         "no version {version} of {} in the pinned catalogs",

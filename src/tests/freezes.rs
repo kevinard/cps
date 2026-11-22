@@ -419,3 +419,61 @@ fn package_freezes_persist_after_removal_and_constrain_reinstallation() -> Resul
     assert!(verify(&f.root)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn version_selectors_name_releases_not_spellings() -> Result<()> {
+    use crate::list_freezes;
+    let f = Fixture::new()?;
+    let name = "test/tool";
+    f.package(name, "1.0.0-0", f.file(COMPOSITOR, "old", "0755", "")?)?;
+    f.package(name, "2.0.0-0", f.file(COMPOSITOR, "new", "0755", "")?)?;
+    f.create()?;
+    let install = |spec: &str| -> Result<()> {
+        apply(
+            &f.root,
+            &plan(
+                &f.root,
+                Request::Install {
+                    packages: vec![spec.into()],
+                },
+            )?,
+        )?;
+        Ok(())
+    };
+    install(&format!("{name}@2.0.0"))?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "new");
+    install(&format!("{name}@1.0.0"))?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Freeze {
+                packages: vec![format!("{name}@0:1.0.0")],
+                reason: None,
+            },
+        )?,
+    )?;
+    assert_eq!(list_freezes(&f.root)?[name].version.to_string(), "1.0.0-0");
+    install(&format!("{name}@01.0.0"))?;
+    assert!(
+        plan(
+            &f.root,
+            Request::Unfreeze {
+                packages: vec![format!("{name}@2.0")],
+            },
+        )
+        .is_err()
+    );
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Unfreeze {
+                packages: vec![format!("{name}@1.0.00")],
+            },
+        )?,
+    )?;
+    assert!(list_freezes(&f.root)?.is_empty());
+    Ok(())
+}

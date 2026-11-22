@@ -885,8 +885,7 @@ fn resolve_local<'a, P: PackageInfo + 'a>(
         ensure!(
             requested
                 .get(name.as_str())
-                .and_then(|spec| spec.version.as_ref())
-                .is_none_or(|version| version == &manifest.version),
+                .is_none_or(|spec| spec.accepts(&manifest.version)),
             "{name} is protected by the installed signed profile; apply a signed profile update to change it"
         );
         ensure!(

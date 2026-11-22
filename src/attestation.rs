@@ -259,9 +259,7 @@ impl Toolchain {
             ensure!(
                 spec.publisher
                     .is_none_or(|publisher| package.publisher == publisher)
-                    && spec
-                        .version
-                        .is_none_or(|version| package.version == version),
+                    && spec.accepts(&package.version),
                 "build attestation claims a different selection for toolchain package {name}"
             );
         }
