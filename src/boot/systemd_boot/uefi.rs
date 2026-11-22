@@ -22,6 +22,8 @@ const LOADER: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
 const EFIVARFS: &str = "/sys/firmware/efi/efivars";
 const EFIVARFS_MAGIC: u32 = 0xde5e81e4;
 const ATTRIBUTES: u32 = 7; // Non-volatile, boot service and runtime access.
+/// The load option attribute that lets firmware boot the option.
+const LOAD_OPTION_ACTIVE: u8 = 1;
 
 pub(super) fn present(esp: &Path) -> Result<bool> {
     policy::directory_exists(&esp.join(DIRECTORY))
@@ -186,6 +188,7 @@ impl Firmware {
         self.check_references(id, existing)?;
         if let Some(number) = existing {
             self.check_option(number, id)?;
+            self.enable(number)?;
             return Ok(number);
         }
         let number = (0..=u16::MAX)
@@ -198,6 +201,26 @@ impl Firmware {
             .context("no free UEFI boot numbers")?;
         write_variable(&option_name(number), &load_option(&self.device, id)?, true)?;
         Ok(number)
+    }
+
+    /// Set the active attribute of a CPS option that firmware or an
+    /// administrator cleared. Firmware skips an inactive option in
+    /// `BootOrder` and may ignore it in `BootNext`, so a selected
+    /// environment would not boot.
+    fn enable(&self, number: u16) -> Result<()> {
+        let mut option = self
+            .options
+            .get(&number)
+            .context("missing firmware boot option")?
+            .clone();
+        let attributes = option
+            .get_mut(..4)
+            .context("invalid firmware boot option")?;
+        if attributes[0] & LOAD_OPTION_ACTIVE == 0 {
+            attributes[0] |= LOAD_OPTION_ACTIVE;
+            write_variable(&option_name(number), &option, false)?;
+        }
+        Ok(())
     }
 
     /// Check that option `number`, which `option` matched to `id`, still
@@ -256,6 +279,7 @@ impl Firmware {
             .option(id)?
             .context("missing firmware boot option for rollback")?;
         self.check_option(target, id)?;
+        self.enable(target)?;
         ensure!(
             boot_number("BootNext")? == self.next,
             "BootNext changed during rollback"
@@ -314,6 +338,7 @@ impl Firmware {
             .context("missing UEFI fallback boot option")?;
         self.check_option(number, &entry.id)?;
         self.check_option(fallback, &parent.id)?;
+        self.enable(number)?;
         ensure!(
             self.current == Some(number) && parent.tries.is_none(),
             "expected a running UEFI trial and a known-good fallback"
@@ -1177,6 +1202,22 @@ mod tests {
         option.extend(path);
         option.extend(b"optional data");
         Ok(option)
+    }
+
+    #[test]
+    fn a_disabled_cps_option_is_enabled_before_it_is_selected() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let mut firmware = fake.firmware(&[42], None, Some(42), &[], FIRST_BOOT)?;
+        let mut disabled = load_option(&device(), BASE)?;
+        disabled[0] &= !LOAD_OPTION_ACTIVE;
+        fake.set(&option_name(3), &disabled)?;
+        firmware.options.insert(3, disabled);
+        firmware.activate(BASE, false)?;
+        assert_eq!(boot_order()?, [3, 42]);
+        let option = variable(&option_name(3))?.context("missing option")?;
+        assert_eq!(option[0] & LOAD_OPTION_ACTIVE, LOAD_OPTION_ACTIVE);
+        assert_eq!(option[1..], load_option(&device(), BASE)?[1..]);
+        Ok(())
     }
 
     #[test]
