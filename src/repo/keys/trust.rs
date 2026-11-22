@@ -73,6 +73,29 @@ impl<'de> Deserialize<'de> for Key {
     }
 }
 
+/// A trust root version that is no longer valid. A catalog signed under it
+/// cannot become current. A mirror that serves one may only be behind a
+/// publisher that has already signed a newer version, so another mirror can
+/// still succeed.
+#[derive(Debug)]
+pub(crate) struct TrustRootExpired {
+    pub(crate) version: u64,
+    pub(crate) publisher: String,
+    pub(crate) expires: String,
+}
+
+impl fmt::Display for TrustRootExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "trust root version {} for {} expired at {}; the publisher's root keys must sign a new version",
+            self.version, self.publisher, self.expires
+        )
+    }
+}
+
+impl std::error::Error for TrustRootExpired {}
+
 /// The signed content of one trust root version.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -159,13 +182,14 @@ impl TrustRoot {
 
     /// Reject a trust root that has expired.
     pub(crate) fn check_unexpired(&self) -> Result<()> {
-        ensure!(
-            self.expires() > Timestamp::now(),
-            "trust root version {} for {} expired at {}; the publisher's root keys must sign a new version",
-            self.version,
-            self.publisher,
-            self.expires
-        );
+        if self.expires() <= Timestamp::now() {
+            return Err(TrustRootExpired {
+                version: self.version,
+                publisher: self.publisher.clone(),
+                expires: self.expires.clone(),
+            }
+            .into());
+        }
         Ok(())
     }
 

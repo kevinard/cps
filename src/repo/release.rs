@@ -33,6 +33,7 @@ use super::{
     read_package, read_pointer, read_trust_root, rebuild, source_archive, write_atomic,
 };
 
+use super::keys::trust::TrustRootExpired;
 use crate::attestation::ATTESTATION_LIMIT;
 
 /// Metadata size limits shared by the mirror signer and every client loader.
@@ -510,12 +511,17 @@ fn rolled_back(error: &anyhow::Error) -> bool {
 }
 
 /// Whether an error came from what a mirror served, rather than from local state.
+///
+/// A catalog whose trust root has expired is one: TUF proves that the
+/// publisher signed it, but a mirror that lags behind its origin may still
+/// serve it after the publisher signed a new trust root.
 fn mirror_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<tough::error::Error>()
             || cause.is::<TransportError>()
             || cause.is::<MetadataTooLarge>()
             || cause.is::<MirrorContent>()
+            || cause.is::<TrustRootExpired>()
     })
 }
 
@@ -663,6 +669,8 @@ fn classify_refresh_failure(error: &anyhow::Error) -> RefreshFailure {
             }
         } else if cause.is::<MetadataTooLarge>() {
             return RefreshFailure::Security;
+        } else if cause.is::<TrustRootExpired>() {
+            expired = true;
         } else if cause.is::<TransportError>() {
             transport = true;
         }
@@ -2359,6 +2367,41 @@ mod tests {
             .block_on(async { transport.fetch(url).await?.into_vec().await })
             .unwrap_err();
         classify_refresh_failure(&anyhow::Error::new(error).context("refreshing publisher extras"))
+    }
+
+    #[test]
+    fn a_lagging_mirror_with_an_expired_trust_root_fails_over() -> Result<()> {
+        let mirror = Mirror::from_base("https://replica.example/")?
+            .with_fallbacks(&["https://origin.example/".to_owned()])?;
+        let expired = || {
+            anyhow::Error::new(TrustRootExpired {
+                version: 1,
+                publisher: "example".into(),
+                expires: "2026-01-01T00:00:00Z".into(),
+            })
+            .context("reading the current catalog")
+        };
+        let mut tried = Vec::new();
+        let served = try_mirrors("example", &mirror, |endpoint| {
+            tried.push(endpoint.to_string());
+            if tried.len() == 1 {
+                Err(expired())
+            } else {
+                Ok("renewed")
+            }
+        })?;
+        assert_eq!(served, "renewed");
+        assert_eq!(tried.len(), 2);
+
+        // When every mirror lags, the failure is expiry, which a deferral
+        // policy may accept, rather than a security failure.
+        let error =
+            try_mirrors("example", &mirror, |_| -> Result<()> { Err(expired()) }).unwrap_err();
+        assert!(matches!(
+            classify_refresh_failure(&error),
+            RefreshFailure::Expired
+        ));
+        Ok(())
     }
 
     #[test]

@@ -163,8 +163,10 @@ Each operation, such as a refresh, a sync, or a payload fetch, tries the
 mirrors in order until one completes, up to five mirrors, so only the first
 five candidates matter. Any failure caused
 by what a mirror served moves on to the next one: an outage, a timeout, a
-missing file, and also a signature, digest, expiry, or rollback failure.
-Trying another mirror is always safe, because each one is verified the same
+missing file, and also a signature, digest, expiry, or rollback failure. A
+current catalog signed under an expired trust root counts as an expiry: a
+replica that lags its origin can still serve it after the publisher signed a
+new trust root. Trying another mirror is always safe, because each one is verified the same
 way. A mirror that is behind the newest release CPS has seen fails as a
 rollback, so a stale mirror never takes a client back. Each mirror gets its
 own transfer deadline, so a stalled mirror leaves time for the next one.
@@ -316,7 +318,8 @@ refresh-policy "extras" on-unavailable="defer" max-staleness-hours=72
 ```
 
 With `on-unavailable="defer"`, CPS defers updates from the publisher when
-the mirror is unreachable, too slow, or serves expired metadata, as long as
+the mirror is unreachable, too slow, or serves expired metadata or a catalog
+signed under an expired trust root, as long as
 the last successful refresh is no older than `max-staleness-hours` (1 to
 8784). Packages from that publisher stay at their installed versions.
 Beyond that age, or when CPS has no record of a refresh, the update fails.
