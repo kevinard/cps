@@ -1785,7 +1785,9 @@ fn marks_installed_package_requests_offline_without_touching_files() -> Result<(
     assert!(promoted_reason.intent.requested);
     assert_eq!(promoted_reason.dependents, explanation.dependents);
     assert!(format!("{:#}", apply(&f.root, &stale).unwrap_err()).contains("stale plan"));
-    let history = crate::transaction_details(&f.root, &promoted.id()?)?.details;
+    let history = crate::transaction_details(&f.root, &promoted.id()?)?
+        .details
+        .unwrap();
     assert_eq!(history.intent_changes, promoted.intent_changes);
     assert!(history.package_changes.is_empty());
     assert_eq!(history.planned_path_changes, 0);
@@ -3380,6 +3382,7 @@ fn rejects_development_journals_and_verifies_completed_transactions() -> Result<
     assert_eq!(
         crate::transaction_details(&f.root, &install_id)?
             .details
+            .unwrap()
             .request,
         install.request,
     );
@@ -3832,11 +3835,11 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
             (1, initial.id()?)
         ]
     );
-    let restored = &history[0].details;
+    let restored = history[0].details.as_ref().unwrap();
     assert_eq!(restored.base_image, original.id);
     assert_eq!(restored.base_revision, 2);
     assert_eq!(restored.request, review(RESTORE, ConfigChoice::Vendor));
-    let upgraded = &history[3].details;
+    let upgraded = history[3].details.as_ref().unwrap();
     assert_eq!(upgraded.base_image, upgrade.image);
     assert_eq!(
         upgraded.catalogs["canopa"],
@@ -4107,6 +4110,13 @@ fn rejects_the_old_image_state_layout_and_format() -> Result<()> {
     let error = verify(&f.root).unwrap_err();
     assert!(format!("{error:#}").contains("unsupported image format"));
     db.execute("UPDATE image SET data=json_set(data, '$.format', 1)", [])?;
+    db.pragma_update(None, "user_version", 2)?;
+    let error = verify(&f.root).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("image database schema version 2 is not supported"),
+        "{error:#}"
+    );
+    db.pragma_update(None, "user_version", 1)?;
     db.pragma_update(None, "application_id", 0)?;
     drop(db);
     let Err(error) = crate::list_publishers(&f.root) else {
@@ -4495,6 +4505,7 @@ mod etc_merge;
 mod facets;
 mod freezes;
 mod modes;
+mod records;
 mod triggers;
 
 #[test]
@@ -4768,7 +4779,14 @@ fn journal_records_only_changes_to_the_committed_state() -> Result<()> {
     let original: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let journal: serde_json::Value = serde_json::from_str(&original)?;
-    let next = &journal["journaled"]["next"];
+    // The journal records the next state as the exact text it digests.
+    let recorded = journal["journaled"]["next"].as_str().unwrap();
+    assert_eq!(
+        journal["journaled"]["state_sha256"],
+        digest(recorded.as_bytes())
+    );
+    let next: serde_json::Value = serde_json::from_str(recorded)?;
+    let next = &next;
     let installed = next["installed"].as_object().unwrap();
     assert_eq!(installed.keys().collect::<Vec<_>>(), ["test/two"]);
     let paths = next["paths"].as_object().unwrap();
@@ -4780,10 +4798,11 @@ fn journal_records_only_changes_to_the_committed_state() -> Result<()> {
     // is rejected, even with a matching digest.
     let tampered = |change: &dyn Fn(&mut serde_json::Value)| -> Result<String> {
         let mut journal = journal.clone();
-        change(&mut journal["journaled"]["next"]);
-        let delta: crate::image::StateDelta =
-            serde_json::from_value(journal["journaled"]["next"].clone())?;
-        journal["journaled"]["state_sha256"] = digest(&serde_json::to_vec(&delta)?).into();
+        let mut delta = next.clone();
+        change(&mut delta);
+        let text = delta.to_string();
+        journal["journaled"]["state_sha256"] = digest(text.as_bytes()).into();
+        journal["journaled"]["next"] = text.into();
         db.execute(
             "UPDATE pending SET data=?1 WHERE id=1",
             [journal.to_string()],

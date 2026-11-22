@@ -60,7 +60,9 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         freezes[runtime].reason.as_deref(),
         Some("keep known-good graphics ABI")
     );
-    let details = crate::transaction_details(&f.root, &freeze.id()?)?.details;
+    let details = crate::transaction_details(&f.root, &freeze.id()?)?
+        .details
+        .unwrap();
     assert_eq!(details.freeze_changes, freeze.freeze_changes);
     assert_eq!(details.planned_path_changes, 0);
     fs::rename(f.repo.with_extension("offline"), &f.repo)?;
@@ -144,10 +146,12 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
     let original: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let mut journal: serde_json::Value = serde_json::from_str(&original)?;
-    journal["journaled"]["next"]["settings"]["freezes"][runtime]["reason"] = "tampered".into();
-    let next: crate::image::StateDelta =
-        serde_json::from_value(journal["journaled"]["next"].clone())?;
-    journal["journaled"]["state_sha256"] = digest(&serde_json::to_vec(&next)?).into();
+    let mut next: serde_json::Value =
+        serde_json::from_str(journal["journaled"]["next"].as_str().unwrap())?;
+    next["settings"]["freezes"][runtime]["reason"] = "tampered".into();
+    let next = next.to_string();
+    journal["journaled"]["state_sha256"] = digest(next.as_bytes()).into();
+    journal["journaled"]["next"] = next.into();
     db.execute(
         "UPDATE pending SET data=?1 WHERE id=1",
         [journal.to_string()],

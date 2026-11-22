@@ -802,7 +802,7 @@ publisher "seed" {{ repository {:?}; trust-root {:?}; }}
     );
     apply(&f.root, &serde_json::from_value(saved)?)?;
     let history = crate::transaction_history(&f.root, 1)?;
-    assert!(history[0].details.force_phased_update);
+    assert!(history[0].details.as_ref().unwrap().force_phased_update);
     assert!(!plan(&f.root, Request::Update)?.has_changes());
 
     if initial.cohort > 0 {
@@ -4541,19 +4541,23 @@ fn offline_verification_checks_catalog_admission_and_pending_archives() -> Resul
     assert_eq!(pending.plan_summary, plan.summary());
     let journal: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
-    for (field, reason) in [
-        (
-            "$.journaled.plan.payload_bytes",
-            "journaled plan digest mismatch",
-        ),
-        (
-            "$.journaled.next.settings.revision",
-            "journaled image state digest mismatch",
-        ),
+    // Each recorded text must match the digest the journal keeps for it.
+    for (record, field, reason) in [
+        ("plan", "payload_bytes", "journaled plan digest mismatch"),
+        ("next", "settings", "journaled image state digest mismatch"),
     ] {
+        let mut tampered: serde_json::Value = serde_json::from_str(&journal)?;
+        let mut text: serde_json::Value =
+            serde_json::from_str(tampered["journaled"][record].as_str().unwrap())?;
+        if field == "settings" {
+            text["settings"]["revision"] = 0.into();
+        } else {
+            text[field] = 0.into();
+        }
+        tampered["journaled"][record] = text.to_string().into();
         db.execute(
-            "UPDATE pending SET data=json_set(?1, ?2, 0) WHERE id=1",
-            (&journal, field),
+            "UPDATE pending SET data=?1 WHERE id=1",
+            [tampered.to_string()],
         )?;
         let error = crate::resume_transaction(&f.root).unwrap_err();
         assert!(format!("{error:#}").contains(reason), "{error:#}");

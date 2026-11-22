@@ -1,0 +1,16 @@
+[].details.base_image: string
+[].details.base_revision: number
+[].details.catalogs.canopa: string
+[].details.format: number
+[].details.kernel_release: null
+[].details.package_changes[].from: null
+[].details.package_changes[].name: string
+[].details.package_changes[].to: string
+[].details.payload_bytes: number
+[].details.planned_path_changes: number
+[].details.request{kind=install}.kind: string
+[].details.request{kind=install}.packages[]: string
+[].details.systemd_actions: number
+[].operation: string
+[].plan_id: string
+[].revision: number

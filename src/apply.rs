@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -18,7 +17,7 @@ use crate::{
         Image, Managed, Publisher, Settings, State, StateDelta, accounts,
         root::{self, DirSyncs, Fingerprint, ReplacementSource, Root},
     },
-    model::{Node, copy_payload, digest_reader, validate_digest},
+    model::{Node, Recorded, copy_payload, digest_reader, validate_digest},
     plan::{Plan, Request, Write, build, config_update_prefix, hardlink_groups, pending_repairs},
     repo::{
         BuildReceipt, Published,
@@ -36,11 +35,12 @@ const JOURNAL_FORMAT: u32 = 1;
 #[serde(deny_unknown_fields)]
 struct Journal {
     format: u32,
+    /// The SHA-256 of the recorded plan text, which names the transaction.
     id: String,
-    plan: Plan,
+    plan: Recorded<Plan>,
     /// The next state as changes to the committed revision it replaces.
-    next: StateDelta,
-    /// The digest of `next`.
+    next: Recorded<StateDelta>,
+    /// The SHA-256 of the recorded `next` text.
     state_sha256: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     files_ready: bool,
@@ -148,21 +148,77 @@ impl PendingRecord {
             journal.format
         );
         ensure!(
-            journal.plan.id()? == journal.id,
+            journal.plan.sha256() == journal.id,
             "journaled plan digest mismatch"
         );
         ensure!(
-            state_digest(&journal.next)? == journal.state_sha256,
+            journal.next.sha256() == journal.state_sha256,
             "journaled image state digest mismatch"
         );
         Ok(&journal.plan)
     }
 }
 
-fn state_digest(state: &StateDelta) -> Result<String> {
-    let mut sha = Sha256::new();
-    serde_json::to_writer(&mut sha, state)?;
-    Ok(hex::encode(sha.finalize()))
+/// The pending record that a transaction from `base` to `next` keeps, with
+/// every optional progress field set, for the record shape tests.
+#[cfg(test)]
+pub(crate) fn sample_pending_record(
+    plan: Plan,
+    base: &State,
+    next: &State,
+) -> Result<serde_json::Value> {
+    let plan = Recorded::new(plan)?;
+    let next = Recorded::new(StateDelta::between(base, next))?;
+    let journal = Journal {
+        format: JOURNAL_FORMAT,
+        id: plan.sha256(),
+        state_sha256: next.sha256(),
+        plan,
+        next,
+        files_ready: true,
+        live_jobs: None,
+        triggers_done: 1,
+        abort: Some(AbortProgress {
+            files_ready: true,
+            live_jobs: None,
+            triggers_done: 1,
+        }),
+    };
+    Ok(serde_json::to_value(PendingRecord::Journaled(Box::new(
+        journal,
+    )))?)
+}
+
+/// The pending transaction of an image, if any.
+///
+/// The journal's format is checked before the rest is decoded, so a journal
+/// that another CPS version wrote is reported as such, with its plan ID,
+/// rather than as a decoding error.
+fn pending_record(image: &Image) -> Result<Option<PendingRecord>> {
+    let Some(record) = image.pending::<serde_json::Value>()? else {
+        return Ok(None);
+    };
+    let journal = record
+        .as_object()
+        .filter(|record| record.len() == 1)
+        .and_then(|record| record.values().next())
+        .context("unrecognized pending transaction record")?;
+    let format = journal.get("format").and_then(serde_json::Value::as_u64);
+    let id = journal
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    if format != Some(u64::from(JOURNAL_FORMAT)) {
+        anyhow::bail!(
+            "pending transaction {id} was journaled in format {} and this cps reads format \
+             {JOURNAL_FORMAT}; finish or abort it with the cps that started it",
+            format.map_or_else(|| "unknown".to_owned(), |format| format.to_string())
+        );
+    }
+    serde_json::from_value(record)
+        .map(Some)
+        .with_context(|| format!("reading pending transaction {id}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -212,8 +268,7 @@ pub(crate) struct TransactionProgress {
 pub(crate) fn transaction_status(path: &Path) -> Result<TransactionStatus> {
     let image = Image::open_query(path)?;
     let settings = image.settings()?;
-    let pending = image
-        .pending::<PendingRecord>()?
+    let pending = pending_record(&image)?
         .map(|pending| -> Result<_> {
             let plan_summary = pending.recorded_plan()?.summary();
             let work = pending.work();
@@ -251,7 +306,7 @@ pub(crate) fn transaction_progress(
         (TransactionPhase::Applied, revision)
     } else {
         ensure!(settings.id == plan.image, "plan targets a different image");
-        let status = match image.pending::<PendingRecord>()? {
+        let status = match pending_record(&image)? {
             Some(pending) => {
                 pending.recorded_plan()?;
                 let work = pending.work();
@@ -503,7 +558,7 @@ pub(crate) fn apply_to_image(
         plan.image == image.settings()?.id,
         "plan targets a different image"
     );
-    if let Some(pending) = image.pending::<PendingRecord>()? {
+    if let Some(pending) = pending_record(&image)? {
         ensure!(
             pending.work().id == id,
             "a different plan is pending; use cps status to identify it"
@@ -554,13 +609,18 @@ pub(crate) fn apply_to_image(
         )?;
     }
     let repo_backed = !checked.catalogs.is_empty();
-    let delta = StateDelta::between(&base, &next);
+    let next_record = Recorded::new(StateDelta::between(&base, &next))?;
+    let plan_record = Recorded::new(checked)?;
+    ensure!(
+        plan_record.sha256() == id,
+        "verified plan does not serialize to its ID"
+    );
     let journal = Box::new(Journal {
         format: JOURNAL_FORMAT,
         id,
-        plan: checked,
-        state_sha256: state_digest(&delta)?,
-        next: delta,
+        plan: plan_record,
+        state_sha256: next_record.sha256(),
+        next: next_record,
         files_ready: false,
         live_jobs: match &after {
             AfterFiles::Live(jobs) => Some(jobs.clone()),
@@ -673,7 +733,7 @@ fn resume_image(
     repair: Option<&BTreeSet<String>>,
 ) -> Result<Option<u64>> {
     let state = image.state()?;
-    let Some(pending) = image.pending::<PendingRecord>()? else {
+    let Some(pending) = pending_record(&image)? else {
         discard_stage(&image);
         return Ok(None);
     };
@@ -796,7 +856,7 @@ fn abort_image(
     after_write: impl FnMut(&Write),
 ) -> Result<Option<u64>> {
     let state = image.state()?;
-    let Some(pending) = image.pending::<PendingRecord>()? else {
+    let Some(pending) = pending_record(&image)? else {
         discard_stage(&image);
         return Ok(None);
     };

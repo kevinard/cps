@@ -3245,8 +3245,7 @@ fn run(command: Command) -> Result<Exit> {
                 } else {
                     println!("REVISION\tPLAN\tOPERATION");
                     for entry in history {
-                        let operation = entry.details.request.operation();
-                        println!("{}\t{}\t{operation}", entry.revision, entry.plan_id);
+                        println!("{}\t{}\t{}", entry.revision, entry.plan_id, entry.operation);
                     }
                 }
             }
@@ -3668,8 +3667,13 @@ fn print_progress(progress: &crate::TransactionProgress, json: bool) -> Result<(
 }
 
 fn print_history_entry(entry: &crate::HistoryEntry) {
-    let details = &entry.details;
     println!("Plan {}", entry.plan_id);
+    let Some(details) = &entry.details else {
+        println!("Revision {}", entry.revision);
+        println!("Operation {}", entry.operation);
+        println!("Another CPS version recorded the other details of this transaction");
+        return;
+    };
     println!(
         "Revision {} from {} revision {}",
         entry.revision, details.base_image, details.base_revision

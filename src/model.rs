@@ -13,9 +13,11 @@ use sha2::{Digest, Sha256};
 use crate::{file_caps::FileCapabilities, image::accounts};
 
 mod metadata;
+mod recorded;
 mod selection;
 mod version;
 
+pub(crate) use recorded::Recorded;
 #[cfg(test)]
 pub(crate) use selection::PackageFacet;
 pub(crate) use selection::{

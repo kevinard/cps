@@ -197,7 +197,8 @@ struct Transfer {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Plan {
     format: u32,
-    // Required to distinguish the current schema from development format 1 plans.
+    /// Whether planning added recommended packages. Apply plans the request
+    /// again with the same choice to check that the plan is still current.
     pub(crate) install_recommends: bool,
     pub(crate) image: String,
     pub(crate) base_revision: u64,
@@ -380,6 +381,7 @@ impl Plan {
 
     pub(crate) fn transaction_details(&self) -> TransactionDetails {
         TransactionDetails {
+            format: crate::image::history::DETAILS_FORMAT,
             base_image: self.image.clone(),
             base_revision: self.base_revision,
             request: self.request.clone(),

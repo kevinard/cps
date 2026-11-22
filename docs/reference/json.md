@@ -13,7 +13,7 @@ nothing matches.
 | `owner`, `contents`, `deps`, `rdeps` | An array of package IDs or paths |
 | `why` | The package's local request, signed profile role, dependents, recommenders, and the dependency path that keeps it installed |
 | `verify` | An array of findings, each with `is_error` and `message` |
-| `history`, `status` | Transactions, or the image revision and its pending transaction. On the running system, `status` adds `running`, `next_boot`, `trial`, `publishers`, and `publisher_error` when publisher freshness cannot be read |
+| `history`, `status` | Transactions, each with its `operation` and its `details`, which are `null` when another CPS version recorded them, or the image revision and its pending transaction. On the running system, `status` adds `running`, `next_boot`, `trial`, `publishers`, and `publisher_error` when publisher freshness cannot be read |
 | `config list` | `pending` vendor copies and `saved` local versions |
 | `publisher list` | An array of publishers: `name`, `repository` |
 | `boot list` | An array of boot environments |

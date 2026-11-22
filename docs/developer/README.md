@@ -104,9 +104,23 @@ Most modules also hold their own unit tests.
 
 ## Internal records
 
-Pending transaction journals in the image database carry `"format": 1`.
-Completed transaction details use the checksum prefix
-`cps transaction details v1` followed by a newline. A synchronized cache
+The image database sets SQLite's `user_version` to its table schema
+version, 1, and CPS refuses a database with another version. Pending
+transaction journals in it carry `"format": 1`. A journal holds the plan and
+the next state as the exact JSON text it recorded, and digests that text
+rather than a fresh serialization, so a later CPS that serializes the same
+values differently still verifies them. CPS reads a journal's format before
+the rest, and reports a journal in another format by its plan ID instead of
+failing to decode it. Completed transaction details carry `"format": 1` and
+use the checksum prefix `cps transaction details v1` followed by a newline.
+History reads the base image, base revision, and request kind of every row,
+so a row whose other details another version recorded still lists.
+
+[`src/tests/records.rs`](../../src/tests/records.rs) pins the JSON shape of
+saved plans, journals, image state rows, transaction details, and every
+request under [`tests/golden/records`](../../tests/golden/records). A change
+there is a format change: raise the record's format, keep older records
+readable, and then rewrite the files with `CPS_UPDATE_GOLDEN=1`. A synchronized cache
 stores its trust binding in `.tuf/origin` with the first line
 `cps mirror cache v1`. Profile retention records, catalog-pinned file
 indexes, Git snapshot reservations, and mirror signer state use JSON

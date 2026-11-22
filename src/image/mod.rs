@@ -41,6 +41,9 @@ use crate::{
 pub(crate) const IMAGE_FORMAT: u32 = 1;
 // Development databases also used format 1 but did not set an application ID.
 const IMAGE_APPLICATION_ID: i32 = i32::from_be_bytes(*b"CPSI");
+/// The version of the image database's tables, in SQLite's `user_version`.
+/// A CPS that changes the tables raises it and migrates older databases.
+const IMAGE_SCHEMA_VERSION: i32 = 1;
 /// The image state: the package database, transaction staging, prepared
 /// kernels and vendor configuration proposals. It lives in `/usr`, so each
 /// Btrfs boot environment snapshot carries the state that matches its files,
@@ -900,6 +903,7 @@ fn initialize(
     configure(&db)?;
     let tx = db.transaction()?;
     tx.pragma_update(None, "application_id", IMAGE_APPLICATION_ID)?;
+    tx.pragma_update(None, "user_version", IMAGE_SCHEMA_VERSION)?;
     tx.execute_batch(
         "CREATE TABLE image (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
          CREATE TABLE publishers (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
@@ -1048,6 +1052,12 @@ impl Image {
         ensure!(
             application_id == IMAGE_APPLICATION_ID,
             "unsupported image database layout"
+        );
+        let schema = db.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?;
+        ensure!(
+            schema == IMAGE_SCHEMA_VERSION,
+            "image database schema version {schema} is not supported; this cps reads version \
+             {IMAGE_SCHEMA_VERSION}"
         );
         if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE) {
             configure(&db)?;

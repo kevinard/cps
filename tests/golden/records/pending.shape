@@ -1,0 +1,9 @@
+.journaled.abort.files_ready: bool
+.journaled.abort.triggers_done: number
+.journaled.files_ready: bool
+.journaled.format: number
+.journaled.id: string
+.journaled.next: string
+.journaled.plan: string
+.journaled.state_sha256: string
+.journaled.triggers_done: number
