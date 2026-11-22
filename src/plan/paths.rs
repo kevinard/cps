@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 
 use crate::{
     image::{Installed, Managed, Settings},
-    model::{Node, Resolved, Selection},
+    model::{Node, Ownership, Resolved, Selection},
 };
 
 #[derive(Debug)]
@@ -57,7 +57,7 @@ pub(crate) fn effective_paths(
     select_paths(
         settings.selection(),
         &settings.mediators,
-        settings.directory(),
+        settings.ownership(),
         installed,
     )
 }
@@ -98,11 +98,11 @@ pub(crate) fn resolve_facets<'a>(
 pub(crate) fn select_paths(
     selection: Selection<'_>,
     preferences: &BTreeMap<String, String>,
-    implicit_directory: Node,
+    ownership: Ownership,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
     let facets = resolve_facets(selection, installed)?;
-    let mut result = compose_paths(&facets, preferences, implicit_directory, installed);
+    let mut result = compose_paths(&facets, preferences, ownership, installed);
     // Rules inherited through a dependency closure make a conflict depend on
     // the other selected packages, so the resolver must not treat it as a
     // property of the two owners alone.
@@ -126,7 +126,7 @@ pub(crate) fn select_paths(
 fn compose_paths(
     facets: &Resolved<'_>,
     preferences: &BTreeMap<String, String>,
-    implicit_directory: Node,
+    ownership: Ownership,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
     let selection = facets.selection;
@@ -182,7 +182,7 @@ fn compose_paths(
                     .into());
                 }
             }
-            let node = action.node()?;
+            let node = action.node(ownership)?;
             if let Node::File { sha256, size, .. } = &node {
                 let previous = sizes.entry(sha256.clone()).or_insert(*size);
                 ensure!(
@@ -223,7 +223,7 @@ fn compose_paths(
                 }
             } else {
                 parents.entry(parent).or_insert_with(|| Managed {
-                    node: implicit_directory.clone(),
+                    node: Node::implicit_directory(),
                     owners: BTreeSet::new(),
                     preserve: false,
                     implicit: true,

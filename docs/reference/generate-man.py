@@ -219,7 +219,7 @@ def packaged(manifest, pages):
     """Return the CPS package manifest with one doc.man file action per page."""
     text = PAGE_LINE.sub("", manifest)
     lines = "".join(
-        f'    file "usr/share/man/man1/{name}" mode="0644" uid=0 gid=0 facet="doc.man"\n'
+        f'    file "usr/share/man/man1/{name}" mode="0644" facet="doc.man"\n'
         for name in sorted(pages)
     )
     anchor = '    file "usr/share/licenses/cps/LICENSE"'

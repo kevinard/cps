@@ -391,6 +391,35 @@ fn tmpfiles_locations<'a>(root: &Root, rules: &'a str, live: bool) -> Result<Vec
         .collect())
 }
 
+/// Create the accounts that a sysusers.d file declares before CPS writes it,
+/// so files that name those accounts can get their IDs. `contents` is the
+/// file's verified payload, which replaces the file at its vendor path as
+/// systemd-sysusers reads every configuration, so administrator overrides
+/// keep their priority. The usual sysusers action still runs after the
+/// files are written.
+pub(crate) fn create_accounts(
+    path: &Path,
+    action: &Action,
+    contents: fs::File,
+    live: bool,
+) -> Result<()> {
+    ensure!(
+        matches!(action, Action::Sysusers(_)),
+        "expected a sysusers action"
+    );
+    action.validate()?;
+    let mut replace = std::ffi::OsString::from("--replace=/");
+    replace.push(action.path());
+    run_tool(
+        command("systemd-sysusers", path)
+            .arg(replace)
+            .arg("-")
+            .stdin(Stdio::from(contents)),
+        "sysusers",
+        live,
+    )
+}
+
 pub(crate) fn run(
     root: &Root,
     path: &Path,

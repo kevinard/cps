@@ -1162,12 +1162,12 @@ enum ManifestCommand {
         /// Restrict the package to one architecture, such as x86_64
         #[arg(long)]
         arch: Option<String>,
-        /// Owner UID for every generated action
-        #[arg(long, default_value_t = 0)]
-        uid: u32,
-        /// Owner GID for every generated action
-        #[arg(long, default_value_t = 0)]
-        gid: u32,
+        /// Owner of every generated action, a user name such as root
+        #[arg(long, default_value = "root")]
+        owner: String,
+        /// Group of every generated action, a group name such as root
+        #[arg(long, default_value = "root")]
+        group: String,
         /// Package name, such as apps/tool
         name: String,
     },
@@ -4438,8 +4438,8 @@ fn run_manifest(command: ManifestCommand) -> Result<Exit> {
             publisher,
             version,
             arch,
-            uid,
-            gid,
+            owner,
+            group,
             name,
         } => {
             let text = generate_manifest_for_architecture(
@@ -4447,8 +4447,8 @@ fn run_manifest(command: ManifestCommand) -> Result<Exit> {
                 &publisher,
                 &name,
                 &version,
-                uid,
-                gid,
+                &owner,
+                &group,
                 arch.as_deref(),
             )?;
             std::io::stdout().lock().write_all(text.as_bytes())?;

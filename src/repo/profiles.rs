@@ -12,7 +12,7 @@ use crate::{
     boot::kernel,
     image::{Installed, Managed},
     kdl_format::publish_policy::{Companion, Profile},
-    model::{Node, PackageSpec, Selection, Version, VersionConstraint},
+    model::{Ownership, PackageSpec, Selection, Version, VersionConstraint},
     plan::{
         CandidateSet, Candidates, Renames, Retention, check_directory, resolve_packages,
         select_paths,
@@ -545,16 +545,7 @@ pub(super) fn profile_paths(
     selection: Selection<'_>,
     installed: &BTreeMap<String, Installed>,
 ) -> Result<BTreeMap<String, Managed>> {
-    let paths = select_paths(
-        selection,
-        &BTreeMap::new(),
-        Node::Dir {
-            mode: 0o755,
-            uid: 0,
-            gid: 0,
-        },
-        installed,
-    )?;
+    let paths = select_paths(selection, &BTreeMap::new(), Ownership::Named, installed)?;
     kernel::selected(installed, &paths)?;
     Ok(paths)
 }

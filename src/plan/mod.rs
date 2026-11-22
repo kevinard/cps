@@ -1170,7 +1170,7 @@ fn build_with_update_diagnostics(
             let paths = select_paths(
                 policy.selection(&state.settings.arch),
                 &state.settings.mediators,
-                state.settings.directory(),
+                state.settings.ownership(),
                 &state.installed,
             )?;
             recomposed = recomposed_packages(
@@ -2288,7 +2288,7 @@ fn stage_config(
                 before.as_ref().is_none_or(Node::is_dir),
                 "config update directory conflict at {parent}"
             );
-            let after = before.clone().unwrap_or_else(|| settings.directory());
+            let after = before.clone().unwrap_or_else(Node::implicit_directory);
             writes.insert(
                 parent.to_owned(),
                 Write {

@@ -1,10 +1,10 @@
 schema-version 1 kind="package-manifest"
 package "system/util-linux" publisher="canopa-util-linux" summary="Block device and mount utilities" license="GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause" homepage="https://github.com/util-linux/util-linux" {
     require "system/elf-runtime"
-    collect "usr/bin/*" uid=0 gid=0
-    collect "usr/lib/lib*.so*" uid=0 gid=0
-    collect "usr/include/**" uid=0 gid=0
-    collect "usr/lib/pkgconfig/*" uid=0 gid=0
-    collect "usr/share/man/**" uid=0 gid=0
-    collect "usr/share/licenses/**" uid=0 gid=0
+    collect "usr/bin/*"
+    collect "usr/lib/lib*.so*"
+    collect "usr/include/**"
+    collect "usr/lib/pkgconfig/*"
+    collect "usr/share/man/**"
+    collect "usr/share/licenses/**"
 }

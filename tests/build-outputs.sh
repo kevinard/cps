@@ -11,8 +11,6 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/cps-build-outputs.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
-uid=$(id -u)
-gid=$(id -g)
 arch=$(uname -m)
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 fingerprint() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -55,7 +53,7 @@ copy_elf "$(command -v bash)" bin/sh
 for tool in cat install ln mkdir objcopy; do
     copy_elf "$(command -v "$tool")" "usr/bin/$tool"
 done
-"$cps" manifest generate --proto toolchain-proto --publisher seed --version 1.0.0-0 --uid "$uid" --gid "$gid" \
+"$cps" manifest generate --proto toolchain-proto --publisher seed --version 1.0.0-0 \
     --arch "$arch" build/tools > tools.kdl
 "$cps" repo trust init --repo toolchain --publisher seed --key toolchain.der >/dev/null
 cp toolchain/trust/1.json seed.trust.json
@@ -104,17 +102,17 @@ cat > app.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/app" publisher="canopa" summary="Demo application" license="MIT OR Apache-2.0" homepage="https://example.org/app/" {
     require "demo/app-data" version="={version}"
-    collect "usr/bin/*" uid=$uid gid=$gid
-    collect "usr/lib/*" uid=$uid gid=$gid
-    collect "usr/include/**" uid=$uid gid=$gid
-    collect "usr/share/man/**" uid=$uid gid=$gid
-    collect "usr/share/locale/*/**" uid=$uid gid=$gid
+    collect "usr/bin/*"
+    collect "usr/lib/*"
+    collect "usr/include/**"
+    collect "usr/share/man/**"
+    collect "usr/share/locale/*/**"
 }
 MANIFEST
 cat > app-data.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/app-data" publisher="canopa" license="CC0-1.0" {
-    collect "usr/share/app/**" uid=$uid gid=$gid
+    collect "usr/share/app/**"
 }
 MANIFEST
 script='    install -Dm755 "$CPS_SOURCES/hello" "$DESTDIR/usr/bin/hello"
@@ -174,7 +172,7 @@ grep -E 'symlink "?usr/bin/hi"? target="?hello"?' "$app"
 grep -E 'file "?usr/include/hello.h"? mode="0644".* facet="?devel"?' "$app"
 grep -E 'file "?usr/share/man/man1/hello.1"? .* facet="?doc.man"?' "$app"
 grep -E 'file "?usr/share/locale/pt_BR/LC_MESSAGES/hello.mo"? .* facet="?locale.pt_br"?' "$app"
-grep -E "file \"?$debug_path\"? mode=\"0644\" .* facet=\"?debug.symbols\"?" "$app"
+grep -E "file \"?$debug_path\"? mode=\"0644\".* facet=\"?debug.symbols\"?" "$app"
 grep -E 'file "?usr/share/app/data.txt"?' first/manifests/demo/app-data.kdl
 absent usr/share/app "$app"
 test ! -e first/proto/usr/share/doc
@@ -193,7 +191,7 @@ printf '%s\n' 'int answer(void); int extra(void);' \
     'int main(void) { return answer() + extra() != 42; }' > link.c
 for object in answer.o libanswer.a; do
     delta="usr/lib/debug/usr/lib/$object.cps-debug"
-    grep -E "file \"?$delta\"? mode=\"0644\" .* facet=\"?debug.symbols\"?" "$app"
+    grep -E "file \"?$delta\"? mode=\"0644\".* facet=\"?debug.symbols\"?" "$app"
     readelf -SW "first/proto/usr/lib/$object" > sections
     absent '\] \.(debug_|zdebug_)' sections
     grep -F .symtab sections

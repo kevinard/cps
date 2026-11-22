@@ -52,7 +52,7 @@ write_repo() {
     $bb cat > "$directory/cps.kdl" <<KDL
 schema-version 1 kind="git-package"
 package "test/git-$package" version="1.0.0-0" {
-    file "usr/share/git-$package" mode="0644" uid=0 gid=0
+    file "usr/share/git-$package" mode="0644"
 }
 build architecture="x86_64" epoch=1700000000 {
     $toolchain

@@ -356,8 +356,8 @@ fn signed_profiles_select_packages_for_each_target_architecture() -> Result<()> 
                 publisher,
                 "library/runtime",
                 version,
-                geteuid().as_raw(),
-                getegid().as_raw(),
+                "root",
+                "root",
                 Some(arch),
             )?;
             fs::write(&fixture.recipe, manifest)?;
@@ -1750,7 +1750,7 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
     f.package(
         "test/layout",
         "1.0.0-0",
-        "    dir \"opt/layout\" mode=\"0755\" uid=0 gid=0\n".to_owned(),
+        "    dir \"opt/layout\" mode=\"0755\"\n".to_owned(),
     )?;
     let baseline = fs::read_to_string(f.repo.join("current"))?;
     f.package(
@@ -1763,7 +1763,7 @@ fn release_upgrade_profiles_check_retained_packages_and_path_transitions() -> Re
         "test/layout",
         "2.0.0-0",
         // Path type transitions are allowed; changed directory metadata is not.
-        "    dir \"opt/layout\" mode=\"0700\" uid=0 gid=0\n".to_owned(),
+        "    dir \"opt/layout\" mode=\"0700\"\n".to_owned(),
     )?;
     f.package("test/retire", "1.0.0-0", String::new())?;
     let old = fs::read_to_string(f.repo.join("current"))?;
@@ -2064,11 +2064,8 @@ fn signed_profile_renames_require_the_successor_and_keep_local_marks_separate() 
 fn upgrade_profile_reuses_signed_baseline_roots_and_companions() -> Result<()> {
     let f = Fixture::new()?;
     let seed = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
-    let root_dir = format!("    dir \"opt/pinned-root\" mode=\"0755\" uid={uid} gid={gid}\n");
-    let companion_dir =
-        format!("    dir \"opt/pinned-companion\" mode=\"0755\" uid={uid} gid={gid}\n");
+    let root_dir = "    dir \"opt/pinned-root\" mode=\"0755\"\n".to_string();
+    let companion_dir = "    dir \"opt/pinned-companion\" mode=\"0755\"\n".to_string();
     let runtime_requirement = "    require \"library/runtime\"\n";
     seed.package_as("seed", "library/runtime", "1.0.0-0", companion_dir.clone())?;
     let old_pin = fs::read_to_string(seed.repo.join("current"))?;
@@ -2078,7 +2075,7 @@ fn upgrade_profile_reuses_signed_baseline_roots_and_companions() -> Result<()> {
         format!("{runtime_requirement}{root_dir}"),
     )?;
     // Path type transitions are allowed; changed directory metadata is not.
-    let replacement = format!("    dir \"opt/pinned-root\" mode=\"0700\" uid={uid} gid={gid}\n");
+    let replacement = "    dir \"opt/pinned-root\" mode=\"0700\"\n".to_string();
     f.package(
         "desktop/compositor",
         "2.0.0-0",
@@ -2251,8 +2248,7 @@ publisher "seed" {{
             signed_base.trim()
         ),
     )?;
-    let replacement =
-        format!("    dir \"opt/pinned-companion\" mode=\"0700\" uid={uid} gid={gid}\n");
+    let replacement = "    dir \"opt/pinned-companion\" mode=\"0700\"\n".to_string();
     seed.package_as("seed", "library/runtime", "2.0.0-0", replacement)?;
     let new_pin = fs::read_to_string(seed.repo.join("current"))?;
     write_policy(
@@ -2631,7 +2627,7 @@ package "devel/compiler" publisher="canopa" license="GPL-3.0-or-later WITH GCC-e
 "#;
     let runtime_template = br#"schema-version 1 kind="package-manifest"
 package "runtime/libcc" publisher="canopa" {
-    file "usr/lib/libcc.so.1" mode="0755" uid=0 gid=0
+    file "usr/lib/libcc.so.1" mode="0755"
 }
 "#;
     let catalog = digest(b"pinned toolchain");
@@ -2834,7 +2830,7 @@ fn rebuild_inputs_survive_withdrawal_and_are_verified_in_fresh_mirror_caches() -
     let manifest = br#"schema-version 1 kind="package-manifest"
 // Reviewed bytes and layout
 package "test/rebuild" publisher="canopa" version="1.0.0-0" {
-    file "usr/share/cps/reference" mode="0644" uid=0 gid=0
+    file "usr/share/cps/reference" mode="0644"
 }
 "#;
     let catalog = digest(b"pinned toolchain");

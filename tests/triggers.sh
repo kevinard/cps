@@ -13,9 +13,6 @@ done
 work=$(mktemp -d)
 trap '[[ -n ${KEEP:-} ]] || rm -rf -- "$work"' EXIT
 cd "$work"
-uid=$(id -u)
-gid=$(id -g)
-owner="uid=$uid gid=$gid"
 
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
 "$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
@@ -30,12 +27,12 @@ script() {
     mkdir -p "proto/$(dirname -- "$1")"
     cat > "proto/$1"
     chmod 0755 "proto/$1"
-    printf '    file "%s" mode="0755" %s\n' "$1" "$owner"
+    printf '    file "%s" mode="0755"\n' "$1"
 }
 item() {
     mkdir -p proto/usr/share/test-items
     printf '%s\n' "$2" > "proto/usr/share/test-items/$1.item"
-    printf '    file "usr/share/test-items/%s.item" mode="0644" %s %s\n' "$1" "$owner" "${3:-}"
+    printf '    file "usr/share/test-items/%s.item" mode="0644" %s\n' "$1" "${3:-}"
 }
 plan_apply() {
     local root=$1
@@ -46,13 +43,13 @@ plan_apply() {
 
 mkdir -p proto
 publish test/runtime "$(ship_runtime proto /usr/bin/bash /usr/bin/cat /usr/bin/sort /usr/bin/ls /usr/bin/sha256sum /usr/bin/mkdir /usr/bin/rm /usr/bin/wc)
-    symlink \"bin\" target=\"usr/bin\" $owner
+    symlink \"bin\" target=\"usr/bin\"
 "
 
 # The index trigger joins every item. It counts its runs in a second output
 # and fails while the image contains a marker, to interrupt a transaction.
 publish test/index "    require \"test/runtime\"
-    dir \"usr/share/test-items\" mode=\"0755\" $owner
+    dir \"usr/share/test-items\" mode=\"0755\"
 $(script usr/libexec/test-index <<'HANDLER'
 #!/usr/bin/bash
 set -eu
@@ -73,7 +70,7 @@ HANDLER
 # The summary trigger watches the index trigger's output, so it runs after
 # it. It fails while the image contains a marker, to interrupt a transaction.
 publish test/summary "    require \"test/index\"
-    dir \"usr/share/test-summary\" mode=\"0755\" $owner
+    dir \"usr/share/test-summary\" mode=\"0755\"
 $(script usr/libexec/test-summary <<'HANDLER'
 #!/usr/bin/bash
 set -eu
@@ -115,7 +112,7 @@ test "$(wc -l < image/usr/share/test-items/runs)" -eq 2
 test "$(cat image/usr/share/test-summary/count)" -eq 3
 
 # An unrelated change runs nothing.
-publish test/other "    dir \"usr/share/other\" mode=\"0755\" $owner
+publish test/other "    dir \"usr/share/other\" mode=\"0755\"
 "
 plan_apply image install test/other
 if rg -F 'Run trigger' plan.log; then
@@ -127,8 +124,8 @@ test "$(wc -l < image/usr/share/test-items/runs)" -eq 2
 # Packages cannot ship generated paths, at publication or in a plan.
 mkdir -p proto/usr/share/test-items proto/usr/share/test-summary
 echo stale > proto/usr/share/test-items/index
-if publish test/self-clash "    dir \"usr/share/test-items\" mode=\"0755\" $owner
-    file \"usr/share/test-items/index\" mode=\"0644\" $owner
+if publish test/self-clash "    dir \"usr/share/test-items\" mode=\"0755\"
+    file \"usr/share/test-items/index\" mode=\"0644\"
 $(script usr/libexec/test-clash <<< '#!/usr/bin/bash')
     trigger \"index\" {
         run \"usr/libexec/test-clash\"
@@ -141,7 +138,7 @@ $(script usr/libexec/test-clash <<< '#!/usr/bin/bash')
 fi
 rg -F 'covers the packaged path usr/share/test-items/index' clash.log
 echo stale > proto/usr/share/test-summary/count
-publish test/clash "    file \"usr/share/test-summary/count\" mode=\"0644\" $owner
+publish test/clash "    file \"usr/share/test-summary/count\" mode=\"0644\"
 "
 if "$cps" install --root image -n --save-plan clash.json test/clash 2> clash.log; then
     echo 'planned a package path inside a trigger output' >&2
@@ -215,7 +212,7 @@ test ! -e image/usr/share/test-items
 # Handlers cannot write outside their declared outputs. The sandbox has no
 # network, a read-only image, and discards changes to undeclared paths.
 publish test/escape "    require \"test/runtime\"
-    dir \"usr/share/test-escape\" mode=\"0755\" $owner
+    dir \"usr/share/test-escape\" mode=\"0755\"
 $(script usr/libexec/test-escape <<'HANDLER'
 #!/usr/bin/bash
 set -u
@@ -262,11 +259,11 @@ if command -v kernel-install >/dev/null && [[ -x /usr/lib/kernel/install.d/90-lo
     echo kernel > "proto/usr/lib/modules/$release/vmlinuz"
     echo base > "proto/usr/lib/modules/$release/kernel/base.ko"
     echo extra > "proto/usr/lib/modules/$release/extra.ko"
-    publish test/kernel "    file \"usr/lib/modules/$release/vmlinuz\" mode=\"0644\" $owner
-    file \"usr/lib/modules/$release/kernel/base.ko\" mode=\"0644\" $owner
+    publish test/kernel "    file \"usr/lib/modules/$release/vmlinuz\" mode=\"0644\"
+    file \"usr/lib/modules/$release/kernel/base.ko\" mode=\"0644\"
     kernel-install \"$release\"
 "
-    publish test/module "    file \"usr/lib/modules/$release/extra.ko\" mode=\"0644\" $owner
+    publish test/module "    file \"usr/lib/modules/$release/extra.ko\" mode=\"0644\"
 "
     publish test/mkinitrd "    require \"test/runtime\"
 $(script usr/libexec/test-mkinitrd <<'HANDLER'

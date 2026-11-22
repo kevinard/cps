@@ -144,8 +144,8 @@ pub(crate) fn plan(
         for action in &manifest.action {
             let Action::File {
                 path,
-                uid,
-                gid,
+                owner: file_owner,
+                group: file_group,
                 variants,
                 ..
             } = action
@@ -193,8 +193,8 @@ pub(crate) fn plan(
                 debug_actions[index].push(Action::File {
                     path: debug.clone(),
                     mode: "0644".into(),
-                    uid: *uid,
-                    gid: *gid,
+                    owner: file_owner.clone(),
+                    group: file_group.clone(),
                     preserve: false,
                     facet: Some(DEBUG_FACET.into()),
                     variants: variants.clone(),

@@ -167,7 +167,7 @@ C
         cat > cap.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/raw-probe" publisher="captest" version="$version.0.0-0" {
-    file "bin/raw-probe" mode="0755" uid=0 gid=0 $flags
+    file "bin/raw-probe" mode="0755" $flags
     hardlink "bin/raw-probe-alias" target="bin/raw-probe"
 }
 MANIFEST

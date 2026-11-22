@@ -1,7 +1,7 @@
 schema-version 1 kind="package-manifest"
 package "system/sqlite" publisher="canopa" summary="SQL database engine library" license="blessing" homepage="https://www.sqlite.org/" {
     require "system/elf-runtime"
-    collect "usr/lib/libsqlite3.so*" uid=0 gid=0
-    collect "usr/include/**" uid=0 gid=0
-    collect "usr/lib/pkgconfig/*" uid=0 gid=0
+    collect "usr/lib/libsqlite3.so*"
+    collect "usr/include/**"
+    collect "usr/lib/pkgconfig/*"
 }

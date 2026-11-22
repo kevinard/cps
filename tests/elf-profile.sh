@@ -8,8 +8,6 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 arch=$(uname -m)
-uid=$(id -u)
-gid=$(id -g)
 for publisher in canopa runtime; do
     openssl genpkey -algorithm ED25519 -outform DER -out "$publisher.der"
     openssl pkey -inform DER -in "$publisher.der" -pubout -outform DER -out "$publisher-public.der"
@@ -38,7 +36,7 @@ cat > app.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/app" publisher="canopa" version="1.0.0-0" {
     require "demo/runtime"
-    file "usr/bin/demo" mode="0755" uid=$uid gid=$gid
+    file "usr/bin/demo" mode="0755"
 }
 MANIFEST
 "$cps" publish manifests --repo repo --proto app --key canopa.der app.kdl
@@ -49,7 +47,7 @@ base=$(cat repo/current)
 
 publish_runtime() {
     "$cps" manifest generate --proto runtime --publisher runtime --version "$1" \
-        --uid "$uid" --gid "$gid" demo/runtime > runtime.kdl
+        demo/runtime > runtime.kdl
     "$cps" publish manifests --repo companion --proto runtime --key runtime.der runtime.kdl
 }
 write_policy() {

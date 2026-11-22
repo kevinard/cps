@@ -51,7 +51,7 @@ cp --reflink=auto -- "$sources/linux-6.12.115.tar.xz" "$recipe/vm.config" "$work
 if [[ ${CPS_KERNEL_VARIANT:-base} == next ]]; then
     printf 'CONFIG_HZ_1000=y\n' >> "$work/inputs/vm.config"
 fi
-sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/$manifest" > kernel.kdl
+cp "$recipe/$manifest" kernel.kdl
 kernel_version=$(awk -F 'version="' '/^package / {split($2, version, "\""); print version[1]}' kernel.kdl)
 test -n "$kernel_version"
 sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \

@@ -25,7 +25,7 @@ printf 'fixture kernel\n' > proto/boot/vmlinuz
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
 "$cps" repo trust init --repo repo --publisher test --key private.der >/dev/null
 "$cps" manifest generate --proto proto --publisher test --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" test/payload > manifest.kdl
+    test/payload > manifest.kdl
 "$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl
 root=volume/@
 mkdir -p volume/@environments

@@ -10,7 +10,6 @@ use aws_lc_rs::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
 };
-use rustix::process::{getegid, geteuid};
 
 use crate::{
     Plan, Request, apply, apply::apply_with, create_image, model::digest, plan, publish, verify,
@@ -106,11 +105,7 @@ impl Fixture {
         let output = self.proto.join(path);
         fs::create_dir_all(output.parent().unwrap())?;
         fs::write(output, bytes)?;
-        let uid = geteuid().as_raw();
-        let gid = getegid().as_raw();
-        Ok(format!(
-            "    file {path:?} mode={mode:?} uid={uid} gid={gid} {extra}\n"
-        ))
+        Ok(format!("    file {path:?} mode={mode:?} {extra}\n"))
     }
 
     fn create(&self) -> Result<()> {
@@ -549,15 +544,15 @@ fn manifest_capabilities_require_a_protected_executable() -> Result<()> {
         ))
     };
     for metadata in [
-        "uid=1000 gid=0 mode=\"0755\"",
-        "uid=0 gid=0 mode=\"0644\"",
-        "uid=0 gid=0 mode=\"0775\"",
-        "uid=0 gid=0 mode=\"0757\"",
-        "uid=0 gid=0 mode=\"0755\" preserve=#true",
+        "owner=\"bin\" mode=\"0755\"",
+        "mode=\"0644\"",
+        "mode=\"0775\"",
+        "mode=\"0757\"",
+        "mode=\"0755\" preserve=#true",
     ] {
         assert!(package(metadata)?.validate(false).is_err());
     }
-    let manifest = package("uid=0 gid=0 mode=\"0755\"")?;
+    let manifest = package("owner=\"root\" mode=\"0755\"")?;
     manifest.validate(false)?;
     assert_eq!(parse_manifest(&manifest_text(&manifest))?, manifest);
     Ok(())
@@ -698,21 +693,21 @@ fn hardlink_targets_must_be_immutable_files_owned_by_the_same_package() -> Resul
             "schema-version 1 kind=\"package-manifest\"\npackage \"test/hardlinks\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}\n}}\n"
         ))
     };
-    let file = "file \"usr/bin/tool\" mode=\"0755\" uid=0 gid=0";
+    let file = "file \"usr/bin/tool\" mode=\"0755\"";
     let link = "hardlink \"bin/tool\" target=\"usr/bin/tool\"";
     for actions in [
         link.to_owned(),
         format!("{file} preserve=#true\n{link}"),
         format!("{file} facet=\"doc.man\"\n{link}"),
         format!("{file} architecture=\"aarch64\"\n{link} architecture=\"x86_64\""),
-        format!("symlink \"usr/bin/tool\" target=\"external\" uid=0 gid=0\n{link}"),
+        format!("symlink \"usr/bin/tool\" target=\"external\"\n{link}"),
         format!("hardlink \"usr/bin/tool\" target=\"bin/tool\"\n{link}"),
         "hardlink \"bin/tool\" target=\"../tool\"".to_owned(),
         "hardlink \"bin/tool\" target=\"bin/tool\"".to_owned(),
     ] {
         assert!(parse(&actions)?.validate(false).is_err(), "{actions}");
     }
-    assert!(parse(&format!("{file}\n{link} uid=0")).is_err());
+    assert!(parse(&format!("{file}\n{link} owner=\"root\"")).is_err());
     parse(&format!("{file}\n{link} architecture=\"x86_64\""))?.validate(false)?;
     parse(&format!(
         "{file} facet=\"doc.man\"\n{link} facet=\"doc.man\""
@@ -763,10 +758,8 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     let generate =
-        |proto| crate::generate_manifest(proto, "canopa", "test/proto", "1.0.0-0", uid, gid);
+        |proto| crate::generate_manifest(proto, "canopa", "test/proto", "1.0.0-0", "root", "root");
     let prepare = |proto: &Path, reverse: bool| -> Result<()> {
         let directories = if reverse {
             ["srv/empty", "usr/bin"]
@@ -2722,9 +2715,7 @@ fn queries_installed_path_ownership_offline() -> Result<()> {
     use crate::query::{package_contents, path_owners};
 
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
-    let shared = format!("    dir \"usr/share\" mode=\"0755\" uid={uid} gid={gid}\n");
+    let shared = "    dir \"usr/share\" mode=\"0755\"\n".to_string();
     let link = "usr/lib/libdisplay-current.so";
     f.package(
         "library/libdisplay",
@@ -2744,7 +2735,7 @@ fn queries_installed_path_ownership_offline() -> Result<()> {
                 "0755",
                 "architecture=\"aarch64\"",
             )?
-            + &format!("    symlink {link:?} target=\"libdisplay.so\" uid={uid} gid={gid}\n"),
+            + &format!("    symlink {link:?} target=\"libdisplay.so\"\n"),
     )?;
     f.create()?;
     let install = plan(
@@ -2942,13 +2933,11 @@ fn queries_direct_dependencies_and_dependents_offline() -> Result<()> {
 #[test]
 fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     f.package(
         "base/paths",
         "1.0.0-0",
         format!(
-            "{}    symlink \"opt/cps\" target=\"elsewhere\" uid={uid} gid={gid}\n",
+            "{}    symlink \"opt/cps\" target=\"elsewhere\"\n",
             f.file(LIBRARY, "owned by base", "0644", "")?,
         ),
     )?;
@@ -4180,16 +4169,12 @@ fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> 
     use std::os::unix::fs::PermissionsExt;
 
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     let actions = f.file("opt/example/bin/tool", "tool", "0755", "")?
         + &f.file("opt/shared/vendor-file", "vendor", "0644", "")?
         + &f.file("srv/example/cache/vendor-file", "vendor", "0644", "")?
-        + &format!(
-            "    dir \"opt/example\" mode=\"0755\" uid={uid} gid={gid}\n\
-             dir \"srv/changed-mode\" mode=\"0755\" uid={uid} gid={gid}\n\
-             dir \"srv/attributes\" mode=\"0755\" uid={uid} gid={gid}\n"
-        );
+        + "    dir \"opt/example\" mode=\"0755\"\n\
+             dir \"srv/changed-mode\" mode=\"0755\"\n\
+             dir \"srv/attributes\" mode=\"0755\"\n";
     f.package("test/prune", "1.0.0-0", actions)?;
     f.create()?;
     fs::create_dir_all(f.root.join("opt/shared"))?;
@@ -4251,14 +4236,12 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     const LINK: &str = "usr/bin/compositor";
     const DIR: &str = "usr/bin";
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     let mut actions = f.file(COMPOSITOR, "compositor 1", "0755", "")?;
     actions += &f.file(PLUGIN, "plugin 1", "0644", "")?;
     actions += &f.file(CONFIG, "vendor config", "0644", "preserve=#true")?;
     actions += &f.file(REMOVED_CONFIG, "optional", "0644", "preserve=#true")?;
-    actions += &format!("    symlink {LINK:?} target=\"canopa-compositor\" uid={uid} gid={gid}\n");
-    actions += &format!("    dir {DIR:?} mode=\"0755\" uid={uid} gid={gid}\n");
+    actions += &format!("    symlink {LINK:?} target=\"canopa-compositor\"\n");
+    actions += &format!("    dir {DIR:?} mode=\"0755\"\n");
     f.package("desktop/compositor", "1.0.0-0", actions)?;
     f.package(
         "library/libdisplay",

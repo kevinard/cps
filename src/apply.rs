@@ -15,7 +15,7 @@ use tempfile::NamedTempFile;
 use crate::{
     boot::kernel::Artifacts,
     image::{
-        Image, Managed, Publisher, Settings, State, StateDelta,
+        Image, Managed, Publisher, Settings, State, StateDelta, accounts,
         root::{self, DirSyncs, Fingerprint, ReplacementSource, Root},
     },
     model::{Node, copy_payload, digest_reader, validate_digest},
@@ -1240,6 +1240,14 @@ fn finish(
         } else {
             staged
         };
+        create_accounts(
+            &image.root,
+            stage,
+            &after,
+            work.systemd,
+            work.writes,
+            pending.is_live(),
+        )?;
         let generated = triggers::outputs_of(base, next);
         write_files(
             &image.root,
@@ -1413,6 +1421,72 @@ struct Target<'a> {
     /// leave with the old tree, and the triggers' next run regenerates
     /// whatever they still declare.
     generated: &'a [&'a str],
+}
+
+const ACCOUNT_DATABASES: [&str; 4] = ["etc/passwd", "etc/group", "etc/shadow", "etc/gshadow"];
+
+/// Resolve the owner and group names of every path before writing any.
+///
+/// A package can name an account that its own sysusers.d file creates. That
+/// account does not exist before the transaction, so the sysusers.d files
+/// that the transaction writes run first, from their verified payloads.
+fn create_accounts(
+    root: &Root,
+    stage: &Root,
+    after: &AfterFiles,
+    systemd: &[systemd::Action],
+    writes: &[Write],
+    live: bool,
+) -> Result<()> {
+    let unresolved = || {
+        writes.iter().find_map(|write| {
+            let (owner, group) = write.after.as_ref()?.ownership()?;
+            let error = root.accounts().ids(owner, group).err()?;
+            Some(error.context(format!("resolving the owner of {}", write.path)))
+        })
+    };
+    if unresolved().is_none() {
+        return Ok(());
+    }
+    // systemd-sysusers would create these files before the writes that the
+    // plan checked against their absence.
+    if let Some(write) = writes
+        .iter()
+        .find(|write| ACCOUNT_DATABASES.contains(&write.path.as_str()) && write.after.is_some())
+    {
+        return Err(unresolved().expect("an unresolved owner")).with_context(|| {
+            format!(
+                "the transaction writes /{} itself, so accounts that its packages \
+                 name must come from sysusers.d",
+                write.path
+            )
+        });
+    }
+    let path = match after {
+        AfterFiles::Offline(path) => Some(path.as_path()),
+        AfterFiles::Live(_) => Some(Path::new("/")),
+        AfterFiles::None => None,
+    };
+    for action in systemd {
+        let (Some(path), systemd::Action::Sysusers(_)) = (path, action) else {
+            continue;
+        };
+        let fragment = action.path();
+        let Some(write) = writes.iter().find(|write| write.path == fragment) else {
+            continue;
+        };
+        let Some(node @ Node::File { .. }) = &write.after else {
+            continue;
+        };
+        let contents = if write.needs_blob() {
+            checked_payload(stage, node)?
+        } else {
+            root.file(&fragment)?
+        };
+        systemd::create_accounts(path, action, contents, live)
+            .with_context(|| format!("creating the accounts of {fragment}"))?;
+    }
+    unresolved().map_or(Ok(()), Err)
 }
 
 fn write_files(
@@ -1832,6 +1906,13 @@ fn clear_stage(stage: &Root) -> Result<()> {
     Ok(())
 }
 
+/// A probe checks what the filesystem supports before any payload is staged.
+/// Accounts that a package creates may not exist until its sysusers.d runs,
+/// so probes belong to root.
+fn probe_node(node: &Node) -> Node {
+    node.with_ownership(accounts::ROOT, accounts::ROOT)
+}
+
 fn prepare(root: &Root, stage: &Root, plan: &Plan, state: &State) -> Result<StagedPayloads> {
     let writes = &plan.writes;
     let dir = Root::fd_path(stage.as_file());
@@ -1842,7 +1923,8 @@ fn prepare(root: &Root, stage: &Root, plan: &Plan, state: &State) -> Result<Stag
                 || matches!(node, Node::File { mode, .. } if mode & 0o6000 != 0))
         {
             let probe = NamedTempFile::new_in(&dir)?;
-            Root::set_file_metadata(probe.as_file(), node)
+            stage
+                .set_file_metadata(probe.as_file(), &probe_node(node))
                 .with_context(|| format!("checking file metadata support for {}", write.path))?;
         }
     }
@@ -1851,9 +1933,11 @@ fn prepare(root: &Root, stage: &Root, plan: &Plan, state: &State) -> Result<Stag
             && mode & 0o2000 != 0
         {
             let probe = tempfile::tempdir_in(&dir)?;
-            Root::set_directory_metadata(&File::open(probe.path())?, node).with_context(|| {
-                format!("checking directory metadata support for {}", write.path)
-            })?;
+            stage
+                .set_directory_metadata(&File::open(probe.path())?, &probe_node(node))
+                .with_context(|| {
+                    format!("checking directory metadata support for {}", write.path)
+                })?;
         }
     }
     // copy_payload hashes each staged copy after writing it, so the staged

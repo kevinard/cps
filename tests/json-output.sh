@@ -41,8 +41,8 @@ publish() {
 schema-version 1 kind="package-manifest"
 package "test/tool" publisher="canopa" version="$1" summary="JSON fixture" {
     require "test/lib"
-    file "usr/share/cps-test/version" mode="0644" uid=$(id -u) gid=$(id -g)
-    file "etc/cps-test.conf" mode="0644" preserve=#true uid=$(id -u) gid=$(id -g)
+    file "usr/share/cps-test/version" mode="0644"
+    file "etc/cps-test.conf" mode="0644" preserve=#true
 }
 MANIFEST
     cat > lib.kdl <<MANIFEST

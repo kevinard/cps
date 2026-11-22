@@ -34,7 +34,7 @@ publish() {
     cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/tool" publisher="canopa" version="$1" summary="Exit status fixture" {
-    file "usr/share/cps-test/version" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "usr/share/cps-test/version" mode="0644"
 }
 MANIFEST
     "$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl > /dev/null

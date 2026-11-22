@@ -20,7 +20,7 @@ cp repo/trust/1.json trust-root.json
 publish() {
     printf '%s\n' "$1" > proto/example
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$1.0.0-0" \
-        --uid "$(id -u)" --gid "$(id -g)" example > manifest.kdl
+        example > manifest.kdl
     "$CPS_BIN" publish manifests --repo repo --proto proto --key publisher-private.der manifest.kdl
 }
 

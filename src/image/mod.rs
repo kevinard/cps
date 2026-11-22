@@ -1,3 +1,4 @@
+pub(crate) mod accounts;
 mod builds;
 mod catalogs;
 pub(crate) mod diff;
@@ -29,7 +30,7 @@ use crate::{
     git_install::GitSource,
     kdl_format::{ImageDefinition, PublisherConfig, read_image_definition},
     model::{
-        ImagePolicy, Node, PackageFacets, Selection, validate_digest, validate_name,
+        ImagePolicy, Node, Ownership, PackageFacets, Selection, validate_digest, validate_name,
         validate_publisher,
     },
     repo::{
@@ -87,6 +88,8 @@ pub(crate) struct Settings {
     pub variants: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) mediators: BTreeMap<String, String>,
+    /// The user and group that created the image. A user other than root
+    /// owns every file of its image; see [`Settings::ownership`].
     pub uid: u32,
     pub gid: u32,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -143,7 +146,7 @@ impl Settings {
         for &ancestor in STATE_ANCESTORS {
             if let Some(managed) = paths.get(ancestor) {
                 ensure!(
-                    matches!(managed.node, Node::Dir { mode, uid, .. } if uid == self.uid && mode & 0o022 == 0),
+                    matches!(&managed.node, Node::Dir { mode, owner, .. } if owner == accounts::ROOT && mode & 0o022 == 0),
                     "unsafe image state ancestor {ancestor}"
                 );
             }
@@ -244,11 +247,14 @@ impl Settings {
         Ok(())
     }
 
-    pub(crate) fn directory(&self) -> Node {
-        Node::Dir {
-            mode: 0o755,
-            uid: self.uid,
-            gid: self.gid,
+    /// Whether files get the owners their manifests name. CPS cannot
+    /// change the owner of a file it writes without root privileges, so an
+    /// unprivileged user's image owns every file as that user.
+    pub(crate) fn ownership(&self) -> Ownership {
+        if self.uid == 0 {
+            Ownership::Named
+        } else {
+            Ownership::Creator
         }
     }
 }
@@ -1046,13 +1052,21 @@ impl Image {
         if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE) {
             configure(&db)?;
         }
-        Ok(Self {
+        let image = Self {
             root,
             db,
             state_dir,
 
             _lock: lock,
-        })
+        };
+        let settings = image.settings()?;
+        if settings.ownership() == Ownership::Creator {
+            image
+                .root
+                .accounts()
+                .map_to_creator(settings.uid, settings.gid);
+        }
+        Ok(image)
     }
 
     pub(crate) fn publishers(&self) -> Result<Publishers> {

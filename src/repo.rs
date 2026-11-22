@@ -4446,8 +4446,8 @@ mod tests {
             sha256: hash,
             size: 3,
             mode: 0o644,
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
             capabilities: None,
         };
         fs::write(&blob, b"abcd")?;

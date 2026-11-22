@@ -28,7 +28,7 @@ openssl genpkey -algorithm ED25519 -outform DER -out private.der
 cat > hello.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/hello" publisher="canopa" version="1.0.0-0" {
-    file "usr/share/cps-demo/hello" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "usr/share/cps-demo/hello" mode="0644"
 }
 MANIFEST
 
@@ -69,8 +69,8 @@ root, and the installed image.
 - `verify --pristine` checks every installed file against its manifest and
   confirms that the image holds nothing unmanaged.
 
-The package manifest uses your UID and GID so CPS can install the file
-without elevated privileges.
+An image that you create without root privileges owns every file as you,
+so CPS installs the package without elevated privileges.
 
 - [Inspect the package and its ownership](client/queries.md)
 - [Update, remove, or repair a package in an image](client/images.md)

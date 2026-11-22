@@ -23,7 +23,7 @@ mkdir -p "$work/proto/usr/share"
 publish() {
     printf '%s\n' "$1" > "$work/proto/usr/share/example"
     cps manifest generate --proto "$work/proto" --publisher canopa --version "$1.0.0-0" \
-        --uid "$(id -u)" --gid "$(id -g)" demo/example > "$work/manifest.kdl"
+        demo/example > "$work/manifest.kdl"
     cps publish manifests --repo "$workspace/repo" --proto "$work/proto" \
         --key "$workspace/keys/catalog.der" "$work/manifest.kdl"
 }

@@ -153,7 +153,7 @@ mod tests {
             "// comments are dropped\n",
             "schema-version 1 kind=package-manifest\n",
             "package \"a/b\" publisher=canopa  version=\"1.0.0-0\" requires-reboot=#true {\n",
-            "  file \"usr/bin/x\" mode=\"0755\" uid=0 gid=-1 \"variant.debug\"=#false\n",
+            "  file \"usr/bin/x\" mode=\"0755\" size=-1 \"variant.debug\"=#false\n",
             "  dir #\"with \"quote\" and \\ slash\"# mode=\"0755\" {}\n",
             "  trigger t { watch \"line\\nbreak\\ttab\\u{7f}\\u{202e}é\" }\n",
             "  \"odd name\" key=#null\n",
@@ -164,7 +164,7 @@ mod tests {
             concat!(
                 "schema-version 1 kind=\"package-manifest\"\n",
                 "package \"a/b\" publisher=\"canopa\" version=\"1.0.0-0\" requires-reboot=#true {\n",
-                "    file \"usr/bin/x\" mode=\"0755\" uid=0 gid=-1 variant.debug=#false\n",
+                "    file \"usr/bin/x\" mode=\"0755\" size=-1 variant.debug=#false\n",
                 "    dir \"with \\\"quote\\\" and \\\\ slash\" mode=\"0755\"\n",
                 "    trigger \"t\" {\n",
                 "        watch \"line\\nbreak\\ttab\\u{7f}\\u{202e}é\"\n",

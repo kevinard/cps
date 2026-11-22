@@ -1,7 +1,7 @@
 schema-version 1 kind="package-manifest"
 package "system/coreutils" publisher="canopa-utilities" architecture="x86_64" summary="GNU file, shell, and text utilities" license="GPL-3.0-or-later" homepage="https://www.gnu.org/software/coreutils/" {
     require "system/elf-runtime"
-    collect "usr/bin/*" uid=0 gid=0
-    collect "usr/libexec/coreutils/*" uid=0 gid=0
-    collect "usr/share/licenses/**" uid=0 gid=0
+    collect "usr/bin/*"
+    collect "usr/libexec/coreutils/*"
+    collect "usr/share/licenses/**"
 }

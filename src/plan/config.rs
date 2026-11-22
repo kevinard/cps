@@ -146,9 +146,11 @@ pub(super) fn resolve(
     ))
 }
 
-pub(super) fn file_metadata(node: &Node) -> Option<(u32, u32, u32)> {
+pub(super) fn file_metadata(node: &Node) -> Option<(u32, &str, &str)> {
     match node {
-        Node::File { mode, uid, gid, .. } => Some((*mode, *uid, *gid)),
+        Node::File {
+            mode, owner, group, ..
+        } => Some((*mode, owner, group)),
         _ => None,
     }
 }
@@ -170,13 +172,13 @@ fn local_contents(local: &Node, vendor: &Node) -> Option<Node> {
     else {
         return None;
     };
-    let (mode, uid, gid) = file_metadata(vendor)?;
+    let (mode, owner, group) = file_metadata(vendor)?;
     Some(Node::File {
         sha256: sha256.clone(),
         size: *size,
         mode,
-        uid,
-        gid,
+        owner: owner.to_owned(),
+        group: group.to_owned(),
         capabilities: None,
     })
 }

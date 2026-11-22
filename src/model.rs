@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::file_caps::FileCapabilities;
+use crate::{file_caps::FileCapabilities, image::accounts};
 
 mod metadata;
 mod selection;
@@ -374,8 +374,8 @@ pub(crate) enum Action {
     File {
         path: String,
         mode: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         preserve: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,8 +394,8 @@ pub(crate) enum Action {
     Dir {
         path: String,
         mode: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -404,8 +404,8 @@ pub(crate) enum Action {
     Symlink {
         path: String,
         target: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -458,20 +458,20 @@ pub(crate) enum Node {
         sha256: String,
         size: u64,
         mode: u32,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<FileCapabilities>,
     },
     Dir {
         mode: u32,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
     },
     Symlink {
         target: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
     },
     Hardlink {
         target: String,
@@ -479,9 +479,62 @@ pub(crate) enum Node {
     Special,
 }
 
+/// Who owns the files of an image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Ownership {
+    /// Each file has the owner and group that its manifest names.
+    Named,
+    /// The unprivileged user who created the image owns every file.
+    Creator,
+}
+
 impl Node {
+    /// A directory that packages create only as the parent of their paths.
+    pub(crate) fn implicit_directory() -> Self {
+        Self::Dir {
+            mode: 0o755,
+            owner: accounts::ROOT.to_owned(),
+            group: accounts::ROOT.to_owned(),
+        }
+    }
+
     pub(crate) fn is_dir(&self) -> bool {
         matches!(self, Self::Dir { .. })
+    }
+
+    /// The owner and group names of a file, directory, or symlink.
+    pub(crate) fn ownership(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::File { owner, group, .. }
+            | Self::Dir { owner, group, .. }
+            | Self::Symlink { owner, group, .. } => Some((owner, group)),
+            Self::Hardlink { .. } | Self::Special => None,
+        }
+    }
+
+    /// This node with another owner and group, if it has them.
+    pub(crate) fn with_ownership(&self, owner: &str, group: &str) -> Self {
+        let mut node = self.clone();
+        if let Self::File {
+            owner: old_owner,
+            group: old_group,
+            ..
+        }
+        | Self::Dir {
+            owner: old_owner,
+            group: old_group,
+            ..
+        }
+        | Self::Symlink {
+            owner: old_owner,
+            group: old_group,
+            ..
+        } = &mut node
+        {
+            owner.clone_into(old_owner);
+            group.clone_into(old_group);
+        }
+        node
     }
 
     pub(crate) fn capabilities(&self) -> Option<&FileCapabilities> {
@@ -559,35 +612,47 @@ impl Action {
         }
     }
 
-    pub(crate) fn node(&self) -> Result<Node> {
+    /// The managed node of this action. An image whose creator owns every
+    /// file records each owner and group as `root`, the name its creator's
+    /// IDs read back as.
+    pub(crate) fn node(&self, ownership: Ownership) -> Result<Node> {
+        let account = |name: &String| match ownership {
+            Ownership::Named => name.clone(),
+            Ownership::Creator => accounts::ROOT.to_owned(),
+        };
         Ok(match self {
             Self::File {
                 sha256,
                 size,
                 mode,
-                uid,
-                gid,
+                owner,
+                group,
                 capabilities,
                 ..
             } => Node::File {
                 sha256: sha256.clone().context("missing file digest")?,
                 size: size.context("missing file size")?,
                 mode: parse_mode(mode)?,
-                uid: *uid,
-                gid: *gid,
+                owner: account(owner),
+                group: account(group),
                 capabilities: *capabilities,
             },
-            Self::Dir { mode, uid, gid, .. } => Node::Dir {
+            Self::Dir {
+                mode, owner, group, ..
+            } => Node::Dir {
                 mode: parse_mode(mode)?,
-                uid: *uid,
-                gid: *gid,
+                owner: account(owner),
+                group: account(group),
             },
             Self::Symlink {
-                target, uid, gid, ..
+                target,
+                owner,
+                group,
+                ..
             } => Node::Symlink {
                 target: target.clone(),
-                uid: *uid,
-                gid: *gid,
+                owner: account(owner),
+                group: account(group),
             },
             Self::Hardlink { target, .. } => Node::Hardlink {
                 target: target.clone(),
@@ -605,11 +670,11 @@ impl Action {
         for (name, value) in selectors.variants {
             validate_variant(name, value)?;
         }
-        let (uid, gid) = match self {
+        let (owner, group) = match self {
             Self::File {
                 mode,
-                uid,
-                gid,
+                owner,
+                group,
                 sha256,
                 size,
                 preserve,
@@ -624,7 +689,10 @@ impl Action {
                 );
                 if mode & 0o6000 != 0 {
                     ensure!(
-                        *uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0 && !preserve,
+                        owner == accounts::ROOT
+                            && mode & 0o111 != 0
+                            && mode & 0o022 == 0
+                            && !preserve,
                         "setid bits require a root-owned executable with no group or other write access and preserve disabled"
                     );
                     ensure!(
@@ -643,7 +711,10 @@ impl Action {
                 if let Some(capabilities) = capabilities {
                     capabilities.validate_declaration()?;
                     ensure!(
-                        *uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0 && !preserve,
+                        owner == accounts::ROOT
+                            && mode & 0o111 != 0
+                            && mode & 0o022 == 0
+                            && !preserve,
                         "file capabilities require a root-owned executable with no group or other write access and preserve disabled"
                     );
                 }
@@ -656,23 +727,28 @@ impl Action {
                         "publish derives file digest and size"
                     );
                 }
-                (*uid, *gid)
+                (owner, group)
             }
-            Self::Dir { mode, uid, gid, .. } => {
+            Self::Dir {
+                mode, owner, group, ..
+            } => {
                 ensure!(
                     parse_mode(mode)? & 0o4000 == 0,
                     "setuid directories are not supported"
                 );
-                (*uid, *gid)
+                (owner, group)
             }
             Self::Symlink {
-                target, uid, gid, ..
+                target,
+                owner,
+                group,
+                ..
             } => {
                 ensure!(
                     !target.is_empty() && !target.contains('\0'),
                     "invalid symlink target"
                 );
-                (*uid, *gid)
+                (owner, group)
             }
             Self::Hardlink { target, .. } => {
                 validate_package_path(target)?;
@@ -680,7 +756,8 @@ impl Action {
                 return Ok(());
             }
         };
-        ensure!(uid != u32::MAX && gid != u32::MAX, "invalid owner");
+        accounts::validate_name(owner).context("invalid owner")?;
+        accounts::validate_name(group).context("invalid group")?;
         Ok(())
     }
 }

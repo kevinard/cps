@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::build::pattern;
+use crate::image::accounts;
 use crate::model::{
     Dependency, FileDigest, MANIFEST_FORMAT, Manifest, PackageSpec, Version, parse_mode,
     validate_digest, validate_facet, validate_path, validate_publisher, validate_variant,
@@ -140,8 +141,8 @@ pub(crate) enum FacetChoice {
 pub(crate) struct CollectRule {
     pub pattern: String,
     pub mode: Option<String>,
-    pub uid: u32,
-    pub gid: u32,
+    pub owner: String,
+    pub group: String,
     pub preserve: bool,
     pub facet: FacetChoice,
     pub variants: BTreeMap<String, String>,
@@ -224,8 +225,8 @@ fn collect_rule(node: &KdlNode) -> Result<CollectRule> {
         1,
         &[
             "mode",
-            "uid",
-            "gid",
+            "owner",
+            "group",
             "preserve",
             "facet",
             "architecture",
@@ -264,15 +265,17 @@ fn collect_rule(node: &KdlNode) -> Result<CollectRule> {
     for (name, value) in &variants {
         validate_variant(name, value)?;
     }
-    let owner = |key| -> Result<u32> {
-        let id = fields.integer(key)?.unwrap_or(0);
-        ensure!(id != u32::MAX, "invalid owner");
-        Ok(id)
+    let account = |key| -> Result<String> {
+        let name = fields
+            .string(key)?
+            .unwrap_or_else(|| accounts::ROOT.to_owned());
+        accounts::validate_name(&name).with_context(|| format!("invalid {key}"))?;
+        Ok(name)
     };
     Ok(CollectRule {
         mode,
-        uid: owner("uid")?,
-        gid: owner("gid")?,
+        owner: account("owner")?,
+        group: account("group")?,
         preserve: fields
             .properties
             .get("preserve")

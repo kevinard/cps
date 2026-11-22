@@ -331,22 +331,22 @@ fn check_state(
             (
                 Node::File {
                     mode,
-                    uid,
-                    gid,
+                    owner,
+                    group,
                     capabilities,
                     ..
                 },
                 Some(Node::File {
                     mode: actual_mode,
-                    uid: actual_uid,
-                    gid: actual_gid,
+                    owner: actual_owner,
+                    group: actual_group,
                     capabilities: actual_capabilities,
                     ..
                 }),
             ) if !pristine
                 && managed.preserve
-                && (mode, uid, gid, capabilities)
-                    == (actual_mode, actual_uid, actual_gid, actual_capabilities) =>
+                && (mode, owner, group, capabilities)
+                    == (actual_mode, actual_owner, actual_group, actual_capabilities) =>
             {
                 findings.push(Finding {
                     is_error: false,
@@ -354,13 +354,26 @@ fn check_state(
                 });
                 continue;
             }
-            (_, None) => "missing",
+            (_, None) => "missing".to_owned(),
             (file @ Node::File { .. }, Some(observed @ Node::File { .. }))
                 if file.capabilities() != observed.capabilities() =>
             {
-                "file capabilities differ"
+                "file capabilities differ".to_owned()
             }
-            _ => "content, type, or metadata differs",
+            (expected, Some(observed))
+                if expected.ownership().is_some_and(|(owner, group)| {
+                    observed.ownership() != Some((owner, group))
+                        && observed.with_ownership(owner, group) == *expected
+                }) =>
+            {
+                let show = |node: &Node| {
+                    node.ownership()
+                        .map(|(owner, group)| format!("{owner}:{group}"))
+                        .unwrap_or_default()
+                };
+                format!("owned by {}, expected {}", show(observed), show(expected))
+            }
+            _ => "content, type, or metadata differs".to_owned(),
         };
         findings.push(Finding {
             is_error: true,

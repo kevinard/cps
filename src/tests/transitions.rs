@@ -6,13 +6,8 @@ use std::os::unix::fs::MetadataExt;
 use super::*;
 use crate::{TransactionPhase, abort_transaction, resume_transaction, transaction_progress};
 
-fn ids() -> (u32, u32) {
-    (geteuid().as_raw(), getegid().as_raw())
-}
-
 fn symlink_action(path: &str, target: &str) -> String {
-    let (uid, gid) = ids();
-    format!("    symlink {path:?} target={target:?} uid={uid} gid={gid}\n")
+    format!("    symlink {path:?} target={target:?}\n")
 }
 
 fn install_all(root: &Path, packages: &[&str]) -> Result<u64> {
@@ -488,7 +483,6 @@ fn replacing_a_file_with_a_directory_keeps_local_configuration() -> Result<()> {
 fn upgrade_fixture() -> Result<(Fixture, Plan)> {
     const ALIAS: &str = "usr/bin/compositor-alias";
     let f = Fixture::new()?;
-    let (uid, gid) = ids();
     f.package(
         "library/libdisplay",
         "1.0.0-0",
@@ -504,7 +498,7 @@ fn upgrade_fixture() -> Result<(Fixture, Plan)> {
                 "0644",
                 "preserve=#true",
             )?
-            + &format!("    dir \"usr/share/canopa\" mode={mode:?} uid={uid} gid={gid}\n"))
+            + &format!("    dir \"usr/share/canopa\" mode={mode:?}\n"))
     };
     f.package(
         "desktop/compositor",

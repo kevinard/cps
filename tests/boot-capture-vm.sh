@@ -76,7 +76,7 @@ cp repo/trust/1.json public.trust.json
 publish() {
     printf '%s\n' "$1" > proto/etc/cps-capture-version
     "$cps" manifest generate --proto proto --publisher test --version "$1" \
-        --uid "$(id -u)" --gid "$(id -g)" test/live-root > manifest.kdl
+        test/live-root > manifest.kdl
     if [[ $system_commands == 1 && $1 != 1.0.0-0 ]]; then
         sed -i '/^package /s/ {$/ requires-reboot=#true {/' manifest.kdl
     fi
@@ -92,7 +92,7 @@ if [[ $git_installs == 1 ]]; then
     CPS_GIT_BUILD_BUSYBOX="$busybox" bash "$project/tests/seed-git-build.sh" "$cps" \
         "$work/git-build" "$work/private.der"
     "$cps" manifest generate --proto git-build --publisher test --version 1.0.0-0 \
-        --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
+        system/git-build > git-build.kdl
     "$cps" publish manifests --repo repo --proto git-build --key private.der git-build.kdl
     base_packages+=(system/git-build)
 fi
@@ -124,10 +124,10 @@ UNIT
             "$version" > service/usr/bin/cps-demo-service
         chmod 755 app/usr/bin/cps-demo service/usr/bin/cps-demo-service
         "$cps" manifest generate --proto service --publisher test --version "$version" \
-            --uid "$(id -u)" --gid "$(id -g)" test/cps-demo-service > service.kdl
+            test/cps-demo-service > service.kdl
         "$cps" publish manifests --repo repo --proto service --key private.der service.kdl
         "$cps" manifest generate --proto app --publisher test --version "$version" \
-            --uid "$(id -u)" --gid "$(id -g)" test/cps-demo > app.kdl
+            test/cps-demo > app.kdl
         sed -i '$i\    require "test/cps-demo-service" version="='"$version"'"' app.kdl
         "$cps" publish manifests --repo repo --proto app --key private.der app.kdl
         cp repo/current "catalog-$version"

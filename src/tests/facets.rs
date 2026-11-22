@@ -292,11 +292,8 @@ fn variants_select_exclusive_content_and_change_offline() -> Result<()> {
     const INIT: &str = "etc/init.conf";
     const GETTY: &str = "usr/bin/getty";
     let f = Fixture::new()?;
-    let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
     let link = |target: &str, value: &str| {
-        format!(
-            "    symlink {INIT:?} target={target:?} uid={uid} gid={gid} variant.container={value:?}\n"
-        )
+        format!("    symlink {INIT:?} target={target:?} variant.container={value:?}\n")
     };
     f.package(
         "system/init",
@@ -383,7 +380,7 @@ fn manifests_require_variant_exclusive_alternatives_and_plain_dependencies() -> 
             Ok(manifest)
         })
     };
-    let file = |extra: &str| format!("file \"etc/tool.conf\" mode=\"0644\" uid=0 gid=0 {extra}\n");
+    let file = |extra: &str| format!("file \"etc/tool.conf\" mode=\"0644\" {extra}\n");
     let exclusive = parse(
         &(file("variant.container=\"true\" facet=\"doc\"")
             + &file("variant.container=\"false\" architecture=\"x86_64\"")

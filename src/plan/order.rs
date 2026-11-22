@@ -313,8 +313,8 @@ mod tests {
             sha256: String::new(),
             size: 0,
             mode,
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
             capabilities: None,
         };
         assert_eq!(file_kind("usr/lib/libz.so.1.3", &file(0o755)), 0);
@@ -323,8 +323,8 @@ mod tests {
         assert_eq!(file_kind("usr/lib/tool/helper", &file(0o755)), 2);
         let link = Node::Symlink {
             target: "busybox".into(),
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
         };
         assert_eq!(file_kind("usr/bin/sh", &link), 2);
         assert_eq!(
@@ -369,19 +369,19 @@ mod tests {
             sha256: String::new(),
             size: 0,
             mode,
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
             capabilities: None,
         };
         let link = |target: &str| Node::Symlink {
             target: target.into(),
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
         };
         let dir = Node::Dir {
             mode: 0o755,
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
         };
         let mut tree = write("opt/tree", dir.clone());
         tree.before = Some(link("elsewhere"));

@@ -40,7 +40,7 @@ bash "$project/tests/seed-native-c.sh" "$work/native-c" --busybox
     build/native-c > native-c.kdl
 "$cps" publish manifests --repo toolchain --proto "$work/native-c" --key "$work/toolchain.der" native-c.kdl
 
-sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$project/packaging/busybox/$manifest" > busybox.kdl
+cp "$project/packaging/busybox/$manifest" busybox.kdl
 sed -e "s/@ARCH@/$(uname -m)/g" -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
     -e "s/@KEY_SHA256@/$(sha256sum < toolchain.trust.json | cut -d' ' -f1)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha busybox.kdl)/g" \

@@ -34,7 +34,7 @@ use rustix::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    image::{CONFIG_UPDATES_DIRECTORY, Image, Managed, root::Root},
+    image::{CONFIG_UPDATES_DIRECTORY, Image, Managed, accounts::Accounts, root::Root},
     model::{Node, digest},
     plan::config_update_prefix,
 };
@@ -248,6 +248,10 @@ impl EtcMergeReport {
 pub(crate) struct Policy<'a> {
     pub paths: &'a BTreeMap<String, Managed>,
     pub generated: Vec<&'a str>,
+    /// The trial's accounts, which the owner names of its paths resolve
+    /// against on both sides: the trial starts as a copy of the running
+    /// root, and sysusers.d only adds accounts.
+    pub accounts: &'a Accounts,
 }
 
 /// Record the merge base in a new root before its plan changes `/etc`.
@@ -332,6 +336,7 @@ pub(crate) fn finalize_with(
     let policy = Policy {
         paths: &state.paths,
         generated: crate::triggers::active_outputs(&state.installed, &state.paths),
+        accounts: trial.root.accounts(),
     };
     let ours = scan(running, true).context("reading the running /etc")?;
     ensure!(
@@ -475,7 +480,7 @@ fn plan(
         let action = if crate::triggers::generated(&policy.generated, path) {
             Action::Keep(Reason::Generated)
         } else if let Some(managed) = policy.paths.get(path.as_str()) {
-            if !acceptable(o, managed) {
+            if !acceptable(o, managed, policy.accounts) {
                 if o.is_some() {
                     Action::Conflict(Reason::Drift)
                 } else {
@@ -490,7 +495,7 @@ fn plan(
                     content,
                     running_metadata,
                 }
-            } else if managed.preserve && matches_node(t, &managed.node) {
+            } else if managed.preserve && matches_node(t, &managed.node, policy.accounts) {
                 Action::ConfigUpdate
             } else {
                 Action::Conflict(Reason::BothChanged)
@@ -517,7 +522,7 @@ fn plan(
 /// Preserved files accept any contents with the manifest's metadata. A
 /// directory that packages only create implicitly accepts any metadata, as
 /// verification does. Other paths must match their manifest exactly.
-fn acceptable(ours: Option<&Entry>, managed: &Managed) -> bool {
+fn acceptable(ours: Option<&Entry>, managed: &Managed, accounts: &Accounts) -> bool {
     match (ours, &managed.node) {
         (Some(Entry::Dir { .. }), _) if managed.implicit => true,
         (
@@ -528,23 +533,29 @@ fn acceptable(ours: Option<&Entry>, managed: &Managed) -> bool {
                 xattrs,
                 ..
             }),
-            Node::File {
+            node @ Node::File {
                 mode: expected_mode,
-                uid: expected_uid,
-                gid: expected_gid,
                 capabilities: None,
                 ..
             },
         ) if managed.preserve => {
-            (*mode, *uid, *gid) == (*expected_mode, *expected_uid, *expected_gid)
+            mode == expected_mode
+                && owned_as(node, accounts, *uid, *gid)
                 && !xattrs.contains_key("security.capability")
         }
-        (Some(entry), node) => matches_node(Some(entry), node),
+        (Some(entry), node) => matches_node(Some(entry), node, accounts),
         (None, _) => false,
     }
 }
 
-fn matches_node(entry: Option<&Entry>, node: &Node) -> bool {
+/// Whether a node's owner and group names resolve to these IDs.
+fn owned_as(node: &Node, accounts: &Accounts, uid: u32, gid: u32) -> bool {
+    node.ownership()
+        .and_then(|(owner, group)| accounts.ids(owner, group).ok())
+        == Some((uid, gid))
+}
+
+fn matches_node(entry: Option<&Entry>, node: &Node, accounts: &Accounts) -> bool {
     match (entry, node) {
         (
             Some(Entry::File {
@@ -557,34 +568,25 @@ fn matches_node(entry: Option<&Entry>, node: &Node) -> bool {
             }),
             Node::File {
                 mode: m,
-                uid: u,
-                gid: g,
                 size: s,
                 sha256: h,
                 capabilities: None,
+                ..
             },
         ) => {
-            (mode, uid, gid, size, sha256) == (m, u, g, s, h)
+            (mode, size, sha256) == (m, s, h)
+                && owned_as(node, accounts, *uid, *gid)
                 && !xattrs.contains_key("security.capability")
         }
-        (
-            Some(Entry::Dir { mode, uid, gid, .. }),
-            Node::Dir {
-                mode: m,
-                uid: u,
-                gid: g,
-            },
-        ) => (mode, uid, gid) == (m, u, g),
+        (Some(Entry::Dir { mode, uid, gid, .. }), Node::Dir { mode: m, .. }) => {
+            mode == m && owned_as(node, accounts, *uid, *gid)
+        }
         (
             Some(Entry::Symlink {
                 target, uid, gid, ..
             }),
-            Node::Symlink {
-                target: t,
-                uid: u,
-                gid: g,
-            },
-        ) => (target, uid, gid) == (t, u, g),
+            Node::Symlink { target: t, .. },
+        ) => target == t && owned_as(node, accounts, *uid, *gid),
         _ => false,
     }
 }
@@ -1492,8 +1494,8 @@ mod tests {
                 sha256: digest(text.as_bytes()),
                 size: text.len() as u64,
                 mode: 0o644,
-                uid: 0,
-                gid: 0,
+                owner: "root".into(),
+                group: "root".into(),
                 capabilities: None,
             },
             owners: BTreeSet::from(["system/base".to_owned()]),
@@ -1611,9 +1613,12 @@ mod tests {
         ours.entries.remove("etc/mounted");
         ours.entries.remove("etc/mounted/inner");
         ours.opaque.insert("etc/mounted".into());
+        let empty = tempfile::tempdir()?;
+        let accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: vec!["etc/ld.so.cache"],
+            accounts: &accounts,
         };
         let actions = plan(&base, &ours, &theirs, &policy)?;
         let expected = BTreeMap::from([
@@ -1658,9 +1663,12 @@ mod tests {
             manifest.entries.insert("etc/group".into(), entry);
             manifest.records.insert("etc/group".into(), record);
         }
+        let empty = tempfile::tempdir()?;
+        let accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: Vec::new(),
+            accounts: &accounts,
         };
         assert_eq!(
             plan(&base, &ours, &theirs, &policy)?["etc/group"],
@@ -1685,9 +1693,12 @@ mod tests {
             (file_with(text, mode), STANDARD.encode(text))
         };
         let paths = BTreeMap::new();
+        let empty = tempfile::tempdir()?;
+        let no_accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: Vec::new(),
+            accounts: &no_accounts,
         };
         let root = "root:x:0:0::/root:/bin/sh\n";
         let case = |ours: (&str, u32), theirs: (&str, u32)| -> Result<Action> {
@@ -1747,8 +1758,8 @@ mod tests {
             Managed {
                 node: Node::Dir {
                     mode: 0o755,
-                    uid: 0,
-                    gid: 0,
+                    owner: "root".into(),
+                    group: "root".into(),
                 },
                 owners: BTreeSet::from(["system/base".to_owned()]),
                 preserve: false,
@@ -1756,9 +1767,12 @@ mod tests {
                 original_name: None,
             },
         )]);
+        let empty = tempfile::tempdir()?;
+        let accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: Vec::new(),
+            accounts: &accounts,
         };
         let base = manifest(&[("etc/ssh", dir())]);
         let mut ours = base.clone();

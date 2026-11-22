@@ -7,8 +7,6 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/cps-build-test.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 cd "$work"
 
-uid=$(id -u)
-gid=$(id -g)
 arch=$(uname -m)
 # Recipes pin each toolchain publisher by the SHA-256 of its trust root file.
 fingerprint() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -144,7 +142,7 @@ add_file() {
     local input=$1 path=$2
     if [[ ! -e proto/$path ]]; then
         install -D -m755 "$input" "proto/$path"
-        printf '    file "%s" mode="0755" uid=0 gid=0\n' "$path"
+        printf '    file "%s" mode="0755"\n' "$path"
     fi
 }
 
@@ -166,7 +164,7 @@ shell=$(command -v bash)
     printf 'schema-version 1 kind="package-manifest"\npackage "build/probe" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
     printf '    require "build/shell" version="=1.0.0-0"\n'
     install -D -m755 probe proto/usr/bin/probe
-    printf '    file "usr/bin/probe" mode="0755" uid=0 gid=0 capabilities="cap_net_raw=ep"\n'
+    printf '    file "usr/bin/probe" mode="0755" capabilities="cap_net_raw=ep"\n'
     printf '    hardlink "usr/bin/probe-alias" target="usr/bin/probe"\n'
     printf '}\n'
 } > probe.kdl
@@ -183,7 +181,7 @@ printf 'outside\n' > host-only
 cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/hello" publisher="canopa" version="1.0.0-0" architecture="$arch" {
-    file "hello" mode="0644" uid=$uid gid=$gid
+    file "hello" mode="0644"
     hardlink "hello-alias" target="hello"
 }
 MANIFEST
@@ -862,7 +860,7 @@ cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/hello" publisher="canopa" version="2.0.0-0" architecture="$arch" {
     require "library/platform" version="=1.0.0-0"
-    file "hello" mode="0644" uid=$uid gid=$gid
+    file "hello" mode="0644"
     hardlink "hello-alias" target="hello"
 }
 MANIFEST
@@ -875,7 +873,7 @@ build_package --sources sources --key signing.der --check-reproducible --output 
 cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "library/platform" publisher="canopa" version="1.0.0-0" {
-    file "platform" mode="0644" uid=$uid gid=$gid
+    file "platform" mode="0644"
 }
 MANIFEST
 recipe '    printf "platform\n" > "$DESTDIR/platform"' > platform.kdl

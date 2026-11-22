@@ -99,7 +99,7 @@ StandardOutput=tty
 StandardError=inherit
 UNIT
 "$cps" manifest generate --proto runtime --publisher vm-test --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" test/btrfs-harness > runtime.kdl
+    test/btrfs-harness > runtime.kdl
 "$cps" publish manifests --repo repos/vm-test --proto runtime --key vm-test-private.der runtime.kdl
 
 publish_desktop() {
@@ -107,7 +107,7 @@ publish_desktop() {
     printf '%s\n' "$2" > desktop/etc/cps-btrfs-state
     printf '%s\n' "$3" > desktop/etc/cps-btrfs-release
     "$cps" manifest generate --proto desktop --publisher vm-test --version "$1" \
-        --uid "$(id -u)" --gid "$(id -g)" test/desktop > desktop.kdl
+        test/desktop > desktop.kdl
     "$cps" publish manifests --repo repos/vm-test --proto desktop --key vm-test-private.der desktop.kdl
 }
 publish_desktop 1.0.0-0 previous "$release"

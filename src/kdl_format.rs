@@ -10,6 +10,7 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
+    image::accounts,
     model::{
         ARCH_VARIANT, Action, Dependency, DependencyTarget, ImagePolicy, MANIFEST_FORMAT, Manifest,
         NIL_UUID, OptionalDependency, is_uuid, validate_digest, validate_name, validate_publisher,
@@ -194,9 +195,11 @@ impl<'a> Fields<'a> {
         Ok(variants)
     }
 
-    fn owner(&self, key: &str) -> Result<u32> {
-        self.integer(key)?
-            .with_context(|| format!("missing {key} property"))
+    /// An owner or group name, `root` unless the node names another.
+    fn account(&self, key: &str) -> Result<String> {
+        Ok(self
+            .string(key)?
+            .unwrap_or_else(|| accounts::ROOT.to_owned()))
     }
 }
 
@@ -529,8 +532,8 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
     let props: &[&str] = match name {
         "file" => &[
             "mode",
-            "uid",
-            "gid",
+            "owner",
+            "group",
             "architecture",
             "facet",
             VARIANT_PROPERTY,
@@ -542,8 +545,8 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
         ],
         "dir" => &[
             "mode",
-            "uid",
-            "gid",
+            "owner",
+            "group",
             "architecture",
             "facet",
             VARIANT_PROPERTY,
@@ -551,8 +554,8 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
         "hardlink" => &["target", "architecture", "facet", VARIANT_PROPERTY],
         _ => &[
             "target",
-            "uid",
-            "gid",
+            "owner",
+            "group",
             "architecture",
             "facet",
             VARIANT_PROPERTY,
@@ -570,13 +573,13 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             facet,
         });
     }
-    let uid = fields.owner("uid")?;
-    let gid = fields.owner("gid")?;
+    let owner = fields.account("owner")?;
+    let group = fields.account("group")?;
     Ok(match name {
         "file" => Action::File {
             path,
-            uid,
-            gid,
+            owner,
+            group,
             variants,
             facet,
             mode: fields.required_string("mode")?,
@@ -597,16 +600,16 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
         },
         "dir" => Action::Dir {
             path,
-            uid,
-            gid,
+            owner,
+            group,
             variants,
             facet,
             mode: fields.required_string("mode")?,
         },
         _ => Action::Symlink {
             path,
-            uid,
-            gid,
+            owner,
+            group,
             variants,
             facet,
             target: fields.required_string("target")?,
@@ -719,8 +722,8 @@ pub(crate) fn manifest_text(manifest: &Manifest) -> String {
         node.push(action.path());
         let owner = match action {
             Action::File {
-                uid,
-                gid,
+                owner,
+                group,
                 mode,
                 preserve,
                 original_name,
@@ -745,26 +748,36 @@ pub(crate) fn manifest_text(manifest: &Manifest) -> String {
                 if let Some(capabilities) = capabilities {
                     node.insert("capabilities", capabilities.to_string());
                 }
-                Some((*uid, *gid))
+                Some((owner, group))
             }
-            Action::Dir { uid, gid, mode, .. } => {
+            Action::Dir {
+                owner, group, mode, ..
+            } => {
                 node.insert("mode", mode.as_str());
-                Some((*uid, *gid))
+                Some((owner, group))
             }
             Action::Symlink {
-                uid, gid, target, ..
+                owner,
+                group,
+                target,
+                ..
             } => {
                 node.insert("target", target.as_str());
-                Some((*uid, *gid))
+                Some((owner, group))
             }
             Action::Hardlink { target, .. } => {
                 node.insert("target", target.as_str());
                 None
             }
         };
-        if let Some((uid, gid)) = owner {
-            node.insert("uid", i128::from(uid));
-            node.insert("gid", i128::from(gid));
+        // Most files belong to root, so only other accounts are written.
+        if let Some((owner, group)) = owner {
+            if owner != accounts::ROOT {
+                node.insert("owner", owner.as_str());
+            }
+            if group != accounts::ROOT {
+                node.insert("group", group.as_str());
+            }
         }
         let selectors = action.selectors();
         if let Some(facet) = selectors.facet {
@@ -1447,11 +1460,11 @@ mod tests {
         let input = r#"
             schema-version 1 kind="package-manifest"
             package "test/example" publisher="canopa" version="1.0.0-0" {
-                file "usr/bin/example" mode="0755" uid=0 uid=1 gid=0
+                file "usr/bin/example" mode="0755" owner="root" owner="bin"
             }
         "#;
         let error = parse_manifest(input).unwrap_err();
-        assert!(format!("{error:#}").contains("duplicate file property uid"));
+        assert!(format!("{error:#}").contains("duplicate file property owner"));
     }
 
     #[test]
@@ -1462,41 +1475,38 @@ mod tests {
             )
         };
         parse_manifest(&package(
-            r#"dir "usr/lib/sysimage" mode="0755" uid=0 gid=0
-               dir "srv/var" mode="0755" uid=0 gid=0
-               symlink "usr/lib/example" target="/var/lib/example" uid=0 gid=0
-               file "usr/lib/tmpfiles.d/example.conf" mode="0644" uid=0 gid=0"#,
+            r#"dir "usr/lib/sysimage" mode="0755"
+               dir "srv/var" mode="0755"
+               symlink "usr/lib/example" target="/var/lib/example"
+               file "usr/lib/tmpfiles.d/example.conf" mode="0644""#,
         ))?
         .validate(false)?;
         for (body, message) in [
-            (r#"dir "var" mode="0755" uid=0 gid=0"#, "var is under /var"),
+            (r#"dir "var" mode="0755""#, "var is under /var"),
+            (r#"dir "var/lib/example" mode="0755""#, "tmpfiles.d"),
             (
-                r#"dir "var/lib/example" mode="0755" uid=0 gid=0"#,
-                "tmpfiles.d",
-            ),
-            (
-                r#"file "var/lib/example/db" mode="0644" uid=0 gid=0"#,
+                r#"file "var/lib/example/db" mode="0644""#,
                 "packages never ship /var",
             ),
             (
-                r#"symlink "var/run" target="../run" uid=0 gid=0"#,
+                r#"symlink "var/run" target="../run""#,
                 "var/run is under /var",
             ),
             (
-                r#"file "usr/bin/a" mode="0755" uid=0 gid=0
+                r#"file "usr/bin/a" mode="0755"
                    hardlink "var/b" target="usr/bin/a""#,
                 "var/b is under /var",
             ),
             (
-                r#"file "etc/example.conf" mode="0644" uid=0 gid=0 preserve=#true original-name="test/old:var/lib/example.conf""#,
+                r#"file "etc/example.conf" mode="0644" preserve=#true original-name="test/old:var/lib/example.conf""#,
                 "is under /var",
             ),
             (
-                r#"dir "usr/lib/sysimage/cps" mode="0755" uid=0 gid=0"#,
+                r#"dir "usr/lib/sysimage/cps" mode="0755""#,
                 "reserved image state path",
             ),
             (
-                r#"file "usr/lib/sysimage/cps/state.sqlite" mode="0644" uid=0 gid=0"#,
+                r#"file "usr/lib/sysimage/cps/state.sqlite" mode="0644""#,
                 "reserved image state path",
             ),
         ] {

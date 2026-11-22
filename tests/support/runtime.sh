@@ -13,7 +13,7 @@ ship_runtime() {
             seen[$path]=1
             mkdir -p -- "$proto/$(dirname -- "${path#/}")"
             cp -L -- "$path" "$proto/${path#/}"
-            printf '    file "%s" mode="0755" uid=%s gid=%s\n' "${path#/}" "$(id -u)" "$(id -g)"
+            printf '    file "%s" mode="0755"\n' "${path#/}"
         done < <(
             printf '%s\n' "$binary"
             ldd "$binary" | awk '$1 ~ /^\// { print $1 } $3 ~ /^\// { print $3 }'

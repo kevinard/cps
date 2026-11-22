@@ -94,7 +94,7 @@ def closure(model, root):
     return seen
 
 
-def manifest_text(number, version, model, files, uid, gid, payloads=None):
+def manifest_text(number, version, model, files, payloads=None):
     """Render one package manifest, optionally with published payload digests."""
     dependencies, provides = model[number]
     name = package_name(number)
@@ -112,7 +112,7 @@ def manifest_text(number, version, model, files, uid, gid, payloads=None):
         if payloads is not None:
             sha256, size = payloads
             extra = f' sha256="{sha256}" size={size}'
-        lines.append(f'    file "{path}" mode="0644" uid={uid} gid={gid}{extra}\n')
+        lines.append(f'    file "{path}" mode="0644"{extra}\n')
     lines.append("}\n")
     return "".join(lines)
 
@@ -196,7 +196,6 @@ def main():
                     "-outform", "DER", "-out", "private.der"], check=True)
     subprocess.run([str(cps), "repo", "trust", "init", "--repo", "repo", "--publisher",
                     PUBLISHER, "--key", "private.der"], check=True, stdout=subprocess.DEVNULL)
-    uid, gid = os.getuid(), os.getgid()
     manifests = Path("manifests")
     manifests.mkdir()
 
@@ -212,7 +211,7 @@ def main():
             for index in range(1, options.files):
                 os.link(first, directory / f"pkg-{number:06}-{index:03}")
             path = manifests / f"{number:06}-{version}.kdl"
-            path.write_text(manifest_text(number, version, model, options.files, uid, gid))
+            path.write_text(manifest_text(number, version, model, options.files))
             paths.append(path)
         return proto, paths
 

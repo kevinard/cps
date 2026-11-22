@@ -29,8 +29,8 @@ fn install_plan(root: &Path, packages: &[&str]) -> Result<Plan> {
 fn trigger_declarations_round_trip_and_validate() -> Result<()> {
     let manifest = r#"schema-version 1 kind="package-manifest"
 package "desktop/glib" publisher="canopa" version="2.86.0-0" {
-    dir "usr/share/glib-2.0/schemas" mode="0755" uid=0 gid=0
-    file "usr/bin/glib-compile-schemas" mode="0755" uid=0 gid=0
+    dir "usr/share/glib-2.0/schemas" mode="0755"
+    file "usr/bin/glib-compile-schemas" mode="0755"
     trigger "schemas" timeout=60 {
         run "usr/bin/glib-compile-schemas" "usr/share/glib-2.0/schemas"
         watch "usr/share/glib-2.0/schemas/*.xml"
@@ -138,11 +138,10 @@ package "desktop/glib" publisher="canopa" version="2.86.0-0" {
 /// A cache trigger and a trigger that summarizes the cache.
 fn cache_fixture() -> Result<Fixture> {
     let f = Fixture::new()?;
-    let owner = format!("uid={} gid={}", geteuid().as_raw(), getegid().as_raw());
     f.package(
         "test/cache",
         "1.0.0-0",
-        format!("    dir \"usr/share/items\" mode=\"0755\" {owner}\n")
+        "    dir \"usr/share/items\" mode=\"0755\"\n".to_string()
             + &handler(&f, "usr/libexec/cache")?
             + &trigger(
                 "index",
@@ -227,12 +226,11 @@ fn package_paths_and_overlapping_outputs_conflict() -> Result<()> {
 #[test]
 fn outputs_beneath_symlinks_are_refused_or_skipped() -> Result<()> {
     let f = Fixture::new()?;
-    let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
     f.package(
         "base/merged",
         "1.0.0-0",
-        format!("    dir \"usr/lib\" mode=\"0755\" uid={uid} gid={gid}\n")
-            + &format!("    symlink \"lib\" target=\"usr/lib\" uid={uid} gid={gid}\n"),
+        "    dir \"usr/lib\" mode=\"0755\"\n".to_string()
+            + "    symlink \"lib\" target=\"usr/lib\"\n",
     )?;
     f.package(
         "test/linked",
@@ -246,7 +244,7 @@ fn outputs_beneath_symlinks_are_refused_or_skipped() -> Result<()> {
     f.package(
         "test/opt",
         "1.0.0-0",
-        format!("    dir \"opt\" mode=\"0755\" uid={uid} gid={gid}\n")
+        "    dir \"opt\" mode=\"0755\"\n".to_string()
             + &handler(&f, "usr/libexec/opt")?
             + &trigger(
                 "cache",
@@ -441,11 +439,7 @@ fn runtime(f: &Fixture, executables: &[&str]) -> Result<String> {
             let destination = f.proto.join(relative);
             fs::create_dir_all(destination.parent().unwrap())?;
             fs::copy(path, &destination)?;
-            actions += &format!(
-                "    file {relative:?} mode=\"0755\" uid={} gid={}\n",
-                geteuid().as_raw(),
-                getegid().as_raw()
-            );
+            actions += &format!("    file {relative:?} mode=\"0755\"\n");
         }
     }
     Ok(actions)
@@ -474,13 +468,12 @@ const SUMMARY_FAIL: &str = "etc/summary-fail";
 /// counts the index. Both handlers record each run in a second output.
 fn running_fixture() -> Result<Fixture> {
     let f = Fixture::new()?;
-    let owner = format!("uid={} gid={}", geteuid().as_raw(), getegid().as_raw());
     f.package("test/runtime", "1.0.0-0", runtime(&f, &["/usr/bin/bash"])?)?;
     f.package(
         "test/index",
         "1.0.0-0",
         dependency("require", "test/runtime", "1.0.0-0")
-            + &format!("    dir \"usr/share/items\" mode=\"0755\" {owner}\n")
+            + "    dir \"usr/share/items\" mode=\"0755\"\n"
             + &f.file(
                 "usr/libexec/index",
                 "#!/usr/bin/bash\nset -eu\ncd /usr/share/items\nshopt -s nullglob\n: > index\nfor item in *.item; do printf '%s\\n' \"$(<\"$item\")\" >> index; done\necho run >> runs\n",
@@ -498,7 +491,7 @@ fn running_fixture() -> Result<Fixture> {
         "test/summary",
         "1.0.0-0",
         dependency("require", "test/index", "1.0.0-0")
-            + &format!("    dir \"usr/share/summary\" mode=\"0755\" {owner}\n")
+            + "    dir \"usr/share/summary\" mode=\"0755\"\n"
             + &f.file(
                 "usr/libexec/summary",
                 &format!(
@@ -742,12 +735,11 @@ fn transitions_carry_generated_outputs_away_with_the_old_tree() -> Result<()> {
         return Ok(());
     }
     let f = Fixture::new()?;
-    let owner = format!("uid={} gid={}", geteuid().as_raw(), getegid().as_raw());
     f.package("test/runtime", "1.0.0-0", runtime(&f, &["/usr/bin/bash"])?)?;
     f.package(
         "test/gen",
         "1.0.0-0",
-        format!("    dir \"usr/share/gen\" mode=\"0755\" {owner}\n")
+        "    dir \"usr/share/gen\" mode=\"0755\"\n".to_string()
             + &f.file("usr/share/gen/a.item", "a", "0644", "")?
             + &cache_generator(&f, "gen", "usr/share/gen")?,
     )?;
@@ -767,7 +759,7 @@ fn transitions_carry_generated_outputs_away_with_the_old_tree() -> Result<()> {
         "test/gen",
         "2.0.0-0",
         f.file("usr/lib/gen/a.item", "a", "0644", "")?
-            + &format!("    symlink \"usr/share/gen\" target=\"../lib/gen\" {owner}\n"),
+            + "    symlink \"usr/share/gen\" target=\"../lib/gen\"\n",
     )?;
     let update = install_plan(&f.root, &["test/gen@2.0.0-0"])?;
     assert_eq!(update.retired_triggers.len(), 1);

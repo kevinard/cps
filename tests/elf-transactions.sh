@@ -8,8 +8,6 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 arch=$(uname -m)
-uid=$(id -u)
-gid=$(id -g)
 mkdir -p runtime/usr/lib app/usr/bin shadow/usr/override loader/usr/lib
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
 "$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
@@ -24,7 +22,7 @@ library() {
 }
 publish() {
     "$cps" manifest generate --proto "$1" --publisher canopa --version "$2" \
-        --uid "$uid" --gid "$gid" "$3" > generated.kdl
+        "$3" > generated.kdl
     "$cps" publish manifests --repo repo --proto "$1" --key private.der generated.kdl
 }
 install_base() {
@@ -81,7 +79,7 @@ reject loader.json 'missing ELF interpreter /usr/lib/cps-test-loader previously 
 # Facet content provides no capability, because facets never gate dependencies.
 missing='missing ELF dependency libcps-abi.so.1 previously provided at usr/lib/libcps-abi.so.1.0'
 "$cps" manifest generate --proto runtime --publisher canopa --version 1.1.0-0 \
-    --uid "$uid" --gid "$gid" demo/runtime |
+    demo/runtime |
     sed '/^    symlink /s/$/ facet="runtime.library"/' > generated.kdl
 "$cps" publish manifests --repo repo --proto runtime --key private.der generated.kdl
 reject_plan install demo/runtime@1.1.0-0
@@ -91,7 +89,7 @@ reject_plan install demo/runtime@1.1.0-0
 mkdir -p plugin/usr/bin
 cp app/usr/bin/demo plugin/usr/bin/demo-plugin
 "$cps" manifest generate --proto plugin --publisher canopa --version 1.0.0-0 \
-    --uid "$uid" --gid "$gid" demo/plugin |
+    demo/plugin |
     sed '/^    file /s/$/ facet="plugin.demo"/' > generated.kdl
 "$cps" publish manifests --repo repo --proto plugin --key private.der generated.kdl
 "$cps" image create --root facet_image --repo repo --trust-root repo/trust/1.json \

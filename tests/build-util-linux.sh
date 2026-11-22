@@ -36,7 +36,7 @@ bash "$project/tests/seed-native-c.sh" "$work/native-util-linux" --util-linux
     --key "$work/toolchain.der" native-util-linux.kdl
 
 recipe="$project/packaging/util-linux"
-sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/util-linux.kdl" > util-linux.kdl
+cp "$recipe/util-linux.kdl" util-linux.kdl
 sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
     -e "s/@KEY_SHA256@/$(sha256sum < toolchain.trust.json | cut -d' ' -f1)/g" \
     -e "s/@MANIFEST_SHA256@/$(sha util-linux.kdl)/g" "$recipe/build.kdl.in" > build.kdl

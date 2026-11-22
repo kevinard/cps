@@ -668,7 +668,7 @@ build architecture="x86_64" epoch=1700000000 {{
         );
         let template = r#"schema-version 1 kind="package-manifest"
 package "test/git" publisher="git" version="1.0.0-0" {
-    file "usr/share/git" mode="0644" uid=0 gid=0
+    file "usr/share/git" mode="0644"
 }
 "#;
         let work = tempfile::tempdir()?;
@@ -686,10 +686,7 @@ package "test/git" publisher="git" version="1.0.0-0" {
         // The build account cannot add actions that the template lacks.
         fs::write(
             &expanded,
-            template.replace(
-                "}\n",
-                "    file \"usr/bin/su\" mode=\"4755\" uid=0 gid=0\n}\n",
-            ),
+            template.replace("}\n", "    file \"usr/bin/su\" mode=\"4755\"\n}\n"),
         )?;
         let Err(error) = checked_output(path, template, &recipe) else {
             panic!("an added setuid file was accepted");

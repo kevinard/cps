@@ -26,14 +26,14 @@ signing=(--key key.der --key key2.der)
 mkdir -p proto/usr/share requests/next/cases/desktop
 echo 'local addition' > proto/usr/share/extra
 "$CPS_BIN" manifest generate --proto proto --publisher extra --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" desktop/extra > extra.kdl
+    desktop/extra > extra.kdl
 "$CPS_BIN" publish manifests --repo extra --proto proto --key extra.der extra.kdl
 extra_pin=$(cat extra/current)
 rm proto/usr/share/extra
 for version in 1 2 3; do
     echo "$version" > proto/usr/share/cps-test
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$version.0.0-0" \
-        --uid "$(id -u)" --gid "$(id -g)" desktop/base > manifest.kdl
+        desktop/base > manifest.kdl
     "$CPS_BIN" publish manifests --repo repo --proto proto "${signing[@]}" manifest.kdl
 done
 policy() {

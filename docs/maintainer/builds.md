@@ -158,7 +158,7 @@ inode with an earlier collected file of the same package becomes a
 variants as that file and does not preserve it. Otherwise it stays a `file`
 with its own rule's metadata. Explicit actions in the template keep their exact form and take
 precedence over patterns, so a template can collect `usr/bin/*` and still
-declare `file "usr/bin/su" mode="4755" uid=0 gid=0`. Within one template the
+declare `file "usr/bin/su" mode="4755"`. Within one template the
 first matching rule wins. Directories are never collected; declare `dir`
 actions for directories that need explicit metadata.
 
@@ -176,7 +176,7 @@ directory itself. Inside a component, `*` matches any run of characters and
 | Property | Default |
 | --- | --- |
 | `mode` | `"0755"` when the installed file has an execute bit, otherwise `"0644"` |
-| `uid`, `gid` | `0` |
+| `owner`, `group` | `"root"` |
 | `preserve` | `#false` |
 | `facet` | The built-in facet below. `facet=#null` ships the paths without a facet. |
 | `architecture`, `variant.NAME` | None |
@@ -298,12 +298,12 @@ the unversioned `liblz.so` link in the `devel` facet, and its debug file in
 ```kdl
 schema-version 1 kind="package-manifest"
 package "library/liblz" publisher="canopa" version="2.4.0-1" upstream-version="2.4.0" summary="LZ compression library" license="BSD-3-Clause" homepage="https://lz.example.org/" {
-    file "usr/include/lz.h" mode="0644" uid=0 gid=0 facet="devel"
-    symlink "usr/lib/liblz.so" target="liblz.so.1" uid=0 gid=0 facet="devel"
-    symlink "usr/lib/liblz.so.1" target="liblz.so.1.0.0" uid=0 gid=0
-    file "usr/lib/liblz.so.1.0.0" mode="0755" uid=0 gid=0
-    file "usr/lib/pkgconfig/lz.pc" mode="0644" uid=0 gid=0 facet="devel"
-    file "usr/lib/debug/.build-id/3d/ff3394e4b04b36c16dbd201c952eecdb4e9d3f.debug" mode="0644" uid=0 gid=0 facet="debug.symbols"
+    file "usr/include/lz.h" mode="0644" facet="devel"
+    symlink "usr/lib/liblz.so" target="liblz.so.1" facet="devel"
+    symlink "usr/lib/liblz.so.1" target="liblz.so.1.0.0"
+    file "usr/lib/liblz.so.1.0.0" mode="0755"
+    file "usr/lib/pkgconfig/lz.pc" mode="0644" facet="devel"
+    file "usr/lib/debug/.build-id/3d/ff3394e4b04b36c16dbd201c952eecdb4e9d3f.debug" mode="0644" facet="debug.symbols"
 }
 ```
 

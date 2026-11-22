@@ -36,7 +36,7 @@ cp builder-public.der repo/
 printf 'schema-version 1 kind="publish-policy"\npublisher "canopa-utilities" {\n    builder-key "builder-public.der"\n}\n' > repo/publish-policy.kdl
 for utility in coreutils grep; do
     recipe="$project/packaging/gnu-tools"
-    sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$recipe/$utility.kdl" > "$utility.kdl"
+    cp "$recipe/$utility.kdl" "$utility.kdl"
     sed -e "s/@CATALOG_SHA256@/$(cat toolchain/current)/g" \
         -e "s/@KEY_SHA256@/$(sha256sum < toolchain.trust.json | cut -d' ' -f1)/g" \
         -e "s/@MANIFEST_SHA256@/$(sha "$utility.kdl")/g" "$recipe/$utility.build.kdl.in" > "$utility.build.kdl"

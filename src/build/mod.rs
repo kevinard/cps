@@ -623,11 +623,7 @@ fn resolve_toolchain(
             select_paths(
                 crate::model::Selection::arch(&recipe.arch, &BTreeMap::new()),
                 &BTreeMap::new(),
-                Node::Dir {
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                },
+                crate::model::Ownership::Named,
                 installed,
             )
         },

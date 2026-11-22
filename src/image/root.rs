@@ -8,6 +8,7 @@ use std::{
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -22,13 +23,17 @@ use rustix::{
     process::{Gid, Uid},
 };
 
-use super::{STATE_ANCESTORS, STATE_DIRECTORY};
+use super::{STATE_ANCESTORS, STATE_DIRECTORY, accounts::Accounts};
 use crate::{
     file_caps::{ATTRIBUTE, FileCapabilities},
     model::{Node, copy_payload, digest_reader, validate_path},
 };
 
-pub(crate) struct Root(File);
+pub(crate) struct Root {
+    file: File,
+    /// The account database of the image root that this directory belongs to.
+    accounts: Rc<Accounts>,
+}
 
 pub(crate) enum ReplacementSource<'a> {
     Staged(File),
@@ -123,16 +128,17 @@ pub(crate) struct Observation {
 }
 
 impl Observation {
-    pub(crate) fn node(&self) -> Node {
+    pub(crate) fn node(&self, accounts: &Accounts) -> Result<Node> {
         let fingerprint = &self.fingerprint;
-        Node::File {
+        let (owner, group) = accounts.names(fingerprint.uid, fingerprint.gid)?;
+        Ok(Node::File {
             sha256: self.sha256.clone(),
             size: fingerprint.size,
             mode: fingerprint.mode & 0o7777,
-            uid: fingerprint.uid,
-            gid: fingerprint.gid,
+            owner,
+            group,
             capabilities: self.capabilities,
-        }
+        })
     }
 }
 
@@ -184,7 +190,7 @@ impl Root {
             Mode::empty(),
         )
         .with_context(|| format!("opening root {}", path.display()))?;
-        Ok(Self(fd.into()))
+        Self::from_file(fd.into())
     }
 
     pub(crate) fn fd_path(file: &File) -> PathBuf {
@@ -213,13 +219,13 @@ impl Root {
     }
 
     pub(crate) fn offline_path(&self) -> Result<PathBuf> {
-        let image = self.0.metadata()?;
+        let image = self.file.metadata()?;
         let host = fs::metadata("/")?;
         ensure!(
             (image.dev(), image.ino()) != (host.dev(), host.ino()),
             "operation requires an inactive image root"
         );
-        let path = fs::read_link(Self::fd_path(&self.0))?;
+        let path = fs::read_link(Self::fd_path(&self.file))?;
         let current = fs::metadata(&path)?;
         ensure!(
             path.is_absolute() && (current.dev(), current.ino()) == (image.dev(), image.ino()),
@@ -229,12 +235,12 @@ impl Root {
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
-        Ok(rustix::fs::syncfs(&self.0)?)
+        Ok(rustix::fs::syncfs(&self.file)?)
     }
 
     fn open_relative(&self, path: &str, flags: OFlags) -> rustix::io::Result<File> {
         Ok(openat2(
-            &self.0,
+            &self.file,
             path,
             flags | OFlags::CLOEXEC,
             Mode::empty(),
@@ -249,7 +255,21 @@ impl Root {
     }
 
     pub(crate) fn subdir(&self, path: &str) -> Result<Self> {
-        Ok(Self(self.dir(path)?))
+        Ok(Self {
+            file: self.dir(path)?,
+            accounts: Rc::clone(&self.accounts),
+        })
+    }
+
+    /// A directory that is its own image root, with its own accounts.
+    fn from_file(file: File) -> Result<Self> {
+        let accounts = Rc::new(Accounts::new(file.try_clone()?));
+        Ok(Self { file, accounts })
+    }
+
+    /// The account database that owner and group names resolve against.
+    pub(crate) fn accounts(&self) -> &Accounts {
+        &self.accounts
     }
 
     pub(crate) fn open_image_state(&self) -> Result<Self> {
@@ -257,7 +277,7 @@ impl Root {
             format!("opening image state under /{STATE_DIRECTORY} on the image filesystem")
         })?;
         let metadata = state.as_file().metadata()?;
-        let device = self.0.metadata()?.dev();
+        let device = self.file.metadata()?.dev();
         ensure!(
             metadata.dev() == device && state.dir("stage")?.metadata()?.dev() == device,
             "image state and staging must be on the image's own filesystem and subvolume"
@@ -275,16 +295,16 @@ impl Root {
     /// Open a Btrfs subvolume beneath a verified top-level volume.
     pub(crate) fn subvolume(&self, path: &str) -> Result<Self> {
         validate_path(path)?;
-        Ok(Self(
+        Self::from_file(
             openat2(
-                &self.0,
+                &self.file,
                 path,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
                 ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
             )?
             .into(),
-        ))
+        )
     }
 
     pub(crate) fn ensure_dir(&self, path: &str) -> Result<Self> {
@@ -299,7 +319,7 @@ impl Root {
     }
 
     pub(crate) fn as_file(&self) -> &File {
-        &self.0
+        &self.file
     }
 
     /// Visit entries in sorted depth-first order without following symlinks or crossing a mount.
@@ -318,7 +338,7 @@ impl Root {
         skip: &[&str],
         mut visit: impl FnMut(&str, &File, &Stat) -> Result<bool>,
     ) -> Result<()> {
-        let mut pending = child_paths(&self.0, "")?;
+        let mut pending = child_paths(&self.file, "")?;
         while let Some(path) = pending.pop() {
             if skip.contains(&path.as_str()) {
                 continue;
@@ -355,7 +375,7 @@ impl Root {
                 self.open_relative(parent, OFlags::RDONLY | OFlags::DIRECTORY)?,
                 leaf,
             )),
-            None => Ok((rustix::io::dup(&self.0)?.into(), path)),
+            None => Ok((rustix::io::dup(&self.file)?.into(), path)),
         }
     }
 
@@ -383,7 +403,7 @@ impl Root {
 
     pub(crate) fn resolves_to_file(&self, path: &str, target: &str) -> Result<bool> {
         let file: File = openat2(
-            &self.0,
+            &self.file,
             path,
             OFlags::PATH | OFlags::CLOEXEC,
             Mode::empty(),
@@ -424,7 +444,7 @@ impl Root {
             .with_context(|| format!("hard link target {target} is not a regular file"))?;
         let file = File::open(Self::fd_path(&entry))?;
         ensure!(
-            file_node(&file)? == *expected,
+            self.file_node(&file)? == *expected,
             "hard link target {target} differs from its manifest"
         );
         Ok(file)
@@ -471,24 +491,32 @@ impl Root {
             Err(Errno::NOENT) => return Ok(absent),
             Err(err) => return Err(err.into()),
         };
-        let (uid, gid, mode) = (info.st_uid, info.st_gid, info.st_mode & 0o7777);
+        let mode = info.st_mode & 0o7777;
         let (mut observed, mut trusted) = (None, false);
         let node = match FileType::from_raw_mode(info.st_mode) {
-            FileType::Directory => Node::Dir { uid, gid, mode },
+            FileType::Directory => {
+                let (owner, group) = self.accounts.names(info.st_uid, info.st_gid)?;
+                Node::Dir { owner, group, mode }
+            }
             FileType::Symlink => {
                 let target = readlinkat(&parent, leaf, Vec::new())?.into_string()?;
-                Node::Symlink { target, uid, gid }
+                let (owner, group) = self.accounts.names(info.st_uid, info.st_gid)?;
+                Node::Symlink {
+                    target,
+                    owner,
+                    group,
+                }
             }
             FileType::RegularFile => match known {
                 Some(known) if known.fingerprint == Fingerprint::of(&info) => {
                     trusted = true;
-                    known.node()
+                    known.node(&self.accounts)?
                 }
                 _ => {
                     let file = self.file(path)?;
                     let now = now_ns();
                     let before = Fingerprint::of(&fstat(&file)?);
-                    let node = file_node(&file)?;
+                    let node = self.file_node(&file)?;
                     if observe
                         && before.settled(now)
                         && before == Fingerprint::of(&fstat(&file)?)
@@ -602,7 +630,7 @@ impl Root {
                     }
                 }
                 temp.flush()?;
-                Self::set_file_metadata(&temp, node)
+                self.set_file_metadata(&temp, node)
                     .with_context(|| format!("preparing file metadata for {path}"))?;
             }
             Node::Dir { .. } => {
@@ -615,17 +643,22 @@ impl Root {
                     ResolveFlags::NO_SYMLINKS,
                 )?;
                 let temp = File::from(temp);
-                Self::set_directory_metadata(&temp, node)?;
+                self.set_directory_metadata(&temp, node)?;
             }
-            Node::Symlink { target, uid, gid } => {
+            Node::Symlink {
+                target,
+                owner,
+                group,
+            } => {
+                let (uid, gid) = self.accounts.ids(owner, group)?;
                 symlinkat(target.as_str(), staging, name)?;
                 let info = statat(staging, name, AtFlags::SYMLINK_NOFOLLOW)?;
-                if (info.st_uid, info.st_gid) != (*uid, *gid) {
+                if (info.st_uid, info.st_gid) != (uid, gid) {
                     chownat(
                         staging,
                         name,
-                        Some(Uid::from_raw(*uid)),
-                        Some(Gid::from_raw(*gid)),
+                        Some(Uid::from_raw(uid)),
+                        Some(Gid::from_raw(gid)),
                         AtFlags::SYMLINK_NOFOLLOW,
                     )?;
                 }
@@ -652,7 +685,7 @@ impl Root {
     /// Remove a private staging entry and, for a directory, everything
     /// beneath it, without following symlinks or crossing a mount.
     pub(crate) fn remove_staged(&self, name: &str) -> Result<bool> {
-        remove_entry(&self.0, name)
+        remove_entry(&self.file, name)
     }
 
     /// Atomically swap the staging entry `swap` with the object at `path`.
@@ -740,7 +773,7 @@ impl Root {
             "unexpected file capabilities on preserved config {path}"
         );
         ensure!(
-            file_node(&source)? == *before,
+            self.file_node(&source)? == *before,
             "local configuration changed at {path}; pending transaction retained"
         );
         source.rewind()?;
@@ -793,7 +826,7 @@ impl Root {
     fn sync_directory(&self, mut path: &str) -> Result<()> {
         loop {
             if path.is_empty() {
-                return Ok(self.0.sync_all()?);
+                return Ok(self.file.sync_all()?);
             }
             match self.open_relative(path, OFlags::RDONLY | OFlags::DIRECTORY) {
                 Ok(directory) => return Ok(directory.sync_all()?),
@@ -810,18 +843,19 @@ impl Root {
         }
     }
 
-    pub(crate) fn set_file_metadata(file: &File, node: &Node) -> Result<()> {
+    pub(crate) fn set_file_metadata(&self, file: &File, node: &Node) -> Result<()> {
         let Node::File {
             mode,
-            uid,
-            gid,
+            owner,
+            group,
             capabilities,
             ..
         } = node
         else {
             anyhow::bail!("expected file metadata");
         };
-        set_metadata(file, *mode, *uid, *gid)?;
+        let (uid, gid) = self.accounts.ids(owner, group)?;
+        set_metadata(file, *mode, uid, gid)?;
         // Writes and ownership changes may clear capabilities. Set them only
         // on the finished inode, before syncing and publishing the path.
         if let Some(capabilities) = capabilities {
@@ -852,39 +886,37 @@ impl Root {
         }
     }
 
-    pub(crate) fn set_directory_metadata(file: &File, node: &Node) -> Result<()> {
-        let Node::Dir { uid, gid, mode } = *node else {
+    pub(crate) fn set_directory_metadata(&self, file: &File, node: &Node) -> Result<()> {
+        let Node::Dir { owner, group, mode } = node else {
             anyhow::bail!("expected directory metadata");
         };
-        set_metadata(file, mode, uid, gid)?;
+        let (uid, gid) = self.accounts.ids(owner, group)?;
+        set_metadata(file, *mode, uid, gid)?;
         file.sync_all()?;
         Ok(())
     }
 
     pub(crate) fn repair_directory(&self, path: &str, before: &Node, after: &Node) -> Result<bool> {
-        let Node::Dir { mode: old_mode, .. } = *before else {
-            anyhow::bail!("expected directory metadata at {path}");
-        };
         let Node::Dir {
-            uid,
-            gid,
-            mode: new_mode,
-        } = *after
+            owner: old_owner,
+            group: old_group,
+            mode: old_mode,
+        } = before
         else {
             anyhow::bail!("expected directory metadata at {path}");
         };
         let Node::Dir {
-            uid: old_uid,
-            gid: old_gid,
-            ..
-        } = *before
+            owner,
+            group,
+            mode: new_mode,
+        } = after
         else {
             anyhow::bail!("expected directory metadata at {path}");
         };
         let file = self
             .dir(path)
             .with_context(|| format!("opening directory {path}"))?;
-        let observed = directory_metadata(&file)?;
+        let observed = self.directory_metadata(&file)?;
         if observed == *after {
             file.sync_all()?;
             return Ok(false);
@@ -894,22 +926,22 @@ impl Root {
         // Aborting such a change runs the same steps the other way, so the
         // old owner with the new permissions is also a half-way state.
         let intermediate = Node::Dir {
-            uid,
-            gid,
-            mode: old_mode,
+            owner: owner.clone(),
+            group: group.clone(),
+            mode: *old_mode,
         };
         let reverted = Node::Dir {
-            uid: old_uid,
-            gid: old_gid,
-            mode: new_mode,
+            owner: old_owner.clone(),
+            group: old_group.clone(),
+            mode: *new_mode,
         };
         ensure!(
             observed == *before || observed == intermediate || observed == reverted,
             "unexpected state at {path}; pending transaction retained"
         );
-        Self::set_directory_metadata(&file, after)?;
+        self.set_directory_metadata(&file, after)?;
         ensure!(
-            directory_metadata(&file)? == *after,
+            self.directory_metadata(&file)? == *after,
             "could not restore directory metadata at {path}; pending transaction retained"
         );
         Ok(true)
@@ -984,13 +1016,29 @@ fn child_paths(directory: &File, prefix: &str) -> Result<Vec<String>> {
     Ok(children)
 }
 
-fn directory_metadata(file: &File) -> Result<Node> {
-    let info = fstat(file)?;
-    Ok(Node::Dir {
-        uid: info.st_uid,
-        gid: info.st_gid,
-        mode: info.st_mode & 0o7777,
-    })
+impl Root {
+    fn directory_metadata(&self, file: &File) -> Result<Node> {
+        let info = fstat(file)?;
+        let (owner, group) = self.accounts.names(info.st_uid, info.st_gid)?;
+        Ok(Node::Dir {
+            owner,
+            group,
+            mode: info.st_mode & 0o7777,
+        })
+    }
+
+    fn file_node(&self, file: &File) -> Result<Node> {
+        let metadata = file.metadata()?;
+        let (owner, group) = self.accounts.names(metadata.uid(), metadata.gid())?;
+        Ok(Node::File {
+            sha256: digest_reader(file)?,
+            size: metadata.len(),
+            mode: metadata.mode() & 0o7777,
+            owner,
+            group,
+            capabilities: FileCapabilities::read(file)?,
+        })
+    }
 }
 
 /// Copy a verified staged payload into a new inode. A reflink shares the
@@ -1009,18 +1057,6 @@ fn copy_verified(source: &mut File, destination: &mut File) -> Result<()> {
     let copied = std::io::copy(source, destination)?;
     ensure!(copied == size, "staged payload changed while copying");
     Ok(())
-}
-
-fn file_node(file: &File) -> Result<Node> {
-    let metadata = file.metadata()?;
-    Ok(Node::File {
-        sha256: digest_reader(file)?,
-        size: metadata.len(),
-        mode: metadata.mode() & 0o7777,
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-        capabilities: FileCapabilities::read(file)?,
-    })
 }
 
 fn xattr_names(file: &File) -> Result<Vec<OsString>> {
@@ -1100,8 +1136,8 @@ mod tests {
             sha256: crate::model::digest(b"data"),
             size: 4,
             mode: 0o644,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
+            owner: metadata.uid().to_string(),
+            group: metadata.gid().to_string(),
             capabilities: None,
         };
         fs::write(temp.path().join("stage/payload"), "data")?;
@@ -1154,7 +1190,7 @@ mod tests {
         // A matching fingerprint stands in for the contents.
         let trusted = root.inspect_with("file", Some(&forged))?;
         assert!(trusted.trusted && trusted.observed.is_none());
-        assert_eq!(trusted.node, Some(forged.node()));
+        assert_eq!(trusted.node, Some(forged.node(root.accounts())?));
         assert!(root.file_matching("file", &observed.fingerprint).is_ok());
         fs::write(temp.path().join("file"), "DATA")?;
         let changed = root.inspect_with("file", Some(&forged))?;
@@ -1179,8 +1215,8 @@ mod tests {
         let metadata = fs::metadata(temp.path())?;
         let link = Node::Symlink {
             target: "usr/bin".into(),
-            uid: metadata.uid(),
-            gid: metadata.gid(),
+            owner: metadata.uid().to_string(),
+            group: metadata.gid().to_string(),
         };
         root.stage_object(stage.as_file(), "swap", "bin", &link, None)?;
         root.exchange("bin", stage.as_file(), "swap", "old")?;
@@ -1217,8 +1253,8 @@ mod tests {
         let stage = Root::open(&temp.path().join("stage"))?;
         let metadata = fs::metadata(temp.path())?;
         let dir = Node::Dir {
-            uid: metadata.uid(),
-            gid: metadata.gid(),
+            owner: metadata.uid().to_string(),
+            group: metadata.gid().to_string(),
             mode: 0o755,
         };
         root.stage_object(stage.as_file(), "swap", "config", &dir, None)?;
@@ -1269,13 +1305,13 @@ mod tests {
         let (uid, gid) = (metadata.uid(), metadata.gid());
         for mode in [0o700, 0o2770, 0o3770] {
             let before = Node::Dir {
-                uid: uid ^ 1,
-                gid,
+                owner: (uid ^ 1).to_string(),
+                group: gid.to_string(),
                 mode,
             };
             let after = Node::Dir {
-                uid,
-                gid,
+                owner: uid.to_string(),
+                group: gid.to_string(),
                 mode: 0o1777,
             };
             fs::set_permissions(&path, fs::Permissions::from_mode(0o770))?;

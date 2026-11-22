@@ -8,8 +8,6 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 arch=$(uname -m)
-uid=$(id -u)
-gid=$(id -g)
 zero=$(printf '0%.0s' {1..64})
 one=$(printf '1%.0s' {1..64})
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -129,7 +127,7 @@ cc -shared -fPIC -nostdlib -Wl,-soname,libfoo.so.2 -o foo2/usr/lib/libfoo.so.2 f
 cc -pie -nostdlib -Wl,-e,_start -o app/usr/bin/app app.c foo1/usr/lib/libfoo.so.1
 publish() {
     "$cps" manifest generate --proto "$1" --publisher canopa --version "$2" \
-        --uid "$uid" --gid "$gid" "$3" > "$4.kdl"
+        "$3" > "$4.kdl"
     if [[ -n ${5:-} ]]; then
         # Canonical manifests have no empty block, so give a childless package one.
         sed -i -E 's/^(package .*[^{])$/\1 {\n}/' "$4.kdl"

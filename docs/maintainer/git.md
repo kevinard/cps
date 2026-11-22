@@ -9,7 +9,7 @@ build recipe in one document.
 ```kdl
 schema-version 1 kind="git-package"
 package "demo/hello" version="1.0.0-0" {
-    file "usr/bin/hello" mode="0755" uid=0 gid=0
+    file "usr/bin/hello" mode="0755"
 }
 build architecture="x86_64" epoch=1700000000 {
     toolchain "default"

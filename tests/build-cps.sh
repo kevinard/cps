@@ -104,10 +104,10 @@ done
 ln "$work/elf-runtime/lib64/ld-linux-x86-64.so.2" "$work/elf-runtime/usr/lib/ld-linux-x86-64.so.2"
 rm -f -- "$work/native-rust/usr/lib/ld-linux-x86-64.so.2"
 "$cps" manifest generate --proto "$work/native-rust" --publisher seed --version "$seed_version" "${seed_arch[@]}" \
-    --uid "$(id -u)" --gid "$(id -g)" build/native-rust > native-rust.kdl
+    build/native-rust > native-rust.kdl
 "$cps" publish manifests --repo toolchain --proto "$work/native-rust" --key "$work/toolchain.der" native-rust.kdl
 "$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version "$runtime_version" "${seed_arch[@]}" \
-    --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
+    system/elf-runtime > elf-runtime.kdl
 "$cps" publish manifests --repo runtime-seed --proto "$work/elf-runtime" --key "$work/runtime-seed.der" elf-runtime.kdl
 
 printf 'schema-version 1 kind="toolchain-config"\n' > bootstrap-toolchain.kdl
@@ -128,7 +128,7 @@ write_toolchain_recipe() {
 write_toolchain_recipe
 
 fixture_manifest() {
-    sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$1"
+    cat "$1"
 }
 build_bundle() {
     "$cps" build --toolchain-config "$1" --source-cache sources --output "$3" \
@@ -154,7 +154,7 @@ if [[ -f $git_build_template ]]; then
     bash "$source_tree/tests/seed-git-build.sh" "$cps" "$git_build_proto" \
         "$work/git-build.der"
     "$cps" manifest generate --proto "$git_build_proto" --publisher canopa --version "$git_build_version" \
-        --arch "$arch" --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
+        --arch "$arch" system/git-build > git-build.kdl
     git_build_archive="$work/sources/git-build.tar.gz"
     tar --sort=name --format=gnu --mtime=@0 --owner=0 --group=0 --numeric-owner \
         -C "$git_build_proto" -cf - . | gzip -n > "$git_build_archive"
