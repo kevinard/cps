@@ -38,8 +38,11 @@ pub(crate) fn register_git_publisher(
     let mut publisher = Publisher::from_config(&name, repo, key)?;
     publisher.git = Some(source);
     if let Some(existing) = configured.get(&name) {
+        // The image's pin may have advanced past the Git store's version 1.
+        let same_key = crate::repo::same_trust_root(&existing.key, &publisher.key)?;
+        publisher.key.clone_from(&existing.key);
         ensure!(
-            existing == &publisher,
+            same_key && existing == &publisher,
             "Git publisher {name} is configured differently"
         );
         return Ok(());

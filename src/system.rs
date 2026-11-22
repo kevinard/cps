@@ -474,7 +474,9 @@ impl System {
                 let store = GitStore::open(path)?;
                 ensure!(
                     fs::canonicalize(store.repo())? == publisher.repo
-                        && crate::repo::read_trust_root(&store.trust_root())? == publisher.key,
+                        && crate::repo::trust_root_genesis(&crate::repo::read_trust_root(
+                            &store.trust_root()
+                        )?)? == crate::repo::trust_root_genesis(&publisher.key)?,
                     "Git publisher cache or signing key changed for {name}"
                 );
                 updates.push(build.publish(source, &store, self.git_toolchain()?)?);

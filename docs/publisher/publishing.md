@@ -320,7 +320,7 @@ cover the bytes `cps publisher trust root v1`, a newline, and the decoded
 payload:
 
 ```json
-{"publisher":"canopa","version":2,"expires":"2027-11-10T00:00:00Z","root_keys":["<64 hex digits>"],"root_threshold":1,"catalog_keys":["<64 hex digits>","<64 hex digits>"],"catalog_threshold":2}
+{"publisher":"canopa","version":2,"genesis_sha256":"<64 hex digits>","expires":"2027-11-10T00:00:00Z","root_keys":["<64 hex digits>"],"root_threshold":1,"catalog_keys":["<64 hex digits>","<64 hex digits>"],"catalog_threshold":2}
 ```
 
 Keys are raw Ed25519 public keys in lowercase hex, sorted. A role lists 1
@@ -329,23 +329,32 @@ fingerprint is the SHA-256 of the raw key, as printed by
 `cps repo trust show`, which accepts a trust root file or a repository.
 
 - Version 1 is valid when a threshold of its own root keys signs it.
-- Each later version is valid only when it is signed by the root threshold
-  of the previous version **and** the root threshold of the new version.
-- Every catalog root carries the whole chain from version 1 in its `trust`
-  field, at most 64 versions, and is signed under the newest one. A
-  successor catalog must extend its predecessor's chain unchanged.
+- Each later version names the SHA-256 of the version 1 payload in
+  `genesis_sha256`, the publisher's lasting identity, and is valid only when
+  it is signed by the root threshold of the previous version **and** the
+  root threshold of the new version.
+- Every catalog root carries the newest 16 versions of the history in its
+  `trust` field, or all of them while there are fewer, and is signed under
+  the newest one. A successor catalog must agree with its predecessor on
+  every version both carry and may not be signed under an older version.
 
-A client pins one version and accepts a catalog only if its chain contains
-that version unchanged. Because a successor must extend the chain, a client
-that has seen version N rejects every later catalog signed under an older
-version.
+The history has no length limit, so renewing an expiring version never runs
+out of versions. A client pins a history: the version it was given, then
+every later version from the catalogs it applies. CPS accepts a catalog only
+if the versions it carries agree with the pinned history on every version
+both hold and continue it without a gap, and a new current catalog must be
+signed under the newest pinned version or a later one. A client that has
+applied a catalog signed under version N therefore rejects every later
+catalog signed under an older version, including from a new cache or a
+mirror it never used. A client whose pin is more than 16 versions behind
+cannot follow the history from catalogs alone and needs a newer trust root.
 
 Builder keys are not part of the trust root. Build attestations are
 evidence that is independent of the publisher. Clients choose builder keys
 in their own [build trust](rebuilds.md#verifying-builds-on-images-and-workers)
 policy and the publisher in its publish policy, so a compromised root key
 cannot also authorize its own builders. CPS rejects any builder key that
-appears anywhere in the trust root history.
+appears in the trust root versions a catalog carries.
 
 ### Expiry
 
@@ -448,8 +457,8 @@ While a threshold of the current root keys remains available, rotate to a
 new root key set. If a threshold of root keys is lost, the publisher can no
 longer sign a new version. If an attacker holds a threshold of root keys,
 they can sign a different history from that version. Clients that already
-hold a newer version reject it, because a catalog's chain must contain
-their checkpoint unchanged. In both cases, create a new trust root and
+hold a newer version reject it, because a catalog's versions must agree
+with their pinned history. In both cases, create a new trust root and
 provision it to clients again.
 
 ## Withdrawing and obsoleting packages
@@ -597,7 +606,7 @@ The root payload is a JSON object with these fields:
 | `attestations_required`, `toolchains_verified`, `source_archives_required`, `profiles_required` | Protection flags. Once set, successors keep them. |
 | `pruned_through` | Withdrawal retention cutoff, see [Pruning withdrawal history](#pruning-withdrawal-history). |
 | `renames`, `release_profiles` | Signed renames and composition profiles. |
-| `trust` | Every [trust root](#publisher-trust-root) envelope from version 1 through the version the catalog is signed under. |
+| `trust` | The newest 16 [trust root](#publisher-trust-root) envelopes, oldest first, ending with the version the catalog is signed under. |
 
 A shard holds the records of every package name whose SHA-256 begins with
 its prefix, so a catalog has at most 256 shards. It is stored at

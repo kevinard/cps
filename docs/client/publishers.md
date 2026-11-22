@@ -236,11 +236,11 @@ Use the new paths in the KDL configuration used for subsequent mirror syncs.
 A publisher's [trust root](../publisher/publishing.md#publisher-trust-root)
 names its offline root keys and online catalog keys, each with a signature
 threshold, and an expiry. The publisher signs a new version of it for every
-key change. Each catalog carries the publisher's whole trust root history,
-from version 1 to the version it is signed under.
+key change. Each catalog carries the newest 16 versions of the publisher's
+trust root history, ending with the version it is signed under.
 
 `trust-root` in the image configuration, or `--trust-root`, names a file
-holding one version. The image stores that version when you create the image
+holding one version. The image pins that version when you create the image
 or add the publisher. Any version works, so provision the newest one you
 have, and inspect it first:
 
@@ -248,20 +248,23 @@ have, and inspect it first:
 cps repo trust show extras.trust.json
 ```
 
-CPS accepts a catalog only if its history contains the pinned version
-unchanged, each later version is signed by the root keys of the previous
-version and of the new one, and exactly the catalog threshold of the newest
-version's catalog keys sign the catalog.
+CPS accepts a catalog only if the versions it carries agree with the pinned
+ones and continue them without a gap, each later version is signed by the
+root keys of the previous version and of the new one, and exactly the
+catalog threshold of the newest version's catalog keys sign the catalog. A
+pin more than 16 versions behind the catalog cannot verify it; pin a newer
+version of the trust root.
 
 ### Rotation and revocation
 
 Key rotation needs nothing from you. When the publisher rotates or revokes a
 key, the next catalog carries the new trust root version, and CPS verifies it
-from your pinned version. The image's catalog checkpoint for the publisher
-records the history of the catalog it last applied, which is the highest
-version it has verified. A later catalog must extend that history, so CPS
-rejects as a rollback a catalog signed under an older version, such as one
-signed with a key that a later version revoked. The
+from your pinned version. When the image applies that catalog, its pin
+advances to the new version in the same transaction, so every later current
+catalog must be signed under that version or a later one. CPS rejects as a
+rollback a catalog signed under an older version, such as one signed with a
+key that a later version revoked, even when it comes from a new cache or
+mirror. The
 [catalog checkpoints](mirrors.md#catalog-checkpoints-and-archived-signatures)
 also reject older catalog sequences.
 

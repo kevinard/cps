@@ -12,7 +12,7 @@ use super::{
 use crate::{
     model::{digest, validate_publisher},
     repo::{
-        keys::trust::{self, Pinned, TRUST_ROOT_LIMIT},
+        keys::trust::{self, TRUST_ROOT_LIMIT},
         read_limited,
     },
     transport::https_client,
@@ -69,13 +69,13 @@ impl PublisherBootstrap {
 
     /// The publisher, version, expiry, and key fingerprints of the trust root.
     pub(crate) fn describe(&self) -> Result<String> {
-        Ok(Pinned::parse(&self.trust_root)?.root().to_string())
+        Ok(trust::decode_file(&self.trust_root)?.to_string())
     }
 
     /// Require the trust root to name exactly these root key fingerprints, so
     /// provisioning does not depend on trusting the first mirror response.
     pub(crate) fn check_root_keys(&self, expected: &[String]) -> Result<()> {
-        trust::check_expected_root_keys(Pinned::parse(&self.trust_root)?.root(), expected)
+        trust::check_expected_root_keys(&trust::decode_file(&self.trust_root)?, expected)
     }
 }
 
@@ -94,11 +94,12 @@ async fn verified_identity(verified: &Repository, scratch: &Path) -> Result<(Str
     validate_publisher(&name)?;
     let trust_root =
         read_target(verified, scratch, TRUST_ROOT_TARGET, TRUST_ROOT_LIMIT, None).await?;
-    let pinned = Pinned::parse(&trust_root).context("checking the TUF publisher trust root")?;
+    let pinned =
+        trust::decode_file(&trust_root).context("checking the TUF publisher trust root")?;
     ensure!(
-        pinned.root().publisher == name,
+        pinned.publisher == name,
         "TUF publisher trust root belongs to {}, not {name}",
-        pinned.root().publisher
+        pinned.publisher
     );
     Ok((name, trust_root))
 }
@@ -190,8 +191,7 @@ mod tests {
             tuf_root: anchor.clone(),
             trust_root: identity.1.clone(),
         };
-        let root_key = Pinned::parse(&key)?
-            .root()
+        let root_key = trust::decode_file(&key)?
             .root_keys
             .iter()
             .map(|key| trust::fingerprint(&key.0))

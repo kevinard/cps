@@ -1325,6 +1325,12 @@ pub(crate) struct CatalogCheckpoint {
 }
 
 impl CatalogCheckpoint {
+    /// A client's pinned trust root after it accepts this checkpoint's
+    /// catalog: the pinned history through the catalog's newest version.
+    pub(crate) fn advance_pin(&self, pinned: &[u8]) -> Result<Vec<u8>> {
+        trust::advance(pinned, &self.trust)
+    }
+
     pub(crate) fn read_archive(
         &self,
         bytes: &[u8],
@@ -1578,7 +1584,24 @@ pub(crate) fn trust_root_keys(pinned: &[u8]) -> Result<Vec<PublicKey>> {
 /// The publisher that a pinned trust root, already read with
 /// [`read_trust_root`], belongs to.
 pub(crate) fn trust_root_publisher(pinned: &[u8]) -> Result<String> {
-    Ok(trust::Pinned::parse(pinned)?.root().publisher.clone())
+    Ok(trust::pinned_root(pinned)?.publisher)
+}
+
+/// The SHA-256 of the version 1 trust root of a pinned publisher: its
+/// identity, which every later version names.
+pub(crate) fn trust_root_genesis(pinned: &[u8]) -> Result<String> {
+    trust::pinned_genesis(pinned)
+}
+
+/// Require `next` to be the pinned trust root `previous` or one advanced
+/// from it along the same history.
+pub(crate) fn check_trust_pin_advanced(previous: &[u8], next: &[u8]) -> Result<()> {
+    trust::check_advanced(previous, next)
+}
+
+/// Whether two pinned trust roots belong to the same publisher identity.
+pub(crate) fn same_trust_root(a: &[u8], b: &[u8]) -> Result<bool> {
+    Ok(trust_root_genesis(a)? == trust_root_genesis(b)?)
 }
 
 /// The publisher that a pinned trust root file names.
@@ -2984,7 +3007,8 @@ fn publication_base(repo: &Path) -> Result<Option<String>> {
 struct Publication {
     signers: Signers,
     trust: trust::Store,
-    /// The version 1 trust root: the publisher's own pin for its catalogs.
+    /// The repository's whole trust history: the publisher's own pin for
+    /// its catalogs.
     anchor: Vec<u8>,
 }
 
@@ -2995,7 +3019,7 @@ impl Publication {
         let signers = Signers::open(keys)?;
         let trust = Self::read_trust(repo, &signers)?;
         Ok(Self {
-            anchor: trust.genesis_bytes()?,
+            anchor: trust.pin()?,
             signers,
             trust,
         })
@@ -3031,7 +3055,7 @@ impl Publication {
     fn locked_trust(&self, repo: &Path) -> Result<trust::Store> {
         let trust = Self::read_trust(repo, &self.signers)?;
         ensure!(
-            trust.genesis_bytes()? == self.anchor,
+            trust.verified.genesis() == self.trust.verified.genesis(),
             "repository trust root changed while publishing"
         );
         Ok(trust)
@@ -3489,12 +3513,14 @@ fn write_catalog_document(
         catalog.publisher
     );
     current.check_unexpired()?;
-    // The new catalog carries the repository's whole trust root history,
-    // which must extend the history of the catalog it replaces.
-    catalog.trust.check_successor(&trust.chain)?;
-    catalog.trust_keys = trust.verified.keys();
-    catalog.trust_genesis = trust.verified.genesis().to_owned();
-    catalog.trust = trust.chain;
+    // The new catalog carries the newest versions of the repository's trust
+    // history, which must continue the history of the catalog it replaces.
+    let chain = trust.catalog_chain();
+    catalog.trust.check_successor(&chain)?;
+    let verified = chain.verify(&catalog.publisher)?;
+    catalog.trust_keys = verified.keys();
+    catalog.trust_genesis = verified.genesis().to_owned();
+    catalog.trust = chain;
     catalog.validate_profile_build_trust()?;
     prepare_objects(repo)?;
     let root = catalog.commit(repo)?;
@@ -3872,6 +3898,14 @@ mod tests {
             assert!(format!("{error:#}").contains("older than the pinned version 2"));
         }
         read_catalog(&repo, &second, "canopa", &pinned_v2)?;
+        // A client that applied the second catalog advanced its pin from
+        // version 1, so no cache can serve it the forged catalog as current.
+        let advanced = trust::advance(&pinned_v1, &current.trust)?;
+        assert_eq!(trust::pinned_root(&advanced)?.version, 2);
+        let error = read_fresh_catalog(&repo, &forged_hash, "canopa", &advanced).unwrap_err();
+        assert!(format!("{error:#}").contains("older than the pinned version 2"));
+        read_fresh_catalog(&repo, &second, "canopa", &advanced)?;
+        read_catalog(&repo, &first, "canopa", &advanced)?;
         Ok(())
     }
 

@@ -369,7 +369,11 @@ fn prune(
             continue;
         }
         ensure!(
-            configured.is_some_and(|configured| configured.repo == repo && configured.key == key),
+            match configured {
+                Some(configured) =>
+                    configured.repo == repo && crate::repo::same_trust_root(&configured.key, key)?,
+                None => false,
+            },
             "kept image {label} does not use this cache and key for {publisher}"
         );
         image

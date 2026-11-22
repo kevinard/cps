@@ -302,6 +302,43 @@ impl Publishers {
         }
     }
 
+    fn as_mut_slice(&mut self) -> &mut [Publisher] {
+        match self {
+            Self::Single(publisher) => std::slice::from_mut(publisher),
+            Self::Ordered(publishers) => publishers,
+            Self::Profiled { publishers, .. } => publishers,
+        }
+    }
+
+    /// Advance each publisher's pinned trust root through the trust history
+    /// of the catalog the image now applies.
+    pub(crate) fn advance_pins(
+        &mut self,
+        checkpoints: &BTreeMap<String, CatalogCheckpoint>,
+    ) -> Result<()> {
+        for publisher in self.as_mut_slice() {
+            if let Some(point) = checkpoints.get(&publisher.name) {
+                publisher.key = point
+                    .advance_pin(&publisher.key)
+                    .with_context(|| format!("advancing the trust root of {}", publisher.name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `next` is these publishers, with each pinned trust root
+    /// unchanged or advanced along its history.
+    pub(crate) fn advanced_to(&self, next: &Self) -> bool {
+        let mut unadvanced = next.clone();
+        for (publisher, current) in unadvanced.as_mut_slice().iter_mut().zip(self.as_slice()) {
+            if crate::repo::check_trust_pin_advanced(&current.key, &publisher.key).is_err() {
+                return false;
+            }
+            publisher.key.clone_from(&current.key);
+        }
+        unadvanced == *self
+    }
+
     pub(crate) fn release_profile(&self) -> Option<&str> {
         match self {
             Self::Profiled {
@@ -1348,6 +1385,12 @@ impl Image {
         tx.execute(
             "UPDATE image SET data=?1 WHERE id=1",
             [serde_json::to_string(&delta.settings)?],
+        )?;
+        // A transaction changes publishers only by advancing their pinned
+        // trust roots, which the plan checked.
+        tx.execute(
+            "UPDATE publishers SET data=?1 WHERE id=1",
+            [serde_json::to_string(&next.publishers)?],
         )?;
         {
             let mut upsert = tx.prepare("INSERT OR REPLACE INTO installed VALUES (?1, ?2)")?;

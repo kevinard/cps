@@ -925,7 +925,7 @@ impl ImageGuard {
             .get(source.publisher)
             .with_context(|| format!("image has no publisher {}", source.publisher))?;
         ensure!(
-            publisher.key == source.key,
+            super::same_trust_root(&publisher.key, &source.key)?,
             "mirror trust key differs from the image trust key for {}",
             source.publisher
         );

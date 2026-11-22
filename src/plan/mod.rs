@@ -629,7 +629,7 @@ impl Plan {
                 && after.arch == before.arch
                 && after.uid == before.uid
                 && after.gid == before.gid
-                && next.publishers == current.publishers
+                && current.publishers.advanced_to(&next.publishers)
                 && after.format == IMAGE_FORMAT,
             "pending state does not match the image identity or transaction revision"
         );
@@ -1519,6 +1519,9 @@ fn build_with_update_diagnostics(
                     .extend(requested.keys().map(|name| (*name).to_owned()));
             }
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
+            state
+                .publishers
+                .advance_pins(&state.settings.catalog_checkpoints)?;
             (installed, paths)
         }
     };

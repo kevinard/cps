@@ -5403,6 +5403,7 @@ fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Resu
         Ok(())
     })?;
     let fork = sign(3)?;
+    let fork_hash = fs::read_to_string(&current)?;
     fs::write(&current, &second)?;
     let error = refresh(&cache, &fork).unwrap_err();
     assert!(
@@ -5440,6 +5441,27 @@ fn publisher_rotation_survives_partial_sync_and_preserves_pinned_plans() -> Resu
     apply(&f.root, &plan(&f.root, Request::Update)?)?;
     assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "new");
     assert!(verify(&f.root)?.iter().all(|finding| !finding.is_error));
+
+    // Applying the update advanced the image's pin through version 3, while
+    // the image that applied the historical plan keeps version 1.
+    let pinned = |root: &Path| -> Result<Vec<u8>> {
+        let state = crate::image::Image::open_query(root)?.state()?;
+        Ok(state.publishers.as_slice()[0].key.clone())
+    };
+    let original = read_trust_root(&f.trust)?;
+    assert_eq!(pinned(&historical)?, original);
+    let advanced = pinned(&f.root)?;
+    assert_ne!(advanced, original);
+    crate::repo::check_trust_pin_advanced(&original, &advanced)?;
+    assert!(crate::repo::check_trust_pin_advanced(&advanced, &original).is_err());
+    // The advanced pin rejects the forged catalog that the revoked key
+    // signed, even from a cache that never saw the rotation.
+    let error = crate::repo::read_fresh_catalog(&f.repo, fork_hash.trim(), "canopa", &advanced)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("older than the pinned version 3"),
+        "{error:#}"
+    );
     Ok(())
 }
 

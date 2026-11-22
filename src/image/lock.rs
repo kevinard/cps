@@ -13,11 +13,14 @@ use super::{Image, Installed, Publisher, Publishers, State, catalogs};
 use crate::{
     kdl_format::ImageDefinition,
     model::{
-        ImagePolicy, Node, PackageFacets, PackageSpec, Selection, Version, digest, validate_digest,
+        ImagePolicy, Node, PackageFacets, PackageSpec, Selection, Version, validate_digest,
         validate_name, validate_policy, validate_publisher,
     },
     query::verified_intent,
-    repo::{CATALOG_LIMIT, PackageInfo, catalog_index, export_locked_repository, read_limited},
+    repo::{
+        CATALOG_LIMIT, PackageInfo, catalog_index, export_locked_repository, read_limited,
+        trust_root_genesis,
+    },
 };
 
 const LOCK_FORMAT: u32 = 1;
@@ -55,7 +58,8 @@ enum LockKind {
 pub(crate) struct LockedPublisher {
     pub name: String,
     pub catalog: String,
-    key_sha256: String,
+    /// The SHA-256 of the publisher's version 1 trust root payload.
+    trust_root_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,7 +113,7 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
         publishers.push(LockedPublisher {
             name: publisher.name.clone(),
             catalog,
-            key_sha256: digest(&publisher.key),
+            trust_root_sha256: trust_root_genesis(&publisher.key)?,
         });
     }
     let packages = state
@@ -247,7 +251,7 @@ impl ImageLock {
         for publisher in &self.publishers {
             validate_publisher(&publisher.name)?;
             validate_digest(&publisher.catalog)?;
-            validate_digest(&publisher.key_sha256)?;
+            validate_digest(&publisher.trust_root_sha256)?;
             ensure!(
                 names.insert(publisher.name.as_str()),
                 "duplicate locked publisher {}",
@@ -307,8 +311,8 @@ impl ImageLock {
         );
         for (locked, publisher) in self.publishers.iter().zip(publishers) {
             ensure!(
-                digest(&publisher.key) == locked.key_sha256,
-                "configured key differs from the image lock for {}",
+                trust_root_genesis(&publisher.key)? == locked.trust_root_sha256,
+                "configured trust root names a different publisher than the image lock for {}",
                 publisher.name
             );
         }
@@ -354,8 +358,8 @@ impl ImageLock {
             .find(|pin| pin.name == publisher)
             .with_context(|| format!("image lock has no publisher {publisher}"))?;
         ensure!(
-            pin.key_sha256 == digest(key),
-            "image lock uses a different key for {publisher}"
+            pin.trust_root_sha256 == trust_root_genesis(key)?,
+            "image lock uses a different trust root for {publisher}"
         );
         Ok(&pin.catalog)
     }

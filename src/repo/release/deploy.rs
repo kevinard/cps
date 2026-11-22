@@ -37,8 +37,7 @@ use super::{
 use crate::{
     model::digest,
     repo::{
-        keys::trust::Pinned, lock_repo, pinned_publisher, read_current, read_current_catalog,
-        read_limited,
+        keys::trust, lock_repo, pinned_publisher, read_current, read_current_catalog, read_limited,
     },
 };
 
@@ -773,10 +772,14 @@ fn check_descriptor(
         return Ok(false);
     }
     // The current catalog's history holds both versions unchanged.
-    read_current_catalog(&session.repo, &session.publisher, &advertised_trust)
-        .context("the web root advertises a trust root outside the history of the catalog")?;
-    let advertised_version = Pinned::parse(&advertised_trust)?.root().version;
-    let version = Pinned::parse(trust_root)?.root().version;
+    read_current_catalog(
+        &session.repo,
+        &session.publisher,
+        &trust::pin_file(&advertised_trust)?,
+    )
+    .context("the web root advertises a trust root outside the history of the catalog")?;
+    let advertised_version = trust::decode_file(&advertised_trust)?.version;
+    let version = trust::decode_file(trust_root)?.version;
     ensure!(
         version > advertised_version,
         "the web root advertises trust root version {advertised_version}; \

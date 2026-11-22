@@ -577,8 +577,9 @@ bootstrap from it. `cps repo deploy` replaces the trust root in
 deploys, and only after that catalog's timestamp is published. It refuses any
 other change to the bootstrap material, an older version than the one the
 mirror advertises, and an advertised version outside the catalog's history.
-Any version in the catalog's history verifies the catalog, so clients that
-pinned an older version keep working after rotation.
+A pin at any version the catalog carries, or at the version just before
+them, verifies the catalog, so clients that pinned an older version keep
+working after rotation.
 
 ## Rotating a mirror's TUF root
 

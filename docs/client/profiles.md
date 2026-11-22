@@ -161,7 +161,7 @@ cps image diff installed replica
 
 An image lock is a JSON document with `"format": 1` and
 `"kind": "image-lock"`. It records the exact package composition, publisher
-order and key fingerprints, catalog pins, architecture, image-wide facet
+order and trust root identities, catalog pins, architecture, image-wide facet
 rules, per-package facet rules, variants, and local package requests. The
 replica gets a fresh image identity. The target's KDL configuration supplies
 its repository locations, trust roots, and build trust policies. Give it the
