@@ -376,7 +376,9 @@ elif $systemd_guest; then
     else
         cp -- "$cps" proto/usr/bin/cps
     fi
-    cp "$project/packaging/systemd/"{cps-boot-health.service,cps-uefi-bless.service,cps-finalize-trial.path,cps-finalize-trial.service} proto/usr/lib/systemd/system/
+    # Every unit that packaging/cps.kdl ships.
+    cp "$project/packaging/systemd/"cps-*.{service,timer,path} proto/usr/lib/systemd/system/
+    install -Dm644 -t proto/usr/share/man/man1 "$project"/docs/reference/man/*.1
     install -Dm644 "$project/LICENSE" proto/usr/share/licenses/cps/LICENSE
     sed -e '/^    require /d' "$project/packaging/cps.kdl" > cps.kdl
     "$cps" publish manifests --repo repo --proto proto --key private.der cps.kdl
