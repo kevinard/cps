@@ -63,6 +63,16 @@ publish 2.0.0-0
 "$cps" upgrade --root changed -y > /dev/null
 expect 3 "$cps" image diff image changed
 
+# A saved plan runs only where it was saved: an image plan with --root, and
+# a plan saved on the running system without it.
+"$cps" install --root image -n --save-plan image-plan.json test/tool > /dev/null
+expect 1 "$cps" apply image-plan.json
+grep -F 'saved for an image' out.log
+expect 1 "$cps" fetch image-plan.json
+jq -c '. + {system: "live"}' image-plan.json > system-plan.json
+expect 1 "$cps" apply --root image system-plan.json
+grep -F 'saved on the running system' out.log
+
 # A declined prompt exits with 4 and changes nothing.
 status=0
 printf 'n\n' | script -qec "$cps upgrade --root image" /dev/null > prompt.log 2>&1 || status=$?

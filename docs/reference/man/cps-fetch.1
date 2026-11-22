@@ -4,14 +4,17 @@
 \&cps\-fetch \- \&Fetch the verified payloads required by a saved plan
 .SH SYNOPSIS
 .HP 4
-.B \&cps fetch [OPTIONS] \-\-root <IMAGE> <PLAN>
+.B \&cps fetch [OPTIONS] <PLAN>
 .SH ARGUMENTS
 .PP
 .B \&<PLAN>
 .SH OPTIONS
 .TP
 .B \&\-\-root <IMAGE>
-\&Image the plan targets
+\&Operate on this offline image instead of the running system
+.TP
+.B \&\-\-config <CONFIG>
+\&Distribution configuration of the running system [default: /etc/cps/image.kdl]
 .TP
 .B \&\-\-archive\-cache <PUBLISHER=PATH>
 \&Use a synced historical archive for pinned metadata and matching payloads

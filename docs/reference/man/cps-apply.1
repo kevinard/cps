@@ -4,14 +4,17 @@
 \&cps\-apply \- \&Apply or resume a saved plan
 .SH SYNOPSIS
 .HP 4
-.B \&cps apply [OPTIONS] \-\-root <IMAGE> <PLAN>
+.B \&cps apply [OPTIONS] <PLAN>
 .SH ARGUMENTS
 .PP
 .B \&<PLAN>
 .SH OPTIONS
 .TP
 .B \&\-\-root <IMAGE>
-\&Image the plan targets
+\&Operate on this offline image instead of the running system
+.TP
+.B \&\-\-config <CONFIG>
+\&Distribution configuration of the running system [default: /etc/cps/image.kdl]
 .TP
 .B \&\-n, \-\-dry\-run
 \&Validate the plan against cached payloads without applying it

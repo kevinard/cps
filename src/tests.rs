@@ -490,10 +490,32 @@ fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     assert!(empty.boot_reason().is_none());
     let ordinary = Change::from_plan(install("apps/independent")?, &policy);
     assert!(ordinary.boot_reason().is_none());
+    // A saved plan records how it runs on the system, and only a system plan
+    // carries that record.
+    use crate::plan::SystemMode;
+    assert_eq!(ordinary.saved_plan().system, None);
+    assert_eq!(ordinary.to_saved().system, Some(SystemMode::Live));
+    let saved: Plan = serde_json::from_slice(&serde_json::to_vec(&ordinary.to_saved())?)?;
+    assert_eq!(saved, ordinary.to_saved());
+    assert_eq!(serde_json::to_value(ordinary.to_saved())?["system"], "live");
+    assert!(
+        serde_json::to_value(ordinary.saved_plan())?
+            .get("system")
+            .is_none()
+    );
+    assert_eq!(
+        Change::from_plan(initial.clone(), &policy)
+            .to_saved()
+            .system,
+        Some(SystemMode::Staged)
+    );
+    let ordinary = Change::from_plan(install("apps/independent")?, &policy);
     assert_eq!(
         ordinary.with_staging().boot_reason(),
         Some("--stage was requested")
     );
+    let staged = Change::from_plan(install("apps/independent")?, &policy).with_staging();
+    assert_eq!(staged.to_saved().system, Some(SystemMode::Staged));
     let remove = plan(
         &fixture.root,
         Request::Remove {

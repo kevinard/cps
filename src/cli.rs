@@ -283,9 +283,8 @@ enum Command {
     },
     /// Fetch the verified payloads required by a saved plan
     Fetch {
-        /// Image the plan targets
-        #[arg(long, value_name = "IMAGE")]
-        root: PathBuf,
+        #[command(flatten)]
+        target: Target,
         /// Use a synced historical archive for pinned metadata and matching payloads
         #[arg(long = "archive-cache", value_name = "PUBLISHER=PATH", value_parser = parse_repository)]
         archive_caches: Vec<(String, PathBuf)>,
@@ -293,9 +292,8 @@ enum Command {
     },
     /// Apply or resume a saved plan
     Apply {
-        /// Image the plan targets
-        #[arg(long, value_name = "IMAGE")]
-        root: PathBuf,
+        #[command(flatten)]
+        target: Target,
         /// Validate the plan against cached payloads without applying it
         #[arg(short = 'n', long)]
         dry_run: bool,
@@ -2598,7 +2596,7 @@ fn change_system(
         change = change.with_staging();
     }
     if let Some(path) = &options.save_plan {
-        save(path, change.saved_plan())?;
+        save(path, &change.to_saved())?;
     }
     if !change.saved_plan().deferred_publishers().is_empty() {
         eprintln!(
@@ -2655,6 +2653,50 @@ fn change_system(
             }
             Err(error) => return Err(error),
         }
+    }
+    Ok(())
+}
+
+/// Refuse a plan saved on the running system for an image `--root` names.
+fn image_plan(plan: &crate::Plan) -> Result<()> {
+    ensure!(
+        plan.system.is_none(),
+        "the plan was saved on the running system; run it without --root"
+    );
+    Ok(())
+}
+
+/// Refuse a plan saved for an image on the running system.
+fn system_plan(plan: &crate::Plan) -> Result<()> {
+    ensure!(
+        plan.system.is_some(),
+        "the plan was saved for an image; run it with --root naming that image"
+    );
+    Ok(())
+}
+
+/// Run a plan saved on the running system the way it was saved: in place,
+/// staged in a trial boot environment, or as a recovery root.
+fn apply_saved_system_plan(config: &Path, plan: crate::Plan, dry_run: bool) -> Result<()> {
+    system_plan(&plan)?;
+    let system = System::load(config)?;
+    let _lock = system.lock()?;
+    let change = system.saved_change(plan)?;
+    println!("{}", change.summary());
+    if dry_run {
+        crate::validate_plan(Path::new("/"), change.saved_plan())?;
+        println!("Plan validated against cached payloads");
+        return Ok(());
+    }
+    match change.mode() {
+        crate::plan::SystemMode::Recovery => {
+            let root = system.prepare_recovery(&change)?;
+            println!("Prepared recovery root {}", root.display());
+        }
+        _ => match system.apply(&change)? {
+            Some(id) => println!("Prepared {id}. Reboot when ready to use the new system."),
+            None => println!("Changes are available now."),
+        },
     }
     Ok(())
 }
@@ -3067,25 +3109,42 @@ fn run(command: Command) -> Result<Exit> {
             }
         }
         Command::Fetch {
-            root,
+            target,
             archive_caches,
             plan,
         } => {
             let saved = load_plan(&plan)?;
-            let count = fetch_plan_with_archives(&root, &saved, &archive_caches)?;
+            let count = match target.root {
+                Some(root) => {
+                    image_plan(&saved)?;
+                    fetch_plan_with_archives(&root, &saved, &archive_caches)?
+                }
+                None => {
+                    system_plan(&saved)?;
+                    let system = System::load(&target.config)?;
+                    let _lock = system.lock()?;
+                    system.fetch_saved(&saved, &archive_caches)?
+                }
+            };
             println!("Verified {count} plan payloads");
         }
         Command::Apply {
-            root,
+            target,
             dry_run,
             plan,
         } => {
             let saved = load_plan(&plan)?;
-            if dry_run {
-                crate::validate_plan(&root, &saved)?;
-                println!("Plan validated against cached payloads");
-            } else {
-                println!("Image revision {}", apply(&root, &saved)?);
+            match target.root {
+                Some(root) => {
+                    image_plan(&saved)?;
+                    if dry_run {
+                        crate::validate_plan(&root, &saved)?;
+                        println!("Plan validated against cached payloads");
+                    } else {
+                        println!("Image revision {}", apply(&root, &saved)?);
+                    }
+                }
+                None => apply_saved_system_plan(&target.config, saved, dry_run)?,
             }
         }
         Command::Status {

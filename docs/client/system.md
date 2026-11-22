@@ -359,7 +359,25 @@ files and what it cannot undo.
 ## Follow a saved plan
 
 Pass `--save-plan PATH` to a system package command to record the exact plan
-it displays. This also works with `--dry-run`. Use
+it displays. This also works with `--dry-run`. The plan records how it runs:
+live on the running root, staged in a trial boot environment (with `--stage`,
+or when the change needs a reboot), or as a recovery root. Review it, then
+run it later the same way:
+
+```sh
+sudo cps upgrade --dry-run --save-plan upgrade.json
+sudo cps fetch upgrade.json
+sudo cps apply upgrade.json
+```
+
+`cps apply` without `--root` refuses a plan that is no longer current, such
+as one made before another change to the running system, and a live plan
+that now needs a reboot, for example after `stage-packages` changed. Plan the
+change again in either case. `cps apply --dry-run PLAN` checks the cached
+payloads without applying. A plan saved for an image that `--root` names runs
+only with `--root`, and a plan saved on the running system only without it.
+
+Use
 `cps status --plan PATH` to follow it, and add `--json` for a report that
 scripts can read. The report includes the plan's SHA-256, its phase, the
 revision, and the boot environment when applicable. The JSON report spells
@@ -375,8 +393,8 @@ result outside the running and selected roots reports
 that environment. A later live change reports its own transaction phase.
 
 The same commands take `--root` to change an
-[inactive image](images.md), where `cps fetch` and `cps apply` complete a
-saved plan. `cps boot` manages boot environments.
+[inactive image](images.md), where `cps fetch --root` and `cps apply --root`
+complete a saved plan. `cps boot` manages boot environments.
 
 ## Repair, restore defaults, and verify
 

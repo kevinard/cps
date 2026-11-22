@@ -237,6 +237,22 @@ pub(crate) struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kernel_install: Option<Artifacts>,
     payload_bytes: u64,
+    /// How a plan saved on the running system runs there. Absent from plans
+    /// for an image that `--root` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system: Option<SystemMode>,
+}
+
+/// How a saved plan changes the running system.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SystemMode {
+    /// Change the running root in place.
+    Live,
+    /// Stage the change in a new trial boot environment.
+    Staged,
+    /// Prepare a verified recovery root for separate activation.
+    Recovery,
 }
 
 impl Plan {
@@ -358,6 +374,7 @@ impl Plan {
             retired_triggers: Vec::new(),
             kernel_install: None,
             payload_bytes: 0,
+            system: None,
         }
     }
 

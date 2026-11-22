@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{FlockOperation, flock};
 use serde::Serialize;
 
@@ -30,7 +30,7 @@ use crate::{
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
-    plan::{UpdateDiagnostics, UpdateSelection, inspect_update, plan_system},
+    plan::{SystemMode, UpdateDiagnostics, UpdateSelection, inspect_update, plan_system},
     query::{InstallSource, SelectSource, select_install_sources},
     release::{
         Mirror, MirrorSources, PublisherFreshness, SyncOptions, image_config_dir,
@@ -221,6 +221,23 @@ impl Change {
 
     pub(crate) fn summary(&self) -> String {
         self.plan.summary()
+    }
+
+    /// How this change runs on the system: in place, staged in a trial
+    /// boot environment, or as a recovery root.
+    pub(crate) fn mode(&self) -> SystemMode {
+        match (&self.boot_reason, self.plan.is_recovery()) {
+            (None, _) => SystemMode::Live,
+            (Some(_), false) => SystemMode::Staged,
+            (Some(_), true) => SystemMode::Recovery,
+        }
+    }
+
+    /// The plan to save, which records how it runs on the system.
+    pub(crate) fn to_saved(&self) -> Plan {
+        let mut plan = self.plan.clone();
+        plan.system = Some(self.mode());
+        plan
     }
 
     /// Route a nonempty change through the trial boot workflow.
@@ -572,6 +589,52 @@ impl System {
         let mut change = Change::from_plan(plan, &self.definition.stage_packages);
         change.live_services = Some(services);
         Ok(change)
+    }
+
+    /// The change a plan saved on this system describes, to run the way it
+    /// was saved.
+    pub(crate) fn saved_change(&self, plan: Plan) -> Result<Change> {
+        let mode = plan
+            .system
+            .context("the plan was saved for an image; apply it with --root naming that image")?;
+        self.check_running()?;
+        let required = plan.boot_reason(&self.definition.stage_packages);
+        let boot_reason = match mode {
+            SystemMode::Live => {
+                if let Some(reason) = required {
+                    bail!(
+                        "the plan was saved as a live change, but it now requires a reboot because \
+                         {reason}; plan the change again"
+                    );
+                }
+                None
+            }
+            SystemMode::Staged => {
+                Some(required.unwrap_or_else(|| "the plan was saved staged".to_owned()))
+            }
+            SystemMode::Recovery => {
+                ensure!(
+                    plan.is_recovery(),
+                    "the saved recovery plan is not a repair or revert"
+                );
+                Some(required.unwrap_or_else(|| "the plan was saved as a recovery".to_owned()))
+            }
+        };
+        Ok(Change {
+            plan,
+            boot_reason,
+            live_services: None,
+        })
+    }
+
+    /// Download and verify the payloads a plan saved on this system needs.
+    pub(crate) fn fetch_saved(&self, plan: &Plan, archives: &[(String, PathBuf)]) -> Result<usize> {
+        ensure!(
+            plan.system.is_some(),
+            "the plan was saved for an image; fetch it with --root naming that image"
+        );
+        self.check_running()?;
+        crate::fetch_plan_with_archives(Path::new(ROOT), plan, archives)
     }
 
     pub(crate) fn apply(&self, change: &Change) -> Result<Option<String>> {
