@@ -529,11 +529,18 @@ pub(crate) fn verify(
 }
 
 /// The pin after a client verified a catalog's history against it: the
-/// pinned history extended through the catalog's newest version.
+/// pinned history extended through the catalog's newest version, or the
+/// pin unchanged when the catalog carries no later version.
 pub(crate) fn advance(pinned: &[u8], chain: &TrustChain) -> Result<Vec<u8>> {
     let pin = parse_pin(pinned)?;
     let verified = chain.verify(&pin.current().publisher)?;
     let mut joined = pin.join(&verified)?;
+    // A catalog that also carries versions older than the pin would
+    // otherwise rewrite the pin without advancing it, which
+    // `check_advanced` rightly refuses when a transaction resumes.
+    if joined.current().version == pin.current().version {
+        return Ok(pinned.to_vec());
+    }
     let excess = joined.0.len().saturating_sub(PIN_VERSIONS);
     joined.0.drain(..excess);
     encode_pin(&joined.chain())
@@ -1290,6 +1297,16 @@ pub(crate) mod tests {
             advance(&again, &TrustChain(versions[..=3].to_vec()))?,
             again
         );
+        // A pin of a later version, such as `trust/2.json`, stays as it is
+        // when the catalog's history only adds older versions, so a resumed
+        // transaction still sees an unchanged pin.
+        let second = versions[1].encode()?;
+        let same = advance(&second, &TrustChain(versions[..=1].to_vec()))?;
+        assert_eq!(same, second);
+        check_advanced(&second, &same)?;
+        let later = advance(&second, &TrustChain(versions[..=2].to_vec()))?;
+        assert_eq!(pinned_root(&later)?.version, 3);
+        check_advanced(&second, &later)?;
         // A pin cannot jump a gap in the history.
         assert!(advance(&first, &TrustChain(versions[24..=39].to_vec())).is_err());
         // Another publisher's history is not an advance.
