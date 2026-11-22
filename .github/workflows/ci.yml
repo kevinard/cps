@@ -69,7 +69,7 @@ jobs:
             for test in package-identity manifest-dependencies elf-transactions elf-profile systemd-actions \
                 hwdb-trigger triggers mediators package-freezes git-snapshots sources build build-outputs \
                 release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
-                recipe-orchestration; do
+                recipe-orchestration exit-status; do
               bash "tests/$test.sh"
             done
             bash tests/transaction-progress.sh

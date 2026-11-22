@@ -38,6 +38,18 @@ def read_help(binary, command):
 
 
 NOTES = "Notes"
+# The exit status table in docs/reference/exit-status.md, which src/cli.rs enforces.
+EXIT_STATUS = [
+    ("0", "Success. A check found nothing to report."),
+    ("1", "An error."),
+    ("2", "Invalid usage, such as an unknown option or a missing argument."),
+    ("3", "A check found something: updates are available (upgrade --check), "
+     "verification found problems (verify, publisher audit-builds), pins are stale "
+     "(recipe repin --check), configuration or images differ (config diff, image diff), "
+     "manifest dependencies are missing (manifest dependencies), or nothing matched "
+     "(search, owner)."),
+    ("4", "A confirmation prompt was declined."),
+]
 NOT_COMMANDS = {"Arguments", "Options", "Examples", NOTES}
 
 
@@ -110,8 +122,16 @@ def command_page(binary, command):
     if command_names(sections):
         lines.append(".SH SUBCOMMAND REFERENCE")
         lines += subcommand_reference(binary, command, sections)
+    lines += exit_status(command)
     lines += [".SH SEE ALSO", ".BR cps (1)"]
     return "\n".join(lines) + "\n"
+
+
+def exit_status(command=()):
+    lines = [".SH EXIT STATUS", *definition_list(EXIT_STATUS)]
+    if command == ("develop",):
+        lines += [".PP", roff("cps develop exits with the status of the command it runs.")]
+    return lines
 
 
 def subcommand_reference(binary, command, sections):
@@ -170,6 +190,7 @@ def manual(binary):
         ".I /usr/lib/sysimage/cps/",
         "Package database, transaction staging, prepared kernel files, and vendor configuration "
         "proposals within an image. Packages never ship /var, which tmpfiles.d populates at boot.",
+        *exit_status(),
         ".SH EXAMPLES",
         ".EX",
         roff("cps search editor"),

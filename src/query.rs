@@ -811,16 +811,16 @@ pub(crate) fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
     Ok(matches)
 }
 
-/// Return the installed package IDs that own an exact image path.
+/// Return the installed package IDs that own an exact image path, none
+/// when no installed package owns it.
 pub(crate) fn path_owners(root: &Path, path: &str) -> Result<Vec<String>> {
     let relative = path.strip_prefix('/').unwrap_or(path);
     validate_path(relative)?;
     let image = Image::open_query(root)?;
     image.require_clean()?;
-    let managed = image
-        .managed_path(relative)?
-        .filter(|entry| !entry.owners.is_empty())
-        .with_context(|| format!("no installed package owns {path:?}"))?;
+    let Some(managed) = image.managed_path(relative)? else {
+        return Ok(Vec::new());
+    };
     let publishers = image.publishers()?;
     managed
         .owners

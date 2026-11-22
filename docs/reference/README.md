@@ -49,6 +49,10 @@ Omit `-M` if the directory is already on your system's man search path.
 For a shared installation, put the pages in `man1/` under your system's
 local manual directory.
 
+Every command exits with a status from the [exit status table](exit-status.md):
+0 for success, 1 for an error, 2 for invalid usage, 3 when a check found
+something, and 4 when a prompt was declined.
+
 ## Commands by task
 
 The links open the man page sources. Use the `man` commands above for

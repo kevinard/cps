@@ -2737,8 +2737,7 @@ fn queries_installed_path_ownership_offline() -> Result<()> {
     assert_eq!(path_owners(&f.root, link)?, [compositor]);
     assert_eq!(path_owners(&f.root, LIBRARY)?, [library]);
     for path in ["usr/lib", MANPAGE, "usr/bin/other-arch"] {
-        let error = path_owners(&f.root, path).unwrap_err();
-        assert!(error.to_string().contains("no installed package owns"));
+        assert!(path_owners(&f.root, path)?.is_empty(), "{path}");
     }
     assert!(path_owners(&f.root, "../usr/share").is_err());
     for spec in [

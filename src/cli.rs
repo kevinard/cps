@@ -2157,11 +2157,7 @@ fn print_etc_merge(trial: &str, report: &crate::EtcMergeReport) {
     }
 }
 
-fn print_boot_prune(
-    report: &system::BootPruneReport,
-    dry_run: bool,
-    report_empty: bool,
-) -> ExitCode {
+fn print_boot_prune(report: &system::BootPruneReport, dry_run: bool, report_empty: bool) -> Exit {
     for (id, kind) in &report.removed {
         let action = if dry_run { "Would remove" } else { "Removed" };
         println!("{action} {} {id}", system::removal_label(*kind));
@@ -2173,9 +2169,9 @@ fn print_boot_prune(
         println!("Nothing to prune");
     }
     if report.failed.is_empty() {
-        ExitCode::SUCCESS
+        Exit::Ok
     } else {
-        ExitCode::FAILURE
+        Exit::Error
     }
 }
 
@@ -2492,8 +2488,7 @@ fn change_image(
         return Ok(());
     }
     if !confirm(options.yes, "Proceed?")? {
-        println!("Canceled.");
-        return Ok(());
+        return Err(Canceled.into());
     }
     fetch_plan_with_archives(root, &plan, &[])?;
     println!("Image revision {}", apply(root, &plan)?);
@@ -2617,8 +2612,7 @@ fn change_system(
         return Ok(());
     }
     if !confirm(options.yes, "Proceed?")? {
-        println!("Canceled.");
-        return Ok(());
+        return Err(Canceled.into());
     }
     if prepare_recovery {
         let root = system.prepare_recovery(&change)?;
@@ -2644,7 +2638,7 @@ fn check_system_updates(
     json: bool,
     base_only: bool,
     explain: Option<&str>,
-) -> Result<ExitCode> {
+) -> Result<Exit> {
     let report = System::check_updates(config, refresh, explain, base_only);
     if json {
         let mut out = io::stdout().lock();
@@ -2701,14 +2695,14 @@ fn check_system_updates(
             println!("Changes can be applied to the running system.");
         }
     }
-    Ok(if report.status == UpdateStatus::Blocked {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    Ok(match report.status {
+        UpdateStatus::Blocked => Exit::Error,
+        UpdateStatus::UpdatesAvailable => Exit::Found,
+        UpdateStatus::UpToDate | UpdateStatus::Deferred => Exit::Ok,
     })
 }
 
-fn run(command: Command) -> Result<ExitCode> {
+fn run(command: Command) -> Result<Exit> {
     match command {
         Command::Install {
             change: mut options,
@@ -2979,8 +2973,8 @@ fn run(command: Command) -> Result<ExitCode> {
                     .status()
                     .context("running /usr/bin/diff")?;
                 return match status.code() {
-                    Some(0) => Ok(ExitCode::SUCCESS),
-                    Some(1) => Ok(ExitCode::FAILURE),
+                    Some(0) => Ok(Exit::Ok),
+                    Some(1) => Ok(Exit::Found),
                     _ => anyhow::bail!("configuration diff failed with {status}"),
                 };
             }
@@ -3000,8 +2994,8 @@ fn run(command: Command) -> Result<ExitCode> {
                 .status()
                 .context("running /usr/bin/diff")?;
             return match status.code() {
-                Some(0) => Ok(ExitCode::SUCCESS),
-                Some(1) => Ok(ExitCode::FAILURE),
+                Some(0) => Ok(Exit::Ok),
+                Some(1) => Ok(Exit::Found),
                 _ => anyhow::bail!("configuration diff failed with {status}"),
             };
         }
@@ -3230,7 +3224,10 @@ fn run(command: Command) -> Result<ExitCode> {
             ..
         } => {
             let matches = search_files(&image.root, &term)?;
-            ensure!(!matches.is_empty(), "no available package ships {term:?}");
+            let found = !matches.is_empty();
+            if !found {
+                eprintln!("cps: no available package ships {term:?}");
+            }
             if json {
                 print_json(&matches)?;
             } else {
@@ -3238,6 +3235,9 @@ fn run(command: Command) -> Result<ExitCode> {
                 for matched in matches {
                     writeln!(out, "{}\t{}", matched.package, matched.path)?;
                 }
+            }
+            if !found {
+                return Ok(Exit::Found);
             }
         }
         Command::Search {
@@ -3267,10 +3267,17 @@ fn run(command: Command) -> Result<ExitCode> {
                             .is_some_and(|summary| summary.to_lowercase().contains(&term))
                 })
                 .collect();
+            let found = !rows.is_empty();
+            if !found {
+                eprintln!("cps: no package matches {term:?}");
+            }
             if json {
                 print_json(&rows)?;
             } else {
                 print_packages(rows, true)?;
+            }
+            if !found {
+                return Ok(Exit::Found);
             }
         }
         Command::Policy {
@@ -3355,7 +3362,15 @@ fn run(command: Command) -> Result<ExitCode> {
             }
         }
         Command::Owner { image, json, path } => {
-            print_lines(path_owners(&image.root, &path)?, json)?
+            let owners = path_owners(&image.root, &path)?;
+            let found = !owners.is_empty();
+            if !found {
+                eprintln!("cps: no installed package owns {path:?}");
+            }
+            print_lines(owners, json)?;
+            if !found {
+                return Ok(Exit::Found);
+            }
         }
         Command::Contents {
             image,
@@ -3400,7 +3415,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 }
             }
             if findings.iter().any(|finding| finding.is_error) {
-                return Ok(ExitCode::FAILURE);
+                return Ok(Exit::Found);
             }
             if runtime {
                 crate::verify_elf_runtime(&root, &library_dirs)?;
@@ -3413,7 +3428,7 @@ fn run(command: Command) -> Result<ExitCode> {
             }
         }
         Command::Publisher { command } => return run_publisher(command),
-        Command::Image { command } => run_image(command)?,
+        Command::Image { command } => return run_image(command),
         Command::Boot { command } => return run_boot(command),
         Command::Source { command } => run_source(command)?,
         Command::Recipe { command } => return run_recipe(command),
@@ -3472,12 +3487,12 @@ fn run(command: Command) -> Result<ExitCode> {
             let code = status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
-            return Ok(ExitCode::from(code as u8));
+            return Ok(Exit::Child(code as u8));
         }
         Command::Publish { command } => run_publish(command)?,
         Command::Repo { command } => run_repo(command)?,
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(Exit::Ok)
 }
 
 /// Whether a package name, or its last component, matches a `*`/`?` pattern.
@@ -3694,7 +3709,7 @@ fn print_why(root: &Path, package: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_publisher(command: PublisherCommand) -> Result<ExitCode> {
+fn run_publisher(command: PublisherCommand) -> Result<Exit> {
     match command {
         PublisherCommand::List { image } => {
             println!("PUBLISHER\tREPOSITORY");
@@ -3738,8 +3753,7 @@ fn run_publisher(command: PublisherCommand) -> Result<ExitCode> {
                 eprint!("{}", bootstrap.describe()?);
                 if expect_root_key.is_empty() {
                     if !confirm(false, "Trust this publisher?")? {
-                        println!("Canceled.");
-                        return Ok(ExitCode::SUCCESS);
+                        return Err(Canceled.into());
                     }
                 } else {
                     bootstrap.check_root_keys(&expect_root_key)?;
@@ -3849,19 +3863,21 @@ fn run_publisher(command: PublisherCommand) -> Result<ExitCode> {
                 "Verified build evidence for {} installed package(s) from {name}",
                 audit.verified
             );
-            ensure!(
-                audit.failures.is_empty(),
-                "{} installed package(s) failed build audit",
-                audit.failures.len()
-            );
+            if !audit.failures.is_empty() {
+                eprintln!(
+                    "cps: {} installed package(s) failed build audit",
+                    audit.failures.len()
+                );
+                return Ok(Exit::Found);
+            }
         }
         PublisherCommand::Prefer { image, name } => prefer_publisher(&image.root, &name)?,
         PublisherCommand::Remove { image, name } => remove_publisher(&image.root, &name)?,
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(Exit::Ok)
 }
 
-fn run_image(command: ImageCommand) -> Result<()> {
+fn run_image(command: ImageCommand) -> Result<Exit> {
     match command {
         ImageCommand::Diff {
             paths,
@@ -3869,7 +3885,13 @@ fn run_image(command: ImageCommand) -> Result<()> {
             before,
             after,
         } => {
-            print_image_diff(&crate::image_diff(&before, &after, paths)?, json)?;
+            let diff = crate::image_diff(&before, &after, paths)?;
+            print_image_diff(&diff, json)?;
+            if !diff.packages.is_empty()
+                || diff.paths.as_ref().is_some_and(|paths| !paths.is_empty())
+            {
+                return Ok(Exit::Found);
+            }
         }
         ImageCommand::Lock { image, export } => {
             if let Some(output) = export {
@@ -3948,7 +3970,7 @@ fn run_image(command: ImageCommand) -> Result<()> {
             println!("Wrote {id} to {}", output.display());
         }
     }
-    Ok(())
+    Ok(Exit::Ok)
 }
 
 /// Select a known-good environment, or the recorded fallback, for the next boot.
@@ -3975,7 +3997,7 @@ fn select_boot_environment(
     Ok(())
 }
 
-fn run_boot(command: BootCommand) -> Result<ExitCode> {
+fn run_boot(command: BootCommand) -> Result<Exit> {
     match command {
         BootCommand::List { config, esp } => {
             let esp = match esp {
@@ -4166,7 +4188,7 @@ fn run_boot(command: BootCommand) -> Result<ExitCode> {
                     Some(id) => println!("The /etc merge into {id} runs at shutdown"),
                     None => println!("No trial is selected for the next boot"),
                 }
-                return Ok(ExitCode::SUCCESS);
+                return Ok(Exit::Ok);
             }
             match system.finalize_trial()? {
                 system::Finalized::NoTrial => {
@@ -4201,7 +4223,7 @@ fn run_boot(command: BootCommand) -> Result<ExitCode> {
             println!("Staged {id} at {}", output.join("root").display());
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(Exit::Ok)
 }
 
 fn run_source(command: SourceCommand) -> Result<()> {
@@ -4266,7 +4288,7 @@ fn run_source(command: SourceCommand) -> Result<()> {
     Ok(())
 }
 
-fn run_manifest(command: ManifestCommand) -> Result<ExitCode> {
+fn run_manifest(command: ManifestCommand) -> Result<Exit> {
     match command {
         ManifestCommand::Generate {
             proto,
@@ -4308,7 +4330,7 @@ fn run_manifest(command: ManifestCommand) -> Result<ExitCode> {
                 for diagnostic in diagnostics {
                     eprintln!("cps: {diagnostic}");
                 }
-                return Ok(ExitCode::FAILURE);
+                return Ok(Exit::Found);
             }
         }
         ManifestCommand::Generated { proto, manifest } => {
@@ -4316,10 +4338,10 @@ fn run_manifest(command: ManifestCommand) -> Result<ExitCode> {
             std::io::stdout().lock().write_all(text.as_bytes())?;
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(Exit::Ok)
 }
 
-fn run_recipe(command: RecipeCommand) -> Result<ExitCode> {
+fn run_recipe(command: RecipeCommand) -> Result<Exit> {
     match command {
         RecipeCommand::Order { explain, paths } => {
             let order = crate::orchestrate::build_order(&paths)?;
@@ -4430,11 +4452,11 @@ fn run_recipe(command: RecipeCommand) -> Result<ExitCode> {
                     "cps: {stale} pin(s) in {} recipe(s) are stale; run cps recipe repin without --check to update them",
                     report.recipes.len()
                 );
-                return Ok(ExitCode::FAILURE);
+                return Ok(Exit::Found);
             }
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(Exit::Ok)
 }
 
 fn run_publish(command: PublishCommand) -> Result<()> {
@@ -5028,18 +5050,67 @@ fn cli() -> clap::Command {
         .after_help(TOP_LEVEL_EXAMPLES)
 }
 
+/// How a command ended. `main` maps each outcome to the exit status in the
+/// table in `docs/reference/exit-status.md`; the argument parser exits with
+/// status 2 for usage errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Exit {
+    /// The command succeeded, and any check it ran found nothing.
+    Ok,
+    /// The command failed.
+    Error,
+    /// A check found something: updates are available, verification found
+    /// problems, pins are stale, configuration differs, or nothing matched.
+    Found,
+    /// `cps develop` exits with the status of the command it ran.
+    Child(u8),
+}
+
+/// The user declined a confirmation prompt.
+#[derive(Debug)]
+struct Canceled;
+
+impl std::fmt::Display for Canceled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("canceled")
+    }
+}
+
+impl std::error::Error for Canceled {}
+
+const EXIT_OK: u8 = 0;
+const EXIT_ERROR: u8 = 1;
+const EXIT_USAGE: u8 = 2;
+const EXIT_FOUND: u8 = 3;
+const EXIT_CANCELED: u8 = 4;
+
 pub fn main() -> ExitCode {
     let command = match Cli::from_arg_matches(&cli().get_matches()) {
         Ok(cli) => cli.command,
-        Err(error) => error.exit(),
+        Err(error) => {
+            // Help and version output is not a usage error.
+            let _ = error.print();
+            return ExitCode::from(if error.use_stderr() {
+                EXIT_USAGE
+            } else {
+                EXIT_OK
+            });
+        }
     };
-    match run(command) {
-        Ok(code) => code,
+    ExitCode::from(match run(command) {
+        Ok(Exit::Ok) => EXIT_OK,
+        Ok(Exit::Error) => EXIT_ERROR,
+        Ok(Exit::Found) => EXIT_FOUND,
+        Ok(Exit::Child(code)) => code,
+        Err(error) if error.is::<Canceled>() => {
+            println!("Canceled.");
+            EXIT_CANCELED
+        }
         Err(error) => {
             eprintln!("cps: {error:#}");
-            ExitCode::FAILURE
+            EXIT_ERROR
         }
-    }
+    })
 }
 
 #[cfg(test)]

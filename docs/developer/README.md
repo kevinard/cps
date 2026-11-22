@@ -198,7 +198,7 @@ export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
 for test in package-identity manifest-dependencies elf-transactions elf-profile systemd-actions \
     hwdb-trigger triggers mediators package-freezes git-snapshots sources build build-outputs \
     release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
-    recipe-orchestration; do
+    recipe-orchestration exit-status; do
   bash "tests/$test.sh"
 done
 bash tests/transaction-progress.sh
@@ -214,6 +214,7 @@ as your own user, the way the workflow does.
 | [`package-identity.sh`](../../tests/package-identity.sh) | Upstream version spelling, package IDs, and architectures | |
 | [`manifest-dependencies.sh`](../../tests/manifest-dependencies.sh) | Generated library capabilities, offline dependency suggestions, and direct requirement checks | A C compiler, Python 3 |
 | [`package-freezes.sh`](../../tests/package-freezes.sh) | Offline freezes, version constraints, staged unfreezing | |
+| [`exit-status.sh`](../../tests/exit-status.sh) | The [exit status table](../reference/exit-status.md): usage errors, lookups that find nothing, verification and image differences, and a declined prompt | `script` from util-linux |
 | [`mediators.sh`](../../tests/mediators.sh) | Mediated defaults, preferences, a cloned root, and reprovisioning | `jq` |
 | [`transaction-progress.sh`](../../tests/transaction-progress.sh) | Plan validation, progress, read-only roots, and aborting a journaled apply | `jq` |
 | [`elf-transactions.sh`](../../tests/elf-transactions.sh) | Generated requirements, transaction ELF regressions, drift, and compatible upgrades | A C compiler |
