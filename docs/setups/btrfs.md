@@ -339,7 +339,12 @@ trial is accepted, or coordinate its backup and restore with the application.
 
 A trial is a snapshot taken when the change is staged. Staging records the
 snapshot's `/etc`, before the plan changes it, as the merge base in the
-trial's image state. After a system command or `boot activate`
+trial's image state. The base records each file's metadata and digest, and
+for the account databases the digest of each record, never its contents,
+so it keeps no password hashes. Once the trial runs, the next system
+command removes its base. Each regular file is hashed as it is read, so a
+large file in `/etc` costs no memory; an account database larger than
+16 MiB stops the merge. After a system command or `boot activate`
 selects the trial, CPS creates `/run/cps/finalize-trial`, and `cps-finalize-trial.path` starts
 `cps-finalize-trial.service`. When the system shuts down, stopping that
 service runs `cps boot finalize-trial`. The command finds the trial
