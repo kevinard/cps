@@ -38,7 +38,7 @@ use crate::{
     model::{digest, digest_reader, is_uuid, validate_digest},
 };
 
-use self::policy::{BootEntry, BootRoot, LoaderPolicy, field};
+use self::policy::{BootEntry, BootRoot, InvalidEntry, LoaderPolicy, field};
 
 const LINUX_HASH: &str = "# cps-linux-sha256 ";
 const INITRD_HASH: &str = "# cps-initrd-sha256 ";
@@ -58,12 +58,37 @@ pub(crate) struct BootEnvironment {
     pub tries_left: Option<u32>,
     pub is_default: bool,
     pub is_retiring: bool,
+    /// Why the entry cannot be read. CPS never selects an invalid entry.
+    pub invalid: Option<String>,
 }
 
 struct Inventory {
     policy: Option<LoaderPolicy>,
     entries: Vec<BootEntry>,
+    /// CPS entry files that cannot be read. No command selects them.
+    invalid: Vec<InvalidEntry>,
     firmware: Option<uefi::Firmware>,
+}
+
+/// Refuse a change that must know every boot entry, such as removing a root
+/// that an unreadable entry might still boot.
+fn require_readable(invalid: &[InvalidEntry]) -> Result<()> {
+    if let Some(entry) = invalid.first() {
+        bail!(
+            "{}; repair or remove it before removing boot environments",
+            entry.describe()
+        );
+    }
+    Ok(())
+}
+
+/// Explain why `selector` names no usable environment when it is the ID of
+/// an unreadable entry.
+fn require_valid(invalid: &[InvalidEntry], selector: &str) -> Result<()> {
+    if let Some(entry) = invalid.iter().find(|entry| entry.id == selector) {
+        bail!(entry.describe());
+    }
+    Ok(())
 }
 
 fn inventory(esp: &Path, lock: &File, direct: bool) -> Result<Inventory> {
@@ -81,19 +106,20 @@ fn inventory(esp: &Path, lock: &File, direct: bool) -> Result<Inventory> {
             }
         }
         let firmware = uefi::Firmware::open(esp, lock)?;
-        let mut entries = if uefi::present(esp)? {
-            policy::boot_entries(&esp.join(uefi::DIRECTORY))?
+        let (mut entries, invalid) = if uefi::present(esp)? {
+            policy::read_entries(&esp.join(uefi::DIRECTORY))?
         } else {
-            Vec::new()
+            Default::default()
         };
         let policy = firmware.inventory(&mut entries)?;
         return Ok(Inventory {
             policy,
             entries,
+            invalid,
             firmware: Some(firmware),
         });
     }
-    let (policy, entries) = policy::inventory(esp)?;
+    let (policy, (entries, invalid)) = policy::inventory(esp)?;
     // systemd-boot gives these EFI variables precedence over loader.conf.
     if let Some(overrides) = uefi::loader_overrides(esp, lock)? {
         overrides.check(policy.as_ref())?;
@@ -101,6 +127,7 @@ fn inventory(esp: &Path, lock: &File, direct: bool) -> Result<Inventory> {
     Ok(Inventory {
         policy,
         entries,
+        invalid,
         firmware: None,
     })
 }
@@ -111,6 +138,7 @@ pub(crate) fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>>
     let Inventory {
         policy,
         entries,
+        invalid,
         firmware: _firmware,
     } = inventory(&esp, &_lock, false)?;
     let selected = policy
@@ -127,6 +155,17 @@ pub(crate) fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>>
         all.push((entry, true));
     }
     all.sort_by(|(a, _), (b, _)| (b.revision, &b.id).cmp(&(a.revision, &a.id)));
+    let unreadable = invalid.into_iter().map(|entry| BootEnvironment {
+        id: entry.id,
+        name: None,
+        title: entry.path.display().to_string(),
+        root_partuuid: String::new(),
+        root_uuid: None,
+        tries_left: None,
+        is_default: false,
+        is_retiring: false,
+        invalid: Some(entry.error),
+    });
     Ok(all
         .into_iter()
         .map(|(entry, is_retiring)| BootEnvironment {
@@ -141,7 +180,9 @@ pub(crate) fn list_boot_environments(esp: &Path) -> Result<Vec<BootEnvironment>>
             },
             tries_left: entry.tries,
             is_retiring,
+            invalid: None,
         })
+        .chain(unreadable)
         .collect())
 }
 
@@ -151,8 +192,12 @@ pub(super) fn rollback(esp: &Path, id: Option<&str>, volume: &BtrfsVolume) -> Re
     let Inventory {
         policy,
         entries,
+        invalid,
         firmware,
     } = inventory(&esp, &lock, false)?;
+    if let Some(id) = id {
+        require_valid(&invalid, id)?;
+    }
     ensure!(!entries.is_empty(), "no CPS boot environments registered");
     // An explicit ID can restore a selection after the `default` line was removed.
     let current = match &policy {
@@ -227,8 +272,12 @@ pub(super) fn preview_btrfs_rollback(
     let Inventory {
         policy,
         entries,
+        invalid,
         firmware,
     } = inventory(&esp, &lock, false)?;
+    if let Some(id) = id {
+        require_valid(&invalid, id)?;
+    }
     let policy = policy.context(NO_SELECTION)?;
     let current = rollback_source(&policy, &entries, firmware.as_ref())?
         .context("no configured default CPS boot environment")?;
@@ -413,6 +462,7 @@ pub(super) fn with_running_environment<T>(
     let Inventory {
         policy,
         entries,
+        invalid,
         firmware,
     } = inventory(&esp, &lock, false)?;
     if let Some(firmware) = &firmware {
@@ -421,8 +471,9 @@ pub(super) fn with_running_environment<T>(
              making more package changes",
         )?;
     }
+    let policy = policy.context(NO_SELECTION)?;
+    require_valid(&invalid, &policy.default)?;
     let selected = policy
-        .context(NO_SELECTION)?
         .selected(&entries)
         .context("no known-good CPS boot environment is selected")?;
     ensure!(
@@ -703,8 +754,11 @@ fn activate_as(
     let Inventory {
         policy,
         entries: existing,
+        invalid,
         firmware,
     } = inventory(&esp, &_lock, direct)?;
+    // Writing this environment's entry would leave two files that claim it.
+    require_valid(&invalid, &id)?;
     if let Some(firmware) = &firmware {
         firmware.check_next(&existing, false)?;
         if activation.known_good && !backup {
@@ -983,9 +1037,12 @@ pub(super) fn bootstrap_offline(
     activation: &Activation,
     files: BootFiles,
 ) -> Result<Vec<String>> {
-    let (policy, entries) = policy::inventory(esp)?;
+    let (policy, (entries, invalid)) = policy::inventory(esp)?;
     ensure!(
-        entries.is_empty() && destroy::pending(esp)?.is_empty() && !uefi::present(esp)?,
+        entries.is_empty()
+            && invalid.is_empty()
+            && destroy::pending(esp)?.is_empty()
+            && !uefi::present(esp)?,
         "the EFI partition already has CPS boot environments"
     );
     ensure!(

@@ -11,7 +11,7 @@ use rustix::fs::{AtFlags, FileType, FlockOperation, RenameFlags, flock, renameat
 use super::{
     Inventory, inventory, lock_esp, manage,
     policy::{self, BootEntry, LoaderPolicy},
-    uefi, verify_fallback_artifacts,
+    require_readable, uefi, verify_fallback_artifacts,
 };
 use crate::{
     boot::{btrfs_boot::BtrfsVolume, uki},
@@ -90,8 +90,11 @@ fn destroy(
     let Inventory {
         policy,
         mut entries,
+        invalid,
         firmware,
     } = inventory(&esp, &esp_lock, false)?;
+    // An unreadable entry might boot the root or artifacts being removed.
+    require_readable(&invalid)?;
     let policy = policy.context("no CPS boot environments registered")?;
     let mut retiring = pending(&esp)?;
     // An interrupted destruction resumes, so a retiring record wins, and a

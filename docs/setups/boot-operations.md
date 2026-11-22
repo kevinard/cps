@@ -27,12 +27,13 @@ Boot management commands use the `boot-btrfs` node in `/etc/cps/image.kdl`
 by default. Pass `--config` for another configuration. Commands that work
 offline also accept `--esp` and, where needed, `--btrfs-volume`.
 
-Each line shows one environment, newest first.
+Each line shows one environment, newest first, followed by any CPS entry
+files that cannot be read.
 
 | Column | Meaning |
 | --- | --- |
 | `DEFAULT` | `*` marks the environment selected for the next boot. |
-| `STATUS` | `known-good`, `trial (N left)` for a trial with N boot attempts left, `exhausted` for a failed trial, or `retiring` for an environment whose removal was interrupted. |
+| `STATUS` | `known-good`, `trial (N left)` for a trial with N boot attempts left, `exhausted` for a failed trial, `retiring` for an environment whose removal was interrupted, or `invalid` for an entry file that cannot be read. |
 | `ID` | `cps-IMAGE-REVISION`, from the root's image identity and revision. |
 | `ROOT` | The PARTUUID of the root's Btrfs partition. When any entry selects its root by Btrfs filesystem UUID, the column shows `UUID=` or `PARTUUID=` before each identifier. |
 | `TITLE` | The entry title, which includes the Linux release for manifest-managed kernels. A [backup](btrfs.md#backups-before-live-changes) of a running Btrfs root is titled `Canopa backup`. |
@@ -41,6 +42,27 @@ Each line shows one environment, newest first.
 CPS entries declare their metadata format with `# cps-boot-entry-version 1`
 and record SHA-256 digests of their boot files. CPS checks those files before
 it uses an entry as a fallback or rollback target.
+
+### Unreadable entries
+
+Each `cps-*.conf` file is read on its own. A file that cannot be read, such
+as one that a power loss truncated or a hand edit broke, or two files that
+claim the same ID, are listed as `invalid` with the file in the `TITLE`
+column, and `boot list` prints the reason on standard error. `--json` gives
+the reason in each environment's `invalid` field. CPS never selects an
+invalid entry, and rollback, activation, renaming and mounting go on using
+the readable ones, so a damaged entry never blocks a rollback.
+
+`boot destroy`, `boot prune` and `boot discard-trial` refuse to run while
+an entry is invalid, because CPS cannot tell which root or boot files it
+would still boot. Repair or remove the file named in the error, then retry.
+Activation also refuses to write an environment whose ID an invalid file
+already claims.
+
+Other Type #1 entries in `loader/entries`, such as those of another
+distribution in a dual-boot setup, are not CPS's and are ignored. CPS names
+its own entries in `loader.conf`, so systemd-boot never selects another
+entry in their place.
 
 ## Manage named environments
 
@@ -239,8 +261,8 @@ firmware would wait at the menu and an unattended trial or fallback would
 never boot. Any other timeout only delays the choice. The other keys
 change the menu, its extra entries, or the console. Automatically detected
 entries have their own IDs, such as `auto-windows`, which never match a CPS
-selector. CPS rejects non-CPS Type #1 entries in
-`loader/entries`. CPS writes `editor no` because the editor lets anyone at the
+selector, and neither does any Type #1 entry that CPS did not write, so
+CPS ignores those entries. CPS writes `editor no` because the editor lets anyone at the
 console change the kernel command line of a Type #1 entry. Enabling it does
 not change the selection.
 

@@ -464,30 +464,84 @@ impl BootRoot {
     }
 }
 
-pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
+/// A CPS boot entry file that cannot be read, such as one that a power loss
+/// truncated or a hand edit broke. It is listed so that it can be repaired
+/// or removed, but never selected, and only the commands that must know
+/// every entry, such as `cps boot destroy`, refuse to run while it exists.
+#[derive(Debug)]
+pub(in crate::boot) struct InvalidEntry {
+    /// The environment ID that the file name claims.
+    pub id: String,
+    pub path: PathBuf,
+    pub error: String,
+}
+
+impl InvalidEntry {
+    pub(super) fn describe(&self) -> String {
+        format!(
+            "boot entry {} is invalid: {}",
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+/// Read every CPS entry in `dir` independently. Files that are not named
+/// `cps-*.conf` belong to other systems, such as a dual-boot distribution,
+/// and are ignored: CPS names its own entries in loader.conf, so another
+/// entry is never selected in their place. Entries that share an ID are
+/// all invalid, because CPS could not tell which one systemd-boot boots.
+pub(super) fn read_entries(dir: &Path) -> Result<(Vec<BootEntry>, Vec<InvalidEntry>)> {
     let mut entries = Vec::new();
-    for entry in fs::read_dir(dir)? {
+    let mut invalid = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
         let entry = entry?;
         let file = entry.file_name();
         let Some(name) = file.to_str().and_then(|s| s.strip_suffix(".conf")) else {
             continue;
         };
-        ensure!(
-            name.starts_with("cps-"),
-            "the EFI partition has a non-CPS boot entry: {name}"
-        );
-        ensure!(entry.file_type()?.is_file(), "invalid CPS entry {name}");
-        let parsed = read_entry(entry.path(), name)?;
-        ensure!(
-            !entries
-                .iter()
-                .any(|entry: &BootEntry| entry.id == parsed.id),
-            "duplicate CPS entry {}",
-            parsed.id
-        );
-        entries.push(parsed);
+        if !name.starts_with("cps-") {
+            continue;
+        }
+        let path = entry.path();
+        let id = name.split_once('+').map_or(name, |(id, _)| id).to_owned();
+        match read_entry(path.clone(), name) {
+            Ok(parsed) => entries.push(parsed),
+            Err(error) => invalid.push(InvalidEntry {
+                id,
+                path,
+                error: format!("{error:#}"),
+            }),
+        }
+    }
+    let mut index = 0;
+    while index < entries.len() {
+        let id = &entries[index].id;
+        let duplicated = entries.iter().filter(|entry| &entry.id == id).count() > 1
+            || invalid.iter().any(|entry| &entry.id == id);
+        if duplicated {
+            let entry = entries.remove(index);
+            invalid.push(InvalidEntry {
+                error: format!("another entry also claims {}", entry.id),
+                id: entry.id,
+                path: entry.path,
+            });
+        } else {
+            index += 1;
+        }
     }
     entries.sort_by(|a, b| (b.revision, &b.id).cmp(&(a.revision, &a.id)));
+    invalid.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((entries, invalid))
+}
+
+/// Read every CPS entry in `dir`, failing on the first invalid one.
+#[cfg(test)]
+pub(super) fn boot_entries(dir: &Path) -> Result<Vec<BootEntry>> {
+    let (entries, invalid) = read_entries(dir)?;
+    if let Some(entry) = invalid.first() {
+        anyhow::bail!(entry.describe());
+    }
     Ok(entries)
 }
 
@@ -609,16 +663,18 @@ fn boot_field<'a>(entry: &'a str, key: &str) -> Result<Option<&'a str>> {
     Ok(value)
 }
 
-pub(super) fn inventory(esp: &Path) -> Result<(Option<LoaderPolicy>, Vec<BootEntry>)> {
+pub(super) type Entries = (Vec<BootEntry>, Vec<InvalidEntry>);
+
+pub(super) fn inventory(esp: &Path) -> Result<(Option<LoaderPolicy>, Entries)> {
     let loader = esp.join("loader");
     if !directory_exists(&loader)? {
-        return Ok((None, Vec::new()));
+        return Ok((None, Default::default()));
     }
     let dir = loader.join("entries");
     let entries = if directory_exists(&dir)? {
-        boot_entries(&dir)?
+        read_entries(&dir)?
     } else {
-        Vec::new()
+        Default::default()
     };
     // Callers that need a selection report the missing `default` line.
     let policy = LoaderPolicy::read(&loader.join("loader.conf"))?;

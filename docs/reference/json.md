@@ -16,7 +16,7 @@ nothing matches.
 | `history`, `status` | Transactions, each with its `operation` and its `details`, which are `null` when another CPS version recorded them, or the image revision and its pending transaction. On the running system, `status` adds `running`, `next_boot`, `trial`, `publishers`, and `publisher_error` when publisher freshness cannot be read |
 | `config list` | `pending` vendor copies and `saved` local versions |
 | `publisher list` | An array of publishers: `name`, `repository` |
-| `boot list` | An array of boot environments |
+| `boot list` | An array of boot environments. `invalid` holds the reason an entry file cannot be read, and is `null` otherwise |
 | `image diff` | Both images' metadata and their package and path changes |
 | `upgrade --check` | The update report, with `status` and the package changes |
 | `recipe order` | An array of recipes, each with its packages and the recipes it follows |

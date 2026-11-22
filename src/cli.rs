@@ -4176,8 +4176,17 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
                     "ROOT PARTUUID"
                 };
                 println!("DEFAULT\tSTATUS\tID\t{header}\tTITLE\tNAME");
+                let mut problems = Vec::new();
                 for environment in environments {
                     let marker = if environment.is_default { "*" } else { "-" };
+                    if let Some(error) = environment.invalid {
+                        println!(
+                            "-\tinvalid\t{}\t-\t{}\t-",
+                            environment.id, environment.title
+                        );
+                        problems.push(format!("{}: {error}", environment.title));
+                        continue;
+                    }
                     let status = if environment.is_retiring {
                         "retiring".to_owned()
                     } else {
@@ -4200,6 +4209,9 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
                         environment.title,
                         environment.name.as_deref().unwrap_or("-")
                     );
+                }
+                for problem in problems {
+                    eprintln!("warning: unreadable boot entry {problem}");
                 }
             }
         }

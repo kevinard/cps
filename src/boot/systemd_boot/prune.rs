@@ -8,7 +8,7 @@ use rustix::fs::{CWD, FlockOperation, RenameFlags, renameat_with};
 use super::{
     Inventory, NO_SELECTION, destroy, inventory, lock_esp,
     policy::{BootEntry, LoaderPolicy},
-    rollback,
+    require_readable, rollback,
 };
 use crate::{
     boot::btrfs_boot::{BtrfsRecord, BtrfsVolume},
@@ -120,8 +120,11 @@ pub(crate) fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<Tria
         let Inventory {
             policy,
             entries,
+            invalid,
             firmware,
         } = inventory(&esp, &lock, false)?;
+        // The prune that follows needs every entry, so fail before cancelling.
+        require_readable(&invalid)?;
         // A verified firmware trial is already known-good and only awaits promotion.
         let booted = match &firmware {
             Some(firmware) => firmware.running_trial(&entries)?,
@@ -176,8 +179,10 @@ fn plan(
     let Inventory {
         policy,
         entries,
+        invalid,
         firmware,
     } = inventory(&esp, &lock, false)?;
+    require_readable(&invalid)?;
     let on_volume = |entry: &BootEntry| volume.has_fsid(&entry.btrfs.fsid);
     let subvolume = |entry: &BootEntry| entry.btrfs.subvolid;
     let mut planned: Vec<_> = destroy::pending(&esp)?
@@ -306,6 +311,7 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
         policy,
         entries,
         firmware,
+        ..
     } = inventory(&esp, &lock, false)?;
     ensure!(
         firmware.is_none(),
