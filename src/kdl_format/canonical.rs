@@ -85,9 +85,11 @@ fn indent(out: &mut String, depth: usize) {
 
 fn identifier(out: &mut String, name: &str) {
     let mut chars = name.chars();
-    let bare = chars
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
+    // KDL 2.0 reserves these words, so they cannot be bare identifiers.
+    let bare = !matches!(name, "true" | "false" | "null" | "inf" | "nan")
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if bare {
         out.push_str(name);
@@ -179,6 +181,15 @@ mod tests {
     #[test]
     fn canonical_text_parses_back_to_itself() -> Result<()> {
         let text = "a \"\\u{0}\\u{85}\\u{2028}\\u{feff}x\" \"\\\\\\\"\\b\\f\\r\"\n";
+        let doc = super::super::document(text)?;
+        assert_eq!(write(&doc)?, text);
+        assert_eq!(write(&super::super::document(&write(&doc)?)?)?, text);
+        Ok(())
+    }
+
+    #[test]
+    fn quotes_names_that_kdl_reserves() -> Result<()> {
+        let text = "\"null\" \"true\"=#false \"inf\"=1 \"nan\"=2 \"false\"=#null nul=3\n";
         let doc = super::super::document(text)?;
         assert_eq!(write(&doc)?, text);
         assert_eq!(write(&super::super::document(&write(&doc)?)?)?, text);
