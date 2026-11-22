@@ -4353,13 +4353,13 @@ fn image_rejects_catalog_replay_and_retired_signer_forks_without_cache_history()
     let error = apply(&f.root, &stale_plan).unwrap_err();
     assert!(format!("{error:#}").contains("publisher catalog rollback or fork"));
 
+    // The resumed install advanced the pin to the rotated trust root, so
+    // catalogs signed under the first one are refused before the replay
+    // check sees them.
     for (rejected, reason) in [
-        (&first, "publisher catalog rollback or fork"),
-        (&equal_fork, "publisher catalog rollback or fork"),
-        (
-            &higher_fork,
-            "release drops or changes the publisher trust root history",
-        ),
+        (&first, "older than the pinned version 2"),
+        (&equal_fork, "older than the pinned version 2"),
+        (&higher_fork, "older than the pinned version 2"),
     ] {
         fs::write(&current, rejected)?;
         let error = plan(&f.root, request.clone()).unwrap_err();

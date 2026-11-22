@@ -28,7 +28,11 @@ if [ -f "$work/git-phase" ]; then
         exec $bb reboot -f
     fi
     check_package tracked 'tracked initial' "$old"
-    cps upgrade --no-refresh --dry-run | $bb grep -Fx 'Nothing to do.'
+    # The Git publisher's catalog advanced in the trial, so the plan may
+    # advance its checkpoint, but no package changes.
+    cps upgrade --no-refresh --dry-run > /run/git-dry-run 2>&1
+    $bb cat /run/git-dry-run
+    if $bb grep -E '^(Install|Update|Remove) ' /run/git-dry-run; then exit 1; fi
     rewritten=$(git -C "$tracked" -c user.name='CPS Test' -c user.email=test@example.invalid \
         commit-tree 'HEAD^{tree}' -m rewrite)
     git -C "$tracked" update-ref refs/heads/main "$rewritten"
