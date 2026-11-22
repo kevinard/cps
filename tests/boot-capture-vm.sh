@@ -617,7 +617,7 @@ if [ -f /etc/cps-btrfs-boot ]; then
         --esp /efi --root-partuuid "$root_uuid" > /tmp/rejected 2>&1; then exit 1; fi
     $bb grep -F 'top-level subvolume' /tmp/rejected
     test "$(sha256sum /efi/loader/loader.conf)" = "$before"
-    cps mark --root /volume/@captures/trial/root -n --save-plan /tmp/mark.json explicit test/live-root
+    cps mark --root /volume/@captures/trial/root -n --save-plan /tmp/mark.json automatic test/live-root
     staged_state=$(sha256sum "/volume/@captures/trial/root/$state_dir/state.sqlite")
     $bb mkfifo /tmp/release
     flock --shared "/volume/@captures/trial/root/$state_dir/lock" sh -c ': > /tmp/locked; read released < /tmp/release' &
@@ -626,9 +626,12 @@ if [ -f /etc/cps-btrfs-boot ]; then
     cps apply --root /volume/@captures/trial/root /tmp/mark.json > /tmp/race-rejected 2>&1 &
     applying=$!
     attempts=0
-    while ! $bb grep -q locks "/proc/$applying/wchan"; do
+    while ! $bb grep -q locks "/proc/$applying/wchan" 2>/dev/null; do
         attempts=$((attempts + 1))
-        test "$attempts" -lt 1000
+        if [ "$attempts" -ge 1000 ] || [ ! -e "/proc/$applying" ]; then
+            $bb cat /tmp/race-rejected
+            exit 1
+        fi
         $bb sleep 0.01
     done
     cps boot activate --root /volume/@captures/trial/root --btrfs-volume /volume \
