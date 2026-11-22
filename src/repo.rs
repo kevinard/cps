@@ -422,7 +422,7 @@ impl Catalog {
             let bytes = shard.encode()?;
             let hash = store(repo, SHARD_OBJECTS, &bytes)?;
             let shard = Arc::new(shard);
-            shards::remember(&hash, shard.clone());
+            shards::remember(&hash, shard.clone(), bytes.len() as u64);
             self.layout.committed.insert(prefix.clone(), hash);
             self.layout.loaded.insert(prefix, shard);
         }
