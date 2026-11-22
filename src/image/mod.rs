@@ -13,7 +13,7 @@ pub(crate) use adopt::adopt_image;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, DirBuilder, File, OpenOptions},
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -54,6 +54,9 @@ const IMAGE_SCHEMA_VERSION: i32 = 1;
 /// while `/var` can be a separate mount shared by every environment.
 pub(crate) const STATE_DIRECTORY: &str = "usr/lib/sysimage/cps";
 pub(crate) const STATE_ANCESTORS: &[&str] = &["usr", "usr/lib", "usr/lib/sysimage"];
+/// Marks an unfinished adoption of the image by root.
+const ADOPTING: &str = "adopting";
+
 /// The files in the image state that control it: the lock, the database,
 /// and the rollback journal and WAL files SQLite may keep beside it.
 const STATE_FILES: &[&str] = &[
@@ -1145,18 +1148,25 @@ impl Image {
             _lock: lock,
         };
         let settings = image.settings()?;
+        let adopting = image.adoption()?;
         match owner {
+            StateOwner::Caller if adopting.is_some() => anyhow::bail!(
+                "root's adoption of this image did not finish; run `cps image adopt` on it again"
+            ),
             StateOwner::Caller if settings.ownership() == Ownership::Creator => image
                 .root
                 .accounts()
                 .map_to_creator(settings.uid, settings.gid),
             StateOwner::Caller => {}
             StateOwner::Adopting => {
-                ensure!(settings.uid != 0, "the image already belongs to root");
-                image
-                    .root
-                    .accounts()
-                    .adopt_from_creator(settings.uid, settings.gid);
+                let (uid, gid) = match adopting {
+                    Some(creator) => creator,
+                    None => {
+                        ensure!(settings.uid != 0, "the image already belongs to root");
+                        (settings.uid, settings.gid)
+                    }
+                };
+                image.root.accounts().adopt_from_creator(uid, gid);
             }
         }
         Ok(image)
@@ -1386,6 +1396,47 @@ impl Image {
         record
             .map(|json| Ok(serde_json::from_str(&json)?))
             .transpose()
+    }
+
+    /// The creator's user and group while root's adoption of the image is
+    /// unfinished. The marker is written before adoption changes any owner
+    /// and removed once the image records root as its owner.
+    pub(crate) fn adoption(&self) -> Result<Option<(u32, u32)>> {
+        let text = match self.state_dir.read_file(ADOPTING) {
+            Ok(bytes) => String::from_utf8(bytes)?,
+            Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let creator = text
+            .trim()
+            .split_once(':')
+            .and_then(|(uid, gid)| Some((uid.parse().ok()?, gid.parse().ok()?)))
+            .with_context(|| format!("invalid adoption marker {text:?}"))?;
+        Ok(Some(creator))
+    }
+
+    /// Record durably that root is adopting the creator's image.
+    pub(crate) fn begin_adoption(&self, (uid, gid): (u32, u32)) -> Result<()> {
+        let directory = Root::fd_path(self.state_dir.as_file());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(ADOPTING))?;
+        std::io::Write::write_all(&mut file, format!("{uid}:{gid}\n").as_bytes())?;
+        file.sync_all()?;
+        self.state_dir.as_file().sync_all()?;
+        Ok(())
+    }
+
+    /// Remove the adoption marker once the adoption is recorded.
+    pub(crate) fn finish_adoption(&self) -> Result<()> {
+        match rustix::fs::unlinkat(self.state_dir.as_file(), ADOPTING, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.state_dir.as_file().sync_all()?;
+        Ok(())
     }
 
     /// Record that root adopted the image: its settings with root as owner,

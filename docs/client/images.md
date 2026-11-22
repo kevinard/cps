@@ -490,14 +490,17 @@ sudo cps image adopt --root /
 ```
 
 Adoption first checks that the packages' files still match their
-manifests, with `verify --quick` semantics. It then hands every path that
-the user owns on the image's own filesystem to root, keeping set-ID bits
-and file capabilities. Mounted filesystems and nested subvolumes, such as a
-shared `/var`, are left alone. It runs `systemd-sysusers` when the packages
-name accounts that the image does not have yet, gives each package path the
-owner and group its manifest names, and records root as the image's owner.
-An interrupted adoption leaves the image the user's; run the command again
-to finish it. Adopt before staging changes or capturing environments from
+manifests, with `verify --quick` semantics, and then records in the image
+state that root is adopting it. It hands every path that the user owns on
+the image's own filesystem to root, keeping set-ID bits and file
+capabilities. Mounted filesystems and nested subvolumes, such as a shared
+`/var`, are left alone. It runs `systemd-sysusers` when the packages name
+accounts that the image does not have yet, and gives each package path that
+exists the owner and group its manifest names. It then verifies every
+package path against those owners, hashing each file whose owner changed,
+records root as the image's owner, and removes the marker. While the marker
+remains, for example after a crash or a failed check, CPS refuses the image
+for every other command; run `cps image adopt` again to finish. Adopt before staging changes or capturing environments from
 the image, because snapshots taken earlier stay the user's.
 
 `/var` is not part of an image. `cps image create` makes `var` an empty

@@ -215,6 +215,20 @@ fn check_image(image: &Image, pristine: bool, quick: bool) -> Result<Vec<Finding
     Ok(check_state(&image.root, &state, pristine, contents, committed, |_| true)?.findings)
 }
 
+/// Check an image's files against `state`, which need not be committed yet,
+/// hashing every file whose recorded fingerprint no longer matches.
+pub(crate) fn check_uncommitted(image: &Image, state: &State) -> Result<Checked> {
+    let records = image.file_records(None)?;
+    check_state(
+        &image.root,
+        state,
+        false,
+        Contents::Fingerprints(&records),
+        Some(&state.installed),
+        |_| true,
+    )
+}
+
 /// Compute the ownership index from the installed manifests, re-verifying
 /// every stored manifest against its signed KDL document and digest.
 pub(crate) fn manifest_paths(state: &State) -> Result<BTreeMap<String, Managed>> {

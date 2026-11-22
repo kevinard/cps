@@ -36,7 +36,7 @@ use rustix::{
 use super::{
     Image,
     accounts::ROOT,
-    root::{Fingerprint, Observation, Root, settle},
+    root::{Root, settle},
 };
 use crate::model::Node;
 
@@ -48,25 +48,37 @@ pub(crate) fn adopt_image(path: &Path) -> Result<u32> {
     let path = fs::canonicalize(path).with_context(|| format!("opening {}", path.display()))?;
     let mut image = Image::open_for_adoption(Root::open(&path)?)?;
     image.require_clean()?;
-    // Root vouches for the image from now on, so its packages' files must
-    // still be what they installed.
-    crate::verify::require_quick(&image).context("checking the image before adopting it")?;
     let state = image.state()?;
-    let creator = (state.settings.uid, state.settings.gid);
+    let resumed = image.adoption()?;
+    let creator = resumed.unwrap_or((state.settings.uid, state.settings.gid));
+    if resumed.is_some() && state.settings.uid == 0 {
+        // The adoption was recorded; only its marker remained.
+        image.finish_adoption()?;
+        return Ok(creator.0);
+    }
+    if resumed.is_none() {
+        // Check before changing anything, so a damaged image fails while it
+        // is still the creator's. The final check below is what root trusts.
+        crate::verify::require_quick(&image).context("checking the image before adopting it")?;
+        image.begin_adoption(creator)?;
+    }
     let records = image.file_records(None)?;
 
+    // Every step below can run again: an owner that is already root's or
+    // already the one a manifest names is left as it is.
     let device = image.root.as_file().metadata()?.dev();
     hand_over_tree(image.root.as_file(), creator, device)?;
     let info = fstat(image.root.as_file())?;
     hand_over_entry(image.root.as_file(), None, &info, creator)?;
 
-    let mut settings = state.settings.clone();
-    settings.uid = 0;
-    settings.gid = 0;
-    let paths = crate::plan::effective_paths(&settings, &state.installed)?;
+    let mut adopted = state.clone();
+    adopted.settings.uid = 0;
+    adopted.settings.gid = 0;
+    adopted.paths = crate::plan::effective_paths(&adopted.settings, &adopted.installed)?;
     let accounts = image.root.accounts();
     accounts.map_by_name();
-    let unresolved = paths
+    let unresolved = adopted
+        .paths
         .values()
         .filter_map(|managed| managed.node.ownership())
         .any(|(owner, group)| accounts.ids(owner, group).is_err());
@@ -74,8 +86,10 @@ pub(crate) fn adopt_image(path: &Path) -> Result<u32> {
         crate::systemd::create_all_accounts(&path, path == Path::new("/"))
             .context("creating the accounts that the image's packages name")?;
     }
-    for (name, managed) in &paths {
-        if managed.implicit {
+    for (name, managed) in &adopted.paths {
+        // A path that verification allows to be missing, such as a removed
+        // preserved file, has no owner to set.
+        if managed.implicit || !image.root.exists(name)? {
             continue;
         }
         set_owner(&image.root, name, &managed.node)
@@ -83,43 +97,26 @@ pub(crate) fn adopt_image(path: &Path) -> Result<u32> {
     }
     image.root.sync()?;
 
-    // The files kept their contents, which the check above verified, so
-    // their fingerprints only need their new owners. A fingerprint must
-    // settle before it is recorded.
+    // Check every package path against root's ownership. Every file whose
+    // owner changed is hashed again, and its new fingerprint is recorded
+    // once it has settled.
     std::thread::sleep(settle());
-    let mut observed = BTreeMap::new();
-    for (name, record) in records {
-        let Some(managed) = paths.get(&name) else {
-            continue;
-        };
-        if matches!(
-            &managed.node,
-            Node::File {
-                capabilities: Some(_),
-                ..
-            }
-        ) {
-            continue;
-        }
-        let Some(file) = image.root.regular_entry(&name)? else {
-            continue;
-        };
-        let fingerprint = Fingerprint::of(&fstat(&file)?);
-        let before = &record.observation.fingerprint;
-        if (fingerprint.ino, fingerprint.size, fingerprint.mtime_ns)
-            == (before.ino, before.size, before.mtime_ns)
-            && fingerprint.is_settled()
-        {
-            observed.insert(
-                name,
-                Observation {
-                    fingerprint,
-                    ..record.observation
-                },
-            );
-        }
+    let checked = crate::verify::check_uncommitted(&image, &adopted)?;
+    if let Some(finding) = checked.errors().next() {
+        anyhow::bail!(
+            "the adopted image does not match its packages: {}; repair it as its creator, or \
+             fix it and run `cps image adopt` again",
+            finding.message
+        );
     }
-    image.record_adoption(&settings, &paths, &observed)?;
+    let mut observed: BTreeMap<_, _> = records
+        .into_iter()
+        .filter(|(name, _)| !checked.stale.contains(name) && adopted.paths.contains_key(name))
+        .map(|(name, record)| (name, record.observation))
+        .collect();
+    observed.extend(checked.observed);
+    image.record_adoption(&adopted.settings, &adopted.paths, &observed)?;
+    image.finish_adoption()?;
     Ok(creator.0)
 }
 

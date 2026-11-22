@@ -188,11 +188,6 @@ impl Fingerprint {
     fn settled(&self, now: i64) -> bool {
         self.ctime_ns < now.saturating_sub(settled_ns())
     }
-
-    /// Whether this fingerprint is old enough to record.
-    pub(crate) fn is_settled(&self) -> bool {
-        self.settled(now_ns())
-    }
 }
 
 /// A regular file's hashed node and the fingerprint the file had while CPS
@@ -471,6 +466,16 @@ impl Root {
         validate_path(path)?;
         self.inspect_inner(path)
             .with_context(|| format!("inspecting {path}"))
+    }
+
+    /// Whether `path` exists beneath the root, without following a link.
+    pub(crate) fn exists(&self, path: &str) -> Result<bool> {
+        validate_path(path)?;
+        match self.open_relative(path, OFlags::PATH | OFlags::NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(Errno::NOENT | Errno::NOTDIR) => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("checking {path}")),
+        }
     }
 
     pub(crate) fn regular_entry(&self, path: &str) -> Result<Option<File>> {
