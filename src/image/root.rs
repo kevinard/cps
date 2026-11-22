@@ -20,7 +20,7 @@ use rustix::{
         symlinkat, unlinkat,
     },
     io::Errno,
-    process::{Gid, Uid},
+    process::{Gid, Uid, geteuid},
 };
 
 use super::{STATE_ANCESTORS, STATE_DIRECTORY, accounts::Accounts};
@@ -68,6 +68,72 @@ pub(crate) struct Fingerprint {
     pub(crate) gid: u32,
 }
 
+/// Who may own the paths that control an image: its root directory, the
+/// directories above its state, the state itself, its lock and database.
+///
+/// CPS reads an image's publishers, trust roots and pending transaction as
+/// the configuration of whoever runs it, so it trusts only an image that the
+/// same user owns and no other user can change. Root therefore never reads
+/// state that an unprivileged user could have written; it takes such an
+/// image over explicitly with `cps image adopt`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StateOwner {
+    /// The user running CPS.
+    Caller,
+    /// Root adopting an image that one unprivileged user created. An
+    /// interrupted adoption leaves some paths owned by root already.
+    Adopting,
+}
+
+impl StateOwner {
+    pub(crate) fn checker(self) -> OwnerCheck {
+        OwnerCheck {
+            owner: self,
+            caller: geteuid().as_raw(),
+            creator: None,
+        }
+    }
+}
+
+/// Checks the owner and mode of each control path of one image.
+pub(crate) struct OwnerCheck {
+    owner: StateOwner,
+    caller: u32,
+    creator: Option<u32>,
+}
+
+impl OwnerCheck {
+    pub(crate) fn check(&mut self, what: &str, metadata: &fs::Metadata) -> Result<()> {
+        let uid = metadata.uid();
+        match self.owner {
+            StateOwner::Caller if uid != self.caller && self.caller == 0 => anyhow::bail!(
+                "{what} belongs to UID {uid}, not root. Root uses only images that root owns; \
+                 hand this one to root with `cps image adopt`"
+            ),
+            StateOwner::Caller => ensure!(
+                uid == self.caller,
+                "{what} belongs to UID {uid}; CPS uses only images that the user running it \
+                 (UID {}) owns",
+                self.caller
+            ),
+            StateOwner::Adopting => {
+                if uid != 0 {
+                    let creator = *self.creator.get_or_insert(uid);
+                    ensure!(
+                        uid == creator,
+                        "{what} belongs to UID {uid}, but the image belongs to UID {creator}"
+                    );
+                }
+            }
+        }
+        ensure!(
+            metadata.mode() & 0o022 == 0,
+            "{what} is writable by its group or by other users"
+        );
+        Ok(())
+    }
+}
+
 // A fingerprint is only recorded once its ctime is older than this margin
 // at hashing time. Filesystems take ctime from a coarse clock, so a change
 // in the same clock tick as a recent write could otherwise keep the old
@@ -85,6 +151,12 @@ fn settled_ns() -> i64 {
     return TEST_SETTLED_NS.with(std::cell::Cell::get);
     #[cfg(not(test))]
     SETTLED_NS
+}
+
+/// How long after a change a fingerprint becomes safe to record.
+#[allow(clippy::cast_sign_loss)]
+pub(crate) fn settle() -> std::time::Duration {
+    std::time::Duration::from_nanos(settled_ns() as u64 + 1)
 }
 
 fn now_ns() -> i64 {
@@ -115,6 +187,11 @@ impl Fingerprint {
 
     fn settled(&self, now: i64) -> bool {
         self.ctime_ns < now.saturating_sub(settled_ns())
+    }
+
+    /// Whether this fingerprint is old enough to record.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.settled(now_ns())
     }
 }
 
@@ -272,22 +349,33 @@ impl Root {
         &self.accounts
     }
 
+    /// Open the image state of a root that the user running CPS owns.
     pub(crate) fn open_image_state(&self) -> Result<Self> {
+        self.open_image_state_for(StateOwner::Caller)
+    }
+
+    /// Open the image state, checking that every directory that controls it
+    /// belongs to the owners `owner` accepts and that no one else can write it.
+    pub(crate) fn open_image_state_for(&self, owner: StateOwner) -> Result<Self> {
         let state = self.subdir(STATE_DIRECTORY).with_context(|| {
             format!("opening image state under /{STATE_DIRECTORY} on the image filesystem")
         })?;
         let metadata = state.as_file().metadata()?;
-        let device = self.file.metadata()?.dev();
+        let stage = state.dir("stage")?.metadata()?;
+        let image = self.file.metadata()?;
         ensure!(
-            metadata.dev() == device && state.dir("stage")?.metadata()?.dev() == device,
+            metadata.dev() == image.dev() && stage.dev() == image.dev(),
             "image state and staging must be on the image's own filesystem and subvolume"
         );
+        let mut control = vec![("the image root".to_owned(), image)];
         for &ancestor in STATE_ANCESTORS {
-            let parent = self.dir(ancestor)?.metadata()?;
-            ensure!(
-                parent.uid() == metadata.uid() && parent.mode() & 0o022 == 0,
-                "unsafe image state ancestor {ancestor}"
-            );
+            control.push((format!("/{ancestor}"), self.dir(ancestor)?.metadata()?));
+        }
+        control.push((format!("/{STATE_DIRECTORY}"), metadata));
+        control.push((format!("/{STATE_DIRECTORY}/stage"), stage));
+        let mut checker = owner.checker();
+        for (what, metadata) in &control {
+            checker.check(what, metadata)?;
         }
         Ok(state)
     }
@@ -884,6 +972,20 @@ impl Root {
             Err(Errno::NOTEMPTY | Errno::EXIST | Errno::BUSY) => Ok(false),
             Err(error) => Err(error).with_context(|| format!("pruning directory {path}")),
         }
+    }
+
+    /// Change the owner of a symbolic link, which has no mode of its own.
+    pub(crate) fn set_link_owner(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
+        validate_path(path)?;
+        let (parent, leaf) = self.parent(path)?;
+        rustix::fs::chownat(
+            &parent,
+            leaf,
+            Some(Uid::from_raw(uid)),
+            Some(Gid::from_raw(gid)),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn set_directory_metadata(&self, file: &File, node: &Node) -> Result<()> {

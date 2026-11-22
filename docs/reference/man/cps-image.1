@@ -10,6 +10,9 @@
 .B \&create
 \&Initialize an empty directory as an image
 .TP
+.B \&adopt
+\&Hand an image that an unprivileged user built to root
+.TP
 .B \&diff
 \&Compare committed package state between two roots, offline
 .TP
@@ -68,6 +71,18 @@
 .TP
 .B \&\-\-variant <NAME=VALUE>
 \&Set a variant other than arch, such as container=true
+.TP
+.B \&\-h, \-\-help
+\&Print help
+.SS "\&cps image adopt"
+\&Hand an image that an unprivileged user built to root
+.PP
+.B \&cps image adopt \-\-root <IMAGE>
+.PP
+.B Options
+.TP
+.B \&\-\-root <IMAGE>
+\&Image to adopt, such as / on a system booted from a disk that a user built
 .TP
 .B \&\-h, \-\-help
 \&Print help

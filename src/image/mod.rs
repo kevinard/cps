@@ -1,4 +1,5 @@
 pub(crate) mod accounts;
+mod adopt;
 mod builds;
 mod catalogs;
 pub(crate) mod diff;
@@ -7,10 +8,12 @@ pub(crate) mod lock;
 pub(crate) mod publishers;
 pub(crate) mod root;
 
+pub(crate) use adopt::adopt_image;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, DirBuilder, File, OpenOptions},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -18,12 +21,13 @@ use anyhow::{Context, Result, ensure};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 use rustix::{
-    fs::{FlockOperation, RenameFlags, flock, renameat_with},
+    fs::{AtFlags, FileType, FlockOperation, RenameFlags, flock, renameat_with, statat},
+    io::Errno,
     process::{getegid, geteuid},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use self::root::{Fingerprint, Observation, Root};
+use self::root::{Fingerprint, Observation, Root, StateOwner};
 use crate::{
     attestation::BuildTrust,
     file_caps::FileCapabilities,
@@ -50,6 +54,15 @@ const IMAGE_SCHEMA_VERSION: i32 = 1;
 /// while `/var` can be a separate mount shared by every environment.
 pub(crate) const STATE_DIRECTORY: &str = "usr/lib/sysimage/cps";
 pub(crate) const STATE_ANCESTORS: &[&str] = &["usr", "usr/lib", "usr/lib/sysimage"];
+/// The files in the image state that control it: the lock, the database,
+/// and the rollback journal and WAL files SQLite may keep beside it.
+const STATE_FILES: &[&str] = &[
+    "lock",
+    "state.sqlite",
+    "state.sqlite-journal",
+    "state.sqlite-wal",
+    "state.sqlite-shm",
+];
 pub(crate) const CONFIG_UPDATES_DIRECTORY: &str = "usr/lib/sysimage/cps/config-updates";
 /// The mount point of `/var`. Packages never ship anything at or below it.
 /// An image starts with it as an empty directory, and tmpfiles.d and
@@ -91,8 +104,10 @@ pub(crate) struct Settings {
     pub variants: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) mediators: BTreeMap<String, String>,
-    /// The user and group that created the image. A user other than root
-    /// owns every file of its image; see [`Settings::ownership`].
+    /// The user and group that own the image state. A user other than root
+    /// owns every file of its image; see [`Settings::ownership`]. An opened
+    /// image takes them from the state directory, which must belong to the
+    /// user running CPS.
     pub uid: u32,
     pub gid: u32,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -680,6 +695,9 @@ pub(crate) struct Image {
     db: Connection,
     pub root: Root,
     pub(crate) state_dir: Root,
+    /// The user and group that own the image state, which replace the
+    /// recorded ones in its settings. `None` while root adopts the image.
+    owner: Option<(u32, u32)>,
 
     _lock: File,
 }
@@ -986,6 +1004,17 @@ impl Image {
         )
     }
 
+    /// Open an image that an unprivileged user created, for root to adopt.
+    pub(crate) fn open_for_adoption(root: Root) -> Result<Self> {
+        Self::open_owned(
+            root,
+            true,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            false,
+            StateOwner::Adopting,
+        )
+    }
+
     pub(crate) fn open_query(path: &Path) -> Result<Self> {
         Self::open_query_root(Root::open(path)?)
     }
@@ -1029,7 +1058,39 @@ impl Image {
         flags: rusqlite::OpenFlags,
         package_write: bool,
     ) -> Result<Self> {
-        let state_dir = root.open_image_state()?;
+        Self::open_owned(root, exclusive, flags, package_write, StateOwner::Caller)
+    }
+
+    fn open_owned(
+        root: Root,
+        exclusive: bool,
+        flags: rusqlite::OpenFlags,
+        package_write: bool,
+        owner: StateOwner,
+    ) -> Result<Self> {
+        let state_dir = root.open_image_state_for(owner)?;
+        // The lock, the database and the files SQLite keeps beside it control
+        // the image as much as the directories above them.
+        let mut checker = owner.checker();
+        for &name in STATE_FILES {
+            match statat(state_dir.as_file(), name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(info) => {
+                    ensure!(
+                        FileType::from_raw_mode(info.st_mode) == FileType::RegularFile,
+                        "/{STATE_DIRECTORY}/{name} is not a regular file"
+                    );
+                    let metadata =
+                        fs::symlink_metadata(Root::fd_path(state_dir.as_file()).join(name))?;
+                    checker.check(&format!("/{STATE_DIRECTORY}/{name}"), &metadata)?;
+                }
+                Err(Errno::NOENT) if !matches!(name, "lock" | "state.sqlite") => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("checking /{STATE_DIRECTORY}/{name}"));
+                }
+            }
+        }
+        let state_metadata = state_dir.as_file().metadata()?;
         let lock = state_dir.file("lock")?;
         flock(
             &lock,
@@ -1066,15 +1127,25 @@ impl Image {
             root,
             db,
             state_dir,
+            owner: (owner == StateOwner::Caller)
+                .then(|| (state_metadata.uid(), state_metadata.gid())),
 
             _lock: lock,
         };
         let settings = image.settings()?;
-        if settings.ownership() == Ownership::Creator {
-            image
+        match owner {
+            StateOwner::Caller if settings.ownership() == Ownership::Creator => image
                 .root
                 .accounts()
-                .map_to_creator(settings.uid, settings.gid);
+                .map_to_creator(settings.uid, settings.gid),
+            StateOwner::Caller => {}
+            StateOwner::Adopting => {
+                ensure!(settings.uid != 0, "the image already belongs to root");
+                image
+                    .root
+                    .accounts()
+                    .adopt_from_creator(settings.uid, settings.gid);
+            }
         }
         Ok(image)
     }
@@ -1113,7 +1184,13 @@ impl Image {
     }
 
     pub(crate) fn settings(&self) -> Result<Settings> {
-        let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
+        let mut settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
+        // Ownership follows the image state on disk, so an image that root
+        // adopted is root's even before its settings are written again.
+        if let Some((uid, gid)) = self.owner {
+            settings.uid = uid;
+            settings.gid = gid;
+        }
         ensure!(settings.format == IMAGE_FORMAT, "unsupported image format");
         ensure!(
             settings
@@ -1297,6 +1374,33 @@ impl Image {
         record
             .map(|json| Ok(serde_json::from_str(&json)?))
             .transpose()
+    }
+
+    /// Record that root adopted the image: its settings with root as owner,
+    /// the path index under named ownership, and the fingerprints of files
+    /// whose contents adoption left alone.
+    pub(crate) fn record_adoption(
+        &mut self,
+        settings: &Settings,
+        paths: &BTreeMap<String, Managed>,
+        observed: &BTreeMap<String, Observation>,
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE image SET data=?1 WHERE id=1",
+            [serde_json::to_string(settings)?],
+        )?;
+        tx.execute("DELETE FROM paths", [])?;
+        {
+            let mut insert = tx.prepare("INSERT INTO paths VALUES (?1, ?2)")?;
+            for (path, managed) in paths {
+                insert.execute(params![path, serde_json::to_string(managed)?])?;
+            }
+        }
+        tx.execute("DELETE FROM files", [])?;
+        save_file_records(&tx, observed, &BTreeSet::new())?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn require_clean(&self) -> Result<()> {

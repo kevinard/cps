@@ -65,7 +65,10 @@ mount another filesystem at `/var`, or none.
 The image keeps owners, modes, links, extended attributes, and timestamps
 from the directory. Run as root to give the files their declared owners.
 An unprivileged caller can only build roots whose files it owns, as the VM
-tests do. The environments directory must be owned by root and writable only
+tests do. Such a root still belongs to that user after it boots, and CPS
+running as root refuses it until root
+[adopts it](../client/images.md#who-may-use-an-image) with
+`cps image adopt --root /` on the first boot. The environments directory must be owned by root and writable only
 by root on the installed system.
 
 ## Prepare the disk template

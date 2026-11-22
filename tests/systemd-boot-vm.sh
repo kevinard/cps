@@ -1011,6 +1011,8 @@ reject() {
 }
 $bb chown 0:0 /volume/@environments
 $bb chmod 0755 /volume/@environments
+# The host built the base root without privileges; root adopts it once.
+cps image adopt --root /volume/@
 cps boot list --esp /efi
 if [ "$mode" = rollback ]; then
     # Pin the base, so the trial is selected with `preferred`.

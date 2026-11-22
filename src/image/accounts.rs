@@ -56,6 +56,9 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 pub(crate) struct Accounts {
     base: File,
     creator: Cell<Option<(u32, u32)>>,
+    /// Root is adopting the creator's image, so files that an interrupted
+    /// adoption already handed to root read back as the creator's.
+    adopting: Cell<bool>,
     database: RefCell<Option<Database>>,
 }
 
@@ -86,6 +89,7 @@ impl Accounts {
         Self {
             base,
             creator: Cell::new(None),
+            adopting: Cell::new(false),
             database: RefCell::new(None),
         }
     }
@@ -93,6 +97,19 @@ impl Accounts {
     /// Map every account to the unprivileged user that created the image.
     pub(crate) fn map_to_creator(&self, uid: u32, gid: u32) {
         self.creator.set(Some((uid, gid)));
+    }
+
+    /// Map accounts as for the creator's image while root adopts it, also
+    /// reading root's IDs back as `root`.
+    pub(crate) fn adopt_from_creator(&self, uid: u32, gid: u32) {
+        self.map_to_creator(uid, gid);
+        self.adopting.set(true);
+    }
+
+    /// Resolve names against the image's account database from now on.
+    pub(crate) fn map_by_name(&self) {
+        self.creator.set(None);
+        self.adopting.set(false);
     }
 
     /// The numeric IDs of an owner and group name.
@@ -111,8 +128,9 @@ impl Accounts {
     /// The owner and group names of numeric IDs.
     pub(crate) fn names(&self, uid: u32, gid: u32) -> Result<(String, String)> {
         if let Some((owner, group)) = self.creator.get() {
+            let adopting = self.adopting.get();
             let name = |id: u32, expected: u32| {
-                if id == expected {
+                if id == expected || (adopting && id == 0) {
                     ROOT.to_owned()
                 } else {
                     id.to_string()

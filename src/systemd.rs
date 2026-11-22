@@ -420,6 +420,11 @@ pub(crate) fn create_accounts(
     )
 }
 
+/// Create every account that the image's sysusers.d configuration declares.
+pub(crate) fn create_all_accounts(path: &Path, live: bool) -> Result<()> {
+    run_tool(&mut command("systemd-sysusers", path), "sysusers", live)
+}
+
 pub(crate) fn run(
     root: &Root,
     path: &Path,

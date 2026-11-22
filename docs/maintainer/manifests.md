@@ -564,7 +564,8 @@ in the image's database never matches a manifest.
 An image that a user creates without root privileges cannot give files to
 other accounts. CPS writes every file of such an image as that user, as if a
 user namespace mapped every account to them, and `verify` checks that mapping
-instead of the names.
+instead of the names. Root gives the files their manifest owners when it
+[adopts](../client/images.md#who-may-use-an-image) the image.
 [sysusers.d](https://www.freedesktop.org/software/systemd/man/latest/sysusers.d.html) ·
 [UIDs and GIDs in systemd](https://systemd.io/UIDS-GIDS/)
 

@@ -708,6 +708,12 @@ enum ImageCommand {
         #[arg(long, value_name = "NAME=VALUE")]
         variant: Vec<String>,
     },
+    /// Hand an image that an unprivileged user built to root
+    Adopt {
+        /// Image to adopt, such as / on a system booted from a disk that a user built
+        #[arg(long, value_name = "IMAGE")]
+        root: PathBuf,
+    },
     /// Compare committed package state between two roots, offline
     Diff {
         /// Include managed file actions and ownership
@@ -4061,6 +4067,10 @@ fn run_image(command: ImageCommand) -> Result<Exit> {
             {
                 return Ok(Exit::Found);
             }
+        }
+        ImageCommand::Adopt { root } => {
+            let uid = crate::image::adopt_image(&root)?;
+            println!("Adopted {} from UID {uid}", root.display());
         }
         ImageCommand::Lock { image, export } => {
             if let Some(output) = export {

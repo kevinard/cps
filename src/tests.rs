@@ -4583,6 +4583,45 @@ fn a_mediated_link_conflicts_with_a_plain_path_whichever_provider_wins() -> Resu
     Ok(())
 }
 
+#[test]
+fn image_state_that_another_user_could_change_is_refused() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new()?;
+    f.create()?;
+    let state = f.root.join("usr/lib/sysimage/cps");
+    let refused = |expected: &str| {
+        let Err(error) = crate::image::Image::open_query(&f.root) else {
+            panic!("opened an image whose state {expected}");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains(expected), "{message}");
+    };
+    fs::set_permissions(
+        state.join("state.sqlite"),
+        fs::Permissions::from_mode(0o664),
+    )?;
+    refused("state.sqlite is writable by its group or by other users");
+    fs::set_permissions(
+        state.join("state.sqlite"),
+        fs::Permissions::from_mode(0o644),
+    )?;
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o777))?;
+    refused("/usr/lib/sysimage/cps is writable by its group or by other users");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+    std::os::unix::fs::symlink("state.sqlite", state.join("state.sqlite-wal"))?;
+    refused("state.sqlite-wal is not a regular file");
+    fs::remove_file(state.join("state.sqlite-wal"))?;
+    crate::image::Image::open_query(&f.root)?;
+    if !rustix::process::geteuid().is_root() {
+        let error = crate::image::adopt_image(&f.root).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("only root can adopt"),
+            "{error:#}"
+        );
+    }
+    Ok(())
+}
+
 mod release;
 mod transitions;
 

@@ -447,6 +447,16 @@ if [ -f /etc/cps-btrfs-boot ]; then
     boot_files=$(sha256sum /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI)
     boot_paths=$(find /boot /efi -print)
 fi
+# The host built this root without privileges, so it belongs to that user.
+# Root refuses it until it adopts it.
+if cps verify --root / > /tmp/unadopted 2>&1; then
+    echo 'Root used an image that another user owns'
+    exit 1
+fi
+$bb grep -F 'cps image adopt' /tmp/unadopted
+cps image adopt --root /
+test "$($bb stat -c %u:%g /usr/lib/sysimage/cps /usr/bin/cps | $bb sort -u)" = 0:0
+cps verify --root /
 if [ -f /etc/cps-btrfs-trial-kernel ]; then
     cps publisher set-repository --root / --repo test=/repository --repo canopa-kernel=/kernel-repository
 else
