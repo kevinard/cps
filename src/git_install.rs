@@ -7,6 +7,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -23,7 +24,7 @@ use crate::{
         snapshot::{ARCHIVE, archive_commit, checkout, git, object_format},
     },
     fetch_sources_with_local,
-    image::root::Root,
+    image::{accounts::Accounts, root::Root},
     kdl_format::{
         build::{
             RECIPE_LIMIT, git_document, git_toolchain_template, parse as parse_recipe,
@@ -128,6 +129,13 @@ impl GitSignatures {
     fn verify(&self, url: &OsStr, clone: &Path, commit: &str) -> Result<()> {
         self.check_file()?;
         let keyring = tempfile::tempdir()?;
+        fs::set_permissions(keyring.path(), fs::Permissions::from_mode(0o700))?;
+        // The build account verifies signatures too, from a copy of the
+        // signers file that only the CPS account can change.
+        let allowed_signers = keyring.path().join("allowed-signers");
+        fs::copy(&self.allowed_signers, &allowed_signers)?;
+        fs::set_permissions(&allowed_signers, fs::Permissions::from_mode(0o644))?;
+        give_to_builder(keyring.path())?;
         let verifier = || -> Command {
             let mut command = install_git();
             command.arg("-C").arg(clone);
@@ -137,7 +145,7 @@ impl GitSignatures {
                         .args(["-c", "gpg.format=ssh", "-c"])
                         .arg(format!(
                             "gpg.ssh.allowedSignersFile={}",
-                            self.allowed_signers.display()
+                            allowed_signers.display()
                         ))
                         .args(["-c", "gpg.minTrustLevel=fully"]);
                 }
@@ -152,11 +160,10 @@ impl GitSignatures {
             command
         };
         if self.format == GitSignatureFormat::Openpgp {
-            fs::set_permissions(keyring.path(), fs::Permissions::from_mode(0o700))?;
-            let status = Command::new("gpg")
+            let status = as_builder(&mut Command::new("gpg"))
                 .env("GNUPGHOME", keyring.path())
                 .args(["--batch", "--quiet", "--import"])
-                .arg(&self.allowed_signers)
+                .arg(&allowed_signers)
                 .stdin(Stdio::null())
                 .status()
                 .context("running gpg to load the allowed signers")?;
@@ -316,6 +323,61 @@ pub(crate) struct GitBuild {
     pub change: GitChange,
 }
 
+/// The account that fetches and builds Git packages when CPS runs as root.
+/// The cps package creates it with sysusers.d.
+const BUILD_ACCOUNT: &str = "cps-build";
+
+static ACCOUNT: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+
+/// The user and group IDs of the build account when CPS runs as root, and
+/// `None` otherwise, when Git and the build run as the calling user.
+///
+/// Root never runs Git on a source: a repository is untrusted input, and
+/// Git runs code that a repository's own configuration names. Root only
+/// reads what the build account reports, hashes the source archive, and
+/// checks the build output against the template CPS wrote.
+fn build_account() -> Result<Option<(u32, u32)>> {
+    if let Some(account) = ACCOUNT.get() {
+        return Ok(*account);
+    }
+    let account = if geteuid().is_root() {
+        let ids = Accounts::new(File::open("/")?)
+            .ids(BUILD_ACCOUNT, BUILD_ACCOUNT)
+            .context(
+                "CPS running as root fetches and builds Git packages as the cps-build account, \
+                 which the cps package's sysusers.d creates",
+            )?;
+        ensure!(
+            ids.0 != 0 && ids.1 != 0,
+            "the {BUILD_ACCOUNT} account must not be root"
+        );
+        Some(ids)
+    } else {
+        None
+    };
+    Ok(*ACCOUNT.get_or_init(|| account))
+}
+
+/// Run a command as the build account when CPS runs as root.
+fn as_builder(command: &mut Command) -> &mut Command {
+    if let Some(Some((uid, gid))) = ACCOUNT.get() {
+        command
+            .uid(*uid)
+            .gid(*gid)
+            .current_dir("/")
+            .env("HOME", "/");
+    }
+    command
+}
+
+/// Hand a private directory to the build account when CPS runs as root.
+fn give_to_builder(path: &Path) -> Result<()> {
+    if let Some((uid, gid)) = build_account()? {
+        chown(path, Some(uid), Some(gid))?;
+    }
+    Ok(())
+}
+
 fn install_git() -> Command {
     let mut command = git();
     command
@@ -327,6 +389,7 @@ fn install_git() -> Command {
         .env_remove("GIT_EXEC_PATH")
         .env_remove("GIT_ASKPASS")
         .env_remove("GIT_SSL_NO_VERIFY");
+    as_builder(&mut command);
     command
 }
 
@@ -349,8 +412,10 @@ impl GitBuild {
             GitReference::Commit(commit) => GitSnapshotRef::Commit(commit),
             GitReference::Branch(branch) => GitSnapshotRef::Branch(branch),
         };
+        build_account()?;
         let checkout_dir = tempfile::tempdir()?;
         fs::set_permissions(checkout_dir.path(), fs::Permissions::from_mode(0o700))?;
+        give_to_builder(checkout_dir.path())?;
         let clone = checkout_dir.path().join("repo");
         let commit = checkout(
             OsStr::new(&source.url),
@@ -481,7 +546,7 @@ impl GitBuild {
 /// Open the build output without following symlinks and check its expanded
 /// manifest against the template that CPS wrote.
 ///
-/// On the sudo path the unprivileged build account owns `worker/`, so the
+/// When CPS runs as root, the cps-build account owns `worker/`, so the
 /// output is untrusted until the expanded manifest is shown to be what the
 /// template produces. The expanded manifest also lists the split debug
 /// information.
@@ -519,16 +584,7 @@ fn build_package(path: &Path, toolchain: &Path) -> Result<()> {
         )?;
         return Ok(());
     }
-    let uid = std::env::var("SUDO_UID")
-        .context("run Git package builds with sudo from an unprivileged account")?
-        .parse()?;
-    let gid = std::env::var("SUDO_GID")
-        .context("missing sudo user's group for the Git build")?
-        .parse()?;
-    ensure!(
-        uid != 0 && gid != 0,
-        "Git builds require an unprivileged build user"
-    );
+    let (uid, gid) = build_account()?.context("expected the Git build account")?;
     for directory in [path, sources.as_path()] {
         chown(directory, None, Some(gid))?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o750))?;

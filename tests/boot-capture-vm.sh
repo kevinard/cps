@@ -208,6 +208,10 @@ CONFIG
                 copy_runtime_deps "$root" "$binary"
             done
             ln -s git "$root/usr/bin/git-upload-pack"
+            # Root fetches and builds Git packages as this account, which
+            # the cps package's sysusers.d would create.
+            printf 'cps-build:x:990:990:CPS Git package builds:/:/usr/bin/nologin\n' >> "$root/etc/passwd"
+            printf 'cps-build:x:990:\n' >> "$root/etc/group"
             install -m755 "$project/tests/git-install-guest.sh" "$root/usr/local/libexec/cps-system-workflow"
         fi
     fi

@@ -378,6 +378,7 @@ elif $systemd_guest; then
     fi
     # Every unit that packaging/cps.kdl ships.
     cp "$project/packaging/systemd/"cps-*.{service,timer,path} proto/usr/lib/systemd/system/
+    install -Dm644 "$project/packaging/systemd/cps.sysusers" proto/usr/lib/sysusers.d/cps.conf
     install -Dm644 -t proto/usr/share/man/man1 "$project"/docs/reference/man/*.1
     install -Dm644 "$project/LICENSE" proto/usr/share/licenses/cps/LICENSE
     sed -e '/^    require /d' "$project/packaging/cps.kdl" > cps.kdl

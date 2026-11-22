@@ -2,7 +2,6 @@
 set -eu
 bb=/bin/busybox
 export PATH=/usr/bin:/bin
-export SUDO_UID=1000 SUDO_GID=1000
 trap 'echo "CPS_VM_GIT: failed"; $bb poweroff -f' EXIT
 work=/volume/@captures
 tracked=$work/tracked
@@ -87,5 +86,8 @@ check_package tracked 'tracked initial' "$old"
 cps upgrade --yes
 check_package tracked 'tracked initial' "$old"
 echo trial > "$work/git-phase"
+# A forced reboot skips the merge at shutdown, and a trial that needs it is
+# never blessed, so merge /etc by hand first.
+cps boot finalize-trial
 $bb sync
 exec $bb reboot -f
