@@ -212,9 +212,9 @@ pub(crate) struct Plan {
     deferred_publishers: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
-    /// Publishers whose trusted catalog checkpoint or pinned trust root the
-    /// plan advances, which is work even when no package changes, such as
-    /// after a publisher rotates a key and re-signs the same packages.
+    /// Publishers whose pinned trust root the plan advances, which is work
+    /// even when no package changes, such as after a publisher rotates a
+    /// key and re-signs the same packages.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) trust_updates: BTreeSet<String>,
     pub(crate) request: Request,
@@ -1014,27 +1014,18 @@ fn check_profile_facets(
     Ok(())
 }
 
-/// The publishers whose catalog checkpoint or pinned trust root differs
-/// between the image's state before planning and the planned state.
-fn trust_updates_between(
-    (checkpoints, publishers): &(
-        BTreeMap<String, crate::repo::CatalogCheckpoint>,
-        crate::image::Publishers,
-    ),
-    next: &State,
-) -> BTreeSet<String> {
-    let mut changed: BTreeSet<String> = checkpoints
-        .keys()
-        .chain(next.settings.catalog_checkpoints.keys())
-        .filter(|name| checkpoints.get(*name) != next.settings.catalog_checkpoints.get(*name))
-        .cloned()
-        .collect();
-    for (before, after) in publishers.as_slice().iter().zip(next.publishers.as_slice()) {
-        if before.key != after.key {
-            changed.insert(after.name.clone());
-        }
-    }
-    changed
+/// The publishers whose pinned trust root differs between the image's
+/// state before planning and the planned state. A catalog checkpoint that
+/// moves without the pin is not work on its own: every publication moves
+/// it, and the next plan that changes the image records it.
+fn trust_updates_between(publishers: &crate::image::Publishers, next: &State) -> BTreeSet<String> {
+    publishers
+        .as_slice()
+        .iter()
+        .zip(next.publishers.as_slice())
+        .filter(|(before, after)| before.key != after.key)
+        .map(|(_, after)| after.name.clone())
+        .collect()
 }
 
 fn composition_paths(
@@ -1574,10 +1565,7 @@ fn build_with_update_diagnostics(
                     .local
                     .extend(requested.keys().map(|name| (*name).to_owned()));
             }
-            let previous = (
-                state.settings.catalog_checkpoints.clone(),
-                state.publishers.clone(),
-            );
+            let previous = state.publishers.clone();
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
             state
                 .publishers

@@ -7416,3 +7416,32 @@ fn a_resumed_upgrade_keeps_its_trust_pin_advance() -> Result<()> {
     assert_eq!(fs::read_to_string(copy.join(COMPOSITOR))?, "next");
     Ok(())
 }
+
+#[test]
+fn a_publication_that_changes_no_installed_package_is_nothing_to_do() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "desktop/compositor",
+        "1.0.0-0",
+        f.file(COMPOSITOR, "first", "0755", "")?,
+    )?;
+    f.create()?;
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["desktop/compositor".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+
+    // The publisher adds a package that the image does not install, which
+    // moves its catalog but not its trust root.
+    f.package(
+        "desktop/other",
+        "1.0.0-0",
+        f.file("usr/bin/other", "other", "0755", "")?,
+    )?;
+    let update = plan(&f.root, Request::Update)?;
+    assert!(!update.changes_image(), "{}", update.summary());
+    Ok(())
+}

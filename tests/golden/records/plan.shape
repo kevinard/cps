@@ -12,7 +12,6 @@
 .request{kind=install}.packages[]: string
 .selected.test/records: string
 .transfers[]: empty
-.trust_updates[]: string
 .writes[].after{kind=dir}.group: string
 .writes[].after{kind=dir}.kind: string
 .writes[].after{kind=dir}.mode: number
