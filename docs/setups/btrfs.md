@@ -540,9 +540,12 @@ record, then commits subvolume deletion before removing boot artifacts and
 the record. `boot list` shows interrupted cleanup as `retiring`. Retry the
 same command to finish. Activation of that identity stays blocked until
 cleanup completes. Keep the recorded root path stable during this operation.
+If Btrfs refuses to delete a systemd-boot environment's root, CPS restores
+its entry, so the environment stays bootable instead of retiring.
 
-Btrfs refuses to delete its filesystem default subvolume. If it is the
-obsolete root, choose another filesystem default, such as top-level ID 5 with
+Btrfs refuses to delete its filesystem default subvolume, so `cps boot
+destroy` and its dry run check for it before they change anything. If it is
+the obsolete root, choose another filesystem default, such as top-level ID 5 with
 `btrfs subvolume set-default 5 /mnt/cps-volume`, then retry. CPS boot entries
 select their subvolume explicitly. Storage reclamation continues in the
 background after the deletion transaction commits.

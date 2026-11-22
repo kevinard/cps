@@ -83,6 +83,7 @@ fn destroy(
         dry_run || !exhausted,
         "only a dry run can assume exhaustion"
     );
+    let volume_path = volume;
     let volume = BtrfsVolume::open(volume)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let esp_lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
@@ -208,6 +209,17 @@ fn destroy(
     } else {
         None
     };
+    // The kernel refuses to delete the filesystem's default subvolume, but
+    // only after the entry is retired, which would leave it retiring for good.
+    if root.is_some() {
+        ensure!(
+            volume.default_subvolume()? != record.subvolid,
+            "the root of {id} is the Btrfs filesystem default subvolume (ID {}); choose another \
+             default, for example with `btrfs subvolume set-default 5 {}`, then retry",
+            record.subvolid,
+            volume_path.display()
+        );
+    }
     let esp_root = Root::open(&esp)?;
     check_artifacts(&esp_root, id)?;
     if dry_run {
@@ -246,12 +258,29 @@ fn destroy(
         File::open(Root::fd_path(&loader_entries).join(&marker))?.sync_all()?;
         loader_entries.sync_all()?;
     }
+    let withdrawn_from_firmware = firmware.is_some();
     if let Some(firmware) = firmware {
         firmware.remove(id)?;
     }
     if let Some(root) = &root {
         check_inactive(root)?;
-        volume.destroy(record, root)?;
+        if let Err(error) = volume.destroy(record, root) {
+            // The root still boots. Put a systemd-boot entry back so the
+            // environment is not left retiring; a direct UEFI environment has
+            // already lost its firmware option and stays retiring.
+            if !withdrawn_from_firmware && resumed.is_none() {
+                renameat_with(
+                    &loader_entries,
+                    &marker,
+                    &loader_entries,
+                    filename,
+                    RenameFlags::NOREPLACE,
+                )?;
+                File::open(Root::fd_path(&loader_entries).join(filename))?.sync_all()?;
+                loader_entries.sync_all()?;
+            }
+            return Err(error.context(format!("deleting the root of {id}")));
+        }
     }
     remove_artifacts(&esp_root, id)?;
     unlinkat(&loader_entries, &marker, AtFlags::empty())?;
