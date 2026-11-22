@@ -98,7 +98,9 @@ can be assembled and unlocked by the initramfs before it mounts that root.
   Other shared data such as `/home` or a swapfile can live on sibling
   subvolumes mounted at ordinary directories in each root. A Btrfs snapshot
   omits nested subvolume contents. See [Nested subvolumes](#nested-subvolumes).
-- Mount the dedicated, writable VFAT systemd-boot ESP at `esp`. CPS reads
+- Mount the dedicated, writable VFAT systemd-boot ESP at `esp`, with
+  systemd-boot 262 or newer installed on it, since CPS selects trials with
+  the `loader.conf` `preferred` key. CPS reads
   the GPT with the disk's logical block size, so disks with 512-byte and
   4096-byte (4Kn) sectors both work. The ESP can be an automount point, as
   created by `systemd-gpt-auto-generator` or an `x-systemd.automount` fstab
@@ -386,11 +388,9 @@ it starts, CPS takes a read-only snapshot of the root in
 registers it as a known-good environment titled `Canopa backup`, and then
 makes it writable, so it boots like any root when it is picked from the boot
 menu. The backup
-has no fallback and is never selected automatically. If `loader.conf` still
-selects the newest entry with `default cps-*.conf`, CPS first pins the running
-environment, because the backup would be the newest. Later trials are then
-selected with the `preferred` key, so this needs systemd-boot 262 or newer;
-CPS refuses the backup on an older loader. With direct UEFI boot,
+has no fallback and is never selected automatically: `loader.conf` names the
+entries it selects, so a new entry never changes the next boot. With direct
+UEFI boot,
 CPS creates the backup's firmware boot option without changing `BootOrder`.
 
 To return to the system as it was before a live change, select the backup
@@ -587,7 +587,10 @@ prunes after it promotes a trial. Automatic pruning reports problems as
 warnings and never blocks the transaction. With `auto-prune=#false`, staging
 still removes failed and abandoned trials but keeps every known-good
 environment. Pruning also removes empty `upgrade-*`, `backup-*`, and
-`named-*` directories left in `environments`.
+`named-*` directories left in `environments`, and the `.cps-capture-*`
+snapshots of staging that was interrupted, for example by a power loss
+while it built an initramfs. A capture that a running CPS still holds is
+kept, and the next staging removes abandoned captures before it starts.
 
 The prune before staging keeps the trial of an interrupted activation of the
 same change, whose root is that change's `upgrade-*/root`, so that the retry

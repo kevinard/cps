@@ -126,8 +126,8 @@ stores its trust binding in `.tuf/origin` with the first line
 indexes, Git snapshot reservations, and mirror signer state use JSON
 `"format": 1`. A self-contained catalog archive, which packs a catalog
 root and its shards into image state, is a Zstandard stream that begins
-with `cps catalog archive v1`. An interrupted partition replacement is recorded
-in an ESP marker beginning with `cps slot retirement v1`.
+with `cps catalog archive v1`. The boot state on an EFI System Partition is
+specified in [Format specifications](../reference/formats.md#efi-system-partition-state).
 
 ## Run the unit tests
 

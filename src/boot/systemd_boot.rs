@@ -22,7 +22,6 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{FlockOperation, flock};
-use tempfile::NamedTempFile;
 
 use super::{
     btrfs_boot::{BtrfsRecord, BtrfsVolume, mark_registered},
@@ -296,7 +295,65 @@ fn lock_esp(esp: &Path, operation: FlockOperation) -> Result<File> {
         "expected an EFI system partition directory"
     );
     flock(&file, operation)?;
+    if operation == FlockOperation::LockExclusive {
+        reconcile(esp)?;
+    }
     Ok(file)
+}
+
+/// Clean up after an interrupted CPS run before changing the ESP.
+///
+/// Every CPS writer holds the exclusive ESP lock, so a temporary file that
+/// remains once this process holds it belongs to no running operation and
+/// is removed. The states that need a decision are not changed here: an
+/// entry marked `.cps-destroy` waits for `cps boot destroy`, which every
+/// other operation refuses to touch, and a half-blessed direct UEFI trial
+/// waits for `cps boot bless`. See the ESP state specification in
+/// docs/reference/formats.md.
+fn reconcile(esp: &Path) -> Result<()> {
+    let mut directories = vec![
+        esp.join("loader"),
+        esp.join("loader/entries"),
+        esp.join("EFI/cps-uefi"),
+    ];
+    match fs::read_dir(esp.join("EFI/cps")) {
+        Ok(artifacts) => {
+            for entry in artifacts {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    directories.push(entry.path());
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("listing EFI/cps"),
+    }
+    for directory in directories {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("listing {}", directory.display()));
+            }
+        };
+        let mut removed = false;
+        for entry in entries {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(policy::TEMP_PREFIX))
+                && entry.file_type()?.is_file()
+            {
+                fs::remove_file(entry.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            File::open(&directory)?.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 fn same_root(a: &Root, b: &Root) -> Result<bool> {
@@ -754,14 +811,13 @@ fn activate_as(
             .as_ref()
             .and_then(|policy| policy.selected(&existing))
             .is_some_and(|entry| entry.id == id);
-    // A pinned selection, as after a rollback, needs `preferred` to try the new entry.
-    let prefer_trial =
-        firmware.is_none() && select_trial && policy.as_ref() != Some(&LoaderPolicy::Automatic);
-    if prefer_trial {
+    // CPS names every systemd-boot selection in `default` and `preferred`,
+    // and only systemd-boot 262 or newer reads `preferred`.
+    if firmware.is_none() {
         loader::require_preferred(&esp)?;
     }
+    let prefer_trial = firmware.is_none() && select_trial;
     let mut _fallback_lock = None;
-    let mut pin_before_backup = None;
     if let Some(fallback) = fallback.as_deref().filter(|_| select_trial) {
         let base = find_known_good(&existing, fallback)
             .context("the base must have a known-good boot entry")?;
@@ -802,23 +858,14 @@ fn activate_as(
             "each environment requires a distinct Btrfs subvolume"
         );
     } else if backup && existing_entry.is_none() {
-        pin_before_backup = backup_selection(policy.as_ref(), &existing, &btrfs, direct)?;
-        if pin_before_backup.is_some() {
-            // Once pinned, every later trial is selected with `preferred`.
-            loader::require_preferred(&esp).context(
-                "a backup pins the boot selection, and later updates then need a loader that \
-                 reads `preferred`; update systemd-boot, or set live-backup=#false in boot-btrfs",
-            )?;
-        }
+        check_backup(policy.as_ref(), &existing, &btrfs)?;
     } else if existing_entry.is_none() {
         ensure!(
             existing.is_empty(),
             "--known-good is only used to bootstrap the first environment"
         );
         ensure!(
-            policy
-                .as_ref()
-                .is_none_or(|policy| *policy == LoaderPolicy::Automatic),
+            policy.is_none(),
             "EFI partition is already configured for another boot environment"
         );
     }
@@ -844,9 +891,6 @@ fn activate_as(
         // loader.conf is replaced through a temporary copy.
         files.push((esp.join("loader/loader.conf.new"), 64 * 1024));
         check_esp_space(&esp, &id, &files)?;
-    }
-    if let Some(selected) = &pin_before_backup {
-        LoaderPolicy::pinned(selected).write(&esp.join("loader/loader.conf"))?;
     }
     if !sign_uki {
         mark_registered(&image.root, &id)?;
@@ -884,14 +928,15 @@ fn activate_as(
         File::open(&entry.path)?.sync_all()?;
         File::open(&entries)?.sync_all()?;
     } else {
-        if fallback.is_none() && !direct && !backup {
-            LoaderPolicy::Automatic.write(&config_path)?;
-        }
         let file = match fallback {
             None => format!("{id}.conf"),
             Some(_) => format!("{id}+{}.conf", if direct { 1 } else { activation.tries }),
         };
         install_text(&entries.join(&file), &description)?;
+        // The first environment becomes the default once its entry is durable.
+        if fallback.is_none() && !direct && !backup {
+            LoaderPolicy::pinned(&id).write(&config_path)?;
+        }
     }
     if let Some(firmware) = firmware {
         if !backup && (fallback.is_none() || select_trial) {
@@ -906,17 +951,12 @@ fn activate_as(
 }
 
 /// Check that a new backup can join `existing` without changing the next
-/// boot, and return the selection to pin first, if any.
-///
-/// An automatic selection boots the newest revision, which a backup of the
-/// running root would become, so the current selection is pinned before the
-/// backup's entry appears.
-fn backup_selection(
+/// boot. The selection names its entries, so a new entry never changes it.
+fn check_backup(
     policy: Option<&LoaderPolicy>,
     existing: &[BootEntry],
     record: &BtrfsRecord,
-    direct: bool,
-) -> Result<Option<String>> {
+) -> Result<()> {
     let policy = policy.context(NO_SELECTION)?;
     let selected = policy.selected(existing).context(NO_SELECTION)?;
     ensure!(
@@ -929,7 +969,7 @@ fn backup_selection(
             .any(|entry| entry.btrfs.fsid == record.fsid && entry.btrfs.same_subvolume(record)),
         "each environment requires a distinct Btrfs subvolume"
     );
-    Ok((*policy == LoaderPolicy::Automatic && !direct).then(|| selected.id.clone()))
+    Ok(())
 }
 
 /// Register the first, known-good environment of an offline disk on a
@@ -949,7 +989,7 @@ pub(super) fn bootstrap_offline(
         "the EFI partition already has CPS boot environments"
     );
     ensure!(
-        policy.is_none_or(|policy| policy == LoaderPolicy::Automatic),
+        policy.is_none(),
         "the EFI partition's loader.conf already selects another boot entry"
     );
     let cmdline = command_line(root, record, &activation.options);
@@ -981,7 +1021,7 @@ pub(super) fn bootstrap_offline(
     )?;
     let entries = ensure_dir(&ensure_dir(esp, "loader")?, "entries")?;
     install_text(&entries.join(format!("{id}.conf")), &description)?;
-    LoaderPolicy::Automatic.write(&esp.join("loader/loader.conf"))?;
+    LoaderPolicy::pinned(id).write(&esp.join("loader/loader.conf"))?;
     written.push(format!("loader/entries/{id}.conf"));
     written.push("loader/loader.conf".into());
     Ok(written)
@@ -1256,7 +1296,7 @@ fn install_checked(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut temp = NamedTempFile::new_in(parent)?;
+    let mut temp = policy::esp_temp(parent)?;
     io::copy(&mut bytes, &mut temp)?;
     temp.as_file_mut().rewind()?;
     ensure!(
@@ -1276,7 +1316,7 @@ fn install_checked(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootEntry, BtrfsRecord, Entry, LoaderPolicy, backup_selection, check_esp_space, digest,
+        BootEntry, BtrfsRecord, Entry, LoaderPolicy, check_backup, check_esp_space, digest,
         install_checked, policy::BootRoot,
     };
 
@@ -1309,33 +1349,10 @@ mod tests {
     fn backups_never_change_the_next_boot() -> anyhow::Result<()> {
         let running = entry("cps-a47593c2-e985-42d2-92b6-44c7057e1e96-4", 4, None, 256);
         let existing = [running];
-        // An automatic selection would boot the backup's newer revision.
-        assert_eq!(
-            backup_selection(
-                Some(&LoaderPolicy::Automatic),
-                &existing,
-                &record(300),
-                false
-            )?,
-            Some(existing[0].id.clone())
-        );
-        // Direct UEFI boot and a pinned default already select by ID.
-        assert_eq!(
-            backup_selection(
-                Some(&LoaderPolicy::Automatic),
-                &existing,
-                &record(300),
-                true
-            )?,
-            None
-        );
         let pinned = LoaderPolicy::pinned(&existing[0].id);
-        assert_eq!(
-            backup_selection(Some(&pinned), &existing, &record(300), false)?,
-            None
-        );
+        check_backup(Some(&pinned), &existing, &record(300))?;
         // The backup needs its own subvolume.
-        assert!(backup_selection(Some(&pinned), &existing, &record(256), false).is_err());
+        assert!(check_backup(Some(&pinned), &existing, &record(256)).is_err());
         // No backup while a trial waits for the next boot.
         let trial = entry(
             "cps-0f6a2c1e-3b1d-4c9e-8a55-2d0e4c3b9f10-5",
@@ -1348,11 +1365,47 @@ mod tests {
             trial,
         ];
         let policy = LoaderPolicy::trial(&existing[0].id, &with_trial[1].id);
-        let error = backup_selection(Some(&policy), &with_trial, &record(300), false)
+        let error = check_backup(Some(&policy), &with_trial, &record(300))
             .unwrap_err()
             .to_string();
         assert!(error.contains("a trial is selected"), "{error}");
-        assert!(backup_selection(None, &existing, &record(300), false).is_err());
+        assert!(check_backup(None, &existing, &record(300)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_esp_locks_remove_interrupted_temporary_files() -> anyhow::Result<()> {
+        use std::fs;
+        let esp = tempfile::tempdir()?;
+        let path = |relative: &str| esp.path().join(relative);
+        for directory in ["loader/entries", "EFI/cps/cps-a-1", "EFI/cps-uefi"] {
+            fs::create_dir_all(path(directory))?;
+        }
+        let stale = [
+            "loader/.cps-tmp-1a2b3c",
+            "loader/entries/.cps-tmp-4d5e6f",
+            "EFI/cps/cps-a-1/.cps-tmp-abcdef",
+            "EFI/cps-uefi/.cps-tmp-012345",
+        ];
+        for file in stale {
+            fs::write(path(file), "partial")?;
+        }
+        let kept = ["loader/loader.conf", "EFI/cps/cps-a-1/vmlinuz.efi"];
+        for file in kept {
+            fs::write(path(file), "kept")?;
+        }
+        // A shared lock only reads the ESP.
+        drop(super::lock_esp(
+            esp.path(),
+            super::FlockOperation::LockShared,
+        )?);
+        assert!(stale.iter().all(|file| path(file).exists()));
+        drop(super::lock_esp(
+            esp.path(),
+            super::FlockOperation::LockExclusive,
+        )?);
+        assert!(stale.iter().all(|file| !path(file).exists()));
+        assert!(kept.iter().all(|file| path(file).exists()));
         Ok(())
     }
 

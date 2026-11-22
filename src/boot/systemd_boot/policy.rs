@@ -15,7 +15,6 @@ use crate::{
 
 /// Defaults for a new loader.conf. Administrators may change these lines.
 const OPTIONS: &str = "timeout 0\neditor no\nauto-entries no\nauto-firmware no\n";
-const AUTO: &str = "cps-*.conf";
 const LOADER: &str = "loader/loader.conf";
 pub(super) const MAX_ENTRY_BYTES: usize = 64 * 1024;
 pub(super) const ENTRY_FORMAT_FIELD: &str = "# cps-boot-entry-version ";
@@ -26,50 +25,45 @@ pub(super) const NAME_FIELD: &str = "# cps-name ";
 ///
 /// CPS owns the `default` and `preferred` keys and rejects `timeout
 /// menu-force`. Every other line belongs to the administrator and is
-/// preserved when CPS changes the selection.
+/// preserved when CPS changes the selection. `default` always names a
+/// known-good entry, and `preferred` names a trial while one is selected,
+/// so the selection never depends on how systemd-boot sorts entries.
 #[derive(Debug, Eq, PartialEq)]
-pub(super) enum LoaderPolicy {
-    Automatic,
-    Pinned {
-        default: String,
-        preferred: Option<String>,
-    },
+pub(super) struct LoaderPolicy {
+    pub(super) default: String,
+    pub(super) preferred: Option<String>,
 }
 
 impl LoaderPolicy {
     pub(super) fn pinned(id: &str) -> Self {
-        Self::Pinned {
+        Self {
             default: id.to_owned(),
             preferred: None,
         }
     }
 
     pub(super) fn trial(base: &str, candidate: &str) -> Self {
-        Self::Pinned {
+        Self {
             default: base.to_owned(),
             preferred: Some(candidate.to_owned()),
         }
     }
 
+    /// The entry systemd-boot boots next: the `preferred` trial while it has
+    /// attempts left, and otherwise the known-good `default`.
     pub(super) fn selected<'a>(&self, entries: &'a [BootEntry]) -> Option<&'a BootEntry> {
-        match self {
-            Self::Automatic => entries
-                .iter()
-                .filter(|entry| entry.tries != Some(0))
-                .max_by_key(|entry| (entry.revision, entry.id.as_str())),
-            Self::Pinned { default, preferred } => preferred
-                .as_deref()
-                .and_then(|id| {
-                    entries
-                        .iter()
-                        .find(|entry| entry.id == id && entry.tries != Some(0))
-                })
-                .or_else(|| {
-                    entries
-                        .iter()
-                        .find(|entry| entry.id == *default && entry.tries.is_none())
-                }),
-        }
+        self.preferred
+            .as_deref()
+            .and_then(|id| {
+                entries
+                    .iter()
+                    .find(|entry| entry.id == id && entry.tries != Some(0))
+            })
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.id == self.default && entry.tries.is_none())
+            })
     }
 
     /// Read the CPS selection. A missing file or `default` line selects nothing.
@@ -121,20 +115,11 @@ impl LoaderPolicy {
             );
             return Ok(None);
         };
-        if default == AUTO {
-            ensure!(
-                preferred.is_none(),
-                "{LOADER} sets `preferred` with `default {AUTO}`. CPS expects no `preferred` \
-                 line in automatic mode; remove it"
-            );
-            return Ok(Some(Self::Automatic));
-        }
         let default = selector(default).with_context(|| {
             format!(
                 "{LOADER} sets `default {default}`, but CPS owns this key and expects \
-                 `default <CPS entry ID>.conf` or `default {AUTO}`. Restore the CPS value, or \
-                 remove the line and select a known-good environment with \
-                 `cps boot rollback --esp ESP ID`"
+                 `default <CPS entry ID>.conf`. Restore the CPS value, or remove the line and \
+                 select a known-good environment with `cps boot activate ID`"
             )
         })?;
         let preferred = preferred
@@ -152,20 +137,15 @@ impl LoaderPolicy {
             preferred.as_ref() != Some(&default),
             "default and preferred boot entries must be distinct"
         );
-        Ok(Some(Self::Pinned { default, preferred }))
+        Ok(Some(Self { default, preferred }))
     }
 
     fn selection(&self) -> String {
-        match self {
-            Self::Automatic => format!("default {AUTO}\n"),
-            Self::Pinned { default, preferred } => {
-                let mut text = format!("default {default}.conf\n");
-                if let Some(preferred) = preferred {
-                    text.push_str(&format!("preferred {preferred}.conf\n"));
-                }
-                text
-            }
+        let mut text = format!("default {}.conf\n", self.default);
+        if let Some(preferred) = &self.preferred {
+            text.push_str(&format!("preferred {preferred}.conf\n"));
         }
+        text
     }
 
     /// Replace the owned selection lines in place and keep every other line.
@@ -216,10 +196,21 @@ impl LoaderPolicy {
     }
 }
 
+/// The name prefix of every temporary file that CPS writes on the ESP.
+/// [`super::reconcile`] removes the ones an interrupted run left behind.
+pub(super) const TEMP_PREFIX: &str = ".cps-tmp-";
+
+/// A temporary file on the ESP, written while CPS holds the ESP lock.
+pub(super) fn esp_temp(parent: &Path) -> Result<NamedTempFile> {
+    Ok(tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(parent)?)
+}
+
 /// Atomically and durably replace a file on the ESP.
 pub(super) fn replace_file(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path.parent().context("missing ESP directory")?;
-    let mut temp = NamedTempFile::new_in(parent)?;
+    let mut temp = esp_temp(parent)?;
     temp.write_all(content)?;
     temp.as_file().sync_all()?;
     // On VFAT the renamed file's size is durable only with its inode.
@@ -281,14 +272,10 @@ impl LoaderOverrides {
                 );
             }
         }
-        let (default, preferred) = match policy {
-            None => (None, None),
-            Some(LoaderPolicy::Automatic) => (Some(AUTO.to_owned()), None),
-            Some(LoaderPolicy::Pinned { default, preferred }) => (
-                Some(format!("{default}.conf")),
-                preferred.as_ref().map(|id| format!("{id}.conf")),
-            ),
-        };
+        let default = policy.map(|policy| format!("{}.conf", policy.default));
+        let preferred = policy
+            .and_then(|policy| policy.preferred.as_ref())
+            .map(|id| format!("{id}.conf"));
         for (name, value, expected, command) in [
             (
                 "LoaderEntryPreferred",
@@ -652,8 +639,8 @@ pub(super) fn directory_exists(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO, BootRoot, BtrfsRecord, INITRD_HASH, LINUX_HASH, LoaderOverrides, LoaderPolicy,
-        OPTIONS, boot_field, check_parent, loader_line, read_entry,
+        BootRoot, BtrfsRecord, INITRD_HASH, LINUX_HASH, LoaderOverrides, LoaderPolicy, OPTIONS,
+        boot_field, check_parent, loader_line, read_entry,
     };
 
     const BASE: &str = "cps-a47593c2-e985-42d2-92b6-44c7057e1e96-2";
@@ -687,13 +674,18 @@ mod tests {
         assert_eq!(LoaderPolicy::pinned(BASE).render(Some(&trial))?, edited);
         // A file without a selection gains one at the top and keeps its last line.
         assert_eq!(
-            LoaderPolicy::Automatic.render(Some("timeout 3"))?,
-            "default cps-*.conf\ntimeout 3\n"
+            LoaderPolicy::pinned(BASE).render(Some("timeout 3"))?,
+            format!("default {BASE}.conf\ntimeout 3\n")
         );
         assert_eq!(
-            LoaderPolicy::parse("\t default  \"cps-*.conf\" \n")?,
-            Some(LoaderPolicy::Automatic)
+            LoaderPolicy::parse(&format!("\t default  \"{BASE}.conf\" \n"))?,
+            Some(LoaderPolicy::pinned(BASE))
         );
+        // CPS no longer selects by pattern, so a pattern names no CPS entry.
+        let message = LoaderPolicy::parse("default cps-*.conf\n")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("cps boot activate"), "{message}");
         assert_eq!(
             LoaderPolicy::parse("timeout 0\n# default other.conf\n")?,
             None
@@ -760,7 +752,6 @@ mod tests {
         entry(Some(&format!("{}.conf", BASE.to_uppercase())), None).check(Some(&trial))?;
         entry(None, Some(&format!("{TRIAL}.conf"))).check(Some(&trial))?;
         entry(Some(""), Some("")).check(Some(&pinned))?;
-        entry(Some(AUTO), None).check(Some(&LoaderPolicy::Automatic))?;
         let message = entry(Some("arch.conf"), None)
             .check(Some(&trial))
             .unwrap_err()
@@ -819,7 +810,7 @@ mod tests {
         let message = error("default arch.conf\n");
         assert!(message.contains("`default arch.conf`"), "{message}");
         assert!(message.contains("default <CPS entry ID>.conf"), "{message}");
-        assert!(message.contains("cps boot rollback"), "{message}");
+        assert!(message.contains("cps boot activate"), "{message}");
         let message = error(&format!("default {BASE}.conf\npreferred @saved\n"));
         assert!(message.contains("`preferred @saved`"), "{message}");
         let message = error(&format!("default {BASE}.conf\ndefault {TRIAL}.conf\n"));
@@ -830,7 +821,7 @@ mod tests {
         let message = error(&format!("preferred {TRIAL}.conf\n"));
         assert!(message.contains("without a CPS `default`"), "{message}");
         let message = error(&format!("default cps-*.conf\npreferred {TRIAL}.conf\n"));
-        assert!(message.contains("automatic mode"), "{message}");
+        assert!(message.contains("`default cps-*.conf`"), "{message}");
         assert!(
             LoaderPolicy::parse(&format!("default {BASE}.conf\npreferred {BASE}.conf\n")).is_err()
         );
@@ -851,9 +842,9 @@ mod tests {
     fn loader_policy_writes_through_a_temporary_file() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("loader.conf");
-        LoaderPolicy::Automatic.write(&path)?;
-        assert_eq!(LoaderPolicy::read(&path)?, Some(LoaderPolicy::Automatic));
-        std::fs::write(&path, "default cps-*.conf\nbeep yes\n")?;
+        LoaderPolicy::pinned(BASE).write(&path)?;
+        assert_eq!(LoaderPolicy::read(&path)?, Some(LoaderPolicy::pinned(BASE)));
+        std::fs::write(&path, format!("default {TRIAL}.conf\nbeep yes\n"))?;
         LoaderPolicy::trial(BASE, TRIAL).write(&path)?;
         assert_eq!(
             std::fs::read_to_string(&path)?,

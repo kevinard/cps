@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 
+use super::scratch::{self, Scratch};
 use crate::{
     image::{Image, Installed, Managed, Settings, root::Root},
     model::{Node, digest, digest_reader},
@@ -220,9 +221,7 @@ impl Artifacts {
 
         // kernel-install add has no alternate-root mode. Give its trusted
         // BLS plugin only a private boot tree and an explicit private config.
-        let scratch = tempfile::Builder::new()
-            .prefix(".kernel-install-")
-            .tempdir_in(state_path)?;
+        let scratch = Scratch::create(&state_path, ".kernel-install-", scratch::plain)?;
         let boot = scratch.path().join("boot");
         let config = scratch.path().join("conf");
         fs::create_dir(&boot)?;

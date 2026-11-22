@@ -104,7 +104,7 @@ mcopy -i disk.raw@@1048576 "::/$entry" entry.conf
 mcopy -i disk.raw@@1048576 ::/loader/loader.conf loader.conf
 mcopy -i disk.raw@@1048576 "::/EFI/cps/cps-$id-1/vmlinuz.efi" kernel.efi
 cmp proto/boot/vmlinuz kernel.efi
-grep -Fx 'default cps-*.conf' loader.conf
+grep -Fx "default cps-$id-1.conf" loader.conf
 grep -Fx "# cps-btrfs-fsid $id" entry.conf
 grep -Fx "# cps-btrfs-subvolid $root_id" entry.conf
 grep -Fx '# cps-btrfs-path @' entry.conf

@@ -107,7 +107,7 @@ disk file. It leaves the template and the volume directory unchanged.
   then removes it.
 - The ESP gets the root's kernel and initramfs under `EFI/cps/ID`, an entry
   that boots the root by `root=PARTUUID=` and its subvolume ID, and a
-  `loader/loader.conf` with `default cps-*.conf`. The entry records the
+  `loader/loader.conf` whose `default` names that entry. The entry records the
   filesystem UUID, subvolume UUID and ID, and path, as an activated entry
   does.
 

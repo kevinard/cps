@@ -8,6 +8,7 @@ fixture byte for byte. A change to one of these fixtures is a format change.
 
 - [Canonical manifest text](#canonical-manifest-text)
 - [Signed envelopes](#signed-envelopes)
+- [EFI System Partition state](#efi-system-partition-state)
 
 ## Canonical manifest text
 
@@ -90,3 +91,61 @@ Build statements keep DSSE so that in-toto tooling can read them. The
 envelope's version is part of what is signed: the domain prefix of a CPS
 envelope and the `payloadType` and statement `predicateType` of a DSSE
 envelope.
+
+## EFI System Partition state
+
+This section specifies version 1 of the boot state that CPS keeps on an EFI
+System Partition (ESP). Every boot entry CPS writes carries the line
+`# cps-boot-entry-version 1`, and CPS rejects an entry with another version.
+CPS writes every file through a temporary file and a rename, syncing the
+file, the rename, and the directory, so a crash leaves each path either
+before or after its write.
+
+**Identifiers.** A boot environment is named `cps-IMAGE-REVISION`, where
+`IMAGE` is the root's image UUID and `REVISION` its boot revision. A root
+registered for boot carries that ID in its `user.cps.boot-environment`
+extended attribute, and CPS refuses to register a root whose attribute names
+another ID.
+
+**Files.** Paths are relative to the ESP root.
+
+| Path | Contents |
+| --- | --- |
+| `loader/loader.conf` | The systemd-boot configuration. CPS owns the `default ID.conf` line, which names a known-good entry once the first environment is registered, and a `preferred ID.conf` line while a trial is selected. Every other line belongs to the administrator. |
+| `loader/entries/ID.conf` | The Type #1 entry of a known-good environment. |
+| `loader/entries/ID+LEFT.conf`, `ID+LEFT-DONE.conf` | A trial with systemd-boot boot counting: `LEFT` attempts remain and `DONE` were used. `ID+0-DONE.conf` is an exhausted trial. systemd-bless-boot renames a blessed trial to `ID.conf`. |
+| `loader/entries/ID.cps-destroy` | The entry of an environment that `cps boot destroy` withdrew from systemd-boot before it removed the root and boot files. |
+| `EFI/cps/ID/vmlinuz.efi`, `EFI/cps/ID/initramfs.img` | The kernel and initramfs of a split entry. |
+| `EFI/cps/ID/uki.efi` | The signed unified kernel image of a UKI entry. |
+| `EFI/cps-uefi/ID.conf` | The record of a known-good environment that boots directly from the firmware, with the same body as a Type #1 entry. systemd-boot does not read this directory. |
+| `EFI/cps-uefi/ID+1.conf`, `ID+0.conf`, `ID+0-1.conf` | A direct UEFI trial: armed with `BootNext` for one attempt, cancelled or spent, or verified by `cps boot bless` before its firmware promotion. |
+| `.cps-tmp-*` in any of these directories | A temporary file of a write in progress. |
+
+**Entry body.** An entry holds these lines in this order, each ending with
+a line feed: `title`, `sort-key cps`, `version REVISION`,
+`# cps-boot-entry-version 1`, then `linux /EFI/cps/ID/vmlinuz.efi` or
+`uki /EFI/cps/ID/uki.efi`, `# cps-parent ID` naming the known-good fallback
+of a trial, and the artifact digests: `# cps-uki-sha256 HEX`, or
+`# cps-linux-sha256 HEX` followed, with an initramfs, by
+`initrd /EFI/cps/ID/initramfs.img` and `# cps-initrd-sha256 HEX`. The root's
+Btrfs identity follows as `# cps-btrfs-fsid`, `# cps-btrfs-uuid`,
+`# cps-btrfs-subvolid`, and `# cps-btrfs-path`, then `options CMDLINE`, or
+`# cps-uki-cmdline CMDLINE` for a UKI, whose command line is inside the
+image. A direct UEFI trial adds `# cps-uefi-armed BOOT-ID`, the boot that
+armed it, and a named environment adds `# cps-name NAME`.
+
+**Selection.** systemd-boot boots the `preferred` entry while its counter
+has attempts left, and otherwise the `default` entry. Direct UEFI boot
+selects with `BootNext` for a trial and the first `BootOrder` option for the
+default.
+
+**Interrupted operations.** Each state that a crash can leave has one owner
+that finishes it:
+
+| State | Finished by |
+| --- | --- |
+| `.cps-tmp-*` files | Any CPS operation that takes the ESP lock exclusively removes them first, since every writer holds that lock. |
+| An entry renamed to `ID.cps-destroy` | `cps boot destroy ID`. Every other operation refuses to reuse that ID. |
+| A direct UEFI record `ID+0-1.conf` | `cps boot bless`, which promotes the verified trial. |
+| A `preferred` line naming an exhausted trial | Nothing: systemd-boot ignores it and boots `default`. The next activation replaces it, and destroying the trial, as `cps boot discard-trial` and pruning do, removes it first. |
+| A capture, UKI, or kernel-install scratch directory | The next capture into the same directory, UKI build, or kernel preparation in the same image. Each scratch directory, named `.cps-capture-*`, `.cps-uki-*`, or `.kernel-install-*`, is locked with `flock` by the process using it, and only unlocked ones are removed. |

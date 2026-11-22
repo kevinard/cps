@@ -6,6 +6,7 @@ mod esp;
 pub(crate) mod etc_merge;
 pub(crate) mod kernel;
 mod offline;
+mod scratch;
 mod systemd_boot;
 mod tree;
 mod uki;
@@ -31,7 +32,7 @@ use crate::{
 pub(crate) use btrfs::{
     backup_running_btrfs, excluded_subvolumes, is_read_only, make_writable, stage_running_btrfs,
 };
-pub(crate) use btrfs::{capture_boot_environment, stage_btrfs_boot_environment};
+pub(crate) use btrfs::{capture_boot_environment, stage_btrfs_boot_environment, sweep_captures};
 pub(crate) use btrfs_boot::{
     bless_uefi, pending_trial, with_registered_images, with_running_environment,
 };

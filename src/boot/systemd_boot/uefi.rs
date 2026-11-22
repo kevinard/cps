@@ -135,7 +135,7 @@ impl Firmware {
             preferred.is_none() || default.is_some(),
             "a UEFI trial requires a known-good default"
         );
-        Ok(default.map(|default| LoaderPolicy::Pinned { default, preferred }))
+        Ok(default.map(|default| LoaderPolicy { default, preferred }))
     }
 
     pub(super) fn armed_boot<'a>(&'a self, entry: Option<&'a BootEntry>) -> Result<&'a str> {

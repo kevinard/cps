@@ -12,7 +12,10 @@ use serde::Deserialize;
 
 use crate::{image::root::Root, model::digest_reader};
 
-use super::artifact_helper;
+use super::{
+    artifact_helper,
+    scratch::{self, Scratch},
+};
 
 pub(super) const NAME: &str = "uki.efi";
 pub(super) const HASH: &str = "# cps-uki-sha256 ";
@@ -34,9 +37,7 @@ pub(super) fn prepare(
                 registered_digest.is_none(),
                 "registered UKI is missing at {path}"
             );
-            let scratch = tempfile::Builder::new()
-                .prefix(".cps-uki-")
-                .tempdir_in("/var/tmp")?;
+            let scratch = Scratch::create(Path::new("/var/tmp"), ".cps-uki-", scratch::plain)?;
             let work = scratch.path();
             copy_input(kernel.0, &work.join("linux"), kernel.1)?;
             copy_input(initrd.0, &work.join("initrd"), initrd.1)?;

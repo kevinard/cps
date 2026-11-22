@@ -183,7 +183,7 @@ variables instead and uses no loader configuration. A new file starts with the
 following lines.
 
 ```
-default cps-*.conf
+default cps-IMAGE-REVISION.conf
 timeout 0
 editor no
 auto-entries no
@@ -196,12 +196,11 @@ can change the menu timeout, enable the editor or the automatic entries, or
 add keys such as `console-mode`. CPS rejects the file and names the key when
 you set one of these:
 
-- A `default` that is neither `cps-*.conf` nor a CPS entry ID followed by
-  `.conf`. Restore the CPS value, or delete the line and select a known-good
-  environment with `cps boot activate ID`.
-- A `preferred` that is not a CPS entry, a `preferred` with
-  `default cps-*.conf`, or a `preferred` without a `default`. Delete the line
-  to cancel the trial selection.
+- A `default` that is not a CPS entry ID followed by `.conf`, including a
+  pattern such as `cps-*.conf`. Restore the CPS value, or delete the line and
+  select a known-good environment with `cps boot activate ID`.
+- A `preferred` that is not a CPS entry, or a `preferred` without a
+  `default`. Delete the line to cancel the trial selection.
 - More than one `default` or `preferred` line. Keep the one CPS wrote.
 - A single-quoted `default` or `preferred` value. systemd-boot 260 and later
   remove matching single or double quotes, but earlier versions read single
@@ -210,36 +209,37 @@ you set one of these:
   systemd-boot treats as `menu-force` and as a menu with a 136-year
   countdown. Use a number of seconds, `menu-hidden`, or `menu-disabled`.
 
-These rules keep trial selection safe. Right after bootstrap,
-`default cps-*.conf` selects the newest CPS entry whose attempts are not
-exhausted, so the first trial boots and falls back to the bootstrapped root.
-After a rollback pins a known-good environment as `default`, CPS publishes
-each later trial and its files before it names the trial as `preferred`.
-systemd-boot 262 boots the `preferred` entry while its boot counter has
-attempts left, and otherwise boots `default`.
+These rules keep trial selection safe. `default` always names a known-good
+entry: the first environment when CPS bootstraps the ESP, and the target of
+each rollback or activation after that. CPS publishes each trial and its
+files before it names the trial as `preferred`. systemd-boot 262 boots the
+`preferred` entry while its boot counter has attempts left, and otherwise
+boots `default`. The selection never depends on how systemd-boot sorts
+entries.
 [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
-Earlier systemd-boot releases ignore `preferred` and would boot the pinned
-default, so the trial would never run. Before it writes `preferred`, CPS
-reads the release from the `#### LoaderInfo: systemd-boot …` marker in each
-systemd-boot binary under `EFI/systemd` and `EFI/BOOT` on the ESP, and
-refuses the activation if any of them is older than 262. When the ESP holds
+Earlier systemd-boot releases ignore `preferred` and would boot the
+default, so a trial would never run. CPS therefore requires systemd-boot 262
+or newer. Before every systemd-boot activation, CPS reads the release from
+the `#### LoaderInfo: systemd-boot …` marker in each systemd-boot binary
+under `EFI/systemd` and `EFI/BOOT` on the ESP, and refuses the activation if
+any of them is older than 262. When the ESP holds
 no systemd-boot binary, CPS uses the running loader's `LoaderInfo` EFI
 variable instead. Update the loader with `bootctl update` and retry.
 [`image disk`](disk-image.md) applies the same check to the template
-ESP, so a new disk can take trials after its first rollback.
+ESP.
 
-The automatic choice therefore depends only on the two owned keys and the CPS
-entry files. A second `default` line would take precedence over the first, so
+The choice therefore depends only on the two owned keys and the CPS entry
+files. A second `default` line would take precedence over the first, so
 CPS rejects duplicates. `timeout menu-force` disables the timeout, so the
 firmware would wait at the menu and an unattended trial or fallback would
-never boot. Any other timeout only delays the automatic choice. The other keys
+never boot. Any other timeout only delays the choice. The other keys
 change the menu, its extra entries, or the console. Automatically detected
 entries have their own IDs, such as `auto-windows`, which never match a CPS
-selector or `cps-*.conf`. CPS rejects non-CPS Type #1 entries in
+selector. CPS rejects non-CPS Type #1 entries in
 `loader/entries`. CPS writes `editor no` because the editor lets anyone at the
 console change the kernel command line of a Type #1 entry. Enabling it does
-not change automatic selection.
+not change the selection.
 
 ### Firmware variable overrides
 

@@ -1085,6 +1085,10 @@ impl System {
 
     /// Remove `upgrade-*` directories left empty after their roots were destroyed.
     fn remove_empty_staging_directories(&self) {
+        // Captures that an interrupted staging left behind hold whole roots.
+        if let Err(error) = crate::boot::sweep_captures(&self.boot().environments) {
+            eprintln!("Warning: could not remove abandoned staging captures: {error:#}");
+        }
         let Ok(children) = fs::read_dir(&self.boot().environments) else {
             return;
         };

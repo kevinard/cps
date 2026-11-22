@@ -232,14 +232,8 @@ fn destroy(
     if resumed.is_none() {
         // An exhausted preferred trial is no longer selected. Remove its
         // obsolete preference before withdrawing the entry from systemd-boot.
-        if firmware.is_none()
-            && let LoaderPolicy::Pinned {
-                default,
-                preferred: Some(preferred),
-            } = &policy
-            && preferred == id
-        {
-            LoaderPolicy::pinned(default).write(&esp.join("loader/loader.conf"))?;
+        if firmware.is_none() && policy.preferred.as_deref() == Some(id) {
+            LoaderPolicy::pinned(&policy.default).write(&esp.join("loader/loader.conf"))?;
         }
         renameat_with(
             &loader_entries,
@@ -270,29 +264,19 @@ fn check_selection<'a>(
     entries: &'a [BootEntry],
     target: &BootEntry,
 ) -> Result<&'a BootEntry> {
-    // The target was removed from the candidate inventory. Explicitly check
-    // selectors before choosing a retained entry so Automatic cannot hide it.
-    if let LoaderPolicy::Pinned { default, preferred } = policy {
-        ensure!(
-            default != &target.id,
-            "cannot destroy the configured default environment"
-        );
-        ensure!(
-            preferred.as_deref() != Some(&target.id) || target.tries == Some(0),
-            "cannot destroy the selected boot environment"
-        );
-    }
+    // The target was removed from the candidate inventory, so the selectors
+    // are checked against it explicitly before choosing a retained entry.
+    ensure!(
+        policy.default != target.id,
+        "cannot destroy the configured default environment"
+    );
+    ensure!(
+        policy.preferred.as_deref() != Some(&target.id) || target.tries == Some(0),
+        "cannot destroy the selected boot environment"
+    );
     let selected = policy
         .selected(entries)
         .context("no retained default CPS boot environment")?;
-    if matches!(policy, LoaderPolicy::Automatic) {
-        ensure!(
-            target.tries == Some(0)
-                || (target.revision, target.id.as_str())
-                    < (selected.revision, selected.id.as_str()),
-            "cannot destroy the selected boot environment"
-        );
-    }
     ensure!(
         selected.tries.is_none(),
         "select a known-good environment before destroying old roots"
@@ -465,18 +449,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            check_selection(
-                &LoaderPolicy::Automatic,
-                &[entry(2, Some(&old.id), None)],
-                &current
-            )
-            .is_err()
-        );
         let exhausted = entry(4, Some(&current.id), Some(0));
         assert!(
             check_selection(
-                &LoaderPolicy::Automatic,
+                &LoaderPolicy::trial(&current.id, &exhausted.id),
                 &[entry(3, Some(&base.id), None)],
                 &exhausted
             )

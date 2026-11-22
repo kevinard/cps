@@ -265,9 +265,7 @@ fn candidates(
          pruning"
     );
     let mut kept: BTreeSet<&str> = protected.iter().map(String::as_str).collect();
-    if let LoaderPolicy::Pinned { default, .. } = policy {
-        kept.insert(default);
-    }
+    kept.insert(&policy.default);
     if let Some(selected) = selected {
         kept.insert(&selected.id);
         kept.extend(selected.parent.as_deref());
@@ -326,7 +324,7 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
         policy
             .selected(&entries)
             .is_none_or(|selected| selected.id != id)
-            && !matches!(&policy, LoaderPolicy::Pinned { preferred: Some(preferred), .. } if preferred == id),
+            && policy.preferred.as_deref() != Some(id),
         "trial {id} is selected for the next boot; cancel it with `cps boot discard-trial`"
     );
     ensure!(
@@ -682,16 +680,6 @@ mod tests {
         entries[3].tries = Some(0);
         assert_eq!(
             removed(&candidates(&entries, &pending, &[], Some(1))?),
-            [(3, BootRemoval::FailedTrial), (4, BootRemoval::FailedTrial)]
-        );
-        // Automatic selection protects the newest bootable entry.
-        assert_eq!(
-            removed(&candidates(
-                &entries,
-                &LoaderPolicy::Automatic,
-                &[],
-                Some(1)
-            )?),
             [(3, BootRemoval::FailedTrial), (4, BootRemoval::FailedTrial)]
         );
         Ok(())
