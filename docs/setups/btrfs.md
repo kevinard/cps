@@ -98,9 +98,14 @@ can be assembled and unlocked by the initramfs before it mounts that root.
   Other shared data such as `/home` or a swapfile can live on sibling
   subvolumes mounted at ordinary directories in each root. A Btrfs snapshot
   omits nested subvolume contents. See [Nested subvolumes](#nested-subvolumes).
-- Mount the dedicated, writable VFAT systemd-boot ESP at `esp`. CPS reads
+- Mount the dedicated, writable VFAT systemd-boot ESP at `esp`, with
+  systemd-boot 262 or newer installed on it, since CPS selects trials with
+  the `loader.conf` `preferred` key. CPS reads
   the GPT with the disk's logical block size, so disks with 512-byte and
-  4096-byte (4Kn) sectors both work. The ESP can be an automount point, as
+  4096-byte (4Kn) sectors both work. Commands on a running system read only
+  the primary GPT and check its CRCs, so a disk that was grown, whose backup
+  GPT is no longer at the end, keeps working. `cps image disk` checks both
+  copies of a disk it writes. The ESP can be an automount point, as
   created by `systemd-gpt-auto-generator` or an `x-systemd.automount` fstab
   entry. CPS opens the directory to trigger the mount, then checks that one
   writable VFAT mount sits on the trigger. It keeps the ESP open for the
@@ -234,7 +239,12 @@ makes the trial the default. It then applies the
 
 Use `--uefi` for manual trial activation. With the ESP mounted on the
 machine, `boot list`, Btrfs rollback, `boot destroy`, and `prune` use
-the firmware entries. After a failed trial boots the fallback, the next
+the firmware entries. CPS recognizes its firmware option by what it boots,
+the ESP's GPT partition and `\EFI\cps\ID\uki.efi`, and not by its exact
+bytes, so firmware that adds optional data, changes the option's attributes
+or expands its device path does not lose track of the environment. A
+second option that boots the same file makes CPS stop, because it could not
+tell which option firmware would use. After a failed trial boots the fallback, the next
 staged change removes the failed trial, or run
 [`cps boot discard-trial`](#discarding-a-trial). CPS preserves an
 unrelated `BootNext` and reports it if it conflicts with activation or
@@ -334,7 +344,12 @@ trial is accepted, or coordinate its backup and restore with the application.
 
 A trial is a snapshot taken when the change is staged. Staging records the
 snapshot's `/etc`, before the plan changes it, as the merge base in the
-trial's image state. After a system command or `boot activate`
+trial's image state. The base records each file's metadata and digest, and
+for the account databases the digest of each record, never its contents,
+so it keeps no password hashes. Once the trial runs, the next system
+command removes its base. Each regular file is hashed as it is read, so a
+large file in `/etc` costs no memory; an account database larger than
+16 MiB stops the merge. After a system command or `boot activate`
 selects the trial, CPS creates `/run/cps/finalize-trial`, and `cps-finalize-trial.path` starts
 `cps-finalize-trial.service`. When the system shuts down, stopping that
 service runs `cps boot finalize-trial`. The command finds the trial
@@ -355,6 +370,12 @@ trial's image lock, and merges the running `/etc` into it as described in
   by hand before a reboot, and the shutdown run then adds what changed since.
   The trial keeps the report of the last merge as `etc-merge.json` in its
   image state.
+- A trial that system commands staged also carries `etc-merge-required`
+  with its revision. Until a merge report for that revision exists, `cps
+  verify --quick`, which `cps-boot-health.service` runs, reports the missing
+  merge as an error, so a trial that booted after a crash or a forced
+  reboot is never blessed. `cps boot stage` and `cps boot activate` used by
+  hand do not require the merge.
 - If the merge fails, CPS leaves the trial's `/etc` as it was and cancels
   the trial, as `boot rollback` would. Booting a trial without a new
   password or user can lock you out, while the fallback keeps every change
@@ -386,11 +407,9 @@ it starts, CPS takes a read-only snapshot of the root in
 registers it as a known-good environment titled `Canopa backup`, and then
 makes it writable, so it boots like any root when it is picked from the boot
 menu. The backup
-has no fallback and is never selected automatically. If `loader.conf` still
-selects the newest entry with `default cps-*.conf`, CPS first pins the running
-environment, because the backup would be the newest. Later trials are then
-selected with the `preferred` key, so this needs systemd-boot 262 or newer;
-CPS refuses the backup on an older loader. With direct UEFI boot,
+has no fallback and is never selected automatically: `loader.conf` names the
+entries it selects, so a new entry never changes the next boot. With direct
+UEFI boot,
 CPS creates the backup's firmware boot option without changing `BootOrder`.
 
 To return to the system as it was before a live change, select the backup
@@ -531,9 +550,12 @@ record, then commits subvolume deletion before removing boot artifacts and
 the record. `boot list` shows interrupted cleanup as `retiring`. Retry the
 same command to finish. Activation of that identity stays blocked until
 cleanup completes. Keep the recorded root path stable during this operation.
+If Btrfs refuses to delete a systemd-boot environment's root, CPS restores
+its entry, so the environment stays bootable instead of retiring.
 
-Btrfs refuses to delete its filesystem default subvolume. If it is the
-obsolete root, choose another filesystem default, such as top-level ID 5 with
+Btrfs refuses to delete its filesystem default subvolume, so `cps boot
+destroy` and its dry run check for it before they change anything. If it is
+the obsolete root, choose another filesystem default, such as top-level ID 5 with
 `btrfs subvolume set-default 5 /mnt/cps-volume`, then retry. CPS boot entries
 select their subvolume explicitly. Storage reclamation continues in the
 background after the deletion transaction commits.
@@ -587,7 +609,10 @@ prunes after it promotes a trial. Automatic pruning reports problems as
 warnings and never blocks the transaction. With `auto-prune=#false`, staging
 still removes failed and abandoned trials but keeps every known-good
 environment. Pruning also removes empty `upgrade-*`, `backup-*`, and
-`named-*` directories left in `environments`.
+`named-*` directories left in `environments`, and the `.cps-capture-*`
+snapshots of staging that was interrupted, for example by a power loss
+while it built an initramfs. A capture that a running CPS still holds is
+kept, and the next staging removes abandoned captures before it starts.
 
 The prune before staging keeps the trial of an interrupted activation of the
 same change, whose root is that change's `upgrade-*/root`, so that the retry

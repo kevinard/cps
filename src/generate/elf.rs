@@ -315,14 +315,14 @@ mod tests {
     fn libraries_in_library_dirs_provide_and_consumers_require() -> Result<()> {
         let manifest = manifest(
             r#"
-    file "usr/lib/libdemo.so.1.0" mode="0755" uid=0 gid=0
-    symlink "usr/lib/libdemo.so.1" target="libdemo.so.1.0" uid=0 gid=0
-    file "usr/lib/private/libhidden.so.2" mode="0755" uid=0 gid=0
-    file "usr/lib/loader-copy" mode="0755" uid=0 gid=0
-    file "usr/bin/demo" mode="0755" uid=0 gid=0 arch="x86_64"
-    hardlink "usr/bin/demo-alias" target="usr/bin/demo" arch="x86_64"
-    file "usr/bin/optional" mode="0755" uid=0 gid=0 facet="extra"
-    file "usr/lib/libgpu.so.3" mode="0755" uid=0 gid=0 variant.gpu="true"
+    file "usr/lib/libdemo.so.1.0" mode="0755"
+    symlink "usr/lib/libdemo.so.1" target="libdemo.so.1.0"
+    file "usr/lib/private/libhidden.so.2" mode="0755"
+    file "usr/lib/loader-copy" mode="0755"
+    file "usr/bin/demo" mode="0755" architecture="x86_64"
+    hardlink "usr/bin/demo-alias" target="usr/bin/demo" architecture="x86_64"
+    file "usr/bin/optional" mode="0755" facet="extra"
+    file "usr/lib/libgpu.so.3" mode="0755" variant.gpu="true"
 "#,
         );
         let mut library = object(Some("libdemo.so.1"), &["libc.so.6"]);
@@ -401,9 +401,9 @@ mod tests {
     fn runpath_and_abi_decide_local_libraries() -> Result<()> {
         let manifest = manifest(
             r#"
-    file "opt/demo/lib/libown.so.1" mode="0755" uid=0 gid=0
-    file "usr/lib/libwide.so.1" mode="0755" uid=0 gid=0
-    file "opt/demo/bin/tool" mode="0755" uid=0 gid=0
+    file "opt/demo/lib/libown.so.1" mode="0755"
+    file "usr/lib/libwide.so.1" mode="0755"
+    file "opt/demo/bin/tool" mode="0755"
 "#,
         );
         let mut narrow = object(Some("libwide.so.1"), &[]);
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn unparseable_elf_payloads_are_data() -> Result<()> {
-        let manifest = manifest("    file \"usr/lib/libbroken.so.1\" mode=\"0644\" uid=0 gid=0\n");
+        let manifest = manifest("    file \"usr/lib/libbroken.so.1\" mode=\"0644\"\n");
         let work = tempfile::tempdir()?;
         let path = work.path().join("payload");
         let bytes = b"\x7fELF\x02\x01\x01 truncated fixture";

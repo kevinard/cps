@@ -8,8 +8,11 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
-use rustix::fs::{FlockOperation, flock};
+use anyhow::{Context, Result, bail, ensure};
+use rustix::{
+    fs::{FlockOperation, flock},
+    io::Errno,
+};
 use serde::Serialize;
 
 use crate::{
@@ -30,7 +33,7 @@ use crate::{
     kdl_format::{BtrfsConfig, ImageDefinition, read_image_definition},
     list_boot_environments,
     model::validate_publisher,
-    plan::{UpdateDiagnostics, UpdateSelection, inspect_update, plan_system},
+    plan::{SystemMode, UpdateDiagnostics, UpdateSelection, inspect_update, plan_system},
     query::{InstallSource, SelectSource, select_install_sources},
     release::{
         Mirror, MirrorSources, PublisherFreshness, SyncOptions, image_config_dir,
@@ -41,18 +44,18 @@ use crate::{
     transaction_progress,
 };
 
-pub use crate::boot::{BootPruneReport, BootRemoval, EtcConflict, EtcMergeReport, TrialDiscard};
-pub use crate::git_install::{GitChange, GitSignatures, GitSignedObject};
-pub use crate::plan::HeldBackUpdate;
+pub(crate) use crate::boot::{BootPruneReport, BootRemoval, EtcMergeReport, TrialDiscard};
+pub(crate) use crate::git_install::{GitChange, GitSignatures, GitSignedObject};
+pub(crate) use crate::plan::HeldBackUpdate;
 
-pub const CONFIG: &str = "/etc/cps/image.kdl";
+pub(crate) const CONFIG: &str = "/etc/cps/image.kdl";
 /// Starts `cps-finalize-trial.service`, whose stop merges /etc into the
 /// pending trial at shutdown. It lives in /run, so it lasts for one boot.
-pub const FINALIZE_FLAG: &str = "/run/cps/finalize-trial";
+pub(crate) const FINALIZE_FLAG: &str = "/run/cps/finalize-trial";
 const ROOT: &str = "/";
 const GIT_TOOLCHAIN: &str = "/usr/share/cps/git-build/toolchain.kdl";
 
-pub struct System {
+pub(crate) struct System {
     config: PathBuf,
     definition: ImageDefinition,
     plan_options: PlanOptions,
@@ -60,7 +63,7 @@ pub struct System {
 }
 
 #[derive(Debug)]
-pub struct RetryBaseOnly;
+pub(crate) struct RetryBaseOnly;
 
 impl std::fmt::Display for RetryBaseOnly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,7 +75,7 @@ impl std::error::Error for RetryBaseOnly {}
 
 /// The result of `cps boot finalize-trial`.
 #[derive(Debug)]
-pub enum Finalized {
+pub(crate) enum Finalized {
     /// No trial is selected to replace the running root at the next boot.
     NoTrial,
     /// The trial was staged without a merge base, so its /etc stays as staged.
@@ -83,7 +86,7 @@ pub enum Finalized {
     },
 }
 
-pub struct Change {
+pub(crate) struct Change {
     plan: Plan,
     boot_reason: Option<String>,
     live_services: Option<LiveServices>,
@@ -91,7 +94,7 @@ pub struct Change {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UpdateStatus {
+pub(crate) enum UpdateStatus {
     UpToDate,
     UpdatesAvailable,
     Deferred,
@@ -99,7 +102,7 @@ pub enum UpdateStatus {
 }
 
 #[derive(Debug, Serialize)]
-pub struct UpdateReport {
+pub(crate) struct UpdateReport {
     pub status: UpdateStatus,
     pub changes: Vec<PackageChange>,
     pub held_back: Vec<HeldBackUpdate>,
@@ -175,30 +178,38 @@ impl UpdateReport {
 impl Change {
     pub(crate) fn from_plan(plan: Plan, stage_packages: &BTreeSet<String>) -> Self {
         let boot_reason = plan.boot_reason(stage_packages);
-        Self {
+        let mut change = Self {
             plan,
             boot_reason,
             live_services: None,
-        }
+        };
+        change.record_mode();
+        change
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// Record in the plan how it runs, so the plan that `--save-plan` writes
+    /// and the plan that runs have the same bytes and ID.
+    fn record_mode(&mut self) {
+        self.plan.system = Some(self.mode());
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         !self.plan.changes_image()
     }
 
-    pub fn packages(&self) -> &[PackageChange] {
+    pub(crate) fn packages(&self) -> &[PackageChange] {
         self.plan.package_changes()
     }
 
-    pub fn saved_plan(&self) -> &Plan {
+    pub(crate) fn saved_plan(&self) -> &Plan {
         &self.plan
     }
 
-    pub fn boot_reason(&self) -> Option<&str> {
+    pub(crate) fn boot_reason(&self) -> Option<&str> {
         self.boot_reason.as_deref()
     }
 
-    pub fn service_effects(&self) -> Vec<String> {
+    pub(crate) fn service_effects(&self) -> Vec<String> {
         let mut effects = self
             .plan
             .systemd
@@ -219,22 +230,45 @@ impl Change {
         effects
     }
 
-    pub fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         self.plan.summary()
     }
 
+    /// How this change runs on the system: in place, staged in a trial
+    /// boot environment, or as a recovery root.
+    pub(crate) fn mode(&self) -> SystemMode {
+        match (&self.boot_reason, self.plan.is_recovery()) {
+            (None, _) => SystemMode::Live,
+            (Some(_), false) => SystemMode::Staged,
+            (Some(_), true) => SystemMode::Recovery,
+        }
+    }
+
+    /// The plan to save, which records how it runs on the system.
+    pub(crate) fn to_saved(&self) -> Plan {
+        self.plan.clone()
+    }
+
     /// Route a nonempty change through the trial boot workflow.
-    pub fn with_staging(mut self) -> Self {
+    pub(crate) fn with_staging(mut self) -> Self {
         if !self.is_empty() {
             self.boot_reason
                 .get_or_insert_with(|| "--stage was requested".into());
         }
+        self.record_mode();
         self
     }
 }
 
+/// Proof that this process holds the boot environments lock. Methods that
+/// change boot environments take it, so a caller cannot forget the lock and
+/// no method takes it a second time.
+pub(crate) struct EnvironmentsLock {
+    _file: File,
+}
+
 impl System {
-    pub fn load(config: &Path) -> Result<Self> {
+    pub(crate) fn load(config: &Path) -> Result<Self> {
         let definition = read_image_definition(config)?;
         ensure!(
             definition.boot_btrfs.is_some(),
@@ -249,23 +283,23 @@ impl System {
         })
     }
 
-    pub fn with_install_recommends(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_install_recommends(mut self, enabled: bool) -> Self {
         self.plan_options.install_recommends = enabled;
         self
     }
 
-    pub fn with_force_phased_update(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_force_phased_update(mut self, enabled: bool) -> Self {
         self.plan_options.force_phased_update = enabled;
         self
     }
 
-    pub fn with_base_only(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_base_only(mut self, enabled: bool) -> Self {
         self.base_only = enabled;
         self
     }
 
     /// The configured EFI System Partition and Btrfs top-level volume.
-    pub fn boot_paths(&self) -> (&Path, &Path) {
+    pub(crate) fn boot_paths(&self) -> (&Path, &Path) {
         let boot = self.boot();
         (&boot.esp, &boot.volume)
     }
@@ -278,7 +312,9 @@ impl System {
     }
 
     /// Hold this across refresh, confirmation, and application.
-    pub fn lock(&self) -> Result<File> {
+    /// Take the boot environments lock, waiting for another CPS command
+    /// that holds it.
+    pub(crate) fn lock(&self) -> Result<EnvironmentsLock> {
         let boot = self.boot();
         let volume = fs::canonicalize(&boot.volume)?;
         let environments = fs::canonicalize(&boot.environments)?;
@@ -292,24 +328,23 @@ impl System {
             metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
             "the environments directory must be owned by root and writable only by root"
         );
-        flock(&lock, FlockOperation::LockExclusive)?;
-        Ok(lock)
+        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(Errno::WOULDBLOCK) => {
+                eprintln!("Waiting for another CPS command to release the boot environments");
+                flock(&lock, FlockOperation::LockExclusive)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(EnvironmentsLock { _file: lock })
     }
 
-    /// Prune a system cache while retaining payloads for its registered boot roots.
-    pub fn prune_cache(
+    /// Prune a system cache while retaining payloads for its registered boot roots
+    /// and the given image locks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prune_cache(
         &self,
-        repo: &Path,
-        publisher: &str,
-        key: &Path,
-        keep: crate::release::CacheRetention<'_>,
-        apply: bool,
-    ) -> Result<crate::release::PruneReport> {
-        self.prune_cache_with_locks(repo, publisher, key, keep, &[], apply)
-    }
-
-    pub fn prune_cache_with_locks(
-        &self,
+        _held: &EnvironmentsLock,
         repo: &Path,
         publisher: &str,
         key: &Path,
@@ -317,7 +352,6 @@ impl System {
         locks: &[crate::ImageLock],
         apply: bool,
     ) -> Result<crate::release::PruneReport> {
-        let _lock = self.lock()?;
         let boot = self.boot();
         crate::boot::with_registered_images(
             &boot.volume,
@@ -331,8 +365,7 @@ impl System {
         )
     }
 
-    // The system operation already holds the environments lock.
-    fn prune_after_transaction(&self) {
+    fn prune_after_transaction(&self, _held: &EnvironmentsLock) {
         let Some(versions) = self.definition.cache_keep_versions else {
             return;
         };
@@ -379,7 +412,7 @@ impl System {
         }
     }
 
-    pub fn publisher_cache(&self, publisher: &str) -> Result<PathBuf> {
+    pub(crate) fn publisher_cache(&self, publisher: &str) -> Result<PathBuf> {
         validate_publisher(publisher)?;
         self.check_running()?;
         // This sibling subvolume is shared by the running root and its trials.
@@ -403,7 +436,7 @@ impl System {
     }
 
     /// Prepare an explicitly selected Git commit and return its local package ID.
-    pub fn prepare_git_install(
+    pub(crate) fn prepare_git_install(
         &self,
         url: &str,
         reference: GitSnapshotRef<'_>,
@@ -447,7 +480,7 @@ impl System {
     }
 
     /// Check opted-in Git sources and build the exact commits approved for this upgrade.
-    pub fn prepare_git_updates(
+    pub(crate) fn prepare_git_updates(
         &self,
         mut approve: impl FnMut(&GitChange) -> Result<bool>,
     ) -> Result<Vec<String>> {
@@ -484,7 +517,9 @@ impl System {
                 let store = GitStore::open(path)?;
                 ensure!(
                     fs::canonicalize(store.repo())? == publisher.repo
-                        && crate::repo::read_trust_root(&store.trust_root())? == publisher.key,
+                        && crate::repo::trust_root_genesis(&crate::repo::read_trust_root(
+                            &store.trust_root()
+                        )?)? == crate::repo::trust_root_genesis(&publisher.key)?,
                     "Git publisher cache or signing key changed for {name}"
                 );
                 updates.push(build.publish(source, &store, self.git_toolchain()?)?);
@@ -493,15 +528,15 @@ impl System {
         Ok(updates)
     }
 
-    pub fn plan(&self, request: Request, refresh: bool) -> Result<Change> {
+    pub(crate) fn plan(&self, request: Request, refresh: bool) -> Result<Change> {
         self.plan_request(request, refresh, None, &[])
     }
 
-    pub fn plan_git_upgrade(&self, updates: &[String], refresh: bool) -> Result<Change> {
+    pub(crate) fn plan_git_upgrade(&self, updates: &[String], refresh: bool) -> Result<Change> {
         self.plan_request(Request::Update, refresh, None, updates)
     }
 
-    pub fn plan_with_source_selection(
+    pub(crate) fn plan_with_source_selection(
         &self,
         request: Request,
         refresh: bool,
@@ -511,19 +546,7 @@ impl System {
     }
 
     /// Check the running system with the same refresh and planner as an upgrade.
-    pub fn check_updates(config: &Path, refresh: bool) -> UpdateReport {
-        Self::check_updates_with_explanation(config, refresh, None)
-    }
-
-    pub fn check_updates_with_explanation(
-        config: &Path,
-        refresh: bool,
-        explain: Option<&str>,
-    ) -> UpdateReport {
-        Self::check_updates_with_scope(config, refresh, explain, false)
-    }
-
-    pub fn check_updates_with_scope(
+    pub(crate) fn check_updates(
         config: &Path,
         refresh: bool,
         explain: Option<&str>,
@@ -555,7 +578,7 @@ impl System {
     }
 
     /// Refresh policy and cache age of each URL-added publisher, without network access.
-    pub fn publisher_freshness(&self) -> Result<Vec<PublisherFreshness>> {
+    pub(crate) fn publisher_freshness(&self) -> Result<Vec<PublisherFreshness>> {
         url_publisher_freshness(Path::new(ROOT), &self.definition.refresh_policies)
     }
 
@@ -594,7 +617,53 @@ impl System {
         Ok(change)
     }
 
-    pub fn apply(&self, change: &Change) -> Result<Option<String>> {
+    /// The change a plan saved on this system describes, to run the way it
+    /// was saved.
+    pub(crate) fn saved_change(&self, plan: Plan) -> Result<Change> {
+        let mode = plan
+            .system
+            .context("the plan was saved for an image; apply it with --root naming that image")?;
+        self.check_running()?;
+        let required = plan.boot_reason(&self.definition.stage_packages);
+        let boot_reason = match mode {
+            SystemMode::Live => {
+                if let Some(reason) = required {
+                    bail!(
+                        "the plan was saved as a live change, but it now requires a reboot because \
+                         {reason}; plan the change again"
+                    );
+                }
+                None
+            }
+            SystemMode::Staged => {
+                Some(required.unwrap_or_else(|| "the plan was saved staged".to_owned()))
+            }
+            SystemMode::Recovery => {
+                ensure!(
+                    plan.is_recovery(),
+                    "the saved recovery plan is not a repair or revert"
+                );
+                Some(required.unwrap_or_else(|| "the plan was saved as a recovery".to_owned()))
+            }
+        };
+        Ok(Change {
+            plan,
+            boot_reason,
+            live_services: None,
+        })
+    }
+
+    /// Download and verify the payloads a plan saved on this system needs.
+    pub(crate) fn fetch_saved(&self, plan: &Plan, archives: &[(String, PathBuf)]) -> Result<usize> {
+        ensure!(
+            plan.system.is_some(),
+            "the plan was saved for an image; fetch it with --root naming that image"
+        );
+        self.check_running()?;
+        crate::fetch_plan_with_archives(Path::new(ROOT), plan, archives)
+    }
+
+    pub(crate) fn apply(&self, held: &EnvironmentsLock, change: &Change) -> Result<Option<String>> {
         self.check_running()?;
         if let Err(error) = fetch_plan(Path::new(ROOT), &change.plan) {
             if !self.base_only
@@ -624,7 +693,7 @@ impl System {
                     boot.activation.root_partuuid.as_deref(),
                     |_, _, _| Ok(()),
                 )?;
-                let id = self.backup_running().context(
+                let id = self.backup_running(held).context(
                     "creating the backup boot environment before the live change. Remove old \
                      environments with `cps boot prune`, or set live-backup=#false in \
                      boot-btrfs to change the running root without a backup",
@@ -643,12 +712,14 @@ impl System {
                     )
                 },
             )?;
-            self.prune_after_transaction();
+            self.prune_after_transaction(held);
             return Ok(None);
         }
 
-        self.prune_before_staging(change)?;
-        let root = self.stage_change(change)?;
+        self.prune_before_staging(held, change)?;
+        let root = self.stage_change(held, change)?;
+        // The trial is selected below, but its /etc is merged at shutdown.
+        etc_merge::require_merge(&Image::open_query(&root)?)?;
         let id = if boot.uefi {
             boot.activation
                 .activate_btrfs_uefi(&root, &boot.volume, &boot.esp)
@@ -661,15 +732,15 @@ impl System {
         }
         .with_context(|| format!("activating the prepared environment at {}", root.display()))?;
         arm_finalize();
-        self.prune_after_transaction();
+        self.prune_after_transaction(held);
         Ok(Some(id))
     }
 
     /// Snapshot the running root as a known-good environment.
     ///
     /// A retry after an interrupted backup or an aborted live change reuses
-    /// the backup of the same revision. Callers hold the environments lock.
-    fn backup_running(&self) -> Result<String> {
+    /// the backup of the same revision.
+    fn backup_running(&self, held: &EnvironmentsLock) -> Result<String> {
         let boot = self.boot();
         let settings = Image::open_query(Path::new(ROOT))?.settings()?;
         let output = boot
@@ -694,7 +765,11 @@ impl System {
                 })?;
             }
             // Make room on the ESP for the backup's boot files.
-            self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments), None);
+            self.prune_quietly(
+                held,
+                boot.auto_prune.then_some(boot.keep_environments),
+                None,
+            );
             backup_running_btrfs(&output, &boot.exclude_subvolumes)?;
         }
         let id = boot
@@ -707,7 +782,7 @@ impl System {
         make_writable(&Root::open(&root)?)
             .with_context(|| format!("making the backup at {} writable", root.display()))?;
         if boot.auto_prune {
-            self.prune_quietly(Some(boot.keep_environments), None);
+            self.prune_quietly(held, Some(boot.keep_environments), None);
         }
         Ok(id)
     }
@@ -718,9 +793,12 @@ impl System {
     /// and revision, so a retry after an interruption reuses a snapshot only
     /// when it holds the same revision. A snapshot stays read-only until it
     /// is registered.
-    pub fn create_boot_environment(&self, name: &str) -> Result<String> {
+    pub(crate) fn create_boot_environment(
+        &self,
+        held: &EnvironmentsLock,
+        name: &str,
+    ) -> Result<String> {
         validate_environment_name(name)?;
-        let _lock = self.lock()?;
         self.check_running()?;
         let boot = self.boot();
         let settings = Image::open_query(Path::new(ROOT))?.settings()?;
@@ -762,7 +840,11 @@ impl System {
                     })?;
                 }
                 // Make room on the ESP for the environment's boot files.
-                self.prune_quietly(boot.auto_prune.then_some(boot.keep_environments), None);
+                self.prune_quietly(
+                    held,
+                    boot.auto_prune.then_some(boot.keep_environments),
+                    None,
+                );
                 backup_running_btrfs(&output, &boot.exclude_subvolumes)?;
             }
             let id = boot
@@ -792,9 +874,8 @@ impl System {
     /// Merge the running /etc into the trial selected for the next boot.
     ///
     /// A failed merge leaves the trial's /etc as staged and cancels the
-    /// trial, so the next boot keeps every local change. Callers hold the
-    /// environments lock.
-    pub fn finalize_trial(&self) -> Result<Finalized> {
+    /// trial, so the next boot keeps every local change.
+    pub(crate) fn finalize_trial(&self, _held: &EnvironmentsLock) -> Result<Finalized> {
         let boot = self.boot();
         if let Err(error) = etc_merge::remove_leftovers(&Root::open(Path::new(ROOT))?) {
             eprintln!("Warning: could not remove /etc merge leftovers: {error:#}");
@@ -836,7 +917,7 @@ impl System {
     }
 
     /// Start the shutdown merge for a trial pending from an earlier boot.
-    pub fn arm_finalize(&self) -> Result<Option<String>> {
+    pub(crate) fn arm_finalize(&self) -> Result<Option<String>> {
         let boot = self.boot();
         let trial = pending_trial(
             &boot.volume,
@@ -850,7 +931,11 @@ impl System {
     }
 
     /// Stage a recovery plan and verify the result before returning its root.
-    pub fn prepare_recovery(&self, change: &Change) -> Result<PathBuf> {
+    pub(crate) fn prepare_recovery(
+        &self,
+        held: &EnvironmentsLock,
+        change: &Change,
+    ) -> Result<PathBuf> {
         ensure!(
             change.plan.is_recovery(),
             "expected a repair or revert plan"
@@ -858,8 +943,8 @@ impl System {
         self.check_running()?;
         fetch_plan(Path::new(ROOT), &change.plan)
             .context("fetching the approved repair payloads")?;
-        self.prune_before_staging(change)?;
-        self.stage_change(change)
+        self.prune_before_staging(held, change)?;
+        self.stage_change(held, change)
     }
 
     /// The staging directory for `change`, which a retry reuses.
@@ -868,7 +953,7 @@ impl System {
         Ok(self.boot().environments.join(format!("upgrade-{plan_id}")))
     }
 
-    fn stage_change(&self, change: &Change) -> Result<PathBuf> {
+    fn stage_change(&self, _held: &EnvironmentsLock, change: &Change) -> Result<PathBuf> {
         let boot = self.boot();
         let plan_id = change.plan.id()?;
         let output = self.staging_directory(change)?;
@@ -909,15 +994,15 @@ impl System {
         Ok(root)
     }
 
-    pub fn resume(&self) -> Result<Option<u64>> {
-        self.resume_transaction(false)
+    pub(crate) fn resume(&self, held: &EnvironmentsLock) -> Result<Option<u64>> {
+        self.resume_transaction(held, false)
     }
 
-    pub fn resume_with_repair(&self) -> Result<Option<u64>> {
-        self.resume_transaction(true)
+    pub(crate) fn resume_with_repair(&self, held: &EnvironmentsLock) -> Result<Option<u64>> {
+        self.resume_transaction(held, true)
     }
 
-    fn resume_transaction(&self, repair: bool) -> Result<Option<u64>> {
+    fn resume_transaction(&self, held: &EnvironmentsLock, repair: bool) -> Result<Option<u64>> {
         let boot = self.boot();
         let revision = with_running_environment(
             &boot.volume,
@@ -932,13 +1017,13 @@ impl System {
                 }
             },
         )?;
-        self.prune_after_transaction();
+        self.prune_after_transaction(held);
         Ok(revision)
     }
 
     /// Abort the interrupted live transaction, returning the running root
     /// to its committed package revision.
-    pub fn abort(&self, fetch: bool) -> Result<Option<u64>> {
+    pub(crate) fn abort(&self, held: &EnvironmentsLock, fetch: bool) -> Result<Option<u64>> {
         let boot = self.boot();
         let revision = with_running_environment(
             &boot.volume,
@@ -946,11 +1031,11 @@ impl System {
             boot.activation.root_partuuid.as_deref(),
             |root, id, revision| abort_live(Image::open_for_live_apply(root, id, revision)?, fetch),
         )?;
-        self.prune_after_transaction();
+        self.prune_after_transaction(held);
         Ok(revision)
     }
 
-    pub fn boot_status(&self) -> Result<(String, Vec<BootEnvironment>)> {
+    pub(crate) fn boot_status(&self) -> Result<(String, Vec<BootEnvironment>)> {
         let settings = Image::open_query(Path::new(ROOT))?.settings()?;
         Ok((
             entry_id(&settings.id, settings.boot_revision()),
@@ -959,25 +1044,26 @@ impl System {
     }
 
     /// Promote the running one-shot firmware trial after verifying its health.
-    pub fn bless_uefi(&self) -> Result<Option<String>> {
+    pub(crate) fn bless_uefi(&self) -> Result<Option<String>> {
         let boot = self.boot();
         ensure!(boot.uefi, "configure uefi=#true in boot-btrfs");
         let blessed = crate::boot::bless_uefi(&boot.esp, &boot.volume)?;
         if blessed.is_some() && boot.auto_prune {
             // The promoted trial is the new default, so older roots can retire.
             match self.lock() {
-                Ok(_lock) => self.prune_quietly(Some(boot.keep_environments), None),
+                Ok(held) => self.prune_quietly(&held, Some(boot.keep_environments), None),
                 Err(error) => eprintln!("Warning: could not prune boot environments: {error:#}"),
             }
         }
         Ok(blessed)
     }
 
-    /// Apply the retention policy. Callers hold the environments lock.
+    /// Apply the retention policy.
     ///
     /// `keep` overrides keep-environments. Failed and abandoned trials are always removed.
-    pub fn prune_boot_environments(
+    pub(crate) fn prune_boot_environments(
         &self,
+        held: &EnvironmentsLock,
         keep: Option<usize>,
         dry_run: bool,
     ) -> Result<BootPruneReport> {
@@ -990,16 +1076,16 @@ impl System {
             None,
         )?;
         if !dry_run {
-            self.remove_empty_staging_directories();
+            self.remove_empty_staging_directories(held);
         }
         Ok(report)
     }
 
-    /// Cancel a pending or running trial and remove failed trials. Callers hold the lock.
-    pub fn discard_trial(&self) -> Result<TrialDiscard> {
+    /// Cancel a pending or running trial and remove failed trials.
+    pub(crate) fn discard_trial(&self, held: &EnvironmentsLock) -> Result<TrialDiscard> {
         let boot = self.boot();
         let discard = discard_btrfs_trial(&boot.esp, &boot.volume)?;
-        self.remove_empty_staging_directories();
+        self.remove_empty_staging_directories(held);
         Ok(discard)
     }
 
@@ -1007,17 +1093,18 @@ impl System {
     ///
     /// The trial of an interrupted activation of `change` stays, so that
     /// staging and activation resume it.
-    fn prune_before_staging(&self, change: &Change) -> Result<()> {
+    fn prune_before_staging(&self, held: &EnvironmentsLock, change: &Change) -> Result<()> {
         let boot = self.boot();
         let staged = self.staging_directory(change)?.join("root");
         self.prune_quietly(
+            held,
             boot.auto_prune.then_some(boot.keep_environments),
             Some(&staged),
         );
         Ok(())
     }
 
-    fn prune_quietly(&self, keep: Option<usize>, staged: Option<&Path>) {
+    fn prune_quietly(&self, held: &EnvironmentsLock, keep: Option<usize>, staged: Option<&Path>) {
         let boot = self.boot();
         match prune_btrfs_boot_environments(&boot.esp, &boot.volume, keep, false, staged) {
             Ok(report) => {
@@ -1030,11 +1117,15 @@ impl System {
             }
             Err(error) => eprintln!("Warning: could not prune boot environments: {error:#}"),
         }
-        self.remove_empty_staging_directories();
+        self.remove_empty_staging_directories(held);
     }
 
     /// Remove `upgrade-*` directories left empty after their roots were destroyed.
-    fn remove_empty_staging_directories(&self) {
+    fn remove_empty_staging_directories(&self, _held: &EnvironmentsLock) {
+        // Captures that an interrupted staging left behind hold whole roots.
+        if let Err(error) = crate::boot::sweep_captures(&self.boot().environments) {
+            eprintln!("Warning: could not remove abandoned staging captures: {error:#}");
+        }
         let Ok(children) = fs::read_dir(&self.boot().environments) else {
             return;
         };
@@ -1052,8 +1143,12 @@ impl System {
         }
     }
 
-    pub fn transaction_progress(&self, plan: &Plan, validate: bool) -> Result<TransactionProgress> {
-        let _lock = self.lock()?;
+    pub(crate) fn transaction_progress(
+        &self,
+        _held: &EnvironmentsLock,
+        plan: &Plan,
+        validate: bool,
+    ) -> Result<TransactionProgress> {
         let boot = self.boot();
         let (running, entries) = self.boot_status()?;
         let plan_id = plan.id()?;
@@ -1243,7 +1338,7 @@ impl System {
 ///
 /// The merge only runs for a trial whose fallback is the running root, so
 /// the request is harmless elsewhere, such as on an installer.
-pub fn arm_finalize() {
+pub(crate) fn arm_finalize() {
     let result = fs::create_dir_all("/run/cps").and_then(|()| fs::write(FINALIZE_FLAG, b""));
     if let Err(error) = result {
         eprintln!(
@@ -1255,7 +1350,7 @@ pub fn arm_finalize() {
 }
 
 /// Describe why prune removed an environment.
-pub fn removal_label(kind: BootRemoval) -> &'static str {
+pub(crate) fn removal_label(kind: BootRemoval) -> &'static str {
     match kind {
         BootRemoval::Retiring => "retiring boot environment",
         BootRemoval::FailedTrial => "failed trial",

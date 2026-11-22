@@ -266,7 +266,7 @@ To enable automatic pruning on an installed Btrfs system, add this line to
 `/etc/cps/image.kdl`.
 
 ```kdl
-cache-keep-versions 2
+keep-cache-versions 2
 ```
 
 After a live transaction commits, a staged update registers its boot entry,

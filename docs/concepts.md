@@ -168,8 +168,8 @@ requests and the release profile no longer need.
 | Selection term | Effect |
 | --- | --- |
 | **Facet** | Optional content inside one package, such as `doc.man` or `devel`, that the image enables or disables, with optional per-package overrides. |
-| **Variant** | A mutually exclusive image property, such as `arch` or `container`, that selects between alternative content. |
-| **Architecture** | The target CPU architecture. It restricts eligible package versions, and as the built-in `arch` variant it selects actions. |
+| **Variant** | A mutually exclusive image property, such as `architecture` or `container`, that selects between alternative content. |
+| **Architecture** | The target CPU architecture. It restricts eligible package versions, and as the built-in `architecture` variant it selects actions. |
 | **Freeze** | A persistent constraint on a package's exact version. |
 | **Mediator** | Picks one provider for shared symlinks, such as the default editor command. |
 | **Preserved configuration** | A file marked `preserve=#true`. CPS carries local edits through an upgrade and can stage changed vendor defaults for review. |
@@ -192,7 +192,7 @@ contains. Each problem has one mechanism.
   needs another service are separate packages, even when one recipe builds
   them.
 - A **variant** is a mutually exclusive property of the image that selects
-  between alternative content. The built-in variant is `arch`. Other examples
+  between alternative content. The built-in variant is `architecture`. Other examples
   are a container or bare-metal variant, like the IPS zone variant, or a
   debug build. An image has exactly one value for each variant, so one path
   can carry different actions for different values.

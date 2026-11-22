@@ -1,11 +1,13 @@
 schema-version 1 kind="build-recipe"
 build architecture="@ARCH@" epoch=1778641860 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
+        publisher "seed" catalog-sha256="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
         package "build/native-c"
     }
     manifest "busybox.kdl" sha256="@MANIFEST_SHA256@"
-    source "busybox-1.38.0.tar.bz2" size=2695723 sha256="34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2" url="https://busybox.net/downloads/busybox-1.38.0.tar.bz2"
+    source "busybox-1.38.0.tar.bz2" size=2695723 sha256="34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2" {
+        url "https://busybox.net/downloads/busybox-1.38.0.tar.bz2"
+    }
     source "CVE-2026-38754.patch" size=1844 sha256="42e072567b70fba049ef36946b85462f2725d22668f0007f8d056314f84a263e"
     source "CVE-2026-38755.patch" size=1665 sha256="fa9cf8d6abd547a7bbeecf77f79fc260cdce3a8902d7f82a7f127aabb8dccb60"
     script """

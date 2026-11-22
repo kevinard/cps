@@ -8,8 +8,6 @@ trap 'rm -rf -- "$work"' EXIT
 cd -- "$work"
 
 arch=$(uname -m)
-uid=$(id -u)
-gid=$(id -g)
 zero=$(printf '0%.0s' {1..64})
 one=$(printf '1%.0s' {1..64})
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -29,7 +27,7 @@ schema-version 1 kind="build-recipe"
 // Reviewed recipe for $name
 build architecture="$arch" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "seed"   catalog="$zero" key-sha256="$zero" // seed toolchain
+        publisher "seed"   catalog-sha256="$zero" key-sha256="$zero" // seed toolchain
         package "$toolchain"
     }
     manifest "$dir.kdl" sha256="$(sha "recipes/$dir/$dir.kdl")"
@@ -87,7 +85,7 @@ grep -F '4 pin(s) in 4 recipe(s) are stale' stale.log
 test "$(cat recipes/tool/tool.build.kdl)" = "$before"
 "$cps" recipe repin --toolchain-catalog "seed=$one" recipes > repinned.txt
 test "$(cat recipes/tool/tool.build.kdl)" = "${before//$zero\" key/$one\" key}"
-grep -Fx "repinned recipes/tool/tool.build.kdl toolchain seed catalog $zero -> $one" repinned.txt
+grep -Fx "repinned recipes/tool/tool.build.kdl toolchain seed catalog-sha256 $zero -> $one" repinned.txt
 grep -Fx "recipe recipes/tool/tool.build.kdl sha256 $(sha recipes/tool/tool.build.kdl)" repinned.txt
 "$cps" recipe repin --toolchain-catalog "seed=$one" recipes > again.txt
 test ! -s again.txt
@@ -129,8 +127,12 @@ cc -shared -fPIC -nostdlib -Wl,-soname,libfoo.so.2 -o foo2/usr/lib/libfoo.so.2 f
 cc -pie -nostdlib -Wl,-e,_start -o app/usr/bin/app app.c foo1/usr/lib/libfoo.so.1
 publish() {
     "$cps" manifest generate --proto "$1" --publisher canopa --version "$2" \
-        --uid "$uid" --gid "$gid" "$3" > "$4.kdl"
-    if [[ -n ${5:-} ]]; then sed -i "/^package .* {\$/a\\    require \"$5\"" "$4.kdl"; fi
+        "$3" > "$4.kdl"
+    if [[ -n ${5:-} ]]; then
+        # Canonical manifests have no empty block, so give a childless package one.
+        sed -i -E 's/^(package .*[^{])$/\1 {\n}/' "$4.kdl"
+        sed -i "/^package .* {\$/a\\    require \"$5\"" "$4.kdl"
+    fi
     "$cps" publish manifests --repo repo --proto "$1" --key private.der "$4.kdl" > /dev/null
 }
 publish foo1 1.0.0-0 lib/foo foo1

@@ -7,8 +7,6 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/cps-build-test.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 cd "$work"
 
-uid=$(id -u)
-gid=$(id -g)
 arch=$(uname -m)
 # Recipes pin each toolchain publisher by the SHA-256 of its trust root file.
 fingerprint() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -144,7 +142,7 @@ add_file() {
     local input=$1 path=$2
     if [[ ! -e proto/$path ]]; then
         install -D -m755 "$input" "proto/$path"
-        printf '    file "%s" mode="0755" uid=0 gid=0\n' "$path"
+        printf '    file "%s" mode="0755"\n' "$path"
     fi
 }
 
@@ -166,7 +164,7 @@ shell=$(command -v bash)
     printf 'schema-version 1 kind="package-manifest"\npackage "build/probe" publisher="canopa" architecture="%s" version="1.0.0-0" {\n' "$arch"
     printf '    require "build/shell" version="=1.0.0-0"\n'
     install -D -m755 probe proto/usr/bin/probe
-    printf '    file "usr/bin/probe" mode="0755" uid=0 gid=0 capabilities="cap_net_raw=ep"\n'
+    printf '    file "usr/bin/probe" mode="0755" capabilities="cap_net_raw=ep"\n'
     printf '    hardlink "usr/bin/probe-alias" target="usr/bin/probe"\n'
     printf '}\n'
 } > probe.kdl
@@ -183,7 +181,7 @@ printf 'outside\n' > host-only
 cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/hello" publisher="canopa" version="1.0.0-0" architecture="$arch" {
-    file "hello" mode="0644" uid=$uid gid=$gid
+    file "hello" mode="0644"
     hardlink "hello-alias" target="hello"
 }
 MANIFEST
@@ -193,7 +191,7 @@ recipe() {
 schema-version 1 kind="build-recipe"
 build architecture="$arch" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="$catalog" key-sha256="$(fingerprint canopa.trust.json)"
+        publisher "canopa" catalog-sha256="$catalog" key-sha256="$(fingerprint canopa.trust.json)"
         package "build/probe"
     }
     manifest "manifest.kdl" sha256="$(sha manifest.kdl)"
@@ -325,7 +323,7 @@ sed 's/version="1.0.0-0" {/version="2.0.0-0" {/' tools-probe.kdl > tools-newer.k
 awk -v companion="$tools_catalog" -v companion_key="$(fingerprint tools.trust.json)" '
     /^        publisher "canopa" / {
         print
-        printf "        publisher \"tools\" catalog=\"%s\" key-sha256=\"%s\"\n", companion, companion_key
+        printf "        publisher \"tools\" catalog-sha256=\"%s\" key-sha256=\"%s\"\n", companion, companion_key
         next
     }
     /^        package "build\/probe"/ {
@@ -794,7 +792,8 @@ protected_image changed-architecture changed-architecture-image
 expect_failure 'No candidates were found for demo/hello' \
     "$cps" install --root changed-architecture-image -n --save-plan rejected.json demo/hello
 protected_image repeated-signature repeated-signature-image
-expect_failure 'requires 2 trusted builder signatures, found 1' \
+# A bad signature in a trusted builder's slot rejects the evidence outright.
+expect_failure 'invalid build attestation signature by key' \
     "$cps" install --root repeated-signature-image -n --save-plan rejected.json demo/hello
 
 protected_image witnessed guarded
@@ -861,7 +860,7 @@ cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "demo/hello" publisher="canopa" version="2.0.0-0" architecture="$arch" {
     require "library/platform" version="=1.0.0-0"
-    file "hello" mode="0644" uid=$uid gid=$gid
+    file "hello" mode="0644"
     hardlink "hello-alias" target="hello"
 }
 MANIFEST
@@ -874,7 +873,7 @@ build_package --sources sources --key signing.der --check-reproducible --output 
 cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "library/platform" publisher="canopa" version="1.0.0-0" {
-    file "platform" mode="0644" uid=$uid gid=$gid
+    file "platform" mode="0644"
 }
 MANIFEST
 recipe '    printf "platform\n" > "$DESTDIR/platform"' > platform.kdl
@@ -895,7 +894,7 @@ publisher "canopa" minimum-builders=2 {
     builder-key "retired-publisher.der"
     approve "demo/hello" version="2.0.0-0" sha256="$hello2_reviewed"
     approve "library/platform" version="1.0.0-0" sha256="$platform_reviewed"
-    profile "base" architecture="$arch" upgrade-from="$witnessed_catalog" {
+    profile "base" architecture="$arch" upgrade-from-sha256="$witnessed_catalog" {
         package "demo/hello"
     }
 }
@@ -910,7 +909,7 @@ test "$(cat witnessed/current)" = "$rotated_catalog"
 
 cat > wave.kdl <<WAVE
 schema-version 1 kind="publish-release"
-release "canopa" base="$rotated_catalog" {
+release "canopa" base-sha256="$rotated_catalog" {
     obsolete "cps://canopa/demo/hello@1.1.0-0"
     bundle "cps://canopa/demo/hello@2.0.0-0" path="hello2-a" builder-key="builder-public.der" recipe-sha256="$hello2_reviewed" {
         witness "hello2-b/attestation.json" key="other-public.der"
@@ -1011,7 +1010,7 @@ publisher "desktop" {
     builder-key "../builder-public.der"
     profile "desktop" architecture="$arch" $primary_baseline {
         package "desktop/base"
-        publisher "canopa" catalog="$(cat "$companion/current")" $companion_baseline {
+        publisher "canopa" catalog-sha256="$(cat "$companion/current")" $companion_baseline {
             repository "../$companion"
             trust-root "../canopa.trust.json"
             build-trust minimum-builders=2 {
@@ -1024,7 +1023,7 @@ publisher "desktop" {
 POLICY
 }
 refresh_desktop() {
-    printf 'schema-version 1 kind="publish-release"\nrelease "desktop" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "desktop" base-sha256="%s" refresh-profiles=#true\n' \
         "$desktop_base" > desktop-refresh.kdl
     "$cps" publish release --repo desktop-repo --key desktop.der desktop-refresh.kdl
 }
@@ -1040,7 +1039,7 @@ rm -- desktop-repo/publish-policy.kdl
 sed -E 's/publisher="?canopa"?/publisher="desktop"/' first/manifests/demo/hello.kdl > desktop-hello.kdl
 "$cps" publish manifests --repo desktop-repo --proto first/proto --key desktop.der desktop-hello.kdl
 desktop_base=$(cat desktop-repo/current)
-profile_policy profile-companion "upgrade-from=\"$desktop_baseline\"" "upgrade-from=\"$unattested\""
+profile_policy profile-companion "upgrade-from-sha256=\"$desktop_baseline\"" "upgrade-from-sha256=\"$unattested\""
 expect_failure 'checking upgrade from' refresh_desktop
 grep -F 'no build attestation for cps://canopa/demo/hello@1.0.0-0' rejected.log
 test "$(cat desktop-repo/current)" = "$desktop_base"
@@ -1048,7 +1047,7 @@ test "$(cat desktop-repo/current)" = "$desktop_base"
 "$cps" publish bundle --repo profile-companion --key signing.der \
     --builder-key builder-public.der --recipe-sha256 "$reviewed" \
     --witness other-public.der=unapproved/attestation.json first
-profile_policy profile-companion "upgrade-from=\"$desktop_baseline\"" "upgrade-from=\"$unattested\""
+profile_policy profile-companion "upgrade-from-sha256=\"$desktop_baseline\"" "upgrade-from-sha256=\"$unattested\""
 refresh_desktop
 desktop_base=$(cat desktop-repo/current)
 # A trust root may not make a companion's builder a catalog key. Try it on a copy.

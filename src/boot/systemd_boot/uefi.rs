@@ -22,6 +22,8 @@ const LOADER: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
 const EFIVARFS: &str = "/sys/firmware/efi/efivars";
 const EFIVARFS_MAGIC: u32 = 0xde5e81e4;
 const ATTRIBUTES: u32 = 7; // Non-volatile, boot service and runtime access.
+/// The load option attribute that lets firmware boot the option.
+const LOAD_OPTION_ACTIVE: u8 = 1;
 
 pub(super) fn present(esp: &Path) -> Result<bool> {
     policy::directory_exists(&esp.join(DIRECTORY))
@@ -38,7 +40,7 @@ pub(super) struct Firmware {
 }
 
 impl Firmware {
-    pub fn open(esp: &Path, locked_esp: &File) -> Result<Self> {
+    pub(super) fn open(esp: &Path, locked_esp: &File) -> Result<Self> {
         let dir = Path::new(EFIVARFS);
         let lock = File::open(dir).context("direct UEFI boot requires mounted efivarfs")?;
         ensure!(
@@ -81,9 +83,21 @@ impl Firmware {
         })
     }
 
+    /// The firmware option that boots environment `id`: the one whose device
+    /// path reaches this ESP's GPT partition and then the environment's UKI.
+    /// Firmware may rewrite an option it was given, for example by adding
+    /// optional data, changing attributes or expanding the device path, so
+    /// options are matched by what they boot rather than byte for byte.
     fn option(&self, id: &str) -> Result<Option<u16>> {
-        let expected = load_option(&self.device, id)?;
-        let mut matches = self.options.iter().filter(|(_, value)| **value == expected);
+        let partition = partition_guid(&self.device.uuid)?;
+        let path = efi_path(id);
+        let mut matches = self.options.iter().filter(|(_, value)| {
+            option_files(value).is_ok_and(|files| {
+                files.iter().any(|(guid, file)| {
+                    *guid == Some(partition) && file.eq_ignore_ascii_case(&path)
+                })
+            })
+        });
         let number = matches.next().map(|(&number, _)| number);
         ensure!(
             matches.next().is_none(),
@@ -92,7 +106,7 @@ impl Firmware {
         Ok(number)
     }
 
-    pub fn inventory(&self, entries: &mut [BootEntry]) -> Result<Option<LoaderPolicy>> {
+    pub(super) fn inventory(&self, entries: &mut [BootEntry]) -> Result<Option<LoaderPolicy>> {
         let mut default = None;
         let mut preferred = None;
         for entry in entries {
@@ -135,26 +149,26 @@ impl Firmware {
             preferred.is_none() || default.is_some(),
             "a UEFI trial requires a known-good default"
         );
-        Ok(default.map(|default| LoaderPolicy::Pinned { default, preferred }))
+        Ok(default.map(|default| LoaderPolicy { default, preferred }))
     }
 
-    pub fn armed_boot<'a>(&'a self, entry: Option<&'a BootEntry>) -> Result<&'a str> {
+    pub(super) fn armed_boot<'a>(&'a self, entry: Option<&'a BootEntry>) -> Result<&'a str> {
         if let Some(entry) = entry {
             return field(&entry.description, ARMED)?.context("missing UEFI trial boot identity");
         }
         Ok(&self.boot_id)
     }
 
-    pub fn can_arm(&self, entry: &BootEntry) -> Result<bool> {
+    pub(super) fn can_arm(&self, entry: &BootEntry) -> Result<bool> {
         Ok(is_trial(entry) && self.armed_boot(Some(entry))? == self.boot_id)
     }
 
-    pub fn require_no_next(&self) -> Result<()> {
+    pub(super) fn require_no_next(&self) -> Result<()> {
         ensure!(self.next.is_none(), "a firmware boot is already scheduled");
         Ok(())
     }
 
-    pub fn check_next(&self, entries: &[BootEntry], cancelling: bool) -> Result<()> {
+    pub(super) fn check_next(&self, entries: &[BootEntry], cancelling: bool) -> Result<()> {
         if let Some(next) = self.next {
             for entry in entries
                 .iter()
@@ -188,16 +202,43 @@ impl Firmware {
         Ok(number)
     }
 
+    /// Set the active attribute of a CPS option that firmware or an
+    /// administrator cleared. Firmware skips an inactive option in
+    /// `BootOrder` and may ignore it in `BootNext`, so a selected
+    /// environment would not boot.
+    ///
+    /// Callers enable an option only once every other precondition of the
+    /// operation holds, and read no option they enabled again, since
+    /// `options` keeps the bytes the operation started with.
+    fn enable(&self, number: u16) -> Result<()> {
+        // An option this operation created is written active.
+        let Some(option) = self.options.get(&number) else {
+            return Ok(());
+        };
+        let mut option = option.clone();
+        let attributes = option
+            .get_mut(..4)
+            .context("invalid firmware boot option")?;
+        if attributes[0] & LOAD_OPTION_ACTIVE == 0 {
+            attributes[0] |= LOAD_OPTION_ACTIVE;
+            write_variable(&option_name(number), &option, false)?;
+        }
+        Ok(())
+    }
+
+    /// Check that option `number`, which `option` matched to `id`, still
+    /// holds what this operation read.
     fn check_option(&self, number: u16, id: &str) -> Result<()> {
         let name = option_name(number);
         ensure!(
-            variable(&name)?.as_deref() == Some(load_option(&self.device, id)?.as_slice()),
+            self.option(id)? == Some(number)
+                && variable(&name)?.as_ref() == self.options.get(&number),
             "firmware option {name} changed during the CPS operation"
         );
         Ok(())
     }
 
-    pub fn activate(&self, id: &str, trial: bool) -> Result<()> {
+    pub(super) fn activate(&self, id: &str, trial: bool) -> Result<()> {
         ensure!(
             boot_number("BootNext")? == self.next,
             "BootNext changed during activation"
@@ -217,7 +258,10 @@ impl Firmware {
                     boot_order()? == self.order && boot_number("BootNext")?.is_none(),
                     "firmware boot selection changed during activation"
                 );
+                self.enable(number)?;
                 write_variable("BootNext", &number.to_le_bytes(), true)?;
+            } else {
+                self.enable(number)?;
             }
         } else {
             ensure!(
@@ -231,11 +275,12 @@ impl Firmware {
 
     /// Create the firmware option of a known-good environment without
     /// changing the boot selection.
-    pub fn register(&self, id: &str) -> Result<()> {
-        self.ensure_option(id).map(drop)
+    pub(super) fn register(&self, id: &str) -> Result<()> {
+        let number = self.ensure_option(id)?;
+        self.enable(number)
     }
 
-    pub fn rollback(&self, esp: &Path, id: &str, entries: &[BootEntry]) -> Result<()> {
+    pub(super) fn rollback(&self, esp: &Path, id: &str, entries: &[BootEntry]) -> Result<()> {
         self.check_next(entries, true)?;
         let target = self
             .option(id)?
@@ -272,7 +317,10 @@ impl Firmware {
         self.promote(target)
     }
 
-    pub fn running_trial<'a>(&self, entries: &'a [BootEntry]) -> Result<Option<&'a BootEntry>> {
+    pub(super) fn running_trial<'a>(
+        &self,
+        entries: &'a [BootEntry],
+    ) -> Result<Option<&'a BootEntry>> {
         for entry in entries
             .iter()
             .filter(|entry| is_trial(entry) || is_verified(entry))
@@ -287,7 +335,7 @@ impl Firmware {
         Ok(None)
     }
 
-    pub fn bless(&self, esp: &Path, entry: &BootEntry, parent: &BootEntry) -> Result<()> {
+    pub(super) fn bless(&self, esp: &Path, entry: &BootEntry, parent: &BootEntry) -> Result<()> {
         let number = self
             .option(&entry.id)?
             .context("missing UEFI trial boot option")?;
@@ -324,6 +372,11 @@ impl Firmware {
             boot_number("BootNext")?.is_none(),
             "BootNext is already scheduled"
         );
+        ensure!(
+            boot_order()? == self.order,
+            "BootOrder changed during the CPS operation"
+        );
+        self.enable(number)?;
         let order = preferred_order(&self.order, number);
         self.set_order(&order)
     }
@@ -340,7 +393,7 @@ impl Firmware {
         Ok(())
     }
 
-    pub fn check_removal(&self, id: &str) -> Result<Option<u16>> {
+    pub(super) fn check_removal(&self, id: &str) -> Result<Option<u16>> {
         let number = self.option(id)?;
         self.check_references(id, number)?;
         if let Some(number) = number {
@@ -354,7 +407,7 @@ impl Firmware {
         Ok(number)
     }
 
-    pub fn remove(&self, id: &str) -> Result<()> {
+    pub(super) fn remove(&self, id: &str) -> Result<()> {
         if let Some(number) = self.check_removal(id)? {
             ensure!(
                 boot_number("BootNext")? != Some(number),
@@ -384,7 +437,7 @@ impl Firmware {
         for (&number, bytes) in &self.options {
             if Some(number) != owned {
                 ensure!(
-                    !references_path(bytes, &path)?,
+                    !references_path(bytes, &path),
                     "firmware option Boot{number:04X} also references {path}"
                 );
             }
@@ -585,13 +638,21 @@ fn ucs2(s: &str) -> Vec<u8> {
         .collect()
 }
 
-fn load_option(device: &EspDevicePath, id: &str) -> Result<Vec<u8>> {
-    policy::entry_identity(id)?;
-    let mut guid = hex::decode(device.uuid.replace('-', ""))?;
-    ensure!(guid.len() == 16, "invalid GPT partition UUID");
+/// A GPT partition UUID in the mixed-endian layout of a device path.
+fn partition_guid(uuid: &str) -> Result<[u8; 16]> {
+    let mut guid: [u8; 16] = hex::decode(uuid.replace('-', ""))?
+        .try_into()
+        .ok()
+        .context("invalid GPT partition UUID")?;
     guid[..4].reverse();
     guid[4..6].reverse();
     guid[6..8].reverse();
+    Ok(guid)
+}
+
+fn load_option(device: &EspDevicePath, id: &str) -> Result<Vec<u8>> {
+    policy::entry_identity(id)?;
+    let guid = partition_guid(&device.uuid)?;
     let filename = ucs2(&efi_path(id));
     let mut path = vec![4, 1, 42, 0]; // GPT hard-drive media device path.
     path.extend(device.number.to_le_bytes());
@@ -610,20 +671,42 @@ fn load_option(device: &EspDevicePath, id: &str) -> Result<Vec<u8>> {
     Ok(option)
 }
 
-fn references_path(data: &[u8], expected: &str) -> Result<bool> {
+/// Whether a firmware option boots the file at `expected` on any device. An
+/// option that cannot be parsed boots nothing.
+fn references_path(data: &[u8], expected: &str) -> bool {
+    option_files(data).is_ok_and(|files| {
+        files
+            .iter()
+            .any(|(_, file)| file.eq_ignore_ascii_case(expected))
+    })
+}
+
+/// The files that a firmware load option boots, each with the GPT partition
+/// GUID of the hard-drive node before it in the same device path instance.
+/// Consecutive file path nodes form one path, and `/` reads as `\`. Optional
+/// data after the device path is ignored.
+fn option_files(data: &[u8]) -> Result<Vec<(Option<[u8; 16]>, String)>> {
     let size = u16::from_le_bytes(
         data.get(4..6)
             .context("invalid firmware boot option")?
             .try_into()?,
     ) as usize;
-    let description = data[6..]
-        .chunks_exact(2)
-        .position(|c| c == [0, 0])
+    let description = data
+        .get(6..)
+        .context("invalid firmware boot option")?
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .position(|c| c == &[0, 0])
         .context("unterminated firmware boot description")?;
     let start = 6 + 2 * (description + 1);
     let mut path = data
         .get(start..start + size)
         .context("truncated firmware device path")?;
+    let mut files = Vec::new();
+    let mut partition = None;
+    let mut file: Option<String> = None;
+    let mut ended = false;
     while !path.is_empty() {
         let [kind, subtype, a, b, ..] = path else {
             anyhow::bail!("invalid firmware device path node")
@@ -633,27 +716,51 @@ fn references_path(data: &[u8], expected: &str) -> Result<bool> {
             len >= 4 && len <= path.len(),
             "invalid firmware device path node length"
         );
+        let node = &path[4..len];
         if (*kind, *subtype) == (4, 4) {
-            let (chars, tail) = path[4..len].as_chunks::<2>();
+            let (chars, tail) = node.as_chunks::<2>();
             ensure!(tail.is_empty(), "invalid firmware file path");
-            let name = String::from_utf16_lossy(
+            let part = String::from_utf16_lossy(
                 &chars
                     .iter()
                     .copied()
                     .map(u16::from_le_bytes)
                     .collect::<Vec<_>>(),
-            );
-            if name
-                .trim_end_matches('\0')
-                .replace('/', r"\")
-                .eq_ignore_ascii_case(expected)
-            {
-                return Ok(true);
+            )
+            .trim_end_matches('\0')
+            .replace('/', r"\");
+            file = Some(match file.take() {
+                None => part,
+                Some(mut joined) => {
+                    if !joined.ends_with('\\') && !part.starts_with('\\') {
+                        joined.push('\\');
+                    }
+                    joined + &part
+                }
+            });
+            path = &path[len..];
+            continue;
+        }
+        files.extend(file.take().map(|file| (partition, file)));
+        match (*kind, *subtype) {
+            // A hard-drive node with a GPT GUID signature.
+            (4, 1) if node.len() == 38 && node[37] == 2 => {
+                partition = Some(node[20..36].try_into()?);
             }
+            // The end of one device path instance, or of the whole path.
+            (0x7f, 0x01) => partition = None,
+            // The end of the boot device path. Any device paths after it,
+            // such as an initrd that systemd-stub may load, are not booted.
+            (0x7f, 0xff) => {
+                ended = true;
+                break;
+            }
+            _ => {}
         }
         path = &path[len..];
     }
-    Ok(false)
+    ensure!(ended, "unterminated firmware device path");
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -1065,10 +1172,101 @@ mod tests {
                 0xee, 0xff,
             ]
         );
-        assert!(references_path(&option, &efi_path(TRIAL).to_uppercase())?);
-        assert!(!references_path(&option, &efi_path(BASE))?);
-        assert!(references_path(&option[..option.len() - 1], &efi_path(TRIAL)).is_err());
+        assert!(references_path(&option, &efi_path(TRIAL).to_uppercase()));
+        assert!(!references_path(&option, &efi_path(BASE)));
+        // Firmware cannot boot an option it cannot parse.
+        assert!(!references_path(
+            &option[..option.len() - 1],
+            &efi_path(TRIAL)
+        ));
         assert_eq!(preferred_order(&[1, 42, 2, 99], 2), [2, 1, 42, 99]);
+        Ok(())
+    }
+
+    /// `id`'s option as firmware may store it: other attributes, the
+    /// controller path before the partition, the file path split in two
+    /// nodes with forward slashes, a second device path, and optional data.
+    fn rewritten_option(partition: &str, id: &str) -> Result<Vec<u8>> {
+        let mut device = device();
+        device.uuid = partition.to_owned();
+        let original = load_option(&device, id)?;
+        let node = 6 + ucs2(&format!("CPS {id}")).len();
+        let file_node = |text: &str| {
+            let name = ucs2(text);
+            let mut node = vec![4, 4];
+            node.extend(u16::try_from(name.len() + 4).unwrap().to_le_bytes());
+            node.extend(name);
+            node
+        };
+        let mut path = vec![2, 1, 12, 0, 0xd0, 0x41, 0x03, 0x0a, 0, 0, 0, 0]; // ACPI PCI root.
+        path.extend([1, 1, 6, 0, 0, 0x1f]); // PCI device.
+        path.extend(&original[node..node + 42]); // The GPT hard-drive node.
+        path.extend(file_node(&format!("/EFI/cps/{id}")));
+        path.extend(file_node(uki::NAME));
+        path.extend([0x7f, 0xff, 4, 0]);
+        path.extend(file_node(r"\other.img"));
+        path.extend([0x7f, 0xff, 4, 0]);
+        let mut option = 9u32.to_le_bytes().to_vec(); // Active and hidden.
+        option.extend(u16::try_from(path.len())?.to_le_bytes());
+        option.extend(&original[6..node]);
+        option.extend(path);
+        option.extend(b"optional data");
+        Ok(option)
+    }
+
+    #[test]
+    fn a_disabled_cps_option_is_enabled_before_it_is_selected() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let mut firmware = fake.firmware(&[42], None, Some(42), &[], FIRST_BOOT)?;
+        let mut disabled = load_option(&device(), BASE)?;
+        disabled[0] &= !LOAD_OPTION_ACTIVE;
+        fake.set(&option_name(3), &disabled)?;
+        firmware.options.insert(3, disabled);
+        firmware.activate(BASE, false)?;
+        assert_eq!(boot_order()?, [3, 42]);
+        let option = variable(&option_name(3))?.context("missing option")?;
+        assert_eq!(option[0] & LOAD_OPTION_ACTIVE, LOAD_OPTION_ACTIVE);
+        assert_eq!(option[1..], load_option(&device(), BASE)?[1..]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_selection_that_fails_leaves_a_disabled_option_disabled() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let mut firmware = fake.firmware(&[42], Some(42), Some(42), &[], FIRST_BOOT)?;
+        let mut disabled = load_option(&device(), BASE)?;
+        disabled[0] &= !LOAD_OPTION_ACTIVE;
+        fake.set(&option_name(3), &disabled)?;
+        firmware.options.insert(3, disabled.clone());
+        let error = firmware.activate(BASE, false).unwrap_err();
+        assert!(format!("{error:#}").contains("BootNext already selects"));
+        assert_eq!(variable(&option_name(3))?, Some(disabled));
+        Ok(())
+    }
+
+    #[test]
+    fn options_match_by_partition_and_uki_after_firmware_rewrites_them() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let mut firmware = fake.firmware(&[1], None, Some(1), &[(1, BASE)], FIRST_BOOT)?;
+        let rewritten = rewritten_option(&device().uuid, TRIAL)?;
+        fake.set(&option_name(7), &rewritten)?;
+        firmware.options.insert(7, rewritten);
+        // The same UKI path on another disk's ESP is not this environment.
+        let elsewhere = rewritten_option("ffeeddcc-bbaa-9988-7766-554433221100", BASE)?;
+        firmware.options.insert(8, elsewhere);
+        // A malformed option boots nothing and blocks nothing.
+        firmware.options.insert(9, vec![1, 0, 0]);
+        assert_eq!(firmware.option(TRIAL)?, Some(7));
+        assert_eq!(firmware.option(BASE)?, Some(1));
+        firmware.check_option(7, TRIAL)?;
+        assert!(references_path(
+            &firmware.options[&7],
+            &efi_path(TRIAL).to_lowercase()
+        ));
+        // Activation reuses the rewritten option instead of creating another.
+        firmware.activate(TRIAL, true)?;
+        assert_eq!(boot_number("BootNext")?, Some(7));
+        assert_eq!(variable(&option_name(0))?, None);
         Ok(())
     }
 

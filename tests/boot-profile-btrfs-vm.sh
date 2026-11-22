@@ -99,7 +99,7 @@ StandardOutput=tty
 StandardError=inherit
 UNIT
 "$cps" manifest generate --proto runtime --publisher vm-test --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" test/btrfs-harness > runtime.kdl
+    test/btrfs-harness > runtime.kdl
 "$cps" publish manifests --repo repos/vm-test --proto runtime --key vm-test-private.der runtime.kdl
 
 publish_desktop() {
@@ -107,7 +107,7 @@ publish_desktop() {
     printf '%s\n' "$2" > desktop/etc/cps-btrfs-state
     printf '%s\n' "$3" > desktop/etc/cps-btrfs-release
     "$cps" manifest generate --proto desktop --publisher vm-test --version "$1" \
-        --uid "$(id -u)" --gid "$(id -g)" test/desktop > desktop.kdl
+        test/desktop > desktop.kdl
     "$cps" publish manifests --repo repos/vm-test --proto desktop --key vm-test-private.der desktop.kdl
 }
 publish_desktop 1.0.0-0 previous "$release"
@@ -138,7 +138,7 @@ refresh_profile() {
         printf 'schema-version 1 kind="publish-policy"\npublisher "vm-profile" {\n    builder-key "unused.der"\n'
         printf '    profile "boot" architecture="%s" {\n        package "test/btrfs-stack@%s"\n        facet "devel" #false\n' "$(uname -m)" "$1"
         for publisher in "${publishers[@]}"; do
-            printf '        publisher "%s" catalog="%s" {\n' "$publisher" "$(cat "repos/$publisher/current")"
+            printf '        publisher "%s" catalog-sha256="%s" {\n' "$publisher" "$(cat "repos/$publisher/current")"
             printf '            repository "../%s"\n            trust-root "../../%s.trust.json"\n' "$publisher" "$publisher"
             if [[ -f $publisher-builder.der ]]; then
                 printf '            build-trust {\n                builder-key "../../%s-builder.der"\n' "$publisher"
@@ -151,7 +151,7 @@ refresh_profile() {
         done
         printf '    }\n}\n'
     } > repos/vm-profile/publish-policy.kdl
-    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base-sha256="%s" refresh-profiles=#true\n' \
         "$(cat repos/vm-profile/current)" > release.kdl
     "$cps" publish release --repo repos/vm-profile --key vm-profile-private.der release.kdl
 }

@@ -1,11 +1,13 @@
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1793361987 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
+        publisher "seed" catalog-sha256="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
         package "build/native-kernel"
     }
     manifest "kernel.kdl" sha256="@MANIFEST_SHA256@"
-    source "linux-6.12.115.tar.xz" size=148760708 sha256="0ec90fe4b20422b1b664b77e6d2dde22b40bd41e7eb2cad8ac8739a4749cb1bb" url="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.115.tar.xz"
+    source "linux-6.12.115.tar.xz" size=148760708 sha256="0ec90fe4b20422b1b664b77e6d2dde22b40bd41e7eb2cad8ac8739a4749cb1bb" {
+        url "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.115.tar.xz"
+    }
     source "vm.config" size=@CONFIG_SIZE@ sha256="@CONFIG_SHA256@"
     script """
     command -v readelf >/dev/null

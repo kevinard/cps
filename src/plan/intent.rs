@@ -8,14 +8,14 @@ use crate::image::{Image, Installed, State};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
-pub enum MarkChoice {
+pub(crate) enum MarkChoice {
     Explicit,
     Automatic,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct IntentChange {
+pub(crate) struct IntentChange {
     pub package: String,
     pub requested: bool,
 }
@@ -40,8 +40,7 @@ pub(super) fn mark(
             .with_context(|| format!("package is not installed: {name}"))?;
         let manifest = &entry.published.manifest;
         ensure!(
-            spec.version
-                .is_none_or(|version| version == manifest.version),
+            spec.accepts(&manifest.version),
             "installed package does not match the requested version: {}",
             manifest.id()
         );

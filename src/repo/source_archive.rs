@@ -19,7 +19,7 @@ use super::{
 pub(super) const OBJECTS: &str = "source-archives";
 
 /// Attach the complete set of pinned sources to an admitted build.
-pub fn archive_build_sources(
+pub(crate) fn archive_build_sources(
     repo: &Path,
     signing_key: &(impl KeySpecs + ?Sized),
     source_cache: &Path,
@@ -92,7 +92,7 @@ pub(super) fn stage(
 }
 
 /// Populate a build source cache from a signed local archive or synchronized TUF mirror.
-pub fn fetch_build_sources(
+pub(crate) fn fetch_build_sources(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,

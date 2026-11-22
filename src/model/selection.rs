@@ -2,7 +2,7 @@
 //!
 //! A facet is optional content inside one package. An image chooses facets with
 //! hierarchical rules (`doc.man`, `locale.*`, `*`) and may override them for single
-//! packages. A variant is a mutually exclusive image property, such as `arch`, that
+//! packages. A variant is a mutually exclusive image property, such as `architecture`, that
 //! selects between alternative content. Neither facets nor variants gate dependencies.
 
 use std::{
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::{Action, Dependency, Manifest, name_component, validate_name};
 
 /// The built-in variant that every image sets.
-pub(crate) const ARCH_VARIANT: &str = "arch";
+pub(crate) const ARCH_VARIANT: &str = "architecture";
 
 /// Facet rules that apply when neither a package override nor an image rule matches.
 /// Every other facet defaults to enabled.
@@ -26,11 +26,11 @@ static NO_VARIANTS: BTreeMap<String, String> = BTreeMap::new();
 static NO_PACKAGE_FACETS: PackageFacets = BTreeMap::new();
 
 /// Per-package facet rules: package name or `prefix/*` glob to facet pattern to rule.
-pub type PackageFacets = BTreeMap<String, BTreeMap<String, PackageFacet>>;
+pub(crate) type PackageFacets = BTreeMap<String, BTreeMap<String, PackageFacet>>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackageFacet {
+pub(crate) struct PackageFacet {
     pub value: bool,
     /// Also apply the rule to the installed dependency closure of the package.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -129,7 +129,7 @@ fn best<'r, V: Copy + 'r>(
 /// The rule that decided a facet value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
-pub enum FacetSource {
+pub(crate) enum FacetSource {
     /// A per-package override, written `PACKAGE:FACET`.
     Package { rule: String },
     /// A per-package override applied with its dependencies, reached from `root`.
@@ -504,7 +504,7 @@ impl Resolved<'_> {
 
 /// The facet and variant policy of an image, as configured or recorded in a lock.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ImagePolicy {
+pub(crate) struct ImagePolicy {
     pub facets: BTreeMap<String, bool>,
     pub package_facets: PackageFacets,
     pub variants: BTreeMap<String, String>,
@@ -534,7 +534,12 @@ impl ImagePolicy {
     }
 
     /// Add one `[PACKAGE:]FACET` rule, refusing duplicates.
-    pub fn insert_facet(&mut self, key: &str, value: bool, with_dependencies: bool) -> Result<()> {
+    pub(crate) fn insert_facet(
+        &mut self,
+        key: &str,
+        value: bool,
+        with_dependencies: bool,
+    ) -> Result<()> {
         let inserted = match parse_facet_key(key)? {
             (None, facet) => {
                 ensure!(!with_dependencies, "{key} is not a per-package facet rule");
@@ -611,7 +616,7 @@ impl ImagePolicy {
         for (name, value) in changes {
             ensure!(
                 name != ARCH_VARIANT,
-                "the arch variant is fixed when an image is created"
+                "the architecture variant is fixed when an image is created"
             );
             match value {
                 Some(value) => {
@@ -658,7 +663,7 @@ pub(crate) fn validate_policy(
     }
     for (name, value) in variants {
         if name == ARCH_VARIANT {
-            bail!("the arch variant is set by the image architecture");
+            bail!("the architecture variant is set by the image architecture");
         }
         validate_variant(name, value)?;
     }
@@ -666,15 +671,15 @@ pub(crate) fn validate_policy(
 }
 
 impl ImagePolicy {
-    /// Add one `NAME=VALUE` variant, refusing duplicates and the arch variant.
-    pub fn insert_variant(&mut self, entry: &str) -> Result<()> {
+    /// Add one `NAME=VALUE` variant, refusing duplicates and the architecture variant.
+    pub(crate) fn insert_variant(&mut self, entry: &str) -> Result<()> {
         let (name, value) = entry
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("expected NAME=VALUE"))?;
         validate_variant(name, value)?;
         ensure!(
             name != ARCH_VARIANT,
-            "set the arch variant with the image architecture"
+            "set the architecture variant with the image architecture"
         );
         ensure!(
             self.variants
@@ -889,14 +894,14 @@ mod tests {
         assert!(
             policy
                 .change_variants(&BTreeMap::from([(
-                    "arch".to_owned(),
+                    "architecture".to_owned(),
                     Some("aarch64".to_owned())
                 )]))
                 .is_err()
         );
         assert!(policy.insert_variant("container=other").is_err());
         assert!(policy.insert_variant("debug=True").is_err());
-        assert!(policy.insert_variant("arch=x86_64").is_err());
+        assert!(policy.insert_variant("architecture=x86_64").is_err());
         policy.insert_variant("debug=false")?;
         assert!(
             policy

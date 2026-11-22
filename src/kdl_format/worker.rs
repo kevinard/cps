@@ -13,7 +13,7 @@ use crate::{
 use super::{Fields, document, one, schema};
 
 /// Read worker resource limits from an operator-owned KDL configuration.
-pub fn read_worker_config(path: &Path) -> Result<BuildWorker> {
+pub(crate) fn read_worker_config(path: &Path) -> Result<BuildWorker> {
     let bytes = read_limited(File::open(path)?, 64 * 1024)?;
     parse(std::str::from_utf8(&bytes)?)
         .with_context(|| format!("parsing build worker configuration {}", path.display()))
@@ -21,7 +21,7 @@ pub fn read_worker_config(path: &Path) -> Result<BuildWorker> {
 
 fn parse(text: &str) -> Result<BuildWorker> {
     let doc = document(text)?;
-    schema(&doc, "build-worker")?;
+    schema(&doc, super::Kind::BuildWorker)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and worker nodes"

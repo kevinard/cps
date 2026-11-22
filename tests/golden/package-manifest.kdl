@@ -1,0 +1,34 @@
+schema-version 1 kind="package-manifest"
+package "demo/editor" publisher="canopa" version="2.1.0-3" upstream-version="2.1" architecture="x86_64" requires-reboot=#true summary="A \"quoted\" editor\twith a tab" license="MIT OR Apache-2.0" homepage="https://example.org/editor" source-url="https://example.org/editor-2.1.tar.gz" {
+    require "system/libc" version=">=2.40-0"
+    require-capability "cap/elf/x86_64/libm.so.6"
+    recommends "demo/spell"
+    incorporate "demo/editor-data" version="=2.1.0-3"
+    exclude "demo/old-editor"
+    require-any {
+        package "demo/clipboard-x"
+        package "demo/clipboard-wayland" version=">=1.0-0"
+    }
+    conditional "demo/editor-gtk" when="system/gtk" when-version=">=4.0-0"
+    provides "cap/editor"
+    provides "cap/editor-api" version="2.0-0"
+    optional "demo/editor-plugins" description="Extra plugins"
+    mediate "usr/bin/editor" group="editor" priority=20
+    dir "usr/share/editor" mode="0755"
+    file "usr/bin/editor-2" mode="0755" sha256="9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" size=4 capabilities="cap_net_bind_service=ep"
+    file "etc/editor.conf" mode="0640" preserve=#true original-name="demo/editor:etc/editor.conf" group="editor"
+    symlink "usr/share/editor/state" target="/run/editor" owner="editor" group="editor"
+    file "usr/share/man/man1/editor.1" mode="0644" facet="doc.man"
+    file "usr/lib/editor/x86.so" mode="0755" architecture="x86_64" variant.debug="false"
+    symlink "usr/bin/ed2" target="editor-2"
+    hardlink "usr/bin/editor-alias" target="usr/bin/editor-2"
+    sysusers "editor.conf"
+    tmpfiles "editor.conf"
+    preset "editor.service"
+    trigger "editor-cache" timeout=30 {
+        run "/usr/libexec/editor/update-cache" "--quiet"
+        watch "usr/share/editor/**"
+        output "var/cache/editor/index"
+    }
+    kernel-install "6.12.0-1" initrd=#true
+}

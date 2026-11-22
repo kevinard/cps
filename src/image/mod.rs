@@ -1,3 +1,5 @@
+pub(crate) mod accounts;
+mod adopt;
 mod builds;
 mod catalogs;
 pub(crate) mod diff;
@@ -6,30 +8,33 @@ pub(crate) mod lock;
 pub(crate) mod publishers;
 pub(crate) mod root;
 
+pub(crate) use adopt::adopt_image;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, DirBuilder, File, OpenOptions},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
-use ring::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 use rustix::{
-    fs::{FlockOperation, RenameFlags, flock, renameat_with},
+    fs::{AtFlags, FileType, FlockOperation, RenameFlags, flock, renameat_with, statat},
+    io::Errno,
     process::{getegid, geteuid},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use self::root::{Fingerprint, Observation, Root};
+use self::root::{Fingerprint, Observation, Root, StateOwner};
 use crate::{
     attestation::BuildTrust,
     file_caps::FileCapabilities,
     git_install::GitSource,
     kdl_format::{ImageDefinition, PublisherConfig, read_image_definition},
     model::{
-        ImagePolicy, Node, PackageFacets, Selection, validate_digest, validate_name,
+        ImagePolicy, Node, Ownership, PackageFacets, Selection, validate_digest, validate_name,
         validate_publisher,
     },
     repo::{
@@ -40,12 +45,27 @@ use crate::{
 pub(crate) const IMAGE_FORMAT: u32 = 1;
 // Development databases also used format 1 but did not set an application ID.
 const IMAGE_APPLICATION_ID: i32 = i32::from_be_bytes(*b"CPSI");
+/// The version of the image database's tables, in SQLite's `user_version`.
+/// A CPS that changes the tables raises it and migrates older databases.
+const IMAGE_SCHEMA_VERSION: i32 = 1;
 /// The image state: the package database, transaction staging, prepared
 /// kernels and vendor configuration proposals. It lives in `/usr`, so each
 /// Btrfs boot environment snapshot carries the state that matches its files,
 /// while `/var` can be a separate mount shared by every environment.
 pub(crate) const STATE_DIRECTORY: &str = "usr/lib/sysimage/cps";
 pub(crate) const STATE_ANCESTORS: &[&str] = &["usr", "usr/lib", "usr/lib/sysimage"];
+/// Marks an unfinished adoption of the image by root.
+const ADOPTING: &str = "adopting";
+
+/// The files in the image state that control it: the lock, the database,
+/// and the rollback journal and WAL files SQLite may keep beside it.
+const STATE_FILES: &[&str] = &[
+    "lock",
+    "state.sqlite",
+    "state.sqlite-journal",
+    "state.sqlite-wal",
+    "state.sqlite-shm",
+];
 pub(crate) const CONFIG_UPDATES_DIRECTORY: &str = "usr/lib/sysimage/cps/config-updates";
 /// The mount point of `/var`. Packages never ship anything at or below it.
 /// An image starts with it as an empty directory, and tmpfiles.d and
@@ -73,7 +93,7 @@ pub(crate) struct DormantConfig {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Settings {
+pub(crate) struct Settings {
     pub format: u32,
     pub id: String,
     pub revision: u64,
@@ -87,6 +107,10 @@ pub struct Settings {
     pub variants: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) mediators: BTreeMap<String, String>,
+    /// The user and group that own the image state. A user other than root
+    /// owns every file of its image; see [`Settings::ownership`]. An opened
+    /// image takes them from the state directory, which must belong to the
+    /// user running CPS.
     pub uid: u32,
     pub gid: u32,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -115,7 +139,7 @@ pub(crate) fn publisher_generation_is_initial(generation: &u64) -> bool {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct BootParent {
+pub(crate) struct BootParent {
     pub id: String,
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,7 +167,7 @@ impl Settings {
         for &ancestor in STATE_ANCESTORS {
             if let Some(managed) = paths.get(ancestor) {
                 ensure!(
-                    matches!(managed.node, Node::Dir { mode, uid, .. } if uid == self.uid && mode & 0o022 == 0),
+                    matches!(&managed.node, Node::Dir { mode, owner, .. } if owner == accounts::ROOT && mode & 0o022 == 0),
                     "unsafe image state ancestor {ancestor}"
                 );
             }
@@ -244,17 +268,20 @@ impl Settings {
         Ok(())
     }
 
-    pub fn directory(&self) -> Node {
-        Node::Dir {
-            mode: 0o755,
-            uid: self.uid,
-            gid: self.gid,
+    /// Whether files get the owners their manifests name. CPS cannot
+    /// change the owner of a file it writes without root privileges, so an
+    /// unprivileged user's image owns every file as that user.
+    pub(crate) fn ownership(&self) -> Ownership {
+        if self.uid == 0 {
+            Ownership::Named
+        } else {
+            Ownership::Creator
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Publisher {
+pub(crate) struct Publisher {
     pub name: String,
     pub repo: PathBuf,
     pub key: Vec<u8>,
@@ -300,6 +327,43 @@ impl Publishers {
             Self::Ordered(publishers) => publishers,
             Self::Profiled { publishers, .. } => publishers,
         }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [Publisher] {
+        match self {
+            Self::Single(publisher) => std::slice::from_mut(publisher),
+            Self::Ordered(publishers) => publishers,
+            Self::Profiled { publishers, .. } => publishers,
+        }
+    }
+
+    /// Advance each publisher's pinned trust root through the trust history
+    /// of the catalog the image now applies.
+    pub(crate) fn advance_pins(
+        &mut self,
+        checkpoints: &BTreeMap<String, CatalogCheckpoint>,
+    ) -> Result<()> {
+        for publisher in self.as_mut_slice() {
+            if let Some(point) = checkpoints.get(&publisher.name) {
+                publisher.key = point
+                    .advance_pin(&publisher.key)
+                    .with_context(|| format!("advancing the trust root of {}", publisher.name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `next` is these publishers, with each pinned trust root
+    /// unchanged or advanced along its history.
+    pub(crate) fn advanced_to(&self, next: &Self) -> bool {
+        let mut unadvanced = next.clone();
+        for (publisher, current) in unadvanced.as_mut_slice().iter_mut().zip(self.as_slice()) {
+            if crate::repo::check_trust_pin_advanced(&current.key, &publisher.key).is_err() {
+                return false;
+            }
+            publisher.key.clone_from(&current.key);
+        }
+        unadvanced == *self
     }
 
     pub(crate) fn release_profile(&self) -> Option<&str> {
@@ -405,7 +469,7 @@ impl Publisher {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Installed {
+pub(crate) struct Installed {
     pub published: Published,
     pub explicit: bool,
 }
@@ -422,7 +486,7 @@ impl Installed {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Managed {
+pub(crate) struct Managed {
     pub node: Node,
     pub owners: BTreeSet<String>,
     pub preserve: bool,
@@ -432,7 +496,7 @@ pub struct Managed {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct State {
+pub(crate) struct State {
     pub settings: Settings,
     #[serde(rename = "publisher")]
     pub(crate) publishers: Publishers,
@@ -444,10 +508,11 @@ pub struct State {
 ///
 /// A pending transaction always applies to the committed revision it was
 /// planned against: the committed tables cannot change while it is pending.
-/// Publishers cannot change in a transaction, so the delta omits them.
+/// A transaction changes publishers only by advancing their pinned trust
+/// roots, and the delta records them only then.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct StateDelta {
+pub(crate) struct StateDelta {
     pub settings: Settings,
     /// New or changed packages, or `null` for removed packages.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -455,6 +520,9 @@ pub struct StateDelta {
     /// New or changed managed paths, or `null` for removed paths.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) paths: BTreeMap<String, Option<Managed>>,
+    /// The publishers with their advanced trust pins, when any advanced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) publishers: Option<Publishers>,
 }
 
 fn changes<T: Clone + PartialEq>(
@@ -501,6 +569,7 @@ impl StateDelta {
             settings: next.settings.clone(),
             installed: changes(&base.installed, &next.installed),
             paths: changes(&base.paths, &next.paths),
+            publishers: (next.publishers != base.publishers).then(|| next.publishers.clone()),
         }
     }
 
@@ -510,6 +579,13 @@ impl StateDelta {
         next.settings = self.settings.clone();
         apply_changes(&mut next.installed, &self.installed, "package")?;
         apply_changes(&mut next.paths, &self.paths, "path")?;
+        if let Some(publishers) = &self.publishers {
+            ensure!(
+                base.publishers.advanced_to(publishers),
+                "the pending transaction changes publishers other than by advancing their trust roots"
+            );
+            next.publishers = publishers.clone();
+        }
         Ok(next)
     }
 }
@@ -630,10 +706,13 @@ fn save_file_records(
     Ok(())
 }
 
-pub struct Image {
+pub(crate) struct Image {
     db: Connection,
     pub root: Root,
     pub(crate) state_dir: Root,
+    /// The user and group that own the image state, which replace the
+    /// recorded ones in its settings. `None` while root adopts the image.
+    owner: Option<(u32, u32)>,
 
     _lock: File,
 }
@@ -661,7 +740,7 @@ fn new_identity() -> Result<String> {
     ))
 }
 
-pub fn create_image(
+pub(crate) fn create_image(
     path: &Path,
     repo: &Path,
     publisher: &str,
@@ -680,12 +759,13 @@ pub fn create_image(
     )
 }
 
-pub fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
+#[cfg(test)]
+pub(crate) fn create_configured_image(path: &Path, config: &Path) -> Result<String> {
     create_configured_image_at(path, config, None, None)
 }
 
 /// Initialize a configured image at an explicit historical or candidate catalog.
-pub fn create_configured_image_at(
+pub(crate) fn create_configured_image_at(
     path: &Path,
     config: &Path,
     catalog: Option<&str>,
@@ -856,6 +936,7 @@ fn initialize(
     configure(&db)?;
     let tx = db.transaction()?;
     tx.pragma_update(None, "application_id", IMAGE_APPLICATION_ID)?;
+    tx.pragma_update(None, "user_version", IMAGE_SCHEMA_VERSION)?;
     tx.execute_batch(
         "CREATE TABLE image (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
          CREATE TABLE publishers (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
@@ -929,12 +1010,23 @@ fn decode_rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<BTreeM
 }
 
 impl Image {
-    pub fn open(path: &Path, exclusive: bool) -> Result<Self> {
+    pub(crate) fn open(path: &Path, exclusive: bool) -> Result<Self> {
         Self::open_database(
             Root::open(path)?,
             exclusive,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
             false,
+        )
+    }
+
+    /// Open an image that an unprivileged user created, for root to adopt.
+    pub(crate) fn open_for_adoption(root: Root) -> Result<Self> {
+        Self::open_owned(
+            root,
+            true,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            false,
+            StateOwner::Adopting,
         )
     }
 
@@ -981,7 +1073,39 @@ impl Image {
         flags: rusqlite::OpenFlags,
         package_write: bool,
     ) -> Result<Self> {
-        let state_dir = root.open_image_state()?;
+        Self::open_owned(root, exclusive, flags, package_write, StateOwner::Caller)
+    }
+
+    fn open_owned(
+        root: Root,
+        exclusive: bool,
+        flags: rusqlite::OpenFlags,
+        package_write: bool,
+        owner: StateOwner,
+    ) -> Result<Self> {
+        let state_dir = root.open_image_state_for(owner)?;
+        // The lock, the database and the files SQLite keeps beside it control
+        // the image as much as the directories above them.
+        let mut checker = owner.checker();
+        for &name in STATE_FILES {
+            match statat(state_dir.as_file(), name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(info) => {
+                    ensure!(
+                        FileType::from_raw_mode(info.st_mode) == FileType::RegularFile,
+                        "/{STATE_DIRECTORY}/{name} is not a regular file"
+                    );
+                    let metadata =
+                        fs::symlink_metadata(Root::fd_path(state_dir.as_file()).join(name))?;
+                    checker.check(&format!("/{STATE_DIRECTORY}/{name}"), &metadata)?;
+                }
+                Err(Errno::NOENT) if !matches!(name, "lock" | "state.sqlite") => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("checking /{STATE_DIRECTORY}/{name}"));
+                }
+            }
+        }
+        let state_metadata = state_dir.as_file().metadata()?;
         let lock = state_dir.file("lock")?;
         flock(
             &lock,
@@ -1005,16 +1129,69 @@ impl Image {
             application_id == IMAGE_APPLICATION_ID,
             "unsupported image database layout"
         );
+        let schema = db.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?;
+        ensure!(
+            schema == IMAGE_SCHEMA_VERSION,
+            "image database schema version {schema} is not supported; this cps reads version \
+             {IMAGE_SCHEMA_VERSION}"
+        );
         if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE) {
             configure(&db)?;
         }
-        Ok(Self {
+        let image = Self {
             root,
             db,
             state_dir,
+            owner: (owner == StateOwner::Caller)
+                .then(|| (state_metadata.uid(), state_metadata.gid())),
 
             _lock: lock,
-        })
+        };
+        let settings = image.settings()?;
+        let adopting = image.adoption()?;
+        match owner {
+            StateOwner::Caller if adopting.is_some() => anyhow::bail!(
+                "root's adoption of this image did not finish; run `cps image adopt` on it again"
+            ),
+            StateOwner::Caller if settings.ownership() == Ownership::Creator => image
+                .root
+                .accounts()
+                .map_to_creator(settings.uid, settings.gid),
+            StateOwner::Caller => {}
+            StateOwner::Adopting => {
+                let (uid, gid) = match adopting {
+                    // Once the adoption is recorded only the marker is left,
+                    // and adopting the image again just removes it.
+                    Some(creator) if settings.uid == 0 => creator,
+                    Some(creator) => {
+                        ensure!(
+                            creator == (settings.uid, settings.gid),
+                            "the adoption marker names UID {}, but the image belongs to UID {}",
+                            creator.0,
+                            settings.uid
+                        );
+                        creator
+                    }
+                    None => {
+                        ensure!(settings.uid != 0, "the image already belongs to root");
+                        (settings.uid, settings.gid)
+                    }
+                };
+                // The creator controls the database, so its recorded owner
+                // must also be the user who owns the image's state.
+                if settings.uid != 0
+                    && let Some(owner) = checker.creator()
+                {
+                    ensure!(
+                        owner == uid,
+                        "the image records UID {uid} as its creator, but its state belongs to \
+                         UID {owner}"
+                    );
+                }
+                image.root.accounts().adopt_from_creator(uid, gid);
+            }
+        }
+        Ok(image)
     }
 
     pub(crate) fn publishers(&self) -> Result<Publishers> {
@@ -1051,7 +1228,13 @@ impl Image {
     }
 
     pub(crate) fn settings(&self) -> Result<Settings> {
-        let settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
+        let mut settings: Settings = decode(&self.db, "SELECT data FROM image WHERE id=1")?;
+        // Ownership follows the image state on disk, so an image that root
+        // adopted is root's even before its settings are written again.
+        if let Some((uid, gid)) = self.owner {
+            settings.uid = uid;
+            settings.gid = gid;
+        }
         ensure!(settings.format == IMAGE_FORMAT, "unsupported image format");
         ensure!(
             settings
@@ -1067,7 +1250,7 @@ impl Image {
         Ok(settings)
     }
 
-    pub fn state(&self) -> Result<State> {
+    pub(crate) fn state(&self) -> Result<State> {
         let settings = self.settings()?;
         let publishers = self.publishers()?;
         ensure!(
@@ -1143,7 +1326,7 @@ impl Image {
         })
     }
 
-    pub fn fork_for_boot(&self, parent: BootParent) -> Result<Settings> {
+    pub(crate) fn fork_for_boot(&self, parent: BootParent) -> Result<Settings> {
         self.require_clean()?;
         let mut settings = self.settings()?;
         ensure!(
@@ -1214,7 +1397,7 @@ impl Image {
         )
     }
 
-    pub fn stage(&self) -> Result<Root> {
+    pub(crate) fn stage(&self) -> Result<Root> {
         self.state_dir.subdir("stage")
     }
 
@@ -1225,7 +1408,7 @@ impl Image {
         builds::read(&self.db, manifest)
     }
 
-    pub fn pending<T: DeserializeOwned>(&self) -> Result<Option<T>> {
+    pub(crate) fn pending<T: DeserializeOwned>(&self) -> Result<Option<T>> {
         let record = self
             .db
             .query_row("SELECT data FROM pending WHERE id=1", [], |row| {
@@ -1237,7 +1420,85 @@ impl Image {
             .transpose()
     }
 
-    pub fn require_clean(&self) -> Result<()> {
+    /// The creator's user and group while root's adoption of the image is
+    /// unfinished. The marker is written before adoption changes any owner
+    /// and removed once the image records root as its owner.
+    ///
+    /// Only root writes the marker, so a marker that root does not own is
+    /// one the creator planted, and is refused.
+    pub(crate) fn adoption(&self) -> Result<Option<(u32, u32)>> {
+        let mut file = match self.state_dir.file(ADOPTING) {
+            Ok(file) => file,
+            Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+            "/{STATE_DIRECTORY}/{ADOPTING} was not written by root"
+        );
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)?;
+        let creator = text
+            .trim()
+            .split_once(':')
+            .and_then(|(uid, gid)| Some((uid.parse().ok()?, gid.parse().ok()?)))
+            .with_context(|| format!("invalid adoption marker {text:?}"))?;
+        Ok(Some(creator))
+    }
+
+    /// Record durably that root is adopting the creator's image.
+    pub(crate) fn begin_adoption(&self, (uid, gid): (u32, u32)) -> Result<()> {
+        let directory = Root::fd_path(self.state_dir.as_file());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(ADOPTING))?;
+        std::io::Write::write_all(&mut file, format!("{uid}:{gid}\n").as_bytes())?;
+        file.sync_all()?;
+        self.state_dir.as_file().sync_all()?;
+        Ok(())
+    }
+
+    /// Remove the adoption marker once the adoption is recorded.
+    pub(crate) fn finish_adoption(&self) -> Result<()> {
+        match rustix::fs::unlinkat(self.state_dir.as_file(), ADOPTING, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.state_dir.as_file().sync_all()?;
+        Ok(())
+    }
+
+    /// Record that root adopted the image: its settings with root as owner,
+    /// the path index under named ownership, and the fingerprints of files
+    /// whose contents adoption left alone.
+    pub(crate) fn record_adoption(
+        &mut self,
+        settings: &Settings,
+        paths: &BTreeMap<String, Managed>,
+        observed: &BTreeMap<String, Observation>,
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE image SET data=?1 WHERE id=1",
+            [serde_json::to_string(settings)?],
+        )?;
+        tx.execute("DELETE FROM paths", [])?;
+        {
+            let mut insert = tx.prepare("INSERT INTO paths VALUES (?1, ?2)")?;
+            for (path, managed) in paths {
+                insert.execute(params![path, serde_json::to_string(managed)?])?;
+            }
+        }
+        tx.execute("DELETE FROM files", [])?;
+        save_file_records(&tx, observed, &BTreeSet::new())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn require_clean(&self) -> Result<()> {
         let pending: bool =
             self.db
                 .query_row("SELECT EXISTS(SELECT 1 FROM pending)", [], |row| row.get(0))?;
@@ -1253,7 +1514,7 @@ impl Image {
         catalogs::verify(&self.db, state)
     }
 
-    pub fn record_pending(
+    pub(crate) fn record_pending(
         &mut self,
         data: &impl Serialize,
         next: &State,
@@ -1307,7 +1568,7 @@ impl Image {
         Ok(records)
     }
 
-    pub fn update_pending(&self, data: &impl Serialize) -> Result<()> {
+    pub(crate) fn update_pending(&self, data: &impl Serialize) -> Result<()> {
         let changed = self.db.execute(
             "UPDATE pending SET data=?1 WHERE id=1",
             [serde_json::to_string(data)?],
@@ -1316,7 +1577,7 @@ impl Image {
         Ok(())
     }
 
-    pub fn applied(&self, plan: &str) -> Result<Option<u64>> {
+    pub(crate) fn applied(&self, plan: &str) -> Result<Option<u64>> {
         Ok(self
             .db
             .query_row(
@@ -1347,6 +1608,12 @@ impl Image {
         tx.execute(
             "UPDATE image SET data=?1 WHERE id=1",
             [serde_json::to_string(&delta.settings)?],
+        )?;
+        // A transaction changes publishers only by advancing their pinned
+        // trust roots, which the plan checked.
+        tx.execute(
+            "UPDATE publishers SET data=?1 WHERE id=1",
+            [serde_json::to_string(&next.publishers)?],
         )?;
         {
             let mut upsert = tx.prepare("INSERT OR REPLACE INTO installed VALUES (?1, ?2)")?;

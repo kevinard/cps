@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 
+use super::scratch::{self, Scratch};
 use crate::{
     image::{Image, Installed, Managed, Settings, root::Root},
     model::{Node, digest, digest_reader},
@@ -26,7 +27,7 @@ pub(crate) struct Kernel {
 }
 
 impl Kernel {
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let release = &self.release;
         ensure!(
             release.len() <= 128
@@ -39,17 +40,17 @@ impl Kernel {
         Ok(())
     }
 
-    pub fn image(&self) -> String {
+    pub(crate) fn image(&self) -> String {
         format!("usr/lib/modules/{}/vmlinuz", self.release)
     }
 
     /// Where the kernel's initramfs is, whether packaged or generated.
-    pub fn initrd_path(&self) -> String {
+    pub(crate) fn initrd_path(&self) -> String {
         format!("usr/lib/modules/{}/initrd", self.release)
     }
 
     /// The packaged initramfs, if the kernel package ships one.
-    pub fn initrd(&self) -> Option<String> {
+    pub(crate) fn initrd(&self) -> Option<String> {
         self.initrd.then(|| self.initrd_path())
     }
 }
@@ -136,7 +137,7 @@ impl Artifacts {
         Ok(format!("kernel-{}", digest(&serde_json::to_vec(self)?)))
     }
 
-    pub fn open_prepared(&self, state: &Root) -> Result<(File, Option<File>)> {
+    pub(crate) fn open_prepared(&self, state: &Root) -> Result<(File, Option<File>)> {
         let dir = self.directory()?;
         let linux = checked_file(state, &format!("{dir}/linux"), &self.linux_sha256)
             .with_context(|| format!("opening prepared kernel {}", self.kernel.release))?;
@@ -149,7 +150,7 @@ impl Artifacts {
     }
 
     /// The digest of the prepared initramfs, packaged or generated.
-    pub fn prepared_initrd_sha256(&self, state: &Root) -> Result<Option<String>> {
+    pub(crate) fn prepared_initrd_sha256(&self, state: &Root) -> Result<Option<String>> {
         if !self.generated_initrd {
             return Ok(self.initrd_sha256.clone());
         }
@@ -164,7 +165,7 @@ impl Artifacts {
         Ok(Some(recorded))
     }
 
-    pub fn prepare(&self, image: &Image, path: &Path, settings: &Settings) -> Result<()> {
+    pub(crate) fn prepare(&self, image: &Image, path: &Path, settings: &Settings) -> Result<()> {
         let root = &image.root;
         self.kernel.validate()?;
         let directory = self.directory()?;
@@ -220,9 +221,7 @@ impl Artifacts {
 
         // kernel-install add has no alternate-root mode. Give its trusted
         // BLS plugin only a private boot tree and an explicit private config.
-        let scratch = tempfile::Builder::new()
-            .prefix(".kernel-install-")
-            .tempdir_in(state_path)?;
+        let scratch = Scratch::create(&state_path, ".kernel-install-", scratch::plain)?;
         let boot = scratch.path().join("boot");
         let config = scratch.path().join("conf");
         fs::create_dir(&boot)?;

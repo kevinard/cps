@@ -10,7 +10,6 @@ tool=$(command -v systemd-hwdb)
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
-owner="uid=$(id -u) gid=$(id -g)"
 mkdir -p proto/usr/lib/udev/hwdb.d proto/usr/libexec
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
 "$cps" repo trust init --repo repo --publisher canopa --key private.der >/dev/null
@@ -33,8 +32,8 @@ exec $tool --strict update
 HANDLER
 chmod 0755 proto/usr/libexec/hwdb-update
 publish test/systemd "$(ship_runtime proto /usr/bin/bash "$tool")
-    file \"usr/libexec/hwdb-update\" mode=\"0755\" $owner
-    dir \"etc/udev\" mode=\"0755\" $owner
+    file \"usr/libexec/hwdb-update\" mode=\"0755\"
+    dir \"etc/udev\" mode=\"0755\"
     trigger \"hwdb\" {
         run \"usr/libexec/hwdb-update\"
         watch \"usr/lib/udev/hwdb.d/*.hwdb\"
@@ -46,7 +45,7 @@ for name in first second; do
     path="usr/lib/udev/hwdb.d/$name.hwdb"
     printf 'test:cps:%s*\n CPS_TEST=%s\n' "$name" "$name" > "proto/$path"
     publish "test/$name" "    require \"test/systemd\"
-    file \"$path\" mode=\"0644\" $owner
+    file \"$path\" mode=\"0644\"
 "
 done
 runs() { wc -l < image/etc/udev/hwdb.runs; }

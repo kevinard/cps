@@ -85,14 +85,14 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
     let fields = Fields::read(
         node,
         1,
-        &["architecture", "upgrade-from", "rollout-percentage"],
+        &["architecture", "upgrade-from-sha256", "rollout-percentage"],
         true,
     )?;
     let name = fields.string_arg(0)?;
     validate_name(&name)?;
     let arch = fields.required_string("architecture")?;
     validate_publisher(&arch).context("invalid profile architecture")?;
-    let upgrade_from = fields.string("upgrade-from")?;
+    let upgrade_from = fields.string("upgrade-from-sha256")?;
     if let Some(hash) = &upgrade_from {
         validate_digest(hash).context("invalid profile upgrade catalog digest")?;
     }
@@ -168,19 +168,20 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
                 signed_baselines.push(hash);
             }
             "publisher" => {
-                let fields = Fields::read(child, 1, &["catalog", "upgrade-from"], true)?;
+                let fields =
+                    Fields::read(child, 1, &["catalog-sha256", "upgrade-from-sha256"], true)?;
                 let name = fields.string_arg(0)?;
                 ensure!(
                     names.insert(name.clone()),
                     "duplicate profile publisher {name}"
                 );
-                let catalog = fields.required_string("catalog")?;
+                let catalog = fields.required_string("catalog-sha256")?;
                 validate_digest(&catalog).context("invalid companion catalog digest")?;
-                let baseline = fields.string("upgrade-from")?;
+                let baseline = fields.string("upgrade-from-sha256")?;
                 if let Some(hash) = &baseline {
                     ensure!(
                         upgrade_from.is_some(),
-                        "companion upgrade-from requires a profile upgrade-from"
+                        "companion upgrade-from-sha256 requires a profile upgrade-from-sha256"
                     );
                     validate_digest(hash).context("invalid companion upgrade catalog digest")?;
                 }
@@ -224,7 +225,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
                 crate::model::validate_variant(&variant, &value)?;
                 ensure!(
                     variant != crate::model::ARCH_VARIANT,
-                    "set the arch variant with the profile architecture"
+                    "set the architecture variant with the profile architecture"
                 );
                 ensure!(
                     variants.insert(variant.clone(), value).is_none(),
@@ -293,7 +294,7 @@ fn profile(node: &KdlNode, publisher: &str, parent: &Path) -> Result<(String, Pr
 
 pub(crate) fn parse(text: &str, parent: &Path) -> Result<PublishPolicy> {
     let doc = document(text)?;
-    schema(&doc, "publish-policy")?;
+    schema(&doc, super::Kind::PublishPolicy)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and publisher nodes"

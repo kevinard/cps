@@ -10,19 +10,23 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::file_caps::FileCapabilities;
+use crate::{file_caps::FileCapabilities, image::accounts};
 
 mod metadata;
+mod recorded;
 mod selection;
 mod version;
 
+pub(crate) use recorded::Recorded;
+#[cfg(test)]
+pub(crate) use selection::PackageFacet;
 pub(crate) use selection::{
     ARCH_VARIANT, DEFAULT_FACETS, Resolved, Selection, facet_pattern_covers,
     package_pattern_matches, validate_facet, validate_facet_pattern, validate_policy,
     validate_variant,
 };
-pub use selection::{FacetSource, ImagePolicy, PackageFacet, PackageFacets};
-pub use version::Version;
+pub(crate) use selection::{FacetSource, ImagePolicy, PackageFacets};
+pub(crate) use version::Version;
 
 pub(crate) const MANIFEST_FORMAT: u32 = 1;
 
@@ -33,17 +37,17 @@ pub(crate) struct FileDigest {
     pub size: u64,
 }
 
-pub fn digest(bytes: &[u8]) -> String {
+pub(crate) fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-pub fn digest_reader(mut reader: impl Read) -> Result<String> {
+pub(crate) fn digest_reader(mut reader: impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
     std::io::copy(&mut reader, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
 }
 
-pub fn validate_digest(hash: &str) -> Result<()> {
+pub(crate) fn validate_digest(hash: &str) -> Result<()> {
     ensure!(
         hash.len() == 64
             && hash
@@ -64,7 +68,7 @@ pub(crate) fn is_uuid(value: &str) -> bool {
         })
 }
 
-pub fn validate_path(path: &str) -> Result<()> {
+pub(crate) fn validate_path(path: &str) -> Result<()> {
     ensure!(
         !path.contains('\0') && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
         "invalid root-relative path {path:?}"
@@ -110,7 +114,7 @@ fn name_component(part: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
-pub fn validate_name(name: &str) -> Result<()> {
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     ensure!(
         name.split('/').all(name_component),
         "invalid package name {name:?}"
@@ -149,7 +153,7 @@ pub(crate) fn elf_name_component(part: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
 }
 
-pub fn validate_publisher(publisher: &str) -> Result<()> {
+pub(crate) fn validate_publisher(publisher: &str) -> Result<()> {
     ensure!(name_component(publisher), "invalid publisher {publisher:?}");
     Ok(())
 }
@@ -162,7 +166,16 @@ pub(crate) struct PackageSpec<'a> {
 }
 
 impl<'a> PackageSpec<'a> {
-    pub fn parse(text: &'a str) -> Result<Self> {
+    /// Whether the selector's version, if any, names the same release as
+    /// `version`. A user writes `@1.0` for `1.0-0`; spelling decides only
+    /// between respellings of one release.
+    pub(crate) fn accepts(&self, version: &Version) -> bool {
+        self.version
+            .as_ref()
+            .is_none_or(|wanted| wanted.semantic() == version.semantic())
+    }
+
+    pub(crate) fn parse(text: &'a str) -> Result<Self> {
         let (publisher, spec) = if let Some(spec) = text.strip_prefix("cps://") {
             let (publisher, spec) = spec.split_once('/').context("package ID has no name")?;
             validate_publisher(publisher)?;
@@ -186,7 +199,7 @@ impl<'a> PackageSpec<'a> {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Dependency {
+pub(crate) enum Dependency {
     Require(DependencyTarget),
     RequireCapability(DependencyTarget),
     Recommend(DependencyTarget),
@@ -203,20 +216,20 @@ pub enum Dependency {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct DependencyTarget {
+pub(crate) struct DependencyTarget {
     pub package: String,
     pub version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct OptionalDependency {
+pub(crate) struct OptionalDependency {
     pub target: DependencyTarget,
     pub description: String,
 }
 
 impl DependencyTarget {
-    pub fn matches(&self, version: impl Borrow<Version>) -> Result<bool> {
+    pub(crate) fn matches(&self, version: impl Borrow<Version>) -> Result<bool> {
         Ok(VersionConstraint::parse(self.version.as_deref())?.matches(version.borrow()))
     }
 
@@ -286,13 +299,38 @@ impl Dependency {
     }
 }
 
+/// A comparison in a version constraint. Every operator a manifest or a user
+/// can write compares release semantics, so `=1.0` matches `1.0-0`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum Operator {
+    /// The same spelling, which names one package ID. Only the planner uses
+    /// it; no constraint text parses to it.
+    Identical,
+    Equal,
+    AtLeast,
+    AtMost,
+    Above,
+    Below,
+}
+
+impl Operator {
+    /// Written operators, longest first so `>=` is not read as `>`.
+    const WRITTEN: [(&'static str, Self); 5] = [
+        (">=", Self::AtLeast),
+        ("<=", Self::AtMost),
+        ("=", Self::Equal),
+        (">", Self::Above),
+        ("<", Self::Below),
+    ];
+}
+
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
-pub(crate) struct VersionConstraint(Vec<(&'static str, Version)>);
+pub(crate) struct VersionConstraint(Vec<(Operator, Version)>);
 
 impl VersionConstraint {
     /// Match one package ID's exact spelling, unlike the semantic `=` operator.
     pub(crate) fn exact(version: Version) -> Self {
-        Self(vec![("==", version)])
+        Self(vec![(Operator::Identical, version)])
     }
 
     pub(crate) fn parse(constraint: Option<&str>) -> Result<Self> {
@@ -302,9 +340,9 @@ impl VersionConstraint {
         clauses
             .map(|clause| {
                 let clause = clause.trim();
-                let (operator, bound) = [">=", "<=", "=", ">", "<"]
+                let (operator, bound) = Operator::WRITTEN
                     .into_iter()
-                    .find_map(|op| clause.strip_prefix(op).map(|value| (op, value)))
+                    .find_map(|(text, op)| clause.strip_prefix(text).map(|value| (op, value)))
                     .with_context(|| format!("invalid constraint {clause:?}"))?;
                 Ok((operator, bound.trim_start().parse()?))
             })
@@ -315,16 +353,14 @@ impl VersionConstraint {
     /// Match by release semantics, so `2.0.0` satisfies `=2.0.0-0`.
     pub(crate) fn matches(&self, version: &Version) -> bool {
         self.0.iter().all(|(operator, bound)| {
-            if *operator == "==" {
-                return version == bound;
-            }
-            let (version, bound) = (version.semantic(), bound.semantic());
-            match *operator {
-                ">=" => version >= bound,
-                "<=" => version <= bound,
-                ">" => version > bound,
-                "<" => version < bound,
-                _ => version == bound,
+            let semantic = (version.semantic(), bound.semantic());
+            match operator {
+                Operator::Identical => version == bound,
+                Operator::Equal => semantic.0 == semantic.1,
+                Operator::AtLeast => semantic.0 >= semantic.1,
+                Operator::AtMost => semantic.0 <= semantic.1,
+                Operator::Above => semantic.0 > semantic.1,
+                Operator::Below => semantic.0 < semantic.1,
             }
         })
     }
@@ -336,12 +372,12 @@ impl VersionConstraint {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Action {
+pub(crate) enum Action {
     File {
         path: String,
         mode: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         preserve: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,8 +396,8 @@ pub enum Action {
     Dir {
         path: String,
         mode: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -370,8 +406,8 @@ pub enum Action {
     Symlink {
         path: String,
         target: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         facet: Option<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -389,13 +425,13 @@ pub enum Action {
 
 /// The facet and variants that select an action.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Selectors<'a> {
+pub(crate) struct Selectors<'a> {
     pub facet: Option<&'a str>,
     pub variants: &'a BTreeMap<String, String>,
 }
 
 impl<'a> Selectors<'a> {
-    pub fn arch(&self) -> Option<&'a str> {
+    pub(crate) fn arch(&self) -> Option<&'a str> {
         self.variants.get(ARCH_VARIANT).map(String::as_str)
     }
 
@@ -419,25 +455,25 @@ impl<'a> Selectors<'a> {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Node {
+pub(crate) enum Node {
     File {
         sha256: String,
         size: u64,
         mode: u32,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<FileCapabilities>,
     },
     Dir {
         mode: u32,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
     },
     Symlink {
         target: String,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
     },
     Hardlink {
         target: String,
@@ -445,9 +481,62 @@ pub enum Node {
     Special,
 }
 
+/// Who owns the files of an image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Ownership {
+    /// Each file has the owner and group that its manifest names.
+    Named,
+    /// The unprivileged user who created the image owns every file.
+    Creator,
+}
+
 impl Node {
-    pub fn is_dir(&self) -> bool {
+    /// A directory that packages create only as the parent of their paths.
+    pub(crate) fn implicit_directory() -> Self {
+        Self::Dir {
+            mode: 0o755,
+            owner: accounts::ROOT.to_owned(),
+            group: accounts::ROOT.to_owned(),
+        }
+    }
+
+    pub(crate) fn is_dir(&self) -> bool {
         matches!(self, Self::Dir { .. })
+    }
+
+    /// The owner and group names of a file, directory, or symlink.
+    pub(crate) fn ownership(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::File { owner, group, .. }
+            | Self::Dir { owner, group, .. }
+            | Self::Symlink { owner, group, .. } => Some((owner, group)),
+            Self::Hardlink { .. } | Self::Special => None,
+        }
+    }
+
+    /// This node with another owner and group, if it has them.
+    pub(crate) fn with_ownership(&self, owner: &str, group: &str) -> Self {
+        let mut node = self.clone();
+        if let Self::File {
+            owner: old_owner,
+            group: old_group,
+            ..
+        }
+        | Self::Dir {
+            owner: old_owner,
+            group: old_group,
+            ..
+        }
+        | Self::Symlink {
+            owner: old_owner,
+            group: old_group,
+            ..
+        } = &mut node
+        {
+            owner.clone_into(old_owner);
+            group.clone_into(old_group);
+        }
+        node
     }
 
     pub(crate) fn capabilities(&self) -> Option<&FileCapabilities> {
@@ -485,7 +574,7 @@ pub(crate) fn parse_mode(mode: &str) -> Result<u32> {
 }
 
 impl Action {
-    pub fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         match self {
             Self::File { path, .. }
             | Self::Dir { path, .. }
@@ -494,7 +583,7 @@ impl Action {
         }
     }
 
-    pub fn selectors(&self) -> Selectors<'_> {
+    pub(crate) fn selectors(&self) -> Selectors<'_> {
         match self {
             Self::File {
                 facet, variants, ..
@@ -514,7 +603,7 @@ impl Action {
         }
     }
 
-    pub fn preserve(&self) -> bool {
+    pub(crate) fn preserve(&self) -> bool {
         matches!(self, Self::File { preserve: true, .. })
     }
 
@@ -525,35 +614,47 @@ impl Action {
         }
     }
 
-    pub fn node(&self) -> Result<Node> {
+    /// The managed node of this action. An image whose creator owns every
+    /// file records each owner and group as `root`, the name its creator's
+    /// IDs read back as.
+    pub(crate) fn node(&self, ownership: Ownership) -> Result<Node> {
+        let account = |name: &String| match ownership {
+            Ownership::Named => name.clone(),
+            Ownership::Creator => accounts::ROOT.to_owned(),
+        };
         Ok(match self {
             Self::File {
                 sha256,
                 size,
                 mode,
-                uid,
-                gid,
+                owner,
+                group,
                 capabilities,
                 ..
             } => Node::File {
                 sha256: sha256.clone().context("missing file digest")?,
                 size: size.context("missing file size")?,
                 mode: parse_mode(mode)?,
-                uid: *uid,
-                gid: *gid,
+                owner: account(owner),
+                group: account(group),
                 capabilities: *capabilities,
             },
-            Self::Dir { mode, uid, gid, .. } => Node::Dir {
+            Self::Dir {
+                mode, owner, group, ..
+            } => Node::Dir {
                 mode: parse_mode(mode)?,
-                uid: *uid,
-                gid: *gid,
+                owner: account(owner),
+                group: account(group),
             },
             Self::Symlink {
-                target, uid, gid, ..
+                target,
+                owner,
+                group,
+                ..
             } => Node::Symlink {
                 target: target.clone(),
-                uid: *uid,
-                gid: *gid,
+                owner: account(owner),
+                group: account(group),
             },
             Self::Hardlink { target, .. } => Node::Hardlink {
                 target: target.clone(),
@@ -571,11 +672,11 @@ impl Action {
         for (name, value) in selectors.variants {
             validate_variant(name, value)?;
         }
-        let (uid, gid) = match self {
+        let (owner, group) = match self {
             Self::File {
                 mode,
-                uid,
-                gid,
+                owner,
+                group,
                 sha256,
                 size,
                 preserve,
@@ -590,7 +691,10 @@ impl Action {
                 );
                 if mode & 0o6000 != 0 {
                     ensure!(
-                        *uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0 && !preserve,
+                        owner == accounts::ROOT
+                            && mode & 0o111 != 0
+                            && mode & 0o022 == 0
+                            && !preserve,
                         "setid bits require a root-owned executable with no group or other write access and preserve disabled"
                     );
                     ensure!(
@@ -609,7 +713,10 @@ impl Action {
                 if let Some(capabilities) = capabilities {
                     capabilities.validate_declaration()?;
                     ensure!(
-                        *uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0 && !preserve,
+                        owner == accounts::ROOT
+                            && mode & 0o111 != 0
+                            && mode & 0o022 == 0
+                            && !preserve,
                         "file capabilities require a root-owned executable with no group or other write access and preserve disabled"
                     );
                 }
@@ -622,23 +729,28 @@ impl Action {
                         "publish derives file digest and size"
                     );
                 }
-                (*uid, *gid)
+                (owner, group)
             }
-            Self::Dir { mode, uid, gid, .. } => {
+            Self::Dir {
+                mode, owner, group, ..
+            } => {
                 ensure!(
                     parse_mode(mode)? & 0o4000 == 0,
                     "setuid directories are not supported"
                 );
-                (*uid, *gid)
+                (owner, group)
             }
             Self::Symlink {
-                target, uid, gid, ..
+                target,
+                owner,
+                group,
+                ..
             } => {
                 ensure!(
                     !target.is_empty() && !target.contains('\0'),
                     "invalid symlink target"
                 );
-                (*uid, *gid)
+                (owner, group)
             }
             Self::Hardlink { target, .. } => {
                 validate_package_path(target)?;
@@ -646,21 +758,22 @@ impl Action {
                 return Ok(());
             }
         };
-        ensure!(uid != u32::MAX && gid != u32::MAX, "invalid owner");
+        accounts::validate_name(owner).context("invalid owner")?;
+        accounts::validate_name(group).context("invalid group")?;
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct MediatedLink {
+pub(crate) struct MediatedLink {
     pub group: String,
     pub priority: i32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Manifest {
+pub(crate) struct Manifest {
     pub format: u32,
     pub publisher: String,
     pub name: String,
@@ -768,11 +881,11 @@ impl Manifest {
             .collect()
     }
 
-    pub fn id(&self) -> String {
+    pub(crate) fn id(&self) -> String {
         format!("cps://{}/{}@{}", self.publisher, self.name, self.version)
     }
 
-    pub fn validate(&self, published: bool) -> Result<()> {
+    pub(crate) fn validate(&self, published: bool) -> Result<()> {
         ensure!(
             self.format == MANIFEST_FORMAT,
             "unsupported manifest format {}",

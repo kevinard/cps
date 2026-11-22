@@ -19,7 +19,7 @@ while read -r name upstream; do
     cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "imports/$name" publisher="imports" version="$upstream" upstream-version="$upstream" {
-    file "$path" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "$path" mode="0644"
 }
 MANIFEST
     "$cps" publish manifests --repo repo --proto proto --key private.der package.kdl
@@ -38,7 +38,7 @@ for version in '3.0.0~rc2-1' '3.0.0~rc10-1' '3.0.0-1'; do
     cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "imports/release-candidate" publisher="imports" version="$version" {
-    file "usr/share/imports/release-candidate" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "usr/share/imports/release-candidate" mode="0644"
 }
 MANIFEST
     "$cps" publish manifests --repo repo --proto proto --key private.der package.kdl

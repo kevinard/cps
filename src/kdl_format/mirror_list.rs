@@ -43,7 +43,7 @@ pub(crate) enum MirrorListKind {
 
 pub(crate) fn parse_mirror_list(text: &str, kind: MirrorListKind) -> Result<MirrorList> {
     let doc = document(text)?;
-    schema(&doc, "mirror-list")?;
+    schema(&doc, super::Kind::MirrorList)?;
     let mut list = MirrorList {
         mirrors: Vec::new(),
         exclude: Vec::new(),

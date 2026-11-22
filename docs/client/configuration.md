@@ -39,10 +39,11 @@ and dependency cleanup remain allowed. The freeze survives removal and
 constrains later reinstallation.
 
 Specify `NAME@VERSION` to freeze a package that is not installed. A freeze
-matches the version exactly as it is spelled in the package ID, so
-`library/libdisplay@2.0.0` does not freeze `2.0.0-0`; see
+holds one package ID, so it records the version as spelled, and for an
+installed package it records the installed spelling: `library/libdisplay@2.0.0`
+freezes an installed `2.0.0-0` at `2.0.0-0`; see
 [package selectors](queries.md#package-selectors-and-versions). For an
-installed package, an explicit version must match the installed version.
+installed package, an explicit version must name the installed release.
 Publisher selectors check the selected installed package, while the stored
 constraint applies to the package name and version. This follows
 [IPS package freezes](https://docs.oracle.com/cd/E26502_01/html/E28984/gilfr.html)
@@ -56,7 +57,7 @@ Run `tests/package-freezes.sh` for the CLI workflow. It also accepts
 A **facet** is optional content inside a package, such as headers and `.so`
 links (`devel`), manual pages (`doc.man`), locales (`locale.fr`), debug
 symbols (`debug.symbols`), or 32-bit multilib objects (`isa.i686`). A
-**variant** is a mutually exclusive image property, such as `arch` or
+**variant** is a mutually exclusive image property, such as `architecture` or
 `container`, that selects between alternative content. Neither changes
 which packages are installed, and neither adds dependencies. Content that
 must be installed on its own, or that needs other packages, is a separate
@@ -187,7 +188,7 @@ cps variant set --root image container=true
 cps variant set --root image --unset container
 ```
 
-`variant list` lists the image's values, including the built-in `arch`. Set
+`variant list` lists the image's values, including the built-in `architecture`. Set
 other variants with `image create --variant NAME=VALUE`, a `variant` node in
 the image configuration, or `variant set`. A variant change works like a
 facet change: it reuses the installed manifests and plans offline. The

@@ -27,12 +27,13 @@ Boot management commands use the `boot-btrfs` node in `/etc/cps/image.kdl`
 by default. Pass `--config` for another configuration. Commands that work
 offline also accept `--esp` and, where needed, `--btrfs-volume`.
 
-Each line shows one environment, newest first.
+Each line shows one environment, newest first, followed by any CPS entry
+files that cannot be read.
 
 | Column | Meaning |
 | --- | --- |
 | `DEFAULT` | `*` marks the environment selected for the next boot. |
-| `STATUS` | `known-good`, `trial (N left)` for a trial with N boot attempts left, `exhausted` for a failed trial, or `retiring` for an environment whose removal was interrupted. |
+| `STATUS` | `known-good`, `trial (N left)` for a trial with N boot attempts left, `exhausted` for a failed trial, `retiring` for an environment whose removal was interrupted, or `invalid` for an entry file that cannot be read. |
 | `ID` | `cps-IMAGE-REVISION`, from the root's image identity and revision. |
 | `ROOT` | The PARTUUID of the root's Btrfs partition. When any entry selects its root by Btrfs filesystem UUID, the column shows `UUID=` or `PARTUUID=` before each identifier. |
 | `TITLE` | The entry title, which includes the Linux release for manifest-managed kernels. A [backup](btrfs.md#backups-before-live-changes) of a running Btrfs root is titled `Canopa backup`. |
@@ -41,6 +42,27 @@ Each line shows one environment, newest first.
 CPS entries declare their metadata format with `# cps-boot-entry-version 1`
 and record SHA-256 digests of their boot files. CPS checks those files before
 it uses an entry as a fallback or rollback target.
+
+### Unreadable entries
+
+Each `cps-*.conf` file is read on its own. A file that cannot be read, such
+as one that a power loss truncated or a hand edit broke, or two files that
+claim the same ID, are listed as `invalid` with the file in the `TITLE`
+column, and `boot list` prints the reason on standard error. `--json` gives
+the reason in each environment's `invalid` field. CPS never selects an
+invalid entry, and rollback, activation, renaming and mounting go on using
+the readable ones, so a damaged entry never blocks a rollback.
+
+`boot destroy`, `boot prune` and `boot discard-trial` refuse to run while
+an entry is invalid, because CPS cannot tell which root or boot files it
+would still boot. Repair or remove the file named in the error, then retry.
+Activation also refuses to write an environment whose ID an invalid file
+already claims.
+
+Other Type #1 entries in `loader/entries`, such as those of another
+distribution in a dual-boot setup, are not CPS's and are ignored. CPS names
+its own entries in `loader.conf`, so systemd-boot never selects another
+entry in their place.
 
 ## Manage named environments
 
@@ -135,7 +157,10 @@ cps boot activate "$environment"
 Before changing the selection, CPS checks the target's boot files against
 the digests in its entry. It then checks the registered filesystem and
 subvolume identity on the mounted top-level volume, and the root's CPS image
-identity and revision. For an entry that boots by PARTUUID, CPS reads the
+identity and revision, and verifies the root's packages. Files whose
+fingerprints match the ones CPS recorded are trusted without hashing them
+again, so a rollback stays fast on a large root; `cps verify` hashes every
+file. For an entry that boots by PARTUUID, CPS reads the
 parent GPT disk of the mounted ESP and checks that the Btrfs device is that
 partition, so it needs read access to the disk.
 
@@ -183,7 +208,7 @@ variables instead and uses no loader configuration. A new file starts with the
 following lines.
 
 ```
-default cps-*.conf
+default cps-IMAGE-REVISION.conf
 timeout 0
 editor no
 auto-entries no
@@ -196,12 +221,11 @@ can change the menu timeout, enable the editor or the automatic entries, or
 add keys such as `console-mode`. CPS rejects the file and names the key when
 you set one of these:
 
-- A `default` that is neither `cps-*.conf` nor a CPS entry ID followed by
-  `.conf`. Restore the CPS value, or delete the line and select a known-good
-  environment with `cps boot activate ID`.
-- A `preferred` that is not a CPS entry, a `preferred` with
-  `default cps-*.conf`, or a `preferred` without a `default`. Delete the line
-  to cancel the trial selection.
+- A `default` that is not a CPS entry ID followed by `.conf`, including a
+  pattern such as `cps-*.conf`. Restore the CPS value, or delete the line and
+  select a known-good environment with `cps boot activate ID`.
+- A `preferred` that is not a CPS entry, or a `preferred` without a
+  `default`. Delete the line to cancel the trial selection.
 - More than one `default` or `preferred` line. Keep the one CPS wrote.
 - A single-quoted `default` or `preferred` value. systemd-boot 260 and later
   remove matching single or double quotes, but earlier versions read single
@@ -210,36 +234,37 @@ you set one of these:
   systemd-boot treats as `menu-force` and as a menu with a 136-year
   countdown. Use a number of seconds, `menu-hidden`, or `menu-disabled`.
 
-These rules keep trial selection safe. Right after bootstrap,
-`default cps-*.conf` selects the newest CPS entry whose attempts are not
-exhausted, so the first trial boots and falls back to the bootstrapped root.
-After a rollback pins a known-good environment as `default`, CPS publishes
-each later trial and its files before it names the trial as `preferred`.
-systemd-boot 262 boots the `preferred` entry while its boot counter has
-attempts left, and otherwise boots `default`.
+These rules keep trial selection safe. `default` always names a known-good
+entry: the first environment when CPS bootstraps the ESP, and the target of
+each rollback or activation after that. CPS publishes each trial and its
+files before it names the trial as `preferred`. systemd-boot 262 boots the
+`preferred` entry while its boot counter has attempts left, and otherwise
+boots `default`. The selection never depends on how systemd-boot sorts
+entries.
 [systemd-boot selection](https://github.com/systemd/systemd/blob/v262/src/boot/boot.c#L1717)
 
-Earlier systemd-boot releases ignore `preferred` and would boot the pinned
-default, so the trial would never run. Before it writes `preferred`, CPS
-reads the release from the `#### LoaderInfo: systemd-boot …` marker in each
-systemd-boot binary under `EFI/systemd` and `EFI/BOOT` on the ESP, and
-refuses the activation if any of them is older than 262. When the ESP holds
+Earlier systemd-boot releases ignore `preferred` and would boot the
+default, so a trial would never run. CPS therefore requires systemd-boot 262
+or newer. Before every systemd-boot activation, CPS reads the release from
+the `#### LoaderInfo: systemd-boot …` marker in each systemd-boot binary
+under `EFI/systemd` and `EFI/BOOT` on the ESP, and refuses the activation if
+any of them is older than 262. When the ESP holds
 no systemd-boot binary, CPS uses the running loader's `LoaderInfo` EFI
 variable instead. Update the loader with `bootctl update` and retry.
 [`image disk`](disk-image.md) applies the same check to the template
-ESP, so a new disk can take trials after its first rollback.
+ESP.
 
-The automatic choice therefore depends only on the two owned keys and the CPS
-entry files. A second `default` line would take precedence over the first, so
+The choice therefore depends only on the two owned keys and the CPS entry
+files. A second `default` line would take precedence over the first, so
 CPS rejects duplicates. `timeout menu-force` disables the timeout, so the
 firmware would wait at the menu and an unattended trial or fallback would
-never boot. Any other timeout only delays the automatic choice. The other keys
+never boot. Any other timeout only delays the choice. The other keys
 change the menu, its extra entries, or the console. Automatically detected
 entries have their own IDs, such as `auto-windows`, which never match a CPS
-selector or `cps-*.conf`. CPS rejects non-CPS Type #1 entries in
-`loader/entries`. CPS writes `editor no` because the editor lets anyone at the
+selector, and neither does any Type #1 entry that CPS did not write, so
+CPS ignores those entries. CPS writes `editor no` because the editor lets anyone at the
 console change the kernel command line of a Type #1 entry. Enabling it does
-not change automatic selection.
+not change the selection.
 
 ### Firmware variable overrides
 

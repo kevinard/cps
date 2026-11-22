@@ -16,20 +16,20 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
-pub enum ConfigChoice {
+pub(crate) enum ConfigChoice {
     Local,
     Vendor,
 }
 
-#[derive(Debug)]
-pub struct ConfigUpdate {
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ConfigUpdate {
     pub path: String,
     pub revision: u64,
     pub vendor_copy: String,
     pub vendor_available: bool,
 }
 
-pub fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
+pub(crate) fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let state = image.state()?;
@@ -58,7 +58,7 @@ pub fn list_config_updates(root: &Path) -> Result<Vec<ConfigUpdate>> {
 
 /// Copy the local and verified vendor inputs for a pending configuration diff.
 /// Both outputs must be empty and the vendor output must be readable for hashing.
-pub fn config_diff_inputs(
+pub(crate) fn config_diff_inputs(
     root: &Path,
     path: &str,
     local: &mut File,
@@ -91,6 +91,38 @@ pub fn config_diff_inputs(
         );
     }
     Ok(())
+}
+
+/// Copy the current file at `path` and its `saved` copy from an earlier
+/// `/etc` merge, as `config diff` compares them. Both are read beneath the
+/// image root: a symbolic link is compared by its target and never
+/// followed, so an offline image cannot show a host file, and a missing
+/// file reads as empty.
+pub(crate) fn saved_diff_inputs(
+    root: &Path,
+    path: &str,
+    saved: &str,
+    current_output: &mut File,
+    saved_output: &mut File,
+) -> Result<()> {
+    let root = Root::open(root)?;
+    copy_beneath(&root, path, current_output)?;
+    copy_beneath(&root, saved, saved_output)
+}
+
+fn copy_beneath(root: &Root, path: &str, output: &mut File) -> Result<()> {
+    if let Some(entry) = root.regular_entry(path)? {
+        std::io::copy(&mut File::open(Root::fd_path(&entry))?, output)?;
+        return Ok(());
+    }
+    match root.inspect(path)? {
+        None => Ok(()),
+        Some(Node::Symlink { target, .. }) => {
+            std::io::Write::write_all(output, format!("symbolic link to {target}\n").as_bytes())?;
+            Ok(())
+        }
+        Some(_) => anyhow::bail!("unexpected file type at {path}"),
+    }
 }
 
 pub(super) fn resolve(
@@ -146,9 +178,11 @@ pub(super) fn resolve(
     ))
 }
 
-pub(super) fn file_metadata(node: &Node) -> Option<(u32, u32, u32)> {
+pub(super) fn file_metadata(node: &Node) -> Option<(u32, &str, &str)> {
     match node {
-        Node::File { mode, uid, gid, .. } => Some((*mode, *uid, *gid)),
+        Node::File {
+            mode, owner, group, ..
+        } => Some((*mode, owner, group)),
         _ => None,
     }
 }
@@ -170,13 +204,13 @@ fn local_contents(local: &Node, vendor: &Node) -> Option<Node> {
     else {
         return None;
     };
-    let (mode, uid, gid) = file_metadata(vendor)?;
+    let (mode, owner, group) = file_metadata(vendor)?;
     Some(Node::File {
         sha256: sha256.clone(),
         size: *size,
         mode,
-        uid,
-        gid,
+        owner: owner.to_owned(),
+        group: group.to_owned(),
         capabilities: None,
     })
 }

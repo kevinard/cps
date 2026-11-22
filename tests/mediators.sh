@@ -17,9 +17,9 @@ publish() {
     cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "editors/$name" publisher="canopa" version="1.0.0-0" {
-    file "usr/bin/editor-$name" mode="0755" uid=$(id -u) gid=$(id -g)
-    symlink "usr/bin/editor" target="editor-$name" uid=$(id -u) gid=$(id -g)
-    symlink "usr/bin/edit" target="editor-$name" uid=$(id -u) gid=$(id -g)
+    file "usr/bin/editor-$name" mode="0755"
+    symlink "usr/bin/editor" target="editor-$name"
+    symlink "usr/bin/edit" target="editor-$name"
     mediate "usr/bin/editor" group="editor" priority=$priority
     mediate "usr/bin/edit" group="editor" priority=$priority
 }

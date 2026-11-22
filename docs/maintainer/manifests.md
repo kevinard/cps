@@ -22,7 +22,7 @@ patterns. Then test the package in an [inactive image](../client/images.md).
   - [Reviewing runtime dependencies](#reviewing-runtime-dependencies)
 - [Filesystem actions](#filesystem-actions)
   - [Packages never ship /var; declare it with tmpfiles.d and sysusers.d](#packages-never-ship-var-declare-it-with-tmpfilesd-and-sysusersd)
-  - [Service accounts with static IDs](#service-accounts-with-static-ids)
+  - [Owners and groups](#owners-and-groups)
   - [Filesystem permissions](#filesystem-permissions)
   - [Linux file capabilities](#linux-file-capabilities)
 - [Facets and variants](#facets-and-variants)
@@ -47,12 +47,12 @@ package "apps/editor" publisher="canopa" version="2.1.0-1" upstream-version="2.1
     require "library/libdisplay" version=">=1.4.0-0, <2.0.0-0"
     recommends "apps/editor-help" version=">=2.1.0-0"
     optional "apps/editor-spellcheck" version=">=2.0.0-0" description="Check spelling while typing"
-    dir "usr/share/editor" mode="0755" uid=0 gid=0
-    file "usr/bin/editor" mode="0755" uid=0 gid=0
-    symlink "usr/bin/edit" target="editor" uid=0 gid=0
-    file "usr/share/editor/themes.conf" mode="0644" uid=0 gid=0
-    file "etc/editor.conf" mode="0644" uid=0 gid=0 preserve=#true
-    file "usr/share/man/man1/editor.1" mode="0644" uid=0 gid=0 facet="doc.man"
+    dir "usr/share/editor" mode="0755"
+    file "usr/bin/editor" mode="0755"
+    symlink "usr/bin/edit" target="editor"
+    file "usr/share/editor/themes.conf" mode="0644"
+    file "etc/editor.conf" mode="0644" preserve=#true
+    file "usr/share/man/man1/editor.1" mode="0644" facet="doc.man"
 }
 ```
 
@@ -70,7 +70,7 @@ Set `architecture` for a package that targets one architecture, or pass
 `--arch` to `manifest generate`. Only matching packages take part in
 dependency resolution and publisher ordering, and a source build must
 declare the same target. Omit it for portable packages and for manifests
-that select actions per architecture with `arch`. Package IDs are unique
+that select actions per architecture with `architecture`. Package IDs are unique
 within a repository, so publishing one name and version for two
 architectures needs two repositories.
 
@@ -140,13 +140,14 @@ So `1.0~rc1` < `1.0-rc1` < `1.0` < `1.0b3` < `1.0+b1` < `1.0-15-0` <
 
 Versions have a meaning and a spelling. `2.0.0`, `2.0.0-0`, and `0:02.0.0`
 have the same meaning: one release. Every newer-or-older decision uses the
-meaning: version constraints, upgrades, downgrade checks, obsoletion
-cutoffs, and the revisions that Git builds allocate. Identity uses the
-spelling: a package ID, an `@VERSION` selector, a freeze, and a signed
-composition name one exact spelling, so `@2.0.0` and `@2.0.0-0` are distinct
-packages. A plan never replaces an installed package with another spelling
-of the same release unless an `@VERSION` selector or a freeze names that
-spelling. When the installed package cannot stay, the plan holds back or
+meaning: version constraints, `@VERSION` selectors, upgrades, downgrade
+checks, obsoletion cutoffs, and the revisions that Git builds allocate.
+Identity uses the spelling: a package ID, a freeze, and a signed
+composition name one exact spelling, so `2.0.0` and `2.0.0-0` are distinct
+packages, and `@2.0.0` selects either, preferring the one spelled `2.0.0`. A
+plan never replaces an installed package with another spelling of the same
+release unless an `@VERSION` selector or a freeze spells the version that
+way. When the installed package cannot stay, the plan holds back or
 fails instead. Pick one spelling convention, such as always
 writing the revision, and keep it.
 
@@ -293,7 +294,8 @@ The generator emits file, directory, symlink, and hard-link actions in
 deterministic order without following symlinks or crossing mounts. For each
 regular-file hard-link group it records one payload path and aliases within
 the prototype, and it rejects groups that extend outside the prototype.
-Ownership defaults to UID and GID zero; `--uid` and `--gid` set other owners.
+Every action belongs to `root`; `--owner` and `--group` name another
+account.
 It captures Linux file capabilities from executable inodes. It rejects
 namespaced capability sets, hard-linked symlinks, unsupported permission
 bits and filesystem objects, and other extended attributes on regular files
@@ -343,7 +345,7 @@ and `/lib`. The set is fixed so that every builder and the publisher derive
 the same declarations.
 
 Only actions without a facet or variant take part. The package-level
-architecture counts as unconditional, so `arch="x86_64"` on an action in an
+architecture counts as unconditional, so `architecture="x86_64"` on an action in an
 `x86_64` package does too. Content that a facet or variant selects neither
 provides nor requires a capability. A file that starts with the ELF magic
 but does not parse as an ELF executable or shared object, such as a
@@ -431,7 +433,8 @@ then validates the final composition and ABI.
 ## Filesystem actions
 
 Paths are relative to the image root, without a leading `/`. Every action
-other than `hardlink` sets `uid` and `gid`.
+other than `hardlink` can name an `owner` and a `group`, which default to
+`root`, as [Owners and groups](#owners-and-groups) describes.
 
 | Action | Properties |
 | --- | --- |
@@ -440,7 +443,7 @@ other than `hardlink` sets `uid` and `gid`.
 | `symlink PATH` | `target`, written as the link's contents. |
 | `hardlink PATH` | `target`, an image-relative path to an immutable `file` of the same package, which supplies ownership, mode, and content. |
 
-Every action also accepts the `facet`, `arch`, and `variant.NAME`
+Every action also accepts the `facet`, `architecture`, and `variant.NAME`
 [selectors](#facets-and-variants). A hard link's target must be selected
 whenever the link is, so the target has no facet or the same facet, and its
 variants are a subset of the link's.
@@ -489,11 +492,11 @@ package ships in `/usr`:
 ```kdl
 schema-version 1 kind="package-manifest"
 package "service/example" publisher="canopa" version="1.0.0-0" {
-    file "usr/lib/sysusers.d/example.conf" mode="0644" uid=0 gid=0
+    file "usr/lib/sysusers.d/example.conf" mode="0644"
     sysusers "example.conf"
-    file "usr/lib/tmpfiles.d/example.conf" mode="0644" uid=0 gid=0
+    file "usr/lib/tmpfiles.d/example.conf" mode="0644"
     tmpfiles "example.conf"
-    file "usr/share/factory/var/lib/example/seed.db" mode="0644" uid=0 gid=0
+    file "usr/share/factory/var/lib/example/seed.db" mode="0644"
 }
 ```
 
@@ -528,28 +531,41 @@ rebuilds goes below `/usr` or `/etc`, as the
 [common triggers](triggers.md#common-triggers) show for font and manual page
 caches.
 
-### Service accounts with static IDs
+### Owners and groups
 
-Manifests record owners as numeric `uid` and `gid`, and CPS writes package
-files before it runs the transaction's sysusers declarations. A service
-account that owns or groups a packaged file therefore needs a fixed ID, the
-same in the sysusers.d line and in the manifest:
+Manifests name accounts, never numeric IDs. `owner` and `group` default to
+`root`, so a manifest names only other accounts. A service account that owns
+or groups a packaged file comes from the package's own sysusers.d file:
 
 ```text
 # usr/lib/sysusers.d/example.conf
-g example 815
-u example 815:815 "Example daemon" /var/lib/example
+u example - "Example daemon" /var/lib/example
 ```
 
 ```kdl
-file "etc/example/secret.conf" mode="0640" uid=0 gid=815 preserve=#true
+file "usr/lib/sysusers.d/example.conf" mode="0644"
+sysusers "example.conf"
+file "etc/example/secret.conf" mode="0640" group="example" preserve=#true
 ```
 
-Take these IDs from a registry that the distribution keeps, in the lower part
-of the system range. sysusers allocates IDs for accounts declared with `-`
-from the top of the system range (`SYS_UID_MAX`, usually 999) downwards, so
-the two never collide. An account that owns only paths in `/var` can use a
-dynamic ID: tmpfiles.d resolves names when it runs, after sysusers.
+Each image resolves names against its own `/etc/passwd` and `/etc/group`, so
+the account can have a different ID in every image, and sysusers can allocate
+it dynamically. When a transaction installs a file whose account does not
+exist yet, CPS runs the sysusers.d files that the transaction writes before
+it writes any file, then resolves the names. A name that still does not
+resolve stops the transaction before it changes the image. A package that
+ships `/etc/passwd` or `/etc/group` itself cannot also own files by an
+account it adds there; declare the account in sysusers.d instead.
+
+`cps verify` reports a file whose owner or group no longer has the manifest's
+name, for example after an account was renumbered. A numeric ID with no name
+in the image's database never matches a manifest.
+
+An image that a user creates without root privileges cannot give files to
+other accounts. CPS writes every file of such an image as that user, as if a
+user namespace mapped every account to them, and `verify` checks that mapping
+instead of the names. Root gives the files their manifest owners when it
+[adopts](../client/images.md#who-may-use-an-image) the image.
 [sysusers.d](https://www.freedesktop.org/software/systemd/man/latest/sysusers.d.html) ·
 [UIDs and GIDs in systemd](https://systemd.io/UIDS-GIDS/)
 
@@ -587,7 +603,7 @@ isolated root clones, and removal of privileges by an upgrade.
 A file action can grant a Linux executable specific capabilities.
 
 ```kdl
-file "usr/bin/ping" mode="0755" uid=0 gid=0 capabilities="cap_net_raw=ep"
+file "usr/bin/ping" mode="0755" capabilities="cap_net_raw=ep"
 ```
 
 Use comma-separated capability names followed by `=` and the permitted
@@ -612,13 +628,13 @@ content with variants. Both apply to `file`, `dir`, `symlink`, and
 `hardlink` actions.
 
 ```kdl
-file "usr/include/sqlite3.h" mode="0644" uid=0 gid=0 facet="devel"
-symlink "usr/lib/libsqlite3.so" target="libsqlite3.so.0" uid=0 gid=0 facet="devel"
-file "usr/share/locale/fr/LC_MESSAGES/sqlite.mo" mode="0644" uid=0 gid=0 facet="locale.fr"
-file "usr/lib32/libsqlite3.so.0" mode="0755" uid=0 gid=0 facet="isa.i686"
-symlink "lib64" target="usr/lib" uid=0 gid=0 arch="x86_64"
-symlink "etc/init.conf" target="../usr/lib/init/container.conf" uid=0 gid=0 variant.container="true"
-symlink "etc/init.conf" target="../usr/lib/init/metal.conf" uid=0 gid=0 variant.container="false"
+file "usr/include/sqlite3.h" mode="0644" facet="devel"
+symlink "usr/lib/libsqlite3.so" target="libsqlite3.so.0" facet="devel"
+file "usr/share/locale/fr/LC_MESSAGES/sqlite.mo" mode="0644" facet="locale.fr"
+file "usr/lib32/libsqlite3.so.0" mode="0755" facet="isa.i686"
+symlink "lib64" target="usr/lib" architecture="x86_64"
+symlink "etc/init.conf" target="../usr/lib/init/container.conf" variant.container="true"
+symlink "etc/init.conf" target="../usr/lib/init/metal.conf" variant.container="false"
 ```
 
 - A facet name is one or more dot-separated components of lowercase ASCII
@@ -631,7 +647,7 @@ symlink "etc/init.conf" target="../usr/lib/init/metal.conf" uid=0 gid=0 variant.
   which are off unless the image enables them.
 - `variant.NAME="VALUE"` selects the action only when the image sets that
   variant to that value. `#true` and `#false` stand for `"true"` and
-  `"false"`. `arch="x86_64"` is shorthand for `variant.arch="x86_64"`. An
+  `"false"`. `architecture="x86_64"` is shorthand for `variant.architecture="x86_64"`. An
   action can carry several variants and is selected when all of them match.
 - Installing a package that selects content by a variant the image does not
   set fails, and the solver tries other versions. Publish a variant only
@@ -656,7 +672,7 @@ Each problem has one mechanism. Pick it with this rule:
 | --- | --- | --- |
 | Facet | Optional content inside one package. It never adds dependencies. | `devel` headers and `.so` links, `doc.man`, `locale.fr`, static libraries, `debug.symbols`, `isa.i686` multilib objects |
 | Separate package | The content is installed or removed on its own, or has its own dependencies. | A runtime library split from its compiler, a plugin that requires another service, a daemon split from its client library |
-| Variant | A mutually exclusive property of the image selects between alternatives. | `arch`, a container or bare-metal layout |
+| Variant | A mutually exclusive property of the image selects between alternatives. | `architecture`, a container or bare-metal layout |
 
 Ship 32-bit multilib objects as `isa.*` facets of the 64-bit package, the
 way illumos ships both in one package. A header set whose headers include
@@ -673,8 +689,8 @@ stripped program. It needs no other package and no dependencies, so it is
 the `debug.symbols` facet, not a separate debug package and not a variant.
 
 ```kdl
-file "usr/bin/editor" mode="0755" uid=0 gid=0
-file "usr/lib/debug/.build-id/87/8fa85a7e413fb286f8caa40d1d5d63f1680a04.debug" mode="0644" uid=0 gid=0 facet="debug.symbols"
+file "usr/bin/editor" mode="0755"
+file "usr/lib/debug/.build-id/87/8fa85a7e413fb286f8caa40d1d5d63f1680a04.debug" mode="0644" facet="debug.symbols"
 ```
 
 `cps build` writes these actions itself when it
@@ -698,7 +714,7 @@ keeping their implementation binaries installed side by side. Mark the
 package's normal symlink action with a mediator group.
 
 ```kdl
-symlink "usr/bin/editor" target="my-editor" uid=0 gid=0
+symlink "usr/bin/editor" target="my-editor"
 mediate "usr/bin/editor" group="editor" priority=20
 ```
 
@@ -707,6 +723,14 @@ declare several links for the same group with one priority. CPS selects
 the highest priority by default, with the package name breaking ties.
 Users inspect the choice with `cps mediator list` and change it with
 [`cps mediator set`](../client/configuration.md#choose-the-provider-of-a-mediated-link).
+
+Every package that offers a mediated link still claims its path, whether or
+not it is selected. Another package may offer the same path only in the
+same group. A package that ships an ordinary file, directory or link there,
+or below it, or a file where the link's parent directory belongs, conflicts
+with every package that offers the link. A conflict therefore never depends
+on which provider a group selects, and CPS can rule out that pair of
+packages once.
 
 ## Change the file layout between versions
 
@@ -719,9 +743,9 @@ one transaction and swap the old and new objects atomically; see
 ```kdl
 schema-version 1 kind="package-manifest"
 package "system/filesystem" publisher="canopa" version="2.0.0-0" {
-    dir "usr/bin" mode="0755" uid=0 gid=0
-    symlink "bin" target="usr/bin" uid=0 gid=0
-    file "usr/bin/sh" mode="0755" uid=0 gid=0
+    dir "usr/bin" mode="0755"
+    symlink "bin" target="usr/bin"
+    file "usr/bin/sh" mode="0755"
 }
 ```
 
@@ -754,7 +778,7 @@ through later moves, including moves between packages of the same
 publisher.
 
 ```kdl
-file "etc/canopa/session/preferences.conf" mode="0600" uid=0 gid=0 preserve=#true original-name="desktop/session:etc/canopa/preferences.conf"
+file "etc/canopa/session/preferences.conf" mode="0600" preserve=#true original-name="desktop/session:etc/canopa/preferences.conf"
 ```
 
 The transaction must retire the old path, and the new path must be
@@ -772,7 +796,7 @@ Mark a package whose changes must be tested by booting them.
 ```kdl
 schema-version 1 kind="package-manifest"
 package "system/example-runtime" publisher="canopa" version="1.0.0-0" requires-reboot=#true {
-    file "usr/lib/libexample.so.1" mode="0644" uid=0 gid=0
+    file "usr/lib/libexample.so.1" mode="0644"
 }
 ```
 

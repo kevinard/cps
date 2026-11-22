@@ -28,8 +28,8 @@ trigger declares.
 ```kdl
 schema-version 1 kind="package-manifest"
 package "desktop/glib" publisher="canopa" version="2.86.0-0" {
-    dir "usr/share/glib-2.0/schemas" mode="0755" uid=0 gid=0
-    file "usr/bin/glib-compile-schemas" mode="0755" uid=0 gid=0
+    dir "usr/share/glib-2.0/schemas" mode="0755"
+    file "usr/bin/glib-compile-schemas" mode="0755"
     trigger "schemas" {
         run "usr/bin/glib-compile-schemas" "usr/share/glib-2.0/schemas"
         watch "usr/share/glib-2.0/schemas/*.xml"
@@ -227,8 +227,8 @@ files under `usr/lib/udev/hwdb.d` need no declaration of their own.
 ```kdl
 schema-version 1 kind="package-manifest"
 package "system/systemd" publisher="canopa" version="262.1-1" {
-    dir "etc/udev" mode="0755" uid=0 gid=0
-    file "usr/bin/systemd-hwdb" mode="0755" uid=0 gid=0
+    dir "etc/udev" mode="0755"
+    file "usr/bin/systemd-hwdb" mode="0755"
     trigger "hwdb" {
         run "usr/bin/systemd-hwdb" "--strict" "update"
         watch "usr/lib/udev/hwdb.d/*.hwdb"
@@ -250,7 +250,7 @@ consumes:
 ```kdl
 schema-version 1 kind="package-manifest"
 package "system/mkinitrd" publisher="canopa" version="1.0.0-0" {
-    file "usr/libexec/canopa/mkinitrd" mode="0755" uid=0 gid=0
+    file "usr/libexec/canopa/mkinitrd" mode="0755"
     trigger "initramfs" timeout=900 {
         run "usr/libexec/canopa/mkinitrd"
         watch "usr/lib/modules/**"

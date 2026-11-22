@@ -26,14 +26,14 @@ signing=(--key key.der --key key2.der)
 mkdir -p proto/usr/share requests/next/cases/desktop
 echo 'local addition' > proto/usr/share/extra
 "$CPS_BIN" manifest generate --proto proto --publisher extra --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" desktop/extra > extra.kdl
+    desktop/extra > extra.kdl
 "$CPS_BIN" publish manifests --repo extra --proto proto --key extra.der extra.kdl
 extra_pin=$(cat extra/current)
 rm proto/usr/share/extra
 for version in 1 2 3; do
     echo "$version" > proto/usr/share/cps-test
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$version.0.0-0" \
-        --uid "$(id -u)" --gid "$(id -g)" desktop/base > manifest.kdl
+        desktop/base > manifest.kdl
     "$CPS_BIN" publish manifests --repo repo --proto proto "${signing[@]}" manifest.kdl
 done
 policy() {
@@ -43,7 +43,7 @@ publisher "canopa" {
     builder-key "unused.der"
     profile "desktop" architecture="$(uname -m)" rollout-percentage=$2 {
         package "desktop/base@$1.0.0-0"
-        publisher "extra" catalog="$extra_pin" {
+        publisher "extra" catalog-sha256="$extra_pin" {
             repository "$work/extra"
             trust-root "$work/extra.trust.json"
         }
@@ -53,7 +53,7 @@ POLICY
 }
 for version in 1 2; do
     policy "$version" 100
-    printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
+    printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base-sha256="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
     "$CPS_BIN" publish release --repo repo "${signing[@]}" baseline.kdl
     if [[ $version == 1 ]]; then
         cat repo/current > requests/next/cases/desktop/baselines
@@ -61,7 +61,7 @@ for version in 1 2; do
 done
 base=$(cat repo/current)
 policy 3 0
-printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$base" > requests/next/release.kdl
+printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base-sha256="%s" refresh-profiles=#true\n' "$base" > requests/next/release.kdl
 cat > requests/next/cases/desktop/image.kdl <<CONFIG
 schema-version 1 kind="image-config"
 architecture "$(uname -m)"

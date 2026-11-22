@@ -11,21 +11,21 @@ use crate::{
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FrozenPackage {
+pub(crate) struct FrozenPackage {
     pub version: Version,
     pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FreezeChange {
+pub(crate) struct FreezeChange {
     pub name: String,
     pub from: Option<FrozenPackage>,
     pub to: Option<FrozenPackage>,
 }
 
 /// Read committed package freezes without contacting a repository.
-pub fn list_freezes(root: &Path) -> Result<BTreeMap<String, FrozenPackage>> {
+pub(crate) fn list_freezes(root: &Path) -> Result<BTreeMap<String, FrozenPackage>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     Ok(image.state()?.settings.freezes)
@@ -110,11 +110,13 @@ pub(super) fn changes(
                 .installed
                 .get(name)
                 .map(|package| &package.published.manifest.version);
-            let version = spec.version.as_ref().or(installed).with_context(|| {
+            // A freeze holds the installed spelling, whichever spelling of its
+            // release the user wrote.
+            let version = installed.or(spec.version.as_ref()).with_context(|| {
                 format!("{name} is not installed; specify the version to freeze")
             })?;
             ensure!(
-                installed.is_none_or(|installed| installed == version),
+                spec.accepts(version),
                 "installed package does not match the requested freeze version: {name}"
             );
             next.insert(
@@ -129,9 +131,7 @@ pub(super) fn changes(
                 .get(name)
                 .with_context(|| format!("package is not frozen: {name}"))?;
             ensure!(
-                spec.version
-                    .as_ref()
-                    .is_none_or(|version| version == &freeze.version),
+                spec.accepts(&freeze.version),
                 "frozen package does not match the requested version: {name}"
             );
             next.remove(name);

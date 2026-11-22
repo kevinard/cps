@@ -33,7 +33,7 @@ pub(crate) enum Action {
 }
 
 impl Action {
-    pub fn kind(&self) -> &str {
+    pub(crate) fn kind(&self) -> &str {
         match self {
             Self::Sysusers(_) => "sysusers",
             Self::Tmpfiles(_) => "tmpfiles",
@@ -41,13 +41,13 @@ impl Action {
         }
     }
 
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             Self::Sysusers(name) | Self::Tmpfiles(name) | Self::Preset(name) => name,
         }
     }
 
-    pub fn path(&self) -> String {
+    pub(crate) fn path(&self) -> String {
         let directory = match self {
             Self::Sysusers(_) => "usr/lib/sysusers.d",
             Self::Tmpfiles(_) => "usr/lib/tmpfiles.d",
@@ -56,7 +56,7 @@ impl Action {
         format!("{directory}/{}", self.name())
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let name = self.name();
         let valid_suffix = match self {
             Self::Sysusers(_) | Self::Tmpfiles(_) => name.ends_with(".conf"),
@@ -389,6 +389,40 @@ fn tmpfiles_locations<'a>(root: &Root, rules: &'a str, live: bool) -> Result<Vec
         .into_iter()
         .filter_map(|(_, rule)| rule)
         .collect())
+}
+
+/// Create the accounts that a sysusers.d file declares before CPS writes it,
+/// so files that name those accounts can get their IDs. `contents` is the
+/// file's verified payload, which replaces the file at its vendor path as
+/// systemd-sysusers reads every configuration, so administrator overrides
+/// keep their priority. The usual sysusers action still runs after the
+/// files are written.
+pub(crate) fn create_accounts(
+    path: &Path,
+    action: &Action,
+    contents: fs::File,
+    live: bool,
+) -> Result<()> {
+    ensure!(
+        matches!(action, Action::Sysusers(_)),
+        "expected a sysusers action"
+    );
+    action.validate()?;
+    let mut replace = std::ffi::OsString::from("--replace=/");
+    replace.push(action.path());
+    run_tool(
+        command("systemd-sysusers", path)
+            .arg(replace)
+            .arg("-")
+            .stdin(Stdio::from(contents)),
+        "sysusers",
+        live,
+    )
+}
+
+/// Create every account that the image's sysusers.d configuration declares.
+pub(crate) fn create_all_accounts(path: &Path, live: bool) -> Result<()> {
+    run_tool(&mut command("systemd-sysusers", path), "sysusers", live)
 }
 
 pub(crate) fn run(

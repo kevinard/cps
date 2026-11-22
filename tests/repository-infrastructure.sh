@@ -23,7 +23,7 @@ mkdir -p "$work/proto/usr/share"
 publish() {
     printf '%s\n' "$1" > "$work/proto/usr/share/example"
     cps manifest generate --proto "$work/proto" --publisher canopa --version "$1.0.0-0" \
-        --uid "$(id -u)" --gid "$(id -g)" demo/example > "$work/manifest.kdl"
+        demo/example > "$work/manifest.kdl"
     cps publish manifests --repo "$workspace/repo" --proto "$work/proto" \
         --key "$workspace/keys/catalog.der" "$work/manifest.kdl"
 }
@@ -71,6 +71,15 @@ cmp "$origin/metadata/timestamp.json" "$replica/metadata/timestamp.json"
 # Nothing new: the replica is left alone, previous release included.
 cps repo replicate --tuf-root "$workspace/tuf-root.json" -o "$replica" "$origin" | grep -F 'already serves'
 [[ -f $replica/metadata/1.snapshot.json ]]
+# With the source unchanged, a served file that went missing is still
+# noticed and restored, and the previous release stays.
+rm -- "$target"
+cps repo replicate --tuf-root "$workspace/tuf-root.json" -o "$replica" "$origin" \
+    2> "$work/repair.log" | grep -F 'Replicated TUF timestamp version'
+grep -F 'repairing the served replica' "$work/repair.log"
+cmp -- "$origin/targets/${target##*/}" "$target"
+[[ -f $replica/metadata/1.snapshot.json ]]
+cps repo replicate --tuf-root "$workspace/tuf-root.json" -o "$replica" "$origin" | grep -F 'already serves'
 # A refresh re-signs the deployed catalog even after an undeployed publish.
 deployed=$(cat "$workspace/repo/current")
 publish 3

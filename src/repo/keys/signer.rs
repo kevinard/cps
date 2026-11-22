@@ -20,11 +20,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use base64::Engine;
-use ring::signature::{
+use aws_lc_rs::signature::{
     ECDSA_P256_SHA256_ASN1, ED25519, RSA_PSS_2048_8192_SHA256, UnparsedPublicKey,
     VerificationAlgorithm,
 };
+use base64::Engine;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tough::schema::key::Key;
 

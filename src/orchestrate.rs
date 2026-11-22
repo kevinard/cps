@@ -20,8 +20,6 @@ use crate::{
     },
 };
 
-const RECIPE_KIND: &str = "build-recipe";
-
 /// One package that a recipe produces, read from its manifest.
 #[derive(Debug, Default)]
 struct Produced {
@@ -41,16 +39,34 @@ struct Recipe {
 }
 
 /// A recipe in build order with the recipes it follows and why.
-#[derive(Debug)]
-pub struct QueuedRecipe {
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct QueuedRecipe {
     pub recipe: PathBuf,
     pub packages: Vec<String>,
+    #[serde(serialize_with = "serialize_after")]
     pub after: Vec<(PathBuf, String)>,
+}
+
+/// Each predecessor as an object with its recipe and the reason.
+fn serialize_after<S: serde::Serializer>(
+    after: &[(PathBuf, String)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(serde::Serialize)]
+    struct After<'a> {
+        recipe: &'a Path,
+        reason: &'a str,
+    }
+    serializer.collect_seq(
+        after
+            .iter()
+            .map(|(recipe, reason)| After { recipe, reason }),
+    )
 }
 
 /// Recipes in dependency order, with diagnostics for recipes read only in part.
 #[derive(Debug)]
-pub struct BuildOrder {
+pub(crate) struct BuildOrder {
     pub recipes: Vec<QueuedRecipe>,
     pub warnings: Vec<String>,
 }
@@ -58,7 +74,7 @@ pub struct BuildOrder {
 /// Order the recipes found under `paths` so that each recipe follows the
 /// recipes producing its toolchain packages and the runtime dependencies of
 /// its own packages.
-pub fn build_order(paths: &[PathBuf]) -> Result<BuildOrder> {
+pub(crate) fn build_order(paths: &[PathBuf]) -> Result<BuildOrder> {
     let (recipes, warnings) = read_recipes(paths)?;
     let graph = Graph::new(&recipes)?;
     let order = graph.order(&recipes)?;
@@ -188,9 +204,7 @@ fn parse_document(path: &Path, limit: u64) -> Result<KdlDocument> {
     if is_template(path) {
         text = fill_placeholders(&text);
     }
-    text.parse().map_err(|error: kdl::KdlError| {
-        anyhow::anyhow!("invalid KDL in {}: {error:?}", path.display())
-    })
+    crate::kdl_format::document(&text).with_context(|| format!("reading {}", path.display()))
 }
 
 fn document_kind(doc: &KdlDocument) -> Option<&str> {
@@ -199,9 +213,9 @@ fn document_kind(doc: &KdlDocument) -> Option<&str> {
 
 fn is_recipe(path: &Path) -> Result<bool> {
     // Other KDL documents and unparseable templates are not recipes.
-    Ok(parse_document(path, RECIPE_LIMIT)
-        .ok()
-        .is_some_and(|doc| document_kind(&doc) == Some(RECIPE_KIND)))
+    Ok(parse_document(path, RECIPE_LIMIT).ok().is_some_and(|doc| {
+        document_kind(&doc) == Some(crate::kdl_format::Kind::BuildRecipe.name())
+    }))
 }
 
 fn argument(node: &KdlNode) -> Option<&str> {
@@ -448,8 +462,8 @@ impl Graph {
 }
 
 /// One package version that changed, and how its capabilities changed.
-#[derive(Debug)]
-pub struct ChangedPackage {
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ChangedPackage {
     pub id: String,
     pub previous: Option<String>,
     pub removed: Vec<String>,
@@ -457,8 +471,8 @@ pub struct ChangedPackage {
 }
 
 /// A package to rebuild, with each reason and its recipe when known.
-#[derive(Debug)]
-pub struct Rebuild {
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Rebuild {
     pub id: String,
     pub reasons: Vec<String>,
     /// Whether it requires a capability that the change removed, such as a
@@ -467,12 +481,13 @@ pub struct Rebuild {
     pub recipe: Option<PathBuf>,
 }
 
-#[derive(Debug)]
-pub struct RebuildPlan {
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct RebuildPlan {
     pub changed: Vec<ChangedPackage>,
     pub rebuilds: Vec<Rebuild>,
     /// Recipes of the rebuilt packages, in build order.
     pub recipes: Vec<PathBuf>,
+    #[serde(skip)]
     pub warnings: Vec<String>,
 }
 
@@ -484,7 +499,7 @@ struct Offered<'a> {
 
 /// List the packages and recipes that must be rebuilt after the `changed`
 /// packages, from the signed dependency summaries of pinned catalogs.
-pub fn rebuild_plan(
+pub(crate) fn rebuild_plan(
     config: &Path,
     pins: &[String],
     changed: &[String],
@@ -572,9 +587,15 @@ pub fn rebuild_plan(
             );
         }
         let position = match &spec.version {
+            // Prefer the exact spelling, then another spelling of the release.
             Some(version) => versions
                 .iter()
                 .position(|candidate| &candidate.version == version)
+                .or_else(|| {
+                    versions
+                        .iter()
+                        .position(|candidate| candidate.version.semantic() == version.semantic())
+                })
                 .with_context(|| {
                     format!(
                         "no version {version} of {} in the pinned catalogs",
@@ -692,7 +713,7 @@ pub fn rebuild_plan(
 /// The pins that `cps recipe repin` refreshes. Each field selects one kind
 /// of pin; the others stay as written.
 #[derive(Debug, Default)]
-pub struct RepinRequest {
+pub(crate) struct RepinRequest {
     /// New toolchain catalog digests, each `PUBLISHER=SHA256`.
     pub catalogs: Vec<String>,
     /// Publisher trust root files whose SHA-256 becomes the `key-sha256` of
@@ -707,10 +728,10 @@ pub struct RepinRequest {
     pub sources: Vec<PathBuf>,
 }
 
-/// One rewritten pin, such as `toolchain seed catalog` or
+/// One rewritten pin, such as `toolchain seed catalog-sha256` or
 /// `source busybox-1.38.0.tar.bz2 size`.
 #[derive(Debug, PartialEq, Eq)]
-pub struct PinChange {
+pub(crate) struct PinChange {
     pub pin: String,
     pub from: String,
     pub to: String,
@@ -718,7 +739,7 @@ pub struct PinChange {
 
 /// A recipe whose pins changed.
 #[derive(Debug)]
-pub struct RepinnedRecipe {
+pub(crate) struct RepinnedRecipe {
     pub recipe: PathBuf,
     pub changes: Vec<PinChange>,
     /// The digest of the rewritten recipe, for publish-policy approvals.
@@ -727,7 +748,7 @@ pub struct RepinnedRecipe {
 }
 
 #[derive(Debug, Default)]
-pub struct RepinReport {
+pub(crate) struct RepinReport {
     pub recipes: Vec<RepinnedRecipe>,
     /// Pins that could not be checked, such as a source found in no directory.
     pub warnings: Vec<String>,
@@ -758,7 +779,7 @@ impl Pins {
                         if let Some(name) = argument(publisher) {
                             pins.toolchain.push((
                                 name.to_owned(),
-                                string(publisher, "catalog"),
+                                string(publisher, "catalog-sha256"),
                                 string(publisher, "key-sha256"),
                             ));
                         }
@@ -853,7 +874,7 @@ fn file_pin(path: &Path) -> Result<(i128, String)> {
 /// Refresh the selected pins of every recipe under `paths`, keeping
 /// comments and formatting. With `write` false nothing is written, which
 /// serves both dry runs and staleness checks.
-pub fn repin_recipes(
+pub(crate) fn repin_recipes(
     paths: &[PathBuf],
     request: &RepinRequest,
     write: bool,
@@ -904,8 +925,8 @@ pub fn repin_recipes(
                 && from != to
             {
                 change(
-                    Edit::string("publisher", name, "catalog", &from, to),
-                    format!("toolchain {name} catalog"),
+                    Edit::string("publisher", name, "catalog-sha256", &from, to),
+                    format!("toolchain {name} catalog-sha256"),
                     from,
                     to.to_owned(),
                 );
@@ -1024,9 +1045,7 @@ pub fn repin_recipes(
         if is_template(&path) {
             check = fill_placeholders(&check);
         }
-        let parsed: KdlDocument = check
-            .parse()
-            .map_err(|error: kdl::KdlError| anyhow::anyhow!("invalid KDL: {error:?}"))?;
+        let parsed = crate::kdl_format::document(&check)?;
         ensure!(
             pending.iter().all(Option::is_none) && Pins::read(&parsed) == expected,
             "{} spells a pin in a form that repin does not rewrite; edit it by hand",
@@ -1081,7 +1100,7 @@ mod tests {
         fs::write(
             dir.join(format!("{name}.build.kdl.in")),
             format!(
-                "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"@ARCH@\" epoch=@EPOCH@ {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog=\"{hash}\" key-sha256=\"@KEY@\" // keep\n        package \"{toolchain}\"\n    }}\n    manifest \"{name}.kdl\" sha256=\"@MANIFEST_SHA256@\"\n    script \"true\"\n}}\n"
+                "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"@ARCH@\" epoch=@EPOCH@ {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog-sha256=\"{hash}\" key-sha256=\"@KEY@\" // keep\n        package \"{toolchain}\"\n    }}\n    manifest \"{name}.kdl\" sha256=\"@MANIFEST_SHA256@\"\n    script \"true\"\n}}\n"
             ),
         )?;
         Ok(())
@@ -1145,7 +1164,7 @@ mod tests {
         assert_eq!(
             dry.recipes[0].changes,
             [PinChange {
-                pin: "toolchain seed catalog".into(),
+                pin: "toolchain seed catalog-sha256".into(),
                 from: "0".repeat(64),
                 to: new.clone(),
             }]
@@ -1173,7 +1192,8 @@ mod tests {
         let bad = dir.path().join("zzz.build.kdl.in");
         let before = fs::read_to_string(&good)?;
         // A pin split over two lines is a form that repin does not rewrite.
-        let split = fs::read_to_string(&bad)?.replace(" catalog=", " \\\n            catalog=");
+        let split = fs::read_to_string(&bad)?
+            .replace(" catalog-sha256=", " \\\n            catalog-sha256=");
         fs::write(&bad, &split)?;
         let new = "1".repeat(64);
         let error = repin_recipes(
@@ -1203,7 +1223,7 @@ mod tests {
         fs::write(
             &recipe,
             format!(
-                "schema-version 1 kind=\"build-recipe\"\n// Reviewed\nbuild architecture=\"x86_64\" epoch=1 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog=\"{zero}\" key-sha256=\"{zero}\"\n        package \"build/cc\"\n    }}\n    manifest \"hello.kdl\"   sha256=\"{zero}\" // template\n    source \"hello-1.0.tar.gz\" size=1 sha256=\"{zero}\" url=\"https://example.org/hello-1.0.tar.gz\"\n    source \"fix.patch\" sha256=\"{zero}\" size=12\n    source \"missing.tar.gz\" size=3 sha256=\"{zero}\"\n    script \"\"\"\n    source \"hello-1.0.tar.gz\" size=1\n    \"\"\"\n}}\n"
+                "schema-version 1 kind=\"build-recipe\"\n// Reviewed\nbuild architecture=\"x86_64\" epoch=1 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog-sha256=\"{zero}\" key-sha256=\"{zero}\"\n        package \"build/cc\"\n    }}\n    manifest \"hello.kdl\"   sha256=\"{zero}\" // template\n    source \"hello-1.0.tar.gz\" size=1 sha256=\"{zero}\" {{\n        url \"https://example.org/hello-1.0.tar.gz\"\n    }}\n    source \"fix.patch\" sha256=\"{zero}\" size=12\n    source \"missing.tar.gz\" size=3 sha256=\"{zero}\"\n    script \"\"\"\n    source \"hello-1.0.tar.gz\" size=1\n    \"\"\"\n}}\n"
             ),
         )?;
         Ok(recipe)

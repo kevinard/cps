@@ -15,11 +15,18 @@
 
 ## Build CPS
 
-Build on Linux with `/proc` and kernel support for `openat2`. Install a Rust
-toolchain that supports the crate's 2024 edition and locked dependencies, a
-C linker, pkg-config, and the SQLite and libseccomp development libraries.
+Build on Linux with `/proc` and kernel support for `openat2`. Install Rust
+1.99 or later, a C linker, pkg-config, and the SQLite and libseccomp
+development libraries. `Cargo.toml` declares 1.99 as `rust-version`, and
+[`rust-toolchain.toml`](../../rust-toolchain.toml) selects the exact
+toolchain CI uses, with Clippy and rustfmt, when you build through rustup.
 The [CI Dockerfile](../../ci/Dockerfile) and its [Rust archive hashes](../../ci/rust-dist.sha256)
 describe the pinned build environment used by the project.
+
+Release binaries do not come from a CI workflow. CPS builds and signs itself
+from [`packaging/cps-build.kdl.in`](../../packaging/cps-build.kdl.in), as
+described in [Build the CPS package fixture](build-fixtures.md#building-cps-itself),
+so a release carries the same signed provenance as every other package.
 
 Run these commands from the checkout root.
 
@@ -58,8 +65,12 @@ and update the affected guide examples.
 
 ## Code layout
 
-[`src/main.rs`](../../src/main.rs) parses arguments and dispatches to the
-library in [`src/lib.rs`](../../src/lib.rs). Each area below has its own
+[`src/cli.rs`](../../src/cli.rs) parses arguments and dispatches to the
+other modules, and [`src/main.rs`](../../src/main.rs) only calls it. The
+crate is a library so that the binary and its tests share code, but nothing
+in it is a public API: items are `pub(crate)`, the crate warns on
+unreachable `pub` items, and code that only tests call is compiled only for
+tests, so the compiler reports dead code. Each area below has its own
 module.
 
 | Area | Modules |
@@ -93,16 +104,30 @@ Most modules also hold their own unit tests.
 
 ## Internal records
 
-Pending transaction journals in the image database carry `"format": 1`.
-Completed transaction details use the checksum prefix
-`cps transaction details v1` followed by a newline. A synchronized cache
+The image database sets SQLite's `user_version` to its table schema
+version, 1, and CPS refuses a database with another version. Pending
+transaction journals in it carry `"format": 1`. A journal holds the plan and
+the next state as the exact JSON text it recorded, and digests that text
+rather than a fresh serialization, so a later CPS that serializes the same
+values differently still verifies them. CPS reads a journal's format before
+the rest, and reports a journal in another format by its plan ID instead of
+failing to decode it. Completed transaction details carry `"format": 1` and
+use the checksum prefix `cps transaction details v1` followed by a newline.
+History reads the base image, base revision, and request kind of every row,
+so a row whose other details another version recorded still lists.
+
+[`src/tests/records.rs`](../../src/tests/records.rs) pins the JSON shape of
+saved plans, journals, image state rows, transaction details, and every
+request under [`tests/golden/records`](../../tests/golden/records). A change
+there is a format change: raise the record's format, keep older records
+readable, and then rewrite the files with `CPS_UPDATE_GOLDEN=1`. A synchronized cache
 stores its trust binding in `.tuf/origin` with the first line
 `cps mirror cache v1`. Profile retention records, catalog-pinned file
 indexes, Git snapshot reservations, and mirror signer state use JSON
 `"format": 1`. A self-contained catalog archive, which packs a catalog
 root and its shards into image state, is a Zstandard stream that begins
-with `cps catalog archive v1`. An interrupted partition replacement is recorded
-in an ESP marker beginning with `cps slot retirement v1`.
+with `cps catalog archive v1`. The boot state on an EFI System Partition is
+specified in [Format specifications](../reference/formats.md#efi-system-partition-state).
 
 ## Run the unit tests
 
@@ -111,6 +136,21 @@ TMPDIR=$PWD/target/tmp cargo test --locked
 ```
 
 Create `target/tmp` first. CI runs `cargo test --frozen --all-targets`.
+Before the tests it runs the lints, which must pass without warnings:
+
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps
+python3 ci/check-dependencies.py
+```
+
+[`check-dependencies.py`](../../ci/check-dependencies.py) keeps one crypto
+implementation, aws-lc-rs, in the build: it fails when `ring` enters the
+dependency graph, or when a crate resolves to a second version not listed
+in [`duplicate-crates.txt`](../../ci/duplicate-crates.txt). Review a new
+duplicate, then run it with `--update` to accept it.
+
 Pass a name filter to run part of the suite, for example
 `cargo test --locked tests::transitions` or `cargo test --locked shards`.
 The unit tests need no privileges. Some use host tools:
@@ -169,21 +209,27 @@ CI sets both CPS variables to the same binary and runs this set:
 ```sh
 export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
 export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
-for test in package-identity elf-transactions systemd-actions hwdb-trigger triggers mediators \
-    package-freezes git-snapshots release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
-    recipe-orchestration; do
+for test in package-identity manifest-dependencies elf-transactions elf-profile systemd-actions \
+    hwdb-trigger triggers mediators package-freezes git-snapshots sources build build-outputs \
+    release-ci release-notes sharded-mirror deploy-mirror repository-infrastructure boot-image \
+    recipe-orchestration exit-status json-output; do
   bash "tests/$test.sh"
 done
 bash tests/transaction-progress.sh
 ```
 
-Every scenario uses OpenSSL to create disposable keys.
+Every scenario uses OpenSSL to create disposable keys. Only
+`systemd-build-worker.sh`, which needs a systemd user session, is left for
+manual runs. [`ci/run.sh`](../../ci/run.sh) runs a command in the CI image
+as your own user, the way the workflow does.
 
 | Scenario | Covers | Also needs |
 | --- | --- | --- |
 | [`package-identity.sh`](../../tests/package-identity.sh) | Upstream version spelling, package IDs, and architectures | |
 | [`manifest-dependencies.sh`](../../tests/manifest-dependencies.sh) | Generated library capabilities, offline dependency suggestions, and direct requirement checks | A C compiler, Python 3 |
 | [`package-freezes.sh`](../../tests/package-freezes.sh) | Offline freezes, version constraints, staged unfreezing | |
+| [`exit-status.sh`](../../tests/exit-status.sh) | The [exit status table](../reference/exit-status.md): usage errors, lookups that find nothing, verification and image differences, and a declined prompt | `script` from util-linux |
+| [`json-output.sh`](../../tests/json-output.sh) | The shape of every `--json` document against [`tests/golden/json`](../../tests/golden/json); `--update` rewrites the key lists | `jq` |
 | [`mediators.sh`](../../tests/mediators.sh) | Mediated defaults, preferences, a cloned root, and reprovisioning | `jq` |
 | [`transaction-progress.sh`](../../tests/transaction-progress.sh) | Plan validation, progress, read-only roots, and aborting a journaled apply | `jq` |
 | [`elf-transactions.sh`](../../tests/elf-transactions.sh) | Generated requirements, transaction ELF regressions, drift, and compatible upgrades | A C compiler |

@@ -32,9 +32,10 @@ use rustix::{
     process::{Gid, Uid},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
-    image::{CONFIG_UPDATES_DIRECTORY, Image, Managed, root::Root},
+    image::{CONFIG_UPDATES_DIRECTORY, Image, Managed, accounts::Accounts, root::Root},
     model::{Node, digest},
     plan::config_update_prefix,
 };
@@ -43,6 +44,11 @@ use crate::{
 pub(crate) const BASE: &str = "etc-base.json";
 /// The report of the last merge into this root, in its image state.
 pub(crate) const REPORT: &str = "etc-merge.json";
+/// The largest account database that the record merge reads.
+const RECORDS_LIMIT: u64 = 16 << 20;
+/// Marks a trial whose /etc must be merged from the running root before
+/// its boot can be blessed.
+const REQUIRED: &str = "etc-merge-required";
 /// Private working directory in the trial's image state.
 const SCRATCH: &str = "etc-merge";
 /// Local versions saved by the merge, below the configuration review area.
@@ -135,9 +141,15 @@ pub(crate) struct Manifest {
     /// Mount points and nested subvolumes, which the merge leaves alone.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     opaque: BTreeSet<String>,
-    /// The contents of the account databases, for the record merge.
+    /// The contents of the account databases in a scan, for the record
+    /// merge. A merge base keeps only `record_digests`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     records: BTreeMap<String, String>,
+    /// In a merge base: the SHA-256 of each record of each account database,
+    /// by the record's name. The merge only compares base records, so the
+    /// base never keeps password hashes or other account data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    record_digests: BTreeMap<String, BTreeMap<String, String>>,
     /// In a merge base: the stash directories of completed merges, which a
     /// later merge into the same trial must keep.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -145,6 +157,20 @@ pub(crate) struct Manifest {
 }
 
 impl Manifest {
+    /// This scan as a merge base, with record digests instead of records.
+    fn into_base(mut self) -> Result<Self> {
+        for (path, text) in std::mem::take(&mut self.records) {
+            let text = STANDARD
+                .decode(text)
+                .context("invalid recorded account database")?;
+            // A database that does not parse merges nothing, as before.
+            if let Some(digests) = record_digests(&text) {
+                self.record_digests.insert(path, digests);
+            }
+        }
+        Ok(self)
+    }
+
     fn record(&self, path: &str) -> Result<Option<Vec<u8>>> {
         self.records
             .get(path)
@@ -212,7 +238,7 @@ impl Reason {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct EtcConflict {
+pub(crate) struct EtcConflict {
     pub path: String,
     pub reason: String,
     /// The saved running version, relative to the root, if there was one.
@@ -222,7 +248,7 @@ pub struct EtcConflict {
 
 /// What a merge carried into the trial.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct EtcMergeReport {
+pub(crate) struct EtcMergeReport {
     pub revision: u64,
     /// Paths copied from, or removed as on, the running system.
     pub applied: Vec<String>,
@@ -236,7 +262,7 @@ pub struct EtcMergeReport {
 }
 
 impl EtcMergeReport {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.applied.is_empty()
             && self.merged.is_empty()
             && self.config_updates.is_empty()
@@ -248,6 +274,10 @@ impl EtcMergeReport {
 pub(crate) struct Policy<'a> {
     pub paths: &'a BTreeMap<String, Managed>,
     pub generated: Vec<&'a str>,
+    /// The trial's accounts, which the owner names of its paths resolve
+    /// against on both sides: the trial starts as a copy of the running
+    /// root, and sysusers.d only adds accounts.
+    pub accounts: &'a Accounts,
 }
 
 /// Record the merge base in a new root before its plan changes `/etc`.
@@ -256,17 +286,74 @@ pub(crate) struct Policy<'a> {
 pub(crate) fn record_base(root: &Root) -> Result<()> {
     let state = root.open_image_state()?;
     remove_tree(&state, SCRATCH)?;
-    match unlinkat(state.as_file(), REPORT, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => {}
-        Err(error) => return Err(error).context("removing an inherited /etc merge report"),
+    for inherited in [REPORT, REQUIRED] {
+        match unlinkat(state.as_file(), inherited, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(error) => return Err(error).context("removing an inherited /etc merge record"),
+        }
     }
     let scan = scan(root, true).context("recording /etc as the merge base")?;
-    write_private(&state, BASE, &serde_json::to_vec(&scan.manifest)?)
+    write_private(
+        &state,
+        BASE,
+        &serde_json::to_vec(&scan.manifest.into_base()?)?,
+    )
 }
 
-/// Remove the scratch tree that an interrupted merge left in a root.
+/// Require the shutdown merge of the running /etc before `root`, a trial
+/// that system commands staged, counts as healthy.
+///
+/// Staging selects the trial for the next boot right away, and the merge
+/// runs only at a clean shutdown. A crash or a forced reboot skips it, so the
+/// trial would boot with /etc as it was at staging. The marker makes the
+/// health check fail until a merge for the trial's revision completes, so
+/// such a boot is never blessed and systemd-boot returns to the root that
+/// kept the local changes.
+pub(crate) fn require_merge(image: &Image) -> Result<()> {
+    let revision = image.settings()?.revision;
+    write_private(&image.state_dir, REQUIRED, revision.to_string().as_bytes())
+}
+
+/// Why an image is not healthy yet because its required /etc merge has not
+/// completed for its revision.
+pub(crate) fn missing_merge(image: &Image) -> Result<Option<String>> {
+    let required = match image.state_dir.read_file(REQUIRED) {
+        Ok(bytes) => String::from_utf8(bytes)?
+            .parse::<u64>()
+            .context("reading the required /etc merge")?,
+        Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let revision = image.settings()?.revision;
+    // Live changes after a blessed trial booted raise its revision.
+    if required != revision {
+        return Ok(None);
+    }
+    let report = match image.state_dir.read_file(REPORT) {
+        Ok(bytes) => Some(serde_json::from_slice::<EtcMergeReport>(&bytes)?),
+        Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(report
+        .is_none_or(|report| report.revision != revision)
+        .then(|| {
+            "the /etc changes made on the running system since staging were not merged into \
+             this trial, because the system did not shut down cleanly. Boot the previous \
+             environment, which keeps them, and stage the change again"
+                .to_owned()
+        }))
+}
+
+/// Remove what merges left in the running root: the scratch tree of an
+/// interrupted merge, and the merge base, which only a pending trial uses.
+/// A booted root no longer needs it, and snapshots of it would carry it on.
 pub(crate) fn remove_leftovers(root: &Root) -> Result<()> {
-    remove_tree(&root.open_image_state()?, SCRATCH)
+    let state = root.open_image_state()?;
+    remove_tree(&state, SCRATCH)?;
+    match unlinkat(state.as_file(), BASE, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(error) => Err(error).context("removing the /etc merge base"),
+    }
 }
 
 /// The stash directory for this merge: `REVISION`, or `REVISION-N` when an
@@ -284,7 +371,8 @@ fn stash_name(completed: &BTreeSet<String>, revision: u64) -> String {
 }
 
 /// The report of the last merge into a root.
-pub fn last_report(root: &Path) -> Result<Option<EtcMergeReport>> {
+#[cfg(test)]
+pub(crate) fn last_report(root: &Path) -> Result<Option<EtcMergeReport>> {
     let state = Root::open(root)?.open_image_state()?;
     match state.read_file(REPORT) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -331,6 +419,7 @@ pub(crate) fn finalize_with(
     let policy = Policy {
         paths: &state.paths,
         generated: crate::triggers::active_outputs(&state.installed, &state.paths),
+        accounts: trial.root.accounts(),
     };
     let ours = scan(running, true).context("reading the running /etc")?;
     ensure!(
@@ -414,7 +503,7 @@ pub(crate) fn finalize_with(
 
     // Later runs only need the edits made after this one, and keep the
     // versions this one saved.
-    let mut rebased = ours.manifest;
+    let mut rebased = ours.manifest.into_base()?;
     rebased.stashes = base.stashes;
     if report
         .conflicts
@@ -474,7 +563,7 @@ fn plan(
         let action = if crate::triggers::generated(&policy.generated, path) {
             Action::Keep(Reason::Generated)
         } else if let Some(managed) = policy.paths.get(path.as_str()) {
-            if !acceptable(o, managed) {
+            if !acceptable(o, managed, policy.accounts) {
                 if o.is_some() {
                     Action::Conflict(Reason::Drift)
                 } else {
@@ -489,7 +578,7 @@ fn plan(
                     content,
                     running_metadata,
                 }
-            } else if managed.preserve && matches_node(t, &managed.node) {
+            } else if managed.preserve && matches_node(t, &managed.node, policy.accounts) {
                 Action::ConfigUpdate
             } else {
                 Action::Conflict(Reason::BothChanged)
@@ -516,7 +605,7 @@ fn plan(
 /// Preserved files accept any contents with the manifest's metadata. A
 /// directory that packages only create implicitly accepts any metadata, as
 /// verification does. Other paths must match their manifest exactly.
-fn acceptable(ours: Option<&Entry>, managed: &Managed) -> bool {
+fn acceptable(ours: Option<&Entry>, managed: &Managed, accounts: &Accounts) -> bool {
     match (ours, &managed.node) {
         (Some(Entry::Dir { .. }), _) if managed.implicit => true,
         (
@@ -527,23 +616,29 @@ fn acceptable(ours: Option<&Entry>, managed: &Managed) -> bool {
                 xattrs,
                 ..
             }),
-            Node::File {
+            node @ Node::File {
                 mode: expected_mode,
-                uid: expected_uid,
-                gid: expected_gid,
                 capabilities: None,
                 ..
             },
         ) if managed.preserve => {
-            (*mode, *uid, *gid) == (*expected_mode, *expected_uid, *expected_gid)
+            mode == expected_mode
+                && owned_as(node, accounts, *uid, *gid)
                 && !xattrs.contains_key("security.capability")
         }
-        (Some(entry), node) => matches_node(Some(entry), node),
+        (Some(entry), node) => matches_node(Some(entry), node, accounts),
         (None, _) => false,
     }
 }
 
-fn matches_node(entry: Option<&Entry>, node: &Node) -> bool {
+/// Whether a node's owner and group names resolve to these IDs.
+fn owned_as(node: &Node, accounts: &Accounts, uid: u32, gid: u32) -> bool {
+    node.ownership()
+        .and_then(|(owner, group)| accounts.ids(owner, group).ok())
+        == Some((uid, gid))
+}
+
+fn matches_node(entry: Option<&Entry>, node: &Node, accounts: &Accounts) -> bool {
     match (entry, node) {
         (
             Some(Entry::File {
@@ -556,34 +651,25 @@ fn matches_node(entry: Option<&Entry>, node: &Node) -> bool {
             }),
             Node::File {
                 mode: m,
-                uid: u,
-                gid: g,
                 size: s,
                 sha256: h,
                 capabilities: None,
+                ..
             },
         ) => {
-            (mode, uid, gid, size, sha256) == (m, u, g, s, h)
+            (mode, size, sha256) == (m, s, h)
+                && owned_as(node, accounts, *uid, *gid)
                 && !xattrs.contains_key("security.capability")
         }
-        (
-            Some(Entry::Dir { mode, uid, gid, .. }),
-            Node::Dir {
-                mode: m,
-                uid: u,
-                gid: g,
-            },
-        ) => (mode, uid, gid) == (m, u, g),
+        (Some(Entry::Dir { mode, uid, gid, .. }), Node::Dir { mode: m, .. }) => {
+            mode == m && owned_as(node, accounts, *uid, *gid)
+        }
         (
             Some(Entry::Symlink {
                 target, uid, gid, ..
             }),
-            Node::Symlink {
-                target: t,
-                uid: u,
-                gid: g,
-            },
-        ) => (target, uid, gid) == (t, u, g),
+            Node::Symlink { target: t, .. },
+        ) => target == t && owned_as(node, accounts, *uid, *gid),
         _ => false,
     }
 }
@@ -613,11 +699,17 @@ fn merge_record_file(
         return Ok(None);
     }
     let running_metadata = o_meta != t_meta && b_meta == Some(t_meta);
-    let base_text = base.record(path)?.unwrap_or_default();
+    // A database that existed at the base but did not parse merges nothing.
+    let empty = BTreeMap::new();
+    let base_records = match base.record_digests.get(path) {
+        Some(digests) => digests,
+        None if base.entries.contains_key(path) => return Ok(None),
+        None => &empty,
+    };
     let (Some(ours_text), Some(theirs_text)) = (ours.record(path)?, theirs.record(path)?) else {
         return Ok(None);
     };
-    let Some(merged) = merge_records(&base_text, &ours_text, &theirs_text) else {
+    let Some(merged) = merge_records(base_records, &ours_text, &theirs_text) else {
         return Ok(None);
     };
     // Accounts that each side added on its own can take the same free ID.
@@ -664,18 +756,36 @@ fn parse_records(text: &[u8]) -> Option<Records<'_>> {
 /// records only the running system added are appended in their order. A
 /// record changed differently on both sides, a duplicate key or a line
 /// without a key makes the whole file a conflict.
-fn merge_records(base: &[u8], ours: &[u8], theirs: &[u8]) -> Option<Vec<u8>> {
-    let base: BTreeMap<_, _> = parse_records(base)?.into_iter().collect();
+/// The digest of each record of an account database, by name, or `None`
+/// when the database does not parse as records.
+fn record_digests(text: &[u8]) -> Option<BTreeMap<String, String>> {
+    Some(
+        parse_records(text)?
+            .into_iter()
+            .map(|(key, line)| (String::from_utf8_lossy(key).into_owned(), digest(line)))
+            .collect(),
+    )
+}
+
+/// Merge account databases record by record. `base` holds the digest of
+/// each record at the merge base.
+fn merge_records(base: &BTreeMap<String, String>, ours: &[u8], theirs: &[u8]) -> Option<Vec<u8>> {
+    let base_of = |key: &[u8]| base.get(&*String::from_utf8_lossy(key));
+    let unchanged = |line: Option<&&[u8]>, base: Option<&String>| match (line, base) {
+        (None, None) => true,
+        (Some(line), Some(base)) => digest(line) == *base,
+        _ => false,
+    };
     let ours_records = parse_records(ours)?;
     let ours: BTreeMap<_, _> = ours_records.iter().copied().collect();
     let theirs_records = parse_records(theirs)?;
     let theirs_keys: BTreeSet<_> = theirs_records.iter().map(|(key, _)| *key).collect();
     let mut lines = Vec::new();
     for (key, line) in &theirs_records {
-        let (b, o) = (base.get(key), ours.get(key));
-        if o == b || o == Some(line) {
+        let (b, o) = (base_of(key), ours.get(key));
+        if unchanged(o, b) || o == Some(line) {
             lines.push(*line);
-        } else if b == Some(line) {
+        } else if unchanged(Some(line), b) {
             lines.extend(o);
         } else {
             return None;
@@ -685,9 +795,9 @@ fn merge_records(base: &[u8], ours: &[u8], theirs: &[u8]) -> Option<Vec<u8>> {
         if theirs_keys.contains(key) {
             continue;
         }
-        match base.get(key) {
+        match base_of(key) {
             // The trial removed a record that the running system kept as it was.
-            Some(b) if b == line => {}
+            Some(b) if digest(line) == *b => {}
             Some(_) => return None,
             None => lines.push(*line),
         }
@@ -1089,22 +1199,44 @@ fn visit(
                     (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino),
                     "{path} changed while reading /etc"
                 );
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
-                    .with_context(|| format!("reading {path}"))?;
-                if records && RECORDS.contains(&path.as_str()) {
-                    scan.manifest
-                        .records
-                        .insert(path.clone(), STANDARD.encode(&bytes));
-                }
+                let (size, sha256) = if records && RECORDS.contains(&path.as_str()) {
+                    // Only account databases are kept, for the record merge.
+                    let mut bytes = Vec::new();
+                    (&mut file)
+                        .take(RECORDS_LIMIT + 1)
+                        .read_to_end(&mut bytes)
+                        .with_context(|| format!("reading {path}"))?;
+                    if bytes.len() as u64 <= RECORDS_LIMIT {
+                        let sha256 = digest(&bytes);
+                        let size = bytes.len() as u64;
+                        scan.manifest
+                            .records
+                            .insert(path.clone(), STANDARD.encode(&bytes));
+                        (size, sha256)
+                    } else {
+                        // A database above the limit is not kept, so it
+                        // merges as a whole file, like one that does not
+                        // parse as records.
+                        let mut hasher = Sha256::new();
+                        hasher.update(&bytes);
+                        let rest = std::io::copy(&mut file, &mut hasher)
+                            .with_context(|| format!("reading {path}"))?;
+                        (bytes.len() as u64 + rest, hex::encode(hasher.finalize()))
+                    }
+                } else {
+                    let mut hasher = Sha256::new();
+                    let size = std::io::copy(&mut file, &mut hasher)
+                        .with_context(|| format!("reading {path}"))?;
+                    (size, hex::encode(hasher.finalize()))
+                };
                 scan.inodes
                     .insert(path.clone(), (opened.st_ino, opened.st_nlink as u64));
                 Entry::File {
                     mode,
                     uid,
                     gid,
-                    size: bytes.len() as u64,
-                    sha256: digest(&bytes),
+                    size,
+                    sha256,
                     xattrs: xattr_digests(&entry_path)?,
                 }
             }
@@ -1399,7 +1531,7 @@ fn write_private(state: &Root, name: &str, bytes: &[u8]) -> Result<()> {
 }
 
 /// Saved running versions in a root: (revision, path, saved copy).
-pub fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
+pub(crate) fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
     let root = Root::open(root)?;
     let prefix = format!("{CONFIG_UPDATES_DIRECTORY}/{STASH}");
     let stash = match root.dir(&prefix) {
@@ -1416,12 +1548,9 @@ pub fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        let Some(number) = name
-            .split_once('-')
-            .map_or(name, |(number, _)| number)
-            .parse::<u64>()
-            .ok()
-        else {
+        // A merge that ran again for the same revision saves `N-ATTEMPT`.
+        let (number, attempt) = name.split_once('-').unwrap_or((name, "0"));
+        let (Ok(number), Ok(attempt)) = (number.parse::<u64>(), attempt.parse::<u64>()) else {
             continue;
         };
         let directory = Root::open(&revision.path())?;
@@ -1437,12 +1566,17 @@ pub fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> {
         visit(&top, ETC, info.st_dev, false, false, &mut scan)?;
         for (path, entry) in scan.manifest.entries {
             if !entry.is_dir() {
-                saved.push((number, path.clone(), format!("{prefix}/{name}/{path}")));
+                let copy = format!("{prefix}/{name}/{path}");
+                saved.push(((number, attempt), path, copy));
             }
         }
     }
+    // Attempts sort as numbers, so attempt 10 follows attempt 9.
     saved.sort();
-    Ok(saved)
+    Ok(saved
+        .into_iter()
+        .map(|((number, _), path, copy)| (number, path, copy))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1491,8 +1625,8 @@ mod tests {
                 sha256: digest(text.as_bytes()),
                 size: text.len() as u64,
                 mode: 0o644,
-                uid: 0,
-                gid: 0,
+                owner: "root".into(),
+                group: "root".into(),
                 capabilities: None,
             },
             owners: BTreeSet::from(["system/base".to_owned()]),
@@ -1504,6 +1638,10 @@ mod tests {
 
     #[test]
     fn records_merge_by_key_and_conflict_on_shared_changes() {
+        // The base keeps only record digests.
+        let merge_records = |base: &[u8], ours: &[u8], theirs: &[u8]| {
+            super::merge_records(&record_digests(base).unwrap(), ours, theirs)
+        };
         let base = b"root:x:0:0::/root:/bin/sh\nbin:x:1:1::/:/bin/false\nold:x:2:2::/:/bin/false\n";
         // The trial adds a system user. The running system changes root's
         // shell, adds alice and removes old.
@@ -1610,9 +1748,12 @@ mod tests {
         ours.entries.remove("etc/mounted");
         ours.entries.remove("etc/mounted/inner");
         ours.opaque.insert("etc/mounted".into());
+        let empty = tempfile::tempdir()?;
+        let accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: vec!["etc/ld.so.cache"],
+            accounts: &accounts,
         };
         let actions = plan(&base, &ours, &theirs, &policy)?;
         let expected = BTreeMap::from([
@@ -1657,9 +1798,15 @@ mod tests {
             manifest.entries.insert("etc/group".into(), entry);
             manifest.records.insert("etc/group".into(), record);
         }
+        // A recorded base keeps only record digests.
+        let base = base.into_base()?;
+        assert!(base.records.is_empty() && !base.record_digests.is_empty());
+        let empty = tempfile::tempdir()?;
+        let accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: Vec::new(),
+            accounts: &accounts,
         };
         assert_eq!(
             plan(&base, &ours, &theirs, &policy)?["etc/group"],
@@ -1684,9 +1831,12 @@ mod tests {
             (file_with(text, mode), STANDARD.encode(text))
         };
         let paths = BTreeMap::new();
+        let empty = tempfile::tempdir()?;
+        let no_accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: Vec::new(),
+            accounts: &no_accounts,
         };
         let root = "root:x:0:0::/root:/bin/sh\n";
         let case = |ours: (&str, u32), theirs: (&str, u32)| -> Result<Action> {
@@ -1698,6 +1848,7 @@ mod tests {
                 manifest.records.insert("etc/passwd".into(), record);
             }
             let [base, ours, theirs] = &manifests;
+            let base = &base.clone().into_base()?;
             Ok(plan(base, ours, theirs, &policy)?
                 .remove("etc/passwd")
                 .unwrap())
@@ -1746,8 +1897,8 @@ mod tests {
             Managed {
                 node: Node::Dir {
                     mode: 0o755,
-                    uid: 0,
-                    gid: 0,
+                    owner: "root".into(),
+                    group: "root".into(),
                 },
                 owners: BTreeSet::from(["system/base".to_owned()]),
                 preserve: false,
@@ -1755,9 +1906,12 @@ mod tests {
                 original_name: None,
             },
         )]);
+        let empty = tempfile::tempdir()?;
+        let accounts = Accounts::new(std::fs::File::open(empty.path())?);
         let policy = Policy {
             paths: &paths,
             generated: Vec::new(),
+            accounts: &accounts,
         };
         let base = manifest(&[("etc/ssh", dir())]);
         let mut ours = base.clone();
@@ -1809,6 +1963,24 @@ mod tests {
         // A root without /etc reads as empty.
         let empty = tempfile::tempdir()?;
         assert!(scan_empty(empty.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn an_account_database_above_the_limit_merges_as_a_whole_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let etc = dir.path().join("etc");
+        fs::create_dir_all(&etc)?;
+        let line = "user:x:1000:1000::/home/user:/bin/sh\n";
+        let text = line.repeat(usize::try_from(RECORDS_LIMIT)? / line.len() + 1);
+        fs::write(etc.join("passwd"), &text)?;
+        let scan = scan(&Root::open(dir.path())?, true)?;
+        assert!(scan.manifest.record("etc/passwd")?.is_none());
+        assert!(matches!(
+            &scan.manifest.entries["etc/passwd"],
+            Entry::File { size, sha256, .. }
+                if *size == text.len() as u64 && *sha256 == digest(text.as_bytes())
+        ));
         Ok(())
     }
 

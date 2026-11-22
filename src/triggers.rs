@@ -77,7 +77,7 @@ const SCRATCH: &str = "triggers";
 /// A trigger declared by a package manifest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Trigger {
+pub(crate) struct Trigger {
     pub name: String,
     /// The image-relative handler executable, shipped by the same package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1165,8 +1165,8 @@ enum Change {
         path: String,
         source: PathBuf,
         mode: u32,
-        uid: u32,
-        gid: u32,
+        owner: String,
+        group: String,
     },
     Symlink {
         path: String,
@@ -1243,7 +1243,7 @@ fn collect(
             );
         }
         let mode = metadata.mode() & 0o777;
-        let (uid, gid) = (metadata.uid(), metadata.gid());
+        let (owner, group) = root.accounts().names(metadata.uid(), metadata.gid())?;
         if file_type.is_char_device() && metadata.rdev() == 0 {
             ensure!(output, "removed {path}");
             changes.push(Change::Remove { path });
@@ -1252,7 +1252,7 @@ fn collect(
             if output {
                 changes.push(Change::Dir {
                     path: path.clone(),
-                    node: Node::Dir { mode, uid, gid },
+                    node: Node::Dir { mode, owner, group },
                     replace,
                 });
             } else {
@@ -1260,8 +1260,8 @@ fn collect(
                 let existing = root.inspect(&path)?;
                 ensure!(
                     !replace
-                        && matches!(existing, Some(Node::Dir { mode: old, uid: old_uid, gid: old_gid })
-                            if old & 0o777 == mode && (old_uid, old_gid) == (uid, gid)),
+                        && matches!(&existing, Some(Node::Dir { mode: old, owner: old_owner, group: old_group })
+                            if old & 0o777 == mode && (old_owner, old_group) == (&owner, &group)),
                     "changed directory {path}"
                 );
             }
@@ -1272,8 +1272,8 @@ fn collect(
                 path,
                 source,
                 mode,
-                uid,
-                gid,
+                owner,
+                group,
             });
         } else if file_type.is_symlink() {
             ensure!(output, "wrote {path}");
@@ -1283,7 +1283,11 @@ fn collect(
                 .map_err(|target| anyhow::anyhow!("non-UTF-8 link target {target:?}"))?;
             changes.push(Change::Symlink {
                 path,
-                node: Node::Symlink { target, uid, gid },
+                node: Node::Symlink {
+                    target,
+                    owner,
+                    group,
+                },
             });
         } else {
             bail!("created special file {path}");
@@ -1310,15 +1314,15 @@ fn publish(root: &Root, stage: &Root, changes: &[Change]) -> Result<()> {
                 match root.inspect(path)? {
                     None => root.replace(path, node, None, staging, true, &mut syncs)?,
                     Some(current) if current == *node => {}
-                    Some(_) => Root::set_directory_metadata(&root.dir(path)?, node)?,
+                    Some(_) => root.set_directory_metadata(&root.dir(path)?, node)?,
                 }
             }
             Change::File {
                 path,
                 source,
                 mode,
-                uid,
-                gid,
+                owner,
+                group,
             } => {
                 if kind(root, path)? == Some(FileType::Directory) {
                     remove_tree(root, path, &mut syncs)?;
@@ -1330,8 +1334,8 @@ fn publish(root: &Root, stage: &Root, changes: &[Change]) -> Result<()> {
                     sha256,
                     size,
                     mode: *mode,
-                    uid: *uid,
-                    gid: *gid,
+                    owner: owner.clone(),
+                    group: group.clone(),
                     capabilities: None,
                 };
                 root.replace(

@@ -1,7 +1,9 @@
 mod dependencies;
 pub(crate) mod elf;
 
-pub use dependencies::{check_manifest_dependencies, generated_dependencies, suggest_dependencies};
+pub(crate) use dependencies::{
+    check_manifest_dependencies, generated_dependencies, suggest_dependencies,
+};
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -13,7 +15,7 @@ use rustix::fs::{FileType, readlinkat};
 
 use crate::{
     file_caps::FileCapabilities,
-    image::root::Root,
+    image::{accounts, root::Root},
     kdl_format::manifest_text,
     model::{Action, MANIFEST_FORMAT, Manifest, validate_name, validate_publisher},
     repo::MANIFEST_LIMIT,
@@ -26,30 +28,32 @@ struct LinkGroup {
 }
 
 /// Generate an unsigned manifest for review before publishing.
-pub fn generate_manifest(
+#[cfg(test)]
+pub(crate) fn generate_manifest(
     proto: &Path,
     publisher: &str,
     name: &str,
     version: &str,
-    uid: u32,
-    gid: u32,
+    owner: &str,
+    group: &str,
 ) -> Result<String> {
-    generate_manifest_for_architecture(proto, publisher, name, version, uid, gid, None)
+    generate_manifest_for_architecture(proto, publisher, name, version, owner, group, None)
 }
 
 /// Generate an unsigned manifest for a portable or architecture-specific package.
-pub fn generate_manifest_for_architecture(
+pub(crate) fn generate_manifest_for_architecture(
     proto: &Path,
     publisher: &str,
     name: &str,
     version: &str,
-    uid: u32,
-    gid: u32,
+    owner: &str,
+    group: &str,
     architecture: Option<&str>,
 ) -> Result<String> {
     validate_name(name)?;
     validate_publisher(publisher)?;
-    ensure!(uid != u32::MAX && gid != u32::MAX, "invalid owner");
+    accounts::validate_name(owner).context("invalid owner")?;
+    accounts::validate_name(group).context("invalid group")?;
     let mut manifest = Manifest {
         format: MANIFEST_FORMAT,
         publisher: publisher.to_owned(),
@@ -93,8 +97,8 @@ pub fn generate_manifest_for_architecture(
             FileType::Directory => Action::Dir {
                 path: path.to_owned(),
                 mode: mode(false)?,
-                uid,
-                gid,
+                owner: owner.to_owned(),
+                group: group.to_owned(),
                 facet: None,
                 variants: BTreeMap::new(),
             },
@@ -131,8 +135,8 @@ pub fn generate_manifest_for_architecture(
                 Action::File {
                     path: path.to_owned(),
                     mode: mode(capabilities.is_some())?,
-                    uid,
-                    gid,
+                    owner: owner.to_owned(),
+                    group: group.to_owned(),
                     preserve: false,
                     facet: None,
                     variants: BTreeMap::new(),
@@ -152,8 +156,8 @@ pub fn generate_manifest_for_architecture(
                     target: readlinkat(entry, "", Vec::new())?
                         .into_string()
                         .with_context(|| format!("non-UTF-8 symlink target at {path:?}"))?,
-                    uid,
-                    gid,
+                    owner: owner.to_owned(),
+                    group: group.to_owned(),
                     facet: None,
                     variants: BTreeMap::new(),
                 }

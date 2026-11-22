@@ -104,10 +104,10 @@ done
 ln "$work/elf-runtime/lib64/ld-linux-x86-64.so.2" "$work/elf-runtime/usr/lib/ld-linux-x86-64.so.2"
 rm -f -- "$work/native-rust/usr/lib/ld-linux-x86-64.so.2"
 "$cps" manifest generate --proto "$work/native-rust" --publisher seed --version "$seed_version" "${seed_arch[@]}" \
-    --uid "$(id -u)" --gid "$(id -g)" build/native-rust > native-rust.kdl
+    build/native-rust > native-rust.kdl
 "$cps" publish manifests --repo toolchain --proto "$work/native-rust" --key "$work/toolchain.der" native-rust.kdl
 "$cps" manifest generate --proto "$work/elf-runtime" --publisher canopa-runtime-seed --version "$runtime_version" "${seed_arch[@]}" \
-    --uid "$(id -u)" --gid "$(id -g)" system/elf-runtime > elf-runtime.kdl
+    system/elf-runtime > elf-runtime.kdl
 "$cps" publish manifests --repo runtime-seed --proto "$work/elf-runtime" --key "$work/runtime-seed.der" elf-runtime.kdl
 
 printf 'schema-version 1 kind="toolchain-config"\n' > bootstrap-toolchain.kdl
@@ -128,7 +128,7 @@ write_toolchain_recipe() {
 write_toolchain_recipe
 
 fixture_manifest() {
-    sed "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" "$1"
+    cat "$1"
 }
 build_bundle() {
     "$cps" build --toolchain-config "$1" --source-cache sources --output "$3" \
@@ -154,7 +154,7 @@ if [[ -f $git_build_template ]]; then
     bash "$source_tree/tests/seed-git-build.sh" "$cps" "$git_build_proto" \
         "$work/git-build.der"
     "$cps" manifest generate --proto "$git_build_proto" --publisher canopa --version "$git_build_version" \
-        --arch "$arch" --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
+        --arch "$arch" system/git-build > git-build.kdl
     git_build_archive="$work/sources/git-build.tar.gz"
     tar --sort=name --format=gnu --mtime=@0 --owner=0 --group=0 --numeric-owner \
         -C "$git_build_proto" -cf - . | gzip -n > "$git_build_archive"
@@ -200,7 +200,7 @@ write_profile() {
             library-dir "/usr/lib"
             library-dir "/lib64"
         }
-        publisher "canopa-runtime-seed" catalog="$(cat runtime-seed/current)" {
+        publisher "canopa-runtime-seed" catalog-sha256="$(cat runtime-seed/current)" {
             repository "../runtime-seed"
             trust-root "../runtime-seed.trust.json"
         }
@@ -239,7 +239,7 @@ POLICY
 write_policy
 cat > bootstrap-release.kdl <<RELEASE
 schema-version 1 kind="publish-release"
-release "canopa" base="empty" {
+release "canopa" base-sha256="empty" {
     bundle "cps://canopa/system/sqlite@$sqlite_version" path="sqlite.bundle" builder-key="builder-public.der" recipe-sha256="$sqlite_recipe"
     bundle "cps://canopa/system/libseccomp@$seccomp_version" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
 }
@@ -273,7 +273,7 @@ final_packages=("$cps_package")
 {
     cat <<RELEASE
 schema-version 1 kind="publish-release"
-release "canopa" base="$bootstrap_catalog" {
+release "canopa" base-sha256="$bootstrap_catalog" {
     bundle "$cps_package" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
 RELEASE
     if [[ -n $trust_version ]]; then
@@ -323,6 +323,9 @@ else
 fi
 "$cps" apply --root image install.json
 cmp bundle/proto/usr/bin/cps image/usr/bin/cps
+for page in "$source_tree"/docs/reference/man/*.1; do
+    cmp "$page" "image/usr/share/man/man1/${page##*/}"
+done
 if [[ -n $trust_version ]]; then
     cmp "$trust_root" image/etc/cps/tuf-root.json
     test "$(stat -c %a image/etc/cps/tuf-root.json)" = 644

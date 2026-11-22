@@ -55,12 +55,10 @@ add_util_linux() {
     "$cps" publisher add --root "$1" --repo "$util_linux/repo" \
         --trust-root "$util_linux/release.trust.json" canopa-util-linux
 }
-seed_args=()
 packaged_libs=0
 configured=false
 if [[ -n $util_linux || $packaged_seccomp == 1 ]]; then
     configured=true
-    seed_args=(--uid "$(id -u)" --gid "$(id -g)")
 fi
 if [[ -n $util_linux ]]; then
     "$cps" repo attestation --repo "$util_linux/repo" \
@@ -97,7 +95,7 @@ if [[ $packaged_seccomp == 0 ]]; then
     ln -s libseccomp.so.2 "$work/native-systemd/usr/lib/libseccomp.so"
 fi
 "$cps" manifest generate --proto "$work/native-systemd" --publisher seed --version 1.0.0-0 \
-    "${seed_args[@]}" build/native-systemd > native-systemd.kdl
+    build/native-systemd > native-systemd.kdl
 "$cps" publish manifests --repo toolchain --proto "$work/native-systemd" --key "$work/toolchain.der" native-systemd.kdl
 
 toolchain_input=(--repo toolchain --trust-root toolchain.trust.json)
@@ -119,15 +117,14 @@ if $configured; then
 else
     cat > "$work/toolchain-recipe" <<TOOLCHAIN
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(sha256sum < toolchain.trust.json | cut -d' ' -f1)"
+        publisher "seed" catalog-sha256="$(cat toolchain/current)" key-sha256="$(sha256sum < toolchain.trust.json | cut -d' ' -f1)"
         package "build/native-systemd"
     }
 TOOLCHAIN
 fi
 
 recipe="$project/packaging/systemd"
-sed -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
-    -e "s/version=\"262.1.0-0\"/version=\"$systemd_version\"/" "$recipe/vm.kdl" > systemd.kdl
+sed -e "s/version=\"262.1.0-0\"/version=\"$systemd_version\"/" "$recipe/vm.kdl" > systemd.kdl
 if [[ $packaged_seccomp == 1 ]]; then
     sed -i 's/>=2.6.1-0/>=2.6.1-1/' systemd.kdl
 fi
@@ -151,7 +148,7 @@ if [[ -z $util_linux ]]; then
         install -Dm755 "$work/native-systemd/usr/lib/$library" "$work/runtime-seed/usr/lib/$library"
     done
     "$cps" manifest generate --proto "$work/runtime-seed" --publisher canopa-systemd-seed --version 1.0.0-0 \
-        --uid "$(id -u)" --gid "$(id -g)" system/systemd-vm-libs > runtime-seed.kdl
+        system/systemd-vm-libs > runtime-seed.kdl
     "$cps" publish manifests --repo runtime-seed --proto "$work/runtime-seed" --key "$work/runtime-seed.der" runtime-seed.kdl
 fi
 

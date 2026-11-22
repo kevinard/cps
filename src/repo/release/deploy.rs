@@ -37,8 +37,7 @@ use super::{
 use crate::{
     model::digest,
     repo::{
-        keys::trust::Pinned, lock_repo, pinned_publisher, read_current, read_current_catalog,
-        read_limited,
+        keys::trust, lock_repo, pinned_publisher, read_current, read_current_catalog, read_limited,
     },
 };
 
@@ -52,7 +51,7 @@ const TARGETS_WARNING: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// How long newly signed metadata stays valid.
 #[derive(Clone, Copy, Debug)]
-pub struct Lifetimes {
+pub(crate) struct Lifetimes {
     pub targets: Duration,
     pub snapshot: Duration,
     pub timestamp: Duration,
@@ -73,7 +72,7 @@ const fn days(count: u64) -> Duration {
 }
 
 /// Parse a lifetime such as `7d`, `12h`, `30 days`, or `1 hours`.
-pub fn parse_lifetime(text: &str) -> Result<Duration> {
+pub(crate) fn parse_lifetime(text: &str) -> Result<Duration> {
     let digits = text.bytes().take_while(u8::is_ascii_digit).count();
     let (number, unit) = text.split_at(digits);
     let count = number
@@ -94,7 +93,7 @@ pub fn parse_lifetime(text: &str) -> Result<Duration> {
 }
 
 /// One web root served from one publishing repository.
-pub struct Publication<'a> {
+pub(crate) struct Publication<'a> {
     /// The private publishing repository.
     pub repo: &'a Path,
     /// The HTTPS document directory.
@@ -573,7 +572,10 @@ fn role_keys(keys: &Path, role: &str, mirror: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Sign and publish the current catalog. Returns a summary line.
-pub fn deploy_mirror(publication: &Publication<'_>, catalog: Option<&str>) -> Result<String> {
+pub(crate) fn deploy_mirror(
+    publication: &Publication<'_>,
+    catalog: Option<&str>,
+) -> Result<String> {
     let session = Session::open(publication, catalog, false)?;
     let version = session.version();
     let mirror = &session.mirror;
@@ -770,10 +772,14 @@ fn check_descriptor(
         return Ok(false);
     }
     // The current catalog's history holds both versions unchanged.
-    read_current_catalog(&session.repo, &session.publisher, &advertised_trust)
-        .context("the web root advertises a trust root outside the history of the catalog")?;
-    let advertised_version = Pinned::parse(&advertised_trust)?.root().version;
-    let version = Pinned::parse(trust_root)?.root().version;
+    read_current_catalog(
+        &session.repo,
+        &session.publisher,
+        &trust::pin_file(&advertised_trust)?,
+    )
+    .context("the web root advertises a trust root outside the history of the catalog")?;
+    let advertised_version = trust::decode_file(&advertised_trust)?.version;
+    let version = trust::decode_file(trust_root)?.version;
     ensure!(
         version > advertised_version,
         "the web root advertises trust root version {advertised_version}; \
@@ -787,7 +793,10 @@ fn check_descriptor(
 /// The deployed catalog stays served even when the workspace has published a
 /// newer one that is not deployed yet. `catalog`, when given, must be the
 /// deployed catalog.
-pub fn refresh_mirror(publication: &Publication<'_>, catalog: Option<&str>) -> Result<String> {
+pub(crate) fn refresh_mirror(
+    publication: &Publication<'_>,
+    catalog: Option<&str>,
+) -> Result<String> {
     let session = Session::open(publication, catalog, true)?;
     let version = session.version();
     let mirror = &session.mirror;

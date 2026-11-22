@@ -326,7 +326,6 @@ dependencies = [
  "object",
  "reqwest",
  "resolvo",
- "ring",
  "rusqlite",
  "rustix",
  "serde",

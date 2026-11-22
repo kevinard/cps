@@ -38,8 +38,11 @@ pub(crate) fn register_git_publisher(
     let mut publisher = Publisher::from_config(&name, repo, key)?;
     publisher.git = Some(source);
     if let Some(existing) = configured.get(&name) {
+        // The image's pin may have advanced past the Git store's version 1.
+        let same_key = crate::repo::same_trust_root(&existing.key, &publisher.key)?;
+        publisher.key.clone_from(&existing.key);
         ensure!(
-            existing == &publisher,
+            same_key && existing == &publisher,
             "Git publisher {name} is configured differently"
         );
         return Ok(());
@@ -56,7 +59,8 @@ pub(crate) fn register_git_publisher(
     )
 }
 
-pub struct PublisherInfo {
+#[derive(serde::Serialize)]
+pub(crate) struct PublisherInfo {
     pub name: String,
     pub repository: PathBuf,
 }
@@ -147,7 +151,7 @@ impl Publishers {
     }
 }
 
-pub fn list_publishers(root: &Path) -> Result<Vec<PublisherInfo>> {
+pub(crate) fn list_publishers(root: &Path) -> Result<Vec<PublisherInfo>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     Ok(image
@@ -161,12 +165,13 @@ pub fn list_publishers(root: &Path) -> Result<Vec<PublisherInfo>> {
         .collect())
 }
 
-pub fn add_publisher(root: &Path, name: &str, repo: &Path, key: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn add_publisher(root: &Path, name: &str, repo: &Path, key: &Path) -> Result<()> {
     add_publisher_with_build_trust(root, name, repo, key, None)
 }
 
 /// Verify a URL mirror before admitting its publisher to the image.
-pub fn add_publisher_from_url(
+pub(crate) fn add_publisher_from_url(
     root: &Path,
     name: &str,
     url: &str,
@@ -234,7 +239,7 @@ pub fn add_publisher_from_url(
     Ok(cache)
 }
 
-pub fn add_publisher_with_build_trust(
+pub(crate) fn add_publisher_with_build_trust(
     root: &Path,
     name: &str,
     repo: &Path,
@@ -288,7 +293,10 @@ fn check_new_publisher(image: &Image, configured: &Publishers, name: &str) -> Re
 }
 
 /// Move one or more configured publishers to authenticated replacement caches.
-pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)]) -> Result<()> {
+pub(crate) fn set_publisher_repositories(
+    root: &Path,
+    replacements: &[(String, PathBuf)],
+) -> Result<()> {
     ensure!(
         !replacements.is_empty(),
         "specify at least one repository to change"
@@ -363,7 +371,7 @@ pub fn set_publisher_repositories(root: &Path, replacements: &[(String, PathBuf)
 
 /// Replace the locally provisioned builder policy. Audit installed packages
 /// first unless the administrator explicitly scopes the change to future plans.
-pub fn set_publisher_build_trust(
+pub(crate) fn set_publisher_build_trust(
     root: &Path,
     name: &str,
     policy: &Path,
@@ -403,7 +411,7 @@ pub fn set_publisher_build_trust(
     Ok(())
 }
 
-pub fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
+pub(crate) fn audit_publisher_builds(root: &Path, name: &str) -> Result<BuildAudit> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let state = image.state()?;
@@ -565,7 +573,7 @@ fn audit_archived<'a>(
     Ok((audit, missing))
 }
 
-pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
+pub(crate) fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
     edit_publisher_order(root, |image, configured, registered| {
         let mut publishers = configured.as_slice().to_vec();
         let position = position(&publishers, name)?;
@@ -587,7 +595,7 @@ pub fn prefer_publisher(root: &Path, name: &str) -> Result<()> {
     })
 }
 
-pub fn remove_publisher(root: &Path, name: &str) -> Result<()> {
+pub(crate) fn remove_publisher(root: &Path, name: &str) -> Result<()> {
     edit_publisher_order(root, |image, configured, registered| {
         let mut publishers = configured.as_slice().to_vec();
         let position = position(&publishers, name)?;

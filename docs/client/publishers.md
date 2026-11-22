@@ -163,8 +163,10 @@ Each operation, such as a refresh, a sync, or a payload fetch, tries the
 mirrors in order until one completes, up to five mirrors, so only the first
 five candidates matter. Any failure caused
 by what a mirror served moves on to the next one: an outage, a timeout, a
-missing file, and also a signature, digest, expiry, or rollback failure.
-Trying another mirror is always safe, because each one is verified the same
+missing file, and also a signature, digest, expiry, or rollback failure. A
+current catalog signed under an expired trust root counts as an expiry: a
+replica that lags its origin can still serve it after the publisher signed a
+new trust root. Trying another mirror is always safe, because each one is verified the same
 way. A mirror that is behind the newest release CPS has seen fails as a
 rollback, so a stale mirror never takes a client back. Each mirror gets its
 own transfer deadline, so a stalled mirror leaves time for the next one.
@@ -236,11 +238,11 @@ Use the new paths in the KDL configuration used for subsequent mirror syncs.
 A publisher's [trust root](../publisher/publishing.md#publisher-trust-root)
 names its offline root keys and online catalog keys, each with a signature
 threshold, and an expiry. The publisher signs a new version of it for every
-key change. Each catalog carries the publisher's whole trust root history,
-from version 1 to the version it is signed under.
+key change. Each catalog carries the newest 16 versions of the publisher's
+trust root history, ending with the version it is signed under.
 
 `trust-root` in the image configuration, or `--trust-root`, names a file
-holding one version. The image stores that version when you create the image
+holding one version. The image pins that version when you create the image
 or add the publisher. Any version works, so provision the newest one you
 have, and inspect it first:
 
@@ -248,20 +250,23 @@ have, and inspect it first:
 cps repo trust show extras.trust.json
 ```
 
-CPS accepts a catalog only if its history contains the pinned version
-unchanged, each later version is signed by the root keys of the previous
-version and of the new one, and exactly the catalog threshold of the newest
-version's catalog keys sign the catalog.
+CPS accepts a catalog only if the versions it carries agree with the pinned
+ones and continue them without a gap, each later version is signed by the
+root keys of the previous version and of the new one, and exactly the
+catalog threshold of the newest version's catalog keys sign the catalog. A
+pin more than 16 versions behind the catalog cannot verify it; pin a newer
+version of the trust root.
 
 ### Rotation and revocation
 
 Key rotation needs nothing from you. When the publisher rotates or revokes a
 key, the next catalog carries the new trust root version, and CPS verifies it
-from your pinned version. The image's catalog checkpoint for the publisher
-records the history of the catalog it last applied, which is the highest
-version it has verified. A later catalog must extend that history, so CPS
-rejects as a rollback a catalog signed under an older version, such as one
-signed with a key that a later version revoked. The
+from your pinned version. When the image applies that catalog, its pin
+advances to the new version in the same transaction, so every later current
+catalog must be signed under that version or a later one. CPS rejects as a
+rollback a catalog signed under an older version, such as one signed with a
+key that a later version revoked, even when it comes from a new cache or
+mirror. The
 [catalog checkpoints](mirrors.md#catalog-checkpoints-and-archived-signatures)
 also reject older catalog sequences.
 
@@ -313,7 +318,8 @@ refresh-policy "extras" on-unavailable="defer" max-staleness-hours=72
 ```
 
 With `on-unavailable="defer"`, CPS defers updates from the publisher when
-the mirror is unreachable, too slow, or serves expired metadata, as long as
+the mirror is unreachable, too slow, or serves expired metadata or a catalog
+signed under an expired trust root, as long as
 the last successful refresh is no older than `max-staleness-hours` (1 to
 8784). Packages from that publisher stay at their installed versions.
 Beyond that age, or when CPS has no record of a refresh, the update fails.

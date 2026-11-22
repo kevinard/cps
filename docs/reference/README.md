@@ -49,6 +49,11 @@ Omit `-M` if the directory is already on your system's man search path.
 For a shared installation, put the pages in `man1/` under your system's
 local manual directory.
 
+Every command exits with a status from the [exit status table](exit-status.md):
+0 for success, 1 for an error, 2 for invalid usage, 3 when a check found
+something, and 4 when a prompt was declined. Commands that list or inspect
+state print [JSON](json.md) with `--json`.
+
 ## Commands by task
 
 The links open the man page sources. Use the `man` commands above for
@@ -73,11 +78,20 @@ formatted output.
 
 ## Configuration and data formats
 
-KDL documents declare `schema-version 1` and a document `kind`.
+KDL documents are KDL 2.0 and start with a `schema-version N kind="KIND"`
+header. Names follow one rule across every kind: names are spelled out
+(`architecture`, `upstream-version`), every property holding a SHA-256
+digest ends in `-sha256` (`catalog-sha256`, `key-sha256`,
+`bootstrap-catalog-sha256`), retention settings start with `keep-`
+(`keep-cache-versions`, `keep-environments`), and a publisher's pinned trust
+root is a `trust-root`. Each kind has its own schema version, so a change to one format
+leaves files of every other kind valid. Every kind is at version 1.
+[Format specifications](formats.md) gives the exact bytes of the signed and
+persisted formats whose spelling matters, each with a golden fixture.
 
 | File | Where to start |
 | --- | --- |
-| KDL `package-manifest` | [Actions, dependency declarations, and versions](../maintainer/manifests.md) |
+| KDL `package-manifest` | [Actions, dependency declarations, and versions](../maintainer/manifests.md), and the [canonical text CPS signs](formats.md#canonical-manifest-text) |
 | Signed publisher catalog root and shards in JSON, version 1 | [Signed catalog format](../publisher/publishing.md#signed-catalog-format) |
 | Publisher trust root in JSON, version 1 | [Publisher trust root](../publisher/publishing.md#publisher-trust-root) |
 | KDL `build-recipe`, `toolchain-config`, and `build-worker` | [Pinned toolchains, sources, and limits](../maintainer/builds.md) |
@@ -105,7 +119,7 @@ command and subcommand with `LC_ALL=C` and `NO_COLOR=1`, and turns the
 description, usage line, arguments, commands, and options into roff. The
 first sentence of a command's description becomes its page summary.
 Command names, syntax, and option descriptions come from the clap
-definitions and doc comments in `src/main.rs`, so edit help there, never
+definitions and doc comments in `src/cli.rs`, so edit help there, never
 the generated pages. The `cps(1)` description, files, and examples are
 fixed text in the script.
 

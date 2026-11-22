@@ -10,6 +10,7 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use crate::{
     attestation::BuildTrust,
     boot::kernel::Kernel,
+    image::accounts,
     model::{
         ARCH_VARIANT, Action, Dependency, DependencyTarget, ImagePolicy, MANIFEST_FORMAT, Manifest,
         NIL_UUID, OptionalDependency, is_uuid, validate_digest, validate_name, validate_publisher,
@@ -21,17 +22,74 @@ use crate::{
 };
 
 pub(crate) mod build;
+pub(crate) mod canonical;
 pub(crate) mod mirror_list;
 pub(crate) mod publish_policy;
 pub(crate) mod publish_release;
 pub(crate) mod signer;
 pub(crate) mod worker;
 
-const SCHEMA_VERSION: u32 = 1;
+/// A kind of KDL document CPS reads, named by its `schema-version` header.
+///
+/// Each kind has its own schema version, so a change to one format leaves files
+/// of every other kind valid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Kind {
+    PackageManifest,
+    BuildRecipe,
+    GitPackage,
+    GitToolchain,
+    ToolchainConfig,
+    BuildTrust,
+    BuildWorker,
+    ImageConfig,
+    MirrorList,
+    PublishPolicy,
+    PublishRelease,
+    Signer,
+}
+
+impl Kind {
+    /// The `kind` property of the header.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::PackageManifest => "package-manifest",
+            Self::BuildRecipe => "build-recipe",
+            Self::GitPackage => "git-package",
+            Self::GitToolchain => "git-toolchain",
+            Self::ToolchainConfig => "toolchain-config",
+            Self::BuildTrust => "build-trust",
+            Self::BuildWorker => "build-worker",
+            Self::ImageConfig => "image-config",
+            Self::MirrorList => "mirror-list",
+            Self::PublishPolicy => "publish-policy",
+            Self::PublishRelease => "publish-release",
+            Self::Signer => "signer",
+        }
+    }
+
+    /// The only schema version CPS reads and writes for this kind.
+    pub(crate) const fn version(self) -> u32 {
+        match self {
+            Self::PackageManifest => MANIFEST_FORMAT,
+            Self::BuildRecipe
+            | Self::GitPackage
+            | Self::GitToolchain
+            | Self::ToolchainConfig
+            | Self::BuildTrust
+            | Self::BuildWorker
+            | Self::ImageConfig
+            | Self::MirrorList
+            | Self::PublishPolicy
+            | Self::PublishRelease
+            | Self::Signer => 1,
+        }
+    }
+}
+
 /// Action properties named `variant.NAME` select by variant.
 const VARIANT_PREFIX: &str = "variant.";
 const VARIANT_PROPERTY: &str = "variant.*";
-const MANIFEST_KIND: &str = "package-manifest";
 
 struct Fields<'a> {
     args: Vec<&'a KdlValue>,
@@ -116,12 +174,12 @@ impl<'a> Fields<'a> {
             .transpose()
     }
 
-    /// Read `arch=` and `variant.NAME=` selectors. Values are strings, and `#true` or
+    /// Read `architecture=` and `variant.NAME=` selectors. Values are strings, and `#true` or
     /// `#false` stand for "true" or "false".
     fn variants(&self) -> Result<BTreeMap<String, String>> {
         let mut variants = BTreeMap::new();
         for (&key, value) in &self.properties {
-            let name = if key == "arch" {
+            let name = if key == "architecture" {
                 ARCH_VARIANT
             } else if let Some(name) = key.strip_prefix(VARIANT_PREFIX) {
                 name
@@ -131,15 +189,17 @@ impl<'a> Fields<'a> {
             let value = variant_value(value).with_context(|| format!("invalid {key}"))?;
             ensure!(
                 variants.insert(name.to_owned(), value).is_none(),
-                "arch and variant.arch select the same variant"
+                "architecture and variant.architecture select the same variant"
             );
         }
         Ok(variants)
     }
 
-    fn owner(&self, key: &str) -> Result<u32> {
-        self.integer(key)?
-            .with_context(|| format!("missing {key} property"))
+    /// An owner or group name, `root` unless the node names another.
+    fn account(&self, key: &str) -> Result<String> {
+        Ok(self
+            .string(key)?
+            .unwrap_or_else(|| accounts::ROOT.to_owned()))
     }
 }
 
@@ -158,19 +218,16 @@ fn variant_value(value: &KdlValue) -> Result<String> {
         .context("variant values must be strings, #true, or #false")
 }
 
-fn schema(doc: &KdlDocument, kind: &str) -> Result<()> {
-    schema_version(doc, SCHEMA_VERSION, kind)
-}
-
-fn schema_version(doc: &KdlDocument, version: u32, kind: &str) -> Result<()> {
+fn schema(doc: &KdlDocument, kind: Kind) -> Result<()> {
     let fields = Fields::read(one(doc, "schema-version")?, 1, &["kind"], false)?;
+    let (name, version) = (kind.name(), kind.version());
     ensure!(
-        fields.args[0].as_integer() == Some(i128::from(version)),
-        "expected schema-version {version} for {kind}"
+        fields.required_string("kind")? == name,
+        "expected schema-version kind={name:?}"
     );
     ensure!(
-        fields.required_string("kind")? == kind,
-        "expected schema-version kind={kind:?}"
+        fields.args[0].as_integer() == Some(i128::from(version)),
+        "expected schema-version {version} for {name}"
     );
     Ok(())
 }
@@ -187,12 +244,12 @@ fn one<'a>(doc: &'a KdlDocument, name: &str) -> Result<&'a KdlNode> {
     Ok(node)
 }
 
-fn document(text: &str) -> Result<KdlDocument> {
-    text.parse()
-        .map_err(|error: kdl::KdlError| anyhow::anyhow!("invalid KDL: {error:?}"))
+/// Parse KDL 2.0 only, whatever features other crates enable on `kdl`.
+pub(crate) fn document(text: &str) -> Result<KdlDocument> {
+    KdlDocument::parse_v2(text).map_err(|error| anyhow::anyhow!("invalid KDL: {error:?}"))
 }
 
-pub fn parse_manifest(text: &str) -> Result<Manifest> {
+pub(crate) fn parse_manifest(text: &str) -> Result<Manifest> {
     parse_package(text, |_| Ok(false), None).map(|(manifest, _)| manifest)
 }
 
@@ -205,7 +262,7 @@ pub(crate) fn parse_package(
     default_version: Option<&crate::model::Version>,
 ) -> Result<(Manifest, bool)> {
     let doc = document(text)?;
-    schema_version(&doc, MANIFEST_FORMAT, MANIFEST_KIND)?;
+    schema(&doc, Kind::PackageManifest)?;
     let package = one(&doc, "package")?;
     ensure!(
         doc.nodes().len() == 2,
@@ -348,7 +405,7 @@ fn parse_trigger(node: &KdlNode) -> Result<Trigger> {
         for key in node.entries().iter().filter_map(|entry| entry.name()) {
             let key = key.value();
             ensure!(
-                !matches!(key, "facet" | "arch") && !key.starts_with(VARIANT_PREFIX),
+                !matches!(key, "facet" | "architecture") && !key.starts_with(VARIANT_PREFIX),
                 "triggers cannot carry {key} selectors: a trigger follows the selection of its handler file"
             );
         }
@@ -419,7 +476,7 @@ fn reject_selectors(node: &KdlNode) -> Result<()> {
         for key in node.entries().iter().filter_map(|entry| entry.name()) {
             let key = key.value();
             ensure!(
-                !matches!(key, "facet" | "arch") && !key.starts_with(VARIANT_PREFIX),
+                !matches!(key, "facet" | "architecture") && !key.starts_with(VARIANT_PREFIX),
                 "dependencies cannot carry {key} selectors: facets and variants select files within installed packages and never change which packages are installed"
             );
         }
@@ -475,9 +532,9 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
     let props: &[&str] = match name {
         "file" => &[
             "mode",
-            "uid",
-            "gid",
-            "arch",
+            "owner",
+            "group",
+            "architecture",
             "facet",
             VARIANT_PROPERTY,
             "preserve",
@@ -486,9 +543,23 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             "size",
             "capabilities",
         ],
-        "dir" => &["mode", "uid", "gid", "arch", "facet", VARIANT_PROPERTY],
-        "hardlink" => &["target", "arch", "facet", VARIANT_PROPERTY],
-        _ => &["target", "uid", "gid", "arch", "facet", VARIANT_PROPERTY],
+        "dir" => &[
+            "mode",
+            "owner",
+            "group",
+            "architecture",
+            "facet",
+            VARIANT_PROPERTY,
+        ],
+        "hardlink" => &["target", "architecture", "facet", VARIANT_PROPERTY],
+        _ => &[
+            "target",
+            "owner",
+            "group",
+            "architecture",
+            "facet",
+            VARIANT_PROPERTY,
+        ],
     };
     let fields = Fields::read(node, 1, props, false)?;
     let path = fields.string_arg(0)?;
@@ -502,13 +573,13 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             facet,
         });
     }
-    let uid = fields.owner("uid")?;
-    let gid = fields.owner("gid")?;
+    let owner = fields.account("owner")?;
+    let group = fields.account("group")?;
     Ok(match name {
         "file" => Action::File {
             path,
-            uid,
-            gid,
+            owner,
+            group,
             variants,
             facet,
             mode: fields.required_string("mode")?,
@@ -529,16 +600,16 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
         },
         "dir" => Action::Dir {
             path,
-            uid,
-            gid,
+            owner,
+            group,
             variants,
             facet,
             mode: fields.required_string("mode")?,
         },
         _ => Action::Symlink {
             path,
-            uid,
-            gid,
+            owner,
+            group,
             variants,
             facet,
             target: fields.required_string("target")?,
@@ -562,10 +633,11 @@ fn schema_header(version: u32, kind: &str) -> KdlNode {
     schema
 }
 
-pub fn manifest_text(manifest: &Manifest) -> String {
+/// The canonical KDL text of a manifest, whose bytes are signed and digested.
+pub(crate) fn manifest_text(manifest: &Manifest) -> String {
     let mut doc = KdlDocument::new();
     doc.nodes_mut()
-        .push(schema_header(manifest.format, MANIFEST_KIND));
+        .push(schema_header(manifest.format, Kind::PackageManifest.name()));
     let mut package = KdlNode::new("package");
     package.push(manifest.name.as_str());
     package.insert("publisher", manifest.publisher.as_str());
@@ -650,8 +722,8 @@ pub fn manifest_text(manifest: &Manifest) -> String {
         node.push(action.path());
         let owner = match action {
             Action::File {
-                uid,
-                gid,
+                owner,
+                group,
                 mode,
                 preserve,
                 original_name,
@@ -676,26 +748,36 @@ pub fn manifest_text(manifest: &Manifest) -> String {
                 if let Some(capabilities) = capabilities {
                     node.insert("capabilities", capabilities.to_string());
                 }
-                Some((*uid, *gid))
+                Some((owner, group))
             }
-            Action::Dir { uid, gid, mode, .. } => {
+            Action::Dir {
+                owner, group, mode, ..
+            } => {
                 node.insert("mode", mode.as_str());
-                Some((*uid, *gid))
+                Some((owner, group))
             }
             Action::Symlink {
-                uid, gid, target, ..
+                owner,
+                group,
+                target,
+                ..
             } => {
                 node.insert("target", target.as_str());
-                Some((*uid, *gid))
+                Some((owner, group))
             }
             Action::Hardlink { target, .. } => {
                 node.insert("target", target.as_str());
                 None
             }
         };
-        if let Some((uid, gid)) = owner {
-            node.insert("uid", i128::from(uid));
-            node.insert("gid", i128::from(gid));
+        // Most files belong to root, so only other accounts are written.
+        if let Some((owner, group)) = owner {
+            if owner != accounts::ROOT {
+                node.insert("owner", owner.as_str());
+            }
+            if group != accounts::ROOT {
+                node.insert("group", group.as_str());
+            }
         }
         let selectors = action.selectors();
         if let Some(facet) = selectors.facet {
@@ -703,7 +785,7 @@ pub fn manifest_text(manifest: &Manifest) -> String {
         }
         for (name, value) in selectors.variants {
             if name == ARCH_VARIANT {
-                node.insert("arch", value.as_str());
+                node.insert("architecture", value.as_str());
             } else {
                 node.insert(format!("{VARIANT_PREFIX}{name}").as_str(), value.as_str());
             }
@@ -754,43 +836,7 @@ pub fn manifest_text(manifest: &Manifest) -> String {
         children.push(node);
     }
     doc.nodes_mut().push(package);
-    doc.autoformat();
-    doc.to_string()
-}
-
-pub struct ImageConfig {
-    pub publisher: String,
-    pub repository: PathBuf,
-    pub trust_key: PathBuf,
-    pub arch: String,
-    pub policy: ImagePolicy,
-}
-
-pub fn read_image_config(path: &Path) -> Result<ImageConfig> {
-    let ImageDefinition {
-        mut publishers,
-        arch,
-        policy,
-        release_profile,
-        image_id,
-        ..
-    } = read_image_definition(path)?;
-    ensure!(
-        image_id.is_none(),
-        "use create_configured_image for an explicit image-id"
-    );
-    ensure!(
-        publishers.len() == 1 && release_profile.is_none() && publishers[0].build_trust.is_none(),
-        "use create_configured_image for multiple publishers, a release profile, or build trust"
-    );
-    let publisher = publishers.pop().expect("one publisher");
-    Ok(ImageConfig {
-        publisher: publisher.name,
-        repository: publisher.repository,
-        trust_key: publisher.trust_key,
-        arch,
-        policy,
-    })
+    canonical::write(&doc).expect("manifests hold only strings, integers, and booleans")
 }
 
 pub(crate) struct PublisherConfig {
@@ -821,7 +867,7 @@ pub(crate) fn read_build_trust(path: &Path) -> Result<BuildTrustConfig> {
         .context("missing build trust policy directory")?;
     let bytes = read_limited(File::open(&path)?, 1024 * 1024)?;
     let doc = document(std::str::from_utf8(&bytes)?)?;
-    schema(&doc, "build-trust")?;
+    schema(&doc, Kind::BuildTrust)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected only schema-version and build-trust"
@@ -924,7 +970,7 @@ pub(crate) fn read_image_definition(path: &Path) -> Result<ImageDefinition> {
 
 fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
     let doc = document(text)?;
-    schema(&doc, "image-config")?;
+    schema(&doc, Kind::ImageConfig)?;
     let mut config = ImageDefinition {
         publishers: Vec::new(),
         arch: std::env::consts::ARCH.to_owned(),
@@ -1109,16 +1155,16 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 let path = Fields::read(node, 1, &[], false)?.string_arg(0)?;
                 config.git_toolchain_config = Some(parent.join(path));
             }
-            "cache-keep-versions" => {
+            "keep-cache-versions" => {
                 ensure!(
                     config.cache_keep_versions.is_none(),
-                    "duplicate cache-keep-versions node"
+                    "duplicate keep-cache-versions node"
                 );
                 let fields = Fields::read(node, 1, &[], false)?;
                 let versions = fields.args[0]
                     .as_integer()
                     .and_then(|value| usize::try_from(value).ok())
-                    .context("cache-keep-versions must be an unsigned integer in range")?;
+                    .context("keep-cache-versions must be an unsigned integer in range")?;
                 config.cache_keep_versions = Some(versions);
             }
             "stage-package" => {
@@ -1148,11 +1194,11 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                     config.release_profile.is_none(),
                     "duplicate release-profile node"
                 );
-                let fields = Fields::read(node, 1, &["bootstrap-catalog"], false)?;
+                let fields = Fields::read(node, 1, &["bootstrap-catalog-sha256"], false)?;
                 let name = fields.string_arg(0)?;
                 validate_name(&name).context("invalid release profile name")?;
                 config.release_profile = Some(name);
-                config.bootstrap_catalog = fields.string("bootstrap-catalog")?;
+                config.bootstrap_catalog = fields.string("bootstrap-catalog-sha256")?;
                 if let Some(catalog) = &config.bootstrap_catalog {
                     validate_digest(catalog).context("invalid bootstrap catalog")?;
                 }
@@ -1195,7 +1241,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 validate_variant(&name, &value)?;
                 ensure!(
                     name != ARCH_VARIANT,
-                    "set the arch variant with the architecture node"
+                    "set the architecture variant with the architecture node"
                 );
                 ensure!(
                     config.policy.variants.insert(name.clone(), value).is_none(),
@@ -1228,7 +1274,7 @@ mod tests {
                 trust-root "/etc/keys/canopa.trust.json"
             }
             architecture "aarch64"
-            cache-keep-versions 2
+            keep-cache-versions 2
             facet "doc.man" #false
             image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"
         "#;
@@ -1271,12 +1317,12 @@ mod tests {
             )
             .is_err()
         );
-        for invalid in ["-1", "#true", "2\ncache-keep-versions 1"] {
+        for invalid in ["-1", "#true", "2\nkeep-cache-versions 1"] {
             assert!(
                 parse_image_config(
                     &config.replace(
-                        "cache-keep-versions 2",
-                        &format!("cache-keep-versions {invalid}")
+                        "keep-cache-versions 2",
+                        &format!("keep-cache-versions {invalid}")
                     ),
                     Path::new("/tmp"),
                 )
@@ -1390,9 +1436,22 @@ mod tests {
             input.replace(" kind=\"package-manifest\"", ""),
             input.replace("package-manifest", "build-recipe"),
             input.replace("schema-version 1", "schema-version 2"),
+            // KDL 1.0 spellings are not KDL 2.0, whatever features enable on kdl.
+            input.replace("1.0.0-0\"", "1.0.0-0\" requires-reboot=true"),
         ] {
             assert!(parse_manifest(&invalid).is_err(), "{invalid}");
         }
+        Ok(())
+    }
+
+    /// The golden manifest uses every manifest node and property, and is the
+    /// canonical text of itself: a change to the bytes CPS writes for a
+    /// manifest changes every published digest, so it must be deliberate.
+    #[test]
+    fn manifest_text_matches_the_golden_bytes() -> Result<()> {
+        let golden = include_str!("../tests/golden/package-manifest.kdl");
+        let manifest = parse_manifest(golden)?;
+        assert_eq!(manifest_text(&manifest), golden);
         Ok(())
     }
 
@@ -1401,11 +1460,11 @@ mod tests {
         let input = r#"
             schema-version 1 kind="package-manifest"
             package "test/example" publisher="canopa" version="1.0.0-0" {
-                file "usr/bin/example" mode="0755" uid=0 uid=1 gid=0
+                file "usr/bin/example" mode="0755" owner="root" owner="bin"
             }
         "#;
         let error = parse_manifest(input).unwrap_err();
-        assert!(format!("{error:#}").contains("duplicate file property uid"));
+        assert!(format!("{error:#}").contains("duplicate file property owner"));
     }
 
     #[test]
@@ -1416,41 +1475,38 @@ mod tests {
             )
         };
         parse_manifest(&package(
-            r#"dir "usr/lib/sysimage" mode="0755" uid=0 gid=0
-               dir "srv/var" mode="0755" uid=0 gid=0
-               symlink "usr/lib/example" target="/var/lib/example" uid=0 gid=0
-               file "usr/lib/tmpfiles.d/example.conf" mode="0644" uid=0 gid=0"#,
+            r#"dir "usr/lib/sysimage" mode="0755"
+               dir "srv/var" mode="0755"
+               symlink "usr/lib/example" target="/var/lib/example"
+               file "usr/lib/tmpfiles.d/example.conf" mode="0644""#,
         ))?
         .validate(false)?;
         for (body, message) in [
-            (r#"dir "var" mode="0755" uid=0 gid=0"#, "var is under /var"),
+            (r#"dir "var" mode="0755""#, "var is under /var"),
+            (r#"dir "var/lib/example" mode="0755""#, "tmpfiles.d"),
             (
-                r#"dir "var/lib/example" mode="0755" uid=0 gid=0"#,
-                "tmpfiles.d",
-            ),
-            (
-                r#"file "var/lib/example/db" mode="0644" uid=0 gid=0"#,
+                r#"file "var/lib/example/db" mode="0644""#,
                 "packages never ship /var",
             ),
             (
-                r#"symlink "var/run" target="../run" uid=0 gid=0"#,
+                r#"symlink "var/run" target="../run""#,
                 "var/run is under /var",
             ),
             (
-                r#"file "usr/bin/a" mode="0755" uid=0 gid=0
+                r#"file "usr/bin/a" mode="0755"
                    hardlink "var/b" target="usr/bin/a""#,
                 "var/b is under /var",
             ),
             (
-                r#"file "etc/example.conf" mode="0644" uid=0 gid=0 preserve=#true original-name="test/old:var/lib/example.conf""#,
+                r#"file "etc/example.conf" mode="0644" preserve=#true original-name="test/old:var/lib/example.conf""#,
                 "is under /var",
             ),
             (
-                r#"dir "usr/lib/sysimage/cps" mode="0755" uid=0 gid=0"#,
+                r#"dir "usr/lib/sysimage/cps" mode="0755""#,
                 "reserved image state path",
             ),
             (
-                r#"file "usr/lib/sysimage/cps/state.sqlite" mode="0644" uid=0 gid=0"#,
+                r#"file "usr/lib/sysimage/cps/state.sqlite" mode="0644""#,
                 "reserved image state path",
             ),
         ] {

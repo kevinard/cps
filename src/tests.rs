@@ -6,11 +6,10 @@ use std::{
 };
 
 use anyhow::Result;
-use ring::{
+use aws_lc_rs::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
 };
-use rustix::process::{getegid, geteuid};
 
 use crate::{
     Plan, Request, apply, apply::apply_with, create_image, model::digest, plan, publish, verify,
@@ -106,11 +105,7 @@ impl Fixture {
         let output = self.proto.join(path);
         fs::create_dir_all(output.parent().unwrap())?;
         fs::write(output, bytes)?;
-        let uid = geteuid().as_raw();
-        let gid = getegid().as_raw();
-        Ok(format!(
-            "    file {path:?} mode={mode:?} uid={uid} gid={gid} {extra}\n"
-        ))
+        Ok(format!("    file {path:?} mode={mode:?} {extra}\n"))
     }
 
     fn create(&self) -> Result<()> {
@@ -425,6 +420,37 @@ fn live_remove_recovers_offline_and_allows_autoremove() -> Result<()> {
 }
 
 #[test]
+fn a_plan_that_records_its_system_mode_applies_under_its_own_id() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "test/pkg",
+        "1.0.0-0",
+        f.file("usr/share/pkg", "pkg", "0644", "")?,
+    )?;
+    f.create()?;
+    let mut saved = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/pkg".into()],
+        },
+    )?;
+    saved.system = Some(crate::plan::SystemMode::Live);
+    let saved: Plan = serde_json::from_slice(&serde_json::to_vec(&saved)?)?;
+    assert_eq!(
+        crate::transaction_progress(&f.root, &saved, false)?.phase,
+        crate::TransactionPhase::Planned
+    );
+    // Apply checks the plan against one built again with the same mode, and
+    // records the transaction under the saved plan's ID.
+    apply(&f.root, &saved)?;
+    assert_eq!(
+        crate::transaction_progress(&f.root, &saved, false)?.phase,
+        crate::TransactionPhase::Applied
+    );
+    Ok(())
+}
+
+#[test]
 fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     use std::collections::BTreeSet;
 
@@ -490,10 +516,28 @@ fn package_manifest_requires_staging_for_dependency_changes() -> Result<()> {
     assert!(empty.boot_reason().is_none());
     let ordinary = Change::from_plan(install("apps/independent")?, &policy);
     assert!(ordinary.boot_reason().is_none());
+    // A system plan records how it runs, and the plan that runs is the one
+    // that `--save-plan` writes, so both have one ID.
+    use crate::plan::SystemMode;
+    assert_eq!(ordinary.saved_plan().system, Some(SystemMode::Live));
+    assert_eq!(ordinary.to_saved(), *ordinary.saved_plan());
+    let saved: Plan = serde_json::from_slice(&serde_json::to_vec(&ordinary.to_saved())?)?;
+    assert_eq!(saved.id()?, ordinary.saved_plan().id()?);
+    assert_eq!(serde_json::to_value(ordinary.to_saved())?["system"], "live");
+
+    assert_eq!(
+        Change::from_plan(initial.clone(), &policy)
+            .to_saved()
+            .system,
+        Some(SystemMode::Staged)
+    );
+    let ordinary = Change::from_plan(install("apps/independent")?, &policy);
     assert_eq!(
         ordinary.with_staging().boot_reason(),
         Some("--stage was requested")
     );
+    let staged = Change::from_plan(install("apps/independent")?, &policy).with_staging();
+    assert_eq!(staged.to_saved().system, Some(SystemMode::Staged));
     let remove = plan(
         &fixture.root,
         Request::Remove {
@@ -527,15 +571,15 @@ fn manifest_capabilities_require_a_protected_executable() -> Result<()> {
         ))
     };
     for metadata in [
-        "uid=1000 gid=0 mode=\"0755\"",
-        "uid=0 gid=0 mode=\"0644\"",
-        "uid=0 gid=0 mode=\"0775\"",
-        "uid=0 gid=0 mode=\"0757\"",
-        "uid=0 gid=0 mode=\"0755\" preserve=#true",
+        "owner=\"bin\" mode=\"0755\"",
+        "mode=\"0644\"",
+        "mode=\"0775\"",
+        "mode=\"0757\"",
+        "mode=\"0755\" preserve=#true",
     ] {
         assert!(package(metadata)?.validate(false).is_err());
     }
-    let manifest = package("uid=0 gid=0 mode=\"0755\"")?;
+    let manifest = package("owner=\"root\" mode=\"0755\"")?;
     manifest.validate(false)?;
     assert_eq!(parse_manifest(&manifest_text(&manifest))?, manifest);
     Ok(())
@@ -676,22 +720,22 @@ fn hardlink_targets_must_be_immutable_files_owned_by_the_same_package() -> Resul
             "schema-version 1 kind=\"package-manifest\"\npackage \"test/hardlinks\" publisher=\"canopa\" version=\"1.0.0-0\" {{\n{actions}\n}}\n"
         ))
     };
-    let file = "file \"usr/bin/tool\" mode=\"0755\" uid=0 gid=0";
+    let file = "file \"usr/bin/tool\" mode=\"0755\"";
     let link = "hardlink \"bin/tool\" target=\"usr/bin/tool\"";
     for actions in [
         link.to_owned(),
         format!("{file} preserve=#true\n{link}"),
         format!("{file} facet=\"doc.man\"\n{link}"),
-        format!("{file} arch=\"aarch64\"\n{link} arch=\"x86_64\""),
-        format!("symlink \"usr/bin/tool\" target=\"external\" uid=0 gid=0\n{link}"),
+        format!("{file} architecture=\"aarch64\"\n{link} architecture=\"x86_64\""),
+        format!("symlink \"usr/bin/tool\" target=\"external\"\n{link}"),
         format!("hardlink \"usr/bin/tool\" target=\"bin/tool\"\n{link}"),
         "hardlink \"bin/tool\" target=\"../tool\"".to_owned(),
         "hardlink \"bin/tool\" target=\"bin/tool\"".to_owned(),
     ] {
         assert!(parse(&actions)?.validate(false).is_err(), "{actions}");
     }
-    assert!(parse(&format!("{file}\n{link} uid=0")).is_err());
-    parse(&format!("{file}\n{link} arch=\"x86_64\""))?.validate(false)?;
+    assert!(parse(&format!("{file}\n{link} owner=\"root\"")).is_err());
+    parse(&format!("{file}\n{link} architecture=\"x86_64\""))?.validate(false)?;
     parse(&format!(
         "{file} facet=\"doc.man\"\n{link} facet=\"doc.man\""
     ))?
@@ -741,10 +785,8 @@ fn generated_manifest_is_deterministic_and_installs_the_prototype() -> Result<()
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     let generate =
-        |proto| crate::generate_manifest(proto, "canopa", "test/proto", "1.0.0-0", uid, gid);
+        |proto| crate::generate_manifest(proto, "canopa", "test/proto", "1.0.0-0", "root", "root");
     let prepare = |proto: &Path, reverse: bool| -> Result<()> {
         let directories = if reverse {
             ["srv/empty", "usr/bin"]
@@ -1514,7 +1556,7 @@ fn build_receipts_survive_offline_transaction_recovery_and_follow_installed_pack
     let recipe = format!(
         r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
-    toolchain solver="sat-v2" {{ publisher "seed" catalog="{pin}" key-sha256="{key_hash}"; package "build/shell"; }}
+    toolchain solver="sat-v2" {{ publisher "seed" catalog-sha256="{pin}" key-sha256="{key_hash}"; package "build/shell"; }}
     manifest "manifest.kdl" sha256="{}"
     script "true"
 }}
@@ -1770,7 +1812,9 @@ fn marks_installed_package_requests_offline_without_touching_files() -> Result<(
     assert!(promoted_reason.intent.requested);
     assert_eq!(promoted_reason.dependents, explanation.dependents);
     assert!(format!("{:#}", apply(&f.root, &stale).unwrap_err()).contains("stale plan"));
-    let history = crate::transaction_details(&f.root, &promoted.id()?)?.details;
+    let history = crate::transaction_details(&f.root, &promoted.id()?)?
+        .details
+        .unwrap();
     assert_eq!(history.intent_changes, promoted.intent_changes);
     assert!(history.package_changes.is_empty());
     assert_eq!(history.planned_path_changes, 0);
@@ -2612,9 +2656,9 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
     f.package(
         "desktop/compositor",
         "2.0.0-0",
-        f.file(COMPOSITOR, "current", "0755", "arch=\"x86_64\"")?
+        f.file(COMPOSITOR, "current", "0755", "architecture=\"x86_64\"")?
             + &f.file(backup, "backup", "0755", "")?
-            + &f.file(foreign, "foreign", "0755", "arch=\"aarch64\"")?
+            + &f.file(foreign, "foreign", "0755", "architecture=\"aarch64\"")?
             + &f.file(MANPAGE, "docs", "0644", "facet=\"doc.man\"")?,
     )?;
     extras.package_as(
@@ -2700,9 +2744,7 @@ fn queries_installed_path_ownership_offline() -> Result<()> {
     use crate::query::{package_contents, path_owners};
 
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
-    let shared = format!("    dir \"usr/share\" mode=\"0755\" uid={uid} gid={gid}\n");
+    let shared = "    dir \"usr/share\" mode=\"0755\"\n".to_string();
     let link = "usr/lib/libdisplay-current.so";
     f.package(
         "library/libdisplay",
@@ -2716,8 +2758,13 @@ fn queries_installed_path_ownership_offline() -> Result<()> {
             + &dependency("require", "library/libdisplay", "1.0.0-0")
             + &f.file(COMPOSITOR, "installed", "0755", "")?
             + &f.file(MANPAGE, "documentation", "0644", "facet=\"doc.man\"")?
-            + &f.file("usr/bin/other-arch", "foreign", "0755", "arch=\"aarch64\"")?
-            + &format!("    symlink {link:?} target=\"libdisplay.so\" uid={uid} gid={gid}\n"),
+            + &f.file(
+                "usr/bin/other-arch",
+                "foreign",
+                "0755",
+                "architecture=\"aarch64\"",
+            )?
+            + &format!("    symlink {link:?} target=\"libdisplay.so\"\n"),
     )?;
     f.create()?;
     let install = plan(
@@ -2737,8 +2784,7 @@ fn queries_installed_path_ownership_offline() -> Result<()> {
     assert_eq!(path_owners(&f.root, link)?, [compositor]);
     assert_eq!(path_owners(&f.root, LIBRARY)?, [library]);
     for path in ["usr/lib", MANPAGE, "usr/bin/other-arch"] {
-        let error = path_owners(&f.root, path).unwrap_err();
-        assert!(error.to_string().contains("no installed package owns"));
+        assert!(path_owners(&f.root, path)?.is_empty(), "{path}");
     }
     assert!(path_owners(&f.root, "../usr/share").is_err());
     for spec in [
@@ -2916,13 +2962,11 @@ fn queries_direct_dependencies_and_dependents_offline() -> Result<()> {
 #[test]
 fn planner_retries_versions_with_incompatible_file_actions() -> Result<()> {
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     f.package(
         "base/paths",
         "1.0.0-0",
         format!(
-            "{}    symlink \"opt/cps\" target=\"elsewhere\" uid={uid} gid={gid}\n",
+            "{}    symlink \"opt/cps\" target=\"elsewhere\"\n",
             f.file(LIBRARY, "owned by base", "0644", "")?,
         ),
     )?;
@@ -3365,6 +3409,7 @@ fn rejects_development_journals_and_verifies_completed_transactions() -> Result<
     assert_eq!(
         crate::transaction_details(&f.root, &install_id)?
             .details
+            .unwrap()
             .request,
         install.request,
     );
@@ -3817,11 +3862,11 @@ fn reviews_configuration_offline_in_a_staged_environment() -> Result<()> {
             (1, initial.id()?)
         ]
     );
-    let restored = &history[0].details;
+    let restored = history[0].details.as_ref().unwrap();
     assert_eq!(restored.base_image, original.id);
     assert_eq!(restored.base_revision, 2);
     assert_eq!(restored.request, review(RESTORE, ConfigChoice::Vendor));
-    let upgraded = &history[3].details;
+    let upgraded = history[3].details.as_ref().unwrap();
     assert_eq!(upgraded.base_image, upgrade.image);
     assert_eq!(
         upgraded.catalogs["canopa"],
@@ -4092,6 +4137,13 @@ fn rejects_the_old_image_state_layout_and_format() -> Result<()> {
     let error = verify(&f.root).unwrap_err();
     assert!(format!("{error:#}").contains("unsupported image format"));
     db.execute("UPDATE image SET data=json_set(data, '$.format', 1)", [])?;
+    db.pragma_update(None, "user_version", 2)?;
+    let error = verify(&f.root).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("image database schema version 2 is not supported"),
+        "{error:#}"
+    );
+    db.pragma_update(None, "user_version", 1)?;
     db.pragma_update(None, "application_id", 0)?;
     drop(db);
     let Err(error) = crate::list_publishers(&f.root) else {
@@ -4154,16 +4206,12 @@ fn prunes_only_empty_created_directories_and_recovers_after_parent_removal() -> 
     use std::os::unix::fs::PermissionsExt;
 
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     let actions = f.file("opt/example/bin/tool", "tool", "0755", "")?
         + &f.file("opt/shared/vendor-file", "vendor", "0644", "")?
         + &f.file("srv/example/cache/vendor-file", "vendor", "0644", "")?
-        + &format!(
-            "    dir \"opt/example\" mode=\"0755\" uid={uid} gid={gid}\n\
-             dir \"srv/changed-mode\" mode=\"0755\" uid={uid} gid={gid}\n\
-             dir \"srv/attributes\" mode=\"0755\" uid={uid} gid={gid}\n"
-        );
+        + "    dir \"opt/example\" mode=\"0755\"\n\
+             dir \"srv/changed-mode\" mode=\"0755\"\n\
+             dir \"srv/attributes\" mode=\"0755\"\n";
     f.package("test/prune", "1.0.0-0", actions)?;
     f.create()?;
     fs::create_dir_all(f.root.join("opt/shared"))?;
@@ -4225,14 +4273,12 @@ fn repair_installed_files_and_resume_offline() -> Result<()> {
     const LINK: &str = "usr/bin/compositor";
     const DIR: &str = "usr/bin";
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     let mut actions = f.file(COMPOSITOR, "compositor 1", "0755", "")?;
     actions += &f.file(PLUGIN, "plugin 1", "0644", "")?;
     actions += &f.file(CONFIG, "vendor config", "0644", "preserve=#true")?;
     actions += &f.file(REMOVED_CONFIG, "optional", "0644", "preserve=#true")?;
-    actions += &format!("    symlink {LINK:?} target=\"canopa-compositor\" uid={uid} gid={gid}\n");
-    actions += &format!("    dir {DIR:?} mode=\"0755\" uid={uid} gid={gid}\n");
+    actions += &format!("    symlink {LINK:?} target=\"canopa-compositor\"\n");
+    actions += &format!("    dir {DIR:?} mode=\"0755\"\n");
     f.package("desktop/compositor", "1.0.0-0", actions)?;
     f.package(
         "library/libdisplay",
@@ -4478,6 +4524,113 @@ fn exact_install_and_remove_offline() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_mediated_link_conflicts_with_a_plain_path_whichever_provider_wins() -> Result<()> {
+    let f = Fixture::new()?;
+    let provider = |tool: &str, links: &[&str], priority: u32| -> Result<String> {
+        let mut actions = f.file(&format!("usr/lib/{tool}/bin"), tool, "0755", "")?;
+        for link in links {
+            actions += &format!(
+                "    symlink \"usr/bin/{link}\" target=\"../lib/{tool}/bin\"\n    \
+                 mediate \"usr/bin/{link}\" group=\"java\" priority={priority}\n"
+            );
+        }
+        Ok(actions)
+    };
+    f.package("java/a", "1.0.0-0", provider("a", &["java", "javac"], 10)?)?;
+    // java/r wins the group and offers no javac link.
+    f.package("java/r", "1.0.0-0", provider("r", &["java"], 20)?)?;
+    f.package(
+        "tools/q",
+        "1.0.0-0",
+        f.file("usr/bin/javac", "q", "0755", "")?,
+    )?;
+    f.package("lib/m", "1.0.0-0", "    require \"java/r\"\n".into())?;
+    f.package(
+        "lib/m",
+        "2.0.0-0",
+        "    require \"java/a\"\n    require \"java/r\"\n".into(),
+    )?;
+    f.package(
+        "apps/top",
+        "1.0.0-0",
+        "    require \"lib/m\"\n    require \"tools/q\"\n".into(),
+    )?;
+    f.create()?;
+    let error = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["java/a".into(), "java/r".into(), "tools/q".into()],
+        },
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    for detail in ["usr/bin/javac", "java/a", "tools/q"] {
+        assert!(message.contains(detail), "missing {detail} in {message}");
+    }
+    // The pair never fits, so the solver keeps the version without java/a.
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["apps/top".into()],
+        },
+    )?;
+    assert!(
+        install.summary().contains("Install lib/m 1.0.0-0"),
+        "{}",
+        install.summary()
+    );
+    Ok(())
+}
+
+#[test]
+fn image_state_that_another_user_could_change_is_refused() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new()?;
+    f.create()?;
+    let state = f.root.join("usr/lib/sysimage/cps");
+    let refused = |expected: &str| {
+        let Err(error) = crate::image::Image::open_query(&f.root) else {
+            panic!("opened an image whose state {expected}");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains(expected), "{message}");
+    };
+    fs::set_permissions(
+        state.join("state.sqlite"),
+        fs::Permissions::from_mode(0o664),
+    )?;
+    refused("state.sqlite is writable by its group or by other users");
+    fs::set_permissions(
+        state.join("state.sqlite"),
+        fs::Permissions::from_mode(0o644),
+    )?;
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o777))?;
+    refused("/usr/lib/sysimage/cps is writable by its group or by other users");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+    std::os::unix::fs::symlink("state.sqlite", state.join("state.sqlite-wal"))?;
+    refused("state.sqlite-wal is not a regular file");
+    fs::remove_file(state.join("state.sqlite-wal"))?;
+    // An unfinished adoption by root leaves the image to `image adopt`, and
+    // only root writes the marker of one.
+    fs::write(state.join("adopting"), "1000:1000\n")?;
+    refused(if rustix::process::geteuid().is_root() {
+        "root's adoption of this image did not finish"
+    } else {
+        "adopting was not written by root"
+    });
+    fs::remove_file(state.join("adopting"))?;
+    crate::image::Image::open_query(&f.root)?;
+    if !rustix::process::geteuid().is_root() {
+        let error = crate::image::adopt_image(&f.root).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("only root can adopt"),
+            "{error:#}"
+        );
+    }
+    Ok(())
+}
+
 mod release;
 mod transitions;
 
@@ -4486,6 +4639,7 @@ mod etc_merge;
 mod facets;
 mod freezes;
 mod modes;
+mod records;
 mod triggers;
 
 #[test]
@@ -4759,7 +4913,14 @@ fn journal_records_only_changes_to_the_committed_state() -> Result<()> {
     let original: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let journal: serde_json::Value = serde_json::from_str(&original)?;
-    let next = &journal["journaled"]["next"];
+    // The journal records the next state as the exact text it digests.
+    let recorded = journal["journaled"]["next"].as_str().unwrap();
+    assert_eq!(
+        journal["journaled"]["state_sha256"],
+        digest(recorded.as_bytes())
+    );
+    let next: serde_json::Value = serde_json::from_str(recorded)?;
+    let next = &next;
     let installed = next["installed"].as_object().unwrap();
     assert_eq!(installed.keys().collect::<Vec<_>>(), ["test/two"]);
     let paths = next["paths"].as_object().unwrap();
@@ -4771,10 +4932,11 @@ fn journal_records_only_changes_to_the_committed_state() -> Result<()> {
     // is rejected, even with a matching digest.
     let tampered = |change: &dyn Fn(&mut serde_json::Value)| -> Result<String> {
         let mut journal = journal.clone();
-        change(&mut journal["journaled"]["next"]);
-        let delta: crate::image::StateDelta =
-            serde_json::from_value(journal["journaled"]["next"].clone())?;
-        journal["journaled"]["state_sha256"] = digest(&serde_json::to_vec(&delta)?).into();
+        let mut delta = next.clone();
+        change(&mut delta);
+        let text = delta.to_string();
+        journal["journaled"]["state_sha256"] = digest(text.as_bytes()).into();
+        journal["journaled"]["next"] = text.into();
         db.execute(
             "UPDATE pending SET data=?1 WHERE id=1",
             [journal.to_string()],

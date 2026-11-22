@@ -52,8 +52,8 @@ printf '[Unit]\nDescription=Fixture target\n' > proto/usr/lib/systemd/system/mul
 cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/systemd-actions" publisher="canopa" version="1.0.0-0" {
-    file "usr/lib/systemd/system/$existing" mode="0644" uid=$uid gid=$gid
-    file "usr/lib/systemd/system/multi-user.target" mode="0644" uid=$uid gid=$gid
+    file "usr/lib/systemd/system/$existing" mode="0644"
+    file "usr/lib/systemd/system/multi-user.target" mode="0644"
 }
 MANIFEST
 
@@ -90,21 +90,21 @@ for unit in "$existing" "$enabled" "$masked" "$denied"; do write_unit "$unit" "V
 cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/systemd-actions" publisher="canopa" version="2.0.0-0" {
-    file "etc/passwd" mode="0644" uid=$uid gid=$gid preserve=#true
-    file "usr/lib/sysusers.d/$scope.conf" mode="0644" uid=$uid gid=$gid
+    file "etc/passwd" mode="0644" preserve=#true
+    file "usr/lib/sysusers.d/$scope.conf" mode="0644"
     sysusers "$scope.conf"
-    file "usr/lib/tmpfiles.d/$scope.conf" mode="0644" uid=$uid gid=$gid
+    file "usr/lib/tmpfiles.d/$scope.conf" mode="0644"
     tmpfiles "$scope.conf"
-    file "usr/lib/tmpfiles.d/$scope-unrelated.conf" mode="0644" uid=$uid gid=$gid
-    file "usr/lib/systemd/system-preset/99-fixture.preset" mode="0644" uid=$uid gid=$gid
-    file "usr/lib/systemd/system/multi-user.target" mode="0644" uid=$uid gid=$gid
-    file "usr/lib/systemd/system/$existing" mode="0644" uid=$uid gid=$gid
+    file "usr/lib/tmpfiles.d/$scope-unrelated.conf" mode="0644"
+    file "usr/lib/systemd/system-preset/99-fixture.preset" mode="0644"
+    file "usr/lib/systemd/system/multi-user.target" mode="0644"
+    file "usr/lib/systemd/system/$existing" mode="0644"
     preset "$existing"
-    file "usr/lib/systemd/system/$enabled" mode="0644" uid=$uid gid=$gid
+    file "usr/lib/systemd/system/$enabled" mode="0644"
     preset "$enabled"
-    file "usr/lib/systemd/system/$masked" mode="0644" uid=$uid gid=$gid
+    file "usr/lib/systemd/system/$masked" mode="0644"
     preset "$masked"
-    file "usr/lib/systemd/system/$denied" mode="0644" uid=$uid gid=$gid
+    file "usr/lib/systemd/system/$denied" mode="0644"
     preset "$denied"
 }
 MANIFEST
@@ -266,7 +266,7 @@ printf 'd /srv/%s-facet 0755 - - -\n' "$scope" > "proto/usr/lib/tmpfiles.d/$face
 cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/optional-tmpfiles" publisher="canopa" version="1.0.0-0" {
-    file "usr/lib/tmpfiles.d/$facet_rule" mode="0644" uid=$uid gid=$gid facet="optional"
+    file "usr/lib/tmpfiles.d/$facet_rule" mode="0644" facet="optional"
     tmpfiles "$facet_rule"
 }
 MANIFEST

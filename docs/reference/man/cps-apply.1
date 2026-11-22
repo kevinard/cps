@@ -4,19 +4,38 @@
 \&cps\-apply \- \&Apply or resume a saved plan
 .SH SYNOPSIS
 .HP 4
-.B \&cps apply [OPTIONS] \-\-root <IMAGE> <PLAN>
+.B \&cps apply [OPTIONS] <PLAN>
 .SH ARGUMENTS
 .PP
 .B \&<PLAN>
 .SH OPTIONS
 .TP
 .B \&\-\-root <IMAGE>
-\&Image the plan targets
+\&Operate on this offline image instead of the running system
+.TP
+.B \&\-\-config <CONFIG>
+\&Distribution configuration of the running system [default: /etc/cps/image.kdl]
 .TP
 .B \&\-n, \-\-dry\-run
 \&Validate the plan against cached payloads without applying it
 .TP
 .B \&\-h, \-\-help
 \&Print help
+.SH EXIT STATUS
+.TP
+.B \&0
+\&Success. A check found nothing to report.
+.TP
+.B \&1
+\&An error.
+.TP
+.B \&2
+\&Invalid usage, such as an unknown option or a missing argument.
+.TP
+.B \&3
+\&A check found something: updates are available (upgrade \-\-check), verification found problems (verify, publisher audit\-builds), pins are stale (recipe repin \-\-check), configuration or images differ (config diff, image diff), manifest dependencies are missing (manifest dependencies), or nothing matched (search, owner).
+.TP
+.B \&4
+\&A confirmation prompt was declined.
 .SH SEE ALSO
 .BR cps (1)

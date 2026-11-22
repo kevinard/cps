@@ -12,7 +12,7 @@ The one-file quickstart image is suitable for package testing.
 
 Use an `image.kdl` that names the signed profile and its publishers, with
 the profile's architecture and facets. Sync any mirrors before creating
-the root. Keep the configuration, trust keys, and repository paths available
+the root. Keep the configuration, trust roots, and repository paths available
 while assembling and verifying the image.
 [Configure and sync the profile](../client/mirrors.md#synchronizing-a-signed-profile)
 

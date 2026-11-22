@@ -11,30 +11,30 @@ fn special_modes_require_protected_executables_and_meaningful_directory_bits() -
         ))
     };
     for action in [
-        "dir \"tmp\" mode=\"1777\" uid=0 gid=0",
-        "dir \"shared\" mode=\"2775\" uid=1000 gid=1000",
-        "dir \"shared\" mode=\"3770\" uid=0 gid=42",
-        "file \"bin/helper\" mode=\"4755\" uid=0 gid=0",
-        "file \"bin/helper\" mode=\"2750\" uid=0 gid=42",
-        "file \"bin/helper\" mode=\"6755\" uid=0 gid=0",
+        "dir \"tmp\" mode=\"1777\"",
+        "dir \"shared\" mode=\"2775\" owner=\"bin\" group=\"bin\"",
+        "dir \"shared\" mode=\"3770\" group=\"users\"",
+        "file \"bin/helper\" mode=\"4755\"",
+        "file \"bin/helper\" mode=\"2750\" group=\"tty\"",
+        "file \"bin/helper\" mode=\"6755\"",
     ] {
         let manifest = package(action)?;
         manifest.validate(false)?;
         assert_eq!(parse_manifest(&manifest_text(&manifest))?, manifest);
     }
     for action in [
-        "dir \"tmp\" mode=\"4755\" uid=0 gid=0",
-        "dir \"tmp\" mode=\"7777\" uid=0 gid=0",
-        "dir \"tmp\" mode=\"755\" uid=0 gid=0",
-        "dir \"tmp\" mode=\"01777\" uid=0 gid=0",
-        "dir \"tmp\" mode=\"1787\" uid=0 gid=0",
-        "file \"bin/helper\" mode=\"1755\" uid=0 gid=0",
-        "file \"bin/helper\" mode=\"4755\" uid=1000 gid=0",
-        "file \"bin/helper\" mode=\"4775\" uid=0 gid=0",
-        "file \"bin/helper\" mode=\"4757\" uid=0 gid=0",
-        "file \"bin/helper\" mode=\"4644\" uid=0 gid=0",
-        "file \"bin/helper\" mode=\"4755\" uid=0 gid=0 preserve=#true",
-        "file \"bin/helper\" mode=\"6755\" uid=0 gid=0 capabilities=\"cap_net_raw=ep\"",
+        "dir \"tmp\" mode=\"4755\"",
+        "dir \"tmp\" mode=\"7777\"",
+        "dir \"tmp\" mode=\"755\"",
+        "dir \"tmp\" mode=\"01777\"",
+        "dir \"tmp\" mode=\"1787\"",
+        "file \"bin/helper\" mode=\"1755\"",
+        "file \"bin/helper\" mode=\"4755\" owner=\"bin\"",
+        "file \"bin/helper\" mode=\"4775\"",
+        "file \"bin/helper\" mode=\"4757\"",
+        "file \"bin/helper\" mode=\"4644\"",
+        "file \"bin/helper\" mode=\"4755\" preserve=#true",
+        "file \"bin/helper\" mode=\"6755\" capabilities=\"cap_net_raw=ep\"",
     ] {
         assert!(package(action)?.validate(false).is_err(), "{action}");
     }
@@ -51,30 +51,28 @@ fn generated_manifests_capture_directory_and_protected_setid_modes() -> Result<(
     fs::write(f.proto.join("helper"), "fixture executable")?;
     fs::set_permissions(f.proto.join("helper"), fs::Permissions::from_mode(0o6755))?;
     fs::hard_link(f.proto.join("helper"), f.proto.join("helper-alias"))?;
-    let generate =
-        |uid| crate::generate_manifest(&f.proto, "canopa", "test/modes", "1.0.0-0", uid, 0);
-    let generated = generate(0)?;
+    let generate = |owner| {
+        crate::generate_manifest(&f.proto, "canopa", "test/modes", "1.0.0-0", owner, "root")
+    };
+    let generated = generate("root")?;
     for mode in ["1777", "2775", "6755"] {
         assert!(generated.contains(&format!("mode=\"{mode}\"")));
     }
     assert!(generated.contains("hardlink"));
-    assert_eq!(generated, generate(0)?);
-    assert!(format!("{:#}", generate(1000).unwrap_err()).contains("root-owned executable"));
+    assert_eq!(generated, generate("root")?);
+    assert!(format!("{:#}", generate("bin").unwrap_err()).contains("root-owned executable"));
     Ok(())
 }
 
 #[test]
 fn directory_special_modes_survive_updates_offline_recovery_repair_and_staging() -> Result<()> {
     let f = Fixture::new()?;
-    let uid = geteuid().as_raw();
-    let gid = getegid().as_raw();
     let package = |version, tmp, shared, content| {
         f.package(
             "system/filesystem",
             version,
-            format!(
-                "    dir \"tmp\" mode=\"{tmp}\" uid={uid} gid={gid}\n    dir \"srv/shared\" mode=\"{shared}\" uid={uid} gid={gid}\n"
-            ) + &f.file(COMPOSITOR, content, "0755", "")?,
+            format!("    dir \"tmp\" mode=\"{tmp}\"\n    dir \"srv/shared\" mode=\"{shared}\"\n")
+                + &f.file(COMPOSITOR, content, "0755", "")?,
         )
     };
     let mode = |path: &Path| -> Result<u32> { Ok(fs::metadata(path)?.mode() & 0o7777) };

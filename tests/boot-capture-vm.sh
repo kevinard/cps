@@ -76,7 +76,7 @@ cp repo/trust/1.json public.trust.json
 publish() {
     printf '%s\n' "$1" > proto/etc/cps-capture-version
     "$cps" manifest generate --proto proto --publisher test --version "$1" \
-        --uid "$(id -u)" --gid "$(id -g)" test/live-root > manifest.kdl
+        test/live-root > manifest.kdl
     if [[ $system_commands == 1 && $1 != 1.0.0-0 ]]; then
         sed -i '/^package /s/ {$/ requires-reboot=#true {/' manifest.kdl
     fi
@@ -92,7 +92,7 @@ if [[ $git_installs == 1 ]]; then
     CPS_GIT_BUILD_BUSYBOX="$busybox" bash "$project/tests/seed-git-build.sh" "$cps" \
         "$work/git-build" "$work/private.der"
     "$cps" manifest generate --proto git-build --publisher test --version 1.0.0-0 \
-        --uid "$(id -u)" --gid "$(id -g)" system/git-build > git-build.kdl
+        system/git-build > git-build.kdl
     "$cps" publish manifests --repo repo --proto git-build --key private.der git-build.kdl
     base_packages+=(system/git-build)
 fi
@@ -124,10 +124,10 @@ UNIT
             "$version" > service/usr/bin/cps-demo-service
         chmod 755 app/usr/bin/cps-demo service/usr/bin/cps-demo-service
         "$cps" manifest generate --proto service --publisher test --version "$version" \
-            --uid "$(id -u)" --gid "$(id -g)" test/cps-demo-service > service.kdl
+            test/cps-demo-service > service.kdl
         "$cps" publish manifests --repo repo --proto service --key private.der service.kdl
         "$cps" manifest generate --proto app --publisher test --version "$version" \
-            --uid "$(id -u)" --gid "$(id -g)" test/cps-demo > app.kdl
+            test/cps-demo > app.kdl
         sed -i '$i\    require "test/cps-demo-service" version="='"$version"'"' app.kdl
         "$cps" publish manifests --repo repo --proto app --key private.der app.kdl
         cp repo/current "catalog-$version"
@@ -208,6 +208,10 @@ CONFIG
                 copy_runtime_deps "$root" "$binary"
             done
             ln -s git "$root/usr/bin/git-upload-pack"
+            # Root fetches and builds Git packages as this account, which
+            # the cps package's sysusers.d would create.
+            printf 'cps-build:x:990:990:CPS Git package builds:/:/usr/bin/nologin\n' >> "$root/etc/passwd"
+            printf 'cps-build:x:990:\n' >> "$root/etc/group"
             install -m755 "$project/tests/git-install-guest.sh" "$root/usr/local/libexec/cps-system-workflow"
         fi
     fi
@@ -447,6 +451,16 @@ if [ -f /etc/cps-btrfs-boot ]; then
     boot_files=$(sha256sum /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI)
     boot_paths=$(find /boot /efi -print)
 fi
+# The host built this root without privileges, so it belongs to that user.
+# Root refuses it until it adopts it.
+if cps verify --root / > /tmp/unadopted 2>&1; then
+    echo 'Root used an image that another user owns'
+    exit 1
+fi
+$bb grep -F 'cps image adopt' /tmp/unadopted
+cps image adopt --root /
+test "$($bb stat -c %u:%g /usr/lib/sysimage/cps /usr/bin/cps | $bb sort -u)" = 0:0
+cps verify --root /
 if [ -f /etc/cps-btrfs-trial-kernel ]; then
     cps publisher set-repository --root / --repo test=/repository --repo canopa-kernel=/kernel-repository
 else
@@ -617,7 +631,7 @@ if [ -f /etc/cps-btrfs-boot ]; then
         --esp /efi --root-partuuid "$root_uuid" > /tmp/rejected 2>&1; then exit 1; fi
     $bb grep -F 'top-level subvolume' /tmp/rejected
     test "$(sha256sum /efi/loader/loader.conf)" = "$before"
-    cps mark --root /volume/@captures/trial/root -n --save-plan /tmp/mark.json explicit test/live-root
+    cps mark --root /volume/@captures/trial/root -n --save-plan /tmp/mark.json automatic test/live-root
     staged_state=$(sha256sum "/volume/@captures/trial/root/$state_dir/state.sqlite")
     $bb mkfifo /tmp/release
     flock --shared "/volume/@captures/trial/root/$state_dir/lock" sh -c ': > /tmp/locked; read released < /tmp/release' &
@@ -626,9 +640,12 @@ if [ -f /etc/cps-btrfs-boot ]; then
     cps apply --root /volume/@captures/trial/root /tmp/mark.json > /tmp/race-rejected 2>&1 &
     applying=$!
     attempts=0
-    while ! $bb grep -q locks "/proc/$applying/wchan"; do
+    while ! $bb grep -q locks "/proc/$applying/wchan" 2>/dev/null; do
         attempts=$((attempts + 1))
-        test "$attempts" -lt 1000
+        if [ "$attempts" -ge 1000 ] || [ ! -e "/proc/$applying" ]; then
+            $bb cat /tmp/race-rejected
+            exit 1
+        fi
         $bb sleep 0.01
     done
     cps boot activate --root /volume/@captures/trial/root --btrfs-volume /volume \

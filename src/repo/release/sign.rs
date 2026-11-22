@@ -49,7 +49,7 @@ const MAX_ROLE_KEYS: usize = 32;
 /// `objects` keys with `objects_threshold`, or the first targets key when no
 /// objects keys are given.
 #[derive(Clone, Copy, Debug)]
-pub struct ReleaseKeys<'a> {
+pub(crate) struct ReleaseKeys<'a> {
     pub targets: &'a [PathBuf],
     pub snapshot: &'a [PathBuf],
     pub timestamp: &'a [PathBuf],
@@ -58,7 +58,7 @@ pub struct ReleaseKeys<'a> {
 }
 
 /// Sign a flat CPS export using stable TUF roles for content-addressed targets.
-pub struct SignExport<'a> {
+pub(crate) struct SignExport<'a> {
     pub root: &'a Path,
     pub export: &'a Path,
     pub output: &'a Path,
@@ -74,7 +74,7 @@ pub struct SignExport<'a> {
 /// the new timestamp covers the existing snapshot byte for byte. With snapshot
 /// keys, a new snapshot lists exactly the role versions and digests of the
 /// existing one under a new version and expiry.
-pub struct RefreshMetadata<'a> {
+pub(crate) struct RefreshMetadata<'a> {
     pub root: &'a Path,
     pub snapshot: &'a Path,
     pub output: &'a Path,
@@ -263,7 +263,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
-pub fn sign_export(request: SignExport<'_>) -> Result<()> {
+pub(crate) fn sign_export(request: SignExport<'_>) -> Result<()> {
     let root = read_root(request.root)?;
     let keys = request.keys;
     ensure!(!keys.targets.is_empty(), "supply at least one targets key");
@@ -398,7 +398,7 @@ fn signed_metafile<T: tough::schema::Role>(role: &SignedRole<T>) -> Metafile {
     }
 }
 
-pub fn refresh_metadata(request: RefreshMetadata<'_>) -> Result<()> {
+pub(crate) fn refresh_metadata(request: RefreshMetadata<'_>) -> Result<()> {
     let root = read_root(request.root)?;
     let bytes = read_limited(fs::File::open(request.snapshot)?, ROLE_LIMIT)
         .with_context(|| format!("reading TUF snapshot {}", request.snapshot.display()))?;
@@ -458,11 +458,11 @@ pub fn refresh_metadata(request: RefreshMetadata<'_>) -> Result<()> {
                     "the snapshot expired at {}; re-sign it with snapshot keys",
                     snapshot.signed.expires
                 );
-                let hash = ring::digest::digest(&ring::digest::SHA256, &bytes);
+                let hash = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
                 (
                     Metafile {
                         hashes: Some(Hashes {
-                            sha256: Decoded::from(hash.as_ref().to_vec()),
+                            sha256: Decoded::from(hash.to_vec()),
                             _extra: HashMap::new(),
                         }),
                         length: Some(bytes.len() as u64),
@@ -508,9 +508,10 @@ mod tests {
     }
 
     fn generate(path: &Path) -> Result<Key> {
-        let document =
-            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-                .expect("generate TUF key");
+        let document = aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(
+            &aws_lc_rs::rand::SystemRandom::new(),
+        )
+        .expect("generate TUF key");
         fs::write(path, document.as_ref())?;
         Ok(parse_keypair(document.as_ref())?.tuf_key())
     }
@@ -553,7 +554,7 @@ mod tests {
         };
         let canonical = root.canonical_form()?;
         let root_key = fs::read(&keys["root"][0])?;
-        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&root_key).expect("root key");
+        let pair = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(&root_key).expect("root key");
         let signed = Signed {
             signatures: vec![Signature {
                 keyid: parse_keypair(&root_key)?.tuf_key().key_id()?,

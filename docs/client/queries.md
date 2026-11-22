@@ -24,11 +24,11 @@ Commands that name packages accept these selectors:
 | `cps://canopa/demo/hello` | The package from the named publisher |
 | `cps://canopa/demo/hello@1.0.0-0` | The full package ID |
 
-A version in a selector matches the version exactly as it is spelled in the
-package ID. `demo/hello@1.0.0` does not select a package published as
-`1.0.0-0`, and the plan reports `no eligible version for demo/hello@1.0.0`.
-Copy the version from `cps list`, `cps policy`, or `cps info`. Freezes and
-signed compositions match exact spellings in the same way.
+A version in a selector names a release, not a spelling:
+`demo/hello@1.0.0` selects a package published as `1.0.0-0`. When a
+publisher offers several spellings of the release, CPS prefers the one
+spelled as in the selector. A freeze records the spelling of the package it
+holds, and signed compositions name exact package IDs.
 
 When CPS decides which version is newer, it compares meaning, not spelling,
 in the order epoch, release, and packaging revision, as dpkg does. Omitted
@@ -37,7 +37,7 @@ epochs and revisions count as zero, and digit runs compare numerically, so
 `rc2`. A `~` sorts before anything, and a `-` followed by a letter marks a
 pre-release, so `1.0~rc1` < `1.0-rc1` < `1.0` < `1.0.1`. A plan never
 replaces an installed package with another spelling of the same release
-unless an `@VERSION` selector or a freeze names that spelling.
+unless an `@VERSION` selector or a freeze spells the version that way.
 
 The dependency constraints that packages declare, which `cps info` shows,
 use the same comparison: `>=2.0.0-0` accepts `2.0.0`, and `<2.0.0` rejects

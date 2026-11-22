@@ -12,8 +12,9 @@ use rustix::{
 };
 
 use super::{
-    BtrfsVolume, destroy, inventory, lock_esp,
+    BtrfsVolume, Inventory, destroy, inventory, lock_esp,
     policy::{self, BootEntry, MAX_ENTRY_BYTES, NAME_FIELD},
+    require_valid,
 };
 use crate::image::root::Root;
 
@@ -80,11 +81,14 @@ pub(super) fn named_description(description: &str, name: &str) -> String {
 }
 
 /// Set a user-facing name without changing the environment's boot identity.
-pub fn rename_boot_environment(esp: &Path, selector: &str, name: &str) -> Result<String> {
+pub(crate) fn rename_boot_environment(esp: &Path, selector: &str, name: &str) -> Result<String> {
     validate_name(name)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
-    let entries = inventory(&esp, &lock, false)?.entries;
+    let Inventory {
+        entries, invalid, ..
+    } = inventory(&esp, &lock, false)?;
+    require_valid(&invalid, selector)?;
     let entry = find(&entries, selector)?;
     ensure!(
         entry.tries.is_none(),
@@ -107,7 +111,7 @@ pub fn rename_boot_environment(esp: &Path, selector: &str, name: &str) -> Result
 }
 
 /// Attach a nonrecursive, read-only inspection mount of a registered root.
-pub fn mount_boot_environment(
+pub(crate) fn mount_boot_environment(
     esp: &Path,
     volume: &Path,
     selector: &str,
@@ -174,10 +178,13 @@ pub fn mount_boot_environment(
 ///
 /// The mount is matched against the entry's Btrfs record alone, so that a
 /// root failing its boot checks can still be unmounted, and then destroyed.
-pub fn unmount_boot_environment(esp: &Path, selector: &str, target: &Path) -> Result<()> {
+pub(crate) fn unmount_boot_environment(esp: &Path, selector: &str, target: &Path) -> Result<()> {
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
-    let entries = inventory(&esp, &lock, false)?.entries;
+    let Inventory {
+        entries, invalid, ..
+    } = inventory(&esp, &lock, false)?;
+    require_valid(&invalid, selector)?;
     let entry = find(&entries, selector)?;
     let MountTarget {
         parent,
@@ -210,7 +217,10 @@ fn with_root<T>(
     let volume = BtrfsVolume::open(volume)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
-    let entries = inventory(&esp, &lock, false)?.entries;
+    let Inventory {
+        entries, invalid, ..
+    } = inventory(&esp, &lock, false)?;
+    require_valid(&invalid, selector)?;
     let entry = find(&entries, selector)?;
     volume.check_boot_device(&esp, &lock, &entry.root)?;
     let (id, revision) = policy::entry_identity(&entry.id)?;
@@ -347,6 +357,60 @@ mod tests {
             BASE
         );
         assert!(find(&entries, "baseline").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_entries_are_listed_but_block_only_removal() -> Result<()> {
+        const OTHER: &str = "cps-0c3e5a8e-41c5-4f43-9f53-58d6a3b0c6f1-6";
+        let esp = tempfile::tempdir()?;
+        let dir = esp.path().join("loader/entries");
+        fs::create_dir_all(&dir)?;
+        LoaderPolicy::pinned(BASE).write(&esp.path().join("loader/loader.conf"))?;
+        fs::write(dir.join(format!("{BASE}.conf")), description(BASE, 4, None))?;
+        // A dual-boot distribution's entry is not CPS's to read.
+        fs::write(
+            dir.join("fedora-6.1.conf"),
+            "title Fedora\nlinux /vmlinuz\n",
+        )?;
+        // A power loss truncated one entry, and two files claim another.
+        fs::write(dir.join(format!("{CHILD}.conf")), "title CPS\n")?;
+        let other = description(OTHER, 6, None);
+        fs::write(dir.join(format!("{OTHER}.conf")), &other)?;
+        fs::write(dir.join(format!("{OTHER}+1.conf")), &other)?;
+
+        let environments = list_boot_environments(esp.path())?;
+        let summary: Vec<_> = environments
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.is_default, entry.invalid.is_some()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (BASE, true, false),
+                (OTHER, false, true),
+                (OTHER, false, true),
+                (CHILD, false, true),
+            ]
+        );
+        assert!(environments.iter().any(|entry| {
+            entry
+                .invalid
+                .as_deref()
+                .is_some_and(|error| error.contains("another entry also claims"))
+        }));
+
+        // Commands that name a readable environment still work.
+        assert_eq!(rename_boot_environment(esp.path(), BASE, "kept")?, BASE);
+        let error = rename_boot_environment(esp.path(), CHILD, "broken").unwrap_err();
+        assert!(format!("{error:#}").contains("is invalid"), "{error:#}");
+        // Removal must know every root an entry could boot.
+        let (_, (_, invalid)) = policy::inventory(esp.path())?;
+        let error = super::super::require_readable(&invalid).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("repair or remove it"),
+            "{error:#}"
+        );
         Ok(())
     }
 

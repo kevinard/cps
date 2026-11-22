@@ -41,7 +41,7 @@ pub(super) struct DiskStage<'a> {
 }
 
 impl<'a> DiskStage<'a> {
-    pub fn new(source: &Path, output: &'a Path) -> Result<Self> {
+    pub(super) fn new(source: &Path, output: &'a Path) -> Result<Self> {
         let name = output
             .file_name()
             .context("expected a new disk file name")?;
@@ -100,11 +100,11 @@ impl<'a> DiskStage<'a> {
         })
     }
 
-    pub fn directory(&self) -> PathBuf {
+    pub(super) fn directory(&self) -> PathBuf {
         Root::fd_path(self.stage.as_file())
     }
 
-    pub fn publish(self) -> Result<()> {
+    pub(super) fn publish(self) -> Result<()> {
         let checked = self.disk.file.metadata()?;
         let published = self.stage.file(DISK)?.metadata()?;
         ensure!(
@@ -188,7 +188,7 @@ impl OfflineDisk {
     }
 
     /// Read the GPT using the device's logical block size, or 512 bytes for an image file.
-    pub fn from_sized_file(file: File, bytes: u64) -> Result<Self> {
+    pub(super) fn from_sized_file(file: File, bytes: u64) -> Result<Self> {
         let sector = logical_sector_size(&file)?;
         let partitions = read_partitions(&file, bytes, sector)?;
         Ok(Self {
@@ -198,8 +198,25 @@ impl OfflineDisk {
         })
     }
 
+    /// Read the partitions of a disk in use from its primary GPT.
+    ///
+    /// The checks for an offline image, `sfdisk --verify` and an identical
+    /// backup GPT at the last block, refuse a disk that was grown: its backup
+    /// table stays at the old end until someone repairs it. The firmware
+    /// already boots this system from the primary table, so live commands
+    /// require only an intact primary header and entry array.
+    pub(super) fn from_device(file: File, bytes: u64) -> Result<Self> {
+        let sector = logical_sector_size(&file)?;
+        let partitions = read_primary_gpt(&file, bytes, sector)?;
+        Ok(Self {
+            file,
+            sector,
+            partitions,
+        })
+    }
+
     /// The logical block size used for GPT LBAs on this disk.
-    pub fn sector_size(&self) -> u64 {
+    pub(super) fn sector_size(&self) -> u64 {
         self.sector
     }
 
@@ -221,7 +238,7 @@ impl OfflineDisk {
     }
 
     /// The disk's only EFI System Partition.
-    pub fn esp(&self) -> Result<&PartitionExtent> {
+    pub(super) fn esp(&self) -> Result<&PartitionExtent> {
         let mut found = self
             .partitions
             .values()
@@ -237,11 +254,11 @@ impl OfflineDisk {
     }
 
     /// The Linux filesystem partition that will hold the root.
-    pub fn root(&self, partuuid: &str) -> Result<&PartitionExtent> {
+    pub(super) fn root(&self, partuuid: &str) -> Result<&PartitionExtent> {
         self.partition(&canonical_partuuid(partuuid)?, LINUX_FILESYSTEM)
     }
 
-    pub fn check_device_extents(
+    pub(super) fn check_device_extents(
         &self,
         root: &str,
         target: (u64, u64),
@@ -255,11 +272,11 @@ impl OfflineDisk {
         self.check_esp_extent(esp)
     }
 
-    pub fn check_esp_extent(&self, esp: (u64, u64)) -> Result<()> {
+    pub(super) fn check_esp_extent(&self, esp: (u64, u64)) -> Result<()> {
         self.esp_uuid_at(esp).map(|_| ())
     }
 
-    pub fn esp_uuid_at(&self, esp: (u64, u64)) -> Result<&str> {
+    pub(super) fn esp_uuid_at(&self, esp: (u64, u64)) -> Result<&str> {
         self.partitions
             .iter()
             .find_map(|(uuid, part)| {
@@ -269,7 +286,7 @@ impl OfflineDisk {
             .context("mounted filesystem does not match a GPT EFI System Partition")
     }
 
-    pub fn read_partition(&self, part: &PartitionExtent, output: &mut File) -> Result<()> {
+    pub(super) fn read_partition(&self, part: &PartitionExtent, output: &mut File) -> Result<()> {
         let mut disk = &self.file;
         disk.seek(SeekFrom::Start(part.offset))?;
         let read = io::copy(&mut disk.take(part.bytes), output)?;
@@ -280,7 +297,7 @@ impl OfflineDisk {
         Ok(())
     }
 
-    pub fn write_partition(&self, part: &PartitionExtent, payload: &File) -> Result<String> {
+    pub(super) fn write_partition(&self, part: &PartitionExtent, payload: &File) -> Result<String> {
         write_extent(&self.file, part.offset, part.bytes, payload)
     }
 }
@@ -413,6 +430,101 @@ fn read_partitions(
     Ok(partitions)
 }
 
+/// Parse the primary GPT header and entry array, checking their CRCs.
+fn read_primary_gpt(
+    disk: &File,
+    disk_bytes: u64,
+    sector: u64,
+) -> Result<BTreeMap<String, PartitionExtent>> {
+    let mut header = vec![0; usize::try_from(sector)?];
+    disk.read_exact_at(&mut header, sector)
+        .context("reading the primary GPT header")?;
+    let u32_at = |offset: usize| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+    let u64_at = |offset: usize| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+    let header_size = usize::try_from(u32_at(12))?;
+    ensure!(
+        &header[..8] == b"EFI PART" && (92..=header.len()).contains(&header_size),
+        "expected a GPT disk with {sector}-byte logical sectors"
+    );
+    let mut checked = header[..header_size].to_vec();
+    checked[16..20].fill(0);
+    ensure!(
+        crc32(&checked) == u32_at(16),
+        "the primary GPT header is damaged"
+    );
+    let (first_usable, last_usable) = (u64_at(40), u64_at(48));
+    let (array_lba, count, entry_size) = (u64_at(72), u32_at(80), u32_at(84));
+    ensure!(
+        u64_at(24) == 1
+            && first_usable >= 2
+            && first_usable <= last_usable
+            && last_usable < disk_bytes / sector
+            && array_lba >= 2
+            && (128..=4096).contains(&entry_size)
+            && entry_size.is_multiple_of(8)
+            && count <= 4096,
+        "invalid primary GPT header"
+    );
+    let mut entries = vec![0; usize::try_from(count)? * usize::try_from(entry_size)?];
+    disk.read_exact_at(&mut entries, array_lba * sector)
+        .context("reading the primary GPT entries")?;
+    ensure!(
+        crc32(&entries) == u32_at(88),
+        "the primary GPT entry array is damaged"
+    );
+    let guid = |bytes: &[u8]| {
+        format!(
+            "{:08x}-{:04x}-{:04x}-{}-{}",
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+            hex::encode(&bytes[8..10]),
+            hex::encode(&bytes[10..16]),
+        )
+    };
+    let mut ranges = Vec::new();
+    for entry in entries.chunks_exact(usize::try_from(entry_size)?) {
+        if entry[..16].iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        let first = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+        let last = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+        ranges.push((first, last, guid(&entry[..16]), guid(&entry[16..32])));
+    }
+    ranges.sort_unstable();
+    let mut next = first_usable;
+    let mut partitions = BTreeMap::new();
+    for (first, last, kind, uuid) in ranges {
+        let uuid = canonical_partuuid(&uuid)?;
+        ensure!(
+            uuid != NIL_UUID && first >= next && first <= last && last <= last_usable,
+            "GPT contains overlapping, out-of-range, or unnamed partitions"
+        );
+        next = last + 1;
+        let Entry::Vacant(entry) = partitions.entry(uuid) else {
+            anyhow::bail!("GPT contains a duplicate partition UUID");
+        };
+        entry.insert(PartitionExtent {
+            offset: first * sector,
+            bytes: (last - first + 1) * sector,
+            kind,
+        });
+    }
+    Ok(partitions)
+}
+
+/// The CRC-32 that GPT uses, as in IEEE 802.3.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
 fn check_gpt_copies(mut disk: &File, backup_lba: u64, table: &Gpt, sector: u64) -> Result<()> {
     // libfdisk can accept two independently valid but disagreeing tables.
     // Compare their shared geometry and the entry arrays before writing.
@@ -532,6 +644,44 @@ mod tests {
             let other = if sector == 512 { 4096 } else { 512 };
             assert!(read_partitions(&disk, bytes, other).is_err());
         }
+        // A disk grown after partitioning keeps its backup GPT at the old
+        // end. The offline checks refuse it, and a running system reads its
+        // primary table the same as before.
+        for sector in [512, 4096] {
+            let disk = gpt_image(dir.path(), sector)?;
+            let bytes = disk.metadata()?.len();
+            let strict = read_partitions(&disk, bytes, sector)?;
+            let grown = bytes + 64 * 1024 * 1024;
+            assert!(read_partitions(&disk, grown, sector).is_err());
+            let live = read_primary_gpt(&disk, grown, sector)?;
+            assert_eq!(
+                live.iter()
+                    .map(|(uuid, part)| (
+                        uuid,
+                        part.offset,
+                        part.bytes,
+                        part.kind.to_ascii_lowercase()
+                    ))
+                    .collect::<Vec<_>>(),
+                strict
+                    .iter()
+                    .map(|(uuid, part)| (
+                        uuid,
+                        part.offset,
+                        part.bytes,
+                        part.kind.to_ascii_lowercase()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            // A damaged primary table is still refused.
+            let mut damaged = vec![0; 4];
+            disk.read_exact_at(&mut damaged, sector + 48)?;
+            let path = dir.path().join(format!("disk-{sector}.raw"));
+            let writable = std::fs::OpenOptions::new().write(true).open(&path)?;
+            std::os::unix::fs::FileExt::write_all_at(&writable, &[damaged[0] ^ 1], sector + 48)?;
+            assert!(read_primary_gpt(&disk, grown, sector).is_err());
+        }
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
         // An image file is read with 512-byte sectors unless it is a block device.
         let disk = gpt_image(dir.path(), 512)?;
         assert_eq!(logical_sector_size(&disk)?, SECTOR_SIZE);

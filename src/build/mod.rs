@@ -5,7 +5,7 @@ pub(crate) mod sandbox;
 pub(crate) mod snapshot;
 pub(crate) mod sources;
 mod strip;
-pub use snapshot::{GitSnapshotRef, prepare_git_snapshot, prepare_git_snapshot_ref};
+pub(crate) use snapshot::{GitSnapshotRef, prepare_git_snapshot_ref};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -48,24 +48,14 @@ const MOUNTS: &[&str] = &[
     "build", "dev", "out", "proc", "recipe", "run", "sources", "tmp",
 ];
 
-pub struct BuildOptions<'a> {
-    pub repo: &'a Path,
-    pub publisher: &'a str,
-    pub trust_key: &'a Path,
+pub(crate) struct BuildSettings<'a> {
     pub sources: &'a Path,
     pub output: &'a Path,
     pub check_reproducible: bool,
     pub builder_signing_key: Option<&'a Path>,
 }
 
-pub struct BuildSettings<'a> {
-    pub sources: &'a Path,
-    pub output: &'a Path,
-    pub check_reproducible: bool,
-    pub builder_signing_key: Option<&'a Path>,
-}
-
-pub enum BuildToolchain<'a> {
+pub(crate) enum BuildToolchain<'a> {
     Single {
         repo: &'a Path,
         publisher: &'a str,
@@ -75,7 +65,7 @@ pub enum BuildToolchain<'a> {
 }
 
 /// Host-side limits for each sandbox run and the collected package outputs.
-pub struct BuildWorker {
+pub(crate) struct BuildWorker {
     pub(crate) timeout_secs: u64,
     pub(crate) scratch_bytes: u64,
     pub(crate) file_bytes: u64,
@@ -122,100 +112,15 @@ impl Default for BuildWorker {
 }
 
 #[derive(Clone, Copy)]
-pub enum SourceLayout {
+pub(crate) enum SourceLayout {
     Directory,
     Cache,
 }
 
-/// Build one package using sources and a package toolchain pinned by the recipe.
-pub fn build(
-    recipe_path: &Path,
-    repo: &Path,
-    publisher: &str,
-    trust_key: &Path,
-    sources: &Path,
-    output: &Path,
-    check_reproducible: bool,
-) -> Result<Vec<String>> {
-    build_package(
-        recipe_path,
-        BuildOptions {
-            repo,
-            publisher,
-            trust_key,
-            sources,
-            output,
-            check_reproducible,
-            builder_signing_key: None,
-        },
-    )
-}
-
-pub fn build_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<Vec<String>> {
-    build_with_worker(
-        recipe_path,
-        options,
-        SourceLayout::Directory,
-        &BuildWorker::default(),
-    )
-}
-
-/// Build offline using pinned objects from a source cache.
-pub fn build_cached_package(recipe_path: &Path, options: BuildOptions<'_>) -> Result<Vec<String>> {
-    build_with_worker(
-        recipe_path,
-        options,
-        SourceLayout::Cache,
-        &BuildWorker::default(),
-    )
-}
-
-pub fn build_with_worker(
-    recipe_path: &Path,
-    options: BuildOptions<'_>,
-    layout: SourceLayout,
-    worker: &BuildWorker,
-) -> Result<Vec<String>> {
-    build_with_recipe_options(
-        recipe_path,
-        BuildToolchain::Single {
-            repo: options.repo,
-            publisher: options.publisher,
-            trust_key: options.trust_key,
-        },
-        BuildSettings {
-            sources: options.sources,
-            output: options.output,
-            check_reproducible: options.check_reproducible,
-            builder_signing_key: options.builder_signing_key,
-        },
-        layout,
-        worker,
-        &BTreeMap::new(),
-    )
-}
-
-/// Build offline using explicitly pinned publishers and worker-local repository locations.
-pub fn build_with_toolchain_config(
-    recipe_path: &Path,
-    config: &Path,
-    settings: BuildSettings<'_>,
-    layout: SourceLayout,
-    worker: &BuildWorker,
-) -> Result<Vec<String>> {
-    build_with_recipe_options(
-        recipe_path,
-        BuildToolchain::Config(config),
-        settings,
-        layout,
-        worker,
-        &BTreeMap::new(),
-    )
-}
-
-/// Override named recipe options and record their effective values in the bundle.
-/// Returns the IDs of the packages that the build produced.
-pub fn build_with_recipe_options(
+/// Build a recipe with its pinned toolchain, overriding named recipe options and
+/// recording their effective values in the bundle. Returns the IDs of the
+/// packages that the build produced.
+pub(crate) fn build(
     recipe_path: &Path,
     location: BuildToolchain<'_>,
     settings: BuildSettings<'_>,
@@ -382,7 +287,7 @@ pub(crate) fn write_explicit_outputs(bundle: &Path, manifests: &[(&str, &[u8])])
 }
 
 /// Run a shell or command with a recipe's verified build inputs.
-pub fn develop(
+pub(crate) fn develop(
     recipe_path: &Path,
     location: BuildToolchain<'_>,
     sources: (&Path, SourceLayout),
@@ -718,11 +623,7 @@ fn resolve_toolchain(
             select_paths(
                 crate::model::Selection::arch(&recipe.arch, &BTreeMap::new()),
                 &BTreeMap::new(),
-                Node::Dir {
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                },
+                crate::model::Ownership::Named,
                 installed,
             )
         },
@@ -764,7 +665,7 @@ pub(crate) fn verify_toolchain(
 }
 
 /// Verify the pinned build selection and fetch only its required toolchain payloads.
-pub fn fetch_toolchain(recipe_path: &Path, config: &Path) -> Result<usize> {
+pub(crate) fn fetch_toolchain(recipe_path: &Path, config: &Path) -> Result<usize> {
     let (_, recipe) = read(recipe_path)?;
     let selection = resolve_toolchain(BuildToolchain::Config(config), &recipe)?;
     let mut required = BTreeMap::<_, BTreeMap<_, u64>>::new();

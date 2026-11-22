@@ -28,7 +28,7 @@ mv -- keys/root.pem offline-root.pem
 publish() {
     printf '%s\n' "$1" > proto/usr/share/example
     "$CPS_BIN" manifest generate --proto proto --publisher canopa --version "$1.0.0-0" \
-        --uid "$(id -u)" --gid "$(id -g)" demo/example > manifest.kdl
+        demo/example > manifest.kdl
     "$CPS_BIN" publish manifests --repo repo --proto proto --key "$signing_key" manifest.kdl
 }
 

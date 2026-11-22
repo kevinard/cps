@@ -107,6 +107,12 @@ impl Root {
     pub(super) fn decode(payload: &[u8]) -> Result<Self> {
         let root: Self = serde_json::from_slice(payload).context("invalid catalog root")?;
         ensure!(root.format == ROOT_FORMAT, "unsupported catalog format");
+        // One signed byte string must mean one thing: duplicate keys, other
+        // spellings, and reordered maps are rejected, not reinterpreted.
+        ensure!(
+            serde_json::to_vec(&root)? == payload,
+            "catalog root payload is not canonical"
+        );
         ensure!(root.sequence > 0, "invalid publisher catalog sequence");
         ensure!(
             root.pruned_through < root.sequence,
@@ -222,13 +228,38 @@ impl Shard {
     }
 }
 
-type ShardCache = Mutex<HashMap<String, Arc<Shard>>>;
+/// Decoded shards, which are immutable by digest, so that one process does
+/// not parse the same bytes twice. The cache saves only decoding: a read
+/// from a repository still checks that the repository holds the object, so
+/// a shard that one repository served never stands in for another's
+/// missing or damaged copy. It holds at most `SHARD_CACHE_BYTES` of encoded
+/// shards and starts over when full.
+#[derive(Default)]
+struct ShardCache {
+    shards: HashMap<String, Arc<Shard>>,
+    bytes: u64,
+}
 
-/// Decoded shards are immutable by digest, so one process shares them.
-static SHARDS: LazyLock<ShardCache> = LazyLock::new(Default::default);
+const SHARD_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+static SHARDS: LazyLock<Mutex<ShardCache>> = LazyLock::new(Default::default);
 
 fn cached(hash: &str) -> Option<Arc<Shard>> {
-    SHARDS.lock().ok()?.get(hash).cloned()
+    SHARDS.lock().ok()?.shards.get(hash).cloned()
+}
+
+fn insert(hash: &str, shard: Arc<Shard>, size: u64) {
+    let Ok(mut cache) = SHARDS.lock() else {
+        return;
+    };
+    if cache.shards.contains_key(hash) || size > SHARD_CACHE_BYTES {
+        return;
+    }
+    if cache.bytes + size > SHARD_CACHE_BYTES {
+        *cache = ShardCache::default();
+    }
+    cache.bytes += size;
+    cache.shards.insert(hash.to_owned(), shard);
 }
 
 /// Decode shard bytes known to have this digest.
@@ -238,29 +269,28 @@ pub(super) fn decode_shard(bytes: &[u8], hash: &str) -> Result<Arc<Shard>> {
     }
     let shard: Shard =
         serde_json::from_slice(bytes).with_context(|| format!("invalid catalog shard {hash}"))?;
+    ensure!(
+        serde_json::to_vec(&shard)? == bytes,
+        "catalog shard {hash} is not canonical"
+    );
     shard
         .validate()
         .with_context(|| format!("checking catalog shard {hash}"))?;
     let shard = Arc::new(shard);
-    if let Ok(mut cache) = SHARDS.lock() {
-        cache.insert(hash.to_owned(), shard.clone());
-    }
+    insert(hash, shard.clone(), bytes.len() as u64);
     Ok(shard)
 }
 
+/// Read a shard that `repo` must hold, checking its digest.
 pub(super) fn read_shard(repo: &std::path::Path, hash: &str) -> Result<Arc<Shard>> {
-    if let Some(shard) = cached(hash) {
-        return Ok(shard);
-    }
     let bytes = read_object(repo, SHARD_OBJECTS, hash, SHARD_LIMIT)?;
     decode_shard(&bytes, hash)
 }
 
-/// Record a shard this process wrote, so later reads need not decode it.
-pub(super) fn remember(hash: &str, shard: Arc<Shard>) {
-    if let Ok(mut cache) = SHARDS.lock() {
-        cache.insert(hash.to_owned(), shard);
-    }
+/// Record a shard this process encoded as `size` bytes, so later reads need
+/// not decode it.
+pub(super) fn remember(hash: &str, shard: Arc<Shard>, size: u64) {
+    insert(hash, shard, size);
 }
 
 /// Pack a root envelope and its shards into one self-contained archive.
@@ -332,6 +362,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_shards_never_stand_in_for_a_missing_object() -> Result<()> {
+        let shard = Shard::new("example", "0a");
+        let bytes = shard.encode()?;
+        let hash = digest(&bytes);
+        let (first, second) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        std::fs::create_dir_all(first.path().join(SHARD_OBJECTS))?;
+        std::fs::write(first.path().join(SHARD_OBJECTS).join(&hash), &bytes)?;
+        assert_eq!(*read_shard(first.path(), &hash)?, shard);
+        // The second repository does not have it, then has a damaged copy.
+        assert!(read_shard(second.path(), &hash).is_err());
+        std::fs::create_dir_all(second.path().join(SHARD_OBJECTS))?;
+        std::fs::write(second.path().join(SHARD_OBJECTS).join(&hash), b"{}")?;
+        assert!(read_shard(second.path(), &hash).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn catalog_roots_require_exactly_the_catalog_threshold() -> Result<()> {
         use crate::repo::keys::{
             Signers,
@@ -341,12 +388,14 @@ mod tests {
         let root_key = key();
         let documents: Vec<_> = (0..3)
             .map(|_| {
-                ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-                    .unwrap()
+                aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(
+                    &aws_lc_rs::rand::SystemRandom::new(),
+                )
+                .unwrap()
             })
             .collect();
         let load = |index: usize| -> crate::repo::keys::SigningKey {
-            ring::signature::Ed25519KeyPair::from_pkcs8(documents[index].as_ref())
+            aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(documents[index].as_ref())
                 .unwrap()
                 .into()
         };

@@ -15,7 +15,7 @@ for name in one two; do
     cat > package.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/$name" publisher="test" version="1.0.0-0" {
-    file "$name" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "$name" mode="0644"
 }
 MANIFEST
     "$cps" publish manifests --repo repo --proto proto --key private.der package.kdl

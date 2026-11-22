@@ -463,7 +463,7 @@
 .SS "\&cps repo withdrawals"
 \&List withdrawn package IDs and their original manifest digests
 .PP
-.B \&cps repo withdrawals \-\-repo <REPO> \-\-trust\-root <TRUST_ROOT>
+.B \&cps repo withdrawals [OPTIONS] \-\-repo <REPO> \-\-trust\-root <TRUST_ROOT>
 .PP
 .B Options
 .PP
@@ -471,6 +471,9 @@
 .TP
 .B \&\-\-trust\-root <TRUST_ROOT>
 \&Pinned trust root of the publisher, which also names it
+.TP
+.B \&\-\-json
+\&Print JSON instead of text
 .TP
 .B \&\-h, \-\-help
 \&Print help
@@ -497,7 +500,7 @@
 .SS "\&cps repo obsoletions"
 \&List signed package obsoletion cutoffs
 .PP
-.B \&cps repo obsoletions \-\-repo <REPO> \-\-trust\-root <TRUST_ROOT>
+.B \&cps repo obsoletions [OPTIONS] \-\-repo <REPO> \-\-trust\-root <TRUST_ROOT>
 .PP
 .B Options
 .PP
@@ -505,6 +508,9 @@
 .TP
 .B \&\-\-trust\-root <TRUST_ROOT>
 \&Pinned trust root of the publisher, which also names it
+.TP
+.B \&\-\-json
+\&Print JSON instead of text
 .TP
 .B \&\-h, \-\-help
 \&Print help
@@ -851,5 +857,21 @@
 .TP
 .B \&\-h, \-\-help
 \&Print help
+.SH EXIT STATUS
+.TP
+.B \&0
+\&Success. A check found nothing to report.
+.TP
+.B \&1
+\&An error.
+.TP
+.B \&2
+\&Invalid usage, such as an unknown option or a missing argument.
+.TP
+.B \&3
+\&A check found something: updates are available (upgrade \-\-check), verification found problems (verify, publisher audit\-builds), pins are stale (recipe repin \-\-check), configuration or images differ (config diff, image diff), manifest dependencies are missing (manifest dependencies), or nothing matched (search, owner).
+.TP
+.B \&4
+\&A confirmation prompt was declined.
 .SH SEE ALSO
 .BR cps (1)

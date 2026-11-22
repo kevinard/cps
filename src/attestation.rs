@@ -4,11 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-};
-use ring::signature::{ED25519, UnparsedPublicKey};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -19,7 +15,10 @@ use crate::{
         manifest_text,
     },
     model::{Action, FileDigest, Manifest, Version, digest, validate_digest, validate_name},
-    repo::{MANIFEST_LIMIT, Purpose, SigningKey, read_key, read_limited, trust_root_keys},
+    repo::{
+        MANIFEST_LIMIT, OtherSigners, PublicKey, Purpose, SigningKey, read_key, read_limited,
+        trust_root_keys, verify_signatures,
+    },
 };
 
 pub(crate) const ATTESTATION_LIMIT: u64 = 64 * 1024 * 1024;
@@ -41,7 +40,7 @@ pub(crate) struct BuildTrust {
 }
 
 impl BuildTrust {
-    pub fn load(minimum_builders: usize, paths: &[PathBuf]) -> Result<Self> {
+    pub(crate) fn load(minimum_builders: usize, paths: &[PathBuf]) -> Result<Self> {
         ensure!(
             paths.len() <= MAX_BUILDERS,
             "at most {MAX_BUILDERS} builder keys are supported"
@@ -61,7 +60,7 @@ impl BuildTrust {
         Ok(trust)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.keys.len() <= MAX_BUILDERS
                 && (1..=self.keys.len()).contains(&self.minimum_builders),
@@ -70,7 +69,7 @@ impl BuildTrust {
         Ok(())
     }
 
-    pub fn check_publisher_key(&self, key: &[u8]) -> Result<()> {
+    pub(crate) fn check_publisher_key(&self, key: &[u8]) -> Result<()> {
         ensure!(
             !self.keys.iter().any(|builder| builder.as_slice() == key),
             "builder and publisher must use distinct keys"
@@ -79,29 +78,28 @@ impl BuildTrust {
     }
 
     /// Require every builder key to differ from every key of a pinned trust root.
-    pub fn check_publisher_trust(&self, trust_root: &[u8]) -> Result<()> {
+    pub(crate) fn check_publisher_trust(&self, trust_root: &[u8]) -> Result<()> {
         for key in trust_root_keys(trust_root)? {
             self.check_publisher_key(&key)?;
         }
         Ok(())
     }
 
-    pub fn verify(&self, bytes: &[u8], manifest: &Manifest, published: FileDigest) -> Result<()> {
+    pub(crate) fn verify(
+        &self,
+        bytes: &[u8],
+        manifest: &Manifest,
+        published: FileDigest,
+    ) -> Result<()> {
         let (payload, signatures) = decode_envelope(bytes)?;
-        let message = pae(&payload);
-        let mut valid = 0;
-        for key in &self.keys {
-            let key = UnparsedPublicKey::new(&ED25519, key);
-            if signatures
-                .iter()
-                .any(|sig| key.verify(&message, sig).is_ok())
-            {
-                valid += 1;
-                if valid == self.minimum_builders {
-                    break;
-                }
-            }
-        }
+        let valid = verify_signatures(
+            "build attestation",
+            &pae(&payload),
+            signatures.iter().map(|(id, sig)| (id.as_str(), sig)),
+            &self.keys,
+            OtherSigners::Ignore,
+        )?
+        .len();
         ensure!(
             valid >= self.minimum_builders,
             "build attestation requires {} trusted builder signatures, found {valid}",
@@ -150,10 +148,12 @@ struct Envelope {
     signatures: Vec<Signature>,
 }
 
+/// A DSSE signature: `keyid` is the SHA-256 of the raw Ed25519 public key in
+/// lowercase hexadecimal and `sig` the standard padded base64 of the 64-byte
+/// signature.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Signature {
-    #[serde(default)]
     keyid: String,
     sig: String,
 }
@@ -259,9 +259,7 @@ impl Toolchain {
             ensure!(
                 spec.publisher
                     .is_none_or(|publisher| package.publisher == publisher)
-                    && spec
-                        .version
-                        .is_none_or(|version| package.version == version),
+                    && spec.accepts(&package.version),
                 "build attestation claims a different selection for toolchain package {name}"
             );
         }
@@ -285,7 +283,7 @@ pub(crate) struct VerifiedBuild {
 }
 
 impl VerifiedBuild {
-    pub fn add_witness(&mut self, bytes: &[u8], key: &[u8]) -> Result<()> {
+    pub(crate) fn add_witness(&mut self, bytes: &[u8], key: &[u8]) -> Result<()> {
         let builder = digest(key);
         ensure!(
             !self.signatures.contains_key(&builder),
@@ -300,11 +298,11 @@ impl VerifiedBuild {
         Ok(())
     }
 
-    pub fn builders(&self) -> impl ExactSizeIterator<Item = &str> {
+    pub(crate) fn builders(&self) -> impl ExactSizeIterator<Item = &str> {
         self.signatures.keys().map(String::as_str)
     }
 
-    pub fn envelope(&self) -> Result<Vec<u8>> {
+    pub(crate) fn envelope(&self) -> Result<Vec<u8>> {
         envelope(
             &self.payload,
             self.signatures
@@ -392,13 +390,14 @@ fn pae(payload: &[u8]) -> Vec<u8> {
     prefix
 }
 
+/// Decode standard padded base64 in its one spelling.
 fn decode(encoded: &str) -> Result<Vec<u8>> {
-    for encoding in [STANDARD, URL_SAFE, STANDARD_NO_PAD, URL_SAFE_NO_PAD] {
-        if let Ok(bytes) = encoding.decode(encoded) {
-            return Ok(bytes);
-        }
-    }
-    anyhow::bail!("invalid DSSE base64")
+    let bytes = STANDARD.decode(encoded).context("invalid DSSE base64")?;
+    ensure!(
+        STANDARD.encode(&bytes) == encoded,
+        "DSSE base64 is not canonical"
+    );
+    Ok(bytes)
 }
 
 fn file_digest(bytes: &[u8]) -> FileDigest {
@@ -436,36 +435,66 @@ fn published_manifest_digest(
     Ok(file_digest(bytes.as_bytes()))
 }
 
-fn decode_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
-    let signed: Envelope = serde_json::from_slice(bytes)?;
+/// The signatures of a DSSE envelope by key ID, in key ID order.
+type Signatures = Vec<(String, [u8; 64])>;
+
+/// Decode an attestation envelope in its one accepted byte form: canonical
+/// JSON, standard padded base64, and 1 to MAX_BUILDERS signatures sorted by
+/// unique key ID, each exactly 64 bytes. Nothing is skipped or reinterpreted.
+fn decode_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Signatures)> {
+    let signed: Envelope = serde_json::from_slice(bytes).context("invalid DSSE envelope")?;
+    ensure!(
+        serde_json::to_vec(&signed)? == bytes,
+        "DSSE envelope is not canonical"
+    );
     ensure!(
         signed.payload_type == MEDIA_TYPE,
         "unexpected attestation payload type"
     );
     ensure!(
-        signed.signatures.len() <= MAX_BUILDERS,
-        "too many attestation signatures"
+        (1..=MAX_BUILDERS).contains(&signed.signatures.len()),
+        "an attestation carries 1 to {MAX_BUILDERS} signatures"
     );
     let payload = decode(&signed.payload)?;
-    let signatures = signed
-        .signatures
-        .into_iter()
-        // An Ed25519 signature is 64 bytes, at most 88 bytes in base64.
-        .filter(|entry| entry.sig.len() <= 88)
-        .filter_map(|entry| decode(&entry.sig).ok())
-        .collect();
+    let mut signatures = Signatures::new();
+    for entry in signed.signatures {
+        validate_digest(&entry.keyid).context("invalid attestation signature key ID")?;
+        ensure!(
+            signatures
+                .last()
+                .is_none_or(|(last, _)| *last < entry.keyid),
+            "attestation signatures must be sorted by unique key ID"
+        );
+        let signature = decode(&entry.sig)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("an attestation signature is 64 bytes"))?;
+        signatures.push((entry.keyid, signature));
+    }
     Ok((payload, signatures))
 }
 
+/// Verify the signature of one builder key and return the payload and that
+/// signature.
 fn verify_envelope(bytes: &[u8], builder_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let (payload, signatures) = decode_envelope(bytes)?;
-    let message = pae(&payload);
-    let key = UnparsedPublicKey::new(&ED25519, builder_key);
-    let signature = signatures
-        .into_iter()
-        .find(|signature| key.verify(&message, signature).is_ok())
-        .context("invalid builder attestation signature")?;
-    Ok((payload, signature))
+    let key: PublicKey = builder_key
+        .try_into()
+        .context("a builder key is a raw 32-byte Ed25519 key")?;
+    let id = digest(&key);
+    let (_, signature) = signatures
+        .iter()
+        .find(|(signer, _)| *signer == id)
+        .with_context(|| {
+            format!("invalid builder attestation signature: none is by builder key {id}")
+        })?;
+    verify_signatures(
+        "builder attestation",
+        &pae(&payload),
+        [(id.as_str(), signature)],
+        &BTreeSet::from([key]),
+        OtherSigners::Reject,
+    )?;
+    Ok((payload, signature.to_vec()))
 }
 
 /// Verify a build bundle against the builder key and the reviewed recipe digest.
@@ -580,19 +609,19 @@ pub(crate) struct RebuildEvidence {
     pub recipe: BuildRecipe,
     pub templates: Vec<TemplateInput>,
     payload: Vec<u8>,
-    signatures: Vec<Vec<u8>>,
+    signatures: Signatures,
     packages: Vec<String>,
     subjects: Vec<Subject>,
 }
 
 impl RebuildEvidence {
     /// The IDs of every package that the admitted build produced.
-    pub fn packages(&self) -> &[String] {
+    pub(crate) fn packages(&self) -> &[String] {
         &self.packages
     }
 
     /// The digest of the published manifest that the admitted build names for a package.
-    pub fn published_manifest(&self, id: &str) -> Result<&str> {
+    pub(crate) fn published_manifest(&self, id: &str) -> Result<&str> {
         let name = &crate::model::PackageSpec::parse(id)?.name;
         self.subjects
             .iter()
@@ -602,7 +631,7 @@ impl RebuildEvidence {
     }
 
     /// The payload digests that the admitted build names, by output path.
-    pub fn admitted_artifacts(&self) -> BTreeMap<String, FileDigest> {
+    pub(crate) fn admitted_artifacts(&self) -> BTreeMap<String, FileDigest> {
         self.subjects
             .iter()
             .filter_map(|subject| {
@@ -614,7 +643,7 @@ impl RebuildEvidence {
 
     /// Check a rebuilt bundle's expanded manifests against the admitted build,
     /// and return the admitted payload digests of every output.
-    pub fn check_outputs(&self, bundle: &Root) -> Result<BTreeMap<String, FileDigest>> {
+    pub(crate) fn check_outputs(&self, bundle: &Root) -> Result<BTreeMap<String, FileDigest>> {
         let manifests = expanded_outputs(bundle, &self.recipe, &self.templates, &self.packages)?;
         let claimed = self
             .subjects
@@ -624,14 +653,19 @@ impl RebuildEvidence {
         Ok(claimed_artifacts(&manifests, claimed, &bundle.subdir("proto")?)?.0)
     }
 
-    pub fn check_witness(&self, envelope: &[u8], key: &[u8]) -> Result<()> {
-        let message = pae(&self.payload);
-        let public = UnparsedPublicKey::new(&ED25519, key);
+    pub(crate) fn check_witness(&self, envelope: &[u8], key: &[u8]) -> Result<()> {
+        let public: PublicKey = key
+            .try_into()
+            .context("a builder key is a raw 32-byte Ed25519 key")?;
+        let signed = verify_signatures(
+            "admitted build attestation",
+            &pae(&self.payload),
+            self.signatures.iter().map(|(id, sig)| (id.as_str(), sig)),
+            &BTreeSet::from([public]),
+            OtherSigners::Ignore,
+        )?;
         ensure!(
-            !self
-                .signatures
-                .iter()
-                .any(|sig| public.verify(&message, sig).is_ok()),
+            signed.is_empty(),
             "rebuild witness already signed the admitted build"
         );
         let (payload, _) = verify_envelope(envelope, key)?;
@@ -720,7 +754,49 @@ fn subjects(input: Vec<Subject>) -> Result<BTreeMap<String, FileDigest>> {
 mod tests {
     use super::*;
     use crate::kdl_format::parse_manifest;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+
+    #[test]
+    fn attestation_envelopes_have_one_spelling() -> Result<()> {
+        let mut ids = [digest(b"a"), digest(b"b")];
+        ids.sort();
+        let [a, b] = ids;
+        let (sa, sb) = ([1; 64], [2; 64]);
+        let good = envelope(b"{}", [(a.as_str(), sa.as_slice()), (b.as_str(), &sb)])?;
+        let (payload, signatures) = decode_envelope(&good)?;
+        assert_eq!(payload, b"{}");
+        assert_eq!(signatures, [(a.clone(), sa), (b.clone(), sb)]);
+
+        let text = String::from_utf8(good)?;
+        let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xfb; 64]);
+        for bad in [
+            // Unsorted or repeated key IDs, and key IDs that are not digests.
+            String::from_utf8(envelope(
+                b"{}",
+                [(b.as_str(), sb.as_slice()), (a.as_str(), &sa)],
+            )?)?,
+            String::from_utf8(envelope(
+                b"{}",
+                [(a.as_str(), sa.as_slice()), (a.as_str(), &sb)],
+            )?)?,
+            String::from_utf8(envelope(b"{}", [("builder", sa.as_slice())])?)?,
+            // Signatures that are not exactly 64 bytes, or not standard base64.
+            String::from_utf8(envelope(b"{}", [(a.as_str(), [1; 63].as_slice())])?)?,
+            text.replace(&STANDARD.encode(sa), &url_safe),
+            text.replace(
+                &STANDARD.encode(sa),
+                STANDARD.encode(sa).trim_end_matches('='),
+            ),
+            // No signatures, a missing key ID, or other JSON spellings.
+            String::from_utf8(envelope(b"{}", [])?)?,
+            text.replacen(&format!("\"keyid\":\"{a}\","), "", 1),
+            text.replacen(':', ": ", 1),
+            format!("{text}\n"),
+        ] {
+            assert!(decode_envelope(bad.as_bytes()).is_err(), "{bad}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn rejects_older_predicates_even_with_a_valid_builder_signature() -> Result<()> {
@@ -729,7 +805,7 @@ mod tests {
             r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{hash}" key-sha256="{hash}"
+        publisher "seed" catalog-sha256="{hash}" key-sha256="{hash}"
         package "build/compiler"
     }}
     manifest "manifest.kdl" sha256="{hash}"
@@ -740,7 +816,7 @@ build architecture="x86_64" epoch=1700000000 {{
         let manifest_bytes = b"schema-version 1 kind=\"package-manifest\"\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
         let recipe = parse(&recipe_bytes)?;
         let manifest = parse_manifest(std::str::from_utf8(manifest_bytes)?)?;
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
         let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let proto = tempfile::tempdir()?;
         let bytes = sign(
@@ -776,7 +852,8 @@ build architecture="x86_64" epoch=1700000000 {{
             statement.predicate_type = old.into();
             let payload = serde_json::to_vec(&statement)?;
             let signature = key.sign(&pae(&payload));
-            let bytes = envelope(&payload, [("builder", signature.as_ref())])?;
+            let id = digest(key.public_key().as_ref());
+            let bytes = envelope(&payload, [(id.as_str(), signature.as_ref())])?;
             let (payload, _) = verify_envelope(&bytes, key.public_key().as_ref())?;
             assert!(parse_statement(&payload).is_err());
         }
@@ -790,8 +867,8 @@ build architecture="x86_64" epoch=1700000000 {{
             r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{hash}" key-sha256="{hash}"
-        publisher "tools" catalog="{hash}" key-sha256="{hash}"
+        publisher "seed" catalog-sha256="{hash}" key-sha256="{hash}"
+        publisher "tools" catalog-sha256="{hash}" key-sha256="{hash}"
         package "cps://tools/build/compiler@1.0.0-0"
     }}
     manifest "manifest.kdl" sha256="{hash}"

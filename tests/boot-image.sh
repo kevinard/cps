@@ -25,7 +25,7 @@ printf 'fixture kernel\n' > proto/boot/vmlinuz
 openssl genpkey -algorithm ED25519 -outform DER -out private.der
 "$cps" repo trust init --repo repo --publisher test --key private.der >/dev/null
 "$cps" manifest generate --proto proto --publisher test --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" test/payload > manifest.kdl
+    test/payload > manifest.kdl
 "$cps" publish manifests --repo repo --proto proto --key private.der manifest.kdl
 root=volume/@
 mkdir -p volume/@environments
@@ -104,7 +104,7 @@ mcopy -i disk.raw@@1048576 "::/$entry" entry.conf
 mcopy -i disk.raw@@1048576 ::/loader/loader.conf loader.conf
 mcopy -i disk.raw@@1048576 "::/EFI/cps/cps-$id-1/vmlinuz.efi" kernel.efi
 cmp proto/boot/vmlinuz kernel.efi
-grep -Fx 'default cps-*.conf' loader.conf
+grep -Fx "default cps-$id-1.conf" loader.conf
 grep -Fx "# cps-btrfs-fsid $id" entry.conf
 grep -Fx "# cps-btrfs-subvolid $root_id" entry.conf
 grep -Fx '# cps-btrfs-path @' entry.conf
@@ -199,7 +199,12 @@ var_image() { image "$1" "${2:-template.raw}" --var volume/@var; }
 reject 'no /etc/fstab to mount the shared /var subvolume' no-fstab.raw var_image no-fstab.raw
 mkdir -p "$root/etc"
 printf 'PARTUUID=%s /var/log btrfs subvol=/@var 0 0\n' "$root_uuid" > "$root/etc/fstab"
-reject 'must mount subvolume @var at /var' wrong-fstab.raw var_image wrong-fstab.raw
+reject 'must mount subvolume @var of the new filesystem' wrong-fstab.raw var_image wrong-fstab.raw
+# A stale identity would mount another filesystem, or none, at first boot.
+printf 'PARTUUID=00000000-0000-4000-8000-000000000000 /var btrfs subvol=/@var 0 0\n' \
+    > "$root/etc/fstab"
+reject '/var mounts PARTUUID=00000000-0000-4000-8000-000000000000, not' stale-fstab.raw \
+    var_image stale-fstab.raw
 printf 'PARTUUID=%s / btrfs defaults 0 0\nPARTUUID=%s /var btrfs noatime,subvol=/@var 0 0\n' \
     "$root_uuid" "$root_uuid" > "$root/etc/fstab"
 touch volume/@var/stray

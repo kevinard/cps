@@ -134,7 +134,7 @@ pub(crate) fn build_recipe(
 
 /// Extract an authenticated build recipe, its templates, and the admitted attestation.
 /// Returns the path to the recipe in the new directory.
-pub fn export_rebuild_inputs(
+pub(crate) fn export_rebuild_inputs(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,
@@ -209,7 +209,7 @@ pub fn export_rebuild_inputs(
 /// The admitted statement covers every output of the build, so the rebuild must
 /// reproduce every output's manifest and payloads, and each output's catalog entry
 /// must name this same attestation. Returns the number of verified payloads.
-pub fn verify_rebuild(
+pub(crate) fn verify_rebuild(
     repo: &Path,
     publisher: &str,
     trust_key: &Path,

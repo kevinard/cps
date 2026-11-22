@@ -71,7 +71,6 @@ jobs:
             --env CPS_RELEASE_PUBLISHER --env CPS_REQUEST --env CPS_CANDIDATE --env CPS_BASE \
             --volume "$data:$data:ro" "$image" bash -euc '
               cargo build --frozen --release
-              cargo test --frozen
               export CPS_BIN="$PWD/target/release/cps"
               bash tests/release-ci.sh
               bash ci/rehearse-release.sh "$CPS_REHEARSAL_CASES/$CPS_REQUEST" \

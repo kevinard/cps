@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Version(Arc<str>);
+pub(crate) struct Version(Arc<str>);
 
 impl FromStr for Version {
     type Err = anyhow::Error;
@@ -47,7 +47,7 @@ impl Version {
     /// treats `2.0.0`, `2.0.0-0`, and `0:02.0.0-00` as the same release. The
     /// `Ord` impl on [`Version`] adds a spelling tiebreak for stable ordering of
     /// distinct package IDs only.
-    pub fn semantic(&self) -> Semantic<'_> {
+    pub(crate) fn semantic(&self) -> Semantic<'_> {
         Semantic(self)
     }
 
@@ -63,7 +63,7 @@ impl Version {
 
 /// A [`Version`] compared by release semantics; see [`Version::semantic`].
 #[derive(Clone, Copy, Debug)]
-pub struct Semantic<'a>(&'a Version);
+pub(crate) struct Semantic<'a>(&'a Version);
 
 impl Ord for Semantic<'_> {
     fn cmp(&self, other: &Self) -> Ordering {

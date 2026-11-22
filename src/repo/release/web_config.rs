@@ -15,7 +15,7 @@ use anyhow::{Context, Result, ensure};
 use crate::model::digest;
 
 /// What the generated server does.
-pub enum WebConfig<'a> {
+pub(crate) enum WebConfig<'a> {
     /// Serve deployed web roots or replicas from disk, by path prefix.
     Static { roots: &'a [Mount<&'a Path>] },
     /// Cache upstream CPS web roots on a LAN, by path prefix.
@@ -29,7 +29,7 @@ pub enum WebConfig<'a> {
 
 /// A web root or upstream served under a path prefix such as `/canopa/`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Mount<T> {
+pub(crate) struct Mount<T> {
     /// Starts and ends with `/`.
     pub prefix: String,
     pub source: T,
@@ -37,7 +37,7 @@ pub struct Mount<T> {
 
 impl Mount<String> {
     /// Parse `[PREFIX=]VALUE`. Without a prefix, the value is served at `/`.
-    pub fn parse(spec: &str) -> Result<Self> {
+    pub(crate) fn parse(spec: &str) -> Result<Self> {
         let (prefix, source) = match spec.split_once('=') {
             Some((prefix, source)) => (prefix, source),
             None => ("/", spec),
@@ -66,7 +66,7 @@ impl Mount<String> {
 }
 
 /// TLS settings of the generated HTTPS server.
-pub struct WebServer<'a> {
+pub(crate) struct WebServer<'a> {
     pub host: &'a str,
     pub certificate: &'a Path,
     pub key: &'a Path,
@@ -185,7 +185,7 @@ fn pattern(prefix: &str) -> String {
 }
 
 /// Print a server block, and for a cache its zone, for NGINX's `http` context.
-pub fn nginx_config(server: &WebServer<'_>, config: &WebConfig<'_>) -> Result<String> {
+pub(crate) fn nginx_config(server: &WebServer<'_>, config: &WebConfig<'_>) -> Result<String> {
     check_host(server.host)?;
     let certificate = check_path(server.certificate)?;
     let key = check_path(server.key)?;

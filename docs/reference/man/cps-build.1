@@ -18,7 +18,7 @@
 \&Trust root file that matches the recipe's key\-sha256 pin and names the publisher
 .TP
 .B \&\-\-toolchain\-config <TOOLCHAIN_CONFIG>
-\&Worker\-local repository and trust key locations for the pinned publishers [default: $CPS_TOOLCHAIN_CONFIG unless \-\-repo is given]
+\&Worker\-local repository and trust root locations for the pinned publishers [default: $CPS_TOOLCHAIN_CONFIG unless \-\-repo is given]
 .TP
 .B \&\-\-sources <SOURCES>
 \&Directory of the recipe's source inputs at their recipe paths
@@ -43,5 +43,21 @@
 .TP
 .B \&\-h, \-\-help
 \&Print help
+.SH EXIT STATUS
+.TP
+.B \&0
+\&Success. A check found nothing to report.
+.TP
+.B \&1
+\&An error.
+.TP
+.B \&2
+\&Invalid usage, such as an unknown option or a missing argument.
+.TP
+.B \&3
+\&A check found something: updates are available (upgrade \-\-check), verification found problems (verify, publisher audit\-builds), pins are stale (recipe repin \-\-check), configuration or images differ (config diff, image diff), manifest dependencies are missing (manifest dependencies), or nothing matched (search, owner).
+.TP
+.B \&4
+\&A confirmation prompt was declined.
 .SH SEE ALSO
 .BR cps (1)

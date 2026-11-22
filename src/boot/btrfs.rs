@@ -22,6 +22,7 @@ use crate::{
     plan::{Plan, Write, payloads},
 };
 
+use super::scratch::{self, Scratch};
 use super::{
     check_image_integrity, check_staging_plan, entry_id, finish_staged_root, kernel::Artifacts,
 };
@@ -30,7 +31,7 @@ const READ_ONLY: u64 = 1 << 1;
 /// Space kept free beyond the plan's payloads and kernel artifacts for metadata.
 const STAGING_RESERVE: u64 = 32 * 1024 * 1024;
 /// Nested subvolumes that systemd creates on Btrfs. Staged roots get an empty directory.
-pub const DEFAULT_EXCLUDED_SUBVOLUMES: [&str; 2] = ["var/lib/machines", "var/lib/portables"];
+pub(super) const DEFAULT_EXCLUDED_SUBVOLUMES: [&str; 2] = ["var/lib/machines", "var/lib/portables"];
 
 // Linux UAPI btrfs_ioctl_vol_args_v2. The reserved union is zeroed.
 #[repr(C)]
@@ -54,7 +55,7 @@ const _: () = assert!(size_of::<VolumeArgs>() == 4096);
 /// Publish a verified read-only snapshot inside a new capture directory.
 ///
 /// Nested subvolumes at the default paths and at `excluded` become empty directories.
-pub fn capture_boot_environment(
+pub(crate) fn capture_boot_environment(
     source: &Path,
     output: &Path,
     excluded: &[String],
@@ -75,7 +76,7 @@ enum Snapshot<'a> {
 }
 
 /// Stage a saved plan in a new writable Btrfs snapshot of an inactive baseline.
-pub fn stage_btrfs_boot_environment(
+pub(crate) fn stage_btrfs_boot_environment(
     source: &Path,
     output: &Path,
     plan: &Plan,
@@ -310,9 +311,12 @@ fn snapshot_environment(
         check_staging_space(&parent, &source, plan)?;
     }
 
-    let scratch = tempfile::Builder::new()
-        .prefix(".cps-capture-")
-        .tempdir_in(Root::fd_path(parent.as_file()))?;
+    // An interrupted capture leaves its snapshot in a scratch directory.
+    let scratch = Scratch::create(
+        &Root::fd_path(parent.as_file()),
+        CAPTURE_PREFIX,
+        remove_stale_capture,
+    )?;
     let directory = Root::open(scratch.path())?;
     // A capture becomes read-only after its excluded subvolume stubs are replaced.
     let mut args = SnapshotArgs {
@@ -400,17 +404,56 @@ fn snapshot_environment(
     if let Err(error) = &result
         && !published
     {
-        let mut args = VolumeArgs {
-            fd: 0,
-            name: [0; 4088],
-        };
-        args.name[..4].copy_from_slice(b"root");
-        const DESTROY: Opcode = opcode::write::<VolumeArgs>(0x94, 15);
-        // SAFETY: BTRFS_IOC_SNAP_DESTROY reads the initialized UAPI buffer.
-        unsafe { ioctl(directory.as_file(), Updater::<DESTROY, _>::new(&mut args)) }
+        destroy_child(&directory, CAPTURED)
             .with_context(|| format!("removing the failed capture after {error:#}"))?;
     }
     result
+}
+
+/// Remove the captures that interrupted runs left in `directory`, such as
+/// staging roots abandoned in the environments directory, and return how
+/// many were removed. A capture that a running process holds is kept.
+pub(crate) fn sweep_captures(directory: &Path) -> Result<usize> {
+    scratch::sweep(directory, CAPTURE_PREFIX, remove_stale_capture)
+}
+
+/// Delete the snapshot inside an abandoned capture's scratch directory. Only
+/// a Btrfs subvolume root named `root` is deleted; anything else stops the
+/// cleanup.
+fn remove_stale_capture(stale: &Path) -> Result<()> {
+    let stale = Root::open(stale)?;
+    let info = match statat(stale.as_file(), CAPTURED, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(info) => info,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let snapshot = stale.subdir(CAPTURED)?;
+    ensure!(
+        FileType::from_raw_mode(info.st_mode) == FileType::Directory
+            && fstatfs(snapshot.as_file())?.f_type == libc::BTRFS_SUPER_MAGIC
+            && snapshot.as_file().metadata()?.ino() == 256,
+        "the abandoned capture holds something other than a Btrfs snapshot"
+    );
+    drop(snapshot);
+    destroy_child(&stale, CAPTURED)
+}
+
+/// The scratch directories of captures in progress.
+const CAPTURE_PREFIX: &str = ".cps-capture-";
+/// The snapshot subvolume inside a capture's scratch directory.
+const CAPTURED: &str = "root";
+
+/// Delete the Btrfs subvolume `name` directly inside `directory`.
+fn destroy_child(directory: &Root, name: &str) -> Result<()> {
+    let mut args = VolumeArgs {
+        fd: 0,
+        name: [0; 4088],
+    };
+    args.name[..name.len()].copy_from_slice(name.as_bytes());
+    const DESTROY: Opcode = opcode::write::<VolumeArgs>(0x94, 15);
+    // SAFETY: BTRFS_IOC_SNAP_DESTROY reads the initialized UAPI buffer.
+    unsafe { ioctl(directory.as_file(), Updater::<DESTROY, _>::new(&mut args)) }?;
+    Ok(())
 }
 
 fn subvolume_flags(root: &Root) -> Result<u64> {
@@ -607,8 +650,8 @@ mod tests {
                 sha256: "c".repeat(64),
                 size,
                 mode: 0o644,
-                uid: 0,
-                gid: 0,
+                owner: "root".into(),
+                group: "root".into(),
                 capabilities: None,
             }),
             detach: false,

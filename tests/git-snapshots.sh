@@ -33,7 +33,7 @@ cat > template.build.kdl <<KDL
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="$(printf '%064d' 0)" key-sha256="$(printf '%064d' 0)"
+        publisher "seed" catalog-sha256="$(printf '%064d' 0)" key-sha256="$(printf '%064d' 0)"
         package "devel/base"
     }
     manifest "template.kdl" sha256="$manifest_sha256"

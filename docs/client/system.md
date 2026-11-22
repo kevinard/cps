@@ -130,8 +130,10 @@ plan as selected.
 
 `reboot_required` is a boolean for the actionable plan and `reboot_reason`
 explains a required reboot. Both fields are `null` when the upgrade is
-blocked. The command exits with status 0 for a successful check with or
-without updates, and status 1 if blocked. Refresh progress goes to stderr.
+blocked. The command exits with status 3 when updates are available, 0
+when there are none or a rollout holds them back, and 1 if blocked; see
+[exit statuses](../reference/exit-status.md). Refresh progress goes to
+stderr.
 
 ## Remove packages and select publishers
 
@@ -152,8 +154,7 @@ When a new package is available from several publishers, an interactive
 `install` shows a choice with the newest matching version from each.
 Press Enter for the first choice or enter a number. Use
 `cps://PUBLISHER/NAME` to select a publisher explicitly, and
-`NAME@VERSION` with the version spelled exactly as in the package ID to
-select a version; see [package selectors](queries.md#package-selectors-and-versions).
+`NAME@VERSION` to select a release; see [package selectors](queries.md#package-selectors-and-versions).
 `--yes` and `--dry-run` use the configured search order. Installed packages
 keep their original publisher.
 
@@ -173,6 +174,14 @@ apply like `install`: live, or staged when a written path needs a reboot.
 for what each one does.
 
 ## How live changes apply
+
+System commands that change the running root or its boot environments take
+turns: one that starts while another runs prints `Waiting for another CPS
+command to release the boot environments` and continues when the other
+finishes. The `Proceed?` prompt does not keep others waiting. Once you
+confirm, CPS takes its turn again and checks that the plan still matches the
+system, so a change that another command made meanwhile stops the stale
+plan instead of being overwritten.
 
 The preview lists what the change does to running services:
 
@@ -291,12 +300,18 @@ sudo cps config diff /etc/hostname
 ```
 
 `config list` shows saved running versions as `saved local`, and
-`config diff` compares the current file with the saved one. Copy what you
+`config diff` compares the current file with the newest saved one. Both are
+read inside the image, and a symbolic link is compared by its target rather
+than followed, so the diff never shows a file from outside the image. Copy what you
 need, then delete the saved copy. `journalctl -b -1 -u cps-finalize-trial`
 shows the merge report of the previous shutdown.
 
 A crash, power loss, or `reboot --force` skips the merge, and the trial boots
-with `/etc` as it was at staging. The merge builds the new `/etc` beside the
+with `/etc` as it was at staging. Staging records that the trial needs the
+merge, so its health check then fails: systemd-boot does not bless it,
+falls back to the previous environment once the trial's attempts are used,
+and that environment still has your changes. Stage the change again from
+there. The merge builds the new `/etc` beside the
 trial's and swaps them in one rename, so an interruption leaves the trial
 with either `/etc`. If the merge fails, CPS leaves the trial's `/etc` as it
 was and cancels the trial, so the next boot starts the fallback with all of
@@ -360,7 +375,25 @@ files and what it cannot undo.
 ## Follow a saved plan
 
 Pass `--save-plan PATH` to a system package command to record the exact plan
-it displays. This also works with `--dry-run`. Use
+it displays. This also works with `--dry-run`. The plan records how it runs:
+live on the running root, staged in a trial boot environment (with `--stage`,
+or when the change needs a reboot), or as a recovery root. Review it, then
+run it later the same way:
+
+```sh
+sudo cps upgrade --dry-run --save-plan upgrade.json
+sudo cps fetch upgrade.json
+sudo cps apply upgrade.json
+```
+
+`cps apply` without `--root` refuses a plan that is no longer current, such
+as one made before another change to the running system, and a live plan
+that now needs a reboot, for example after `stage-packages` changed. Plan the
+change again in either case. `cps apply --dry-run PLAN` checks the cached
+payloads without applying. A plan saved for an image that `--root` names runs
+only with `--root`, and a plan saved on the running system only without it.
+
+Use
 `cps status --plan PATH` to follow it, and add `--json` for a report that
 scripts can read. The report includes the plan's SHA-256, its phase, the
 revision, and the boot environment when applicable. The JSON report spells
@@ -376,8 +409,8 @@ result outside the running and selected roots reports
 that environment. A later live change reports its own transaction phase.
 
 The same commands take `--root` to change an
-[inactive image](images.md), where `cps fetch` and `cps apply` complete a
-saved plan. `cps boot` manages boot environments.
+[inactive image](images.md), where `cps fetch --root` and `cps apply --root`
+complete a saved plan. `cps boot` manages boot environments.
 
 ## Repair, restore defaults, and verify
 

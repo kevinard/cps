@@ -11,7 +11,7 @@ use rustix::fs::{AtFlags, FileType, FlockOperation, RenameFlags, flock, renameat
 use super::{
     Inventory, inventory, lock_esp, manage,
     policy::{self, BootEntry, LoaderPolicy},
-    uefi, verify_fallback_artifacts,
+    require_readable, uefi, verify_fallback_artifacts,
 };
 use crate::{
     boot::{btrfs_boot::BtrfsVolume, uki},
@@ -52,7 +52,7 @@ fn entries_dir(esp: &Path) -> Result<&'static str> {
 }
 
 /// Retire an inactive Btrfs root and its private boot artifacts, with retryable cleanup.
-pub fn destroy_btrfs_boot_environment(
+pub(crate) fn destroy_btrfs_boot_environment(
     esp: &Path,
     volume: &Path,
     id: &str,
@@ -83,14 +83,18 @@ fn destroy(
         dry_run || !exhausted,
         "only a dry run can assume exhaustion"
     );
+    let volume_path = volume;
     let volume = BtrfsVolume::open(volume)?;
     let esp = fs::canonicalize(esp).context("opening the EFI system partition")?;
     let esp_lock = lock_esp(&esp, FlockOperation::LockExclusive)?;
     let Inventory {
         policy,
         mut entries,
+        invalid,
         firmware,
     } = inventory(&esp, &esp_lock, false)?;
+    // An unreadable entry might boot the root or artifacts being removed.
+    require_readable(&invalid)?;
     let policy = policy.context("no CPS boot environments registered")?;
     let mut retiring = pending(&esp)?;
     // An interrupted destruction resumes, so a retiring record wins, and a
@@ -208,6 +212,17 @@ fn destroy(
     } else {
         None
     };
+    // The kernel refuses to delete the filesystem's default subvolume, but
+    // only after the entry is retired, which would leave it retiring for good.
+    if root.is_some() {
+        ensure!(
+            volume.default_subvolume()? != record.subvolid,
+            "the root of {id} is the Btrfs filesystem default subvolume (ID {}); choose another \
+             default, for example with `btrfs subvolume set-default 5 {}`, then retry",
+            record.subvolid,
+            volume_path.display()
+        );
+    }
     let esp_root = Root::open(&esp)?;
     check_artifacts(&esp_root, id)?;
     if dry_run {
@@ -232,14 +247,8 @@ fn destroy(
     if resumed.is_none() {
         // An exhausted preferred trial is no longer selected. Remove its
         // obsolete preference before withdrawing the entry from systemd-boot.
-        if firmware.is_none()
-            && let LoaderPolicy::Pinned {
-                default,
-                preferred: Some(preferred),
-            } = &policy
-            && preferred == id
-        {
-            LoaderPolicy::pinned(default).write(&esp.join("loader/loader.conf"))?;
+        if firmware.is_none() && policy.preferred.as_deref() == Some(id) {
+            LoaderPolicy::pinned(&policy.default).write(&esp.join("loader/loader.conf"))?;
         }
         renameat_with(
             &loader_entries,
@@ -252,12 +261,29 @@ fn destroy(
         File::open(Root::fd_path(&loader_entries).join(&marker))?.sync_all()?;
         loader_entries.sync_all()?;
     }
+    let withdrawn_from_firmware = firmware.is_some();
     if let Some(firmware) = firmware {
         firmware.remove(id)?;
     }
     if let Some(root) = &root {
         check_inactive(root)?;
-        volume.destroy(record, root)?;
+        if let Err(error) = volume.destroy(record, root) {
+            // The root still boots. Put a systemd-boot entry back so the
+            // environment is not left retiring; a direct UEFI environment has
+            // already lost its firmware option and stays retiring.
+            if !withdrawn_from_firmware && resumed.is_none() {
+                renameat_with(
+                    &loader_entries,
+                    &marker,
+                    &loader_entries,
+                    filename,
+                    RenameFlags::NOREPLACE,
+                )?;
+                File::open(Root::fd_path(&loader_entries).join(filename))?.sync_all()?;
+                loader_entries.sync_all()?;
+            }
+            return Err(error.context(format!("deleting the root of {id}")));
+        }
     }
     remove_artifacts(&esp_root, id)?;
     unlinkat(&loader_entries, &marker, AtFlags::empty())?;
@@ -270,29 +296,19 @@ fn check_selection<'a>(
     entries: &'a [BootEntry],
     target: &BootEntry,
 ) -> Result<&'a BootEntry> {
-    // The target was removed from the candidate inventory. Explicitly check
-    // selectors before choosing a retained entry so Automatic cannot hide it.
-    if let LoaderPolicy::Pinned { default, preferred } = policy {
-        ensure!(
-            default != &target.id,
-            "cannot destroy the configured default environment"
-        );
-        ensure!(
-            preferred.as_deref() != Some(&target.id) || target.tries == Some(0),
-            "cannot destroy the selected boot environment"
-        );
-    }
+    // The target was removed from the candidate inventory, so the selectors
+    // are checked against it explicitly before choosing a retained entry.
+    ensure!(
+        policy.default != target.id,
+        "cannot destroy the configured default environment"
+    );
+    ensure!(
+        policy.preferred.as_deref() != Some(&target.id) || target.tries == Some(0),
+        "cannot destroy the selected boot environment"
+    );
     let selected = policy
         .selected(entries)
         .context("no retained default CPS boot environment")?;
-    if matches!(policy, LoaderPolicy::Automatic) {
-        ensure!(
-            target.tries == Some(0)
-                || (target.revision, target.id.as_str())
-                    < (selected.revision, selected.id.as_str()),
-            "cannot destroy the selected boot environment"
-        );
-    }
     ensure!(
         selected.tries.is_none(),
         "select a known-good environment before destroying old roots"
@@ -465,18 +481,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            check_selection(
-                &LoaderPolicy::Automatic,
-                &[entry(2, Some(&old.id), None)],
-                &current
-            )
-            .is_err()
-        );
         let exhausted = entry(4, Some(&current.id), Some(0));
         assert!(
             check_selection(
-                &LoaderPolicy::Automatic,
+                &LoaderPolicy::trial(&current.id, &exhausted.id),
                 &[entry(3, Some(&base.id), None)],
                 &exhausted
             )

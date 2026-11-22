@@ -339,3 +339,97 @@ fn ensure_not(condition: bool, message: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn a_trial_waiting_for_its_etc_merge_is_not_healthy() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "test/pkg",
+        "1.0.0-0",
+        f.file("usr/share/pkg", "pkg", "0644", "")?,
+    )?;
+    f.create()?;
+    let image = crate::image::Image::open_query(&f.root)?;
+    crate::boot::etc_merge::require_merge(&image)?;
+    let findings = crate::verify_quick(&f.root)?;
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.is_error && finding.message.contains("were not merged")),
+        "{findings:?}"
+    );
+    // A completed merge for the trial's revision satisfies the requirement.
+    let state = f.root.join("usr/lib/sysimage/cps");
+    let report = crate::boot::EtcMergeReport {
+        revision: image.settings()?.revision,
+        ..Default::default()
+    };
+    fs::write(
+        state.join(crate::boot::etc_merge::REPORT),
+        serde_json::to_vec(&report)?,
+    )?;
+    assert!(crate::verify_quick(&f.root)?.is_empty());
+    // A report of another revision does not.
+    fs::write(
+        state.join(crate::boot::etc_merge::REPORT),
+        serde_json::to_vec(&crate::boot::EtcMergeReport {
+            revision: 7,
+            ..Default::default()
+        })?,
+    )?;
+    assert!(!crate::verify_quick(&f.root)?.is_empty());
+    // Live changes after the trial booted leave the requirement behind.
+    drop(image);
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/pkg".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    assert!(crate::verify_quick(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn saved_versions_diff_beneath_the_root_in_attempt_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let stash = root
+        .join(crate::image::CONFIG_UPDATES_DIRECTORY)
+        .join(etc_merge::STASH);
+    fs::create_dir_all(stash.join("7-9/etc"))?;
+    fs::write(stash.join("7-9/etc/app.conf"), "ninth\n")?;
+    // The latest attempt saved a symbolic link to a file that exists on the host.
+    fs::create_dir_all(stash.join("7-10/etc"))?;
+    std::os::unix::fs::symlink("/etc/os-release", stash.join("7-10/etc/app.conf"))?;
+    fs::create_dir_all(root.join("etc"))?;
+    std::os::unix::fs::symlink("/etc/hostname", root.join("etc/app.conf"))?;
+
+    let saved = crate::saved_etc_versions(root)?;
+    let (revision, _, copy) = saved
+        .iter()
+        .rfind(|(_, path, _)| path == "etc/app.conf")
+        .expect("a saved version");
+    assert_eq!(*revision, 7);
+    assert!(copy.ends_with("/7-10/etc/app.conf"), "{copy}");
+
+    let current = dir.path().join("current");
+    let previous = dir.path().join("saved");
+    crate::plan::saved_diff_inputs(
+        root,
+        "etc/app.conf",
+        copy,
+        &mut fs::File::create_new(&current)?,
+        &mut fs::File::create_new(&previous)?,
+    )?;
+    assert_eq!(
+        fs::read_to_string(current)?,
+        "symbolic link to /etc/hostname\n"
+    );
+    assert_eq!(
+        fs::read_to_string(previous)?,
+        "symbolic link to /etc/os-release\n"
+    );
+    Ok(())
+}

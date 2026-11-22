@@ -34,9 +34,9 @@ use crate::{
 };
 
 pub(crate) use catalogs::{CandidateSet, claim_source};
-pub use config::{ConfigChoice, ConfigUpdate, config_diff_inputs, list_config_updates};
-pub use freeze::{FreezeChange, FrozenPackage, list_freezes};
-pub use intent::{IntentChange, MarkChoice};
+pub(crate) use config::{ConfigChoice, config_diff_inputs, list_config_updates, saved_diff_inputs};
+pub(crate) use freeze::{FreezeChange, FrozenPackage, list_freezes};
+pub(crate) use intent::{IntentChange, MarkChoice};
 use order::WriteOrder;
 pub(crate) use paths::{
     check_directory, choose_mediators, effective_paths, hardlink_groups, mediator_offers,
@@ -46,7 +46,7 @@ pub(crate) use rename::Renames;
 pub(crate) use resolve::{
     Candidates, Retention, check as check_dependencies, resolve as resolve_packages,
 };
-pub use update::{HeldBackUpdate, PhasedUpdateDeferred};
+pub(crate) use update::{HeldBackUpdate, PhasedUpdateDeferred};
 
 fn is_config_update(path: &str) -> bool {
     path.strip_prefix(CONFIG_UPDATES_DIRECTORY)
@@ -57,7 +57,7 @@ const PLAN_FORMAT: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Request {
+pub(crate) enum Request {
     Install {
         packages: Vec<String>,
     },
@@ -122,12 +122,12 @@ pub enum Request {
 impl Request {
     /// Whether the running system can apply this request. Provisioning a
     /// release profile or a lock only makes sense for a new, empty image.
-    pub fn applies_live(&self) -> bool {
+    pub(crate) fn applies_live(&self) -> bool {
         !matches!(self, Self::InstallProfile | Self::InstallLock { .. })
     }
 
     /// The cps command that makes this request, as `cps history` shows it.
-    pub fn operation(&self) -> &'static str {
+    pub(crate) fn operation(&self) -> &'static str {
         match self {
             Self::Install { .. } => "install",
             Self::InstallBuildDeps { .. } => "install --build-deps",
@@ -175,7 +175,7 @@ pub(crate) struct ConfigMove {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackageChange {
+pub(crate) struct PackageChange {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher: Option<String>,
@@ -195,9 +195,10 @@ struct Transfer {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Plan {
+pub(crate) struct Plan {
     format: u32,
-    // Required to distinguish the current schema from development format 1 plans.
+    /// Whether planning added recommended packages. Apply plans the request
+    /// again with the same choice to check that the plan is still current.
     pub(crate) install_recommends: bool,
     pub(crate) image: String,
     pub(crate) base_revision: u64,
@@ -211,6 +212,11 @@ pub struct Plan {
     deferred_publishers: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) catalogs: BTreeMap<String, String>,
+    /// Publishers whose pinned trust root the plan advances, which is work
+    /// even when no package changes, such as after a publisher rotates a
+    /// key and re-signs the same packages.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) trust_updates: BTreeSet<String>,
     pub(crate) request: Request,
     selected: BTreeMap<String, String>,
     package_changes: Vec<PackageChange>,
@@ -237,6 +243,22 @@ pub struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kernel_install: Option<Artifacts>,
     payload_bytes: u64,
+    /// How a plan saved on the running system runs there. Absent from plans
+    /// for an image that `--root` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system: Option<SystemMode>,
+}
+
+/// How a saved plan changes the running system.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SystemMode {
+    /// Change the running root in place.
+    Live,
+    /// Stage the change in a new trial boot environment.
+    Staged,
+    /// Prepare a verified recovery root for separate activation.
+    Recovery,
 }
 
 impl Plan {
@@ -295,6 +317,7 @@ impl Plan {
     /// as freezes, rules, and preferences that leave every file alone.
     pub(crate) fn changes_image(&self) -> bool {
         self.has_changes()
+            || !self.trust_updates.is_empty()
             || !self.freeze_changes.is_empty()
             || !self.recomposed.is_empty()
             || self.config_update_revision.is_some()
@@ -316,7 +339,7 @@ impl Plan {
             || self.kernel_install.is_some()
     }
 
-    pub fn deferred_publishers(&self) -> &BTreeSet<String> {
+    pub(crate) fn deferred_publishers(&self) -> &BTreeSet<String> {
         &self.deferred_publishers
     }
 
@@ -340,6 +363,7 @@ impl Plan {
             git_updates: Vec::new(),
             deferred_publishers: BTreeSet::new(),
             catalogs: BTreeMap::new(),
+            trust_updates: BTreeSet::new(),
             request,
             selected: installed
                 .iter()
@@ -358,11 +382,13 @@ impl Plan {
             retired_triggers: Vec::new(),
             kernel_install: None,
             payload_bytes: 0,
+            system: None,
         }
     }
 
     pub(crate) fn transaction_details(&self) -> TransactionDetails {
         TransactionDetails {
+            format: crate::image::history::DETAILS_FORMAT,
             base_image: self.image.clone(),
             base_revision: self.base_revision,
             request: self.request.clone(),
@@ -385,7 +411,7 @@ impl Plan {
         }
     }
 
-    pub fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         let mut lines = vec![format!(
             "Image {} at revision {}",
             self.image, self.base_revision
@@ -398,6 +424,9 @@ impl Plan {
         }
         if self.force_phased_update {
             lines.push("Allow upgrade outside the phased rollout".into());
+        }
+        for publisher in &self.trust_updates {
+            lines.push(format!("Advance the trusted catalog of {publisher}"));
         }
         for change in &self.package_changes {
             let name = change.publisher.as_ref().map_or_else(
@@ -629,7 +658,7 @@ impl Plan {
                 && after.arch == before.arch
                 && after.uid == before.uid
                 && after.gid == before.gid
-                && next.publishers == current.publishers
+                && current.publishers.advanced_to(&next.publishers)
                 && after.format == IMAGE_FORMAT,
             "pending state does not match the image identity or transaction revision"
         );
@@ -707,11 +736,12 @@ impl Plan {
     }
 }
 
-pub fn plan(path: &Path, request: Request) -> Result<Plan> {
+pub(crate) fn plan(path: &Path, request: Request) -> Result<Plan> {
     plan_with_options(path, request, PlanOptions::default())
 }
 
-pub fn plan_with_recommends(
+#[cfg(test)]
+pub(crate) fn plan_with_recommends(
     path: &Path,
     request: Request,
     install_recommends: bool,
@@ -727,7 +757,7 @@ pub fn plan_with_recommends(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct PlanOptions {
+pub(crate) struct PlanOptions {
     pub install_recommends: bool,
     pub force_phased_update: bool,
 }
@@ -741,7 +771,11 @@ impl Default for PlanOptions {
     }
 }
 
-pub fn plan_with_options(path: &Path, request: Request, options: PlanOptions) -> Result<Plan> {
+pub(crate) fn plan_with_options(
+    path: &Path,
+    request: Request,
+    options: PlanOptions,
+) -> Result<Plan> {
     Ok(plan_image(path, request, options, None)?.0)
 }
 
@@ -880,8 +914,7 @@ fn resolve_local<'a, P: PackageInfo + 'a>(
         ensure!(
             requested
                 .get(name.as_str())
-                .and_then(|spec| spec.version.as_ref())
-                .is_none_or(|version| version == &manifest.version),
+                .is_none_or(|spec| spec.accepts(&manifest.version)),
             "{name} is protected by the installed signed profile; apply a signed profile update to change it"
         );
         ensure!(
@@ -981,6 +1014,20 @@ fn check_profile_facets(
     Ok(())
 }
 
+/// The publishers whose pinned trust root differs between the image's
+/// state before planning and the planned state. A catalog checkpoint that
+/// moves without the pin is not work on its own: every publication moves
+/// it, and the next plan that changes the image records it.
+fn trust_updates_between(publishers: &crate::image::Publishers, next: &State) -> BTreeSet<String> {
+    publishers
+        .as_slice()
+        .iter()
+        .zip(next.publishers.as_slice())
+        .filter(|(before, after)| before.key != after.key)
+        .map(|(_, after)| after.name.clone())
+        .collect()
+}
+
 fn composition_paths(
     settings: &Settings,
     installed: &BTreeMap<String, Installed>,
@@ -997,7 +1044,7 @@ pub(crate) fn build(
     saved: Option<&Plan>,
     install_recommends: bool,
 ) -> Result<(Plan, State, Vec<BuildReceipt>)> {
-    build_with_update_diagnostics(
+    let (mut plan, next, receipts) = build_with_update_diagnostics(
         image,
         state,
         request,
@@ -1006,9 +1053,13 @@ pub(crate) fn build(
         saved.is_some_and(|plan| plan.force_phased_update),
         None,
         UpdateSelection::default(),
-    )
+    )?;
+    // How a saved plan runs on the system is part of the plan.
+    plan.system = saved.and_then(|saved| saved.system);
+    Ok((plan, next, receipts))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_with_update_diagnostics(
     image: &Image,
     mut state: State,
@@ -1114,6 +1165,7 @@ fn build_with_update_diagnostics(
     let mut next_policy = None;
     let mut recomposed = BTreeSet::new();
     let mut update_profile = matches!(request, Request::UpdateProfile);
+    let mut trust_updates = BTreeSet::new();
     let (mut installed, paths) = match &request {
         Request::ChangeFacet { .. } | Request::ChangeVariant { .. } => {
             let mut policy = state.settings.policy();
@@ -1148,7 +1200,7 @@ fn build_with_update_diagnostics(
             let paths = select_paths(
                 policy.selection(&state.settings.arch),
                 &state.settings.mediators,
-                state.settings.directory(),
+                state.settings.ownership(),
                 &state.installed,
             )?;
             recomposed = recomposed_packages(
@@ -1373,11 +1425,15 @@ fn build_with_update_diagnostics(
                 .filter(|_| track_profile_intent)
                 .map(|intent| {
                     let mut retained = intent.local.clone();
-                    retained.extend(state.installed.iter().filter_map(|(name, package)| {
-                        deferred_publishers
-                            .contains(&package.published.manifest.publisher)
-                            .then(|| name.clone())
-                    }));
+                    retained.extend(
+                        state
+                            .installed
+                            .iter()
+                            .filter(|(_, package)| {
+                                deferred_publishers.contains(&package.published.manifest.publisher)
+                            })
+                            .map(|(name, _)| name.clone()),
+                    );
                     retained
                 });
             let select = |state: &State, requirements: &BTreeMap<&str, PackageSpec<'_>>| {
@@ -1509,7 +1565,12 @@ fn build_with_update_diagnostics(
                     .local
                     .extend(requested.keys().map(|name| (*name).to_owned()));
             }
+            let previous = state.publishers.clone();
             state.settings.catalog_checkpoints = std::mem::take(&mut catalogs.checkpoints);
+            state
+                .publishers
+                .advance_pins(&state.settings.catalog_checkpoints)?;
+            trust_updates = trust_updates_between(&previous, &state);
             (installed, paths)
         }
     };
@@ -1536,6 +1597,7 @@ fn build_with_update_diagnostics(
         force_phased_update,
         git_updates: git_updates.to_vec(),
         deferred_publishers: deferred_publishers.clone(),
+        trust_updates,
         catalogs: catalogs.pins,
         systemd: systemd::plan_actions(&state, &installed, &paths),
         kernel_install,
@@ -2259,7 +2321,7 @@ fn stage_config(
                 before.as_ref().is_none_or(Node::is_dir),
                 "config update directory conflict at {parent}"
             );
-            let after = before.clone().unwrap_or_else(|| settings.directory());
+            let after = before.clone().unwrap_or_else(Node::implicit_directory);
             writes.insert(
                 parent.to_owned(),
                 Write {

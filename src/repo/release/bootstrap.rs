@@ -12,7 +12,7 @@ use super::{
 use crate::{
     model::{digest, validate_publisher},
     repo::{
-        keys::trust::{self, Pinned, TRUST_ROOT_LIMIT},
+        keys::trust::{self, TRUST_ROOT_LIMIT},
         read_limited,
     },
     transport::https_client,
@@ -20,7 +20,7 @@ use crate::{
 
 const PUBLISHER_NAME_LIMIT: u64 = 2 * 1024 * 1024;
 
-pub struct PublisherBootstrap {
+pub(crate) struct PublisherBootstrap {
     pub name: String,
     pub url: Url,
     pub tuf_root: Vec<u8>,
@@ -30,7 +30,7 @@ pub struct PublisherBootstrap {
 
 impl PublisherBootstrap {
     /// Discover the publisher and its trust root using a locally trusted TUF root.
-    pub fn fetch(base: &str, trusted_root: &Path) -> Result<Self> {
+    pub(crate) fn fetch(base: &str, trusted_root: &Path) -> Result<Self> {
         let url = mirror_base(base)?;
         ensure!(
             url.scheme() == "https",
@@ -63,19 +63,19 @@ impl PublisherBootstrap {
     }
 
     /// The SHA-256 of the trusted TUF root document.
-    pub fn tuf_root_fingerprint(&self) -> String {
+    pub(crate) fn tuf_root_fingerprint(&self) -> String {
         digest(&self.tuf_root)
     }
 
     /// The publisher, version, expiry, and key fingerprints of the trust root.
-    pub fn describe(&self) -> Result<String> {
-        Ok(Pinned::parse(&self.trust_root)?.root().to_string())
+    pub(crate) fn describe(&self) -> Result<String> {
+        Ok(trust::decode_file(&self.trust_root)?.to_string())
     }
 
     /// Require the trust root to name exactly these root key fingerprints, so
     /// provisioning does not depend on trusting the first mirror response.
-    pub fn check_root_keys(&self, expected: &[String]) -> Result<()> {
-        trust::check_expected_root_keys(Pinned::parse(&self.trust_root)?.root(), expected)
+    pub(crate) fn check_root_keys(&self, expected: &[String]) -> Result<()> {
+        trust::check_expected_root_keys(&trust::decode_file(&self.trust_root)?, expected)
     }
 }
 
@@ -94,11 +94,12 @@ async fn verified_identity(verified: &Repository, scratch: &Path) -> Result<(Str
     validate_publisher(&name)?;
     let trust_root =
         read_target(verified, scratch, TRUST_ROOT_TARGET, TRUST_ROOT_LIMIT, None).await?;
-    let pinned = Pinned::parse(&trust_root).context("checking the TUF publisher trust root")?;
+    let pinned =
+        trust::decode_file(&trust_root).context("checking the TUF publisher trust root")?;
     ensure!(
-        pinned.root().publisher == name,
+        pinned.publisher == name,
         "TUF publisher trust root belongs to {}, not {name}",
-        pinned.root().publisher
+        pinned.publisher
     );
     Ok((name, trust_root))
 }
@@ -117,12 +118,9 @@ async fn read_target(
 }
 
 #[cfg(test)]
-#[path = "../../../tests/support/tuf.rs"]
-mod tuf;
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_tuf as tuf;
     use std::fs;
     use tough::editor::signed::PathExists;
 
@@ -140,9 +138,11 @@ mod tests {
         let key = publisher.join("key.der");
         fs::write(
             &key,
-            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-                .unwrap()
-                .as_ref(),
+            aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(
+                &aws_lc_rs::rand::SystemRandom::new(),
+            )
+            .unwrap()
+            .as_ref(),
         )?;
         let trust_path = crate::repo::init_trust(&publisher, "extras", &key, None)?;
         let key = fs::read(trust_path)?;
@@ -168,16 +168,18 @@ mod tests {
             .enable_all()
             .build()?;
         let load = || {
-            runtime.block_on(
-                RepositoryLoader::new(
-                    &anchor,
-                    endpoints.metadata.clone(),
-                    endpoints.targets.clone(),
+            runtime
+                .block_on(
+                    RepositoryLoader::new(
+                        &anchor,
+                        endpoints.metadata.clone(),
+                        endpoints.targets.clone(),
+                    )
+                    .transport(MirrorTransport::new(None).expect("default transfer limits"))
+                    .datastore(scratch.path())
+                    .load(),
                 )
-                .transport(MirrorTransport::new(None).expect("default transfer limits"))
-                .datastore(scratch.path())
-                .load(),
-            )
+                .map_err(anyhow::Error::from)
         };
         let verified = load()?;
         let identity = runtime.block_on(verified_identity(&verified, scratch.path()))?;
@@ -189,8 +191,7 @@ mod tests {
             tuf_root: anchor.clone(),
             trust_root: identity.1.clone(),
         };
-        let root_key = Pinned::parse(&key)?
-            .root()
+        let root_key = trust::decode_file(&key)?
             .root_keys
             .iter()
             .map(|key| trust::fingerprint(&key.0))

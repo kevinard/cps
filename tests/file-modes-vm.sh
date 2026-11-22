@@ -36,11 +36,11 @@ for version in 1 2 3 4; do
     cat > modes.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/modes" publisher="modetest" version="$version.0.0-0" {
-    file "bin/helper" mode="$mode" uid=0 gid=0
+    file "bin/helper" mode="$mode"
     hardlink "bin/helper-link" target="bin/helper"
-    dir "tmp" mode="1777" uid=0 gid=0
-    file "tmp/root-owned" mode="0644" uid=0 gid=0
-    dir "srv/shared" mode="2777" uid=0 gid=0
+    dir "tmp" mode="1777"
+    file "tmp/root-owned" mode="0644"
+    dir "srv/shared" mode="2777"
 }
 MANIFEST
     "$cps" publish manifests --repo root/repository --proto proto --key private.der modes.kdl
@@ -48,7 +48,7 @@ done
 cat > groups.kdl <<'MANIFEST'
 schema-version 1 kind="package-manifest"
 package "test/groups" publisher="modetest" version="1.0.0-0" {
-    dir "srv/shared" mode="2777" uid=0 gid=0
+    dir "srv/shared" mode="2777"
 }
 MANIFEST
 "$cps" publish manifests --repo root/repository --proto proto --key private.der groups.kdl

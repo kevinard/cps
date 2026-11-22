@@ -14,7 +14,7 @@ use rustix::fs::{FileType, readlinkat};
 use crate::{
     image::root::Root,
     kdl_format::build::{CollectRule, FacetChoice, Template},
-    model::{Action, Manifest},
+    model::{Action, Manifest, Ownership},
 };
 
 use super::pattern;
@@ -116,7 +116,7 @@ fn first_rule<'a>(template: &'a Template, path: &str) -> Option<&'a CollectRule>
 fn shared_directory(first: &Action, second: &Action) -> Result<bool> {
     Ok(
         matches!((first, second), (Action::Dir { .. }, Action::Dir { .. }))
-            && first.node()? == second.node()?,
+            && first.node(Ownership::Named)? == second.node(Ownership::Named)?,
     )
 }
 
@@ -141,8 +141,8 @@ struct LinkTarget {
     facet: Option<String>,
     variants: BTreeMap<String, String>,
     mode: String,
-    uid: u32,
-    gid: u32,
+    owner: String,
+    group: String,
 }
 
 /// Expand every template against the tree and check that each installed
@@ -261,8 +261,8 @@ pub(crate) fn expand(
                 Entry::Symlink(target) => Action::Symlink {
                     path: path.to_owned(),
                     target: target.clone(),
-                    uid: rule.uid,
-                    gid: rule.gid,
+                    owner: rule.owner.clone(),
+                    group: rule.group.clone(),
                     facet,
                     variants,
                 },
@@ -276,8 +276,8 @@ pub(crate) fn expand(
                             if (link.facet.is_none() || link.facet == facet)
                                 && link.variants == variants
                                 && !rule.preserve
-                                && (&link.mode, link.uid, link.gid)
-                                    == (&mode, rule.uid, rule.gid) =>
+                                && (&link.mode, &link.owner, &link.group)
+                                    == (&mode, &rule.owner, &rule.group) =>
                         {
                             Action::Hardlink {
                                 path: path.to_owned(),
@@ -293,15 +293,15 @@ pub(crate) fn expand(
                                     facet: facet.clone(),
                                     variants: variants.clone(),
                                     mode: mode.clone(),
-                                    uid: rule.uid,
-                                    gid: rule.gid,
+                                    owner: rule.owner.clone(),
+                                    group: rule.group.clone(),
                                 });
                             }
                             Action::File {
                                 path: path.to_owned(),
                                 mode,
-                                uid: rule.uid,
-                                gid: rule.gid,
+                                owner: rule.owner.clone(),
+                                group: rule.group.clone(),
                                 preserve: rule.preserve,
                                 facet,
                                 variants,
@@ -358,19 +358,21 @@ pub(crate) fn check_expansion(template: &Template, expanded: &Manifest, strip: b
             && match action {
                 Action::File {
                     mode,
-                    uid,
-                    gid,
+                    owner,
+                    group,
                     preserve,
                     capabilities,
                     original_name,
                     ..
                 } => {
                     (mode == &file_mode(rule, true) || mode == &file_mode(rule, false))
-                        && (*uid, *gid, *preserve) == (rule.uid, rule.gid, rule.preserve)
+                        && (owner, group, *preserve) == (&rule.owner, &rule.group, rule.preserve)
                         && capabilities.is_none()
                         && original_name.is_none()
                 }
-                Action::Symlink { uid, gid, .. } => (*uid, *gid) == (rule.uid, rule.gid),
+                Action::Symlink { owner, group, .. } => {
+                    (owner, group) == (&rule.owner, &rule.group)
+                }
                 Action::Hardlink { target, .. } => {
                     !rule.preserve && link_matches_rule(&expanded.action, target, rule)
                 }
@@ -390,10 +392,10 @@ pub(crate) fn check_expansion(template: &Template, expanded: &Manifest, strip: b
 /// file with the metadata that the alias's own collect rule gives it.
 fn link_matches_rule(actions: &[Action], target: &str, rule: &CollectRule) -> bool {
     actions.iter().any(|action| {
-        matches!(action, Action::File { path, mode, uid, gid, preserve: false, .. }
+        matches!(action, Action::File { path, mode, owner, group, preserve: false, .. }
             if path == target
                 && (mode == &file_mode(rule, true) || mode == &file_mode(rule, false))
-                && (*uid, *gid) == (rule.uid, rule.gid))
+                && (owner, group) == (&rule.owner, &rule.group))
     })
 }
 
@@ -412,8 +414,8 @@ fn is_debug_action(action: &Action, actions: &[Action]) -> bool {
     let Action::File {
         path,
         mode,
-        uid,
-        gid,
+        owner,
+        group,
         variants,
         preserve: false,
         facet: Some(facet),
@@ -442,9 +444,9 @@ fn is_debug_action(action: &Action, actions: &[Action]) -> bool {
         .is_some_and(|source_path| {
             !source_path.starts_with("usr/lib/debug/")
                 && actions.iter().any(|source| matches!(source,
-                    Action::File { path, uid: source_uid, gid: source_gid, variants: source_variants, .. }
+                    Action::File { path, owner: source_owner, group: source_group, variants: source_variants, .. }
                         if path == source_path
-                            && (uid, gid, variants) == (source_uid, source_gid, source_variants)
+                            && (owner, group, variants) == (source_owner, source_group, source_variants)
                 ))
         });
     mode == "0644" && facet == DEBUG_FACET && (build_id || delta)
@@ -461,10 +463,10 @@ mod tests {
             r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{digest}" key-sha256="{digest}"
+        publisher "seed" catalog-sha256="{digest}" key-sha256="{digest}"
         package "devel/base"
     }}
-    version "1.2.0-1" upstream="1.2"
+    version "1.2.0-1" upstream-version="1.2"
     manifest "compiler.kdl" sha256="{digest}"
     manifest "runtime.kdl" sha256="{digest}"
 {extra}
@@ -487,7 +489,7 @@ build architecture="x86_64" epoch=1700000000 {{
             r#"schema-version 1 kind="package-manifest"
 package "devel/compiler" publisher="canopa" license="GPL-3.0-or-later" {
     require "runtime/libcc" version="={version}"
-    file "usr/bin/cc" mode="0755" uid=0 gid=0
+    file "usr/bin/cc" mode="0755"
     collect "usr/lib/cc/**"
     collect "usr/include/**"
     collect "usr/share/man/**"
@@ -498,7 +500,7 @@ package "devel/compiler" publisher="canopa" license="GPL-3.0-or-later" {
             r#"schema-version 1 kind="package-manifest"
 package "runtime/libcc" publisher="canopa" {
     collect "usr/lib/libcc.so*"
-    collect "etc/cc.conf" preserve=#true facet=#null mode="0640" gid=5
+    collect "etc/cc.conf" preserve=#true facet=#null mode="0640" group="tty"
 }
 "#,
         ]
@@ -581,7 +583,7 @@ package "runtime/libcc" publisher="canopa" {
         );
         assert!(matches!(
             runtime_actions["etc/cc.conf"],
-            Action::File { mode, gid: 5, preserve: true, facet: None, .. } if mode == "0640"
+            Action::File { mode, group, preserve: true, facet: None, .. } if mode == "0640" && group == "tty"
         ));
         for (template, output) in templates.iter().zip(&outputs) {
             check_expansion(template, output, true)?;
@@ -648,8 +650,8 @@ package "runtime/libcc" publisher="canopa" {
         templates[1].collect.push(CollectRule {
             pattern: "usr/lib/**".into(),
             mode: None,
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
             preserve: false,
             facet: FacetChoice::Default,
             variants: BTreeMap::new(),
@@ -704,8 +706,8 @@ package "runtime/libcc" publisher="canopa" {
         compiler.action.push(Action::File {
             path: debug_path(&[0xab, 0xcd, 0xef]),
             mode: "0644".into(),
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
             preserve: false,
             facet: Some(DEBUG_FACET.into()),
             variants: BTreeMap::new(),
@@ -726,8 +728,8 @@ package "runtime/libcc" publisher="canopa" {
         compiler.action.push(Action::File {
             path: debug_delta_path("usr/lib/cc/x"),
             mode: "0644".into(),
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
             preserve: false,
             facet: Some(DEBUG_FACET.into()),
             variants: BTreeMap::new(),
@@ -738,8 +740,8 @@ package "runtime/libcc" publisher="canopa" {
         });
         check_expansion(&templates[0], compiler, true)?;
         let mut changed = compiler.clone();
-        if let Some(Action::File { uid, .. }) = changed.action.last_mut() {
-            *uid = 1;
+        if let Some(Action::File { owner, .. }) = changed.action.last_mut() {
+            *owner = "bin".into();
         }
         assert!(check_expansion(&templates[0], &changed, true).is_err());
         let mut changed = compiler.clone();
@@ -764,8 +766,8 @@ package "runtime/libcc" publisher="canopa" {
         changed.action.push(Action::Symlink {
             path: "etc/passwd".into(),
             target: "x".into(),
-            uid: 0,
-            gid: 0,
+            owner: "root".into(),
+            group: "root".into(),
             facet: None,
             variants: BTreeMap::new(),
         });
@@ -792,7 +794,7 @@ package "runtime/libcc" publisher="canopa" {
             ("usr/lib/a/x".into(), file(false, 1)),
             ("usr/lib/b/y".into(), file(false, 2)),
         ]);
-        let shared = "dir \"usr/lib/plugins\" mode=\"0755\" uid=0 gid=0";
+        let shared = "dir \"usr/lib/plugins\" mode=\"0755\"";
         let templates = [template("a", shared), template("b", shared)];
         let outputs = expand(&templates, &[], &tree)?;
         for (template, output) in templates.iter().zip(&outputs) {
@@ -807,7 +809,7 @@ package "runtime/libcc" publisher="canopa" {
         assert!(message.contains("belongs to both a and b"), "{message}");
         let templates = [
             template("a", shared),
-            template("b", "symlink \"usr/lib/plugins\" target=\"x\" uid=0 gid=0"),
+            template("b", "symlink \"usr/lib/plugins\" target=\"x\""),
         ];
         assert!(expand(&templates, &[], &tree).is_err());
         Ok(())
@@ -875,12 +877,12 @@ package "runtime/libcc" publisher="canopa" {
         // The consistency check rejects a hard link whose target has other metadata.
         assert!(check_expansion(&helper, linked, false).is_err());
         let mut changed = linked.clone();
-        if let Some(Action::File { uid, .. }) = changed
+        if let Some(Action::File { owner, .. }) = changed
             .action
             .iter_mut()
             .find(|action| action.path() == "usr/bin/x")
         {
-            *uid = 1;
+            *owner = "bin".into();
         }
         assert!(check_expansion(&same, &changed, false).is_err());
         Ok(())

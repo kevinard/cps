@@ -10,16 +10,24 @@ use crate::{
     plan::{FreezeChange, IntentChange, PackageChange, Request},
 };
 
+/// The format of the transaction details that this CPS records.
+pub(crate) const DETAILS_FORMAT: u32 = 1;
+
 #[derive(Debug, Serialize)]
-pub struct HistoryEntry {
+pub(crate) struct HistoryEntry {
     pub plan_id: String,
     pub revision: u64,
-    pub details: TransactionDetails,
+    /// The operation, such as `install`.
+    pub operation: String,
+    /// `None` when another CPS version recorded details that this one
+    /// cannot read. The entry still lists the transaction.
+    pub details: Option<TransactionDetails>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct TransactionDetails {
+pub(crate) struct TransactionDetails {
+    pub format: u32,
     pub base_image: String,
     pub base_revision: u64,
     pub request: Request,
@@ -37,12 +45,12 @@ pub struct TransactionDetails {
     pub kernel_release: Option<String>,
 }
 
-pub fn transaction_history(root: &Path, limit: u32) -> Result<Vec<HistoryEntry>> {
+pub(crate) fn transaction_history(root: &Path, limit: u32) -> Result<Vec<HistoryEntry>> {
     ensure!(limit > 0, "history limit must be positive");
     read(root, None, limit)
 }
 
-pub fn transaction_details(root: &Path, plan_id: &str) -> Result<HistoryEntry> {
+pub(crate) fn transaction_details(root: &Path, plan_id: &str) -> Result<HistoryEntry> {
     validate_digest(plan_id).context("invalid transaction plan digest")?;
     read(root, Some(plan_id), 1)?
         .pop()
@@ -64,31 +72,58 @@ pub(super) fn record(
     Ok(())
 }
 
-fn checksum(plan: &str, revision: u64, data: &str) -> String {
+pub(crate) fn checksum(plan: &str, revision: u64, data: &str) -> String {
     digest(format!("cps transaction details v1\n{plan}\n{revision}\n{data}").as_bytes())
 }
 
-fn checked_details(
-    plan: &str,
-    revision: u64,
-    data: &str,
-    hash: &str,
-) -> Result<TransactionDetails> {
+/// The fields of transaction details that every format keeps, so the
+/// history stays readable whatever else a later CPS records.
+#[derive(Deserialize)]
+struct DetailsCore {
+    base_image: String,
+    base_revision: u64,
+    request: RequestKind,
+}
+
+#[derive(Deserialize)]
+struct RequestKind {
+    kind: String,
+}
+
+/// Committed details, checked against their digest and revision.
+struct Checked {
+    base_image: String,
+    operation: String,
+    details: Option<TransactionDetails>,
+}
+
+fn checked_details(plan: &str, revision: u64, data: &str, hash: &str) -> Result<Checked> {
     ensure!(
         checksum(plan, revision, data) == hash,
         "transaction details digest mismatch for {plan}"
     );
-    let details: TransactionDetails = serde_json::from_str(data)?;
-    let expected = if matches!(details.request, Request::ResolveConfig { .. }) {
-        Some(details.base_revision)
+    let core: DetailsCore = serde_json::from_str(data)
+        .with_context(|| format!("reading the transaction details of {plan}"))?;
+    // Resolving a configuration update records the revision it started at.
+    let expected = if core.request.kind == "resolve_config" {
+        Some(core.base_revision)
     } else {
-        details.base_revision.checked_add(1)
+        core.base_revision.checked_add(1)
     };
     ensure!(
-        expected == Some(revision) && is_uuid(&details.base_image),
+        expected == Some(revision) && is_uuid(&core.base_image),
         "transaction details do not match the committed revision"
     );
-    Ok(details)
+    let details = serde_json::from_str::<TransactionDetails>(data)
+        .ok()
+        .filter(|details| details.format == DETAILS_FORMAT);
+    Ok(Checked {
+        base_image: core.base_image,
+        operation: details.as_ref().map_or(core.request.kind, |details| {
+            details.request.operation().to_owned()
+        }),
+        details,
+    })
 }
 
 impl Image {
@@ -134,11 +169,12 @@ fn read(root: &Path, plan: Option<&str>, limit: u32) -> Result<Vec<HistoryEntry>
         );
         let data: String = row.get(2)?;
         let hash: String = row.get(3)?;
-        let details = checked_details(&plan_id, revision, &data, &hash)?;
+        let checked = checked_details(&plan_id, revision, &data, &hash)?;
         history.push(HistoryEntry {
             plan_id,
             revision,
-            details,
+            operation: checked.operation,
+            details: checked.details,
         });
     }
     Ok(history)

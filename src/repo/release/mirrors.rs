@@ -119,20 +119,20 @@ pub(super) fn mirror_base(base: &str) -> Result<Url> {
 
 /// Mirrors of one signed TUF repository, in the order to try them.
 #[derive(Clone, Debug)]
-pub struct Mirror {
+pub(crate) struct Mirror {
     pub(super) endpoints: Vec<Endpoint>,
 }
 
 impl Mirror {
     /// One mirror whose metadata and targets live at separate URLs.
-    pub fn new(metadata: &str, targets: &str) -> Result<Self> {
+    pub(crate) fn new(metadata: &str, targets: &str) -> Result<Self> {
         Ok(Self {
             endpoints: vec![Endpoint::new(metadata, targets)?],
         })
     }
 
     /// One mirror with `metadata/` and `targets/` under a base URL.
-    pub fn from_base(base: &str) -> Result<Self> {
+    pub(crate) fn from_base(base: &str) -> Result<Self> {
         Self::from_base_url(&mirror_base(base)?)
     }
 
@@ -143,7 +143,7 @@ impl Mirror {
     }
 
     /// Append more base URLs for the same signed repository, in preference order.
-    pub fn with_fallbacks(mut self, urls: &[String]) -> Result<Self> {
+    pub(crate) fn with_fallbacks(mut self, urls: &[String]) -> Result<Self> {
         for url in urls {
             let endpoint = Endpoint::from_base(&mirror_base(url)?)?;
             ensure!(
@@ -209,7 +209,7 @@ impl Mirror {
 /// Where a mirror candidate came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MirrorSource {
+pub(crate) enum MirrorSource {
     /// The administrator's local mirror list.
     Local,
     /// The URL the publisher was added from, or the image configuration.
@@ -236,7 +236,7 @@ struct Candidate {
 
 /// The mirrors a sync may use for one publisher.
 #[derive(Clone, Debug)]
-pub struct MirrorSources {
+pub(crate) struct MirrorSources {
     configured: Mirror,
     list: Option<PathBuf>,
     signed: bool,
@@ -244,7 +244,7 @@ pub struct MirrorSources {
 
 impl MirrorSources {
     /// Exactly these mirrors, in this order, as `repo sync` uses them.
-    pub fn explicit(mirror: Mirror) -> Self {
+    pub(crate) fn explicit(mirror: Mirror) -> Self {
         Self {
             configured: mirror,
             list: None,
@@ -411,7 +411,7 @@ fn read_signed_list(state: &Root) -> Result<Option<MirrorList>> {
 /// What the last probe found at a mirror.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MirrorStatus {
+pub(crate) enum MirrorStatus {
     /// Serves the newest timestamp seen, with a valid signature.
     Current,
     /// Serves a valid but older timestamp.
@@ -437,7 +437,7 @@ impl std::fmt::Display for MirrorStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MirrorProbe {
+pub(crate) struct MirrorProbe {
     pub metadata: String,
     pub targets: String,
     pub status: MirrorStatus,
@@ -486,7 +486,7 @@ fn read_ranking(state: &Root) -> Option<MirrorRanking> {
 
 /// One mirror candidate as shown by `cps publisher mirror list`.
 #[derive(Clone, Debug, Serialize)]
-pub struct MirrorEntry {
+pub(crate) struct MirrorEntry {
     pub url: String,
     pub source: MirrorSource,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -497,7 +497,7 @@ pub struct MirrorEntry {
 
 /// A publisher's mirrors in the order the next operation tries them.
 #[derive(Clone, Debug, Serialize)]
-pub struct PublisherMirrors {
+pub(crate) struct PublisherMirrors {
     pub publisher: String,
     /// Unix time of the last ranking.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -635,7 +635,10 @@ fn describe(name: &str, state: &Root, sources: &MirrorSources) -> Result<Publish
 }
 
 /// Show each mirrored publisher's candidates in the order they are tried.
-pub fn list_publisher_mirrors(root: &Path, names: &[String]) -> Result<Vec<PublisherMirrors>> {
+pub(crate) fn list_publisher_mirrors(
+    root: &Path,
+    names: &[String],
+) -> Result<Vec<PublisherMirrors>> {
     mirrored_publishers(root, names)?
         .into_iter()
         .map(|(name, repo, sources)| {
@@ -651,7 +654,10 @@ pub fn list_publisher_mirrors(root: &Path, names: &[String]) -> Result<Vec<Publi
 /// A publisher that cannot be ranked, for example because it was never
 /// synced, keeps its previous order and is reported with its error; the
 /// other publishers are still ranked. Check [`PublisherMirrors::error`].
-pub fn rank_publisher_mirrors(root: &Path, names: &[String]) -> Result<Vec<PublisherMirrors>> {
+pub(crate) fn rank_publisher_mirrors(
+    root: &Path,
+    names: &[String],
+) -> Result<Vec<PublisherMirrors>> {
     let mut report = Vec::new();
     for (name, repo, sources) in mirrored_publishers(root, names)? {
         let ranked = (|| {

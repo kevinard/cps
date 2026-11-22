@@ -65,7 +65,7 @@ configuration.
 
 Once a profile has a signed composition, CPS checks an upgrade from the
 current release before publishing its successor. Set
-`upgrade-from="<signed catalog SHA-256>"` on the profile to check an
+`upgrade-from-sha256="<signed catalog SHA-256>"` on the profile to check an
 additional historical release, or to provide a baseline before the first
 composition is signed. For a fleet with several supported deployed
 releases, add one `upgrade-from "<catalog SHA-256>"` child per historical
@@ -155,7 +155,7 @@ profile "cps-runtime" architecture="x86_64" {
     package "system/cps"
     package "system/canopa-trust"
     package "system/git-build"
-    publisher "canopa-runtime-seed" catalog="<signed seed catalog SHA-256>" {
+    publisher "canopa-runtime-seed" catalog-sha256="<signed seed catalog SHA-256>" {
         repository "../runtime-seed"
         trust-root "../runtime-seed.trust.json"
     }
@@ -166,11 +166,11 @@ Paths resolve relative to the directory containing `publish-policy.kdl`.
 The signer checks each pinned catalog against the configured trust root. It
 uses the release publisher first, then companions in declaration order.
 During an upgrade check, installed packages keep their original publishers.
-Set `upgrade-from` on a companion to pin a different baseline catalog for
+Set `upgrade-from-sha256` on a companion to pin a different baseline catalog for
 that publisher when the baseline lacks a signed record for the profile. If
-the baseline has that record, any companion `upgrade-from` must match its
+the baseline has that record, any companion `upgrade-from-sha256` must match its
 signed pin. A baseline without a profile record or a companion override
-uses the candidate's `catalog` pin.
+uses the candidate's `catalog-sha256` pin.
 
 The primary catalog signs the ordered companion catalog digests. For each
 companion it also records the signed catalog sequence and the SHA-256 of
@@ -243,7 +243,7 @@ To widen the rollout, change the percentage and publish with
 `refresh-profiles=#true` using the current catalog as the release base, or
 run `cps repo widen-rollout` on the exact current catalog. Keeping the same
 composition, roots, and companion pins keeps the same cohorts. If an
-earlier composition is still deployed, the publish policy's `upgrade-from`
+earlier composition is still deployed, the publish policy's `upgrade-from-sha256`
 can also check the transition from that catalog. The
 [release process](release-process.md#widen-a-phased-rollout) can widen in
 approved steps after a health check.

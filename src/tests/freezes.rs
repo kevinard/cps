@@ -60,7 +60,9 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
         freezes[runtime].reason.as_deref(),
         Some("keep known-good graphics ABI")
     );
-    let details = crate::transaction_details(&f.root, &freeze.id()?)?.details;
+    let details = crate::transaction_details(&f.root, &freeze.id()?)?
+        .details
+        .unwrap();
     assert_eq!(details.freeze_changes, freeze.freeze_changes);
     assert_eq!(details.planned_path_changes, 0);
     fs::rename(f.repo.with_extension("offline"), &f.repo)?;
@@ -144,10 +146,12 @@ fn package_freezes_constrain_updates_and_survive_offline_recovery() -> Result<()
     let original: String =
         db.query_row("SELECT data FROM pending WHERE id=1", [], |row| row.get(0))?;
     let mut journal: serde_json::Value = serde_json::from_str(&original)?;
-    journal["journaled"]["next"]["settings"]["freezes"][runtime]["reason"] = "tampered".into();
-    let next: crate::image::StateDelta =
-        serde_json::from_value(journal["journaled"]["next"].clone())?;
-    journal["journaled"]["state_sha256"] = digest(&serde_json::to_vec(&next)?).into();
+    let mut next: serde_json::Value =
+        serde_json::from_str(journal["journaled"]["next"].as_str().unwrap())?;
+    next["settings"]["freezes"][runtime]["reason"] = "tampered".into();
+    let next = next.to_string();
+    journal["journaled"]["state_sha256"] = digest(next.as_bytes()).into();
+    journal["journaled"]["next"] = next.into();
     db.execute(
         "UPDATE pending SET data=?1 WHERE id=1",
         [journal.to_string()],
@@ -228,7 +232,7 @@ publisher "canopa" {{
         fs::write(
             &definition,
             format!(
-                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base-sha256={:?} refresh-profiles=#true\n",
                 fs::read_to_string(f.repo.join("current"))?.trim()
             ),
         )?;
@@ -417,5 +421,63 @@ fn package_freezes_persist_after_removal_and_constrain_reinstallation() -> Resul
     );
     assert_eq!(list_freezes(&f.root)?, before);
     assert!(verify(&f.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn version_selectors_name_releases_not_spellings() -> Result<()> {
+    use crate::list_freezes;
+    let f = Fixture::new()?;
+    let name = "test/tool";
+    f.package(name, "1.0.0-0", f.file(COMPOSITOR, "old", "0755", "")?)?;
+    f.package(name, "2.0.0-0", f.file(COMPOSITOR, "new", "0755", "")?)?;
+    f.create()?;
+    let install = |spec: &str| -> Result<()> {
+        apply(
+            &f.root,
+            &plan(
+                &f.root,
+                Request::Install {
+                    packages: vec![spec.into()],
+                },
+            )?,
+        )?;
+        Ok(())
+    };
+    install(&format!("{name}@2.0.0"))?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "new");
+    install(&format!("{name}@1.0.0"))?;
+    assert_eq!(fs::read_to_string(f.root.join(COMPOSITOR))?, "old");
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Freeze {
+                packages: vec![format!("{name}@0:1.0.0")],
+                reason: None,
+            },
+        )?,
+    )?;
+    assert_eq!(list_freezes(&f.root)?[name].version.to_string(), "1.0.0-0");
+    install(&format!("{name}@01.0.0"))?;
+    assert!(
+        plan(
+            &f.root,
+            Request::Unfreeze {
+                packages: vec![format!("{name}@2.0")],
+            },
+        )
+        .is_err()
+    );
+    apply(
+        &f.root,
+        &plan(
+            &f.root,
+            Request::Unfreeze {
+                packages: vec![format!("{name}@1.0.00")],
+            },
+        )?,
+    )?;
+    assert!(list_freezes(&f.root)?.is_empty());
     Ok(())
 }

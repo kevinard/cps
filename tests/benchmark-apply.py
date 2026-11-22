@@ -47,7 +47,6 @@ def main():
         parser.error("packages, files, and size must be positive")
     binaries = [path.resolve(strict=True)
                 for path in options.cps or [project / "target/release/cps"]]
-    uid, gid = os.getuid(), os.getgid()
 
     if options.work:
         options.work.mkdir(parents=True, exist_ok=True)
@@ -89,7 +88,7 @@ def main():
             for number in range(files):
                 path = (f"usr/share/bench/{name.split('/')[1]}/"
                         f"{number // 100:03}/f{number:05}")
-                lines.append(f'    file "{path}" mode="0644" uid={uid} gid={gid}\n')
+                lines.append(f'    file "{path}" mode="0644"\n')
             manifest = work / "package.kdl"
             manifest.write_text(
                 'schema-version 1 kind="package-manifest"\n'

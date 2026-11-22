@@ -78,7 +78,7 @@ fn publish(
         .into_iter()
         .map(|publisher| {
             format!(
-                "        publisher {publisher:?} catalog={:?} key-sha256={:?}\n",
+                "        publisher {publisher:?} catalog-sha256={:?} key-sha256={:?}\n",
                 digest(b"historical toolchain catalog"),
                 digest(b"historical toolchain key")
             )
@@ -262,7 +262,9 @@ fn installs_build_dependencies_without_installing_outputs_or_running_the_recipe(
     assert!(state.installed["devel/compiler"].explicit);
     assert!(state.installed["library/headers"].explicit);
     assert!(!state.installed["runtime/compiler"].explicit);
-    let details = crate::transaction_details(&fixture.root, &planned.id()?)?.details;
+    let details = crate::transaction_details(&fixture.root, &planned.id()?)?
+        .details
+        .unwrap();
     assert_eq!(details.request, request(&["apps/tool"]));
     assert!(!plan(&fixture.root, Request::Autoremove)?.has_changes());
     assert!(

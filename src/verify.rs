@@ -17,8 +17,8 @@ use crate::{
     repo::profiles::runtime::{self, DEFAULT_LIBRARY_DIRS},
 };
 
-#[derive(Debug)]
-pub struct Finding {
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Finding {
     pub is_error: bool,
     pub message: String,
 }
@@ -48,7 +48,7 @@ impl Checked {
 }
 
 /// Check an image, hashing every managed regular file.
-pub fn verify(path: &Path) -> Result<Vec<Finding>> {
+pub(crate) fn verify(path: &Path) -> Result<Vec<Finding>> {
     verify_image(&Image::open_query(path)?)
 }
 
@@ -61,12 +61,12 @@ pub fn verify(path: &Path) -> Result<Vec<Finding>> {
 /// recorded when it last hashed the file is not read again. Use full
 /// verification to detect changes made below the filesystem, such as an
 /// edited block device, or by someone who resets the system clock.
-pub fn verify_quick(path: &Path) -> Result<Vec<Finding>> {
+pub(crate) fn verify_quick(path: &Path) -> Result<Vec<Finding>> {
     verify_image_quick(&Image::open_query(path)?)
 }
 
 /// Audit the entire installed managed ELF closure without executing its binaries.
-pub fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
+pub(crate) fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     let state = image.state()?;
@@ -86,7 +86,7 @@ pub fn verify_elf_runtime(path: &Path, library_dirs: &[String]) -> Result<()> {
     runtime::audit_installed(&image.root, &paths, &state.settings.arch, library_dirs)
 }
 
-pub fn verify_selected(
+pub(crate) fn verify_selected(
     root: &Path,
     packages: &[String],
     paths: &[String],
@@ -161,7 +161,7 @@ pub(crate) fn selected_paths<'a>(
     Ok(selected)
 }
 
-pub fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
+pub(crate) fn verify_pristine(path: &Path) -> Result<Vec<Finding>> {
     let image = Image::open_query(path)?;
     image.require_clean()?;
     image
@@ -176,9 +176,18 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     check_image(image, false, false)
 }
 
+/// Quick verification gates blessing a boot, so it also requires the /etc
+/// merge of a trial that system commands staged.
 pub(crate) fn verify_image_quick(image: &Image) -> Result<Vec<Finding>> {
     image.require_clean()?;
-    check_image(image, false, true)
+    let mut findings = check_image(image, false, true)?;
+    if let Some(message) = crate::boot::etc_merge::missing_merge(image)? {
+        findings.push(Finding {
+            is_error: true,
+            message,
+        });
+    }
+    Ok(findings)
 }
 
 /// Fail on the first error of a quick verification of an opened image.
@@ -204,6 +213,20 @@ fn check_image(image: &Image, pristine: bool, quick: bool) -> Result<Vec<Finding
     // verified before committing them, instead of parsing every manifest.
     let committed = quick.then_some(&state.installed);
     Ok(check_state(&image.root, &state, pristine, contents, committed, |_| true)?.findings)
+}
+
+/// Check an image's files against `state`, which need not be committed yet,
+/// hashing every file whose recorded fingerprint no longer matches.
+pub(crate) fn check_uncommitted(image: &Image, state: &State) -> Result<Checked> {
+    let records = image.file_records(None)?;
+    check_state(
+        &image.root,
+        state,
+        false,
+        Contents::Fingerprints(&records),
+        Some(&state.installed),
+        |_| true,
+    )
 }
 
 /// Compute the ownership index from the installed manifests, re-verifying
@@ -331,22 +354,22 @@ fn check_state(
             (
                 Node::File {
                     mode,
-                    uid,
-                    gid,
+                    owner,
+                    group,
                     capabilities,
                     ..
                 },
                 Some(Node::File {
                     mode: actual_mode,
-                    uid: actual_uid,
-                    gid: actual_gid,
+                    owner: actual_owner,
+                    group: actual_group,
                     capabilities: actual_capabilities,
                     ..
                 }),
             ) if !pristine
                 && managed.preserve
-                && (mode, uid, gid, capabilities)
-                    == (actual_mode, actual_uid, actual_gid, actual_capabilities) =>
+                && (mode, owner, group, capabilities)
+                    == (actual_mode, actual_owner, actual_group, actual_capabilities) =>
             {
                 findings.push(Finding {
                     is_error: false,
@@ -354,13 +377,26 @@ fn check_state(
                 });
                 continue;
             }
-            (_, None) => "missing",
+            (_, None) => "missing".to_owned(),
             (file @ Node::File { .. }, Some(observed @ Node::File { .. }))
                 if file.capabilities() != observed.capabilities() =>
             {
-                "file capabilities differ"
+                "file capabilities differ".to_owned()
             }
-            _ => "content, type, or metadata differs",
+            (expected, Some(observed))
+                if expected.ownership().is_some_and(|(owner, group)| {
+                    observed.ownership() != Some((owner, group))
+                        && observed.with_ownership(owner, group) == *expected
+                }) =>
+            {
+                let show = |node: &Node| {
+                    node.ownership()
+                        .map(|(owner, group)| format!("{owner}:{group}"))
+                        .unwrap_or_default()
+                };
+                format!("owned by {}, expected {}", show(observed), show(expected))
+            }
+            _ => "content, type, or metadata differs".to_owned(),
         };
         findings.push(Finding {
             is_error: true,

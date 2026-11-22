@@ -133,6 +133,9 @@ if [ -f /volume/@captures/backup-booted ]; then
     test -e /usr/bin/cps-demo-service
     cps status | $bb grep -F 'Reboot pending into '
     : > /volume/@captures/cli-autoremove
+    # A forced reboot skips the merge at shutdown, and a trial that needs
+    # it is never blessed, so merge /etc by hand first.
+    cps boot finalize-trial
     $bb sync
     exec $bb reboot -f
 fi
@@ -244,7 +247,10 @@ if [ ! -f /volume/@captures/live-upgrade.json ]; then
     $bb grep -F 'base changed after staging' /run/rejected
 
     $bb cp /repository/catalog-2.0.0-0 /repository/current
-    report=$(cps upgrade --check --json)
+    # A check that finds updates exits with 3.
+    code=0
+    report=$(cps upgrade --check --json) || code=$?
+    test "$code" = 3
     printf '%s\n' "$report" | $bb grep -F '"status": "updates_available"'
     printf '%s\n' "$report" | $bb grep -F '"name": "test/cps-demo"'
     printf '%s\n' "$report" | $bb grep -F '"reboot_required": false'
@@ -269,7 +275,9 @@ verify_service 2.0.0-0
 test "$(environments)" = "$before"
 
 $bb cp /repository/catalog-base-upgrade /repository/current
-report=$(cps upgrade --check --json)
+code=0
+report=$(cps upgrade --check --json) || code=$?
+test "$code" = 3
 printf '%s\n' "$report" | $bb grep -F '"reboot_required": true'
 test "$(environments)" = "$before"
 if [ -f /etc/cps-btrfs-trial-kernel ]; then

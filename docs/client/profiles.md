@@ -42,11 +42,11 @@ packages. Only a signed profile update can replace the protected set.
 
 ## Install a particular release
 
-To install a particular published release, set `bootstrap-catalog` to the
+To install a particular published release, set `bootstrap-catalog-sha256` to the
 primary publisher's signed catalog digest.
 
 ```kdl
-release-profile "desktop" bootstrap-catalog="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+release-profile "desktop" bootstrap-catalog-sha256="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
 Keep that catalog and its signed companion catalogs in the configured local
@@ -161,7 +161,7 @@ cps image diff installed replica
 
 An image lock is a JSON document with `"format": 1` and
 `"kind": "image-lock"`. It records the exact package composition, publisher
-order and key fingerprints, catalog pins, architecture, image-wide facet
+order and trust root identities, catalog pins, architecture, image-wide facet
 rules, per-package facet rules, variants, and local package requests. The
 replica gets a fresh image identity. The target's KDL configuration supplies
 its repository locations, trust roots, and build trust policies. Give it the

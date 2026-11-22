@@ -20,6 +20,7 @@ one, which applies equally to [the running system](system.md).
 - [Replace a directory with a file or symlink](#replace-a-directory-with-a-file-or-symlink)
 - [Inspect transaction history](#inspect-transaction-history)
 - [Verify an image and locate its state](#verify-an-image-and-locate-its-state)
+- [Who may use an image](#who-may-use-an-image)
 - [Reconcile or remove packages](#reconcile-or-remove-packages)
 - [Repair files or restore vendor defaults](#repair-files-or-restore-vendor-defaults)
 - [Shared-library regressions](#shared-library-regressions)
@@ -77,6 +78,11 @@ the saved plan. `apply -n` is an optional preflight that checks the plan
 against the cached payloads, and `apply` repeats its checks before writing
 package files. Once CPS has recorded the transaction, the verified staged
 payloads let it finish offline.
+
+A request that changes nothing, such as `upgrade` on an up-to-date image,
+prints `Nothing to do.` and commits no revision, and so does `apply` of a
+saved plan that changes nothing. Running the same command again in an image
+pipeline therefore leaves the image and its history unchanged.
 
 A plan applies only to the revision it was made for. After any other change
 commits, apply reports `stale plan for revision N`, and you plan again.
@@ -461,6 +467,41 @@ The directory must be on the image root's own filesystem, and on Btrfs on
 the root subvolume, so each boot environment snapshot carries the package
 state that matches its files. After a transaction commits or aborts, CPS
 clears its recovery copies in `/usr/lib/sysimage/cps/stage`.
+
+## Who may use an image
+
+CPS reads an image's publishers, trust roots and pending transaction as the
+configuration of whoever runs it, so it uses only an image that the same
+user owns and that no other user can change. The image root, `/usr`,
+`/usr/lib`, `/usr/lib/sysimage`, the state directory and its `stage`
+directory, the lock, `state.sqlite` and the files SQLite keeps beside it
+must all belong to the user running CPS, and none may be writable by its
+group or by other users. Root therefore uses only root's images, and a user
+only their own.
+
+A user who builds an image without privileges cannot give its files to
+other accounts, so CPS writes every file as that user, and every owner that
+a manifest names reads back as `root`. Such an image stays usable by that
+user. When root is to manage it, for example on a system booted from a
+disk that a user [built](../setups/disk-image.md), root adopts it once:
+
+```sh
+sudo cps image adopt --root /
+```
+
+Adoption first checks that the packages' files still match their
+manifests, with `verify --quick` semantics, and then records in the image
+state that root is adopting it. It hands every path that the user owns on
+the image's own filesystem to root, keeping set-ID bits and file
+capabilities. Mounted filesystems and nested subvolumes, such as a shared
+`/var`, are left alone. It runs `systemd-sysusers` when the packages name
+accounts that the image does not have yet, and gives each package path that
+exists the owner and group its manifest names. It then verifies every
+package path against those owners, hashing each file whose owner changed,
+records root as the image's owner, and removes the marker. While the marker
+remains, for example after a crash or a failed check, CPS refuses the image
+for every other command; run `cps image adopt` again to finish. Adopt before staging changes or capturing environments from
+the image, because snapshots taken earlier stay the user's.
 
 `/var` is not part of an image. `cps image create` makes `var` an empty
 directory, the mount point of a `/var` that the

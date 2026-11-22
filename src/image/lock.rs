@@ -13,11 +13,14 @@ use super::{Image, Installed, Publisher, Publishers, State, catalogs};
 use crate::{
     kdl_format::ImageDefinition,
     model::{
-        ImagePolicy, Node, PackageFacets, PackageSpec, Selection, Version, digest, validate_digest,
+        ImagePolicy, Node, PackageFacets, PackageSpec, Selection, Version, validate_digest,
         validate_name, validate_policy, validate_publisher,
     },
     query::verified_intent,
-    repo::{CATALOG_LIMIT, PackageInfo, catalog_index, export_locked_repository, read_limited},
+    repo::{
+        CATALOG_LIMIT, PackageInfo, catalog_index, export_locked_repository, read_limited,
+        trust_root_genesis,
+    },
 };
 
 const LOCK_FORMAT: u32 = 1;
@@ -26,7 +29,7 @@ const BUNDLE_REPOSITORIES: &str = "repositories";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImageLock {
+pub(crate) struct ImageLock {
     format: u32,
     kind: LockKind,
     pub(crate) architecture: String,
@@ -55,7 +58,8 @@ enum LockKind {
 pub(crate) struct LockedPublisher {
     pub name: String,
     pub catalog: String,
-    key_sha256: String,
+    /// The SHA-256 of the publisher's version 1 trust root payload.
+    trust_root_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -67,7 +71,7 @@ struct LockedPackage {
 }
 
 /// Capture the installed package composition and its signed catalog pins.
-pub fn capture_image_lock(root: &Path) -> Result<ImageLock> {
+pub(crate) fn capture_image_lock(root: &Path) -> Result<ImageLock> {
     let image = Image::open_query(root)?;
     capture(&image).map(|(lock, _)| lock)
 }
@@ -109,7 +113,7 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
         publishers.push(LockedPublisher {
             name: publisher.name.clone(),
             catalog,
-            key_sha256: digest(&publisher.key),
+            trust_root_sha256: trust_root_genesis(&publisher.key)?,
         });
     }
     let packages = state
@@ -146,7 +150,7 @@ fn capture(image: &Image) -> Result<(ImageLock, State)> {
 }
 
 /// Export the locked composition and the verified objects needed for offline provisioning.
-pub fn export_image_bundle(root: &Path, output: &Path) -> Result<()> {
+pub(crate) fn export_image_bundle(root: &Path, output: &Path) -> Result<()> {
     let image = Image::open_query(root)?;
     let (lock, state) = capture(&image)?;
     ensure!(
@@ -211,7 +215,7 @@ pub fn export_image_bundle(root: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn read_image_lock(path: &Path) -> Result<ImageLock> {
+pub(crate) fn read_image_lock(path: &Path) -> Result<ImageLock> {
     let load = || -> Result<ImageLock> {
         let bytes = read_limited(File::open(path)?, CATALOG_LIMIT)?;
         let lock: ImageLock = serde_json::from_slice(&bytes)?;
@@ -247,7 +251,7 @@ impl ImageLock {
         for publisher in &self.publishers {
             validate_publisher(&publisher.name)?;
             validate_digest(&publisher.catalog)?;
-            validate_digest(&publisher.key_sha256)?;
+            validate_digest(&publisher.trust_root_sha256)?;
             ensure!(
                 names.insert(publisher.name.as_str()),
                 "duplicate locked publisher {}",
@@ -307,8 +311,8 @@ impl ImageLock {
         );
         for (locked, publisher) in self.publishers.iter().zip(publishers) {
             ensure!(
-                digest(&publisher.key) == locked.key_sha256,
-                "configured key differs from the image lock for {}",
+                trust_root_genesis(&publisher.key)? == locked.trust_root_sha256,
+                "configured trust root names a different publisher than the image lock for {}",
                 publisher.name
             );
         }
@@ -354,8 +358,8 @@ impl ImageLock {
             .find(|pin| pin.name == publisher)
             .with_context(|| format!("image lock has no publisher {publisher}"))?;
         ensure!(
-            pin.key_sha256 == digest(key),
-            "image lock uses a different key for {publisher}"
+            pin.trust_root_sha256 == trust_root_genesis(key)?,
+            "image lock uses a different trust root for {publisher}"
         );
         Ok(&pin.catalog)
     }
@@ -428,13 +432,21 @@ impl ImageLock {
 }
 
 /// Initialize a fresh root with the local trust configuration and locked profile.
-pub fn create_image_from_lock(path: &Path, config: &Path, lock: &ImageLock) -> Result<String> {
+pub(crate) fn create_image_from_lock(
+    path: &Path,
+    config: &Path,
+    lock: &ImageLock,
+) -> Result<String> {
     let config = crate::kdl_format::read_image_definition(config)?;
     create_locked(path, config, lock, false)
 }
 
 /// Use the bundle's repositories with publisher keys and policy from local configuration.
-pub fn create_image_from_bundle(path: &Path, config: &Path, bundle: &Path) -> Result<String> {
+pub(crate) fn create_image_from_bundle(
+    path: &Path,
+    config: &Path,
+    bundle: &Path,
+) -> Result<String> {
     let mut config = crate::kdl_format::read_image_definition(config)?;
     let bundle = fs::canonicalize(bundle)?;
     let lock = read_image_lock(&bundle.join(BUNDLE_LOCK))?;

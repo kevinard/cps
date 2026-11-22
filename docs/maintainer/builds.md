@@ -35,10 +35,10 @@ synchronized cache that holds the signed toolchain catalog.
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+        publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
         package "devel/base"
     }
-    version "1.0.0-1" upstream="1.0.0"
+    version "1.0.0-1" upstream-version="1.0.0"
     manifest "hello.kdl" sha256="<manifest SHA-256>"
     source "hello.c" sha256="<source SHA-256>" size=123
     script """
@@ -57,7 +57,7 @@ package "demo/hello" publisher="canopa" summary="Print a greeting" license="MIT"
 }
 ```
 
-`catalog` is the digest of the toolchain repository's signed catalog root,
+`catalog-sha256` is the digest of the toolchain repository's signed catalog root,
 such as the digest in its `current` file when you prepare the recipe.
 `key-sha256` is the SHA-256 of the publisher trust root file that the worker
 pins, such as `sha256sum canopa.trust.json`. Replace the template and
@@ -82,10 +82,10 @@ node. `architecture` names the target, and `epoch` sets
 
 | Node | Meaning |
 | --- | --- |
-| `toolchain solver="sat-v2"` | Required, once. At least one `publisher NAME catalog=... key-sha256=...` pin and at least one `package` request. |
+| `toolchain solver="sat-v2"` | Required, once. At least one `publisher NAME catalog-sha256=... key-sha256=...` pin and at least one `package` request. |
 | `manifest PATH sha256=...` | A package template. One or more, up to 64; each produces one package. |
-| `version VERSION upstream=...` | The version of every produced package. Optional; without it, each template declares its own `version`. |
-| `source PATH sha256=... size=...` | A pinned input, staged under `$CPS_SOURCES`. Add `url` to [fetch it](#preparing-a-source-cache). |
+| `version VERSION upstream-version=...` | The version of every produced package. Optional; without it, each template declares its own `version`. |
+| `source PATH sha256=... size=...` | A pinned input, staged under `$CPS_SOURCES`. Add `url` children to [fetch it](#preparing-a-source-cache). |
 | `script """..."""` | Required. Runs with `/bin/sh -eu` in `/build`, umask `022`. |
 | `discard PATTERN` | Installed paths that no package claims and the build may drop. See [collecting](#collecting-installed-files). |
 | `strip #false` | Ship ELF objects unstripped. See [debug information](#stripping-and-debug-information). |
@@ -121,14 +121,16 @@ version in the recipe and its template by digest.
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1791504000 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+        publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
         package "devel/base"
     }
-    version "3.54.1-1" upstream="3.54.1"
+    version "3.54.1-1" upstream-version="3.54.1"
     manifest "sqlite.kdl" sha256="<template SHA-256>"
     discard "usr/lib/*.la"
     discard "usr/share/doc/**"
-    source "sqlite-autoconf-3540100.tar.gz" size=3332984 sha256="926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e" url="https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
+    source "sqlite-autoconf-3540100.tar.gz" size=3332984 sha256="926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e" {
+        url "https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
+    }
     script """
     tar -xzf "$CPS_SOURCES/sqlite-autoconf-3540100.tar.gz"
     cd sqlite-autoconf-3540100
@@ -156,7 +158,7 @@ inode with an earlier collected file of the same package becomes a
 variants as that file and does not preserve it. Otherwise it stays a `file`
 with its own rule's metadata. Explicit actions in the template keep their exact form and take
 precedence over patterns, so a template can collect `usr/bin/*` and still
-declare `file "usr/bin/su" mode="4755" uid=0 gid=0`. Within one template the
+declare `file "usr/bin/su" mode="4755"`. Within one template the
 first matching rule wins. Directories are never collected; declare `dir`
 actions for directories that need explicit metadata.
 
@@ -174,10 +176,10 @@ directory itself. Inside a component, `*` matches any run of characters and
 | Property | Default |
 | --- | --- |
 | `mode` | `"0755"` when the installed file has an execute bit, otherwise `"0644"` |
-| `uid`, `gid` | `0` |
+| `owner`, `group` | `"root"` |
 | `preserve` | `#false` |
 | `facet` | The built-in facet below. `facet=#null` ships the paths without a facet. |
-| `arch`, `variant.NAME` | None |
+| `architecture`, `variant.NAME` | None |
 
 Without a `facet` property, a collected path gets the first matching
 built-in facet:
@@ -244,14 +246,17 @@ headers, manual pages, and debug information, stays in its package as a
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1767225600 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+        publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
         package "devel/base"
     }
-    version "2.4.0-1" upstream="2.4.0"
+    version "2.4.0-1" upstream-version="2.4.0"
     manifest "liblz.kdl" sha256="<template SHA-256>"
     manifest "lz.kdl" sha256="<template SHA-256>"
     discard "usr/lib/liblz.a"
-    source "lz-2.4.0.tar.gz" sha256="<source SHA-256>" size=481920 url="https://lz.example.org/releases/lz-2.4.0.tar.gz"
+    source "lz-2.4.0.tar.gz" sha256="<source SHA-256>" size=481920 {
+        url "https://lz.example.org/releases/lz-2.4.0.tar.gz"
+        url "https://mirror.example.net/lz/lz-2.4.0.tar.gz"
+    }
     script """
     tar -xzf "$CPS_SOURCES/lz-2.4.0.tar.gz"
     cd lz-2.4.0
@@ -293,12 +298,12 @@ the unversioned `liblz.so` link in the `devel` facet, and its debug file in
 ```kdl
 schema-version 1 kind="package-manifest"
 package "library/liblz" publisher="canopa" version="2.4.0-1" upstream-version="2.4.0" summary="LZ compression library" license="BSD-3-Clause" homepage="https://lz.example.org/" {
-    file "usr/include/lz.h" mode="0644" uid=0 gid=0 facet="devel"
-    symlink "usr/lib/liblz.so" target="liblz.so.1" uid=0 gid=0 facet="devel"
-    symlink "usr/lib/liblz.so.1" target="liblz.so.1.0.0" uid=0 gid=0
-    file "usr/lib/liblz.so.1.0.0" mode="0755" uid=0 gid=0
-    file "usr/lib/pkgconfig/lz.pc" mode="0644" uid=0 gid=0 facet="devel"
-    file "usr/lib/debug/.build-id/3d/ff3394e4b04b36c16dbd201c952eecdb4e9d3f.debug" mode="0644" uid=0 gid=0 facet="debug.symbols"
+    file "usr/include/lz.h" mode="0644" facet="devel"
+    symlink "usr/lib/liblz.so" target="liblz.so.1" facet="devel"
+    symlink "usr/lib/liblz.so.1" target="liblz.so.1.0.0"
+    file "usr/lib/liblz.so.1.0.0" mode="0755"
+    file "usr/lib/pkgconfig/lz.pc" mode="0644" facet="devel"
+    file "usr/lib/debug/.build-id/3d/ff3394e4b04b36c16dbd201c952eecdb4e9d3f.debug" mode="0644" facet="debug.symbols"
 }
 ```
 
@@ -466,8 +471,8 @@ publisher trust root file the worker pins for that publisher, such as
 
 ```kdl
 toolchain solver="sat-v2" {
-    publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
-    publisher "tools" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+    publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+    publisher "tools" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
     package "devel/base"
     package "cps://tools/devel/compiler@1.0.0-0"
 }
@@ -517,11 +522,21 @@ moves recipes to it.
 
 ## Preparing a source cache
 
-Add a `url="https://upstream.example.org/releases/hello.c"` property to a
-pinned `source` entry to fetch it. Use the final HTTPS URL, without
-credentials or a fragment. The fetcher checks the exact byte count and
-SHA-256 before publishing an object to the cache. It rejects redirects and
-rechecks existing objects before reuse. Recipes can share a cache by digest.
+Give a pinned `source` entry one or more `url` children to fetch it:
+
+```kdl
+source "hello.c" sha256="<source SHA-256>" size=1234 {
+    url "https://upstream.example.org/releases/hello.c"
+    url "https://mirror.example.net/hello/hello.c"
+}
+```
+
+URLs use HTTPS, without credentials or a fragment. CPS tries them in order
+and uses the first that delivers the exact byte count and SHA-256, so a
+mirror only matters when an earlier URL fails. It follows up to 10
+redirects, all of them to HTTPS URLs, since release assets and mirrors
+usually redirect and the pin decides what is accepted. Existing objects
+are rechecked before reuse, and recipes can share a cache by digest.
 
 ```sh
 cps source fetch --cache source-cache hello.build.kdl
@@ -635,6 +650,17 @@ builders and witnesses sign one run once, and no package can be paired with
 payloads from another run. Each package's catalog entry names the same
 attestation, and clients verify each package against its own manifest and
 payloads in that statement.
+
+CPS reads the envelope in one byte form, as strictly as a
+[catalog envelope](../publisher/publishing.md#signed-catalog-format): compact
+JSON with the fields `payloadType`, `payload`, and `signatures` in that
+order; `payloadType` exactly `application/vnd.in-toto+json`; padded standard
+base64 for the payload and each signature; and 1 to 16 signatures sorted by
+unique `keyid`, each the lowercase SHA-256 of the raw Ed25519 public key with
+a 64-byte signature. An envelope in any other spelling, or with a signature
+it cannot decode, is rejected rather than read around. A signature by a key
+the reader trusts must verify; signatures by other keys, such as witnesses
+an image does not trust, are skipped.
 
 `publish bundle` verifies the statement and checks that each expanded
 manifest is what its pinned template produces: the same metadata,

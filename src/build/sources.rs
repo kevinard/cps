@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use futures_util::TryStreamExt;
-use reqwest::{Client, StatusCode, header::ACCEPT_ENCODING};
+use reqwest::{Client, StatusCode, header::ACCEPT_ENCODING, redirect::Policy};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -26,17 +26,17 @@ use crate::{
 pub(crate) const OBJECTS: &str = "sha256";
 
 /// Fetch missing pinned inputs over HTTPS and verify every object in the recipe.
-pub fn fetch_sources(recipe: &Path, cache: &Path) -> Result<usize> {
+pub(crate) fn fetch_sources(recipe: &Path, cache: &Path) -> Result<usize> {
     cache_sources(recipe, cache, None, true)
 }
 
 /// Prefer local recipe inputs and fetch missing ones over HTTPS.
-pub fn fetch_sources_with_local(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
+pub(crate) fn fetch_sources_with_local(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
     cache_sources(recipe, cache, Some(Root::open(from)?), true)
 }
 
 /// Verify and cache pinned inputs from a local directory, offline.
-pub fn import_sources(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
+pub(crate) fn import_sources(recipe: &Path, cache: &Path, from: &Path) -> Result<usize> {
     cache_sources(recipe, cache, Some(Root::open(from)?), false)
 }
 
@@ -73,17 +73,35 @@ fn cache_sources(recipe: &Path, cache: &Path, local: Option<Root>, fetch: bool) 
             copy_verified(file, temp.as_file_mut(), pin, name)?;
         } else {
             ensure!(fetch, "no local source file for {name}");
-            let (name, url) = aliases
+            let urls: Vec<_> = aliases
                 .iter()
-                .find_map(|(name, source)| source.url.as_ref().map(|url| (*name, url)))
-                .with_context(|| format!("source {name} is uncached and has no URL"))?;
+                .flat_map(|(_, source)| &source.urls)
+                .collect();
+            ensure!(!urls.is_empty(), "source {name} is uncached and has no URL");
             let (runtime, client) = match &https {
                 Some(https) => https,
                 None => https.insert(http()?),
             };
-            runtime
-                .block_on(download(client, url, temp.as_file_mut(), pin))
-                .with_context(|| format!("fetching source {name}"))?;
+            // Each URL must deliver the pinned bytes; the next one is tried
+            // only after a failure.
+            let mut failures = Vec::new();
+            for url in urls {
+                let file = temp.as_file_mut();
+                file.set_len(0)?;
+                file.rewind()?;
+                match runtime.block_on(download(client, url, file, pin)) {
+                    Ok(()) => {
+                        failures.clear();
+                        break;
+                    }
+                    Err(error) => failures.push(format!("{url}: {error:#}")),
+                }
+            }
+            ensure!(
+                failures.is_empty(),
+                "fetching source {name} failed from every URL:\n  {}",
+                failures.join("\n  ")
+            );
         }
         publish_verified(&cache, temp, pin)?;
     }
@@ -144,9 +162,24 @@ pub(crate) fn publish_verified(cache: &Root, temp: NamedTempFile, pin: &FileDige
     Ok(())
 }
 
+/// The most redirects a source download follows.
+const MAX_REDIRECTS: usize = 10;
+
 fn http() -> Result<(Runtime, Client)> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
+    // Release assets and mirrors usually redirect. The content is pinned by
+    // digest, so following HTTPS redirects cannot change what is accepted.
+    let redirects = Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error(format!("more than {MAX_REDIRECTS} redirects"))
+        } else if attempt.url().scheme() != "https" {
+            attempt.error("redirect leaves HTTPS")
+        } else {
+            attempt.follow()
+        }
+    });
     let client = https_client()
+        .redirect(redirects)
         .timeout(Duration::from_secs(30 * 60))
         .build()?;
     Ok((runtime, client))

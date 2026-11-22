@@ -167,7 +167,7 @@ C
         cat > cap.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/raw-probe" publisher="captest" version="$version.0.0-0" {
-    file "bin/raw-probe" mode="0755" uid=0 gid=0 $flags
+    file "bin/raw-probe" mode="0755" $flags
     hardlink "bin/raw-probe-alias" target="bin/raw-probe"
 }
 MANIFEST
@@ -219,8 +219,11 @@ setup_systemd_guest() {
         cp -L "$binary" "$root/usr/bin/$command"
         copy_runtime_deps "$root" "$binary" "$merged"
     done
-    printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
-    printf 'root:x:0:\n' > "$root/etc/group"
+    # The runtime package ships the account databases, so they already hold
+    # the account that system/cps declares in sysusers.d.
+    printf 'root:x:0:0:root:/root:/bin/sh\ncps-build:x:999:999:CPS Git package builds:/:/usr/bin/nologin\n' \
+        > "$root/etc/passwd"
+    printf 'root:x:0:\ncps-build:x:999:\n' > "$root/etc/group"
     printf 'ID=canopa\nPRETTY_NAME="Canopa CPS VM"\n' > "$root/etc/os-release"
     printf '9b6c080d423b4a6090307e0670659a21\n' > "$root/etc/machine-id"
     mkdir -p "$root/etc/systemd/system.conf.d"

@@ -33,9 +33,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def do_GET(self):
-        if self.path == '/redirect':
+        redirects = {
+            '/redirect': '/hop',
+            '/hop': '/payload',
+            '/insecure': 'http://127.0.0.1:1/payload',
+            '/loop': '/loop',
+        }
+        if self.path in redirects:
             self.send_response(302)
-            self.send_header('Location', '/payload')
+            self.send_header('Location', redirects[self.path])
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
@@ -73,12 +79,14 @@ recipe() {
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="$digest" key-sha256="$digest"
+        publisher "seed" catalog-sha256="$digest" key-sha256="$digest"
         package "build/base"
     }
     manifest "manifest.kdl" sha256="$digest"
     ${2:-}
-    source "nested/input" sha256="$digest" size=3$1
+    source "nested/input" sha256="$digest" size=3 {
+$1
+    }
     script "true"
 }
 RECIPE
@@ -88,7 +96,7 @@ fetch() {
 }
 reject() {
     local path=$1 error=$2
-    recipe " url=\"$base/$path\"" > "$path.kdl"
+    recipe "        url \"$base/$path\"" > "$path.kdl"
     if fetch "cache-$path" "$path.kdl" > reject.log 2>&1; then
         echo "unexpected success for $path" >&2
         exit 1
@@ -98,7 +106,7 @@ reject() {
 }
 
 alias_source="source \"alias\" sha256=\"$digest\" size=3"
-recipe " url=\"$base/payload\"" "$alias_source" > good.kdl
+recipe "        url \"$base/payload\"" "$alias_source" > good.kdl
 fetch cache good.kdl &
 first=$!
 fetch cache good.kdl &
@@ -112,12 +120,19 @@ test "$(ls "cache/sha256")" = "$digest"
 reject bad 'source digest differs from its pin'
 reject short 'source is shorter than its pinned size'
 reject long 'source exceeded its pinned size'
-reject redirect 'expected HTTP 200'
+reject insecure 'redirect leaves HTTPS'
+reject loop 'more than 10 redirects'
+
+# Redirects to HTTPS are followed, and a failing URL falls back to the next.
+recipe "        url \"$base/bad\"
+        url \"$base/redirect\"" > fallback.kdl
+fetch fallback-cache fallback.kdl
+cmp expected "fallback-cache/sha256/$digest"
 
 mkdir -p mixed/nested
 printf patch > mixed/fix.patch
 patch_digest=$(sha256sum mixed/fix.patch | cut -d' ' -f1)
-recipe " url=\"$base/payload\"" "source \"fix.patch\" sha256=\"$patch_digest\" size=5" > mixed.kdl
+recipe "        url \"$base/payload\"" "source \"fix.patch\" sha256=\"$patch_digest\" size=5" > mixed.kdl
 "$cps" source fetch --cache mixed-cache --from mixed mixed.kdl
 cmp mixed/fix.patch "mixed-cache/sha256/$patch_digest"
 cmp expected "mixed-cache/sha256/$digest"

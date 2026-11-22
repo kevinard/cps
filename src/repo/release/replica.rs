@@ -1,14 +1,15 @@
 //! Keep a full replica of a CPS web root, verified before it is served.
 //!
 //! A replica reads the source like a client: it follows the signed
-//! timestamp to the snapshot, the targets roles, and every target they list.
-//! It reuses unchanged files from the served tree by hard link once their
-//! digests match, or once a private record shows they are the very files it
-//! verified before, unchanged since. It keeps the previous release's files for clients that are
-//! mid-download, and verifies the staged tree against the TUF root before it
-//! replaces the served one. A source that serves expired, forged, or older
-//! metadata leaves the replica unchanged, and a source that serves what the
-//! replica already has leaves it untouched.
+//! timestamp to the snapshot and the targets roles, verifies that metadata
+//! against the TUF root, and only then copies the targets the verified roles
+//! list. It reuses unchanged files from the served tree by hard link once
+//! their digests match, or once a private record shows they are the very
+//! files it verified before, unchanged since. It keeps the previous
+//! release's files for clients that are mid-download. A source that serves
+//! expired, forged, or older metadata leaves the replica unchanged. When the
+//! source serves what the replica already has, the served tree is verified
+//! and left untouched, or rebuilt from the source if it is damaged.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -29,23 +30,29 @@ use url::Url;
 
 use super::{
     DESCRIPTOR, DESCRIPTOR_LIMIT, ROLE_LIMIT, ROOT_LIMIT, TIMESTAMP_LIMIT, TUF_LIMITS,
-    mirrors::{get_limited, mirror_base},
+    mirrors::mirror_base,
     read_tuf_root,
     web_files::{create_public, create_public_dir, fd_url, link_or_copy, write_public},
 };
 use crate::{
     model::digest_reader,
     repo::{lock_file, read_limited},
-    transport::https_client,
+    transport::{TransferBudget, TransferLimits, https_client},
 };
 
 const DOWNLOADS: usize = 8;
 const MAX_TARGETS: usize = 1 << 20;
+/// CPS publishes the targets role and 16 `objects-*` delegations.
+const MAX_ROLES: usize = 32;
+/// All metadata of one release that is read before it is verified.
+const METADATA_LIMIT: u64 = 512 << 20;
 
 /// Where a replica copies from: a served web root on this host or over HTTPS.
+/// Every remote body counts against one transfer deadline and throughput
+/// floor, so a slow or endless source cannot hold the replica lock.
 enum Source {
     Local(PathBuf),
-    Remote(Client, Url),
+    Remote(Client, Url, TransferBudget),
 }
 
 impl Source {
@@ -63,13 +70,14 @@ impl Source {
             url.scheme() == "https",
             "replicate from an absolute path or an https:// URL"
         );
-        Ok((Self::Remote(https_client().build()?, url), None))
+        let budget = TransferLimits::from_env()?.start();
+        Ok((Self::Remote(https_client().build()?, url, budget), None))
     }
 
     fn describe(&self) -> String {
         match self {
             Self::Local(path) => path.display().to_string(),
-            Self::Remote(_, url) => url.to_string(),
+            Self::Remote(_, url, _) => url.to_string(),
         }
     }
 
@@ -77,7 +85,9 @@ impl Source {
     async fn read(&self, name: &str, limit: u64) -> Result<Option<Vec<u8>>> {
         let result = match self {
             Self::Local(path) => read_optional(&path.join(name), limit),
-            Self::Remote(client, base) => get_limited(client, base.join(name)?, limit).await,
+            Self::Remote(client, base, budget) => {
+                get_metered(client, base.join(name)?, limit, budget).await
+            }
         };
         result.with_context(|| format!("reading {name} from {}", self.describe()))
     }
@@ -106,15 +116,20 @@ impl Source {
                     write(&buffer[..count])?;
                 }
             }
-            Self::Remote(client, base) => {
-                let response = client.get(base.join(name)?).send().await?;
+            Self::Remote(client, base, budget) => {
+                let response =
+                    tokio::time::timeout(budget.remaining()?, client.get(base.join(name)?).send())
+                        .await
+                        .map_err(|_| past_deadline(budget))??;
                 ensure!(
                     response.status() == StatusCode::OK,
                     "HTTP status {} for {name}",
                     response.status()
                 );
+                let mut meter = budget.meter();
                 let mut chunks = response.bytes_stream();
                 while let Some(chunk) = chunks.try_next().await? {
+                    meter.record(chunk.len())?;
                     write(&chunk)?;
                 }
             }
@@ -126,6 +141,44 @@ impl Source {
         file.sync_all()?;
         Ok(())
     }
+}
+
+/// The error for a request that outlived the transfer deadline.
+fn past_deadline(budget: &TransferBudget) -> anyhow::Error {
+    match budget.remaining() {
+        Err(error) => error.into(),
+        Ok(_) => anyhow::anyhow!("the replica transfer exceeded its deadline"),
+    }
+}
+
+/// A small remote file within the transfer budget, or `None` when the
+/// source does not have it.
+async fn get_metered(
+    client: &Client,
+    url: Url,
+    limit: u64,
+    budget: &TransferBudget,
+) -> Result<Option<Vec<u8>>> {
+    let response = tokio::time::timeout(budget.remaining()?, client.get(url).send())
+        .await
+        .map_err(|_| past_deadline(budget))??;
+    match response.status() {
+        StatusCode::NOT_FOUND | StatusCode::GONE => return Ok(None),
+        StatusCode::OK => {}
+        status => anyhow::bail!("HTTP status {status}"),
+    }
+    let mut meter = budget.meter();
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.try_next().await? {
+        meter.record(chunk.len())?;
+        ensure!(
+            body.len() + chunk.len() <= limit as usize,
+            "the file exceeds the {limit}-byte limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 /// A small local file, or `None` when it does not exist.
@@ -180,7 +233,13 @@ where
         .context("invalid snapshot")?
         .clone();
     release.snapshot.clone_from(&snapshot_name);
+    let mut total = snapshot.len() as u64;
     release.metadata.insert(snapshot_name, snapshot);
+    ensure!(
+        meta.len() <= MAX_ROLES,
+        "the snapshot lists {} roles; a CPS release has at most {MAX_ROLES}",
+        meta.len()
+    );
     for (role, entry) in meta {
         ensure!(
             role.ends_with(".json")
@@ -196,6 +255,11 @@ where
         let bytes = read(format!("metadata/{name}"), ROLE_LIMIT)
             .await?
             .with_context(|| format!("missing {name}"))?;
+        total += bytes.len() as u64;
+        ensure!(
+            total <= METADATA_LIMIT,
+            "the release metadata exceeds {METADATA_LIMIT} bytes"
+        );
         if let Some(expected) = entry["hashes"]["sha256"].as_str() {
             ensure!(
                 hex::encode(Sha256::digest(&bytes)) == expected,
@@ -244,22 +308,29 @@ fn served_release(web: &Path) -> Option<Release> {
 }
 
 /// Identifies one file on disk as it was when it was verified. Writing to
-/// the file changes its modification time; replacing it changes its inode.
+/// the file changes its modification and change times, replacing it changes
+/// its inode, and restoring it from a copy changes its change time.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Stamp {
+    device: u64,
     inode: u64,
     length: u64,
     mtime: i64,
     mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 impl Stamp {
     fn of(metadata: &fs::Metadata) -> Self {
         Self {
+            device: metadata.dev(),
             inode: metadata.ino(),
             length: metadata.len(),
             mtime: metadata.mtime(),
             mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
         }
     }
 }
@@ -283,9 +354,9 @@ impl Verified {
     }
 
     /// Record the served release's targets after a successful swap.
-    fn record(path: &Path, web: &Path, release: &Release) -> Result<()> {
+    fn record(path: &Path, web: &Path, targets: &VerifiedTargets) -> Result<()> {
         let mut verified = Self::default();
-        for file in release.targets.keys() {
+        for file in targets.files.keys() {
             let metadata = fs::metadata(web.join("targets").join(file))?;
             verified.targets.insert(file.clone(), Stamp::of(&metadata));
         }
@@ -317,7 +388,7 @@ fn intact(path: &Path, name: &str, length: u64, sha256: &str, verified: &Verifie
 }
 
 /// Update a replica of `source` at `output`. Returns a summary line.
-pub fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String> {
+pub(crate) fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String> {
     let anchor = read_tuf_root(tuf_root)?;
     let name = output
         .file_name()
@@ -371,15 +442,23 @@ pub fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String>
             version > served || served_timestamp.as_ref() == Some(&timestamp),
             "the source reused timestamp version {version} with different contents"
         );
-        // Nothing changed: leave the served tree, and the previous release it keeps, alone.
+        // Nothing changed upstream: leave the served tree, and the previous
+        // release it keeps, alone if it still verifies. Otherwise rebuild it.
         if version == served
             && read_optional(&web.join(DESCRIPTOR), DESCRIPTOR_LIMIT)? == descriptor
         {
-            return Ok(format!(
-                "The replica at {} already serves TUF timestamp version {version} from {}",
-                web.display(),
-                source.describe()
-            ));
+            match runtime.block_on(check_served(&anchor, &web, &Verified::read(&record))) {
+                Ok(()) => {
+                    return Ok(format!(
+                        "The replica at {} already serves TUF timestamp version {version} from {}",
+                        web.display(),
+                        source.describe()
+                    ));
+                }
+                Err(error) => {
+                    eprintln!("Warning: repairing the served replica: {error:#}");
+                }
+            }
         }
     }
 
@@ -392,7 +471,7 @@ pub fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String>
     }
     let served = served_release(&web);
     let verified = Verified::read(&record);
-    let (summary, release) = runtime.block_on(async {
+    let (summary, targets) = runtime.block_on(async {
         let release = walk(&timestamp, |name, limit| {
             let source = &source;
             async move { source.read(&name, limit).await }
@@ -420,8 +499,20 @@ pub fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String>
         if let Some(descriptor) = &descriptor {
             write_public(&tree.join(DESCRIPTOR), descriptor)?;
         }
+
+        // Verify the staged metadata from the TUF root, as a new client
+        // would, before copying any target it lists.
+        let targets = verify(&anchor, &tree, stage.path())
+            .await
+            .context("verifying the staged replica")?;
+        let summary = format!(
+            "Replicated TUF timestamp version {} from {} to {}",
+            targets.timestamp,
+            source.describe(),
+            web.display(),
+        );
         let mut wanted = Vec::new();
-        for (file, (length, sha256)) in &release.targets {
+        for (file, (length, sha256)) in &targets.files {
             let existing = web.join("targets").join(file);
             // A damaged served file is fetched again rather than carried forward.
             if intact(&existing, file, *length, sha256, &verified)? {
@@ -445,29 +536,17 @@ pub fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String>
             .try_for_each(|()| async { Ok(()) })
             .await?;
         keep_previous(&web, &tree, served.as_ref(), &release)?;
-
-        // Verify the staged tree from the TUF root, as a new client would.
-        let datastore = tempfile::tempdir_in(stage.path())?;
-        let metadata = File::open(tree.join("metadata"))?;
-        let targets = File::open(tree.join("targets"))?;
-        let verified = RepositoryLoader::new(&anchor, fd_url(&metadata)?, fd_url(&targets)?)
-            .limits(TUF_LIMITS)
-            .datastore(datastore.path())
-            .load()
-            .await
-            .context("verifying the staged replica")?;
         let summary = format!(
-            "Replicated TUF timestamp version {} from {} to {}: {} new targets, valid until {}",
-            verified.timestamp().signed.version,
-            source.describe(),
-            web.display(),
-            fetched,
-            verified.timestamp().signed.expires
+            "{summary}: {fetched} new targets, valid until {}",
+            targets.expires
         );
-        anyhow::Ok((summary, release))
+        anyhow::Ok((summary, targets))
     })?;
 
-    File::open(&tree)?.sync_all()?;
+    // Make the populated tree durable before clients can see it.
+    for directory in ["metadata", "targets", ""] {
+        File::open(tree.join(directory))?.sync_all()?;
+    }
     let directory = File::open(&parent)?;
     let staged = Path::new(stage.path().file_name().context("missing stage name")?).join("tree");
     if web.exists() {
@@ -492,11 +571,72 @@ pub fn replicate(source: &str, tuf_root: &Path, output: &Path) -> Result<String>
         )?;
         directory.sync_all()?;
     }
+    File::open(stage.path())?.sync_all()?;
     // The swap is done. Without the record, the next run only hashes again.
-    if let Err(error) = Verified::record(&record, &web, &release) {
+    if let Err(error) = Verified::record(&record, &web, &targets) {
         eprintln!("Warning: recording the verified targets: {error:#}");
     }
     Ok(summary)
+}
+
+/// The targets of a release whose metadata verified against the TUF root.
+struct VerifiedTargets {
+    timestamp: u64,
+    expires: String,
+    /// Target files, by consistent-snapshot name, with length and SHA-256.
+    files: BTreeMap<String, (u64, String)>,
+}
+
+/// Verify the metadata of the web root `tree` from `anchor`, as a new client
+/// would, and list the target files its signed roles require.
+async fn verify(anchor: &[u8], tree: &Path, scratch: &Path) -> Result<VerifiedTargets> {
+    let datastore = tempfile::tempdir_in(scratch)?;
+    let metadata = File::open(tree.join("metadata"))?;
+    let targets = File::open(tree.join("targets"))?;
+    let verified = RepositoryLoader::new(&anchor, fd_url(&metadata)?, fd_url(&targets)?)
+        .limits(TUF_LIMITS)
+        .datastore(datastore.path())
+        .load()
+        .await?;
+    let mut files = BTreeMap::new();
+    for (name, target) in verified.all_targets() {
+        let name = name.raw();
+        ensure!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+            "unsupported target name {name}"
+        );
+        let sha256 = hex::encode(target.hashes.sha256.as_ref());
+        files.insert(format!("{sha256}.{name}"), (target.length, sha256));
+        ensure!(files.len() <= MAX_TARGETS, "too many targets");
+    }
+    Ok(VerifiedTargets {
+        timestamp: verified.timestamp().signed.version.get(),
+        expires: verified.timestamp().signed.expires.to_string(),
+        files,
+    })
+}
+
+/// Check that the served tree still verifies from `anchor`, is unexpired,
+/// and holds every target its release lists, intact.
+async fn check_served(anchor: &[u8], web: &Path, verified: &Verified) -> Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let targets = verify(anchor, web, scratch.path()).await?;
+    for (file, (length, sha256)) in &targets.files {
+        ensure!(
+            intact(
+                &web.join("targets").join(file),
+                file,
+                *length,
+                sha256,
+                verified
+            )?,
+            "target {file} is missing or damaged"
+        );
+    }
+    Ok(())
 }
 
 /// Keep the previous release's files for clients that loaded it before the swap.
@@ -545,4 +685,43 @@ fn keep_previous(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unverified_metadata_is_bounded_before_any_target_is_scheduled() -> Result<()> {
+        let timestamp = br#"{"signed":{"version":1,"meta":{"snapshot.json":{"version":1}}}}"#;
+        let snapshot = |roles: usize| {
+            let meta: serde_json::Map<_, _> = (0..roles)
+                .map(|role| {
+                    (
+                        format!("role{role}.json"),
+                        serde_json::json!({"version": 1}),
+                    )
+                })
+                .collect();
+            serde_json::to_vec(&serde_json::json!({"signed": {"meta": meta}})).unwrap()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let read_all = |roles: usize| {
+            let snapshot = snapshot(roles);
+            runtime.block_on(walk(timestamp, move |name, _| {
+                let snapshot = snapshot.clone();
+                async move {
+                    Ok(Some(if name == "metadata/1.snapshot.json" {
+                        snapshot
+                    } else {
+                        br#"{"signed":{"targets":{}}}"#.to_vec()
+                    }))
+                }
+            }))
+        };
+        assert_eq!(read_all(MAX_ROLES)?.metadata.len(), MAX_ROLES + 1);
+        let error = read_all(MAX_ROLES + 1).err().expect("too many roles");
+        assert!(format!("{error:#}").contains("at most 32"), "{error:#}");
+        Ok(())
+    }
 }

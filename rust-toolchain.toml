@@ -1,0 +1,5 @@
+# Matches the toolchain CI pins in ci/rust-dist.sha256.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

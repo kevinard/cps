@@ -17,7 +17,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Scope {
+pub(crate) enum Scope {
     Installed,
     Available,
     AllAvailableVersions,
@@ -25,7 +25,7 @@ pub enum Scope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Status {
+pub(crate) enum Status {
     Explicit,
     Dependency,
     Available,
@@ -42,14 +42,14 @@ impl fmt::Display for Status {
 }
 
 #[derive(Debug, Serialize)]
-pub struct PackageRow {
+pub(crate) struct PackageRow {
     pub id: String,
     pub name: String,
     pub status: Status,
     pub summary: Option<String>,
 }
 
-pub struct InstallSource {
+pub(crate) struct InstallSource {
     pub publisher: String,
     pub version: String,
 }
@@ -148,7 +148,7 @@ pub(crate) fn select_install_sources(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProfileRole {
+pub(crate) enum ProfileRole {
     Root,
     Dependency,
     None,
@@ -165,7 +165,7 @@ impl fmt::Display for ProfileRole {
 }
 
 #[derive(Debug, Serialize)]
-pub struct PackageIntentRow {
+pub(crate) struct PackageIntentRow {
     pub id: String,
     pub name: String,
     pub requested: bool,
@@ -173,7 +173,7 @@ pub struct PackageIntentRow {
 }
 
 /// List effective local requests and roles in the applied profile, offline.
-pub fn list_package_intent(root: &Path) -> Result<Vec<PackageIntentRow>> {
+pub(crate) fn list_package_intent(root: &Path) -> Result<Vec<PackageIntentRow>> {
     let (state, intent) = read_intent(root)?;
     Ok(state
         .installed
@@ -182,8 +182,8 @@ pub fn list_package_intent(root: &Path) -> Result<Vec<PackageIntentRow>> {
         .collect())
 }
 
-#[derive(Debug)]
-pub struct PackageExplanation {
+#[derive(Debug, Serialize)]
+pub(crate) struct PackageExplanation {
     pub intent: PackageIntentRow,
     pub profile_name: Option<String>,
     pub dependents: Vec<String>,
@@ -191,21 +191,21 @@ pub struct PackageExplanation {
     pub path: Option<DependencyPath>,
 }
 
-#[derive(Debug)]
-pub struct DependencyPath {
+#[derive(Debug, Serialize)]
+pub(crate) struct DependencyPath {
     pub root: PackageIntentRow,
     pub steps: Vec<DependencyStep>,
 }
 
-#[derive(Debug)]
-pub struct DependencyStep {
+#[derive(Debug, Serialize)]
+pub(crate) struct DependencyStep {
     pub provider: String,
     pub requirement: String,
     pub matching_providers: usize,
 }
 
 /// Explain the current local request, signed profile role, and direct dependents.
-pub fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
+pub(crate) fn explain_package(root: &Path, spec: &str) -> Result<PackageExplanation> {
     let selector = PackageSpec::parse(spec)?;
     let (state, intent) = read_intent(root)?;
     let package = select_installed(&state.installed, &selector, spec)?;
@@ -343,7 +343,7 @@ pub(crate) fn intent_row(
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
-pub struct FacetRuleRow {
+pub(crate) struct FacetRuleRow {
     /// `FACET` for an image-wide rule or `PACKAGE:FACET` for a per-package rule.
     pub rule: String,
     pub value: bool,
@@ -355,7 +355,7 @@ pub struct FacetRuleRow {
 
 /// List the facet rules of the committed image: built-in defaults that no local rule
 /// replaces, image-wide rules, and per-package rules.
-pub fn list_facets(root: &Path) -> Result<Vec<FacetRuleRow>> {
+pub(crate) fn list_facets(root: &Path) -> Result<Vec<FacetRuleRow>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let settings = image.settings()?;
@@ -386,7 +386,7 @@ pub fn list_facets(root: &Path) -> Result<Vec<FacetRuleRow>> {
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
-pub struct FacetValueRow {
+pub(crate) struct FacetValueRow {
     pub facet: String,
     pub value: bool,
     #[serde(flatten)]
@@ -395,7 +395,7 @@ pub struct FacetValueRow {
 
 /// Show effective facet values and the rule that decided each one. With a package,
 /// resolve its per-package and inherited rules and default to the facets its actions use.
-pub fn facet_values(
+pub(crate) fn facet_values(
     root: &Path,
     package: Option<&str>,
     facets: &[String],
@@ -449,8 +449,8 @@ pub fn facet_values(
         .collect())
 }
 
-/// List the image's variant values, including the built-in arch variant.
-pub fn list_variants(root: &Path) -> Result<BTreeMap<String, String>> {
+/// List the image's variant values, including the built-in architecture variant.
+pub(crate) fn list_variants(root: &Path) -> Result<BTreeMap<String, String>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let settings = image.settings()?;
@@ -460,14 +460,14 @@ pub fn list_variants(root: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 #[derive(Debug, Serialize)]
-pub struct MediatorRow {
+pub(crate) struct MediatorRow {
     pub group: String,
     pub preferred: Option<String>,
     pub selected: Option<String>,
     pub providers: BTreeMap<String, i32>,
 }
 
-pub fn list_mediators(root: &Path) -> Result<Vec<MediatorRow>> {
+pub(crate) fn list_mediators(root: &Path) -> Result<Vec<MediatorRow>> {
     let image = Image::open_query(root)?;
     let (state, _) = verified_intent(&image)?;
     let facets = crate::plan::resolve_facets(state.settings.selection(), &state.installed)?;
@@ -548,7 +548,7 @@ fn available(
 }
 
 #[derive(Debug, Serialize)]
-pub struct PackagePolicy {
+pub(crate) struct PackagePolicy {
     pub package: String,
     pub installed: Option<String>,
     pub preferred_publisher: Option<String>,
@@ -561,7 +561,7 @@ pub struct PackagePolicy {
 }
 
 #[derive(Debug, Serialize)]
-pub struct PolicyPublisher {
+pub(crate) struct PolicyPublisher {
     pub name: String,
     pub catalog: String,
     pub obsoleted_through: Option<Version>,
@@ -570,20 +570,20 @@ pub struct PolicyPublisher {
 }
 
 #[derive(Debug, Serialize)]
-pub struct PolicyCandidate {
+pub(crate) struct PolicyCandidate {
     pub id: String,
     pub manifest: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum InstallProbe {
+pub(crate) enum InstallProbe {
     Solved { plan: String },
     Blocked { reason: String },
 }
 
 /// Inspect candidate sources and image policy without refreshing catalogs.
-pub fn package_policy(root: &Path, spec: &str, probe: bool) -> Result<PackagePolicy> {
+pub(crate) fn package_policy(root: &Path, spec: &str, probe: bool) -> Result<PackagePolicy> {
     let selector = PackageSpec::parse(spec)?;
     let image = Image::open_query(root)?;
     let (state, _) = verified_intent(&image)?;
@@ -674,7 +674,7 @@ fn status(package: &Installed) -> Status {
 }
 
 /// List packages without modifying image state or fetching from a mirror.
-pub fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
+pub(crate) fn list_packages(root: &Path, scope: Scope) -> Result<Vec<PackageRow>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;
     let publishers = image.publishers()?;
@@ -750,13 +750,13 @@ fn verify_installed_metadata(image: &Image) -> Result<()> {
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
-pub struct FileMatch {
+pub(crate) struct FileMatch {
     pub package: String,
     pub path: String,
 }
 
 /// Search the latest compatible package from each publisher by exact path or basename.
-pub fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
+pub(crate) fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
     let by_path = term.contains('/');
     let term = term.trim_start_matches('/');
     validate_path(term)?;
@@ -811,16 +811,16 @@ pub fn search_files(root: &Path, term: &str) -> Result<Vec<FileMatch>> {
     Ok(matches)
 }
 
-/// Return the installed package IDs that own an exact image path.
-pub fn path_owners(root: &Path, path: &str) -> Result<Vec<String>> {
+/// Return the installed package IDs that own an exact image path, none
+/// when no installed package owns it.
+pub(crate) fn path_owners(root: &Path, path: &str) -> Result<Vec<String>> {
     let relative = path.strip_prefix('/').unwrap_or(path);
     validate_path(relative)?;
     let image = Image::open_query(root)?;
     image.require_clean()?;
-    let managed = image
-        .managed_path(relative)?
-        .filter(|entry| !entry.owners.is_empty())
-        .with_context(|| format!("no installed package owns {path:?}"))?;
+    let Some(managed) = image.managed_path(relative)? else {
+        return Ok(Vec::new());
+    };
     let publishers = image.publishers()?;
     managed
         .owners
@@ -836,7 +836,7 @@ pub fn path_owners(root: &Path, path: &str) -> Result<Vec<String>> {
 }
 
 /// List the root-relative paths owned by an installed package.
-pub fn package_contents(root: &Path, spec: &str) -> Result<Vec<String>> {
+pub(crate) fn package_contents(root: &Path, spec: &str) -> Result<Vec<String>> {
     let selector = PackageSpec::parse(spec)?;
     let image = Image::open_query(root)?;
     image.require_clean()?;
@@ -865,7 +865,7 @@ pub fn package_contents(root: &Path, spec: &str) -> Result<Vec<String>> {
 }
 
 /// List installed package IDs that satisfy this package's direct requirements.
-pub fn direct_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
+pub(crate) fn direct_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
     let (installed, name) = dependency_query(root, spec)?;
     let mut dependencies = BTreeMap::new();
     for dependency in &installed[name].published.manifest.dependency {
@@ -905,7 +905,7 @@ fn matching_providers<'a>(
 }
 
 /// List installed package IDs with a direct requirement satisfied by this package.
-pub fn reverse_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
+pub(crate) fn reverse_dependencies(root: &Path, spec: &str) -> Result<Vec<String>> {
     let (installed, name) = dependency_query(root, spec)?;
     installed_dependents(&installed, name)
 }
@@ -992,8 +992,9 @@ fn matches_installed(package: &Installed, selector: &PackageSpec<'_>) -> bool {
 
 /// Where `cps info` looks for a package's manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManifestSource {
-    /// The installed package only.
+pub(crate) enum ManifestSource {
+    /// The installed package only, which tests use to check what is installed.
+    #[cfg(test)]
     Installed,
     /// The configured signed catalogs only.
     Catalog,
@@ -1003,7 +1004,7 @@ pub enum ManifestSource {
 
 /// A package's identity and descriptive metadata, as `cps info` shows it.
 #[derive(Debug, Serialize)]
-pub struct PackageInfo {
+pub(crate) struct PackageInfo {
     pub id: String,
     pub name: String,
     pub publisher: String,
@@ -1024,7 +1025,8 @@ pub struct PackageInfo {
 }
 
 /// Return the verified manifest for a package in KDL.
-pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<String> {
+#[cfg(test)]
+pub(crate) fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<String> {
     let source = if from_catalog {
         ManifestSource::Catalog
     } else {
@@ -1034,12 +1036,12 @@ pub fn package_manifest(root: &Path, spec: &str, from_catalog: bool) -> Result<S
 }
 
 /// Return the verified manifest for a package from `source` in KDL.
-pub fn manifest_from(root: &Path, spec: &str, source: ManifestSource) -> Result<String> {
+pub(crate) fn manifest_from(root: &Path, spec: &str, source: ManifestSource) -> Result<String> {
     Ok(manifest_text(&select_manifest(root, spec, source)?.0))
 }
 
 /// Describe a package from its verified manifest.
-pub fn package_info(root: &Path, spec: &str, source: ManifestSource) -> Result<PackageInfo> {
+pub(crate) fn package_info(root: &Path, spec: &str, source: ManifestSource) -> Result<PackageInfo> {
     let (manifest, installed) = select_manifest(root, spec, source)?;
     let is_installed = installed.as_ref() == Some(&manifest.version);
     Ok(PackageInfo {
@@ -1091,6 +1093,7 @@ fn select_manifest(
         .as_ref()
         .map(|package| package.published.manifest.version.clone());
     let from_catalog = match source {
+        #[cfg(test)]
         ManifestSource::Installed => false,
         ManifestSource::Catalog => true,
         ManifestSource::InstalledOrCatalog => !installed

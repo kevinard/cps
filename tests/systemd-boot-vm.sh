@@ -229,9 +229,9 @@ publish_state() {
     if [[ $mode == facet-change ]]; then
         mkdir -p proto/usr/share/man/man1
         printf 'trial\n' > proto/usr/share/man/man1/cps-vm.1
-        facet_action="    file \"usr/share/man/man1/cps-vm.1\" mode=\"0644\" uid=$(id -u) gid=$(id -g) facet=\"doc.man\""
+        facet_action="    file \"usr/share/man/man1/cps-vm.1\" mode=\"0644\" facet=\"doc.man\""
         printf 'vendor settings\n' > proto/etc/cps-vm-optional.conf
-        facet_action+=$'\n'"    file \"etc/cps-vm-optional.conf\" mode=\"0644\" uid=$(id -u) gid=$(id -g) preserve=#true facet=\"optional\""
+        facet_action+=$'\n'"    file \"etc/cps-vm-optional.conf\" mode=\"0644\" preserve=#true facet=\"optional\""
     fi
     if [[ $mode == rollback ]]; then
         case $state in
@@ -249,7 +249,7 @@ publish_state() {
     cat > manifest.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/boot-state" publisher="$fixture_publisher" version="$version" {
-    file "etc/cps-vm-state" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "etc/cps-vm-state" mode="0644"
     hardlink "etc/cps-vm-boot-state" target="etc/cps-vm-state"
 $facet_action
 $dependency
@@ -268,8 +268,8 @@ publish_kernel() {
     cat > kernel.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "system/kernel" publisher="$fixture_publisher" version="$version" {
-    file "$modules/vmlinuz" mode="0644" uid=$(id -u) gid=$(id -g)
-    file "$modules/initrd" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "$modules/vmlinuz" mode="0644"
+    file "$modules/initrd" mode="0644"
     kernel-install "$release" initrd=#true
 }
 MANIFEST
@@ -284,7 +284,7 @@ publish_extra_marker() {
     cat > extra-marker.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/extra-marker" publisher="extras" version="1.0.0-0" {
-    file "etc/cps-vm-extra-marker" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "etc/cps-vm-extra-marker" mode="0644"
 }
 MANIFEST
     "$cps" publish manifests --repo extras --proto proto --key extras-private.der extra-marker.kdl
@@ -336,7 +336,7 @@ refresh_vm_profile() {
         if [[ ${1:-} == base ]]; then printf '        package "test/previous-default"\n'; fi
         printf '        facet "devel" #false\n'
         while read -r name repository key; do
-            printf '        publisher "%s" catalog="%s" {\n' "$name" "$(cat "$repository/current")"
+            printf '        publisher "%s" catalog-sha256="%s" {\n' "$name" "$(cat "$repository/current")"
             printf '            repository "../%s"\n            trust-root "../%s"\n' "$repository" "$key"
             if [[ $name == canopa ]] && $signed_cps_builds; then
                 printf '            build-trust { builder-key "../cps-builder-public.der"; }\n'
@@ -345,7 +345,7 @@ refresh_vm_profile() {
         done < <(profile_companions)
         printf '    }\n}\n'
     } > profile-repo/publish-policy.kdl
-    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base-sha256="%s" refresh-profiles=#true\n' \
         "$(cat profile-repo/current)" > profile-release.kdl
     "$cps" publish release --repo profile-repo --key profile-private.der profile-release.kdl
 }
@@ -355,7 +355,7 @@ if [[ $mode == rollback ]]; then
     cat > legacy-marker.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/legacy-marker" publisher="$fixture_publisher" version="1.0.0-0" {
-    file "etc/cps-vm-legacy-marker" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "etc/cps-vm-legacy-marker" mode="0644"
 }
 MANIFEST
     "$cps" publish manifests --repo repo --proto proto --key private.der legacy-marker.kdl
@@ -376,10 +376,12 @@ elif $systemd_guest; then
     else
         cp -- "$cps" proto/usr/bin/cps
     fi
-    cp "$project/packaging/systemd/"{cps-boot-health.service,cps-uefi-bless.service,cps-finalize-trial.path,cps-finalize-trial.service} proto/usr/lib/systemd/system/
+    # Every unit that packaging/cps.kdl ships.
+    cp "$project/packaging/systemd/"cps-*.{service,timer,path} proto/usr/lib/systemd/system/
+    install -Dm644 "$project/packaging/systemd/cps.sysusers" proto/usr/lib/sysusers.d/cps.conf
+    install -Dm644 -t proto/usr/share/man/man1 "$project"/docs/reference/man/*.1
     install -Dm644 "$project/LICENSE" proto/usr/share/licenses/cps/LICENSE
-    sed -e '/^    require /d' -e "s/uid=0 gid=0/uid=$(id -u) gid=$(id -g)/g" \
-        "$project/packaging/cps.kdl" > cps.kdl
+    sed -e '/^    require /d' "$project/packaging/cps.kdl" > cps.kdl
     "$cps" publish manifests --repo repo --proto proto --key private.der cps.kdl
     packages+=(system/cps)
 fi
@@ -488,7 +490,7 @@ GUEST
     chmod 0755 runtime/init
 fi
 "$cps" manifest generate --proto runtime --publisher "$fixture_publisher" --version 1.0.0-0 \
-    --uid "$(id -u)" --gid "$(id -g)" test/boot-runtime > runtime.kdl
+    test/boot-runtime > runtime.kdl
 "$cps" publish manifests --repo repo --proto runtime --key private.der runtime.kdl
 packages+=(test/boot-runtime)
 if $profiled; then
@@ -549,7 +551,7 @@ MANIFEST
     cat > previous-default.kdl <<MANIFEST
 schema-version 1 kind="package-manifest"
 package "test/previous-default" publisher="vm-profile" version="1.0.0-0" {
-    file "etc/cps-vm-previous-default" mode="0644" uid=$(id -u) gid=$(id -g)
+    file "etc/cps-vm-previous-default" mode="0644"
 }
 MANIFEST
     "$cps" publish manifests --repo profile-repo --proto proto --key profile-private.der previous-default.kdl
@@ -565,7 +567,7 @@ MANIFEST
         printf 'schema-version 1 kind="image-config"\nfacet "devel" #false\n'
         if [[ $reprovision == 1 ]]; then
             printf 'image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"\n'
-            printf 'release-profile "boot" bootstrap-catalog="%s"\n' "$(cat profile-repo/current)"
+            printf 'release-profile "boot" bootstrap-catalog-sha256="%s"\n' "$(cat profile-repo/current)"
         else
             printf 'release-profile "boot"\n'
         fi
@@ -746,7 +748,7 @@ if [[ $mode == rollback ]]; then
     fi
     cat > retirement.kdl <<RELEASE
 schema-version 1 kind="publish-release"
-release "$fixture_publisher" base="$(cat repo/current)" {
+release "$fixture_publisher" base-sha256="$(cat repo/current)" {
     obsolete "cps://$fixture_publisher/test/legacy-marker@2.0.0-0"
 $retire_kernel
 }
@@ -1010,6 +1012,8 @@ reject() {
 }
 $bb chown 0:0 /volume/@environments
 $bb chmod 0755 /volume/@environments
+# The host built the base root without privileges; root adopts it once.
+cps image adopt --root /volume/@
 cps boot list --esp /efi
 if [ "$mode" = rollback ]; then
     # Pin the base, so the trial is selected with `preferred`.

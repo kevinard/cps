@@ -3,7 +3,8 @@
 //! Catalog roots and trust roots share one envelope: canonical JSON holding a
 //! base64 payload and signatures sorted by key ID. Each kind of document signs
 //! under its own domain prefix, so a signature for one kind never verifies as
-//! another.
+//! another. Build attestations use DSSE, the in-toto envelope, decoded just as
+//! strictly. Every envelope checks its signatures with [`verify_signatures`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,8 +13,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{digest, validate_digest};
@@ -140,7 +141,7 @@ impl SigningKey {
 
 /// One or more signing key specifications: `PATH`, `file:PATH`, or
 /// `command:DESCRIPTOR`.
-pub trait KeySpecs {
+pub(crate) trait KeySpecs {
     fn key_specs(&self) -> Vec<&Path>;
 }
 
@@ -398,55 +399,79 @@ impl Envelope {
         domain: &Domain,
         authorized: &BTreeSet<PublicKey>,
     ) -> Result<BTreeSet<PublicKey>> {
-        let message = domain.message(&self.validate(domain)?);
-        let by_id: BTreeMap<String, &PublicKey> =
-            authorized.iter().map(|key| (digest(key), key)).collect();
-        let mut signers = BTreeSet::new();
-        for signature in &self.signatures {
-            let key = by_id.get(&signature.keyid).with_context(|| {
-                format!(
-                    "{} is signed by unauthorized key {}",
-                    domain.what, signature.keyid
-                )
-            })?;
-            UnparsedPublicKey::new(&ED25519, key)
-                .verify(&message, &signature.bytes()?)
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "invalid {} signature by key {}",
-                        domain.what,
-                        signature.keyid
-                    )
-                })?;
-            signers.insert(**key);
-        }
-        Ok(signers)
+        self.verify_with(domain, authorized, OtherSigners::Reject)
     }
-}
 
-impl Envelope {
     /// Verify the signatures by authorized keys and ignore any other key ID.
     pub(crate) fn verify_known(
         &self,
         domain: &Domain,
         authorized: &BTreeSet<PublicKey>,
     ) -> Result<BTreeSet<PublicKey>> {
-        let known: BTreeSet<String> = authorized.iter().map(|key| digest(key)).collect();
-        let signatures: Vec<_> = self
+        self.verify_with(domain, authorized, OtherSigners::Ignore)
+    }
+
+    fn verify_with(
+        &self,
+        domain: &Domain,
+        authorized: &BTreeSet<PublicKey>,
+        others: OtherSigners,
+    ) -> Result<BTreeSet<PublicKey>> {
+        let message = domain.message(&self.validate(domain)?);
+        let signatures = self
             .signatures
             .iter()
-            .filter(|signature| known.contains(&signature.keyid))
-            .cloned()
-            .collect();
-        if signatures.is_empty() {
-            return Ok(BTreeSet::new());
-        }
-        Self {
-            signed: self.signed.clone(),
-            signatures,
-        }
-        .verify(domain, authorized)
+            .map(|signature| Ok((signature.keyid.as_str(), signature.bytes()?)))
+            .collect::<Result<Vec<_>>>()?;
+        verify_signatures(
+            domain.what,
+            &message,
+            signatures.iter().map(|(id, sig)| (*id, sig)),
+            authorized,
+            others,
+        )
     }
+}
+
+/// Which signatures [`verify_signatures`] accepts besides authorized ones.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum OtherSigners {
+    /// A signature by any other key rejects the document.
+    Reject,
+    /// Signatures by other keys are skipped: a build attestation may carry
+    /// witnesses that this image does not trust.
+    Ignore,
+}
+
+/// Verify the signatures of `message` by authorized keys and return those
+/// keys. Each signature names its key by the SHA-256 of the raw Ed25519 public
+/// key. A signature by an authorized key that does not verify rejects the
+/// document, whatever the threshold, so a document never carries a bad
+/// signature by a trusted key.
+pub(crate) fn verify_signatures<'a>(
+    what: &str,
+    message: &[u8],
+    signatures: impl IntoIterator<Item = (&'a str, &'a [u8; 64])>,
+    authorized: &BTreeSet<PublicKey>,
+    others: OtherSigners,
+) -> Result<BTreeSet<PublicKey>> {
+    let by_id: BTreeMap<String, &PublicKey> =
+        authorized.iter().map(|key| (digest(key), key)).collect();
+    let mut signers = BTreeSet::new();
+    for (key_id, signature) in signatures {
+        let Some(key) = by_id.get(key_id) else {
+            ensure!(
+                others == OtherSigners::Ignore,
+                "{what} is signed by unauthorized key {key_id}"
+            );
+            continue;
+        };
+        UnparsedPublicKey::new(&ED25519, key)
+            .verify(message, signature)
+            .map_err(|_| anyhow::anyhow!("invalid {what} signature by key {key_id}"))?;
+        signers.insert(**key);
+    }
+    Ok(signers)
 }
 
 /// Seal a payload with exactly the signers' signatures.
@@ -457,13 +482,69 @@ pub(crate) fn seal(domain: &Domain, payload: &[u8], signers: &Signers) -> Result
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use ring::rand::SystemRandom;
+    use aws_lc_rs::rand::SystemRandom;
 
     pub(crate) fn key() -> SigningKey {
         let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate key");
         Ed25519KeyPair::from_pkcs8(document.as_ref())
             .expect("read generated key")
             .into()
+    }
+
+    /// The fixtures come from OpenSSL, not from the crypto library CPS links:
+    /// both PKCS#8 versions of one key load, and the deterministic Ed25519
+    /// signature of a catalog message is exactly OpenSSL's.
+    #[test]
+    fn ed25519_keys_and_signatures_match_the_golden_fixtures() -> Result<()> {
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+        let public: PublicKey = crate::repo::read_key(&golden.join("ed25519-public.der"))?
+            .try_into()
+            .expect("read_key returns 32 bytes");
+        let expected: [u8; 64] = hex::decode(
+            std::fs::read_to_string(golden.join("ed25519-catalog-signature.hex"))?.trim(),
+        )?
+        .try_into()
+        .expect("a 64-byte signature");
+        let message = CATALOG.message(br#"{"golden":true}"#);
+        for name in ["ed25519-pkcs8-v1.der", "ed25519-pkcs8-v2.der"] {
+            let key = SigningKey::from(
+                crate::repo::read_signing_key(&golden.join(name))
+                    .with_context(|| name.to_owned())?,
+            );
+            assert_eq!(key.public_key(), &public, "{name}");
+            assert_eq!(key.sign(Purpose::Catalog, &message)?, expected, "{name}");
+        }
+        // Trailing bytes, a public key that does not match the seed, and keys
+        // generated by CPS itself.
+        let v1 = std::fs::read(golden.join("ed25519-pkcs8-v1.der"))?;
+        let mut v2 = std::fs::read(golden.join("ed25519-pkcs8-v2.der"))?;
+        assert!(crate::repo::parse_signing_key(&[v1.as_slice(), &[0]].concat()).is_err());
+        *v2.last_mut().expect("a key") ^= 1;
+        assert!(crate::repo::parse_signing_key(&v2).is_err());
+        crate::repo::parse_signing_key(&crate::repo::generate_signing_key()?)?;
+
+        let id = digest(&public);
+        let signers = verify_signatures(
+            "golden",
+            &message,
+            [(id.as_str(), &expected)],
+            &BTreeSet::from([public]),
+            OtherSigners::Reject,
+        )?;
+        assert_eq!(signers, BTreeSet::from([public]));
+        let mut forged = expected;
+        forged[0] ^= 1;
+        assert!(
+            verify_signatures(
+                "golden",
+                &message,
+                [(id.as_str(), &forged)],
+                &BTreeSet::from([public]),
+                OtherSigners::Reject,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

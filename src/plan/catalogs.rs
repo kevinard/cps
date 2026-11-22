@@ -152,6 +152,7 @@ impl<P: PackageInfo> CandidateSet<P> {
         Ok(installed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_profile<T>(
         &self,
         before: &BTreeMap<String, Installed>,
@@ -341,6 +342,7 @@ pub(super) fn build_dependencies(
     Ok(dependencies.into_iter().collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load(
     image: &Image,
     state: &State,

@@ -14,11 +14,11 @@ A manifest can request an operation for a vendor file it delivers.
 ```kdl
 schema-version 1 kind="package-manifest"
 package "service/example" publisher="canopa" version="1.0.0-0" {
-    file "usr/lib/sysusers.d/example.conf" mode="0644" uid=0 gid=0
+    file "usr/lib/sysusers.d/example.conf" mode="0644"
     sysusers "example.conf"
-    file "usr/lib/tmpfiles.d/example.conf" mode="0644" uid=0 gid=0
+    file "usr/lib/tmpfiles.d/example.conf" mode="0644"
     tmpfiles "example.conf"
-    file "usr/lib/systemd/system/example.service" mode="0644" uid=0 gid=0
+    file "usr/lib/systemd/system/example.service" mode="0644"
     preset "example.service"
 }
 ```
@@ -102,8 +102,8 @@ installed [initramfs trigger](triggers.md#generate-an-initramfs) generates
 ```kdl
 schema-version 1 kind="package-manifest"
 package "system/kernel" publisher="canopa" version="7.2.11-1" {
-    file "usr/lib/modules/7.2.11-arch1-1/vmlinuz" mode="0644" uid=0 gid=0
-    file "usr/lib/modules/7.2.11-arch1-1/initrd" mode="0644" uid=0 gid=0
+    file "usr/lib/modules/7.2.11-arch1-1/vmlinuz" mode="0644"
+    file "usr/lib/modules/7.2.11-arch1-1/initrd" mode="0644"
     kernel-install "7.2.11-arch1-1" initrd=#true
 }
 ```

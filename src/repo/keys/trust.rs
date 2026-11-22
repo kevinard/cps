@@ -4,10 +4,18 @@
 //! keys, each with a signature threshold, and expires at a fixed time. Version
 //! 1 is signed by a threshold of its own root keys. Every later version is
 //! signed by a threshold of the previous version's root keys and a threshold of
-//! its own, so the root keys alone can rotate or revoke any key. Each catalog
-//! root carries the whole version chain it was signed under, and its
+//! its own, so the root keys alone can rotate or revoke any key, and names the
+//! SHA-256 of the version 1 payload: the publisher's lasting identity.
+//!
+//! A trust history is a run of consecutive versions, each verified as the
+//! successor of the one before. A catalog root carries the newest
+//! [`CATALOG_VERSIONS`] versions of its repository's history, and its
 //! signatures must come from exactly the catalog threshold of the last
-//! version's catalog keys.
+//! version's catalog keys. A client pins a history: first the version it was
+//! given, then every later version it verifies. A catalog's history must agree
+//! with the pin on every version both hold and continue it without a gap, and
+//! a current catalog must be signed under the newest pinned version or a later
+//! one, so a revoked key cannot sign for a client that has seen the revocation.
 
 use std::{
     collections::BTreeSet,
@@ -27,12 +35,16 @@ use super::{
     signer::{self, CommandSigner, KeySpec},
 };
 use crate::{
-    model::{digest, validate_publisher},
+    model::{digest, validate_digest, validate_publisher},
     repo::{read_limited, write_atomic},
 };
 
-/// The most versions a catalog's trust history may hold.
-pub(crate) const MAX_VERSIONS: usize = 64;
+/// How many of the newest trust root versions a catalog root carries. A
+/// client whose pin is fewer versions behind follows every rotation from the
+/// catalog alone; one further behind must pin a newer trust root.
+pub(crate) const CATALOG_VERSIONS: usize = 16;
+/// The most versions a pinned history keeps; older ones are dropped.
+const PIN_VERSIONS: usize = 4096;
 /// The repository directory holding `1.json`, `2.json`, and so on.
 pub(crate) const TRUST_DIR: &str = "trust";
 pub(crate) const TRUST_ROOT_LIMIT: u64 = 64 * 1024;
@@ -61,12 +73,38 @@ impl<'de> Deserialize<'de> for Key {
     }
 }
 
+/// A trust root version that is no longer valid. A catalog signed under it
+/// cannot become current. A mirror that serves one may only be behind a
+/// publisher that has already signed a newer version, so another mirror can
+/// still succeed.
+#[derive(Debug)]
+pub(crate) struct TrustRootExpired {
+    pub(crate) version: u64,
+    pub(crate) publisher: String,
+    pub(crate) expires: String,
+}
+
+impl fmt::Display for TrustRootExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "trust root version {} for {} expired at {}; the publisher's root keys must sign a new version",
+            self.version, self.publisher, self.expires
+        )
+    }
+}
+
+impl std::error::Error for TrustRootExpired {}
+
 /// The signed content of one trust root version.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrustRoot {
     pub(crate) publisher: String,
     pub(crate) version: u64,
+    /// The SHA-256 of the version 1 payload, in every later version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) genesis_sha256: Option<String>,
     pub(crate) expires: String,
     pub(crate) root_keys: BTreeSet<Key>,
     pub(crate) root_threshold: usize,
@@ -103,6 +141,12 @@ impl TrustRoot {
     fn validate(&self) -> Result<()> {
         validate_publisher(&self.publisher).context("invalid trust root publisher")?;
         ensure!(self.version > 0, "trust root versions start at 1");
+        match (self.version, &self.genesis_sha256) {
+            (1, None) => {}
+            (1, Some(_)) => bail!("trust root version 1 cannot name a genesis"),
+            (_, Some(genesis)) => validate_digest(genesis).context("invalid trust root genesis")?,
+            (version, None) => bail!("trust root version {version} does not name its version 1"),
+        }
         parse_expiry(&self.expires)?;
         for (role, keys, threshold) in [
             ("root", &self.root_keys, self.root_threshold),
@@ -114,6 +158,14 @@ impl TrustRoot {
             );
         }
         Ok(())
+    }
+
+    /// The SHA-256 of the publisher's version 1 payload.
+    fn genesis(&self) -> Result<String> {
+        match &self.genesis_sha256 {
+            Some(genesis) => Ok(genesis.clone()),
+            None => Ok(digest(&self.encode()?)),
+        }
     }
 
     pub(crate) fn expires(&self) -> Timestamp {
@@ -130,13 +182,14 @@ impl TrustRoot {
 
     /// Reject a trust root that has expired.
     pub(crate) fn check_unexpired(&self) -> Result<()> {
-        ensure!(
-            self.expires() > Timestamp::now(),
-            "trust root version {} for {} expired at {}; the publisher's root keys must sign a new version",
-            self.version,
-            self.publisher,
-            self.expires
-        );
+        if self.expires() <= Timestamp::now() {
+            return Err(TrustRootExpired {
+                version: self.version,
+                publisher: self.publisher.clone(),
+                expires: self.expires.clone(),
+            }
+            .into());
+        }
         Ok(())
     }
 
@@ -166,28 +219,40 @@ impl SignedTrustRoot {
         Ok((TrustRoot::decode(&payload)?, digest(&payload)))
     }
 
-    /// Verify this version as the successor of `previous`, or as version 1.
+    /// Verify this version as the successor of `previous`, or as the first
+    /// version of a history. A later version on its own also carries its
+    /// predecessor's signatures, which cannot be checked without it: its own
+    /// root keys must still reach their threshold, and every signature they
+    /// made must be valid.
     fn verify(&self, previous: Option<&TrustRoot>) -> Result<Verified> {
         let (root, payload_sha256) = self.open()?;
-        let mut authorized = root.root_keys();
-        if let Some(previous) = previous {
-            ensure!(
-                root.publisher == previous.publisher && root.version == previous.version + 1,
-                "trust root version {} does not follow version {} for {}",
-                root.version,
-                previous.version,
-                previous.publisher
-            );
-            authorized.extend(previous.root_keys());
-        } else {
-            ensure!(
-                root.version == 1,
-                "trust root history must start at version 1"
-            );
-        }
-        let signers = self.0.verify(&TRUST_ROOT, &authorized)?;
+        let signers = match previous {
+            Some(previous) => {
+                ensure!(
+                    root.publisher == previous.publisher && root.version == previous.version + 1,
+                    "trust root version {} does not follow version {} for {}",
+                    root.version,
+                    previous.version,
+                    previous.publisher
+                );
+                ensure!(
+                    root.genesis_sha256 == Some(previous.genesis()?),
+                    "trust root version {} names a different version 1 than version {} for {}",
+                    root.version,
+                    previous.version,
+                    previous.publisher
+                );
+                let mut authorized = root.root_keys();
+                authorized.extend(previous.root_keys());
+                self.0.verify(&TRUST_ROOT, &authorized)?
+            }
+            None if root.version == 1 => self.0.verify(&TRUST_ROOT, &root.root_keys())?,
+            None => self.0.verify_known(&TRUST_ROOT, &root.root_keys())?,
+        };
         check_root_signatures(&root, previous, &signers)?;
         Ok(Verified {
+            signed: self.clone(),
+            genesis: root.genesis()?,
             root,
             payload_sha256,
         })
@@ -219,38 +284,16 @@ fn check_root_signatures(
     Ok(())
 }
 
+#[derive(Clone)]
 struct Verified {
+    signed: SignedTrustRoot,
     root: TrustRoot,
     payload_sha256: String,
+    genesis: String,
 }
 
-/// A client's pinned trust root: any version, checked against its own root keys.
-pub(crate) struct Pinned {
-    root: TrustRoot,
-    payload_sha256: String,
-}
-
-impl Pinned {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        let signed = SignedTrustRoot::decode(bytes).context("reading the pinned trust root")?;
-        let (root, payload_sha256) = signed.open()?;
-        // A later version also carries its predecessor's signatures, which a
-        // standalone pin cannot check. Its own root keys must still reach
-        // their threshold, and every signature they made must be valid.
-        let signers = signed.0.verify_known(&TRUST_ROOT, &root.root_keys())?;
-        check_root_signatures(&root, None, &signers)?;
-        Ok(Self {
-            root,
-            payload_sha256,
-        })
-    }
-
-    pub(crate) fn root(&self) -> &TrustRoot {
-        &self.root
-    }
-}
-
-/// Every trust root version from 1 through the one a catalog is signed under.
+/// Consecutive trust root versions: the newest versions a catalog carries,
+/// a client's pin, or a repository's whole history.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct TrustChain(Vec<SignedTrustRoot>);
@@ -260,15 +303,17 @@ impl TrustChain {
         &self.0
     }
 
-    /// Verify every version from version 1 for this publisher.
+    /// The newest `count` versions.
+    pub(crate) fn newest(&self, count: usize) -> Self {
+        Self(self.0[self.0.len().saturating_sub(count)..].to_vec())
+    }
+
+    /// Verify each version as the successor of the one before, and the first
+    /// on its own root keys, for this publisher.
     pub(crate) fn verify(&self, publisher: &str) -> Result<VerifiedChain> {
         ensure!(
             !self.0.is_empty(),
             "catalog for {publisher} carries no trust root"
-        );
-        ensure!(
-            self.0.len() <= MAX_VERSIONS,
-            "publisher trust root history exceeds {MAX_VERSIONS} versions"
         );
         let mut versions: Vec<Verified> = Vec::with_capacity(self.0.len());
         for signed in &self.0 {
@@ -283,28 +328,43 @@ impl TrustChain {
         Ok(VerifiedChain(versions))
     }
 
-    /// Require `next` to extend this history unchanged.
+    /// Require `next`, a later catalog's history, to agree with this one and
+    /// to end at the same version or a later one.
     pub(crate) fn check_successor(&self, next: &Self) -> Result<()> {
-        ensure!(
-            next.0.starts_with(&self.0),
-            "release drops or changes the publisher trust root history"
-        );
-        Ok(())
+        let Some(first) = self.0.first() else {
+            return Ok(());
+        };
+        let publisher = first.open()?.0.publisher;
+        (|| {
+            let (previous, next) = (self.verify(&publisher)?, next.verify(&publisher)?);
+            ensure!(
+                next.current().version >= previous.current().version,
+                "trust root version {} precedes version {}",
+                next.current().version,
+                previous.current().version
+            );
+            previous.join(&next).map(drop)
+        })()
+        .context("release drops or changes the publisher trust root history")
     }
 }
 
-/// A trust root history whose signatures all verify.
+/// A trust history whose signatures all verify.
 pub(crate) struct VerifiedChain(Vec<Verified>);
 
 impl VerifiedChain {
-    /// The version catalogs carrying this history are signed under.
+    /// The newest version: catalogs carrying this history are signed under it.
     pub(crate) fn current(&self) -> &TrustRoot {
         &self.0.last().expect("verified chains are not empty").root
     }
 
+    fn first(&self) -> u64 {
+        self.0[0].root.version
+    }
+
     /// The SHA-256 of the version 1 payload: a stable publisher identity.
     pub(crate) fn genesis(&self) -> &str {
-        &self.0[0].payload_sha256
+        &self.0[0].genesis
     }
 
     /// Every root and catalog key of every version.
@@ -322,28 +382,54 @@ impl VerifiedChain {
             .collect()
     }
 
-    /// Require the history to contain the client's pinned version unchanged.
-    pub(crate) fn check_pinned(&self, pinned: &Pinned) -> Result<()> {
-        let version = pinned.root.version;
+    fn chain(&self) -> TrustChain {
+        TrustChain(
+            self.0
+                .iter()
+                .map(|version| version.signed.clone())
+                .collect(),
+        )
+    }
+
+    /// Join two histories of one publisher. They must agree on every version
+    /// both hold, and the later one must start no later than the version
+    /// after the earlier one ends.
+    fn join(&self, other: &Self) -> Result<Self> {
+        let (low, high) = if self.first() <= other.first() {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let publisher = &low.current().publisher;
         ensure!(
-            pinned.root.publisher == self.current().publisher,
-            "pinned trust root belongs to publisher {}",
-            pinned.root.publisher
+            low.genesis() == high.genesis(),
+            "trust root histories for {publisher} start from different version 1 trust roots"
         );
-        let index = usize::try_from(version - 1)?;
-        let found = self.0.get(index).with_context(|| {
-            format!(
-                "catalog for {} is signed under trust root version {}, older than the pinned version {version}",
-                pinned.root.publisher,
-                self.current().version
-            )
-        })?;
+        let end = low.current().version;
         ensure!(
-            found.payload_sha256 == pinned.payload_sha256,
-            "catalog trust history differs from the pinned trust root version {version} for {}",
-            pinned.root.publisher
+            high.first() <= end + 1,
+            "trust root history for {publisher} jumps from version {end} to version {}; pin a newer trust root",
+            high.first()
         );
-        Ok(())
+        let mut joined = low.0.clone();
+        for version in &high.0 {
+            let number = version.root.version;
+            if number <= end {
+                let known = &low.0[usize::try_from(number - low.first())?];
+                ensure!(
+                    known.payload_sha256 == version.payload_sha256,
+                    "trust root histories for {publisher} differ at version {number}"
+                );
+            } else {
+                if number == end + 1 {
+                    version
+                        .signed
+                        .verify(Some(&joined.last().expect("not empty").root))?;
+                }
+                joined.push(version.clone());
+            }
+        }
+        Ok(Self(joined))
     }
 
     /// Require exactly the catalog threshold of distinct, authorized signatures.
@@ -369,51 +455,143 @@ pub(crate) enum Freshness {
     /// An exact pin or a historical catalog: its trust root may have expired
     /// or been superseded.
     Pinned,
-    /// A new current catalog: its trust root must not have expired.
+    /// A new current catalog: it must be signed under the newest pinned
+    /// version or a later one, which must not have expired.
     Current,
 }
 
-/// Verify a catalog's trust history against a client's pinned trust root.
+/// Decode a pinned history in its only accepted byte form: a single
+/// version is its trust root file, and a longer history is the canonical
+/// JSON array of its versions, oldest first.
+fn parse_pin(bytes: &[u8]) -> Result<VerifiedChain> {
+    (|| {
+        let chain = if bytes.first() == Some(&b'[') {
+            let chain: TrustChain = serde_json::from_slice(bytes)?;
+            ensure!(
+                (2..=PIN_VERSIONS).contains(&chain.0.len()),
+                "pinned trust root history holds 2 to {PIN_VERSIONS} versions"
+            );
+            chain
+        } else {
+            TrustChain(vec![SignedTrustRoot::decode(bytes)?])
+        };
+        ensure!(
+            encode_pin(&chain)? == bytes,
+            "pinned trust root history is not canonical"
+        );
+        let publisher = chain.0[0].open()?.0.publisher;
+        chain.verify(&publisher)
+    })()
+    .context("reading the pinned trust root")
+}
+
+fn encode_pin(chain: &TrustChain) -> Result<Vec<u8>> {
+    match chain.0.as_slice() {
+        [single] => single.encode(),
+        _ => Ok(serde_json::to_vec(chain)?),
+    }
+}
+
+/// Verify a catalog's trust history against a client's pinned history.
 pub(crate) fn verify(
     publisher: &str,
     chain: &TrustChain,
     pinned: &[u8],
     freshness: Freshness,
 ) -> Result<VerifiedChain> {
-    let pinned = Pinned::parse(pinned)?;
+    let pin = parse_pin(pinned)?;
     ensure!(
-        pinned.root.publisher == publisher,
+        pin.current().publisher == publisher,
         "pinned trust root belongs to publisher {}, not {publisher}",
-        pinned.root.publisher
+        pin.current().publisher
+    );
+    ensure!(
+        chain.0.len() <= CATALOG_VERSIONS,
+        "catalog for {publisher} carries more than {CATALOG_VERSIONS} trust root versions"
     );
     let verified = chain.verify(publisher)?;
-    verified.check_pinned(&pinned)?;
+    let signed_under = verified.current().version;
+    let oldest = match freshness {
+        Freshness::Pinned => pin.first(),
+        Freshness::Current => pin.current().version,
+    };
+    ensure!(
+        signed_under >= oldest,
+        "catalog for {publisher} is signed under trust root version {signed_under}, older than the pinned version {oldest}"
+    );
+    pin.join(&verified).with_context(|| {
+        format!("catalog trust history does not continue the pinned trust root for {publisher}")
+    })?;
     if freshness == Freshness::Current {
         verified.current().check_unexpired()?;
     }
     Ok(verified)
 }
 
-/// Every key named by a pinned trust root.
-pub(crate) fn pinned_keys(pinned: &[u8]) -> Result<BTreeSet<PublicKey>> {
-    let pinned = Pinned::parse(pinned)?;
-    Ok(pinned
-        .root
-        .root_keys
-        .iter()
-        .chain(&pinned.root.catalog_keys)
-        .map(|key| key.0)
-        .collect())
+/// The pin after a client verified a catalog's history against it: the
+/// pinned history extended through the catalog's newest version, or the
+/// pin unchanged when the catalog carries no later version.
+pub(crate) fn advance(pinned: &[u8], chain: &TrustChain) -> Result<Vec<u8>> {
+    let pin = parse_pin(pinned)?;
+    let verified = chain.verify(&pin.current().publisher)?;
+    let mut joined = pin.join(&verified)?;
+    // A catalog that also carries versions older than the pin would
+    // otherwise rewrite the pin without advancing it, which
+    // `check_advanced` rightly refuses when a transaction resumes.
+    if joined.current().version == pin.current().version {
+        return Ok(pinned.to_vec());
+    }
+    let excess = joined.0.len().saturating_sub(PIN_VERSIONS);
+    joined.0.drain(..excess);
+    encode_pin(&joined.chain())
 }
 
-/// Read a pinned trust root file, returning its canonical bytes.
+/// Require `next` to be `previous` or a pin advanced from it: the same
+/// publisher's history, agreeing on every version both hold and ending at
+/// the same version or a later one.
+pub(crate) fn check_advanced(previous: &[u8], next: &[u8]) -> Result<()> {
+    if previous == next {
+        return Ok(());
+    }
+    let (previous, next) = (parse_pin(previous)?, parse_pin(next)?);
+    ensure!(
+        next.current().version > previous.current().version,
+        "a pinned trust root can only advance to a later version"
+    );
+    previous.join(&next).map(drop)
+}
+
+/// Every key named by a pinned history.
+pub(crate) fn pinned_keys(pinned: &[u8]) -> Result<BTreeSet<PublicKey>> {
+    Ok(parse_pin(pinned)?.keys())
+}
+
+/// The newest version of a pinned history.
+pub(crate) fn pinned_root(pinned: &[u8]) -> Result<TrustRoot> {
+    Ok(parse_pin(pinned)?.current().clone())
+}
+
+/// The SHA-256 of the version 1 payload of a pinned history's publisher.
+pub(crate) fn pinned_genesis(pinned: &[u8]) -> Result<String> {
+    Ok(parse_pin(pinned)?.genesis().to_owned())
+}
+
+/// Decode a standalone trust root file, such as `trust/2.json`, checked
+/// against its own root keys.
+pub(crate) fn decode_file(bytes: &[u8]) -> Result<TrustRoot> {
+    Ok(SignedTrustRoot::decode(bytes)?.verify(None)?.root)
+}
+
+/// A pinned history of one standalone trust root file: the file itself.
+pub(crate) fn pin_file(bytes: &[u8]) -> Result<Vec<u8>> {
+    SignedTrustRoot::decode(bytes)?.verify(None)?;
+    Ok(bytes.to_vec())
+}
+
+/// Read a trust root file as a pinned history of that one version.
 pub(crate) fn read_pinned(path: &Path) -> Result<Vec<u8>> {
-    (|| -> Result<_> {
-        let bytes = read_limited(File::open(path)?, TRUST_ROOT_LIMIT)?;
-        Pinned::parse(&bytes)?;
-        Ok(bytes)
-    })()
-    .with_context(|| format!("reading trust root {}", path.display()))
+    (|| pin_file(&read_limited(File::open(path)?, TRUST_ROOT_LIMIT)?))()
+        .with_context(|| format!("reading trust root {}", path.display()))
 }
 
 /// The trust root history stored in a publisher repository.
@@ -474,16 +652,21 @@ impl Store {
         repo.join(TRUST_DIR).join(format!("{version}.json"))
     }
 
-    /// The version 1 trust root bytes: the publisher's own pin.
-    pub(crate) fn genesis_bytes(&self) -> Result<Vec<u8>> {
-        self.chain.0[0].encode()
+    /// The whole history as a pin: the publisher's own pin for its catalogs.
+    pub(crate) fn pin(&self) -> Result<Vec<u8>> {
+        encode_pin(&self.chain)
+    }
+
+    /// The versions a new catalog carries.
+    pub(crate) fn catalog_chain(&self) -> TrustChain {
+        self.chain.newest(CATALOG_VERSIONS)
     }
 }
 
 /// Membership changes for the next trust root version. Empty key lists and
 /// absent thresholds keep the previous version's values.
 #[derive(Default)]
-pub struct TrustDraft<'a> {
+pub(crate) struct TrustDraft<'a> {
     pub publisher: Option<&'a str>,
     pub root_keys: &'a [PathBuf],
     pub root_threshold: Option<usize>,
@@ -564,6 +747,7 @@ pub(crate) fn draft_with(
                 .context("the first trust root requires a publisher")?
                 .to_owned(),
             version: 1,
+            genesis_sha256: None,
             expires: new_expiry(expires)?,
             root_keys: root_keys.context("the first trust root requires root keys")?,
             root_threshold: root_threshold.unwrap_or(1),
@@ -581,6 +765,7 @@ pub(crate) fn draft_with(
             TrustRoot {
                 publisher: previous.publisher.clone(),
                 version: previous.version + 1,
+                genesis_sha256: Some(previous.genesis()?),
                 expires: new_expiry(expires)?,
                 root_keys: root_keys.unwrap_or_else(|| previous.root_keys.clone()),
                 root_threshold: root_threshold.unwrap_or(previous.root_threshold),
@@ -589,10 +774,6 @@ pub(crate) fn draft_with(
             }
         }
     };
-    ensure!(
-        usize::try_from(root.version)? <= MAX_VERSIONS,
-        "publisher trust root history is limited to {MAX_VERSIONS} versions"
-    );
     root.validate()?;
     Ok(root)
 }
@@ -741,7 +922,7 @@ pub(crate) fn describe(path: &Path) -> Result<String> {
             .with_context(|| format!("repository {} has no trust root", path.display()))?;
         store.verified.current().clone()
     } else {
-        Pinned::parse(&read_pinned(path)?)?.root
+        pinned_root(&read_pinned(path)?)?
     };
     let mut text = root.to_string();
     if root.expires() <= Timestamp::now() {
@@ -754,12 +935,12 @@ pub(crate) fn describe(path: &Path) -> Result<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::repo::keys::SigningKey;
-    use ring::signature::Ed25519KeyPair;
+    use aws_lc_rs::signature::Ed25519KeyPair;
 
     /// Keys reloadable from their PKCS#8 documents, with public key files.
     pub(crate) struct Keys {
         dir: tempfile::TempDir,
-        documents: Vec<ring::pkcs8::Document>,
+        documents: Vec<aws_lc_rs::pkcs8::Document>,
     }
 
     impl Keys {
@@ -768,7 +949,7 @@ pub(crate) mod tests {
             let mut documents = Vec::new();
             for index in 0..count {
                 let document =
-                    Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+                    Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
                 fs::write(dir.path().join(format!("{index}.der")), document.as_ref())?;
                 let key: SigningKey = Ed25519KeyPair::from_pkcs8(document.as_ref())
                     .unwrap()
@@ -812,12 +993,33 @@ pub(crate) mod tests {
         TrustRoot {
             publisher: "canopa".to_owned(),
             version,
+            genesis_sha256: None,
             expires: "2099-01-01T00:00:00Z".to_owned(),
             root_keys: root.iter().map(|index| keys.key(*index)).collect(),
             root_threshold,
             catalog_keys: BTreeSet::from([keys.key(9)]),
             catalog_threshold: 1,
         }
+    }
+
+    /// The version after `previous` with these root keys.
+    fn next(previous: &TrustRoot, keys: &Keys, root: &[usize], root_threshold: usize) -> TrustRoot {
+        TrustRoot {
+            version: previous.version + 1,
+            genesis_sha256: Some(previous.genesis().unwrap()),
+            ..self::root(keys, 1, root, root_threshold)
+        }
+    }
+
+    /// Versions 1 through `count`, each signed by key 0 alone.
+    fn history(keys: &Keys, count: u64) -> Vec<SignedTrustRoot> {
+        let mut root = self::root(keys, 1, &[0], 1);
+        let mut versions = vec![sign(&root, &keys.signers(&[0]))];
+        for _ in 1..count {
+            root = next(&root, keys, &[0], 1);
+            versions.push(sign(&root, &keys.signers(&[0])));
+        }
+        versions
     }
 
     /// Sign without the expiry and successor checks of [`combine`].
@@ -837,7 +1039,7 @@ pub(crate) mod tests {
         assert!(TrustChain(vec![genesis.clone()]).verify("other").is_err());
 
         // Version 2 replaces keys 1 and 2 with 3 and 4.
-        let second = root(&keys, 2, &[0, 3, 4], 2);
+        let second = next(&first, &keys, &[0, 3, 4], 2);
         let chain = |signed: SignedTrustRoot| TrustChain(vec![genesis.clone(), signed]);
         for (signers, valid) in [
             (&[0, 1, 3, 4][..], true),
@@ -861,7 +1063,8 @@ pub(crate) mod tests {
             .unwrap();
         assert!(format!("{error:#}").contains("unauthorized key"));
         // Versions must be contiguous.
-        let skipped = root(&keys, 3, &[0, 1, 2], 2);
+        let mut skipped = next(&first, &keys, &[0, 1, 2], 2);
+        skipped.version = 3;
         assert!(
             chain(sign(&skipped, &keys.signers(&[0, 1])))
                 .verify("canopa")
@@ -879,7 +1082,13 @@ pub(crate) mod tests {
                 .check_successor(&TrustChain(vec![genesis.clone()]))
                 .is_err()
         );
-        let fork = chain(sign(&second, &keys.signers(&[0, 1, 4])));
+        // Signatures may differ, but a different version 2 is a fork.
+        let resigned = chain(sign(&second, &keys.signers(&[0, 1, 4])));
+        valid.check_successor(&resigned)?;
+        let fork = chain(sign(
+            &next(&first, &keys, &[0, 4, 5], 2),
+            &keys.signers(&[0, 1, 4]),
+        ));
         assert!(valid.check_successor(&fork).is_err());
         Ok(())
     }
@@ -887,8 +1096,9 @@ pub(crate) mod tests {
     #[test]
     fn clients_pin_any_version_and_reject_older_or_different_histories() -> Result<()> {
         let keys = Keys::new(10)?;
-        let first = sign(&root(&keys, 1, &[0], 1), &keys.signers(&[0]));
-        let second = sign(&root(&keys, 2, &[1], 1), &keys.signers(&[0, 1]));
+        let genesis = root(&keys, 1, &[0], 1);
+        let first = sign(&genesis, &keys.signers(&[0]));
+        let second = sign(&next(&genesis, &keys, &[1], 1), &keys.signers(&[0, 1]));
         let chain = TrustChain(vec![first.clone(), second.clone()]);
         // A later version pins on its own root keys; the predecessor's
         // signature is ignored when it is standalone.
@@ -909,21 +1119,21 @@ pub(crate) mod tests {
         assert!(verify("canopa", &chain, &other.encode()?, Freshness::Pinned).is_err());
         assert!(verify("other", &chain, &first.encode()?, Freshness::Pinned).is_err());
         // A pin needs its own root threshold.
-        let unsigned = sign(&root(&keys, 2, &[1], 1), &keys.signers(&[0]));
-        assert!(Pinned::parse(&unsigned.encode()?).is_err());
+        let unsigned = sign(&next(&genesis, &keys, &[1], 1), &keys.signers(&[0]));
+        assert!(parse_pin(&unsigned.encode()?).is_err());
         // The pinned file must be canonical.
         let mut spaced = first.encode()?;
         spaced.push(b'\n');
-        assert!(Pinned::parse(&spaced).is_err());
+        assert!(parse_pin(&spaced).is_err());
         Ok(())
     }
 
     #[test]
     fn expiry_rejects_new_current_catalogs_but_not_pinned_history() -> Result<()> {
         let keys = Keys::new(10)?;
-        let mut expired = root(&keys, 1, &[0], 1);
-        expired.expires = "2020-01-01T00:00:00Z".to_owned();
-        let expired = sign(&expired, &keys.signers(&[0]));
+        let mut genesis = root(&keys, 1, &[0], 1);
+        genesis.expires = "2020-01-01T00:00:00Z".to_owned();
+        let expired = sign(&genesis, &keys.signers(&[0]));
         let chain = TrustChain(vec![expired.clone()]);
         let pin = expired.encode()?;
         verify("canopa", &chain, &pin, Freshness::Pinned)?;
@@ -932,7 +1142,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(format!("{error:#}").contains("expired at 2020-01-01T00:00:00Z"));
         // A renewed version makes the same pin current again.
-        let renewed = sign(&root(&keys, 2, &[0], 1), &keys.signers(&[0]));
+        let renewed = sign(&next(&genesis, &keys, &[0], 1), &keys.signers(&[0]));
         verify(
             "canopa",
             &TrustChain(vec![expired, renewed]),
@@ -1001,6 +1211,132 @@ pub(crate) mod tests {
             .collect();
         check_expected_root_keys(&next, &expected)?;
         assert!(check_expected_root_keys(&next, &expected[..1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn catalogs_carry_recent_versions_that_continue_the_pin() -> Result<()> {
+        let keys = Keys::new(10)?;
+        let versions = history(&keys, 70);
+        let pin = |range: std::ops::RangeInclusive<usize>| {
+            encode_pin(&TrustChain(versions[range].to_vec())).unwrap()
+        };
+        let window = |range: std::ops::RangeInclusive<usize>| TrustChain(versions[range].to_vec());
+        // Histories have no version limit, but a catalog carries at most
+        // CATALOG_VERSIONS of them.
+        let store = TrustChain(versions.clone());
+        let carried = store.newest(CATALOG_VERSIONS);
+        assert_eq!(carried.versions().len(), CATALOG_VERSIONS);
+        verify("canopa", &carried, &store_pin(&store)?, Freshness::Current)?;
+        let error = verify("canopa", &store, &pin(0..=0), Freshness::Pinned)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("more than 16 trust root versions"));
+        // A pin inside the window, or just before it, follows it.
+        verify(
+            "canopa",
+            &window(54..=69),
+            &pin(60..=60),
+            Freshness::Current,
+        )?;
+        verify(
+            "canopa",
+            &window(54..=69),
+            &pin(40..=53),
+            Freshness::Current,
+        )?;
+        // A pin further behind cannot.
+        let error = verify("canopa", &window(54..=69), &pin(0..=0), Freshness::Current)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("jumps from version 1 to version 55"));
+        // A current catalog may not be signed under an older version than
+        // the pin's newest, but a historical one may.
+        let error = verify("canopa", &window(0..=9), &pin(0..=19), Freshness::Current)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("older than the pinned version 20"));
+        verify("canopa", &window(0..=9), &pin(0..=19), Freshness::Pinned)?;
+        let error = verify("canopa", &window(0..=9), &pin(15..=19), Freshness::Pinned)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("older than the pinned version 16"));
+        // The catalog must agree with every pinned version it holds.
+        let fork = sign(
+            &next(
+                &TrustRoot::decode(&versions[9].0.validate(&TRUST_ROOT)?)?,
+                &keys,
+                &[0, 1],
+                1,
+            ),
+            &keys.signers(&[0, 1]),
+        );
+        let forked = TrustChain([&versions[5..=9], &[fork]].concat());
+        assert!(verify("canopa", &forked, &pin(0..=10), Freshness::Pinned).is_err());
+        Ok(())
+    }
+
+    fn store_pin(chain: &TrustChain) -> Result<Vec<u8>> {
+        encode_pin(chain)
+    }
+
+    #[test]
+    fn pins_advance_along_their_history() -> Result<()> {
+        let keys = Keys::new(10)?;
+        let versions = history(&keys, 40);
+        let first = versions[0].encode()?;
+        let advanced = advance(&first, &TrustChain(versions[..=15].to_vec()))?;
+        assert_eq!(pinned_root(&advanced)?.version, 16);
+        check_advanced(&first, &advanced)?;
+        assert!(check_advanced(&advanced, &first).is_err());
+        let again = advance(&advanced, &TrustChain(versions[16..=31].to_vec()))?;
+        assert_eq!(pinned_root(&again)?.version, 32);
+        assert_eq!(pinned_genesis(&again)?, pinned_genesis(&first)?);
+        // Advancing to an older catalog keeps the newest version.
+        assert_eq!(
+            advance(&again, &TrustChain(versions[..=3].to_vec()))?,
+            again
+        );
+        // A pin of a later version, such as `trust/2.json`, stays as it is
+        // when the catalog's history only adds older versions, so a resumed
+        // transaction still sees an unchanged pin.
+        let second = versions[1].encode()?;
+        let same = advance(&second, &TrustChain(versions[..=1].to_vec()))?;
+        assert_eq!(same, second);
+        check_advanced(&second, &same)?;
+        let later = advance(&second, &TrustChain(versions[..=2].to_vec()))?;
+        assert_eq!(pinned_root(&later)?.version, 3);
+        check_advanced(&second, &later)?;
+        // A pin cannot jump a gap in the history.
+        assert!(advance(&first, &TrustChain(versions[24..=39].to_vec())).is_err());
+        // Another publisher's history is not an advance.
+        let other = sign(&root(&keys, 1, &[1], 1), &keys.signers(&[1]));
+        assert!(check_advanced(&first, &other.encode()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn later_versions_name_their_version_one() -> Result<()> {
+        let keys = Keys::new(10)?;
+        let genesis = root(&keys, 1, &[0], 1);
+        let second = next(&genesis, &keys, &[0], 1);
+        let mut wrong = second.clone();
+        wrong.genesis_sha256 = Some(digest(b"another publisher"));
+        let chain = |root: &TrustRoot| {
+            TrustChain(vec![
+                sign(&genesis, &keys.signers(&[0])),
+                sign(root, &keys.signers(&[0])),
+            ])
+        };
+        chain(&second).verify("canopa")?;
+        let error = chain(&wrong).verify("canopa").err().unwrap();
+        assert!(format!("{error:#}").contains("names a different version 1"));
+        let mut unnamed = second.clone();
+        unnamed.genesis_sha256 = None;
+        assert!(unnamed.encode().is_err());
+        let mut named = genesis.clone();
+        named.genesis_sha256 = Some(digest(b"x"));
+        assert!(named.encode().is_err());
         Ok(())
     }
 }

@@ -7,23 +7,24 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
+
 use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use url::Url;
 
 use crate::{
-    BuildSettings, BuildWorker, GitSnapshotRef, SourceLayout,
+    BuildSettings, BuildToolchain, BuildWorker, GitSnapshotRef, SourceLayout,
     build::{
         read_expanded_output,
         snapshot::{ARCHIVE, archive_commit, checkout, git, object_format},
     },
-    build_with_toolchain_config, fetch_sources_with_local,
-    image::root::Root,
+    fetch_sources_with_local,
+    image::{accounts::Accounts, root::Root},
     kdl_format::{
         build::{
             RECIPE_LIMIT, git_document, git_toolchain_template, parse as parse_recipe,
@@ -54,7 +55,7 @@ pub(crate) struct GitSource {
 /// package is installed and on every tracked-branch upgrade.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct GitSignatures {
+pub(crate) struct GitSignatures {
     format: GitSignatureFormat,
     allowed_signers: PathBuf,
     require: GitSignedObject,
@@ -69,14 +70,14 @@ enum GitSignatureFormat {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum GitSignedObject {
+pub(crate) enum GitSignedObject {
     Commit,
     Tag,
 }
 
 impl GitSignatures {
     /// Parse `ssh:PATH` or `openpgp:PATH`.
-    pub fn new(signers: &str, require: GitSignedObject) -> Result<Self> {
+    pub(crate) fn new(signers: &str, require: GitSignedObject) -> Result<Self> {
         let (format, path) = signers
             .split_once(':')
             .context("use ssh:PATH or openpgp:PATH for the allowed signers")?;
@@ -125,39 +126,26 @@ impl GitSignatures {
         )
     }
 
+    /// Check the signature that the policy requires on `commit`.
+    ///
+    /// The build account fetches tags and reports raw Git objects, but it
+    /// cannot vouch for them: CPS checks that each object's bytes hash to
+    /// its ID, separates the signature from the signed payload as Git does,
+    /// and verifies it itself with `ssh-keygen` or `gpg` against the signers
+    /// file, in a directory that only the CPS account can write.
     fn verify(&self, url: &OsStr, clone: &Path, commit: &str) -> Result<()> {
         self.check_file()?;
-        let keyring = tempfile::tempdir()?;
-        let verifier = || -> Command {
-            let mut command = install_git();
-            command.arg("-C").arg(clone);
-            match self.format {
-                GitSignatureFormat::Ssh => {
-                    command
-                        .args(["-c", "gpg.format=ssh", "-c"])
-                        .arg(format!(
-                            "gpg.ssh.allowedSignersFile={}",
-                            self.allowed_signers.display()
-                        ))
-                        .args(["-c", "gpg.minTrustLevel=fully"]);
-                }
-                GitSignatureFormat::Openpgp => {
-                    // A private keyring holds only the allowed keys.
-                    command
-                        .args(["-c", "gpg.format=openpgp", "-c", "gpg.program=gpg"])
-                        .env("GNUPGHOME", keyring.path());
-                }
-            }
-            command.stdin(Stdio::null());
-            command
-        };
+        let scratch = tempfile::tempdir()?;
+        fs::set_permissions(scratch.path(), fs::Permissions::from_mode(0o700))?;
+        let keyring = scratch.path().join("keyring");
         if self.format == GitSignatureFormat::Openpgp {
-            fs::set_permissions(keyring.path(), fs::Permissions::from_mode(0o700))?;
-            let status = Command::new("gpg")
-                .env("GNUPGHOME", keyring.path())
+            // A private keyring holds only the allowed keys.
+            fs::create_dir(&keyring)?;
+            fs::set_permissions(&keyring, fs::Permissions::from_mode(0o700))?;
+            let status = signature_tool("gpg")
+                .env("GNUPGHOME", &keyring)
                 .args(["--batch", "--quiet", "--import"])
                 .arg(&self.allowed_signers)
-                .stdin(Stdio::null())
                 .status()
                 .context("running gpg to load the allowed signers")?;
             ensure!(
@@ -167,12 +155,15 @@ impl GitSignatures {
         }
         let result = (|| match self.require {
             GitSignedObject::Commit => {
-                let status = verifier()
-                    .args(["verify-commit", commit])
-                    .status()
-                    .context("running git verify-commit")?;
+                let object = read_object(clone, "commit", commit)?;
+                let signed = match commit_signature(&object, commit) {
+                    Some((payload, signature)) => {
+                        self.signed_by_allowed(scratch.path(), &payload, &signature)?
+                    }
+                    None => false,
+                };
                 ensure!(
-                    status.success(),
+                    signed,
                     "Git commit {commit} has no valid signature from an allowed signer"
                 );
                 Ok(())
@@ -209,12 +200,12 @@ impl GitSignatures {
                         object_format(object).is_some(),
                         "git returned an invalid tag ID"
                     );
-                    if verifier()
-                        .args(["verify-tag", object])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()?
-                        .success()
+                    let tag = read_object(clone, "tag", object)?;
+                    if !tag.starts_with(format!("object {commit}\ntype commit\n").as_bytes()) {
+                        continue;
+                    }
+                    if let Some((payload, signature)) = tag_signature(&tag)
+                        && self.signed_by_allowed(scratch.path(), payload, signature)?
                     {
                         return Ok(());
                     }
@@ -223,14 +214,187 @@ impl GitSignatures {
             }
         })();
         if self.format == GitSignatureFormat::Openpgp {
-            let _ = Command::new("gpgconf")
-                .env("GNUPGHOME", keyring.path())
+            let _ = signature_tool("gpgconf")
+                .env("GNUPGHOME", &keyring)
                 .args(["--kill", "all"])
-                .stdin(Stdio::null())
                 .status();
         }
         result
     }
+
+    /// Whether `signature` over `payload` comes from an allowed signer.
+    fn signed_by_allowed(&self, scratch: &Path, payload: &[u8], signature: &[u8]) -> Result<bool> {
+        let payload_path = scratch.join("payload");
+        let signature_path = scratch.join("signature");
+        fs::write(&payload_path, payload)?;
+        fs::write(&signature_path, signature)?;
+        match self.format {
+            GitSignatureFormat::Ssh => {
+                if !signature.starts_with(b"-----BEGIN SSH SIGNATURE-----") {
+                    return Ok(false);
+                }
+                let principals = signature_tool("ssh-keygen")
+                    .args(["-Y", "find-principals", "-f"])
+                    .arg(&self.allowed_signers)
+                    .arg("-s")
+                    .arg(&signature_path)
+                    .output()
+                    .context("running ssh-keygen to find the signer")?;
+                if !principals.status.success() {
+                    return Ok(false);
+                }
+                for principal in std::str::from_utf8(&principals.stdout)?.lines() {
+                    let status = signature_tool("ssh-keygen")
+                        .args(["-Y", "verify", "-n", "git", "-f"])
+                        .arg(&self.allowed_signers)
+                        .arg("-I")
+                        .arg(principal)
+                        .arg("-s")
+                        .arg(&signature_path)
+                        .stdin(File::open(&payload_path)?)
+                        .stdout(Stdio::null())
+                        .status()
+                        .context("running ssh-keygen to verify the signature")?;
+                    if status.success() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            GitSignatureFormat::Openpgp => {
+                if !signature.starts_with(b"-----BEGIN PGP SIGNATURE-----") {
+                    return Ok(false);
+                }
+                let output = signature_tool("gpg")
+                    .env("GNUPGHOME", scratch.join("keyring"))
+                    .args(["--batch", "--no-tty", "--status-fd", "1", "--verify"])
+                    .arg(&signature_path)
+                    .arg(&payload_path)
+                    .output()
+                    .context("running gpg to verify the signature")?;
+                let status = String::from_utf8_lossy(&output.stdout);
+                let has = |keyword: &str| {
+                    status
+                        .lines()
+                        .any(|line| line.starts_with(&format!("[GNUPG:] {keyword} ")))
+                };
+                Ok(output.status.success()
+                    && has("GOODSIG")
+                    && has("VALIDSIG")
+                    && !has("BADSIG")
+                    && !has("ERRSIG"))
+            }
+        }
+    }
+}
+
+/// A signature tool that CPS runs itself, with a clean environment.
+fn signature_tool(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null());
+    command
+}
+
+/// Commit and tag objects larger than this are refused.
+const OBJECT_LIMIT: u64 = 1 << 20;
+
+/// Read a Git object that the build account reports, and check that its
+/// bytes are the object `id` names.
+fn read_object(clone: &Path, kind: &str, id: &str) -> Result<Vec<u8>> {
+    let format = object_format(id).context("invalid Git object ID")?;
+    let output = install_git()
+        .arg("-C")
+        .arg(clone)
+        .args(["cat-file", kind, id])
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("reading Git {kind} {id}"))?;
+    ensure!(
+        output.status.success() && output.stdout.len() as u64 <= OBJECT_LIMIT,
+        "reading Git {kind} {id} failed"
+    );
+    let object = output.stdout;
+    let mut framed = format!("{kind} {}\0", object.len()).into_bytes();
+    framed.extend_from_slice(&object);
+    let algorithm = if format == "sha256" {
+        &aws_lc_rs::digest::SHA256
+    } else {
+        &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY
+    };
+    ensure!(
+        hex::encode(aws_lc_rs::digest::digest(algorithm, &framed)) == id.to_ascii_lowercase(),
+        "Git {kind} {id} does not match its ID"
+    );
+    Ok(object)
+}
+
+/// Split a commit into the payload its signature covers and the signature,
+/// as Git does: every signature header is left out of the payload, and the
+/// one for the commit's object format holds the signature.
+fn commit_signature(object: &[u8], id: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let header = if id.len() == 64 {
+        "gpgsig-sha256"
+    } else {
+        "gpgsig"
+    };
+    let mut payload = Vec::new();
+    let mut signature = Vec::new();
+    let mut in_headers = true;
+    let mut current: Option<bool> = None;
+    for line in object.split_inclusive(|byte| *byte == b'\n') {
+        if !in_headers {
+            payload.extend_from_slice(line);
+            continue;
+        }
+        if line == b"\n" {
+            in_headers = false;
+            current = None;
+            payload.extend_from_slice(line);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(b" ")
+            && let Some(ours) = current
+        {
+            if ours {
+                signature.extend_from_slice(rest);
+            }
+            continue;
+        }
+        current = None;
+        for name in ["gpgsig", "gpgsig-sha256"] {
+            if let Some(rest) = line.strip_prefix(format!("{name} ").as_bytes()) {
+                let ours = name == header;
+                if ours {
+                    signature.extend_from_slice(rest);
+                }
+                current = Some(ours);
+            }
+        }
+        if current.is_none() {
+            payload.extend_from_slice(line);
+        }
+    }
+    (!signature.is_empty()).then_some((payload, signature))
+}
+
+/// Split a tag into its payload and the signature at the end of its
+/// message, which starts at the last line that opens a signature block.
+fn tag_signature(object: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut start = None;
+    let mut offset = 0;
+    for line in object.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"-----BEGIN PGP SIGNATURE-----")
+            || line.starts_with(b"-----BEGIN SSH SIGNATURE-----")
+        {
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    start.map(|start| object.split_at(start))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -298,7 +462,7 @@ impl GitSource {
 }
 
 #[derive(Debug)]
-pub struct GitChange {
+pub(crate) struct GitChange {
     pub package: String,
     pub url: String,
     pub branch: Option<String>,
@@ -316,6 +480,61 @@ pub(crate) struct GitBuild {
     pub change: GitChange,
 }
 
+/// The account that fetches and builds Git packages when CPS runs as root.
+/// The cps package creates it with sysusers.d.
+const BUILD_ACCOUNT: &str = "cps-build";
+
+static ACCOUNT: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+
+/// The user and group IDs of the build account when CPS runs as root, and
+/// `None` otherwise, when Git and the build run as the calling user.
+///
+/// Root never runs Git on a source: a repository is untrusted input, and
+/// Git runs code that a repository's own configuration names. Root only
+/// reads what the build account reports, hashes the source archive, and
+/// checks the build output against the template CPS wrote.
+fn build_account() -> Result<Option<(u32, u32)>> {
+    if let Some(account) = ACCOUNT.get() {
+        return Ok(*account);
+    }
+    let account = if geteuid().is_root() {
+        let ids = Accounts::new(File::open("/")?)
+            .ids(BUILD_ACCOUNT, BUILD_ACCOUNT)
+            .context(
+                "CPS running as root fetches and builds Git packages as the cps-build account, \
+                 which the cps package's sysusers.d creates",
+            )?;
+        ensure!(
+            ids.0 != 0 && ids.1 != 0,
+            "the {BUILD_ACCOUNT} account must not be root"
+        );
+        Some(ids)
+    } else {
+        None
+    };
+    Ok(*ACCOUNT.get_or_init(|| account))
+}
+
+/// Run a command as the build account when CPS runs as root.
+fn as_builder(command: &mut Command) -> &mut Command {
+    if let Some(Some((uid, gid))) = ACCOUNT.get() {
+        command
+            .uid(*uid)
+            .gid(*gid)
+            .current_dir("/")
+            .env("HOME", "/");
+    }
+    command
+}
+
+/// Hand a private directory to the build account when CPS runs as root.
+fn give_to_builder(path: &Path) -> Result<()> {
+    if let Some((uid, gid)) = build_account()? {
+        chown(path, Some(uid), Some(gid))?;
+    }
+    Ok(())
+}
+
 fn install_git() -> Command {
     let mut command = git();
     command
@@ -327,6 +546,7 @@ fn install_git() -> Command {
         .env_remove("GIT_EXEC_PATH")
         .env_remove("GIT_ASKPASS")
         .env_remove("GIT_SSL_NO_VERIFY");
+    as_builder(&mut command);
     command
 }
 
@@ -349,8 +569,10 @@ impl GitBuild {
             GitReference::Commit(commit) => GitSnapshotRef::Commit(commit),
             GitReference::Branch(branch) => GitSnapshotRef::Branch(branch),
         };
+        build_account()?;
         let checkout_dir = tempfile::tempdir()?;
         fs::set_permissions(checkout_dir.path(), fs::Permissions::from_mode(0o700))?;
+        give_to_builder(checkout_dir.path())?;
         let clone = checkout_dir.path().join("repo");
         let commit = checkout(
             OsStr::new(&source.url),
@@ -481,7 +703,7 @@ impl GitBuild {
 /// Open the build output without following symlinks and check its expanded
 /// manifest against the template that CPS wrote.
 ///
-/// On the sudo path the unprivileged build account owns `worker/`, so the
+/// When CPS runs as root, the cps-build account owns `worker/`, so the
 /// output is untrusted until the expanded manifest is shown to be what the
 /// template produces. The expanded manifest also lists the split debug
 /// information.
@@ -504,9 +726,9 @@ fn build_package(path: &Path, toolchain: &Path) -> Result<()> {
     let output = worker.join("bundle");
     if !geteuid().is_root() {
         fetch_sources_with_local(&recipe, &cache, &sources)?;
-        build_with_toolchain_config(
+        crate::build::build(
             &recipe,
-            toolchain,
+            BuildToolchain::Config(toolchain),
             BuildSettings {
                 sources: &cache,
                 output: &output,
@@ -515,19 +737,11 @@ fn build_package(path: &Path, toolchain: &Path) -> Result<()> {
             },
             SourceLayout::Cache,
             &BuildWorker::default(),
+            &std::collections::BTreeMap::new(),
         )?;
         return Ok(());
     }
-    let uid = std::env::var("SUDO_UID")
-        .context("run Git package builds with sudo from an unprivileged account")?
-        .parse()?;
-    let gid = std::env::var("SUDO_GID")
-        .context("missing sudo user's group for the Git build")?
-        .parse()?;
-    ensure!(
-        uid != 0 && gid != 0,
-        "Git builds require an unprivileged build user"
-    );
+    let (uid, gid) = build_account()?.context("expected the Git build account")?;
     for directory in [path, sources.as_path()] {
         chown(directory, None, Some(gid))?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o750))?;
@@ -591,10 +805,9 @@ impl GitStore {
         if !path.try_exists()? {
             let stage = TempDir::new_in(parent)?;
             fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700))?;
-            let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-                .map_err(|_| anyhow::anyhow!("generating Git publisher signing key"))?;
+            let key = crate::repo::generate_signing_key()?;
             let private = stage.path().join("private.der");
-            fs::write(&private, key.as_ref())?;
+            fs::write(&private, key)?;
             fs::set_permissions(&private, fs::Permissions::from_mode(0o600))?;
             read_signing_key(&private)?;
             fs::create_dir(stage.path().join("repo"))?;
@@ -658,7 +871,7 @@ mod tests {
             r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{hash}" key-sha256="{hash}"
+        publisher "seed" catalog-sha256="{hash}" key-sha256="{hash}"
         package "build/compiler"
     }}
     manifest "manifest.kdl" sha256="{hash}"
@@ -668,7 +881,7 @@ build architecture="x86_64" epoch=1700000000 {{
         );
         let template = r#"schema-version 1 kind="package-manifest"
 package "test/git" publisher="git" version="1.0.0-0" {
-    file "usr/share/git" mode="0644" uid=0 gid=0
+    file "usr/share/git" mode="0644"
 }
 "#;
         let work = tempfile::tempdir()?;
@@ -686,10 +899,7 @@ package "test/git" publisher="git" version="1.0.0-0" {
         // The build account cannot add actions that the template lacks.
         fs::write(
             &expanded,
-            template.replace(
-                "}\n",
-                "    file \"usr/bin/su\" mode=\"4755\" uid=0 gid=0\n}\n",
-            ),
+            template.replace("}\n", "    file \"usr/bin/su\" mode=\"4755\"\n}\n"),
         )?;
         let Err(error) = checked_output(path, template, &recipe) else {
             panic!("an added setuid file was accepted");
@@ -817,6 +1027,80 @@ package "test/git" publisher="git" version="1.0.0-0" {
                 .to_string()
                 .contains("writable only by the CPS account")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn openpgp_policies_accept_only_allowed_signers() -> Result<()> {
+        if Command::new("gpg").arg("--version").output().is_err() {
+            eprintln!("skipping: gpg is unavailable");
+            return Ok(());
+        }
+        let work = tempfile::tempdir()?;
+        let dir = work.path();
+        let home = |name: &str| -> Result<PathBuf> {
+            let home = dir.join(name);
+            fs::create_dir(&home)?;
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+            let status = Command::new("gpg")
+                .env("GNUPGHOME", &home)
+                .args(["--batch", "--quiet", "--passphrase", "", "--quick-gen-key"])
+                .arg(format!("{name} <{name}@example.org>"))
+                .args(["ed25519", "sign", "never"])
+                .stdin(Stdio::null())
+                .status()?;
+            ensure!(status.success(), "generating a {name} key failed");
+            Ok(home)
+        };
+        let good = home("good")?;
+        let bad = home("bad")?;
+        let allowed = dir.join("allowed.asc");
+        let export = Command::new("gpg")
+            .env("GNUPGHOME", &good)
+            .args(["--batch", "--armor", "--export"])
+            .output()?;
+        fs::write(&allowed, export.stdout)?;
+        fs::set_permissions(&allowed, fs::Permissions::from_mode(0o644))?;
+        let repo = dir.join("repo");
+        fs::create_dir(&repo)?;
+        run(&repo, &["init", "-q"])?;
+        let commit = |home: &Path, message: &str| -> Result<String> {
+            let signer = format!(
+                "user.signingkey={}@example.org",
+                home.file_name().unwrap().display()
+            );
+            fs::write(repo.join("file"), message)?;
+            run(&repo, &["add", "file"])?;
+            let status = install_git()
+                .arg("-C")
+                .arg(&repo)
+                .env("GNUPGHOME", home)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.org"])
+                .args(["-c", &signer, "-c", "gpg.format=openpgp"])
+                .args(["commit", "-q", "-S", "-m", message])
+                .stdin(Stdio::null())
+                .status()?;
+            ensure!(status.success(), "signing a commit failed");
+            run(&repo, &["rev-parse", "HEAD"])
+        };
+        let signed = commit(&good, "good")?;
+        let forged = commit(&bad, "bad")?;
+        let policy = GitSignatures::new(
+            &format!("openpgp:{}", allowed.display()),
+            GitSignedObject::Commit,
+        )?;
+        policy.verify(repo.as_os_str(), &repo, &signed)?;
+        let error = policy.verify(repo.as_os_str(), &repo, &forged).unwrap_err();
+        assert!(
+            error.to_string().contains("no valid signature"),
+            "{error:#}"
+        );
+        for home in [good, bad] {
+            let _ = Command::new("gpgconf")
+                .env("GNUPGHOME", home)
+                .args(["--kill", "all"])
+                .status();
+        }
         Ok(())
     }
 }

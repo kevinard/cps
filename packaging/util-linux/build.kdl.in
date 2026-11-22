@@ -1,13 +1,15 @@
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1789987631 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
+        publisher "seed" catalog-sha256="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
         package "build/native-util-linux"
     }
-    version "2.42.4-1" upstream="2.42.4"
+    version "2.42.4-1" upstream-version="2.42.4"
     manifest "util-linux.kdl" sha256="@MANIFEST_SHA256@"
     discard "usr/lib/*.la"
-    source "util-linux-2.42.4.tar.xz" size=10729748 sha256="fbd62a100ab7bb8746ba0661255c3c48185b1e9021507c624da01fbc696330ec" url="https://cdn.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.4.tar.xz"
+    source "util-linux-2.42.4.tar.xz" size=10729748 sha256="fbd62a100ab7bb8746ba0661255c3c48185b1e9021507c624da01fbc696330ec" {
+        url "https://cdn.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.4.tar.xz"
+    }
     script """
     tar -xJf "$CPS_SOURCES/util-linux-2.42.4.tar.xz"
     cd util-linux-2.42.4

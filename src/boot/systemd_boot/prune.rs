@@ -8,7 +8,7 @@ use rustix::fs::{CWD, FlockOperation, RenameFlags, renameat_with};
 use super::{
     Inventory, NO_SELECTION, destroy, inventory, lock_esp,
     policy::{BootEntry, LoaderPolicy},
-    rollback,
+    require_readable, rollback,
 };
 use crate::{
     boot::btrfs_boot::{BtrfsRecord, BtrfsVolume},
@@ -17,7 +17,7 @@ use crate::{
 
 /// Why prune removes an environment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BootRemoval {
+pub(crate) enum BootRemoval {
     /// An interrupted destruction left a retirement record.
     Retiring,
     /// The trial used up its boot attempts or was cancelled.
@@ -29,7 +29,7 @@ pub enum BootRemoval {
 }
 
 #[derive(Debug, Default)]
-pub struct BootPruneReport {
+pub(crate) struct BootPruneReport {
     /// Environments removed, or that a dry run would remove, oldest first.
     pub removed: Vec<(String, BootRemoval)>,
     /// Environments that could not be removed, with the reason.
@@ -37,7 +37,7 @@ pub struct BootPruneReport {
 }
 
 #[derive(Debug)]
-pub struct TrialDiscard {
+pub(crate) struct TrialDiscard {
     /// The pending or running trial whose selection was cancelled.
     pub cancelled: Option<String>,
     /// The cancelled trial is the running system and stays until reboot.
@@ -55,7 +55,7 @@ pub struct TrialDiscard {
 /// `staged` names the root that the caller's transaction stages into. A
 /// trial booting that root is an interrupted activation that the caller
 /// resumes, so it stays while its activation can still complete.
-pub fn prune_btrfs_boot_environments(
+pub(crate) fn prune_btrfs_boot_environments(
     esp: &Path,
     volume_path: &Path,
     keep: Option<usize>,
@@ -111,7 +111,7 @@ fn remove(
 }
 
 /// Cancel the pending or running trial, then remove every failed trial that is not running.
-pub fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscard> {
+pub(crate) fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscard> {
     let volume = BtrfsVolume::open(volume_path)?;
     let running = volume.running()?.map(|(id, _)| id);
     let pending = {
@@ -120,8 +120,11 @@ pub fn discard_btrfs_trial(esp: &Path, volume_path: &Path) -> Result<TrialDiscar
         let Inventory {
             policy,
             entries,
+            invalid,
             firmware,
         } = inventory(&esp, &lock, false)?;
+        // The prune that follows needs every entry, so fail before cancelling.
+        require_readable(&invalid)?;
         // A verified firmware trial is already known-good and only awaits promotion.
         let booted = match &firmware {
             Some(firmware) => firmware.running_trial(&entries)?,
@@ -176,8 +179,10 @@ fn plan(
     let Inventory {
         policy,
         entries,
+        invalid,
         firmware,
     } = inventory(&esp, &lock, false)?;
+    require_readable(&invalid)?;
     let on_volume = |entry: &BootEntry| volume.has_fsid(&entry.btrfs.fsid);
     let subvolume = |entry: &BootEntry| entry.btrfs.subvolid;
     let mut planned: Vec<_> = destroy::pending(&esp)?
@@ -265,9 +270,7 @@ fn candidates(
          pruning"
     );
     let mut kept: BTreeSet<&str> = protected.iter().map(String::as_str).collect();
-    if let LoaderPolicy::Pinned { default, .. } = policy {
-        kept.insert(default);
-    }
+    kept.insert(&policy.default);
     if let Some(selected) = selected {
         kept.insert(&selected.id);
         kept.extend(selected.parent.as_deref());
@@ -308,6 +311,7 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
         policy,
         entries,
         firmware,
+        ..
     } = inventory(&esp, &lock, false)?;
     ensure!(
         firmware.is_none(),
@@ -326,7 +330,7 @@ fn exhaust_trial(esp: &Path, volume: &BtrfsVolume, id: &str, dry_run: bool) -> R
         policy
             .selected(&entries)
             .is_none_or(|selected| selected.id != id)
-            && !matches!(&policy, LoaderPolicy::Pinned { preferred: Some(preferred), .. } if preferred == id),
+            && policy.preferred.as_deref() != Some(id),
         "trial {id} is selected for the next boot; cancel it with `cps boot discard-trial`"
     );
     ensure!(
@@ -682,16 +686,6 @@ mod tests {
         entries[3].tries = Some(0);
         assert_eq!(
             removed(&candidates(&entries, &pending, &[], Some(1))?),
-            [(3, BootRemoval::FailedTrial), (4, BootRemoval::FailedTrial)]
-        );
-        // Automatic selection protects the newest bootable entry.
-        assert_eq!(
-            removed(&candidates(
-                &entries,
-                &LoaderPolicy::Automatic,
-                &[],
-                Some(1)
-            )?),
             [(3, BootRemoval::FailedTrial), (4, BootRemoval::FailedTrial)]
         );
         Ok(())

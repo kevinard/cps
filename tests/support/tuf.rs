@@ -1,8 +1,8 @@
 use std::{fs, num::NonZeroU64, path::Path};
 
 use anyhow::{Context, Result};
+use aws_lc_rs::{rand::SystemRandom, signature::Ed25519KeyPair};
 use jiff::Timestamp;
-use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
 use tough::{
     editor::{RepositoryEditor, signed::PathExists},
     key_source::{KeySource, LocalKeySource},
@@ -10,7 +10,7 @@ use tough::{
     sign::{Sign, parse_keypair},
 };
 
-pub fn sign_root(path: &Path, private: &Path, predecessor: Option<&Path>) -> Result<()> {
+pub(crate) fn sign_root(path: &Path, private: &Path, predecessor: Option<&Path>) -> Result<()> {
     let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate TUF key");
     fs::write(private, document.as_ref())?;
     let key = parse_keypair(document.as_ref())?.tuf_key();
@@ -59,7 +59,7 @@ pub fn sign_root(path: &Path, private: &Path, predecessor: Option<&Path>) -> Res
     Ok(())
 }
 
-pub fn sign_export(
+pub(crate) fn sign_export(
     export: &Path,
     mirror: &Path,
     version: u64,

@@ -170,6 +170,22 @@ Default configuration for system commands.
 .TP
 .I /usr/lib/sysimage/cps/
 Package database, transaction staging, prepared kernel files, and vendor configuration proposals within an image. Packages never ship /var, which tmpfiles.d populates at boot.
+.SH EXIT STATUS
+.TP
+.B \&0
+\&Success. A check found nothing to report.
+.TP
+.B \&1
+\&An error.
+.TP
+.B \&2
+\&Invalid usage, such as an unknown option or a missing argument.
+.TP
+.B \&3
+\&A check found something: updates are available (upgrade \-\-check), verification found problems (verify, publisher audit\-builds), pins are stale (recipe repin \-\-check), configuration or images differ (config diff, image diff), manifest dependencies are missing (manifest dependencies), or nothing matched (search, owner).
+.TP
+.B \&4
+\&A confirmation prompt was declined.
 .SH EXAMPLES
 .EX
 \&cps search editor

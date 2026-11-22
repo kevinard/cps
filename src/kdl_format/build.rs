@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::build::pattern;
+use crate::image::accounts;
 use crate::model::{
     Dependency, FileDigest, MANIFEST_FORMAT, Manifest, PackageSpec, Version, parse_mode,
     validate_digest, validate_facet, validate_path, validate_publisher, validate_variant,
@@ -17,18 +18,16 @@ use crate::model::{
 use crate::repo::read_limited;
 
 use super::{
-    Fields, MANIFEST_KIND, PublisherConfig, SCHEMA_VERSION, document, one, publisher_config,
-    schema, schema_header,
+    Fields, Kind, PublisherConfig, document, one, publisher_config, schema, schema_header,
 };
 
 pub(crate) const RECIPE_LIMIT: u64 = 1024 * 1024;
 /// The most packages that one build can produce.
 pub(crate) const MAX_OUTPUTS: usize = 64;
-const RECIPE_KIND: &str = "build-recipe";
 
 pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, String)> {
     let doc = document(text)?;
-    schema(&doc, "git-package")?;
+    schema(&doc, Kind::GitPackage)?;
     ensure!(
         doc.nodes().len() == 3,
         "expected schema-version, package, and build in cps.kdl"
@@ -36,9 +35,10 @@ pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, Str
     let mut package = one(&doc, "package")?.clone();
     package.insert("publisher", publisher);
     let mut manifest = KdlDocument::new();
-    manifest
-        .nodes_mut()
-        .extend([schema_header(MANIFEST_FORMAT, MANIFEST_KIND), package]);
+    manifest.nodes_mut().extend([
+        schema_header(MANIFEST_FORMAT, Kind::PackageManifest.name()),
+        package,
+    ]);
     let manifest = super::parse_manifest(&manifest.to_string())?;
 
     let mut build = one(&doc, "build")?.clone();
@@ -49,9 +49,10 @@ pub(crate) fn git_document(text: &str, publisher: &str) -> Result<(Manifest, Str
     );
     children.nodes_mut().push(KdlNode::new("manifest"));
     let mut recipe = KdlDocument::new();
-    recipe
-        .nodes_mut()
-        .extend([schema_header(SCHEMA_VERSION, RECIPE_KIND), build]);
+    recipe.nodes_mut().extend([
+        schema_header(Kind::BuildRecipe.version(), Kind::BuildRecipe.name()),
+        build,
+    ]);
     Ok((manifest, recipe.to_string()))
 }
 
@@ -72,7 +73,7 @@ pub(crate) fn git_toolchain_template(template: &str, config: &Path) -> Result<St
         RECIPE_LIMIT,
     )?;
     let pins = document(std::str::from_utf8(&bytes)?)?;
-    schema(&pins, "git-toolchain")?;
+    schema(&pins, Kind::GitToolchain)?;
     ensure!(
         pins.nodes().len() == 2,
         "expected schema-version and toolchain in {}",
@@ -86,7 +87,8 @@ pub(crate) fn git_toolchain_template(template: &str, config: &Path) -> Result<St
 
 pub(crate) struct Source {
     pub pin: FileDigest,
-    pub url: Option<Url>,
+    /// Where to download the source, tried in order.
+    pub urls: Vec<Url>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -139,8 +141,8 @@ pub(crate) enum FacetChoice {
 pub(crate) struct CollectRule {
     pub pattern: String,
     pub mode: Option<String>,
-    pub uid: u32,
-    pub gid: u32,
+    pub owner: String,
+    pub group: String,
     pub preserve: bool,
     pub facet: FacetChoice,
     pub variants: BTreeMap<String, String>,
@@ -223,11 +225,11 @@ fn collect_rule(node: &KdlNode) -> Result<CollectRule> {
         1,
         &[
             "mode",
-            "uid",
-            "gid",
+            "owner",
+            "group",
             "preserve",
             "facet",
-            "arch",
+            "architecture",
             super::VARIANT_PROPERTY,
         ],
         false,
@@ -263,15 +265,17 @@ fn collect_rule(node: &KdlNode) -> Result<CollectRule> {
     for (name, value) in &variants {
         validate_variant(name, value)?;
     }
-    let owner = |key| -> Result<u32> {
-        let id = fields.integer(key)?.unwrap_or(0);
-        ensure!(id != u32::MAX, "invalid owner");
-        Ok(id)
+    let account = |key| -> Result<String> {
+        let name = fields
+            .string(key)?
+            .unwrap_or_else(|| accounts::ROOT.to_owned());
+        accounts::validate_name(&name).with_context(|| format!("invalid {key}"))?;
+        Ok(name)
     };
     Ok(CollectRule {
         mode,
-        uid: owner("uid")?,
-        gid: owner("gid")?,
+        owner: account("owner")?,
+        group: account("group")?,
         preserve: fields
             .properties
             .get("preserve")
@@ -432,7 +436,7 @@ pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, Publ
         .context("missing toolchain configuration directory")?
         .to_owned();
     let doc = document(std::str::from_utf8(&bytes)?)?;
-    schema(&doc, "toolchain-config")?;
+    schema(&doc, Kind::ToolchainConfig)?;
     let mut publishers = BTreeMap::new();
     for node in doc.nodes() {
         match node.name().value() {
@@ -454,7 +458,7 @@ pub(crate) fn read_toolchain_config(path: &Path) -> Result<BTreeMap<String, Publ
 
 pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     let doc = document(text)?;
-    schema(&doc, RECIPE_KIND)?;
+    schema(&doc, Kind::BuildRecipe)?;
     ensure!(
         doc.nodes().len() == 2,
         "expected schema-version and build nodes"
@@ -489,14 +493,14 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
                 );
             }
             "publisher" => {
-                let fields = Fields::read(node, 1, &["catalog", "key-sha256"], false)?;
+                let fields = Fields::read(node, 1, &["catalog-sha256", "key-sha256"], false)?;
                 let name = fields.string_arg(0)?;
                 validate_publisher(&name)?;
                 ensure!(
                     publishers.insert(name.clone()),
                     "duplicate toolchain publisher {name}"
                 );
-                let catalog_sha256 = fields.required_string("catalog")?;
+                let catalog_sha256 = fields.required_string("catalog-sha256")?;
                 validate_digest(&catalog_sha256).context("invalid toolchain catalog")?;
                 let key_sha256 = fields.required_string("key-sha256")?;
                 validate_digest(&key_sha256).context("invalid toolchain key digest")?;
@@ -547,8 +551,8 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
             }
             "version" => {
                 ensure!(version.is_none(), "duplicate version node");
-                let fields = Fields::read(node, 1, &["upstream"], false)?;
-                let upstream = fields.string("upstream")?;
+                let fields = Fields::read(node, 1, &["upstream-version"], false)?;
+                let upstream = fields.string("upstream-version")?;
                 version = Some(RecipeVersion {
                     version: fields.string_arg(0)?.parse()?,
                     upstream,
@@ -583,23 +587,34 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
                 );
             }
             "source" => {
-                let fields = Fields::read(node, 1, &["sha256", "size", "url"], false)?;
+                let fields = Fields::read(node, 1, &["sha256", "size"], true)?;
                 let path = fields.string_arg(0)?;
                 validate_path(&path)?;
                 let sha256 = fields.required_string("sha256")?;
                 validate_digest(&sha256).with_context(|| format!("invalid digest for {path}"))?;
                 let size = fields.integer("size")?.context("missing source size")?;
-                let url = fields
-                    .string("url")?
-                    .map(|value| source_url(&value))
-                    .transpose()?;
+                let mut urls = Vec::new();
+                for child in node.iter_children() {
+                    ensure!(
+                        child.name().value() == "url",
+                        "unknown source child {} for {path}",
+                        child.name().value()
+                    );
+                    let url = source_url(&Fields::read(child, 1, &[], false)?.string_arg(0)?)
+                        .with_context(|| format!("reading a URL of source {path}"))?;
+                    ensure!(
+                        !urls.contains(&url),
+                        "duplicate URL {url} for source {path}"
+                    );
+                    urls.push(url);
+                }
                 ensure!(
                     sources
                         .insert(
                             path.clone(),
                             Source {
                                 pin: FileDigest { sha256, size },
-                                url
+                                urls
                             }
                         )
                         .is_none(),
@@ -705,7 +720,7 @@ build architecture="x86_64" epoch=1700000000 {
         )?;
         assert_eq!(manifest.format, 1);
         assert_eq!(manifest.publisher, "local");
-        schema(&document(&recipe)?, RECIPE_KIND)?;
+        schema(&document(&recipe)?, Kind::BuildRecipe)?;
         Ok(())
     }
 
@@ -717,7 +732,7 @@ build architecture="x86_64" epoch=1700000000 {
             r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{digest}" key-sha256="{digest}"
+        publisher "seed" catalog-sha256="{digest}" key-sha256="{digest}"
         package "devel/base"
     }}
     manifest "nested/hello.kdl" sha256="{digest}"
@@ -750,6 +765,59 @@ build architecture="x86_64" epoch=1700000000 {{
         assert!(read_with_options(&path, &options("CFLAGS", "\0")).is_err());
         assert!(parse(&recipe.replace("CFLAGS", "CFLAGS=PATH")).is_err());
         assert!(parse(&recipe.replace("script", "option \"CFLAGS\" \"-O0\"; script")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sources_list_their_urls_in_order() -> Result<()> {
+        let recipe = |source: &str| {
+            format!(
+                r#"schema-version 1 kind="build-recipe"
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain solver="sat-v2" {{
+        publisher "seed" catalog-sha256="{digest}" key-sha256="{digest}"
+        package "devel/base"
+    }}
+    manifest "hello.kdl" sha256="{digest}"
+    {source}
+    script "true"
+}}
+"#,
+                digest = "0".repeat(64),
+            )
+        };
+        let digest = "1".repeat(64);
+        let parsed = parse(&recipe(&format!(
+            "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n url \"https://a.example/a.tar\"\n url \"https://b.example/a.tar\"\n }}"
+        )))?;
+        let urls: Vec<_> = parsed.sources["a.tar"]
+            .urls
+            .iter()
+            .map(Url::as_str)
+            .collect();
+        assert_eq!(urls, ["https://a.example/a.tar", "https://b.example/a.tar"]);
+        assert!(
+            parse(&recipe(&format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1"
+            )))?
+            .sources["a.tar"]
+                .urls
+                .is_empty()
+        );
+        for invalid in [
+            format!("source \"a.tar\" sha256=\"{digest}\" size=1 url=\"https://a.example/a.tar\""),
+            format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n mirror \"https://a.example/a.tar\"\n }}"
+            ),
+            format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n url \"https://a.example/a\"\n url \"https://a.example/a\"\n }}"
+            ),
+            format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n url \"http://a.example/a\"\n }}"
+            ),
+        ] {
+            assert!(parse(&recipe(&invalid)).is_err(), "{invalid}");
+        }
         Ok(())
     }
 

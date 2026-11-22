@@ -24,10 +24,8 @@ openssl pkey -inform DER -in "$work/release.der" -pubout -outform DER -out relea
 "$cps" repo trust init --repo repo --publisher canopa-usr-base --key "$work/release.der" >/dev/null
 cp -- repo/trust/1.json release.trust.json
 mkdir "$work/proto"
-uid=$(id -u)
-gid=$(id -g)
 for package in filesystem elf-runtime; do
-    sed "s/uid=0 gid=0/uid=$uid gid=$gid/g" "$project/packaging/filesystem/$package.kdl" > "$package.kdl"
+    cp "$project/packaging/filesystem/$package.kdl" "$package.kdl"
 done
 for path in lib64/ld-linux-x86-64.so.2 usr/lib/{libc.so.6,libm.so.6,libgcc_s.so.1}; do
     install -Dm755 "$original/$path" "$work/proto/usr/lib/${path##*/}"
