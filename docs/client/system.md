@@ -305,7 +305,11 @@ need, then delete the saved copy. `journalctl -b -1 -u cps-finalize-trial`
 shows the merge report of the previous shutdown.
 
 A crash, power loss, or `reboot --force` skips the merge, and the trial boots
-with `/etc` as it was at staging. The merge builds the new `/etc` beside the
+with `/etc` as it was at staging. Staging records that the trial needs the
+merge, so its health check then fails: systemd-boot does not bless it,
+falls back to the previous environment once the trial's attempts are used,
+and that environment still has your changes. Stage the change again from
+there. The merge builds the new `/etc` beside the
 trial's and swaps them in one rename, so an interruption leaves the trial
 with either `/etc`. If the merge fails, CPS leaves the trial's `/etc` as it
 was and cancels the trial, so the next boot starts the fallback with all of

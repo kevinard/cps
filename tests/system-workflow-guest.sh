@@ -133,6 +133,9 @@ if [ -f /volume/@captures/backup-booted ]; then
     test -e /usr/bin/cps-demo-service
     cps status | $bb grep -F 'Reboot pending into '
     : > /volume/@captures/cli-autoremove
+    # A forced reboot skips the merge at shutdown, and a trial that needs
+    # it is never blessed, so merge /etc by hand first.
+    cps boot finalize-trial
     $bb sync
     exec $bb reboot -f
 fi

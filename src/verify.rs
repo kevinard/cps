@@ -176,9 +176,18 @@ pub(crate) fn verify_image(image: &Image) -> Result<Vec<Finding>> {
     check_image(image, false, false)
 }
 
+/// Quick verification gates blessing a boot, so it also requires the /etc
+/// merge of a trial that system commands staged.
 pub(crate) fn verify_image_quick(image: &Image) -> Result<Vec<Finding>> {
     image.require_clean()?;
-    check_image(image, false, true)
+    let mut findings = check_image(image, false, true)?;
+    if let Some(message) = crate::boot::etc_merge::missing_merge(image)? {
+        findings.push(Finding {
+            is_error: true,
+            message,
+        });
+    }
+    Ok(findings)
 }
 
 /// Fail on the first error of a quick verification of an opened image.

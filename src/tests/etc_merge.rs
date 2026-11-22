@@ -339,3 +339,54 @@ fn ensure_not(condition: bool, message: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn a_trial_waiting_for_its_etc_merge_is_not_healthy() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "test/pkg",
+        "1.0.0-0",
+        f.file("usr/share/pkg", "pkg", "0644", "")?,
+    )?;
+    f.create()?;
+    let image = crate::image::Image::open_query(&f.root)?;
+    crate::boot::etc_merge::require_merge(&image)?;
+    let findings = crate::verify_quick(&f.root)?;
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.is_error && finding.message.contains("were not merged")),
+        "{findings:?}"
+    );
+    // A completed merge for the trial's revision satisfies the requirement.
+    let state = f.root.join("usr/lib/sysimage/cps");
+    let report = crate::boot::EtcMergeReport {
+        revision: image.settings()?.revision,
+        ..Default::default()
+    };
+    fs::write(
+        state.join(crate::boot::etc_merge::REPORT),
+        serde_json::to_vec(&report)?,
+    )?;
+    assert!(crate::verify_quick(&f.root)?.is_empty());
+    // A report of another revision does not.
+    fs::write(
+        state.join(crate::boot::etc_merge::REPORT),
+        serde_json::to_vec(&crate::boot::EtcMergeReport {
+            revision: 7,
+            ..Default::default()
+        })?,
+    )?;
+    assert!(!crate::verify_quick(&f.root)?.is_empty());
+    // Live changes after the trial booted leave the requirement behind.
+    drop(image);
+    let install = plan(
+        &f.root,
+        Request::Install {
+            packages: vec!["test/pkg".into()],
+        },
+    )?;
+    apply(&f.root, &install)?;
+    assert!(crate::verify_quick(&f.root)?.is_empty());
+    Ok(())
+}

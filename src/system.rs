@@ -718,6 +718,8 @@ impl System {
 
         self.prune_before_staging(held, change)?;
         let root = self.stage_change(held, change)?;
+        // The trial is selected below, but its /etc is merged at shutdown.
+        etc_merge::require_merge(&Image::open_query(&root)?)?;
         let id = if boot.uefi {
             boot.activation
                 .activate_btrfs_uefi(&root, &boot.volume, &boot.esp)

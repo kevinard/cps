@@ -357,6 +357,12 @@ trial's image lock, and merges the running `/etc` into it as described in
   by hand before a reboot, and the shutdown run then adds what changed since.
   The trial keeps the report of the last merge as `etc-merge.json` in its
   image state.
+- A trial that system commands staged also carries `etc-merge-required`
+  with its revision. Until a merge report for that revision exists, `cps
+  verify --quick`, which `cps-boot-health.service` runs, reports the missing
+  merge as an error, so a trial that booted after a crash or a forced
+  reboot is never blessed. `cps boot stage` and `cps boot activate` used by
+  hand do not require the merge.
 - If the merge fails, CPS leaves the trial's `/etc` as it was and cancels
   the trial, as `boot rollback` would. Booting a trial without a new
   password or user can lock you out, while the fallback keeps every change

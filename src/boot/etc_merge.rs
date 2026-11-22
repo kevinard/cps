@@ -43,6 +43,9 @@ use crate::{
 pub(crate) const BASE: &str = "etc-base.json";
 /// The report of the last merge into this root, in its image state.
 pub(crate) const REPORT: &str = "etc-merge.json";
+/// Marks a trial whose /etc must be merged from the running root before
+/// its boot can be blessed.
+const REQUIRED: &str = "etc-merge-required";
 /// Private working directory in the trial's image state.
 const SCRATCH: &str = "etc-merge";
 /// Local versions saved by the merge, below the configuration review area.
@@ -260,12 +263,58 @@ pub(crate) struct Policy<'a> {
 pub(crate) fn record_base(root: &Root) -> Result<()> {
     let state = root.open_image_state()?;
     remove_tree(&state, SCRATCH)?;
-    match unlinkat(state.as_file(), REPORT, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => {}
-        Err(error) => return Err(error).context("removing an inherited /etc merge report"),
+    for inherited in [REPORT, REQUIRED] {
+        match unlinkat(state.as_file(), inherited, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(error) => return Err(error).context("removing an inherited /etc merge record"),
+        }
     }
     let scan = scan(root, true).context("recording /etc as the merge base")?;
     write_private(&state, BASE, &serde_json::to_vec(&scan.manifest)?)
+}
+
+/// Require the shutdown merge of the running /etc before `root`, a trial
+/// that system commands staged, counts as healthy.
+///
+/// Staging selects the trial for the next boot right away, and the merge
+/// runs only at a clean shutdown. A crash or a forced reboot skips it, so the
+/// trial would boot with /etc as it was at staging. The marker makes the
+/// health check fail until a merge for the trial's revision completes, so
+/// such a boot is never blessed and systemd-boot returns to the root that
+/// kept the local changes.
+pub(crate) fn require_merge(image: &Image) -> Result<()> {
+    let revision = image.settings()?.revision;
+    write_private(&image.state_dir, REQUIRED, revision.to_string().as_bytes())
+}
+
+/// Why an image is not healthy yet because its required /etc merge has not
+/// completed for its revision.
+pub(crate) fn missing_merge(image: &Image) -> Result<Option<String>> {
+    let required = match image.state_dir.read_file(REQUIRED) {
+        Ok(bytes) => String::from_utf8(bytes)?
+            .parse::<u64>()
+            .context("reading the required /etc merge")?,
+        Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let revision = image.settings()?.revision;
+    // Live changes after a blessed trial booted raise its revision.
+    if required != revision {
+        return Ok(None);
+    }
+    let report = match image.state_dir.read_file(REPORT) {
+        Ok(bytes) => Some(serde_json::from_slice::<EtcMergeReport>(&bytes)?),
+        Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::NOENT) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(report
+        .is_none_or(|report| report.revision != revision)
+        .then(|| {
+            "the /etc changes made on the running system since staging were not merged into \
+             this trial, because the system did not shut down cleanly. Boot the previous \
+             environment, which keeps them, and stage the change again"
+                .to_owned()
+        }))
 }
 
 /// Remove the scratch tree that an interrupted merge left in a root.
