@@ -3,7 +3,9 @@ build architecture="@ARCH@" epoch=1791504000 {
 @TOOLCHAIN@
     version "3.54.1-1" upstream="3.54.1"
     manifest "sqlite.kdl" sha256="@MANIFEST_SHA256@"
-    source "sqlite-autoconf-3540100.tar.gz" size=3332984 sha256="926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e" url="https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
+    source "sqlite-autoconf-3540100.tar.gz" size=3332984 sha256="926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e" {
+        url "https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
+    }
     script """
     tar -xzf "$CPS_SOURCES/sqlite-autoconf-3540100.tar.gz"
     cd sqlite-autoconf-3540100

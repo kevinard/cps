@@ -90,7 +90,8 @@ jobs:
           ci/run.sh -i -- bash -euo pipefail <<'DOWNLOAD'
           cargo fetch --locked
           recipe=packaging/kernel-qemu/build.kdl.in
-          read -r archive checksum url < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" url="(https:[^"]+)"$/\1 \2 \3/p' "$recipe")
+          read -r archive checksum < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" \{$/\1 \2/p' "$recipe")
+          url=$(sed -nE '/^    source "linux-/,/^    \}/s/^        url "(https:[^"]+)"$/\1/p' "$recipe" | head -n 1)
           cd "$RUNNER_TEMP"
           curl --fail --location --proto '=https' --retry 3 --output "$archive" "$url"
           printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
@@ -98,7 +99,7 @@ jobs:
           ci/run.sh --network none -i -- bash -euo pipefail <<'VM'
           workspace=$PWD
           recipe=packaging/kernel-qemu/build.kdl.in
-          read -r archive checksum < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" url="https:[^"]+"$/\1 \2/p' "$recipe")
+          read -r archive checksum < <(sed -nE 's/^    source "(linux-[^"]+\.tar\.xz)" size=[0-9]+ sha256="([0-9a-f]{64})" \{$/\1 \2/p' "$recipe")
           cd "$RUNNER_TEMP"
           printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
           tar -xf "$archive"

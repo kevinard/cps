@@ -5,7 +5,9 @@ build architecture="x86_64" epoch=1744301157 {
         package "build/native-gnu"
     }
     manifest "grep.kdl" sha256="@MANIFEST_SHA256@"
-    source "grep-3.12.tar.xz" size=1918448 sha256="2649b27c0e90e632eadcd757be06c6e9a4f48d941de51e7c0f83ff76408a07b9" url="https://ftp.gnu.org/gnu/grep/grep-3.12.tar.xz"
+    source "grep-3.12.tar.xz" size=1918448 sha256="2649b27c0e90e632eadcd757be06c6e9a4f48d941de51e7c0f83ff76408a07b9" {
+        url "https://ftp.gnu.org/gnu/grep/grep-3.12.tar.xz"
+    }
     script """
     tar -xJf "$CPS_SOURCES/grep-3.12.tar.xz"
     cd grep-3.12

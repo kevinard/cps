@@ -2,7 +2,9 @@ schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1792187472 {
 @TOOLCHAIN@
     manifest "systemd.kdl" sha256="@MANIFEST_SHA256@"
-    source "systemd-262.1.tar.gz" size=19088198 sha256="100fc873b848b9b0297d8a705e8e2ed326256c8483d9960ee1ffe264c8a5c3e3" url="https://codeload.github.com/systemd/systemd/tar.gz/refs/tags/v262.1"
+    source "systemd-262.1.tar.gz" size=19088198 sha256="100fc873b848b9b0297d8a705e8e2ed326256c8483d9960ee1ffe264c8a5c3e3" {
+        url "https://codeload.github.com/systemd/systemd/tar.gz/refs/tags/v262.1"
+    }
     script """
     tar -xzf "$CPS_SOURCES/systemd-262.1.tar.gz"
     cd systemd-262.1

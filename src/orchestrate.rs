@@ -1203,7 +1203,7 @@ mod tests {
         fs::write(
             &recipe,
             format!(
-                "schema-version 1 kind=\"build-recipe\"\n// Reviewed\nbuild architecture=\"x86_64\" epoch=1 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog=\"{zero}\" key-sha256=\"{zero}\"\n        package \"build/cc\"\n    }}\n    manifest \"hello.kdl\"   sha256=\"{zero}\" // template\n    source \"hello-1.0.tar.gz\" size=1 sha256=\"{zero}\" url=\"https://example.org/hello-1.0.tar.gz\"\n    source \"fix.patch\" sha256=\"{zero}\" size=12\n    source \"missing.tar.gz\" size=3 sha256=\"{zero}\"\n    script \"\"\"\n    source \"hello-1.0.tar.gz\" size=1\n    \"\"\"\n}}\n"
+                "schema-version 1 kind=\"build-recipe\"\n// Reviewed\nbuild architecture=\"x86_64\" epoch=1 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog=\"{zero}\" key-sha256=\"{zero}\"\n        package \"build/cc\"\n    }}\n    manifest \"hello.kdl\"   sha256=\"{zero}\" // template\n    source \"hello-1.0.tar.gz\" size=1 sha256=\"{zero}\" {{\n        url \"https://example.org/hello-1.0.tar.gz\"\n    }}\n    source \"fix.patch\" sha256=\"{zero}\" size=12\n    source \"missing.tar.gz\" size=3 sha256=\"{zero}\"\n    script \"\"\"\n    source \"hello-1.0.tar.gz\" size=1\n    \"\"\"\n}}\n"
             ),
         )?;
         Ok(recipe)

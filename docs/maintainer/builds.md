@@ -85,7 +85,7 @@ node. `architecture` names the target, and `epoch` sets
 | `toolchain solver="sat-v2"` | Required, once. At least one `publisher NAME catalog=... key-sha256=...` pin and at least one `package` request. |
 | `manifest PATH sha256=...` | A package template. One or more, up to 64; each produces one package. |
 | `version VERSION upstream=...` | The version of every produced package. Optional; without it, each template declares its own `version`. |
-| `source PATH sha256=... size=...` | A pinned input, staged under `$CPS_SOURCES`. Add `url` to [fetch it](#preparing-a-source-cache). |
+| `source PATH sha256=... size=...` | A pinned input, staged under `$CPS_SOURCES`. Add `url` children to [fetch it](#preparing-a-source-cache). |
 | `script """..."""` | Required. Runs with `/bin/sh -eu` in `/build`, umask `022`. |
 | `discard PATTERN` | Installed paths that no package claims and the build may drop. See [collecting](#collecting-installed-files). |
 | `strip #false` | Ship ELF objects unstripped. See [debug information](#stripping-and-debug-information). |
@@ -128,7 +128,9 @@ build architecture="x86_64" epoch=1791504000 {
     manifest "sqlite.kdl" sha256="<template SHA-256>"
     discard "usr/lib/*.la"
     discard "usr/share/doc/**"
-    source "sqlite-autoconf-3540100.tar.gz" size=3332984 sha256="926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e" url="https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
+    source "sqlite-autoconf-3540100.tar.gz" size=3332984 sha256="926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e" {
+        url "https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
+    }
     script """
     tar -xzf "$CPS_SOURCES/sqlite-autoconf-3540100.tar.gz"
     cd sqlite-autoconf-3540100
@@ -251,7 +253,10 @@ build architecture="x86_64" epoch=1767225600 {
     manifest "liblz.kdl" sha256="<template SHA-256>"
     manifest "lz.kdl" sha256="<template SHA-256>"
     discard "usr/lib/liblz.a"
-    source "lz-2.4.0.tar.gz" sha256="<source SHA-256>" size=481920 url="https://lz.example.org/releases/lz-2.4.0.tar.gz"
+    source "lz-2.4.0.tar.gz" sha256="<source SHA-256>" size=481920 {
+        url "https://lz.example.org/releases/lz-2.4.0.tar.gz"
+        url "https://mirror.example.net/lz/lz-2.4.0.tar.gz"
+    }
     script """
     tar -xzf "$CPS_SOURCES/lz-2.4.0.tar.gz"
     cd lz-2.4.0
@@ -517,11 +522,21 @@ moves recipes to it.
 
 ## Preparing a source cache
 
-Add a `url="https://upstream.example.org/releases/hello.c"` property to a
-pinned `source` entry to fetch it. Use the final HTTPS URL, without
-credentials or a fragment. The fetcher checks the exact byte count and
-SHA-256 before publishing an object to the cache. It rejects redirects and
-rechecks existing objects before reuse. Recipes can share a cache by digest.
+Give a pinned `source` entry one or more `url` children to fetch it:
+
+```kdl
+source "hello.c" sha256="<source SHA-256>" size=1234 {
+    url "https://upstream.example.org/releases/hello.c"
+    url "https://mirror.example.net/hello/hello.c"
+}
+```
+
+URLs use HTTPS, without credentials or a fragment. CPS tries them in order
+and uses the first that delivers the exact byte count and SHA-256, so a
+mirror only matters when an earlier URL fails. It follows up to 10
+redirects, all of them to HTTPS URLs, since release assets and mirrors
+usually redirect and the pin decides what is accepted. Existing objects
+are rechecked before reuse, and recipes can share a cache by digest.
 
 ```sh
 cps source fetch --cache source-cache hello.build.kdl

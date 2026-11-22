@@ -86,7 +86,8 @@ pub(crate) fn git_toolchain_template(template: &str, config: &Path) -> Result<St
 
 pub(crate) struct Source {
     pub pin: FileDigest,
-    pub url: Option<Url>,
+    /// Where to download the source, tried in order.
+    pub urls: Vec<Url>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -583,23 +584,34 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
                 );
             }
             "source" => {
-                let fields = Fields::read(node, 1, &["sha256", "size", "url"], false)?;
+                let fields = Fields::read(node, 1, &["sha256", "size"], true)?;
                 let path = fields.string_arg(0)?;
                 validate_path(&path)?;
                 let sha256 = fields.required_string("sha256")?;
                 validate_digest(&sha256).with_context(|| format!("invalid digest for {path}"))?;
                 let size = fields.integer("size")?.context("missing source size")?;
-                let url = fields
-                    .string("url")?
-                    .map(|value| source_url(&value))
-                    .transpose()?;
+                let mut urls = Vec::new();
+                for child in node.iter_children() {
+                    ensure!(
+                        child.name().value() == "url",
+                        "unknown source child {} for {path}",
+                        child.name().value()
+                    );
+                    let url = source_url(&Fields::read(child, 1, &[], false)?.string_arg(0)?)
+                        .with_context(|| format!("reading a URL of source {path}"))?;
+                    ensure!(
+                        !urls.contains(&url),
+                        "duplicate URL {url} for source {path}"
+                    );
+                    urls.push(url);
+                }
                 ensure!(
                     sources
                         .insert(
                             path.clone(),
                             Source {
                                 pin: FileDigest { sha256, size },
-                                url
+                                urls
                             }
                         )
                         .is_none(),
@@ -750,6 +762,59 @@ build architecture="x86_64" epoch=1700000000 {{
         assert!(read_with_options(&path, &options("CFLAGS", "\0")).is_err());
         assert!(parse(&recipe.replace("CFLAGS", "CFLAGS=PATH")).is_err());
         assert!(parse(&recipe.replace("script", "option \"CFLAGS\" \"-O0\"; script")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sources_list_their_urls_in_order() -> Result<()> {
+        let recipe = |source: &str| {
+            format!(
+                r#"schema-version 1 kind="build-recipe"
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain solver="sat-v2" {{
+        publisher "seed" catalog="{digest}" key-sha256="{digest}"
+        package "devel/base"
+    }}
+    manifest "hello.kdl" sha256="{digest}"
+    {source}
+    script "true"
+}}
+"#,
+                digest = "0".repeat(64),
+            )
+        };
+        let digest = "1".repeat(64);
+        let parsed = parse(&recipe(&format!(
+            "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n url \"https://a.example/a.tar\"\n url \"https://b.example/a.tar\"\n }}"
+        )))?;
+        let urls: Vec<_> = parsed.sources["a.tar"]
+            .urls
+            .iter()
+            .map(Url::as_str)
+            .collect();
+        assert_eq!(urls, ["https://a.example/a.tar", "https://b.example/a.tar"]);
+        assert!(
+            parse(&recipe(&format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1"
+            )))?
+            .sources["a.tar"]
+                .urls
+                .is_empty()
+        );
+        for invalid in [
+            format!("source \"a.tar\" sha256=\"{digest}\" size=1 url=\"https://a.example/a.tar\""),
+            format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n mirror \"https://a.example/a.tar\"\n }}"
+            ),
+            format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n url \"https://a.example/a\"\n url \"https://a.example/a\"\n }}"
+            ),
+            format!(
+                "source \"a.tar\" sha256=\"{digest}\" size=1 {{\n url \"http://a.example/a\"\n }}"
+            ),
+        ] {
+            assert!(parse(&recipe(&invalid)).is_err(), "{invalid}");
+        }
         Ok(())
     }
 
