@@ -78,7 +78,7 @@ fn publish(
         .into_iter()
         .map(|publisher| {
             format!(
-                "        publisher {publisher:?} catalog={:?} key-sha256={:?}\n",
+                "        publisher {publisher:?} catalog-sha256={:?} key-sha256={:?}\n",
                 digest(b"historical toolchain catalog"),
                 digest(b"historical toolchain key")
             )

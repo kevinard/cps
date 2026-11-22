@@ -135,10 +135,10 @@ recipe() {
 schema-version 1 kind="build-recipe"
 build architecture="$arch" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(fingerprint seed.trust.json)"
+        publisher "seed" catalog-sha256="$(cat toolchain/current)" key-sha256="$(fingerprint seed.trust.json)"
         package "build/tools"
     }
-    version "1.2.0-1" upstream="1.2"
+    version "1.2.0-1" upstream-version="1.2"
     manifest "app.kdl" sha256="$(sha app.kdl)"
     manifest "app-data.kdl" sha256="$(sha app-data.kdl)"
 $1

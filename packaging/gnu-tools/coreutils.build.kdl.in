@@ -1,10 +1,10 @@
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1789400270 {
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
+        publisher "seed" catalog-sha256="@CATALOG_SHA256@" key-sha256="@KEY_SHA256@"
         package "build/native-gnu"
     }
-    version "9.12.0-0" upstream="9.12"
+    version "9.12.0-0" upstream-version="9.12"
     manifest "coreutils.kdl" sha256="@MANIFEST_SHA256@"
     source "coreutils-9.12.tar.xz" size=6704996 sha256="a480198559733e9b3da999e90543ac6f888a2caa544d8d664c5a1f17e528e210" {
         url "https://ftp.gnu.org/gnu/coreutils/coreutils-9.12.tar.xz"

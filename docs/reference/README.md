@@ -79,7 +79,12 @@ formatted output.
 ## Configuration and data formats
 
 KDL documents are KDL 2.0 and start with a `schema-version N kind="KIND"`
-header. Each kind has its own schema version, so a change to one format
+header. Names follow one rule across every kind: names are spelled out
+(`architecture`, `upstream-version`), every property holding a SHA-256
+digest ends in `-sha256` (`catalog-sha256`, `key-sha256`,
+`bootstrap-catalog-sha256`), retention settings start with `keep-`
+(`keep-cache-versions`, `keep-environments`), and a publisher's pinned trust
+root is a `trust-root`. Each kind has its own schema version, so a change to one format
 leaves files of every other kind valid. Every kind is at version 1.
 [Format specifications](formats.md) gives the exact bytes of the signed and
 persisted formats whose spelling matters, each with a golden fixture.

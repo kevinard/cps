@@ -70,7 +70,7 @@ Set `architecture` for a package that targets one architecture, or pass
 `--arch` to `manifest generate`. Only matching packages take part in
 dependency resolution and publisher ordering, and a source build must
 declare the same target. Omit it for portable packages and for manifests
-that select actions per architecture with `arch`. Package IDs are unique
+that select actions per architecture with `architecture`. Package IDs are unique
 within a repository, so publishing one name and version for two
 architectures needs two repositories.
 
@@ -344,7 +344,7 @@ and `/lib`. The set is fixed so that every builder and the publisher derive
 the same declarations.
 
 Only actions without a facet or variant take part. The package-level
-architecture counts as unconditional, so `arch="x86_64"` on an action in an
+architecture counts as unconditional, so `architecture="x86_64"` on an action in an
 `x86_64` package does too. Content that a facet or variant selects neither
 provides nor requires a capability. A file that starts with the ELF magic
 but does not parse as an ELF executable or shared object, such as a
@@ -441,7 +441,7 @@ other than `hardlink` sets `uid` and `gid`.
 | `symlink PATH` | `target`, written as the link's contents. |
 | `hardlink PATH` | `target`, an image-relative path to an immutable `file` of the same package, which supplies ownership, mode, and content. |
 
-Every action also accepts the `facet`, `arch`, and `variant.NAME`
+Every action also accepts the `facet`, `architecture`, and `variant.NAME`
 [selectors](#facets-and-variants). A hard link's target must be selected
 whenever the link is, so the target has no facet or the same facet, and its
 variants are a subset of the link's.
@@ -617,7 +617,7 @@ file "usr/include/sqlite3.h" mode="0644" uid=0 gid=0 facet="devel"
 symlink "usr/lib/libsqlite3.so" target="libsqlite3.so.0" uid=0 gid=0 facet="devel"
 file "usr/share/locale/fr/LC_MESSAGES/sqlite.mo" mode="0644" uid=0 gid=0 facet="locale.fr"
 file "usr/lib32/libsqlite3.so.0" mode="0755" uid=0 gid=0 facet="isa.i686"
-symlink "lib64" target="usr/lib" uid=0 gid=0 arch="x86_64"
+symlink "lib64" target="usr/lib" uid=0 gid=0 architecture="x86_64"
 symlink "etc/init.conf" target="../usr/lib/init/container.conf" uid=0 gid=0 variant.container="true"
 symlink "etc/init.conf" target="../usr/lib/init/metal.conf" uid=0 gid=0 variant.container="false"
 ```
@@ -632,7 +632,7 @@ symlink "etc/init.conf" target="../usr/lib/init/metal.conf" uid=0 gid=0 variant.
   which are off unless the image enables them.
 - `variant.NAME="VALUE"` selects the action only when the image sets that
   variant to that value. `#true` and `#false` stand for `"true"` and
-  `"false"`. `arch="x86_64"` is shorthand for `variant.arch="x86_64"`. An
+  `"false"`. `architecture="x86_64"` is shorthand for `variant.architecture="x86_64"`. An
   action can carry several variants and is selected when all of them match.
 - Installing a package that selects content by a variant the image does not
   set fails, and the solver tries other versions. Publish a variant only
@@ -657,7 +657,7 @@ Each problem has one mechanism. Pick it with this rule:
 | --- | --- | --- |
 | Facet | Optional content inside one package. It never adds dependencies. | `devel` headers and `.so` links, `doc.man`, `locale.fr`, static libraries, `debug.symbols`, `isa.i686` multilib objects |
 | Separate package | The content is installed or removed on its own, or has its own dependencies. | A runtime library split from its compiler, a plugin that requires another service, a daemon split from its client library |
-| Variant | A mutually exclusive property of the image selects between alternatives. | `arch`, a container or bare-metal layout |
+| Variant | A mutually exclusive property of the image selects between alternatives. | `architecture`, a container or bare-metal layout |
 
 Ship 32-bit multilib objects as `isa.*` facets of the 64-bit package, the
 way illumos ships both in one package. A header set whose headers include

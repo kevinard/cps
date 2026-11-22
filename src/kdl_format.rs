@@ -173,12 +173,12 @@ impl<'a> Fields<'a> {
             .transpose()
     }
 
-    /// Read `arch=` and `variant.NAME=` selectors. Values are strings, and `#true` or
+    /// Read `architecture=` and `variant.NAME=` selectors. Values are strings, and `#true` or
     /// `#false` stand for "true" or "false".
     fn variants(&self) -> Result<BTreeMap<String, String>> {
         let mut variants = BTreeMap::new();
         for (&key, value) in &self.properties {
-            let name = if key == "arch" {
+            let name = if key == "architecture" {
                 ARCH_VARIANT
             } else if let Some(name) = key.strip_prefix(VARIANT_PREFIX) {
                 name
@@ -188,7 +188,7 @@ impl<'a> Fields<'a> {
             let value = variant_value(value).with_context(|| format!("invalid {key}"))?;
             ensure!(
                 variants.insert(name.to_owned(), value).is_none(),
-                "arch and variant.arch select the same variant"
+                "architecture and variant.architecture select the same variant"
             );
         }
         Ok(variants)
@@ -402,7 +402,7 @@ fn parse_trigger(node: &KdlNode) -> Result<Trigger> {
         for key in node.entries().iter().filter_map(|entry| entry.name()) {
             let key = key.value();
             ensure!(
-                !matches!(key, "facet" | "arch") && !key.starts_with(VARIANT_PREFIX),
+                !matches!(key, "facet" | "architecture") && !key.starts_with(VARIANT_PREFIX),
                 "triggers cannot carry {key} selectors: a trigger follows the selection of its handler file"
             );
         }
@@ -473,7 +473,7 @@ fn reject_selectors(node: &KdlNode) -> Result<()> {
         for key in node.entries().iter().filter_map(|entry| entry.name()) {
             let key = key.value();
             ensure!(
-                !matches!(key, "facet" | "arch") && !key.starts_with(VARIANT_PREFIX),
+                !matches!(key, "facet" | "architecture") && !key.starts_with(VARIANT_PREFIX),
                 "dependencies cannot carry {key} selectors: facets and variants select files within installed packages and never change which packages are installed"
             );
         }
@@ -531,7 +531,7 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             "mode",
             "uid",
             "gid",
-            "arch",
+            "architecture",
             "facet",
             VARIANT_PROPERTY,
             "preserve",
@@ -540,9 +540,23 @@ fn parse_action(node: &KdlNode) -> Result<Action> {
             "size",
             "capabilities",
         ],
-        "dir" => &["mode", "uid", "gid", "arch", "facet", VARIANT_PROPERTY],
-        "hardlink" => &["target", "arch", "facet", VARIANT_PROPERTY],
-        _ => &["target", "uid", "gid", "arch", "facet", VARIANT_PROPERTY],
+        "dir" => &[
+            "mode",
+            "uid",
+            "gid",
+            "architecture",
+            "facet",
+            VARIANT_PROPERTY,
+        ],
+        "hardlink" => &["target", "architecture", "facet", VARIANT_PROPERTY],
+        _ => &[
+            "target",
+            "uid",
+            "gid",
+            "architecture",
+            "facet",
+            VARIANT_PROPERTY,
+        ],
     };
     let fields = Fields::read(node, 1, props, false)?;
     let path = fields.string_arg(0)?;
@@ -758,7 +772,7 @@ pub(crate) fn manifest_text(manifest: &Manifest) -> String {
         }
         for (name, value) in selectors.variants {
             if name == ARCH_VARIANT {
-                node.insert("arch", value.as_str());
+                node.insert("architecture", value.as_str());
             } else {
                 node.insert(format!("{VARIANT_PREFIX}{name}").as_str(), value.as_str());
             }
@@ -1128,16 +1142,16 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 let path = Fields::read(node, 1, &[], false)?.string_arg(0)?;
                 config.git_toolchain_config = Some(parent.join(path));
             }
-            "cache-keep-versions" => {
+            "keep-cache-versions" => {
                 ensure!(
                     config.cache_keep_versions.is_none(),
-                    "duplicate cache-keep-versions node"
+                    "duplicate keep-cache-versions node"
                 );
                 let fields = Fields::read(node, 1, &[], false)?;
                 let versions = fields.args[0]
                     .as_integer()
                     .and_then(|value| usize::try_from(value).ok())
-                    .context("cache-keep-versions must be an unsigned integer in range")?;
+                    .context("keep-cache-versions must be an unsigned integer in range")?;
                 config.cache_keep_versions = Some(versions);
             }
             "stage-package" => {
@@ -1167,11 +1181,11 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                     config.release_profile.is_none(),
                     "duplicate release-profile node"
                 );
-                let fields = Fields::read(node, 1, &["bootstrap-catalog"], false)?;
+                let fields = Fields::read(node, 1, &["bootstrap-catalog-sha256"], false)?;
                 let name = fields.string_arg(0)?;
                 validate_name(&name).context("invalid release profile name")?;
                 config.release_profile = Some(name);
-                config.bootstrap_catalog = fields.string("bootstrap-catalog")?;
+                config.bootstrap_catalog = fields.string("bootstrap-catalog-sha256")?;
                 if let Some(catalog) = &config.bootstrap_catalog {
                     validate_digest(catalog).context("invalid bootstrap catalog")?;
                 }
@@ -1214,7 +1228,7 @@ fn parse_image_config(text: &str, parent: &Path) -> Result<ImageDefinition> {
                 validate_variant(&name, &value)?;
                 ensure!(
                     name != ARCH_VARIANT,
-                    "set the arch variant with the architecture node"
+                    "set the architecture variant with the architecture node"
                 );
                 ensure!(
                     config.policy.variants.insert(name.clone(), value).is_none(),
@@ -1247,7 +1261,7 @@ mod tests {
                 trust-root "/etc/keys/canopa.trust.json"
             }
             architecture "aarch64"
-            cache-keep-versions 2
+            keep-cache-versions 2
             facet "doc.man" #false
             image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"
         "#;
@@ -1290,12 +1304,12 @@ mod tests {
             )
             .is_err()
         );
-        for invalid in ["-1", "#true", "2\ncache-keep-versions 1"] {
+        for invalid in ["-1", "#true", "2\nkeep-cache-versions 1"] {
             assert!(
                 parse_image_config(
                     &config.replace(
-                        "cache-keep-versions 2",
-                        &format!("cache-keep-versions {invalid}")
+                        "keep-cache-versions 2",
+                        &format!("keep-cache-versions {invalid}")
                     ),
                     Path::new("/tmp"),
                 )

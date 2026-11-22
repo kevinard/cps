@@ -336,7 +336,7 @@ refresh_vm_profile() {
         if [[ ${1:-} == base ]]; then printf '        package "test/previous-default"\n'; fi
         printf '        facet "devel" #false\n'
         while read -r name repository key; do
-            printf '        publisher "%s" catalog="%s" {\n' "$name" "$(cat "$repository/current")"
+            printf '        publisher "%s" catalog-sha256="%s" {\n' "$name" "$(cat "$repository/current")"
             printf '            repository "../%s"\n            trust-root "../%s"\n' "$repository" "$key"
             if [[ $name == canopa ]] && $signed_cps_builds; then
                 printf '            build-trust { builder-key "../cps-builder-public.der"; }\n'
@@ -345,7 +345,7 @@ refresh_vm_profile() {
         done < <(profile_companions)
         printf '    }\n}\n'
     } > profile-repo/publish-policy.kdl
-    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "vm-profile" base-sha256="%s" refresh-profiles=#true\n' \
         "$(cat profile-repo/current)" > profile-release.kdl
     "$cps" publish release --repo profile-repo --key profile-private.der profile-release.kdl
 }
@@ -565,7 +565,7 @@ MANIFEST
         printf 'schema-version 1 kind="image-config"\nfacet "devel" #false\n'
         if [[ $reprovision == 1 ]]; then
             printf 'image-id "A47593C2-E985-42D2-92B6-44C7057E1E96"\n'
-            printf 'release-profile "boot" bootstrap-catalog="%s"\n' "$(cat profile-repo/current)"
+            printf 'release-profile "boot" bootstrap-catalog-sha256="%s"\n' "$(cat profile-repo/current)"
         else
             printf 'release-profile "boot"\n'
         fi
@@ -746,7 +746,7 @@ if [[ $mode == rollback ]]; then
     fi
     cat > retirement.kdl <<RELEASE
 schema-version 1 kind="publish-release"
-release "$fixture_publisher" base="$(cat repo/current)" {
+release "$fixture_publisher" base-sha256="$(cat repo/current)" {
     obsolete "cps://$fixture_publisher/test/legacy-marker@2.0.0-0"
 $retire_kernel
 }

@@ -47,10 +47,10 @@ pub(crate) fn parse(text: &str) -> Result<Release> {
         "expected schema-version and release nodes"
     );
     let release = one(&doc, "release")?;
-    let fields = Fields::read(release, 1, &["base", "refresh-profiles"], true)?;
+    let fields = Fields::read(release, 1, &["base-sha256", "refresh-profiles"], true)?;
     let publisher = fields.string_arg(0)?;
     validate_publisher(&publisher)?;
-    let base = fields.required_string("base")?;
+    let base = fields.required_string("base-sha256")?;
     let base = if base == "empty" {
         None
     } else {

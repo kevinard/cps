@@ -200,7 +200,7 @@ write_profile() {
             library-dir "/usr/lib"
             library-dir "/lib64"
         }
-        publisher "canopa-runtime-seed" catalog="$(cat runtime-seed/current)" {
+        publisher "canopa-runtime-seed" catalog-sha256="$(cat runtime-seed/current)" {
             repository "../runtime-seed"
             trust-root "../runtime-seed.trust.json"
         }
@@ -239,7 +239,7 @@ POLICY
 write_policy
 cat > bootstrap-release.kdl <<RELEASE
 schema-version 1 kind="publish-release"
-release "canopa" base="empty" {
+release "canopa" base-sha256="empty" {
     bundle "cps://canopa/system/sqlite@$sqlite_version" path="sqlite.bundle" builder-key="builder-public.der" recipe-sha256="$sqlite_recipe"
     bundle "cps://canopa/system/libseccomp@$seccomp_version" path="libseccomp.bundle" builder-key="builder-public.der" recipe-sha256="$seccomp_recipe"
 }
@@ -273,7 +273,7 @@ final_packages=("$cps_package")
 {
     cat <<RELEASE
 schema-version 1 kind="publish-release"
-release "canopa" base="$bootstrap_catalog" {
+release "canopa" base-sha256="$bootstrap_catalog" {
     bundle "$cps_package" path="bundle" builder-key="builder-public.der" recipe-sha256="$reviewed"
 RELEASE
     if [[ -n $trust_version ]]; then

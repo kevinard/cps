@@ -449,7 +449,7 @@ pub(crate) fn facet_values(
         .collect())
 }
 
-/// List the image's variant values, including the built-in arch variant.
+/// List the image's variant values, including the built-in architecture variant.
 pub(crate) fn list_variants(root: &Path) -> Result<BTreeMap<String, String>> {
     let image = Image::open_query(root)?;
     image.require_clean()?;

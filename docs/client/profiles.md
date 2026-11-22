@@ -42,11 +42,11 @@ packages. Only a signed profile update can replace the protected set.
 
 ## Install a particular release
 
-To install a particular published release, set `bootstrap-catalog` to the
+To install a particular published release, set `bootstrap-catalog-sha256` to the
 primary publisher's signed catalog digest.
 
 ```kdl
-release-profile "desktop" bootstrap-catalog="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+release-profile "desktop" bootstrap-catalog-sha256="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
 Keep that catalog and its signed companion catalogs in the configured local

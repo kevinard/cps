@@ -110,8 +110,8 @@ package "desktop/glib" publisher="canopa" version="2.86.0-0" {
         ),
         (
             run,
-            r#"run "usr/bin/glib-compile-schemas" arch="x86_64""#,
-            "triggers cannot carry arch selectors",
+            r#"run "usr/bin/glib-compile-schemas" architecture="x86_64""#,
+            "triggers cannot carry architecture selectors",
         ),
         (run, "", "needs a run handler"),
     ];

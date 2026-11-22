@@ -62,7 +62,7 @@ publisher "canopa" {
         elf-check require-declarations=#true {
             library-dir "/usr/lib"
         }
-        publisher "runtime" catalog="$(cat companion/current)" {
+        publisher "runtime" catalog-sha256="$(cat companion/current)" {
             repository "../companion"
             trust-root "../runtime.trust.json"
         }
@@ -73,7 +73,7 @@ POLICY
 refresh() {
     cat > refresh.kdl <<RELEASE
 schema-version 1 kind="publish-release"
-release "canopa" base="$base" refresh-profiles=#true
+release "canopa" base-sha256="$base" refresh-profiles=#true
 RELEASE
     "$cps" publish release --repo repo --key canopa.der refresh.kdl
 }

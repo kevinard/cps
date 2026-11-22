@@ -974,7 +974,7 @@ struct BuildInputs {
     /// Trust root file that matches the recipe's key-sha256 pin and names the publisher
     #[arg(long, requires = "repo")]
     trust_root: Option<PathBuf>,
-    /// Worker-local repository and trust key locations for the pinned publishers
+    /// Worker-local repository and trust root locations for the pinned publishers
     /// [default: $CPS_TOOLCHAIN_CONFIG unless --repo is given]
     #[arg(long, conflicts_with_all = ["repo", "trust_root"])]
     toolchain_config: Option<PathBuf>,

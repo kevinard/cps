@@ -57,7 +57,7 @@ Run `tests/package-freezes.sh` for the CLI workflow. It also accepts
 A **facet** is optional content inside a package, such as headers and `.so`
 links (`devel`), manual pages (`doc.man`), locales (`locale.fr`), debug
 symbols (`debug.symbols`), or 32-bit multilib objects (`isa.i686`). A
-**variant** is a mutually exclusive image property, such as `arch` or
+**variant** is a mutually exclusive image property, such as `architecture` or
 `container`, that selects between alternative content. Neither changes
 which packages are installed, and neither adds dependencies. Content that
 must be installed on its own, or that needs other packages, is a separate
@@ -188,7 +188,7 @@ cps variant set --root image container=true
 cps variant set --root image --unset container
 ```
 
-`variant list` lists the image's values, including the built-in `arch`. Set
+`variant list` lists the image's values, including the built-in `architecture`. Set
 other variants with `image create --variant NAME=VALUE`, a `variant` node in
 the image configuration, or `variant set`. A variant change works like a
 facet change: it reuses the installed manifests and plans offline. The

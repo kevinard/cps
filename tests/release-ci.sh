@@ -43,7 +43,7 @@ publisher "canopa" {
     builder-key "unused.der"
     profile "desktop" architecture="$(uname -m)" rollout-percentage=$2 {
         package "desktop/base@$1.0.0-0"
-        publisher "extra" catalog="$extra_pin" {
+        publisher "extra" catalog-sha256="$extra_pin" {
             repository "$work/extra"
             trust-root "$work/extra.trust.json"
         }
@@ -53,7 +53,7 @@ POLICY
 }
 for version in 1 2; do
     policy "$version" 100
-    printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
+    printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base-sha256="%s" refresh-profiles=#true\n' "$(cat repo/current)" > baseline.kdl
     "$CPS_BIN" publish release --repo repo "${signing[@]}" baseline.kdl
     if [[ $version == 1 ]]; then
         cat repo/current > requests/next/cases/desktop/baselines
@@ -61,7 +61,7 @@ for version in 1 2; do
 done
 base=$(cat repo/current)
 policy 3 0
-printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base="%s" refresh-profiles=#true\n' "$base" > requests/next/release.kdl
+printf 'schema-version 1 kind="publish-release"\nrelease "canopa" base-sha256="%s" refresh-profiles=#true\n' "$base" > requests/next/release.kdl
 cat > requests/next/cases/desktop/image.kdl <<CONFIG
 schema-version 1 kind="image-config"
 architecture "$(uname -m)"

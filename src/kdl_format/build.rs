@@ -228,7 +228,7 @@ fn collect_rule(node: &KdlNode) -> Result<CollectRule> {
             "gid",
             "preserve",
             "facet",
-            "arch",
+            "architecture",
             super::VARIANT_PROPERTY,
         ],
         false,
@@ -490,14 +490,14 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
                 );
             }
             "publisher" => {
-                let fields = Fields::read(node, 1, &["catalog", "key-sha256"], false)?;
+                let fields = Fields::read(node, 1, &["catalog-sha256", "key-sha256"], false)?;
                 let name = fields.string_arg(0)?;
                 validate_publisher(&name)?;
                 ensure!(
                     publishers.insert(name.clone()),
                     "duplicate toolchain publisher {name}"
                 );
-                let catalog_sha256 = fields.required_string("catalog")?;
+                let catalog_sha256 = fields.required_string("catalog-sha256")?;
                 validate_digest(&catalog_sha256).context("invalid toolchain catalog")?;
                 let key_sha256 = fields.required_string("key-sha256")?;
                 validate_digest(&key_sha256).context("invalid toolchain key digest")?;
@@ -548,8 +548,8 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
             }
             "version" => {
                 ensure!(version.is_none(), "duplicate version node");
-                let fields = Fields::read(node, 1, &["upstream"], false)?;
-                let upstream = fields.string("upstream")?;
+                let fields = Fields::read(node, 1, &["upstream-version"], false)?;
+                let upstream = fields.string("upstream-version")?;
                 version = Some(RecipeVersion {
                     version: fields.string_arg(0)?.parse()?,
                     upstream,
@@ -729,7 +729,7 @@ build architecture="x86_64" epoch=1700000000 {
             r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{digest}" key-sha256="{digest}"
+        publisher "seed" catalog-sha256="{digest}" key-sha256="{digest}"
         package "devel/base"
     }}
     manifest "nested/hello.kdl" sha256="{digest}"
@@ -772,7 +772,7 @@ build architecture="x86_64" epoch=1700000000 {{
                 r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{digest}" key-sha256="{digest}"
+        publisher "seed" catalog-sha256="{digest}" key-sha256="{digest}"
         package "devel/base"
     }}
     manifest "hello.kdl" sha256="{digest}"

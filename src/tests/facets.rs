@@ -313,7 +313,7 @@ fn variants_select_exclusive_content_and_change_offline() -> Result<()> {
             "variant.container=#false",
         )? + &link("../usr/lib/init/container.conf", "true")
             + &link("../usr/lib/init/metal.conf", "false")
-            + &f.file("usr/bin/init", "init", "0755", "arch=\"x86_64\"")?
+            + &f.file("usr/bin/init", "init", "0755", "architecture=\"x86_64\"")?
             + &f.file(GETTY, "getty", "0755", "variant.container=#false")?,
     )?;
     f.create()?;
@@ -341,7 +341,7 @@ fn variants_select_exclusive_content_and_change_offline() -> Result<()> {
     assert_eq!(
         list_variants(&f.root)?,
         BTreeMap::from([
-            ("arch".to_owned(), "x86_64".to_owned()),
+            ("architecture".to_owned(), "x86_64".to_owned()),
             ("container".to_owned(), "true".to_owned()),
         ])
     );
@@ -359,8 +359,12 @@ fn variants_select_exclusive_content_and_change_offline() -> Result<()> {
     assert!(!f.root.join("usr/lib/init/container.conf").exists());
     assert!(crate::verify_pristine(&f.root)?.is_empty());
 
-    let error = plan(&f.root, change_variants(&[("arch", Some("aarch64"))])).unwrap_err();
-    assert!(error.to_string().contains("arch variant is fixed"));
+    let error = plan(
+        &f.root,
+        change_variants(&[("architecture", Some("aarch64"))]),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("architecture variant is fixed"));
     let error = plan(&f.root, change_variants(&[("container", None)])).unwrap_err();
     assert!(format!("{error:#}").contains("does not set"));
     let error = plan(&f.root, change_variants(&[("container", Some("Yes"))])).unwrap_err();
@@ -382,14 +386,14 @@ fn manifests_require_variant_exclusive_alternatives_and_plain_dependencies() -> 
     let file = |extra: &str| format!("file \"etc/tool.conf\" mode=\"0644\" uid=0 gid=0 {extra}\n");
     let exclusive = parse(
         &(file("variant.container=\"true\" facet=\"doc\"")
-            + &file("variant.container=\"false\" arch=\"x86_64\"")
-            + &file("variant.container=\"false\" arch=\"aarch64\" facet=\"doc\"")),
+            + &file("variant.container=\"false\" architecture=\"x86_64\"")
+            + &file("variant.container=\"false\" architecture=\"aarch64\" facet=\"doc\"")),
     )?;
     assert_eq!(parse_manifest(&manifest_text(&exclusive))?, exclusive);
     assert!(manifest_text(&exclusive).contains("variant.container=\"true\""));
     assert!(
-        manifest_text(&exclusive).contains(" arch=")
-            && !manifest_text(&exclusive).contains("variant.arch")
+        manifest_text(&exclusive).contains(" architecture=")
+            && !manifest_text(&exclusive).contains("variant.architecture")
     );
     // Booleans spell the "true" and "false" values.
     assert_eq!(
@@ -406,10 +410,10 @@ fn manifests_require_variant_exclusive_alternatives_and_plain_dependencies() -> 
             "duplicate action",
         ),
         (
-            file("variant.container=\"true\"") + &file("arch=\"x86_64\""),
+            file("variant.container=\"true\"") + &file("architecture=\"x86_64\""),
             "duplicate action",
         ),
-        (file("arch=\"x86_64\" variant.arch=\"x86_64\""), "same variant"),
+        (file("architecture=\"x86_64\" variant.architecture=\"x86_64\""), "same variant"),
         (file("variant.Container=\"true\""), "invalid variant"),
         (file("variant.container=\"\""), "invalid value"),
         (file("facet=\"locale.*\""), "invalid facet"),
@@ -419,7 +423,7 @@ fn manifests_require_variant_exclusive_alternatives_and_plain_dependencies() -> 
             "dependencies cannot carry facet",
         ),
         (
-            "recommends \"library/zlib\" arch=\"x86_64\"".to_owned(),
+            "recommends \"library/zlib\" architecture=\"x86_64\"".to_owned(),
             "dependencies cannot carry arch",
         ),
         (
@@ -550,7 +554,7 @@ fn image_configs_and_bundles_carry_per_package_facets_and_variants() -> Result<(
             "facet \"devel\" #true package=\"Library\"\n",
             "invalid package pattern",
         ),
-        ("variant \"arch\" \"x86_64\"\n", "architecture node"),
+        ("variant \"architecture\" \"x86_64\"\n", "architecture node"),
         (
             "variant \"container\" #true\nvariant \"container\" #false\n",
             "duplicate variant",
@@ -592,7 +596,7 @@ publisher "canopa" {{
         fs::write(
             &release,
             format!(
-                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base-sha256={:?} refresh-profiles=#true\n",
                 base.trim()
             ),
         )?;

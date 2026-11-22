@@ -193,7 +193,7 @@ recipe() {
 schema-version 1 kind="build-recipe"
 build architecture="$arch" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="$catalog" key-sha256="$(fingerprint canopa.trust.json)"
+        publisher "canopa" catalog-sha256="$catalog" key-sha256="$(fingerprint canopa.trust.json)"
         package "build/probe"
     }
     manifest "manifest.kdl" sha256="$(sha manifest.kdl)"
@@ -325,7 +325,7 @@ sed 's/version="1.0.0-0" {/version="2.0.0-0" {/' tools-probe.kdl > tools-newer.k
 awk -v companion="$tools_catalog" -v companion_key="$(fingerprint tools.trust.json)" '
     /^        publisher "canopa" / {
         print
-        printf "        publisher \"tools\" catalog=\"%s\" key-sha256=\"%s\"\n", companion, companion_key
+        printf "        publisher \"tools\" catalog-sha256=\"%s\" key-sha256=\"%s\"\n", companion, companion_key
         next
     }
     /^        package "build\/probe"/ {
@@ -896,7 +896,7 @@ publisher "canopa" minimum-builders=2 {
     builder-key "retired-publisher.der"
     approve "demo/hello" version="2.0.0-0" sha256="$hello2_reviewed"
     approve "library/platform" version="1.0.0-0" sha256="$platform_reviewed"
-    profile "base" architecture="$arch" upgrade-from="$witnessed_catalog" {
+    profile "base" architecture="$arch" upgrade-from-sha256="$witnessed_catalog" {
         package "demo/hello"
     }
 }
@@ -911,7 +911,7 @@ test "$(cat witnessed/current)" = "$rotated_catalog"
 
 cat > wave.kdl <<WAVE
 schema-version 1 kind="publish-release"
-release "canopa" base="$rotated_catalog" {
+release "canopa" base-sha256="$rotated_catalog" {
     obsolete "cps://canopa/demo/hello@1.1.0-0"
     bundle "cps://canopa/demo/hello@2.0.0-0" path="hello2-a" builder-key="builder-public.der" recipe-sha256="$hello2_reviewed" {
         witness "hello2-b/attestation.json" key="other-public.der"
@@ -1012,7 +1012,7 @@ publisher "desktop" {
     builder-key "../builder-public.der"
     profile "desktop" architecture="$arch" $primary_baseline {
         package "desktop/base"
-        publisher "canopa" catalog="$(cat "$companion/current")" $companion_baseline {
+        publisher "canopa" catalog-sha256="$(cat "$companion/current")" $companion_baseline {
             repository "../$companion"
             trust-root "../canopa.trust.json"
             build-trust minimum-builders=2 {
@@ -1025,7 +1025,7 @@ publisher "desktop" {
 POLICY
 }
 refresh_desktop() {
-    printf 'schema-version 1 kind="publish-release"\nrelease "desktop" base="%s" refresh-profiles=#true\n' \
+    printf 'schema-version 1 kind="publish-release"\nrelease "desktop" base-sha256="%s" refresh-profiles=#true\n' \
         "$desktop_base" > desktop-refresh.kdl
     "$cps" publish release --repo desktop-repo --key desktop.der desktop-refresh.kdl
 }
@@ -1041,7 +1041,7 @@ rm -- desktop-repo/publish-policy.kdl
 sed -E 's/publisher="?canopa"?/publisher="desktop"/' first/manifests/demo/hello.kdl > desktop-hello.kdl
 "$cps" publish manifests --repo desktop-repo --proto first/proto --key desktop.der desktop-hello.kdl
 desktop_base=$(cat desktop-repo/current)
-profile_policy profile-companion "upgrade-from=\"$desktop_baseline\"" "upgrade-from=\"$unattested\""
+profile_policy profile-companion "upgrade-from-sha256=\"$desktop_baseline\"" "upgrade-from-sha256=\"$unattested\""
 expect_failure 'checking upgrade from' refresh_desktop
 grep -F 'no build attestation for cps://canopa/demo/hello@1.0.0-0' rejected.log
 test "$(cat desktop-repo/current)" = "$desktop_base"
@@ -1049,7 +1049,7 @@ test "$(cat desktop-repo/current)" = "$desktop_base"
 "$cps" publish bundle --repo profile-companion --key signing.der \
     --builder-key builder-public.der --recipe-sha256 "$reviewed" \
     --witness other-public.der=unapproved/attestation.json first
-profile_policy profile-companion "upgrade-from=\"$desktop_baseline\"" "upgrade-from=\"$unattested\""
+profile_policy profile-companion "upgrade-from-sha256=\"$desktop_baseline\"" "upgrade-from-sha256=\"$unattested\""
 refresh_desktop
 desktop_base=$(cat desktop-repo/current)
 # A trust root may not make a companion's builder a catalog key. Try it on a copy.

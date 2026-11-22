@@ -29,7 +29,7 @@ schema-version 1 kind="build-recipe"
 // Reviewed recipe for $name
 build architecture="$arch" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "seed"   catalog="$zero" key-sha256="$zero" // seed toolchain
+        publisher "seed"   catalog-sha256="$zero" key-sha256="$zero" // seed toolchain
         package "$toolchain"
     }
     manifest "$dir.kdl" sha256="$(sha "recipes/$dir/$dir.kdl")"
@@ -87,7 +87,7 @@ grep -F '4 pin(s) in 4 recipe(s) are stale' stale.log
 test "$(cat recipes/tool/tool.build.kdl)" = "$before"
 "$cps" recipe repin --toolchain-catalog "seed=$one" recipes > repinned.txt
 test "$(cat recipes/tool/tool.build.kdl)" = "${before//$zero\" key/$one\" key}"
-grep -Fx "repinned recipes/tool/tool.build.kdl toolchain seed catalog $zero -> $one" repinned.txt
+grep -Fx "repinned recipes/tool/tool.build.kdl toolchain seed catalog-sha256 $zero -> $one" repinned.txt
 grep -Fx "recipe recipes/tool/tool.build.kdl sha256 $(sha recipes/tool/tool.build.kdl)" repinned.txt
 "$cps" recipe repin --toolchain-catalog "seed=$one" recipes > again.txt
 test ! -s again.txt

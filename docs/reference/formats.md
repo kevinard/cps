@@ -63,7 +63,7 @@ these properties in this order, each only when set: `publisher`, `version`,
    for `file`, `mode`, `preserve=#true` when set, `original-name`, `sha256`,
    `size`, and `capabilities`; for `dir`, `mode`; for `symlink` and
    `hardlink`, `target`. Then `uid` and `gid`, except on `hardlink`, then
-   `facet`, then `arch` and the `variant.NAME` selectors in name order.
+   `facet`, then `architecture` and the `variant.NAME` selectors in name order.
 6. `sysusers`, `tmpfiles`, and `preset` nodes in the order declared.
 7. `trigger` nodes in the order declared, with `timeout` when set and a block
    holding `run` with the handler and its arguments, then `watch`, `output`,

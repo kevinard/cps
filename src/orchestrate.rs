@@ -728,7 +728,7 @@ pub(crate) struct RepinRequest {
     pub sources: Vec<PathBuf>,
 }
 
-/// One rewritten pin, such as `toolchain seed catalog` or
+/// One rewritten pin, such as `toolchain seed catalog-sha256` or
 /// `source busybox-1.38.0.tar.bz2 size`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PinChange {
@@ -779,7 +779,7 @@ impl Pins {
                         if let Some(name) = argument(publisher) {
                             pins.toolchain.push((
                                 name.to_owned(),
-                                string(publisher, "catalog"),
+                                string(publisher, "catalog-sha256"),
                                 string(publisher, "key-sha256"),
                             ));
                         }
@@ -925,8 +925,8 @@ pub(crate) fn repin_recipes(
                 && from != to
             {
                 change(
-                    Edit::string("publisher", name, "catalog", &from, to),
-                    format!("toolchain {name} catalog"),
+                    Edit::string("publisher", name, "catalog-sha256", &from, to),
+                    format!("toolchain {name} catalog-sha256"),
                     from,
                     to.to_owned(),
                 );
@@ -1100,7 +1100,7 @@ mod tests {
         fs::write(
             dir.join(format!("{name}.build.kdl.in")),
             format!(
-                "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"@ARCH@\" epoch=@EPOCH@ {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog=\"{hash}\" key-sha256=\"@KEY@\" // keep\n        package \"{toolchain}\"\n    }}\n    manifest \"{name}.kdl\" sha256=\"@MANIFEST_SHA256@\"\n    script \"true\"\n}}\n"
+                "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"@ARCH@\" epoch=@EPOCH@ {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog-sha256=\"{hash}\" key-sha256=\"@KEY@\" // keep\n        package \"{toolchain}\"\n    }}\n    manifest \"{name}.kdl\" sha256=\"@MANIFEST_SHA256@\"\n    script \"true\"\n}}\n"
             ),
         )?;
         Ok(())
@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(
             dry.recipes[0].changes,
             [PinChange {
-                pin: "toolchain seed catalog".into(),
+                pin: "toolchain seed catalog-sha256".into(),
                 from: "0".repeat(64),
                 to: new.clone(),
             }]
@@ -1192,7 +1192,8 @@ mod tests {
         let bad = dir.path().join("zzz.build.kdl.in");
         let before = fs::read_to_string(&good)?;
         // A pin split over two lines is a form that repin does not rewrite.
-        let split = fs::read_to_string(&bad)?.replace(" catalog=", " \\\n            catalog=");
+        let split = fs::read_to_string(&bad)?
+            .replace(" catalog-sha256=", " \\\n            catalog-sha256=");
         fs::write(&bad, &split)?;
         let new = "1".repeat(64);
         let error = repin_recipes(
@@ -1222,7 +1223,7 @@ mod tests {
         fs::write(
             &recipe,
             format!(
-                "schema-version 1 kind=\"build-recipe\"\n// Reviewed\nbuild architecture=\"x86_64\" epoch=1 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog=\"{zero}\" key-sha256=\"{zero}\"\n        package \"build/cc\"\n    }}\n    manifest \"hello.kdl\"   sha256=\"{zero}\" // template\n    source \"hello-1.0.tar.gz\" size=1 sha256=\"{zero}\" {{\n        url \"https://example.org/hello-1.0.tar.gz\"\n    }}\n    source \"fix.patch\" sha256=\"{zero}\" size=12\n    source \"missing.tar.gz\" size=3 sha256=\"{zero}\"\n    script \"\"\"\n    source \"hello-1.0.tar.gz\" size=1\n    \"\"\"\n}}\n"
+                "schema-version 1 kind=\"build-recipe\"\n// Reviewed\nbuild architecture=\"x86_64\" epoch=1 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"seed\" catalog-sha256=\"{zero}\" key-sha256=\"{zero}\"\n        package \"build/cc\"\n    }}\n    manifest \"hello.kdl\"   sha256=\"{zero}\" // template\n    source \"hello-1.0.tar.gz\" size=1 sha256=\"{zero}\" {{\n        url \"https://example.org/hello-1.0.tar.gz\"\n    }}\n    source \"fix.patch\" sha256=\"{zero}\" size=12\n    source \"missing.tar.gz\" size=3 sha256=\"{zero}\"\n    script \"\"\"\n    source \"hello-1.0.tar.gz\" size=1\n    \"\"\"\n}}\n"
             ),
         )?;
         Ok(recipe)

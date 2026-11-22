@@ -35,10 +35,10 @@ synchronized cache that holds the signed toolchain catalog.
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+        publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
         package "devel/base"
     }
-    version "1.0.0-1" upstream="1.0.0"
+    version "1.0.0-1" upstream-version="1.0.0"
     manifest "hello.kdl" sha256="<manifest SHA-256>"
     source "hello.c" sha256="<source SHA-256>" size=123
     script """
@@ -57,7 +57,7 @@ package "demo/hello" publisher="canopa" summary="Print a greeting" license="MIT"
 }
 ```
 
-`catalog` is the digest of the toolchain repository's signed catalog root,
+`catalog-sha256` is the digest of the toolchain repository's signed catalog root,
 such as the digest in its `current` file when you prepare the recipe.
 `key-sha256` is the SHA-256 of the publisher trust root file that the worker
 pins, such as `sha256sum canopa.trust.json`. Replace the template and
@@ -82,9 +82,9 @@ node. `architecture` names the target, and `epoch` sets
 
 | Node | Meaning |
 | --- | --- |
-| `toolchain solver="sat-v2"` | Required, once. At least one `publisher NAME catalog=... key-sha256=...` pin and at least one `package` request. |
+| `toolchain solver="sat-v2"` | Required, once. At least one `publisher NAME catalog-sha256=... key-sha256=...` pin and at least one `package` request. |
 | `manifest PATH sha256=...` | A package template. One or more, up to 64; each produces one package. |
-| `version VERSION upstream=...` | The version of every produced package. Optional; without it, each template declares its own `version`. |
+| `version VERSION upstream-version=...` | The version of every produced package. Optional; without it, each template declares its own `version`. |
 | `source PATH sha256=... size=...` | A pinned input, staged under `$CPS_SOURCES`. Add `url` children to [fetch it](#preparing-a-source-cache). |
 | `script """..."""` | Required. Runs with `/bin/sh -eu` in `/build`, umask `022`. |
 | `discard PATTERN` | Installed paths that no package claims and the build may drop. See [collecting](#collecting-installed-files). |
@@ -121,10 +121,10 @@ version in the recipe and its template by digest.
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1791504000 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+        publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
         package "devel/base"
     }
-    version "3.54.1-1" upstream="3.54.1"
+    version "3.54.1-1" upstream-version="3.54.1"
     manifest "sqlite.kdl" sha256="<template SHA-256>"
     discard "usr/lib/*.la"
     discard "usr/share/doc/**"
@@ -179,7 +179,7 @@ directory itself. Inside a component, `*` matches any run of characters and
 | `uid`, `gid` | `0` |
 | `preserve` | `#false` |
 | `facet` | The built-in facet below. `facet=#null` ships the paths without a facet. |
-| `arch`, `variant.NAME` | None |
+| `architecture`, `variant.NAME` | None |
 
 Without a `facet` property, a collected path gets the first matching
 built-in facet:
@@ -246,10 +246,10 @@ headers, manual pages, and debug information, stays in its package as a
 schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1767225600 {
     toolchain solver="sat-v2" {
-        publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+        publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
         package "devel/base"
     }
-    version "2.4.0-1" upstream="2.4.0"
+    version "2.4.0-1" upstream-version="2.4.0"
     manifest "liblz.kdl" sha256="<template SHA-256>"
     manifest "lz.kdl" sha256="<template SHA-256>"
     discard "usr/lib/liblz.a"
@@ -471,8 +471,8 @@ publisher trust root file the worker pins for that publisher, such as
 
 ```kdl
 toolchain solver="sat-v2" {
-    publisher "canopa" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
-    publisher "tools" catalog="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+    publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+    publisher "tools" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
     package "devel/base"
     package "cps://tools/devel/compiler@1.0.0-0"
 }

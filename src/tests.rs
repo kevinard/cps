@@ -704,7 +704,7 @@ fn hardlink_targets_must_be_immutable_files_owned_by_the_same_package() -> Resul
         link.to_owned(),
         format!("{file} preserve=#true\n{link}"),
         format!("{file} facet=\"doc.man\"\n{link}"),
-        format!("{file} arch=\"aarch64\"\n{link} arch=\"x86_64\""),
+        format!("{file} architecture=\"aarch64\"\n{link} architecture=\"x86_64\""),
         format!("symlink \"usr/bin/tool\" target=\"external\" uid=0 gid=0\n{link}"),
         format!("hardlink \"usr/bin/tool\" target=\"bin/tool\"\n{link}"),
         "hardlink \"bin/tool\" target=\"../tool\"".to_owned(),
@@ -713,7 +713,7 @@ fn hardlink_targets_must_be_immutable_files_owned_by_the_same_package() -> Resul
         assert!(parse(&actions)?.validate(false).is_err(), "{actions}");
     }
     assert!(parse(&format!("{file}\n{link} uid=0")).is_err());
-    parse(&format!("{file}\n{link} arch=\"x86_64\""))?.validate(false)?;
+    parse(&format!("{file}\n{link} architecture=\"x86_64\""))?.validate(false)?;
     parse(&format!(
         "{file} facet=\"doc.man\"\n{link} facet=\"doc.man\""
     ))?
@@ -1536,7 +1536,7 @@ fn build_receipts_survive_offline_transaction_recovery_and_follow_installed_pack
     let recipe = format!(
         r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
-    toolchain solver="sat-v2" {{ publisher "seed" catalog="{pin}" key-sha256="{key_hash}"; package "build/shell"; }}
+    toolchain solver="sat-v2" {{ publisher "seed" catalog-sha256="{pin}" key-sha256="{key_hash}"; package "build/shell"; }}
     manifest "manifest.kdl" sha256="{}"
     script "true"
 }}
@@ -2634,9 +2634,9 @@ fn searches_files_in_verified_available_manifests() -> Result<()> {
     f.package(
         "desktop/compositor",
         "2.0.0-0",
-        f.file(COMPOSITOR, "current", "0755", "arch=\"x86_64\"")?
+        f.file(COMPOSITOR, "current", "0755", "architecture=\"x86_64\"")?
             + &f.file(backup, "backup", "0755", "")?
-            + &f.file(foreign, "foreign", "0755", "arch=\"aarch64\"")?
+            + &f.file(foreign, "foreign", "0755", "architecture=\"aarch64\"")?
             + &f.file(MANPAGE, "docs", "0644", "facet=\"doc.man\"")?,
     )?;
     extras.package_as(
@@ -2738,7 +2738,12 @@ fn queries_installed_path_ownership_offline() -> Result<()> {
             + &dependency("require", "library/libdisplay", "1.0.0-0")
             + &f.file(COMPOSITOR, "installed", "0755", "")?
             + &f.file(MANPAGE, "documentation", "0644", "facet=\"doc.man\"")?
-            + &f.file("usr/bin/other-arch", "foreign", "0755", "arch=\"aarch64\"")?
+            + &f.file(
+                "usr/bin/other-arch",
+                "foreign",
+                "0755",
+                "architecture=\"aarch64\"",
+            )?
             + &format!("    symlink {link:?} target=\"libdisplay.so\" uid={uid} gid={gid}\n"),
     )?;
     f.create()?;

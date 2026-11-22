@@ -119,7 +119,7 @@ if $configured; then
 else
     cat > "$work/toolchain-recipe" <<TOOLCHAIN
     toolchain solver="sat-v2" {
-        publisher "seed" catalog="$(cat toolchain/current)" key-sha256="$(sha256sum < toolchain.trust.json | cut -d' ' -f1)"
+        publisher "seed" catalog-sha256="$(cat toolchain/current)" key-sha256="$(sha256sum < toolchain.trust.json | cut -d' ' -f1)"
         package "build/native-systemd"
     }
 TOOLCHAIN

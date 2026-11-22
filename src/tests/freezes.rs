@@ -228,7 +228,7 @@ publisher "canopa" {{
         fs::write(
             &definition,
             format!(
-                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base={:?} refresh-profiles=#true\n",
+                "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base-sha256={:?} refresh-profiles=#true\n",
                 fs::read_to_string(f.repo.join("current"))?.trim()
             ),
         )?;

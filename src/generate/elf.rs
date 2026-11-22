@@ -319,8 +319,8 @@ mod tests {
     symlink "usr/lib/libdemo.so.1" target="libdemo.so.1.0" uid=0 gid=0
     file "usr/lib/private/libhidden.so.2" mode="0755" uid=0 gid=0
     file "usr/lib/loader-copy" mode="0755" uid=0 gid=0
-    file "usr/bin/demo" mode="0755" uid=0 gid=0 arch="x86_64"
-    hardlink "usr/bin/demo-alias" target="usr/bin/demo" arch="x86_64"
+    file "usr/bin/demo" mode="0755" uid=0 gid=0 architecture="x86_64"
+    hardlink "usr/bin/demo-alias" target="usr/bin/demo" architecture="x86_64"
     file "usr/bin/optional" mode="0755" uid=0 gid=0 facet="extra"
     file "usr/lib/libgpu.so.3" mode="0755" uid=0 gid=0 variant.gpu="true"
 "#,

@@ -1562,7 +1562,7 @@ const PUBLIC_KEY_DER_LEN: u64 = 44;
 
 fn read_key_der(path: &Path) -> Result<Vec<u8>> {
     (|| read_limited(File::open(path)?, PUBLIC_KEY_DER_LEN))()
-        .with_context(|| format!("reading trust key {}", path.display()))
+        .with_context(|| format!("reading public key {}", path.display()))
 }
 
 /// Read a raw Ed25519 public key from a DER file, such as a builder key.

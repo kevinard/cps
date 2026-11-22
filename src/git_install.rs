@@ -658,7 +658,7 @@ mod tests {
             r#"schema-version 1 kind="build-recipe"
 build architecture="x86_64" epoch=1700000000 {{
     toolchain solver="sat-v2" {{
-        publisher "seed" catalog="{hash}" key-sha256="{hash}"
+        publisher "seed" catalog-sha256="{hash}" key-sha256="{hash}"
         package "build/compiler"
     }}
     manifest "manifest.kdl" sha256="{hash}"

@@ -265,13 +265,13 @@ separately operated workers. To keep build inputs for rebuilders, see
 ## Publish a coordinated release
 
 Group related package changes and withdrawals in a KDL release file. Use
-the reviewed catalog digest from `repo/current` as `base`, or `base="empty"`
+the reviewed catalog digest from `repo/current` as `base-sha256`, or `base-sha256="empty"`
 when initializing a repository. Bundle, builder key, and witness paths are
 relative to the release file's directory.
 
 ```kdl
 schema-version 1 kind="publish-release"
-release "canopa" base="<reviewed catalog SHA-256>" {
+release "canopa" base-sha256="<reviewed catalog SHA-256>" {
     bundle "cps://canopa/demo/hello@2.0.0-0" path="hello-build" builder-key="worker-a-public.der" recipe-sha256="<reviewed recipe SHA-256>" {
         witness "worker-b-build/attestation.json" key="worker-b-public.der"
     }
@@ -298,7 +298,7 @@ recomputed candidate equals the tested digest. See
 [Checking release composition](profiles.md#checking-release-composition).
 
 When only the release profiles change, update the publish policy and
-publish a release with `refresh-profiles=#true` and the current `base`
+publish a release with `refresh-profiles=#true` and the current `base-sha256`
 digest. The signer reruns the profile checks and publishes a new catalog if
 the signed profile records changed. This lets a primary publisher advance a
 companion pin without rebuilding its own packages.
@@ -489,7 +489,7 @@ action to the KDL file for `publish release`.
 
 ```kdl
 schema-version 1 kind="publish-release"
-release "canopa" base="<reviewed catalog SHA-256>" {
+release "canopa" base-sha256="<reviewed catalog SHA-256>" {
     obsolete "cps://canopa/library/retired@2.0.0-0"
 }
 ```
@@ -548,7 +548,7 @@ same release. Add a `rename` action to the reviewed release document.
 
 ```kdl
 schema-version 1 kind="publish-release"
-release "canopa" base="<reviewed catalog SHA-256>" {
+release "canopa" base-sha256="<reviewed catalog SHA-256>" {
     rename "cps://canopa/apps/old-editor@2.0.0-0" to="apps/editor"
 }
 ```
