@@ -300,7 +300,9 @@ sudo cps config diff /etc/hostname
 ```
 
 `config list` shows saved running versions as `saved local`, and
-`config diff` compares the current file with the saved one. Copy what you
+`config diff` compares the current file with the newest saved one. Both are
+read inside the image, and a symbolic link is compared by its target rather
+than followed, so the diff never shows a file from outside the image. Copy what you
 need, then delete the saved copy. `journalctl -b -1 -u cps-finalize-trial`
 shows the merge report of the previous shutdown.
 

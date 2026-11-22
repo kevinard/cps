@@ -93,6 +93,38 @@ pub(crate) fn config_diff_inputs(
     Ok(())
 }
 
+/// Copy the current file at `path` and its `saved` copy from an earlier
+/// `/etc` merge, as `config diff` compares them. Both are read beneath the
+/// image root: a symbolic link is compared by its target and never
+/// followed, so an offline image cannot show a host file, and a missing
+/// file reads as empty.
+pub(crate) fn saved_diff_inputs(
+    root: &Path,
+    path: &str,
+    saved: &str,
+    current_output: &mut File,
+    saved_output: &mut File,
+) -> Result<()> {
+    let root = Root::open(root)?;
+    copy_beneath(&root, path, current_output)?;
+    copy_beneath(&root, saved, saved_output)
+}
+
+fn copy_beneath(root: &Root, path: &str, output: &mut File) -> Result<()> {
+    if let Some(entry) = root.regular_entry(path)? {
+        std::io::copy(&mut File::open(Root::fd_path(&entry))?, output)?;
+        return Ok(());
+    }
+    match root.inspect(path)? {
+        None => Ok(()),
+        Some(Node::Symlink { target, .. }) => {
+            std::io::Write::write_all(output, format!("symbolic link to {target}\n").as_bytes())?;
+            Ok(())
+        }
+        Some(_) => anyhow::bail!("unexpected file type at {path}"),
+    }
+}
+
 pub(super) fn resolve(
     root: &Root,
     settings: &mut Settings,

@@ -3044,10 +3044,20 @@ fn run(command: Command) -> Result<Exit> {
                     .iter()
                     .any(|update| update.path == relative)
             {
+                let dir = tempfile::tempdir()?;
+                let current = dir.path().join("current");
+                let saved = dir.path().join("saved");
+                crate::plan::saved_diff_inputs(
+                    &root,
+                    relative,
+                    &copy,
+                    &mut File::create_new(&current)?,
+                    &mut File::create_new(&saved)?,
+                )?;
                 let status = std::process::Command::new("/usr/bin/diff")
                     .args(["-u", "--label", "current", "--label", "saved", "--"])
-                    .arg(root.join(relative))
-                    .arg(root.join(copy))
+                    .arg(current)
+                    .arg(saved)
                     .status()
                     .context("running /usr/bin/diff")?;
                 return match status.code() {

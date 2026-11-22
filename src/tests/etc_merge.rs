@@ -390,3 +390,46 @@ fn a_trial_waiting_for_its_etc_merge_is_not_healthy() -> Result<()> {
     assert!(crate::verify_quick(&f.root)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn saved_versions_diff_beneath_the_root_in_attempt_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let stash = root
+        .join(crate::image::CONFIG_UPDATES_DIRECTORY)
+        .join(etc_merge::STASH);
+    fs::create_dir_all(stash.join("7-9/etc"))?;
+    fs::write(stash.join("7-9/etc/app.conf"), "ninth\n")?;
+    // The latest attempt saved a symbolic link to a file that exists on the host.
+    fs::create_dir_all(stash.join("7-10/etc"))?;
+    std::os::unix::fs::symlink("/etc/os-release", stash.join("7-10/etc/app.conf"))?;
+    fs::create_dir_all(root.join("etc"))?;
+    std::os::unix::fs::symlink("/etc/hostname", root.join("etc/app.conf"))?;
+
+    let saved = crate::saved_etc_versions(root)?;
+    let (revision, _, copy) = saved
+        .iter()
+        .rfind(|(_, path, _)| path == "etc/app.conf")
+        .expect("a saved version");
+    assert_eq!(*revision, 7);
+    assert!(copy.ends_with("/7-10/etc/app.conf"), "{copy}");
+
+    let current = dir.path().join("current");
+    let previous = dir.path().join("saved");
+    crate::plan::saved_diff_inputs(
+        root,
+        "etc/app.conf",
+        copy,
+        &mut fs::File::create_new(&current)?,
+        &mut fs::File::create_new(&previous)?,
+    )?;
+    assert_eq!(
+        fs::read_to_string(current)?,
+        "symbolic link to /etc/hostname\n"
+    );
+    assert_eq!(
+        fs::read_to_string(previous)?,
+        "symbolic link to /etc/os-release\n"
+    );
+    Ok(())
+}

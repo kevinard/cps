@@ -1541,12 +1541,9 @@ pub(crate) fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> 
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        let Some(number) = name
-            .split_once('-')
-            .map_or(name, |(number, _)| number)
-            .parse::<u64>()
-            .ok()
-        else {
+        // A merge that ran again for the same revision saves `N-ATTEMPT`.
+        let (number, attempt) = name.split_once('-').unwrap_or((name, "0"));
+        let (Ok(number), Ok(attempt)) = (number.parse::<u64>(), attempt.parse::<u64>()) else {
             continue;
         };
         let directory = Root::open(&revision.path())?;
@@ -1562,12 +1559,17 @@ pub(crate) fn saved_versions(root: &Path) -> Result<Vec<(u64, String, String)>> 
         visit(&top, ETC, info.st_dev, false, false, &mut scan)?;
         for (path, entry) in scan.manifest.entries {
             if !entry.is_dir() {
-                saved.push((number, path.clone(), format!("{prefix}/{name}/{path}")));
+                let copy = format!("{prefix}/{name}/{path}");
+                saved.push(((number, attempt), path, copy));
             }
         }
     }
+    // Attempts sort as numbers, so attempt 10 follows attempt 9.
     saved.sort();
-    Ok(saved)
+    Ok(saved
+        .into_iter()
+        .map(|((number, _), path, copy)| (number, path, copy))
+        .collect())
 }
 
 #[cfg(test)]

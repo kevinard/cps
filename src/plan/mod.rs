@@ -34,7 +34,7 @@ use crate::{
 };
 
 pub(crate) use catalogs::{CandidateSet, claim_source};
-pub(crate) use config::{ConfigChoice, config_diff_inputs, list_config_updates};
+pub(crate) use config::{ConfigChoice, config_diff_inputs, list_config_updates, saved_diff_inputs};
 pub(crate) use freeze::{FreezeChange, FrozenPackage, list_freezes};
 pub(crate) use intent::{IntentChange, MarkChoice};
 use order::WriteOrder;
