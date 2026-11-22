@@ -145,11 +145,14 @@ pub(crate) fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
             .regular_entry("etc/fstab")?
             .context("the root has no /etc/fstab to mount the shared /var subvolume")?;
         let fstab = image.root.read_file("etc/fstab")?;
-        ensure!(
-            mounts_var(&String::from_utf8_lossy(&fstab), var),
-            "the root's /etc/fstab must mount subvolume {var} at /var, for example\n  \
-             PARTUUID={partuuid} /var btrfs subvol=/{var} 0 0"
-        );
+        check_var_mount(&String::from_utf8_lossy(&fstab), var, &partuuid, &image_id).with_context(
+            || {
+                format!(
+                    "the root's /etc/fstab must mount subvolume {var} of the new filesystem at \
+                     /var, for example\n  PARTUUID={partuuid} /var btrfs subvol=/{var} 0 0"
+                )
+            },
+        )?;
     }
     check_tree(&image.root)?;
     let fingerprint = tree::digest(&image.root).context("fingerprinting the root")?;
@@ -252,25 +255,54 @@ pub(crate) fn create_boot_image(spec: BootImage<'_>) -> Result<String> {
     Ok(id)
 }
 
-/// Whether an fstab mounts the top-level subvolume `name` at /var.
-fn mounts_var(fstab: &str, name: &str) -> bool {
-    fstab
+/// Check that an fstab has exactly one /var entry, and that it mounts the
+/// top-level subvolume `name` of the filesystem that the image creates,
+/// named by its root partition UUID or its filesystem UUID.
+fn check_var_mount(fstab: &str, name: &str, partuuid: &str, fsid: &str) -> Result<()> {
+    let mut entries = fstab
         .lines()
         .map(|line| line.split('#').next().unwrap_or_default())
-        .filter_map(|line| {
-            let fields: Vec<_> = line.split_ascii_whitespace().collect();
-            match fields[..] {
-                [_, "/var", "btrfs", options, ..] => Some(options),
-                _ => None,
-            }
-        })
-        .any(|options| {
-            options.split(',').any(|option| {
-                option
-                    .strip_prefix("subvol=")
-                    .is_some_and(|subvol| subvol.trim_start_matches('/') == name)
-            })
-        })
+        .map(|line| line.split_ascii_whitespace().collect::<Vec<_>>())
+        .filter(|fields| {
+            fields
+                .get(1)
+                .is_some_and(|target| target.trim_end_matches('/') == "/var")
+        });
+    let fields = entries.next().context("no /var entry")?;
+    ensure!(entries.next().is_none(), "more than one /var entry");
+    let [source, _, kind, options, ..] = fields[..] else {
+        bail!("the /var entry has no mount options");
+    };
+    ensure!(kind == "btrfs", "/var is not a btrfs mount");
+    let identity = |value: &str, expected: &str| value.eq_ignore_ascii_case(expected);
+    let source_matches = match source.split_once('=') {
+        Some(("PARTUUID", value)) => identity(value, partuuid),
+        Some(("UUID", value)) => identity(value, fsid),
+        _ => match source.rsplit_once('/') {
+            Some(("/dev/disk/by-partuuid", value)) => identity(value, partuuid),
+            Some(("/dev/disk/by-uuid", value)) => identity(value, fsid),
+            _ => false,
+        },
+    };
+    ensure!(
+        source_matches,
+        "/var mounts {source}, not PARTUUID={partuuid} or UUID={fsid}"
+    );
+    let mut subvolumes = Vec::new();
+    for option in options.split(',') {
+        ensure!(
+            !option.starts_with("subvolid=") && option != "noauto",
+            "the /var entry has the conflicting option {option}"
+        );
+        if let Some(subvolume) = option.strip_prefix("subvol=") {
+            subvolumes.push(subvolume.trim_start_matches('/'));
+        }
+    }
+    ensure!(
+        subvolumes == [name],
+        "the /var entry must have exactly one option subvol=/{name}"
+    );
+    Ok(())
 }
 
 /// The name of a directory directly inside the volume directory.
@@ -576,22 +608,42 @@ fs uuid 11111111-2222-4333-8444-555555555555
     }
 
     #[test]
-    fn fstab_must_mount_the_shared_var_subvolume() {
-        let fstab = "# comment /var btrfs subvol=/@var\n\
-                     PARTUUID=x / btrfs defaults 0 0\n\
-                     PARTUUID=x /var btrfs noatime,subvol=/@var 0 0\n";
-        assert!(mounts_var(fstab, "@var"));
-        assert!(mounts_var("UUID=x /var btrfs subvol=@var 0 0", "@var"));
-        assert!(!mounts_var(fstab, "@other"));
-        assert!(!mounts_var(
-            "# PARTUUID=x /var btrfs subvol=/@var 0 0",
-            "@var"
-        ));
-        assert!(!mounts_var(
-            "UUID=x /var/log btrfs subvol=/@var 0 0",
-            "@var"
-        ));
-        assert!(!mounts_var("tmpfs /var tmpfs subvol=/@var 0 0", "@var"));
+    fn fstab_must_mount_the_shared_var_subvolume_of_the_new_filesystem() {
+        const PARTUUID: &str = "3f93dbde-d29d-4c3f-9a3b-3d165490c830";
+        const FSID: &str = "11111111-1111-4111-8111-111111111111";
+        let check = |fstab: &str| check_var_mount(fstab, "@var", PARTUUID, FSID);
+        let fstab = format!(
+            "# comment /var btrfs subvol=/@var\n\
+             PARTUUID={PARTUUID} / btrfs defaults 0 0\n\
+             PARTUUID={PARTUUID} /var btrfs noatime,subvol=/@var 0 0\n"
+        );
+        assert!(check(&fstab).is_ok());
+        assert!(check_var_mount(&fstab, "@other", PARTUUID, FSID).is_err());
+        // Either identity of the new filesystem, in any of its forms.
+        for source in [
+            format!("UUID={}", FSID.to_uppercase()),
+            format!("/dev/disk/by-uuid/{FSID}"),
+            format!("/dev/disk/by-partuuid/{PARTUUID}"),
+        ] {
+            assert!(check(&format!("{source} /var/ btrfs subvol=@var 0 0")).is_ok());
+        }
+        for fstab in [
+            // Commented out, or a different mount point or filesystem type.
+            format!("# PARTUUID={PARTUUID} /var btrfs subvol=/@var 0 0"),
+            format!("PARTUUID={PARTUUID} /var/log btrfs subvol=/@var 0 0"),
+            "tmpfs /var tmpfs subvol=/@var 0 0".to_owned(),
+            // A stale or placeholder identity, or a device name.
+            "PARTUUID=x /var btrfs subvol=/@var 0 0".to_owned(),
+            format!("UUID={PARTUUID} /var btrfs subvol=/@var 0 0"),
+            "/dev/sda2 /var btrfs subvol=/@var 0 0".to_owned(),
+            // Conflicting options or entries.
+            format!("PARTUUID={PARTUUID} /var btrfs subvol=/@var,subvolid=258 0 0"),
+            format!("PARTUUID={PARTUUID} /var btrfs subvol=/@var,subvol=/@old 0 0"),
+            format!("PARTUUID={PARTUUID} /var btrfs noauto,subvol=/@var 0 0"),
+            format!("{fstab}tmpfs /var tmpfs defaults 0 0\n"),
+        ] {
+            assert!(check(&fstab).is_err(), "{fstab}");
+        }
     }
 
     #[test]

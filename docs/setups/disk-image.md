@@ -53,8 +53,14 @@ PARTUUID=ROOT-PARTUUID  /cps  btrfs  subvolid=5        0 0
 PARTUUID=ESP-PARTUUID   /efi  vfat   umask=0077        0 2
 ```
 
-With `--var`, `image disk` refuses a root whose `/etc/fstab` does not
-mount that subvolume at `/var`.
+With `--var`, the root's `/etc/fstab` must have exactly one `/var` entry, of
+type `btrfs`, with exactly one `subvol=` option that names that subvolume.
+Its source must name the filesystem that `image disk` creates: the root
+partition as `PARTUUID=ROOT-PARTUUID` or `/dev/disk/by-partuuid/ROOT-PARTUUID`,
+or the filesystem as `UUID=IMAGE-ID` or `/dev/disk/by-uuid/IMAGE-ID`, where
+IMAGE-ID is the root's image identity, which becomes its Btrfs filesystem
+UUID. `subvolid=` and `noauto` are refused. Otherwise the first boot could
+mount another filesystem at `/var`, or none.
 
 The image keeps owners, modes, links, extended attributes, and timestamps
 from the directory. Run as root to give the files their declared owners.
