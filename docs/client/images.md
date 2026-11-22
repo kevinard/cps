@@ -78,6 +78,11 @@ against the cached payloads, and `apply` repeats its checks before writing
 package files. Once CPS has recorded the transaction, the verified staged
 payloads let it finish offline.
 
+A request that changes nothing, such as `upgrade` on an up-to-date image,
+prints `Nothing to do.` and commits no revision, and so does `apply` of a
+saved plan that changes nothing. Running the same command again in an image
+pipeline therefore leaves the image and its history unchanged.
+
 A plan applies only to the revision it was made for. After any other change
 commits, apply reports `stale plan for revision N`, and you plan again.
 Apply also refuses when a path that the plan leaves unchanged no longer

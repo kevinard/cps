@@ -63,6 +63,12 @@ publish 2.0.0-0
 "$cps" upgrade --root changed -y > /dev/null
 expect 3 "$cps" image diff image changed
 
+# An image change with nothing to do commits no revision.
+revision=$("$cps" status --root changed | sed -n 's/^Image revision //p')
+expect 0 "$cps" upgrade --root changed -y
+grep -Fx 'Nothing to do.' out.log
+test "$("$cps" status --root changed | sed -n 's/^Image revision //p')" = "$revision"
+
 # A saved plan runs only where it was saved: an image plan with --root, and
 # a plan saved on the running system without it.
 "$cps" install --root image -n --save-plan image-plan.json test/tool > /dev/null

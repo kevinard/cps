@@ -2508,6 +2508,11 @@ fn change_image(
     if let Some(path) = &options.save_plan {
         save(path, &plan).with_context(|| format!("saving {}", path.display()))?;
     }
+    // As on the running system, a plan that changes nothing commits no revision.
+    if !plan.changes_image() {
+        println!("Nothing to do.");
+        return Ok(());
+    }
     println!("{}", plan.summary());
     if options.dry_run {
         return Ok(());
@@ -3137,7 +3142,11 @@ fn run(command: Command) -> Result<Exit> {
             match target.root {
                 Some(root) => {
                     image_plan(&saved)?;
-                    if dry_run {
+                    if !saved.changes_image() {
+                        // A plan that changes nothing still has to be current.
+                        crate::validate_plan(&root, &saved)?;
+                        println!("Nothing to do.");
+                    } else if dry_run {
                         crate::validate_plan(&root, &saved)?;
                         println!("Plan validated against cached payloads");
                     } else {
