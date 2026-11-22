@@ -53,14 +53,14 @@ Administrators can set `git-toolchain-config "toolchains.kdl"` in
 
 The running Btrfs system needs Git and Bubblewrap. When CPS runs as root,
 however it was started (`sudo`, `doas`, `run0`, or a timer), it fetches the
-repository, checks signatures, archives the commit and builds the package
-as the `cps-build` system account, which the cps package creates with
+repository, archives the commit and builds the package as the `cps-build`
+system account, which the cps package creates with
 sysusers.d. Root never runs Git on the repository, because a repository is
 untrusted input and Git runs programs that a repository's configuration
 names. The account needs read access to the toolchain configuration, its
 keys, and the pinned toolchain payloads, and it should run nothing else.
-Root reads the commit and `cps.kdl` that Git reports, hashes the source
-archive, then reads the build output without following symlinks and
+Root reads the commit and `cps.kdl` that Git reports, verifies any
+required signature itself, hashes the source archive, then reads the build output without following symlinks and
 publishes it only when the expanded manifest is exactly what `cps.kdl`
 declares, so the build account cannot add files or change their modes or
 owners. An unprivileged user installing into their own image runs every
@@ -132,7 +132,11 @@ commit in place. OpenPGP checks use a private keyring that contains only the
 allowed keys. CPS records the policy with the installed source and reads the
 file each time, so editing the file rotates or revokes signers for later
 upgrades. The file must be owned by the CPS account, normally root, and not
-writable by group or others. The build account verifies signatures against a
-copy of it. The signature covers the commit being
+writable by group or others. The build account only reports the signed
+commit or tag objects: CPS checks that their bytes hash to their IDs,
+separates each signature from the data it signs as Git does, and verifies
+it with `ssh-keygen -Y verify` or `gpg --verify` in a directory that only
+the CPS account can write, so the build account cannot change the signers
+or the result. The signature covers the commit being
 installed. CPS still requires each upgrade to descend from the installed
 commit, so a signed commit on a rewritten branch is rejected.
