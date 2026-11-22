@@ -10,6 +10,7 @@
 - [Code layout](#code-layout)
 - [Internal records](#internal-records)
 - [Run the unit tests](#run-the-unit-tests)
+- [Install test dependencies](#install-test-dependencies)
 - [Run the shell scenarios](#run-the-shell-scenarios)
 - [Measure performance](#measure-performance)
 
@@ -184,6 +185,29 @@ do not set them by hand.
 | `CPS_TEST_NO_EXCHANGE` | Use the fallback without `RENAME_EXCHANGE`, which moves the old object aside first |
 | `CPS_TEST_ABORT` | Run `cps abort` instead of apply |
 
+## Install test dependencies
+
+Install the host tools once for the scenarios you run. Use your Linux
+distribution's packages where available and put the commands on `PATH`.
+A fresh checkout does not need pre-existing tool copies in `target/`.
+
+| Scenario | Host dependencies |
+| --- | --- |
+| Offline disk images | btrfs-progs, dosfstools, mtools, util-linux (`sfdisk`), `attr` (`setfattr` and `getfattr`), and OpenSSL |
+| VM boots | The disk-image tools plus x86-64 QEMU (`qemu-system-x86_64`), OVMF firmware, systemd-boot, and BusyBox. See [VM boot tests](boot-tests.md#common-settings) for firmware paths, kernel requirements, and tool overrides. |
+| Building a guest kernel | `bc` and the [native kernel build tools](build-fixtures.md#testing-a-source-built-linux-kernel). You do not need these to run a VM test with a compatible prebuilt kernel. |
+
+For `tests/deploy-mirror.sh`, install `tuftool` once. To match the version
+pinned in the [CI Dockerfile](../../ci/Dockerfile), run:
+
+```sh
+cargo install --locked tuftool@0.17.0
+```
+
+Keep Cargo's bin directory on `PATH` so the test can find `tuftool`. This is
+separate from the in-tree `tuf-fixture` example, which you build from the
+checkout along with CPS.
+
 ## Run the shell scenarios
 
 The scripts in [`tests/`](../../tests) exercise the compiled CLI against
@@ -204,9 +228,11 @@ The scripts find CPS through one of two variables, defaulting to
 | `CPS_TEST_BINARY` | The other scenarios and the fixture builders |
 | `CPS_TUF_FIXTURE` | `sharded-mirror.sh`: the disposable TUF signer, defaulting to `target/debug/examples/tuf-fixture` |
 
-CI sets both CPS variables to the same binary and runs this set:
+Build CPS and the test signer from the current checkout before running the
+scenarios. CI sets both CPS variables to the same fresh binary:
 
 ```sh
+cargo build --locked --bin cps --example tuf-fixture
 export CPS_BIN="$PWD/target/debug/cps" CPS_TEST_BINARY="$PWD/target/debug/cps"
 export CPS_TUF_FIXTURE="$PWD/target/debug/examples/tuf-fixture"
 for test in package-identity manifest-dependencies elf-transactions elf-profile systemd-actions \
