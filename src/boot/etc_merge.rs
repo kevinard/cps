@@ -1206,16 +1206,23 @@ fn visit(
                         .take(RECORDS_LIMIT + 1)
                         .read_to_end(&mut bytes)
                         .with_context(|| format!("reading {path}"))?;
-                    ensure!(
-                        bytes.len() as u64 <= RECORDS_LIMIT,
-                        "{path} is larger than 16 MiB, the limit for an account database"
-                    );
-                    let sha256 = digest(&bytes);
-                    let size = bytes.len() as u64;
-                    scan.manifest
-                        .records
-                        .insert(path.clone(), STANDARD.encode(&bytes));
-                    (size, sha256)
+                    if bytes.len() as u64 <= RECORDS_LIMIT {
+                        let sha256 = digest(&bytes);
+                        let size = bytes.len() as u64;
+                        scan.manifest
+                            .records
+                            .insert(path.clone(), STANDARD.encode(&bytes));
+                        (size, sha256)
+                    } else {
+                        // A database above the limit is not kept, so it
+                        // merges as a whole file, like one that does not
+                        // parse as records.
+                        let mut hasher = Sha256::new();
+                        hasher.update(&bytes);
+                        let rest = std::io::copy(&mut file, &mut hasher)
+                            .with_context(|| format!("reading {path}"))?;
+                        (bytes.len() as u64 + rest, hex::encode(hasher.finalize()))
+                    }
                 } else {
                     let mut hasher = Sha256::new();
                     let size = std::io::copy(&mut file, &mut hasher)
@@ -1956,6 +1963,24 @@ mod tests {
         // A root without /etc reads as empty.
         let empty = tempfile::tempdir()?;
         assert!(scan_empty(empty.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn an_account_database_above_the_limit_merges_as_a_whole_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let etc = dir.path().join("etc");
+        fs::create_dir_all(&etc)?;
+        let line = "user:x:1000:1000::/home/user:/bin/sh\n";
+        let text = line.repeat(usize::try_from(RECORDS_LIMIT)? / line.len() + 1);
+        fs::write(etc.join("passwd"), &text)?;
+        let scan = scan(&Root::open(dir.path())?, true)?;
+        assert!(scan.manifest.record("etc/passwd")?.is_none());
+        assert!(matches!(
+            &scan.manifest.entries["etc/passwd"],
+            Entry::File { size, sha256, .. }
+                if *size == text.len() as u64 && *sha256 == digest(text.as_bytes())
+        ));
         Ok(())
     }
 
