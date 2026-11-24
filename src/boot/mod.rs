@@ -34,7 +34,8 @@ pub(crate) use btrfs::{
 };
 pub(crate) use btrfs::{capture_boot_environment, stage_btrfs_boot_environment, sweep_captures};
 pub(crate) use btrfs_boot::{
-    bless_uefi, pending_trial, with_registered_images, with_running_environment,
+    bless_handover, bless_uefi, finalize_handover, handover_trial, pending_trial, prepare_handover,
+    restore_handover, with_registered_images, with_running_environment,
 };
 pub(crate) use btrfs_boot::{preview_btrfs_rollback, rollback_btrfs_boot_environment};
 #[cfg(test)]

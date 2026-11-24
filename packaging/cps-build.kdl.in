@@ -27,6 +27,7 @@ build architecture="@ARCH@" epoch=@EPOCH@ {
     install -Dm644 packaging/systemd/cps-boot-health.service "$DESTDIR/usr/lib/systemd/system/cps-boot-health.service"
     install -Dm644 packaging/systemd/cps-finalize-trial.path "$DESTDIR/usr/lib/systemd/system/cps-finalize-trial.path"
     install -Dm644 packaging/systemd/cps-finalize-trial.service "$DESTDIR/usr/lib/systemd/system/cps-finalize-trial.service"
+    install -Dm644 packaging/systemd/cps-handover-bless.service "$DESTDIR/usr/lib/systemd/system/cps-handover-bless.service"
     install -Dm644 packaging/systemd/cps-uefi-bless.service "$DESTDIR/usr/lib/systemd/system/cps-uefi-bless.service"
     install -Dm644 packaging/systemd/cps-mirror-rank.service "$DESTDIR/usr/lib/systemd/system/cps-mirror-rank.service"
     install -Dm644 packaging/systemd/cps-mirror-rank.timer "$DESTDIR/usr/lib/systemd/system/cps-mirror-rank.timer"

@@ -25,6 +25,55 @@ verify_service() {
 }
 
 version=$($bb cat /etc/cps-capture-version)
+if [ -f /etc/cps-vm-handover ]; then
+    if $bb grep -q cps.handover= /proc/cmdline; then
+        test "$version" = 2.0.0-0
+        test "$($bb cat /proc/sys/kernel/random/boot_id)" != "$($bb cat /volume/@captures/handover-boot-id)"
+        test "$($bb cat /etc/cps-vm-after-staging)" = 'edited after staging'
+        echo 'CPS_VM_HANDOVER: booted the staged root through kexec'
+        echo 'CPS_VM_SYSTEM: /etc edits made after staging reached the trial'
+        if [ "$($bb cat /etc/cps-vm-handover)" = health-fail ]; then
+            attempts=0
+            until systemctl is-failed --quiet cps-boot-health.service; do
+                attempts=$((attempts + 1))
+                test "$attempts" -lt 100
+                $bb sleep 0.1
+            done
+            if cps boot bless; then exit 1; fi
+            : > /volume/@captures/handover-failed
+        else
+            systemctl start cps-vm-handover-workload.service
+            systemctl start cps-handover-bless.service
+            systemctl is-active --quiet cps-boot-health.service
+            cps status --json --plan /volume/@captures/handover-plan.json | $bb grep -F '"phase": "booted_known_good"'
+            : > /volume/@captures/handover-blessed
+        fi
+        $bb sync
+        exec $bb reboot -f
+    fi
+    if [ -f /volume/@captures/handover-failed ]; then
+        test "$version" = 1.0.0-0
+        echo 'CPS_VM_HANDOVER: firmware booted the fallback after failed health'
+        exec $bb poweroff -f
+    fi
+    if [ -f /volume/@captures/handover-blessed ]; then
+        test "$version" = 2.0.0-0
+        systemctl start boot-complete.target
+        echo 'CPS_VM_HANDOVER: healthy trial promoted and selected by firmware'
+        exec $bb poweroff -f
+    fi
+    test "$version" = 1.0.0-0
+    if [ "$($bb cat /etc/cps-vm-handover)" = success ]; then
+        systemctl start cps-vm-handover-workload.service
+        test "$(systemctl show -p NFileDescriptorStore --value cps-vm-handover-workload.service)" = 1
+    fi
+    $bb cp /repository/catalog-base-upgrade /repository/current
+    cps upgrade --stage --yes --save-plan /volume/@captures/handover-plan.json
+    printf 'edited after staging\n' > /etc/cps-vm-after-staging
+    $bb cat /proc/sys/kernel/random/boot_id > /volume/@captures/handover-boot-id
+    $bb sync
+    exec cps boot handover
+fi
 if [ "$version" = 2.0.0-0 ]; then
     if [ -f /etc/cps-btrfs-trial-kernel ]; then
         test "$($bb uname -r)" = "$($bb cat /etc/cps-btrfs-trial-kernel)"

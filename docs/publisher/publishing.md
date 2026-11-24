@@ -132,6 +132,50 @@ The signed catalog digest appears in `repo/current`. For a protected
 repository, set the [publishing policy](#publishing-policy) before the first
 publication. To distribute the catalog, [export and sign a mirror](mirrors.md).
 
+### Build and publish a kernel livepatch
+
+Build a cumulative patch series for one deployed kernel build. Keep that
+release's unstripped `vmlinux`, source, `.config`, toolchain, and build
+settings. Use a clean, configured, in-tree x86-64 build with
+`CONFIG_LIVEPATCH` and `CONFIG_KLP_BUILD`. Install `patchutils` for
+`recountdiff`, build `vmlinux` and `scripts/sign-file`, and use a module
+signing certificate trusted by the deployed kernel. CPS checks the GNU
+build ID of the build tree's `vmlinux` against the release artifact before
+calling Linux's `scripts/livepatch/klp-build`. Reproduce the source and
+configuration as part of preparing that tree. Use a fresh copy of this
+build tree for each run because `klp-build` temporarily applies patches
+and overwrites the kernel build outputs.
+
+```sh
+cps kernel livepatch build \
+    --kernel-tree /build/linux --vmlinux /releases/linux/vmlinux \
+    --module canopa_livepatch_2026_01 \
+    --signing-key /secure/kernel-signing.pem \
+    --signing-cert /secure/kernel-signing.x509 \
+    --publisher canopa --package livepatch/server-2026-01 --version 1.0-0 \
+    --output prepared-livepatch fixes/*.patch
+
+cps publish manifests --repo repo --proto prepared-livepatch/proto \
+    --key private.der prepared-livepatch/manifest.kdl
+```
+
+List patches in application order. Each new cumulative series includes
+fixes from previous livepatches for the same kernel build and has a new
+module name. The build command signs the uncompressed module with SHA-256
+and places it under `usr/lib/livepatch/<kernel-build-id>/`. During
+publication, CPS records the signed module’s digest in the package
+manifest. Keep the signing key outside both the source tree and the
+published package. Once the module is signed, preserve its bytes through
+packaging and distribution.
+
+Use the usual [signed mirror](mirrors.md) to deliver the catalog and
+payloads. For a [protected repository](#publishing-policy), use the signed
+module as a digest-pinned input to an approved recipe, copy it verbatim
+into the prototype tree, and publish the attested bundle with `cps publish
+bundle` or `cps publish release`. CPS repository signing and Linux module
+signing use separate keys. See [Apply a livepatch](../client/system.md#apply-a-livepatch)
+for the client commands.
+
 ### Publish many packages in one catalog
 
 A catalog is a signed root that commits to up to 256 content-addressed

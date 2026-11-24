@@ -266,6 +266,65 @@ filesystem has room for the new payloads, and by default it prunes old
 boot environments under the `boot-btrfs` retention policy. See
 [Retention and pruning](../setups/btrfs.md#retention-and-pruning).
 
+### Switch to a staged kernel with handover
+
+On an x86-64 server configured for Linux Kexec Handover (KHO) and the
+Live Update Orchestrator (LUO), use the ordinary staged upgrade, then
+request handover during the maintenance window.
+
+```sh
+sudo cps upgrade --stage --yes
+sudo cps boot handover
+```
+
+Use the default system configuration at `/etc/cps/image.kdl`. The running
+and target kernel need compatible KHO and LUO support and the
+`kho=on liveupdate=on` boot options. Both roots need systemd 261 or newer
+and CPS with the staged handover support. The running systemd must finish
+shutdown itself. CPS rejects an active exitrd shutdown hook. The staged
+entry needs an initramfs. CPS can use a split entry or its single-profile
+UKI. For a UKI, any kernel signature enforced by `kexec_file_load` must
+cover the inner kernel as well. Keep enough KHO scratch memory to load the
+kernel and initramfs.
+
+CPS tests that the kernel can load the registered artifacts, then selects
+the known-good fallback for the next firmware boot. systemd stops services
+normally. The shutdown finalizer merges `/etc` and loads only the checked
+staged kernel and initramfs. If the merge or the load fails, the fallback
+remains selected. After kexec, `cps-handover-bless.service` promotes the
+staged root only if the image and systemd boot-health checks pass. On
+failed health, a firmware reboot returns to the known-good fallback.
+
+Userspace restarts. A cooperating service can save supported state such as
+a memfd to systemd's file descriptor store with `FileDescriptorStoreMax=`
+and `FileDescriptorStorePreserve=yes` and recover it on startup. This
+workflow interrupts ordinary workloads and drops established TCP
+connections. For a fix distributed as a livepatch, you can keep running
+workloads in place.
+
+### Apply a livepatch
+
+Get a livepatch package for the GNU build ID shown by `cps kernel
+livepatch status`. Install it from a trusted CPS publisher, then activate
+it on the running kernel.
+
+```sh
+cps kernel livepatch status
+sudo cps install --yes livepatch/server-2026-01
+sudo cps kernel livepatch apply-package livepatch/server-2026-01
+cps kernel livepatch status
+```
+
+CPS reads the target build ID and module digest from the installed package
+manifest and checks the on-disk module. Linux must trust the publisher's
+module signing certificate and enforce signatures with
+`CONFIG_MODULE_SIG_FORCE=y` or `module.sig_enforce=1`. Install and
+activation are separate operations. After a reboot, apply the patch
+again if the running build still needs it. Use `sudo cps kernel livepatch
+disable MODULE` to reverse an active patch and wait for the transition
+before removing the module. If an operation times out, check status for
+an ongoing kernel transition before retrying.
+
 ### Local changes before the reboot
 
 The trial starts as a snapshot of the running root, so it does not see

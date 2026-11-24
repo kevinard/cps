@@ -75,6 +75,7 @@ formatted output.
 | Export, sign, sync, or refresh a mirror by hand | [repo](man/cps-repo.1) (`repo export`, `repo sign-export`, `repo refresh-metadata`, `repo sync`) | [Serve a mirror](../publisher/mirrors.md) · [Mirror clients](../client/mirrors.md) |
 | Choose and rank the mirrors a client uses | [publisher](man/cps-publisher.1) (`publisher mirror list`, `publisher mirror rank`) | [Mirror lists](../client/publishers.md#mirror-lists) |
 | Create, name, inspect, or switch boot environments | [boot](man/cps-boot.1) | [Boot operations](../setups/boot-operations.md) |
+| Experiment with livepatches or kernel handover | [kernel](man/cps-kernel.1) | [Kernel livepatch and handover](../developer/boot-tests.md#kernel-livepatch-and-handover) |
 
 ## Configuration and data formats
 

@@ -13,6 +13,7 @@ mod generate;
 mod git_install;
 mod image;
 mod kdl_format;
+mod kernel;
 mod model;
 mod orchestrate;
 mod plan;

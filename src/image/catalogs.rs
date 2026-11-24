@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, Transaction};
 
-use super::{Image, ProfileIntent, Publisher, Publishers, Settings, State};
+use super::{Image, Installed, ProfileIntent, Publisher, Publishers, Settings, State};
 use crate::repo::{
     CATALOG_LIMIT, Catalog, CatalogCheckpoint, ReleaseProfile, archived_catalog_hash,
     catalog_bytes, read_catalog, take_profile,
@@ -85,6 +85,26 @@ fn profile(catalog: &mut Catalog, hash: &str, name: &str, state: &State) -> Resu
 }
 
 impl super::Image {
+    /// Authenticate one committed package against its archived signed catalog.
+    pub(crate) fn require_catalog_admission(
+        &self,
+        name: &str,
+        installed: &Installed,
+    ) -> Result<()> {
+        let publishers = self.publishers()?;
+        installed.verify(name, &publishers)?;
+        let publisher = publishers
+            .get(&installed.published.manifest.publisher)
+            .context("missing installed publisher")?;
+        let settings = self.settings()?;
+        let checkpoint = settings
+            .catalog_checkpoints
+            .get(&publisher.name)
+            .context("missing installed publisher's catalog checkpoint")?;
+        read_checkpoint(&self.db, publisher, checkpoint)?.check_installed(&installed.published)?;
+        Ok(())
+    }
+
     /// The signed release profile archived with the image's applied catalog, offline.
     pub(crate) fn archived_profile(&self, state: &State) -> Result<Option<ReleaseProfile>> {
         read_profile(&self.db, state)
