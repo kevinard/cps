@@ -15,6 +15,7 @@ configurations. See the [CI workflow](../../.github/workflows/ci.yml).
 - [Offline disk images](#offline-disk-images)
 - [systemd-boot scenarios](#systemd-boot-scenarios)
   - [Signed fixtures and release profiles](#signed-fixtures-and-release-profiles)
+- [Kernel livepatch and handover](#kernel-livepatch-and-handover)
 - [Btrfs snapshot and boot tests](#btrfs-snapshot-and-boot-tests)
 - [File modes and capabilities in a guest](#file-modes-and-capabilities-in-a-guest)
 - [Rebuild the VM fixtures after packaging changes](#rebuild-the-vm-fixtures-after-packaging-changes)
@@ -163,6 +164,90 @@ The fixture variables select the signed packages: `CPS_VM_CPS_FIXTURE`,
 [Build signed packages for tests](build-fixtures.md). `CPS_VM_CPS_VERSION`
 and `CPS_VM_BUSYBOX_VERSION` override the expected package versions when a
 fixture was built with another revision.
+
+## Kernel livepatch and handover
+
+[`tests/kernel-live-vm.sh`](../../tests/kernel-live-vm.sh) boots two x86-64
+Linux builds in one disposable QEMU VM with no disks or network interfaces.
+The first boot applies and disables the upstream livepatch sample while a
+process repeatedly reads `/proc/cmdline`. The test checks the process and
+boot ID across both transitions and exercises build ID, hash, and signature
+rejection.
+It then starts the second kernel through Kexec Handover. The receiver gets
+the workload's memfd from Linux's Live Update Orchestrator (LUO) and resumes
+its counter. The test compares a runtime-generated nonce in the memfd and
+requires both the kernel release and boot ID to change.
+
+Both kernels need `CONFIG_KEXEC_FILE`, `CONFIG_KEXEC_HANDOVER`,
+`CONFIG_LIVEUPDATE`, and `CONFIG_LIVEUPDATE_MEMFD`. They also need built-in
+devtmpfs, procfs, sysfs, gzip initramfs, and a serial console. Use two builds
+with compatible KHO and LUO ABIs and different releases. Linux 7.3.5 can
+provide both builds with different `CONFIG_LOCALVERSION` values. Enable
+`CONFIG_LIVEPATCH`, `CONFIG_MODULES`, `CONFIG_MODULE_SIG_FORCE`, and
+`CONFIG_FILE_LOCKING` in the source kernel. The x86-64 Livepatch dependencies include dynamic ftrace and
+`CONFIG_KALLSYMS_ALL`. Build
+`samples/livepatch/livepatch-sample.c` from that source as `livepatch-sample.ko`
+and sign it with a key trusted by the source kernel. For a kernel built
+with `CONFIG_MODULE_SIG_SHA256` and its generated signing key, use
+`scripts/sign-file sha256 certs/signing_key.pem certs/signing_key.x509`
+followed by the path to the uncompressed module. All three build paths are
+relative to the kernel's build directory.
+
+```sh
+CPS_VM_KERNEL=/path/to/source/bzImage \
+CPS_VM_KERNEL_BUILD_ID=$(readelf -n /path/to/source/vmlinux | awk '/Build ID:/ {print $3; exit}') \
+CPS_VM_HANDOVER_KERNEL=/path/to/target/bzImage \
+CPS_VM_LIVEPATCH_MODULE=/path/to/livepatch-sample.ko \
+tests/kernel-live-vm.sh
+```
+
+The test needs a built CPS binary, `cpio`, `gzip`, and a C compiler with
+static libc. It uses `CPS_VM_BUSYBOX` and `CPS_VM_TIMEOUT` from the VM settings.
+
+Set `CPS_VM_LIVEPATCH_REPO`, `CPS_VM_LIVEPATCH_TRUST_ROOT`, and
+`CPS_VM_LIVEPATCH_PACKAGE=cps://PUBLISHER/PACKAGE` to exercise the package
+path. The test installs from the signed repository inside the VM, rejects
+a modified installed module, and then enables the exact published bytes.
+The package should contain the module passed as `CPS_VM_LIVEPATCH_MODULE`.
+
+`cps kernel livepatch status --json` shows the release, build ID, and
+kernel-reported patch state. `cps kernel livepatch apply MODULE --sha256
+DIGEST --kernel-build-id ID` takes the digest and target kernel build ID
+from a trusted source and requires the kernel to enforce module signatures.
+`cps kernel livepatch disable NAME` waits for the kernel
+to finish reverting the patch. After that, the patch module can be removed
+with `rmmod`. A timed-out apply or disable may still be transitioning. Check
+status before retrying. Patch activation applies to the running boot and
+has no automatic reapplication. See [Build and publish a kernel livepatch](../publisher/publishing.md#build-and-publish-a-kernel-livepatch)
+for the packaged path.
+
+`cps kernel handover start` runs as PID 1 in a RAM-backed initramfs. The
+caller quiesces its workload and passes one inherited, populated memfd. The
+kernel and initramfs are explicitly selected and pinned by digest. The
+target initramfs uses `cps kernel handover receive --session NAME -- /path/to/program`.
+CPS consumes the named session and execs the receiver with `CPS_HANDOVER_FD`
+holding the descriptor number. Use a receiver that is ready to exec upon
+retrieval. A receiver failure after the session is consumed loses access to
+that state. This handover restarts userspace and validates only the state
+explicitly carried in the memfd. It skips the CPS bootloader trial path and
+provides no firmware fallback or application availability guarantee.
+
+
+### Staged handover through systemd
+
+With the native Btrfs fixture, set `CPS_VM_BTRFS_BOOT=1`,
+`CPS_VM_SYSTEM_COMMANDS=1`, and `CPS_VM_STAGED_HANDOVER=success` or
+`CPS_VM_STAGED_HANDOVER=health-fail`. The fixture boots a KHO- and
+LUO-capable kernel, stages an upgrade, and runs `cps boot handover`. The
+success variant checks that kexec changes the boot ID, a cooperating
+systemd service recovers its memfd, `/etc` edits reach the trial, and the
+next firmware boot selects the promoted root. The success variant also
+needs a C compiler with static libc and `systemd-notify`. The failure
+variant rejects the trial's health and checks that firmware boots the
+fallback. Use a kernel with built-in Btrfs and virtio block support and
+systemd 261 or newer. The test can reuse the same kernel binary on both
+sides of the switch.
+
 
 ## Btrfs snapshot and boot tests
 

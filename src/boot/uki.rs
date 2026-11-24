@@ -134,43 +134,7 @@ pub(super) fn verify_contents(
     cmdline: &str,
     components: Option<(&str, &str)>,
 ) -> Result<()> {
-    let (linux, initrd) = {
-        let cache = ReadCache::new(&mut *file);
-        let image = object::File::parse(&cache).context("reading UKI PE headers")?;
-        ensure!(
-            matches!(image, object::File::Pe32(_) | object::File::Pe64(_)),
-            "expected a PE executable for the UKI"
-        );
-        ensure!(
-            image.section_by_name(".profile").is_none(),
-            "CPS UKIs require a single boot profile"
-        );
-        let section = |name| -> Result<(u64, u64)> {
-            let mut sections = image
-                .sections()
-                .filter(|section| section.name().ok() == Some(name));
-            let range = sections
-                .next()
-                .and_then(|section| section.file_range())
-                .with_context(|| format!("missing UKI section {name}"))?;
-            ensure!(
-                range.1 > 0 && sections.next().is_none(),
-                "invalid UKI section {name}"
-            );
-            Ok(range)
-        };
-        let (offset, size) = section(".cmdline")?;
-        ensure!(size <= 64 * 1024, "UKI command line exceeds 64 KiB");
-        let embedded = (&cache)
-            .read_bytes_at(offset, size)
-            .map_err(|()| anyhow::anyhow!("truncated UKI command line"))?;
-        let embedded = std::str::from_utf8(embedded)?.trim_end_matches('\0');
-        ensure!(
-            embedded == cmdline,
-            "UKI command line differs from the boot entry"
-        );
-        (section(".linux")?, section(".initrd")?)
-    };
+    let [linux, initrd] = component_ranges(file, cmdline, false)?;
     if let Some((kernel, ramdisk)) = components {
         for ((offset, size), expected) in [(linux, kernel), (initrd, ramdisk)] {
             file.seek(SeekFrom::Start(offset))?;
@@ -182,6 +146,68 @@ pub(super) fn verify_contents(
         }
     }
     Ok(())
+}
+
+/// Recover the inner kernel and initramfs from an already digest-checked UKI.
+pub(super) fn handover_payloads(file: &mut File, cmdline: &str) -> Result<(File, File)> {
+    let [linux, initrd] = component_ranges(file, cmdline, true)?;
+    let mut extract = |(offset, size), label| {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut input = (&mut *file).take(size);
+        let payload = crate::kernel::sealed_payload(&mut input, label)?;
+        ensure!(input.limit() == 0, "truncated {label}");
+        Ok(payload)
+    };
+    Ok((
+        extract(linux, "UKI kernel")?,
+        extract(initrd, "UKI initramfs")?,
+    ))
+}
+
+fn component_ranges(file: &mut File, cmdline: &str, for_handover: bool) -> Result<[(u64, u64); 2]> {
+    let cache = ReadCache::new(&mut *file);
+    let image = object::File::parse(&cache).context("reading UKI PE headers")?;
+    ensure!(
+        matches!(image, object::File::Pe32(_) | object::File::Pe64(_)),
+        "expected a PE executable for the UKI"
+    );
+    ensure!(
+        image.section_by_name(".profile").is_none(),
+        "CPS UKIs require a single boot profile"
+    );
+    if for_handover {
+        for name in [".ucode", ".dtb", ".dtbauto"] {
+            ensure!(
+                image.section_by_name(name).is_none(),
+                "staged handover cannot load a separate UKI {name} section"
+            );
+        }
+    }
+    let section = |name| -> Result<(u64, u64)> {
+        let mut sections = image
+            .sections()
+            .filter(|section| section.name().ok() == Some(name));
+        let range = sections
+            .next()
+            .and_then(|section| section.file_range())
+            .with_context(|| format!("missing UKI section {name}"))?;
+        ensure!(
+            range.1 > 0 && sections.next().is_none(),
+            "invalid UKI section {name}"
+        );
+        Ok(range)
+    };
+    let (offset, size) = section(".cmdline")?;
+    ensure!(size <= 64 * 1024, "UKI command line exceeds 64 KiB");
+    let embedded = (&cache)
+        .read_bytes_at(offset, size)
+        .map_err(|()| anyhow::anyhow!("truncated UKI command line"))?;
+    let embedded = std::str::from_utf8(embedded)?.trim_end_matches('\0');
+    ensure!(
+        embedded == cmdline,
+        "UKI command line differs from the boot entry"
+    );
+    Ok([section(".linux")?, section(".initrd")?])
 }
 
 #[cfg(test)]

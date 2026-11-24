@@ -17,6 +17,7 @@ nothing matches.
 | `config list` | `pending` vendor copies and `saved` local versions |
 | `publisher list` | An array of publishers: `name`, `repository` |
 | `boot list` | An array of boot environments. `invalid` holds the reason an entry file cannot be read, and is `null` otherwise |
+| `kernel livepatch status` | The running kernel's `release`, `build_id` when available, `supported` flag, and `patches` with their `enabled` and `transition` flags |
 | `image diff` | Both images' metadata and their package and path changes |
 | `upgrade --check` | The update report, with `status` and the package changes |
 | `recipe order` | An array of recipes, each with its packages and the recipes it follows |

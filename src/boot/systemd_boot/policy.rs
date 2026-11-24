@@ -653,7 +653,7 @@ pub(in crate::boot) fn field<'a>(entry: &'a str, prefix: &str) -> Result<Option<
     Ok(value)
 }
 
-fn boot_field<'a>(entry: &'a str, key: &str) -> Result<Option<&'a str>> {
+pub(super) fn boot_field<'a>(entry: &'a str, key: &str) -> Result<Option<&'a str>> {
     let mut values = entry.lines().filter_map(|line| {
         let (name, value) = line.trim_ascii_start().split_once([' ', '\t'])?;
         (name == key).then(|| value.trim_ascii())

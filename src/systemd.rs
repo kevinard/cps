@@ -1007,6 +1007,54 @@ fn live_systemctl() -> Command {
     command
 }
 
+pub(crate) fn require_luo_systemd() -> Result<()> {
+    let output = live_systemctl()
+        .args(["show", "--property=Version", "--value"])
+        .output()
+        .context("checking the running systemd version")?;
+    let version = std::str::from_utf8(&output.stdout)?.trim();
+    let major = version
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse::<u32>().ok());
+    ensure!(
+        output.status.success() && major.is_some_and(|n| n >= 261),
+        "staged kernel handover requires systemd 261 or newer"
+    );
+    Ok(())
+}
+
+pub(crate) fn arm_staged_handover() -> Result<()> {
+    require_luo_systemd()?;
+    let unit = "cps-finalize-trial.service";
+    run_live_job(
+        live_systemctl().args(["start", unit]),
+        "starting the staged shutdown finalizer",
+    )?;
+    let active = live_systemctl()
+        .args(["is-active", "--quiet", unit])
+        .status()?;
+    ensure!(
+        active.success(),
+        "the staged shutdown finalizer is inactive"
+    );
+    Ok(())
+}
+
+pub(crate) fn request_staged_handover() -> Result<()> {
+    // The kexec verb can autodetect and load a different boot entry. The
+    // checked CPS target is loaded by the shutdown finalizer instead.
+    run_live_job(
+        live_systemctl().args([
+            "--no-block",
+            "--job-mode=replace-irreversibly",
+            "start",
+            "kexec.target",
+        ]),
+        "requesting the systemd kexec shutdown",
+    )
+}
+
 pub(crate) fn require_boot_health() -> Result<()> {
     for unit in ["cps-boot-health.service", "boot-complete.target"] {
         let status = live_systemctl()

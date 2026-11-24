@@ -491,6 +491,11 @@ enum Command {
         #[command(subcommand)]
         command: BootCommand,
     },
+    /// Experiment with running kernel patches and state handover
+    Kernel {
+        #[command(subcommand)]
+        command: crate::kernel::KernelCommand,
+    },
     /// Prepare pinned package sources for offline builds
     Source {
         #[command(subcommand)]
@@ -964,8 +969,14 @@ enum BootCommand {
         /// during an earlier boot
         #[arg(long)]
         arm: bool,
+        /// Run as cps-finalize-trial.service at shutdown, which also
+        /// finalizes a requested kernel handover
+        #[arg(long, hide = true, conflicts_with = "arm")]
+        shutdown: bool,
     },
-    /// Verify and promote the running direct UEFI trial in the firmware boot order
+    /// Shut down and switch kernels into the pending staged trial
+    Handover,
+    /// Verify and promote the running UEFI or kernel handover trial
     Bless {
         #[arg(long, default_value = system::CONFIG)]
         config: PathBuf,
@@ -3579,6 +3590,7 @@ fn run(command: Command) -> Result<Exit> {
         Command::Publisher { command } => return run_publisher(command),
         Command::Image { command } => return run_image(command),
         Command::Boot { command } => return run_boot(command),
+        Command::Kernel { command } => command.run()?,
         Command::Source { command } => run_source(command)?,
         Command::Recipe { command } => return run_recipe(command),
         Command::Manifest { command } => return run_manifest(command),
@@ -4341,9 +4353,14 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
             }
             println!("Activated {id}");
         }
+        BootCommand::Handover => {
+            let system = System::load(Path::new(system::CONFIG))?;
+            let held = system.lock()?;
+            system.handover(&held)?;
+        }
         BootCommand::Bless { config } => {
-            if let Some(id) = System::load(&config)?.bless_uefi()? {
-                println!("Promoted {id} in UEFI BootOrder");
+            if let Some(id) = System::load(&config)?.bless()? {
+                println!("Promoted {id} as the default boot environment");
             }
         }
         BootCommand::Prune {
@@ -4374,16 +4391,27 @@ fn run_boot(command: BootCommand) -> Result<Exit> {
             }
             return Ok(print_boot_prune(&discard.prune, false, false));
         }
-        BootCommand::FinalizeTrial { config, arm } => {
+        BootCommand::FinalizeTrial {
+            config,
+            arm,
+            shutdown,
+        } => {
             let system = System::load(&config)?;
-            let held = system.lock()?;
             if arm {
+                let _held = system.lock()?;
                 match system.arm_finalize()? {
                     Some(id) => println!("The /etc merge into {id} runs at shutdown"),
                     None => println!("No trial is selected for the next boot"),
                 }
                 return Ok(Exit::Ok);
             }
+            // Only the shutdown unit finalizes a requested handover: it loads
+            // the kexec target, which must happen once, after services stop.
+            let held = if shutdown {
+                system.lock_for_finalize()?
+            } else {
+                system.lock()?
+            };
             match system.finalize_trial(&held)? {
                 system::Finalized::NoTrial => {
                     println!("No trial is selected for the next boot")
@@ -5243,7 +5271,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
         "Transactions and recovery",
         &["status", "history", "resume", "abort", "fetch", "apply"],
     ),
-    ("Images and boot environments", &["image", "boot"]),
+    ("Images and boot environments", &["image", "boot", "kernel"]),
     (
         "Build packages",
         &["source", "recipe", "manifest", "build", "develop", "debug"],

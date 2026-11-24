@@ -336,6 +336,74 @@ impl Firmware {
     }
 
     pub(super) fn bless(&self, esp: &Path, entry: &BootEntry, parent: &BootEntry) -> Result<()> {
+        self.bless_verified(esp, entry, parent, false)
+    }
+
+    pub(super) fn disarm_handover(&self, entry: &BootEntry) -> Result<()> {
+        let number = self
+            .option(&entry.id)?
+            .context("missing UEFI trial boot option")?;
+        self.check_option(number, &entry.id)?;
+        ensure!(
+            self.can_arm(entry)?
+                && self.next == Some(number)
+                && boot_number("BootNext")? == self.next,
+            "BootNext no longer selects the staged UEFI trial"
+        );
+        ensure!(
+            boot_order()? == self.order,
+            "BootOrder changed during handover preparation"
+        );
+        // Leave the trial record available for promotion after health checks.
+        fs::remove_file(variable_path("BootNext")).context("disarming BootNext for staged handover")
+    }
+
+    /// Select a trial that [`Self::disarm_handover`] disarmed for the next
+    /// boot again.
+    pub(super) fn rearm_handover(&self, entry: &BootEntry) -> Result<()> {
+        let number = self
+            .option(&entry.id)?
+            .context("missing UEFI trial boot option")?;
+        self.check_option(number, &entry.id)?;
+        ensure!(
+            self.can_arm(entry)? && !self.order.contains(&number),
+            "the staged UEFI trial can no longer be selected"
+        );
+        ensure!(
+            self.next.is_none()
+                && boot_number("BootNext")?.is_none()
+                && boot_order()? == self.order,
+            "the firmware boot selection changed during the handover request"
+        );
+        self.enable(number)?;
+        write_variable("BootNext", &number.to_le_bytes(), true)
+    }
+
+    /// The mounted root and kexec command line identify the trial after handover.
+    pub(super) fn bless_handover(
+        &self,
+        esp: &Path,
+        entry: &BootEntry,
+        parent: &BootEntry,
+    ) -> Result<()> {
+        ensure!(
+            is_trial(entry) || is_verified(entry),
+            "expected a staged UEFI handover trial"
+        );
+        ensure!(
+            self.armed_boot(Some(entry))? != self.boot_id,
+            "the UEFI handover has not crossed a kernel boot"
+        );
+        self.bless_verified(esp, entry, parent, true)
+    }
+
+    fn bless_verified(
+        &self,
+        esp: &Path,
+        entry: &BootEntry,
+        parent: &BootEntry,
+        handover: bool,
+    ) -> Result<()> {
         let number = self
             .option(&entry.id)?
             .context("missing UEFI trial boot option")?;
@@ -345,7 +413,7 @@ impl Firmware {
         self.check_option(number, &entry.id)?;
         self.check_option(fallback, &parent.id)?;
         ensure!(
-            self.current == Some(number) && parent.tries.is_none(),
+            (handover || self.current == Some(number)) && parent.tries.is_none(),
             "expected a running UEFI trial and a known-good fallback"
         );
         ensure!(
@@ -446,7 +514,7 @@ impl Firmware {
     }
 }
 
-fn rename_record(dir: &Path, from: &Path, to: &Path) -> Result<()> {
+pub(super) fn rename_record(dir: &Path, from: &Path, to: &Path) -> Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)?;
     // On VFAT the renamed record's size is durable only with its inode.
@@ -463,7 +531,7 @@ fn is_trial(entry: &BootEntry) -> bool {
         .is_some_and(|n| n.ends_with("+1.conf"))
 }
 
-fn is_verified(entry: &BootEntry) -> bool {
+pub(super) fn is_verified(entry: &BootEntry) -> bool {
     entry
         .path
         .file_name()
@@ -1018,6 +1086,39 @@ mod tests {
             Some(TRIAL)
         );
         firmware.bless(fake.esp.path(), &trial, &base)?;
+        assert_eq!(boot_order()?, [2, 1, 42]);
+        assert_eq!(
+            fake.records()?,
+            [format!("{BASE}.conf"), format!("{TRIAL}.conf")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handover_leaves_the_firmware_fallback_selected_until_blessed() -> Result<()> {
+        let fake = FakeFirmware::new()?;
+        let base = fake.record(BASE, "")?;
+        let trial = fake.record(TRIAL, "+1")?;
+        let options = [(1, BASE), (2, TRIAL)];
+        let source = fake.firmware(&[1, 42], Some(2), Some(1), &options, FIRST_BOOT)?;
+        source.disarm_handover(&trial)?;
+        assert_eq!(boot_number("BootNext")?, None);
+        assert_eq!(boot_order()?, [1, 42]);
+        assert!(trial.path.exists());
+
+        // A failed shutdown request selects the trial again during this boot.
+        let disarmed = fake.firmware(&[1, 42], None, Some(1), &options, FIRST_BOOT)?;
+        disarmed.rearm_handover(&trial)?;
+        assert_eq!(boot_number("BootNext")?, Some(2));
+        assert_eq!(boot_order()?, [1, 42]);
+        let rearmed = fake.firmware(&[1, 42], Some(2), Some(1), &options, FIRST_BOOT)?;
+        assert!(rearmed.rearm_handover(&trial).is_err());
+        rearmed.disarm_handover(&trial)?;
+
+        // kexec leaves BootCurrent identifying the fallback's firmware boot.
+        let target = fake.firmware(&[1, 42], None, Some(1), &options, SECOND_BOOT)?;
+        assert!(target.bless(fake.esp.path(), &trial, &base).is_err());
+        target.bless_handover(fake.esp.path(), &trial, &base)?;
         assert_eq!(boot_order()?, [2, 1, 42]);
         assert_eq!(
             fake.records()?,

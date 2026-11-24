@@ -46,8 +46,11 @@
 .B \&finalize\-trial
 \&Merge the running /etc into the trial selected for the next boot. cps\-finalize\-trial.service runs this at shutdown
 .TP
+.B \&handover
+\&Shut down and switch kernels into the pending staged trial
+.TP
 .B \&bless
-\&Verify and promote the running direct UEFI trial in the firmware boot order
+\&Verify and promote the running UEFI or kernel handover trial
 .TP
 .B \&help
 \&Print this message or the help of the given subcommand(s)
@@ -356,8 +359,17 @@
 .TP
 .B \&\-h, \-\-help
 \&Print help
+.SS "\&cps boot handover"
+\&Shut down and switch kernels into the pending staged trial
+.PP
+.B \&cps boot handover
+.PP
+.B Options
+.TP
+.B \&\-h, \-\-help
+\&Print help
 .SS "\&cps boot bless"
-\&Verify and promote the running direct UEFI trial in the firmware boot order
+\&Verify and promote the running UEFI or kernel handover trial
 .PP
 .B \&cps boot bless [OPTIONS]
 .PP

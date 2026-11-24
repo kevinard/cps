@@ -1,4 +1,5 @@
 mod destroy;
+pub(super) mod handover;
 pub(super) mod loader;
 mod manage;
 pub(super) mod policy;
@@ -1277,10 +1278,9 @@ fn validate_options(options: &str) -> Result<()> {
         "invalid boot options"
     );
     ensure!(
-        !options
-            .split_ascii_whitespace()
-            .any(|arg| arg.contains('"') || arg.split('=').next() == Some("root")),
-        "boot options must be unquoted tokens and CPS supplies root="
+        !options.split_ascii_whitespace().any(|arg| arg.contains('"')
+            || matches!(arg.split('=').next(), Some("root" | "cps.handover"))),
+        "boot options must be unquoted tokens; CPS supplies root= and reserves cps.handover="
     );
     Ok(())
 }

@@ -565,6 +565,31 @@ pub(crate) fn pending_trial(
     systemd_boot::pending_trial(&BtrfsVolume::open(volume)?, esp, partuuid)
 }
 
+pub(crate) fn prepare_handover(esp: &Path, volume: &Path) -> Result<String> {
+    systemd_boot::handover::prepare(esp, &BtrfsVolume::open(volume)?)
+}
+
+pub(crate) fn restore_handover(esp: &Path, id: &str) -> Result<()> {
+    systemd_boot::handover::restore(esp, id)
+}
+
+pub(crate) fn finalize_handover<T>(
+    esp: &Path,
+    volume: &Path,
+    id: &str,
+    merge: impl FnOnce(Root) -> Result<T>,
+) -> Result<T> {
+    systemd_boot::handover::finalize(esp, &BtrfsVolume::open(volume)?, id, merge)
+}
+
+pub(crate) fn bless_handover(esp: &Path, volume: &Path, id: &str) -> Result<Option<String>> {
+    systemd_boot::handover::bless(esp, &BtrfsVolume::open(volume)?, id)
+}
+
+pub(crate) fn handover_trial(cmdline: &str) -> Result<Option<&str>> {
+    systemd_boot::handover::running_trial(cmdline)
+}
+
 fn filesystem_info(root: &Root) -> Result<FsInfo> {
     ensure!(
         fstatfs(root.as_file())?.f_type == libc::BTRFS_SUPER_MAGIC,

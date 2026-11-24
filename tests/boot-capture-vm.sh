@@ -19,6 +19,16 @@ discard_failed=${CPS_VM_BTRFS_DISCARD_FAILED:-0}
 staged_transactions=${CPS_VM_STAGED_TRANSACTIONS:-0}
 system_commands=${CPS_VM_SYSTEM_COMMANDS:-0}
 git_installs=${CPS_VM_GIT_INSTALLS:-0}
+handover=${CPS_VM_STAGED_HANDOVER:-off}
+case $handover in
+    off) vm_memory=768 ;;
+    success|health-fail)
+        [[ $system_commands == 1 ]] || { echo 'CPS_VM_STAGED_HANDOVER requires CPS_VM_SYSTEM_COMMANDS=1' >&2; exit 2; }
+        command -v cpio >/dev/null
+        vm_memory=2048
+        ;;
+    *) echo 'CPS_VM_STAGED_HANDOVER must be off, success, or health-fail' >&2; exit 2 ;;
+esac
 if [[ $git_installs == 1 && $system_commands != 1 ]]; then
     echo 'CPS_VM_GIT_INSTALLS requires CPS_VM_SYSTEM_COMMANDS=1' >&2
     exit 2
@@ -193,13 +203,49 @@ if [[ $native_boot == 1 ]]; then
         # The guest mounts the ESP and the volume before systemd starts.
         printf '[Unit]\nRequiresMountsFor=/efi /volume\n' > \
             "$root/etc/systemd/system/cps-finalize-trial.service.d/mounts.conf"
+        handover_options= handover_initrd=
+        if [[ $handover != off ]]; then
+            for unit in kexec.target systemd-kexec.service; do
+                cp -L "$systemd/system/$unit" "$root/usr/lib/systemd/system/"
+            done
+            cp "$project/packaging/systemd/cps-handover-bless.service" "$root/usr/lib/systemd/system/"
+            ln -s ../cps-handover-bless.service "$root/usr/lib/systemd/system/multi-user.target.wants/"
+            printf '%s\n' "$handover" > "$root/etc/cps-vm-handover"
+            mkdir -p "$root/boot"
+            (cd "$root/etc" && printf 'cps-vm-handover\n' | cpio --quiet -o -H newc) > "$root/boot/handover-initrd"
+            handover_options=' kho=on liveupdate=on kho_scratch=128M,256M,128M'
+            handover_initrd=' initrd="boot/handover-initrd"'
+            if [[ $handover == success ]]; then
+                notify=$(command -v systemd-notify)
+                cp -L "$notify" "$root/usr/bin/systemd-notify"
+                copy_runtime_deps "$root" "$notify"
+                cc -O2 -Wall -Wextra -Werror -static "$project/tests/support/kernel-handover.c" \
+                    -o "$root/usr/local/libexec/cps-handover-workload"
+                cat > "$root/usr/lib/systemd/system/cps-vm-handover-workload.service" <<'UNIT'
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+FileDescriptorStoreMax=1
+FileDescriptorStorePreserve=yes
+ExecStart=/usr/local/libexec/cps-handover-workload fdstore /usr/bin/systemd-notify
+StandardOutput=tty
+TTYPath=/dev/console
+UNIT
+            else
+                mkdir -p "$root/etc/systemd/system/cps-boot-health.service.d"
+                cat > "$root/etc/systemd/system/cps-boot-health.service.d/handover.conf" <<'UNIT'
+[Service]
+ExecStart=/bin/sh -c '! /bin/busybox grep -q cps.handover= /proc/cmdline'
+UNIT
+            fi
+        fi
         cat > "$root/etc/cps/image.kdl" <<CONFIG
 schema-version 1 kind="image-config"
 publisher "test" {
     repository "/repository"
     trust-root "test.trust.json"
 }
-boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid" options="rw console=ttyS0 loglevel=3 init=/init-systemd"
+boot-btrfs volume="/volume" environments="/volume/@captures" esp="/efi" root-partuuid="$root_uuid"$handover_initrd options="rw console=ttyS0 loglevel=3 init=/init-systemd$handover_options"
 CONFIG
         if [[ $git_installs == 1 ]]; then
             for tool in git bwrap; do
@@ -599,8 +645,14 @@ echo 'CPS_VM_CAPTURE: immutable live snapshot staged without changing the runnin
 if [ -f /etc/cps-btrfs-boot ]; then
     boot_options='console=ttyS0 loglevel=3 init=/init-systemd'
     if [ -x /usr/local/libexec/cps-system-workflow ]; then boot_options="rw $boot_options"; fi
+    if [ -f /etc/cps-vm-handover ]; then
+        set -- --initrd boot/handover-initrd
+        boot_options="$boot_options kho=on liveupdate=on kho_scratch=128M,256M,128M"
+    else
+        set --
+    fi
     base=$(cps boot activate --known-good --root /volume/@ --btrfs-volume /volume \
-        --esp /efi --root-partuuid "$root_uuid" --options "$boot_options")
+        --esp /efi --root-partuuid "$root_uuid" --options "$boot_options" "$@")
     base=${base#Activated }
     echo "$base" > /captures/base-id
     if [ -x /usr/local/libexec/cps-system-workflow ]; then
@@ -727,7 +779,7 @@ run() {
     local log=$1 root_image=$2 arguments=$3
     shift 3
     timeout "${CPS_VM_TIMEOUT:-180}" "$qemu" "${data_args[@]}" \
-        -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
+        -machine "q35,accel=${CPS_VM_QEMU_ACCEL:-tcg}" -m "$vm_memory" -smp 2 -nic none -display none -monitor none \
         -serial "file:$log" -kernel "$kernel" -append "$arguments console=ttyS0 loglevel=3" \
         -drive "if=virtio,format=raw,file=$root_image" "$@" || { cat "$log"; return 1; }
     tr -d '\r' < "$log" > "$log.clean"
@@ -745,7 +797,7 @@ if [[ $native_boot == 1 ]]; then
     uefi_timeout=180
     if [[ $destroy == 1 ]]; then uefi_timeout=300; fi
     timeout "${CPS_VM_TIMEOUT:-$uefi_timeout}" "$qemu" "${data_args[@]}" \
-        -machine q35,accel=tcg -m 768 -smp 2 -nic none -display none -monitor none \
+        -machine "q35,accel=${CPS_VM_QEMU_ACCEL:-tcg}" -m "$vm_memory" -smp 2 -nic none -display none -monitor none \
         -serial file:uefi.log \
         -drive "if=pflash,format=raw,readonly=on,file=${CPS_VM_OVMF_CODE:?Set CPS_VM_OVMF_CODE}" \
         -drive if=pflash,format=raw,file=vars.fd -drive if=virtio,format=raw,file=disk.raw || { cat uefi.log; exit 1; }
@@ -779,6 +831,21 @@ if [[ $native_boot == 1 ]]; then
     elif [[ $git_installs == 1 ]]; then
         grep -Fx 'CPS_VM_GIT: tracked package advanced and pinned package stayed at its commit' uefi.log.clean
         grep -Fx 'CPS_VM_GIT: rollback restored the tracked commit and payload' uefi.log.clean
+    elif [[ $handover == health-fail ]]; then
+        grep -Fx 'CPS_VM_HANDOVER: booted the staged root through kexec' uefi.log.clean
+        grep -Fx 'CPS_VM_HANDOVER: firmware booted the fallback after failed health' uefi.log.clean
+    elif [[ $handover == success ]]; then
+        grep -Fx 'CPS_VM_HANDOVER: booted the staged root through kexec' uefi.log.clean
+        grep -Fx 'CPS_VM_SYSTEM: /etc edits made after staging reached the trial' uefi.log.clean
+        grep -Fx 'CPS_VM_HANDOVER: healthy trial promoted and selected by firmware' uefi.log.clean
+        awk '
+            /^CPS_VM_HANDOVER: before / { nonce = $3; boot = $5; count = $6; before++ }
+            /^CPS_VM_HANDOVER: after / {
+                after++
+                if (NF == 6 && $3 == nonce && $5 != boot && $6 == count + 1) verified++
+            }
+            END { exit !(before == 1 && after == 1 && verified == 1) }
+        ' uefi.log.clean
     elif [[ $system_commands == 1 ]]; then
         grep -Fx 'CPS_VM_SYSTEM: a live install saved a backup environment' uefi.log.clean
         grep -Fx 'CPS_VM_SYSTEM: verified staged and live repair of a damaged running image' uefi.log.clean

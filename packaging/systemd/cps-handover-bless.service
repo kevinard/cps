@@ -1,0 +1,15 @@
+[Unit]
+Description=Promote a healthy CPS kernel handover trial
+DefaultDependencies=no
+ConditionKernelCommandLine=cps.handover
+After=multi-user.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl start boot-complete.target
+ExecStart=/usr/bin/cps boot bless
+
+[Install]
+WantedBy=multi-user.target

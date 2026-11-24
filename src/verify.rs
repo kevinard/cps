@@ -192,7 +192,17 @@ pub(crate) fn verify_image_quick(image: &Image) -> Result<Vec<Finding>> {
 
 /// Fail on the first error of a quick verification of an opened image.
 pub(crate) fn require_quick(image: &Image) -> Result<()> {
-    for finding in verify_image_quick(image)? {
+    require_verified(verify_image_quick(image)?)
+}
+
+/// Check staged files while the running system still owns the final /etc merge.
+pub(crate) fn require_staged_quick(image: &Image) -> Result<()> {
+    image.require_clean()?;
+    require_verified(check_image(image, false, true)?)
+}
+
+fn require_verified(findings: Vec<Finding>) -> Result<()> {
+    for finding in findings {
         ensure!(
             !finding.is_error,
             "image verification failed: {}",

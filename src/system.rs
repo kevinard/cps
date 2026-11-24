@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File},
+    io::Write,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
@@ -52,6 +53,7 @@ pub(crate) const CONFIG: &str = "/etc/cps/image.kdl";
 /// Starts `cps-finalize-trial.service`, whose stop merges /etc into the
 /// pending trial at shutdown. It lives in /run, so it lasts for one boot.
 pub(crate) const FINALIZE_FLAG: &str = "/run/cps/finalize-trial";
+const HANDOVER_REQUEST: &str = "/run/cps/staged-handover";
 const ROOT: &str = "/";
 const GIT_TOOLCHAIN: &str = "/usr/share/cps/git-build/toolchain.kdl";
 
@@ -315,6 +317,15 @@ impl System {
     /// Take the boot environments lock, waiting for another CPS command
     /// that holds it.
     pub(crate) fn lock(&self) -> Result<EnvironmentsLock> {
+        let held = self.lock_for_finalize()?;
+        ensure!(
+            !Path::new(HANDOVER_REQUEST).try_exists()?,
+            "a staged kernel handover is in progress"
+        );
+        Ok(held)
+    }
+
+    pub(crate) fn lock_for_finalize(&self) -> Result<EnvironmentsLock> {
         let boot = self.boot();
         let volume = fs::canonicalize(&boot.volume)?;
         let environments = fs::canonicalize(&boot.environments)?;
@@ -871,15 +882,62 @@ impl System {
         unreachable!()
     }
 
+    /// Request an orderly shutdown into the pending staged environment.
+    pub(crate) fn handover(&self, _held: &EnvironmentsLock) -> Result<()> {
+        ensure!(
+            rustix::process::geteuid().is_root(),
+            "staged kernel handover requires root"
+        );
+        crate::kernel::handover::check_staged_support()?;
+        fs::create_dir_all("/run/cps")?;
+        fs::write(FINALIZE_FLAG, b"")?;
+        crate::systemd::arm_staged_handover()?;
+        let boot = self.boot();
+        let mut request = tempfile::NamedTempFile::new_in("/run/cps")?;
+        let id = crate::boot::prepare_handover(&boot.esp, &boot.volume)?;
+        let requested = (|| {
+            writeln!(request, "{id}")?;
+            request
+                .persist_noclobber(HANDOVER_REQUEST)
+                .context("recording the staged handover after disarming its firmware trial")?;
+            if let Err(error) = crate::systemd::request_staged_handover() {
+                fs::remove_file(HANDOVER_REQUEST)
+                    .context("clearing the staged handover request")?;
+                return Err(error);
+            }
+            anyhow::Ok(())
+        })();
+        if let Err(error) = requested {
+            // Preparing disarmed the trial's firmware selection. Select it
+            // again, so a retry or an ordinary reboot still finds it.
+            return Err(match crate::boot::restore_handover(&boot.esp, &id) {
+                Ok(()) => error.context(format!(
+                    "the handover request failed; trial {id} stays selected for the next boot"
+                )),
+                Err(restore) => error.context(format!(
+                    "the handover request failed, and selecting trial {id} again also failed \
+                     ({restore:#}). The next boot starts the fallback; stage the change again"
+                )),
+            });
+        }
+        println!("Requested kernel handover to {id}");
+        Ok(())
+    }
+
     /// Merge the running /etc into the trial selected for the next boot.
     ///
     /// A failed merge leaves the trial's /etc as staged and cancels the
     /// trial, so the next boot keeps every local change.
     pub(crate) fn finalize_trial(&self, _held: &EnvironmentsLock) -> Result<Finalized> {
-        let boot = self.boot();
         if let Err(error) = etc_merge::remove_leftovers(&Root::open(Path::new(ROOT))?) {
             eprintln!("Warning: could not remove /etc merge leftovers: {error:#}");
         }
+        match fs::read_to_string(HANDOVER_REQUEST) {
+            Ok(id) => return self.finalize_handover(id.trim()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("reading the staged handover request"),
+        }
+        let boot = self.boot();
         let Some(trial) = pending_trial(
             &boot.volume,
             &boot.esp,
@@ -914,6 +972,26 @@ impl System {
                 })
             }
         }
+    }
+
+    fn finalize_handover(&self, id: &str) -> Result<Finalized> {
+        let boot = self.boot();
+        let report = crate::boot::finalize_handover(&boot.esp, &boot.volume, id, |root| {
+            let image = Image::open_exclusive_root(root)?;
+            etc_merge::finalize(&image, &Root::open(Path::new(ROOT))?)
+        })
+        .context(
+            "finalizing the staged kernel handover; the next firmware boot starts the fallback",
+        )?;
+        Ok(match report {
+            Some(report) => Finalized::Merged {
+                trial: id.to_owned(),
+                report,
+            },
+            None => Finalized::NoBase {
+                trial: id.to_owned(),
+            },
+        })
     }
 
     /// Start the shutdown merge for a trial pending from an earlier boot.
@@ -1043,11 +1121,17 @@ impl System {
         ))
     }
 
-    /// Promote the running one-shot firmware trial after verifying its health.
-    pub(crate) fn bless_uefi(&self) -> Result<Option<String>> {
+    /// Promote a running firmware or handover trial after verifying its health.
+    pub(crate) fn bless(&self) -> Result<Option<String>> {
         let boot = self.boot();
-        ensure!(boot.uefi, "configure uefi=#true in boot-btrfs");
-        let blessed = crate::boot::bless_uefi(&boot.esp, &boot.volume)?;
+        let cmdline = fs::read_to_string("/proc/cmdline")?;
+        let blessed = if let Some(id) = crate::boot::handover_trial(&cmdline)? {
+            let _held = self.lock()?;
+            crate::boot::bless_handover(&boot.esp, &boot.volume, id)?
+        } else {
+            ensure!(boot.uefi, "configure uefi=#true in boot-btrfs");
+            crate::boot::bless_uefi(&boot.esp, &boot.volume)?
+        };
         if blessed.is_some() && boot.auto_prune {
             // The promoted trial is the new default, so older roots can retire.
             match self.lock() {
