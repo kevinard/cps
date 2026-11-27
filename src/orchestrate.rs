@@ -244,6 +244,7 @@ fn read_recipe(path: &Path, warnings: &mut Vec<String>) -> Result<Recipe> {
     let doc = parse_document(path, RECIPE_LIMIT)?;
     let build = doc.get("build").context("missing build node")?;
     let mut toolchain = Vec::new();
+    let mut has_toolchain = false;
     let mut manifests = Vec::new();
     for node in children(build) {
         match node.name().value() {
@@ -251,6 +252,11 @@ fn read_recipe(path: &Path, warnings: &mut Vec<String>) -> Result<Recipe> {
                 for package in children(node).filter(|node| node.name().value() == "package") {
                     let selector = argument(package).context("toolchain package needs a name")?;
                     let spec = PackageSpec::parse(selector)?;
+                    // A bootstrap request takes an earlier build, so it orders nothing.
+                    if package.get("bootstrap").and_then(KdlValue::as_bool) == Some(true) {
+                        has_toolchain = true;
+                        continue;
+                    }
                     toolchain.push((spec.publisher.map(str::to_owned), spec.name.to_owned()));
                 }
             }
@@ -263,7 +269,7 @@ fn read_recipe(path: &Path, warnings: &mut Vec<String>) -> Result<Recipe> {
             ),
         }
     }
-    if toolchain.is_empty() {
+    if toolchain.is_empty() && !has_toolchain {
         warnings.push(format!(
             "{}: the toolchain is a template placeholder, so build-time needs are unknown",
             path.display()
@@ -1141,6 +1147,27 @@ mod tests {
         assert!(error.contains("build dependency cycle"), "{error}");
         assert!(error.contains("toolchain needs compiler"), "{error}");
         assert!(error.contains("compiler requires libc"), "{error}");
+
+        // A bootstrap request takes an earlier build of the compiler, so it
+        // orders nothing and breaks the cycle.
+        let libc = path.join("libc.build.kdl.in");
+        let text = fs::read_to_string(&libc)?;
+        fs::write(
+            &libc,
+            text.replace(
+                "package \"compiler\"",
+                "package \"compiler\" bootstrap=#true",
+            ),
+        )?;
+        let order = build_order(&[path.to_owned()])?;
+        let names: Vec<_> = order
+            .recipes
+            .iter()
+            .map(|queued| queued.packages.join(","))
+            .collect();
+        assert_eq!(names, ["libc", "compiler", "app"]);
+        assert!(order.recipes[0].after.is_empty());
+        assert!(order.warnings.is_empty(), "{:?}", order.warnings);
         Ok(())
     }
 

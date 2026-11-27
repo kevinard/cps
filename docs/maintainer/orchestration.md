@@ -55,7 +55,8 @@ A recipe follows another recipe when:
 
 - its toolchain block requests a package that the other recipe produces.
   A selector with a publisher, such as `cps://seed/build/cc@1.0.0-0`,
-  matches only a manifest from that publisher;
+  matches only a manifest from that publisher, and a
+  [bootstrap request](builds.md#bootstrap-requests) matches no recipe;
 - one of its packages has a `require` or `require-any` entry naming a
   package that the other recipe produces; or
 - one of its packages has a `require-capability` for a capability that a
@@ -84,8 +85,10 @@ cps: build dependency cycle:
   packaging/glibc.build.kdl follows packaging/gcc.build.kdl: toolchain needs devel/gcc
 ```
 
-Break a toolchain cycle by bootstrapping one side from an existing catalog,
-the way the seed toolchain does.
+Break a toolchain cycle by marking one side's request `bootstrap=#true`.
+That recipe then builds against an earlier build of the package from a
+pinned catalog, or without it when no catalog offers one yet. See
+[bootstrap requests](builds.md#bootstrap-requests).
 
 ## Plan rebuilds after a change
 

@@ -96,6 +96,7 @@ fn attach_evidence(
         recipe.as_bytes(),
         Toolchain {
             publishers: recipe_model.toolchain.clone(),
+            absent_bootstrap_packages: Default::default(),
             package_manifests: BTreeMap::from([(
                 "desktop/compositor".to_owned(),
                 PinnedPackage {
@@ -219,6 +220,7 @@ publisher "tools" {{ repository {:?}; trust-root {:?}; }}
             recipe.as_bytes(),
             Toolchain {
                 publishers: sources.iter().map(|(pin, _)| pin.clone()).collect(),
+                absent_bootstrap_packages: Default::default(),
                 package_manifests,
             },
             &BTreeMap::new(),
@@ -2690,6 +2692,7 @@ package "runtime/libcc" publisher="canopa" {
         recipe.as_bytes(),
         Toolchain {
             publishers: parsed.toolchain.clone(),
+            absent_bootstrap_packages: Default::default(),
             package_manifests: BTreeMap::from([(
                 "build/tool".into(),
                 PinnedPackage {
@@ -2853,6 +2856,7 @@ package "test/rebuild" publisher="canopa" version="1.0.0-0" {
         recipe.as_bytes(),
         Toolchain {
             publishers: build::parse(&recipe)?.toolchain,
+            absent_bootstrap_packages: Default::default(),
             package_manifests: BTreeMap::from([(
                 "build/tool".into(),
                 PinnedPackage {
@@ -7443,5 +7447,163 @@ fn a_publication_that_changes_no_installed_package_is_nothing_to_do() -> Result<
     )?;
     let update = plan(&f.root, Request::Update)?;
     assert!(!update.changes_image(), "{}", update.summary());
+    Ok(())
+}
+
+#[test]
+fn absent_bootstrap_requests_are_left_out_of_the_toolchain() -> Result<()> {
+    let f = Fixture::new()?;
+    f.package(
+        "build/shell",
+        "1.0.0-0",
+        f.file("usr/bin/sh", "shell", "0755", "")?,
+    )?;
+    let work = f._dir.path();
+    let key_hash = digest(&read_trust_root(&f.trust)?);
+    let recipe = work.join("build.kdl");
+    let write_recipe = |request: &str| -> Result<()> {
+        let pin = fs::read_to_string(f.repo.join("current"))?;
+        fs::write(
+            &recipe,
+            format!(
+                "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n\
+             toolchain solver=\"sat-v2\" {{\n\
+             publisher \"canopa\" catalog-sha256={:?} key-sha256={key_hash:?}\n\
+             package \"build/shell\"\n {request}\n }}\n\
+             manifest \"manifest.kdl\" sha256={:?}\n script \"exit 1\"\n}}\n",
+                pin.trim(),
+                digest(b"reviewed manifest"),
+            ),
+        )?;
+        Ok(())
+    };
+    let config = work.join("toolchain.kdl");
+    fs::write(
+        &config,
+        format!(
+            "schema-version 1 kind=\"toolchain-config\"\npublisher \"canopa\" {{ repository {:?}; trust-root {:?}; }}\n",
+            f.repo, f.trust,
+        ),
+    )?;
+    // No pinned catalog offers library/earlier: an ordinary request fails,
+    // and a bootstrap request is left out.
+    write_recipe("package \"library/earlier\"")?;
+    let error = fetch_toolchain(&recipe, &config).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("library/earlier"),
+        "{error:#}"
+    );
+    write_recipe("package \"library/earlier\" bootstrap=#true")?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 1);
+
+    // Once a pinned catalog offers it, the bootstrap request resolves.
+    f.package(
+        "library/earlier",
+        "1.0.0-0",
+        f.file("usr/lib/libearlier.so.1", "earlier", "0755", "")?,
+    )?;
+    write_recipe("package \"library/earlier\" bootstrap=#true")?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 2);
+
+    // An obsoleted build is not offered, so the request is left out again.
+    let base = fs::read_to_string(f.repo.join("current"))?;
+    let release = work.join("obsolete.kdl");
+    fs::write(
+        &release,
+        format!(
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base-sha256={:?} {{\n    obsolete \"cps://canopa/library/earlier@1.0.0-1\"\n}}\n",
+            base.trim()
+        ),
+    )?;
+    publish_release(&f.repo, &f.private, &release)?;
+    write_recipe("package \"library/earlier\" bootstrap=#true")?;
+    assert_eq!(fetch_toolchain(&recipe, &config)?, 1);
+    Ok(())
+}
+
+#[test]
+fn verified_toolchains_reject_a_false_absent_bootstrap_claim() -> Result<()> {
+    let f = Fixture::new()?;
+    let tools = Fixture::new()?;
+    let builder = Fixture::new()?;
+    tools.package_as("tools", "build/compiler", "1.0.0-0", String::new())?;
+    tools.package_as("tools", "build/earlier", "1.0.0-0", String::new())?;
+    let key = read_trust_root(&tools.trust)?;
+    let release = snapshot(&tools.repo, "tools", &key, None)?;
+    let pinned = |name: &str| {
+        let published = release
+            .packages
+            .iter()
+            .find(|pkg| pkg.manifest.name == name)
+            .unwrap();
+        PinnedPackage {
+            publisher: "tools".into(),
+            version: published.manifest.version.clone(),
+            sha256: published.sha256.clone(),
+        }
+    };
+    let work = f._dir.path();
+    fs::write(
+        work.join("toolchain.kdl"),
+        format!(
+            "schema-version 1 kind=\"toolchain-config\"\npublisher \"tools\" {{ repository {:?}; trust-root {:?}; }}\n",
+            tools.repo, tools.trust
+        ),
+    )?;
+    let manifest =
+        b"schema-version 1 kind=\"package-manifest\"\npackage \"test/compiled\" publisher=\"canopa\" version=\"1.0.0-0\"\n";
+    let bundle = work.join("bundle");
+    fs::create_dir_all(bundle.join("proto"))?;
+    crate::build::write_explicit_outputs(&bundle, &[("manifest.kdl", manifest)])?;
+    let recipe = format!(
+        "schema-version 1 kind=\"build-recipe\"\nbuild architecture=\"x86_64\" epoch=1700000000 {{\n    toolchain solver=\"sat-v2\" {{\n        publisher \"tools\" catalog-sha256={:?} key-sha256={:?}\n        package \"build/compiler\"\n        package \"build/earlier\" bootstrap=#true\n        package \"build/missing\" bootstrap=#true\n    }}\n    manifest \"manifest.kdl\" sha256={:?}\n    script \"true\"\n}}\n",
+        release.sha256,
+        digest(&key),
+        digest(manifest),
+    );
+    let reviewed = digest(recipe.as_bytes());
+    fs::write(bundle.join("build.kdl"), &recipe)?;
+    fs::create_dir_all(&f.repo)?;
+    fs::write(
+        f.repo.join("publish-policy.kdl"),
+        format!(
+            "schema-version 1 kind=\"publish-policy\"\npublisher \"canopa\" verify-toolchains=#true {{\n    builder-key {:?}\n    approve \"test/compiled\" version=\"1.0.0-0\" sha256=\"{reviewed}\" toolchain-config=\"../toolchain.kdl\"\n}}\n",
+            builder.public
+        ),
+    )?;
+    let sign = |resolved: &[&str], absent: &[&str]| -> Result<()> {
+        let envelope = attestation::sign(
+            &crate::repo::SigningKey::open(&builder.private)?,
+            &[parse_manifest(std::str::from_utf8(manifest)?)?],
+            &build::parse(&recipe)?,
+            recipe.as_bytes(),
+            Toolchain {
+                publishers: build::parse(&recipe)?.toolchain,
+                package_manifests: resolved
+                    .iter()
+                    .map(|name| ((*name).to_owned(), pinned(name)))
+                    .collect(),
+                absent_bootstrap_packages: absent.iter().map(|name| (*name).to_owned()).collect(),
+            },
+            &BTreeMap::new(),
+            &crate::image::root::Root::open(&bundle.join("proto"))?,
+        )?;
+        fs::write(bundle.join("attestation.json"), envelope)?;
+        Ok(())
+    };
+    let publish = || publish_bundle(&f.repo, &bundle, &f.private, &builder.public, &reviewed);
+    // The pinned catalog offers build/earlier, so a builder cannot claim it was absent.
+    sign(&["build/compiler"], &["build/earlier", "build/missing"])?;
+    let error = publish().unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("attested toolchain differs from the independently resolved toolchain"),
+        "{error:#}"
+    );
+    // Nor can it leave out a request that no catalog offers without saying so.
+    sign(&["build/compiler", "build/earlier"], &[])?;
+    assert!(publish().is_err());
+    sign(&["build/compiler", "build/earlier"], &["build/missing"])?;
+    publish()?;
     Ok(())
 }

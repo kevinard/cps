@@ -82,8 +82,10 @@ version when specified, using the configured publisher order and installed
 packages' sticky publishers. It verifies the archived recipe, templates, and
 their binding to the admitted build attestation, including configured builder
 trust policies, then installs the union of the recipes' `toolchain` package
-requests and their dependencies. Selecting any output of a multi-package build
-uses the same recipe. Missing or invalid build evidence stops the transaction.
+requests and their dependencies. A [bootstrap request](../maintainer/builds.md#bootstrap-requests)
+that no configured catalog offers is left out, as the build leaves it out.
+Selecting any output of a multi-package build uses the same recipe. Missing
+or invalid build evidence stops the transaction.
 
 These are normal installations into the running system or the selected image:
 the client's current catalogs, signed release profile, freezes, facets, and

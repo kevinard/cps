@@ -572,6 +572,8 @@ struct ResolvedToolchain {
     repositories: Vec<ToolchainRepository>,
     installed: BTreeMap<String, Installed>,
     paths: BTreeMap<String, Managed>,
+    /// Bootstrap requests that no pinned catalog offered.
+    absent: BTreeSet<String>,
 }
 
 fn resolve_toolchain(
@@ -579,7 +581,7 @@ fn resolve_toolchain(
     recipe: &BuildRecipe,
 ) -> Result<ResolvedToolchain> {
     let repositories = toolchain_repositories(&recipe.toolchain, location)?;
-    let requested = recipe.requested()?;
+    let mut requested = recipe.requested()?;
     let mut sources: BTreeMap<_, _> = requested
         .values()
         .filter_map(|spec| {
@@ -607,6 +609,16 @@ fn resolve_toolchain(
             );
         }
     }
+    // A bootstrap request that no pinned catalog offers is left out, and the
+    // attestation records that it was absent.
+    let mut absent = BTreeSet::new();
+    requested.retain(|name, _| {
+        if candidates.offers(name) || !recipe.is_bootstrap(name) {
+            return true;
+        }
+        absent.insert((*name).to_owned());
+        false
+    });
     let (installed, paths) = resolve_packages(
         &BTreeMap::new(),
         Candidates {
@@ -648,6 +660,7 @@ fn resolve_toolchain(
         repositories,
         installed,
         paths,
+        absent,
     })
 }
 
@@ -814,6 +827,7 @@ impl ResolvedToolchain {
                     )
                 })
                 .collect(),
+            absent_bootstrap_packages: self.absent,
         }
     }
 }
