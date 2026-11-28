@@ -117,6 +117,9 @@ pub(crate) struct BuildRecipe {
     pub epoch: u32,
     pub toolchain: Vec<PublisherPin>,
     pub packages: BTreeSet<String>,
+    /// The toolchain selectors marked `bootstrap=#true`: requests for an
+    /// earlier build that order no recipe and may be absent.
+    pub bootstrap: BTreeSet<String>,
     pub version: Option<RecipeVersion>,
     pub manifests: Vec<TemplatePin>,
     pub discard: Vec<String>,
@@ -295,6 +298,11 @@ impl BuildRecipe {
             let spec = PackageSpec::parse(selector)?;
             if let Some(name) = spec.publisher {
                 ensure!(
+                    !self.bootstrap.contains(selector),
+                    "bootstrap request {selector} names a publisher, \
+                     but a bootstrap request resolves by publisher order"
+                );
+                ensure!(
                     self.toolchain.iter().any(|pin| pin.name == name),
                     "requested toolchain publisher {name} is not pinned"
                 );
@@ -306,6 +314,13 @@ impl BuildRecipe {
             );
         }
         Ok(requested)
+    }
+
+    /// Whether the toolchain request for package `name` is a bootstrap request.
+    pub(crate) fn is_bootstrap(&self, name: &str) -> bool {
+        self.bootstrap
+            .iter()
+            .any(|selector| PackageSpec::parse(selector).is_ok_and(|spec| spec.name == name))
     }
 
     pub(crate) fn source_digests(&self) -> BTreeMap<String, FileDigest> {
@@ -477,6 +492,7 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         "unsupported toolchain solver, expected sat-v2"
     );
     let mut packages = BTreeSet::new();
+    let mut bootstrap_requests = BTreeSet::new();
     let mut pins = Vec::new();
     let mut publishers = BTreeSet::new();
     for node in toolchain
@@ -486,11 +502,21 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
     {
         match node.name().value() {
             "package" => {
-                let name = Fields::read(node, 1, &[], false)?.string_arg(0)?;
+                let fields = Fields::read(node, 1, &["bootstrap"], false)?;
+                let name = fields.string_arg(0)?;
+                let bootstrap = fields
+                    .properties
+                    .get("bootstrap")
+                    .map(|value| value.as_bool().context("bootstrap must be #true or #false"))
+                    .transpose()?
+                    .unwrap_or(false);
                 ensure!(
                     packages.insert(name.clone()),
                     "duplicate toolchain package {name}"
                 );
+                if bootstrap {
+                    bootstrap_requests.insert(name);
+                }
             }
             "publisher" => {
                 let fields = Fields::read(node, 1, &["catalog-sha256", "key-sha256"], false)?;
@@ -653,6 +679,7 @@ pub(crate) fn parse(text: &str) -> Result<BuildRecipe> {
         epoch,
         toolchain: pins,
         packages,
+        bootstrap: bootstrap_requests,
         version,
         manifests,
         discard,
@@ -817,6 +844,45 @@ build architecture="x86_64" epoch=1700000000 {{
             ),
         ] {
             assert!(parse(&recipe(&invalid)).is_err(), "{invalid}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_requests_are_unqualified_flags() -> Result<()> {
+        let recipe = |packages: &str| {
+            format!(
+                r#"schema-version 1 kind="build-recipe"
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain solver="sat-v2" {{
+        publisher "seed" catalog-sha256="{digest}" key-sha256="{digest}"
+        package "devel/base"
+        {packages}
+    }}
+    manifest "hello.kdl" sha256="{digest}"
+    script "true"
+}}
+"#,
+                digest = "0".repeat(64),
+            )
+        };
+        let parsed = parse(&recipe(
+            "package \"library/earlier\" bootstrap=#true\npackage \"library/plain\" bootstrap=#false",
+        ))?;
+        assert_eq!(
+            parsed.bootstrap,
+            BTreeSet::from(["library/earlier".to_owned()])
+        );
+        assert!(parsed.is_bootstrap("library/earlier"));
+        assert!(!parsed.is_bootstrap("library/plain"));
+        assert!(!parsed.is_bootstrap("devel/base"));
+        assert_eq!(parsed.requested()?.len(), 3);
+        for invalid in [
+            "package \"cps://seed/library/earlier\" bootstrap=#true",
+            "package \"library/earlier\" bootstrap=\"yes\"",
+            "package \"library/earlier\" ordered=#false",
+        ] {
+            assert!(parse(&recipe(invalid)).is_err(), "{invalid}");
         }
         Ok(())
     }

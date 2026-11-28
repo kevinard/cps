@@ -118,6 +118,17 @@ impl<P> Default for CandidateSet<P> {
 }
 
 impl<P: PackageInfo> CandidateSet<P> {
+    /// Whether a candidate offers package `name` above its obsoletion cutoff.
+    pub(crate) fn offers(&self, name: &str) -> bool {
+        self.packages.iter().any(|package| {
+            package.name() == name
+                && self
+                    .obsoletions
+                    .get(name)
+                    .is_none_or(|cutoff| package.version().semantic() > cutoff.semantic())
+        })
+    }
+
     pub(crate) fn replay(&self, profile: &ReleaseProfile) -> Result<BTreeMap<String, Installed>> {
         let mut installed = BTreeMap::new();
         for package in &self.packages {
@@ -337,7 +348,18 @@ pub(super) fn build_dependencies(
             recipe.arch,
             state.settings.arch
         );
-        dependencies.extend(recipe.packages);
+        // Like the build, leave out a bootstrap request that no configured
+        // catalog offers.
+        for selector in recipe.packages {
+            if recipe.bootstrap.contains(&selector)
+                && !catalogs
+                    .candidates
+                    .offers(PackageSpec::parse(&selector)?.name)
+            {
+                continue;
+            }
+            dependencies.insert(selector);
+        }
     }
     Ok(dependencies.into_iter().collect())
 }

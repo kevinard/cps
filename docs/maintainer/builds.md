@@ -24,6 +24,7 @@ synchronized cache that holds the signed toolchain catalog.
 - [Setting build options](#setting-build-options)
 - [Debugging a recipe in its build environment](#debugging-a-recipe-in-its-build-environment)
 - [Building with several publishers](#building-with-several-publishers)
+- [Bootstrap requests](#bootstrap-requests)
 - [Preparing a source cache](#preparing-a-source-cache)
 - [Preparing a snapshot from Git](#preparing-a-snapshot-from-git)
 - [Building and publishing with signed evidence](#building-and-publishing-with-signed-evidence)
@@ -82,7 +83,7 @@ node. `architecture` names the target, and `epoch` sets
 
 | Node | Meaning |
 | --- | --- |
-| `toolchain solver="sat-v2"` | Required, once. At least one `publisher NAME catalog-sha256=... key-sha256=...` pin and at least one `package` request. |
+| `toolchain solver="sat-v2"` | Required, once. At least one `publisher NAME catalog-sha256=... key-sha256=...` pin and at least one `package` request. A request marked `bootstrap=#true` is a [bootstrap request](#bootstrap-requests). |
 | `manifest PATH sha256=...` | A package template. One or more, up to 64; each produces one package. |
 | `version VERSION upstream-version=...` | The version of every produced package. Optional; without it, each template declares its own `version`. |
 | `source PATH sha256=... size=...` | A pinned input, staged under `$CPS_SOURCES`. Add `url` children to [fetch it](#preparing-a-source-cache). |
@@ -520,6 +521,44 @@ new toolchain catalog is published,
 [`cps recipe repin --toolchain-catalog`](orchestration.md#refresh-recipe-pins)
 moves recipes to it.
 
+## Bootstrap requests
+
+Some packages need each other to build. A C library needs a compiler, and
+the compiler links that C library. A login library links the service
+manager's client library, and the service manager links the login library.
+Such a cycle is broken by building one side against an *earlier build* of
+the other, and a bootstrap request says so:
+
+```kdl
+toolchain solver="sat-v2" {
+    publisher "canopa" catalog-sha256="<catalog SHA-256>" key-sha256="<trust root SHA-256>"
+    package "devel/base"
+    package "library/systemd" bootstrap=#true
+}
+```
+
+A bootstrap request differs from an ordinary request in two ways:
+
+- [`cps recipe order`](orchestration.md#order-recipe-builds) does not
+  order the recipe after the producer of the package, so the two recipes
+  can need each other.
+- When no pinned catalog offers the package, the request is left out and
+  the build runs without it. The recipe must then build either way, for
+  example through a Meson `auto` feature or configure-time detection. An
+  ordinary request for a package that no catalog offers fails the build.
+
+Otherwise it resolves like any unqualified request, from the first pinned
+publisher that offers the name, with its dependencies. It cannot name a
+publisher: which earlier build it gets is decided by the pinned publishers
+and their order, so the same recipe can take a bootstrap stage's package in
+one build and the distribution's own earlier package in another. The
+[build evidence](#building-and-publishing-with-signed-evidence) lists the
+bootstrap requests that were left out. Verifying an attestation checks that
+only bootstrap requests are absent. A publisher with
+[`verify-toolchains=#true`](../publisher/publishing.md#publishing-policy) also resolves the
+toolchain again from the pinned catalogs and rejects an attestation whose
+absent requests differ, as it does for any other selection.
+
 ## Preparing a source cache
 
 Give a pinned `source` entry one or more `url` children to fetch it:
@@ -643,6 +682,7 @@ match. The predicate type is
 `urn:canopa:cps:published-build-provenance:v1`. One statement covers every
 package of the build. It lists their IDs and binds the recipe and source
 digests, pinned publisher catalogs and keys, resolved toolchain manifests,
+any [bootstrap requests](#bootstrap-requests) that no catalog offered,
 every payload's hash and length, and each package's exact published KDL
 manifest, including its generated library dependencies, as the subject
 `manifest/NAME`. One statement per build makes the build the unit of trust:

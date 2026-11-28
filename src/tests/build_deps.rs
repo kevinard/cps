@@ -62,6 +62,8 @@ fn publish(
     let mut publishers = BTreeSet::new();
     let mut packages = BTreeMap::new();
     for dependency in dependencies {
+        // A leading ~ marks a bootstrap request.
+        let dependency = dependency.strip_prefix('~').unwrap_or(dependency);
         let spec = PackageSpec::parse(dependency)?;
         let publisher = spec.publisher.unwrap_or("canopa");
         publishers.insert(publisher);
@@ -86,7 +88,10 @@ fn publish(
         .collect::<String>();
     let requests = dependencies
         .iter()
-        .map(|dependency| format!("        package {dependency:?}\n"))
+        .map(|dependency| match dependency.strip_prefix('~') {
+            Some(dependency) => format!("        package {dependency:?} bootstrap=#true\n"),
+            None => format!("        package {dependency:?}\n"),
+        })
         .collect::<String>();
     let mut manifest_nodes = String::new();
     let mut approvals = String::new();
@@ -144,6 +149,7 @@ fn publish(
         recipe.as_bytes(),
         Toolchain {
             publishers: parsed.toolchain.clone(),
+            absent_bootstrap_packages: Default::default(),
             package_manifests: packages,
         },
         &artifacts,
@@ -611,5 +617,56 @@ fn build_dependency_installs_reject_wrong_architectures_and_unconfigured_publish
         assert!(format!("{error:#}").contains(expected), "{error:#}");
     }
     assert!(installed(&fixture.root)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn build_dependencies_leave_out_bootstrap_requests_without_an_active_build() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let builder = Fixture::new()?;
+    package(
+        &fixture,
+        &builder,
+        "devel/compiler",
+        "1.0.0-0",
+        String::new(),
+    )?;
+    package(
+        &fixture,
+        &builder,
+        "library/earlier",
+        "1.0.0-0",
+        String::new(),
+    )?;
+    archive(
+        &fixture,
+        &builder,
+        &[("apps/tool", "1.0.0-0")],
+        &["devel/compiler", "~library/earlier"],
+        "x86_64",
+    )?;
+    fixture.create()?;
+    let planned = plan(&fixture.root, request(&["apps/tool"]))?;
+    assert!(planned.summary().contains("library/earlier"));
+
+    // Obsoleting the package withdraws its only build, so a build would leave
+    // the request out, and so does --build-deps.
+    let base = fs::read_to_string(fixture.repo.join("current"))?;
+    let release = fixture._dir.path().join("obsolete.kdl");
+    fs::write(
+        &release,
+        format!(
+            "schema-version 1 kind=\"publish-release\"\nrelease \"canopa\" base-sha256={:?} {{\n    obsolete \"cps://canopa/library/earlier@1.0.0-1\"\n}}\n",
+            base.trim()
+        ),
+    )?;
+    crate::publish_release(&fixture.repo, &fixture.private, &release)?;
+    let planned = plan(&fixture.root, request(&["apps/tool"]))?;
+    assert!(!planned.summary().contains("library/earlier"));
+    apply(&fixture.root, &planned)?;
+    assert_eq!(
+        installed(&fixture.root)?,
+        BTreeSet::from(["devel/compiler".into()])
+    );
     Ok(())
 }

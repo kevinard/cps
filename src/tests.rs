@@ -1567,6 +1567,7 @@ build architecture="x86_64" epoch=1700000000 {{
     let recipe_model = build::parse(&recipe)?;
     let toolchain = Toolchain {
         publishers: recipe_model.toolchain.clone(),
+        absent_bootstrap_packages: Default::default(),
         package_manifests: BTreeMap::from([(
             "build/shell".into(),
             PinnedPackage {

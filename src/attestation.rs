@@ -226,6 +226,10 @@ struct Predicate {
 pub(crate) struct Toolchain {
     pub publishers: Vec<PublisherPin>,
     pub package_manifests: BTreeMap<String, PinnedPackage>,
+    /// Bootstrap requests that no pinned catalog offered, so the build ran
+    /// without them.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub absent_bootstrap_packages: BTreeSet<String>,
 }
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
@@ -251,7 +255,16 @@ impl Toolchain {
                 "toolchain package {name} claims an unpinned publisher"
             );
         }
+        for name in &self.absent_bootstrap_packages {
+            ensure!(
+                recipe.is_bootstrap(name) && !self.package_manifests.contains_key(name),
+                "build attestation claims that toolchain package {name} was an absent bootstrap request"
+            );
+        }
         for (name, spec) in recipe.requested()? {
+            if self.absent_bootstrap_packages.contains(name) {
+                continue;
+            }
             let package = self
                 .package_manifests
                 .get(name)
@@ -826,6 +839,7 @@ build architecture="x86_64" epoch=1700000000 {{
             recipe_bytes.as_bytes(),
             Toolchain {
                 publishers: recipe.toolchain.clone(),
+                absent_bootstrap_packages: Default::default(),
                 package_manifests: BTreeMap::from([(
                     "build/compiler".into(),
                     PinnedPackage {
@@ -879,6 +893,7 @@ build architecture="x86_64" epoch=1700000000 {{
         let pins = &recipe.toolchain;
         let chain = |publishers, publisher: &str, version: &str| Toolchain {
             publishers,
+            absent_bootstrap_packages: Default::default(),
             package_manifests: BTreeMap::from([(
                 "build/compiler".to_owned(),
                 PinnedPackage {
@@ -910,6 +925,57 @@ build architecture="x86_64" epoch=1700000000 {{
                 .verify(&recipe)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn only_bootstrap_requests_may_be_absent() -> Result<()> {
+        let hash = "a".repeat(64);
+        let recipe = parse(&format!(
+            r#"schema-version 1 kind="build-recipe"
+build architecture="x86_64" epoch=1700000000 {{
+    toolchain solver="sat-v2" {{
+        publisher "seed" catalog-sha256="{hash}" key-sha256="{hash}"
+        package "build/compiler"
+        package "library/earlier" bootstrap=#true
+    }}
+    manifest "manifest.kdl" sha256="{hash}"
+    script "true"
+}}
+"#
+        ))?;
+        let pinned = |name: &str| {
+            (
+                name.to_owned(),
+                PinnedPackage {
+                    publisher: "seed".into(),
+                    version: "1.0.0-0".parse().unwrap(),
+                    sha256: hash.clone(),
+                },
+            )
+        };
+        let toolchain = |packages: &[&str], absent: &[&str]| Toolchain {
+            publishers: recipe.toolchain.clone(),
+            package_manifests: packages.iter().map(|name| pinned(name)).collect(),
+            absent_bootstrap_packages: absent.iter().map(|name| (*name).to_owned()).collect(),
+        };
+        toolchain(&["build/compiler", "library/earlier"], &[]).verify(&recipe)?;
+        toolchain(&["build/compiler"], &["library/earlier"]).verify(&recipe)?;
+        // An absent request must be a bootstrap request, and it cannot also be resolved.
+        assert!(toolchain(&["build/compiler"], &[]).verify(&recipe).is_err());
+        assert!(
+            toolchain(&["library/earlier"], &["build/compiler"])
+                .verify(&recipe)
+                .is_err()
+        );
+        assert!(
+            toolchain(&["build/compiler", "library/earlier"], &["library/earlier"])
+                .verify(&recipe)
+                .is_err()
+        );
+        // Without an absent request, the statement keeps its earlier encoding.
+        let encoded = serde_json::to_string(&toolchain(&["build/compiler"], &[]))?;
+        assert!(!encoded.contains("absent_bootstrap_packages"));
         Ok(())
     }
 }
